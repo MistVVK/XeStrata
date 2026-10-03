@@ -1,6 +1,68 @@
-MIT License
+XeStrata
+Copyright (C) 2026 MistVVK and the XeStrata contributors
+
+XeStrata is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+XeStrata is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+details.
+
+The GNU Lesser General Public License is in COPYING.LESSER; it supplements the GNU General Public License, which is in
+COPYING.
+
+Copyright notices
+=================
+
+Every copyright holder whose work is in this repository, its license and where the license text is:
+
+- Copyright (C) 2026 MistVVK and the XeStrata contributors
+  LGPL-3.0-or-later - XeStrata - COPYING.LESSER, COPYING
+- Copyright (c) 2026 Niko1221 and the Strata contributors
+  MIT - Strata, which XeStrata is a port of; its code is part of XeStrata under the LGPL - text below
+- Copyright (c) 2023-2026 The ggml authors
+  MIT - third_party/main/ggml/ggml-common.h (an unmodified copy, kept under MIT), and the code in src/ transcribed
+  from ggml / llama.cpp (each such file says so in its header; part of XeStrata under the LGPL) - text below and in
+  third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
+  with its own LICENSE
+- Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
+  SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
+- Copyright (c) 2026 Qwen
+  Qwen Community License 1.0 - third_party/nonfree/: material made from or copied from the Qwen3.8-Flash-Next model.
+  Not free software and not covered by the LGPL; XeStrata builds and runs without it - third_party/nonfree/*/LICENSE
+
+The models are not part of this repository; each model's own license applies to its files.
+
+
+Strata (MIT License)
+--------------------
 
 Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+ggml / llama.cpp (MIT License)
+------------------------------
+
+Copyright (c) 2023-2026 The ggml authors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # experimental-speed-projection (EXPERIMENTAL, off by default)
 
 `Qwen3.8-Flash-Next-experimental-speed-projection.gguf` is a 480 KB control vector for Qwen3.8-Flash-Next: one unit
@@ -12,7 +17,7 @@ safety behaviour - you are responsible for what the model writes with it on. It 
 slightly on ordinary text (measured here: `bench/results/2026-09-27-esp/`). It is not an optimization in the engine:
 on the same text it costs 0.2-0.4% per token; a chat's speed with it on depends on the text the model writes.
 
-**Turning it on.** `START-HERE.bat --setup` asks (default: off), or pass `--experimental-speed-projection on`. With it
+**Turning it on.** `./setup.sh --setup` asks (default: off), or pass `--experimental-speed-projection on`. With it
 loaded, the web app's Sampling drawer and the API field `"experimental_speed_projection": false` switch it off per
 request. See `docs/DETAILS.md`, "Experimental speed projection".
 
