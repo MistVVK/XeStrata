@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Tests for tools/calibrate.py and setup's use of it, without a GPU: a stand-in engine whose decode speed is a
 function of the settings it runs with.
 
@@ -106,8 +109,7 @@ class Calibrate(unittest.TestCase):
 class SetupIntegration(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = {k: os.environ.get(k) for k in ("APPDATA", "XDG_CONFIG_HOME")}
-        os.environ["APPDATA"] = self.tmp.name
+        self.old = {k: os.environ.get(k) for k in ("XDG_CONFIG_HOME",)}
         os.environ["XDG_CONFIG_HOME"] = self.tmp.name
         import setup as S
         self.S = S
@@ -126,7 +128,7 @@ class SetupIntegration(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_calibrate_config_writes_and_remembers(self):
-        cfg_path = Path(self.tmp.name) / "strata-q2_0.json"
+        cfg_path = Path(self.tmp.name) / "xestrata-q2_0.json"
         cfg = {"exe": "x", "args": list(BASE), "model_name": "qwen3.8-flash-next-q2_0"}
         cfg_path.write_text(json.dumps(cfg))
         CAL.run = lambda c, say=print, start_engine=None: {"settings": {"--pcie-frac": "0.20"}, "report": {"tok_s": 61.2}}
@@ -142,7 +144,7 @@ class SetupIntegration(unittest.TestCase):
         self.assertIsNone(self.S.saved_calibration(other))
 
     def test_failed_calibration_keeps_defaults(self):
-        cfg_path = Path(self.tmp.name) / "strata-q2_0.json"
+        cfg_path = Path(self.tmp.name) / "xestrata-q2_0.json"
         cfg_path.write_text(json.dumps({"exe": "x", "args": list(BASE), "model_name": "m"}))
 
         def boom(*a, **k):

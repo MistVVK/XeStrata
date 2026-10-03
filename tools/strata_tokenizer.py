@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/strata_tokenizer.py - the tokenizer, as the reference implementation of record.
 
 WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
@@ -142,7 +145,13 @@ class Tokenizer:
 
         Applying merges in list order rather than rank order is the classic BPE bug: it produces a different
         segmentation and a plausible token count.
+
+        A word longer than HEAP_MIN symbols (a long CJK run, a minified blob: one pre-token piece of thousands of
+        bytes) goes to _bpe_heap, which applies the same merges in the same order without rescanning every pair
+        after each merge (#268: that rescan is O(n^2) and took seconds on an 8K-character CJK run).
         """
+        if len(word) > self.HEAP_MIN:
+            return self._bpe_heap(word)
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
@@ -154,6 +163,48 @@ class Tokenizer:
                 break
             parts[best:best + 2] = [parts[best] + parts[best + 1]]
         return parts
+
+    HEAP_MIN = 64       # words up to this many symbols keep the scan above, unchanged
+
+    def _bpe_heap(self, word: str) -> list[str]:
+        """_bpe's result in O(n log n): the symbols as a linked list, every adjacent pair with a rank in a heap
+        keyed (rank, position).  Popping the lowest rank and then the lowest position is exactly the order the
+        scan picks (its strict `<` keeps the leftmost of equal ranks), and a symbol's position is where it starts
+        in the word, which only its left neighbour's merge can change - so a popped pair whose two symbols are
+        no longer the ones it was pushed with is stale and skipped."""
+        import heapq
+        parts = list(word)
+        n = len(parts)
+        gone = [False] * n                              # merged into its left neighbour
+        nxt = list(range(1, n)) + [-1]
+        prv = list(range(-1, n - 1))
+        ranks = self.ranks
+        heap = []
+        for i in range(n - 1):
+            r = ranks.get((parts[i], parts[i + 1]))
+            if r is not None:
+                heap.append((r, i, parts[i], parts[i + 1]))
+        heapq.heapify(heap)
+        while heap:
+            r, i, left, right = heapq.heappop(heap)
+            j = nxt[i]
+            if gone[i] or parts[i] != left or j < 0 or parts[j] != right:
+                continue                                # stale: one of its symbols has merged since
+            parts[i] = left + right
+            gone[j] = True                              # j is gone: i takes its place in the list
+            k = nxt[j]
+            nxt[i] = k
+            if k >= 0:
+                prv[k] = i
+                r2 = ranks.get((parts[i], parts[k]))
+                if r2 is not None:
+                    heapq.heappush(heap, (r2, i, parts[i], parts[k]))
+            p = prv[i]
+            if p >= 0:
+                r2 = ranks.get((parts[p], parts[i]))
+                if r2 is not None:
+                    heapq.heappush(heap, (r2, p, parts[p], parts[i]))
+        return [s for s, g in zip(parts, gone) if not g]
 
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []

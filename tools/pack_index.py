@@ -1,4 +1,7 @@
-﻿"""tools/pack_index.py - emit a flat index of the pack's dense tensors for the engine's loader.
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""tools/pack_index.py - emit a flat index of the pack's dense tensors for the engine's loader.
 
 WHY AN INDEX AND NOT A JSON PARSER.  The manifest is JSON and the engine is C++.  A JSON parser in the engine
 would be a new, unaudited component whose failure mode is a wrong byte offset - which decodes to a plausible

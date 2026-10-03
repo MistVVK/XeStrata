@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Tune the engine's hardware-dependent settings on this PC (setup's --calibrate).
 
 Three settings depend on the machine more than on the model, and the defaults are right for the PC they were
@@ -14,7 +17,7 @@ per value.  Decode speed only: the prompt path streams every expert whatever the
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
 
-    python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
+    python tools/calibrate.py xestrata-q2_0.json        # measure and print; setup.py --calibrate also saves it
 """
 from __future__ import annotations
 
@@ -223,6 +226,6 @@ def apply(args: list[str], settings: dict) -> list[str]:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        sys.exit("usage: calibrate.py <strata-*.json>")
+        sys.exit("usage: calibrate.py <xestrata-*.json>")
     res = run(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig")))
     print(json.dumps(res, indent=1))

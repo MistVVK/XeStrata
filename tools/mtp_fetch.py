@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/mtp_fetch.py - plan v0.3, P0.3/P6: the MTP block from the BF16 checkpoint, without the checkpoint.
 
 The GSQ-RCO GGUF ships no MTP head. The BF16 checkpoint (Qwen/Qwen3.8-Flash-Next, 360 GB in 131 shards) does:
@@ -17,9 +20,16 @@ import os
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 
-REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
+# A fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next on
+# 2026-09-30, upstream #214), so every install reads the same tensors; STRATA_MTP_REVISION overrides it (e.g. main).
+# When the repository no longer has it, the current files are read instead, with a message (resolve_repo).
+REVISION = os.environ.get("STRATA_MTP_REVISION") or "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+# #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision
+HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
+REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 
 
@@ -39,6 +49,23 @@ def get(url, start=None, end=None, retries=4):
                 raise
             time.sleep(2 ** attempt)
             print("retry %s: %s" % (url, e), file=sys.stderr)
+
+
+def resolve_repo():
+    """REPO, or the repository's current files when the pinned revision is gone from it (a 404 on its index)."""
+    global REPO
+    try:
+        req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
+                                     headers={"User-Agent": "strata-mtp-fetch"})
+        urllib.request.urlopen(req, timeout=120).close()
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and "/resolve/main/" not in REPO:
+            print("the checkpoint's pinned revision %s is gone: reading its current files (main)" % REVISION,
+                  file=sys.stderr)
+            REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
+    except OSError:
+        pass                                        # no answer: get() retries and reports it
+    return REPO
 
 
 def shard_header(shard):
@@ -114,6 +141,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--only")
     a = ap.parse_args()
+    resolve_repo()
     inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
 
 

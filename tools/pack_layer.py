@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Strata P0.S9 - build the pack-layout expert arena from the real GGUF.
 
 The architecture (§3.2) defines one expert blob as 1,382,400 bytes:

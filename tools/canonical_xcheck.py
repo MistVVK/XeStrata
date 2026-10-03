@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/canonical_xcheck.py - P1.T3 in prototype: does the canonical form round-trip BIT-EXACTLY?
 
 P1.S6's release-blocking test is `dequant(canonical) == dequant_ggml(original)` bit for bit, for every tensor

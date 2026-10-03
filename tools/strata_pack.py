@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Strata P1.S6/S7 - the pack builder and verifier.
 
 This is `strata-pack build` / `strata-pack verify` / `strata-pack info`.  It is the Python implementation of

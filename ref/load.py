@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """ref/load.py - P1.S4: GGUF -> FP32 tensors on demand, with LAZY per-expert dequantization.
 
 The plan is explicit: "experts are dequantized lazily per (layer, expert) - do not materialize 120B

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """A missing or short model shard is named with its numbers, and a pack's verify reads back the source hash
 its manifest recorded - over a minimal GGUF written here (no download, no model, no GPU).
 

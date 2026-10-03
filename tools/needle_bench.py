@@ -1,10 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/needle_bench.py - needle-in-a-haystack recall through a running Strata server.
 
 A long text is built from files in this repository (its docs and source code, and the llama.cpp docs setup downloads
 into third_party/), a code word is hidden in it at a chosen depth, and the model is asked for it through the normal
 API (thinking off, greedy). One line per test: length, depth, found or not, prompt tokens, time.
 
-    python tools/needle_bench.py                                  # 32K at depths 10/50/90, http://127.0.0.1:8080
+    python tools/needle_bench.py                                  # 32K at depths 10/50/90, http://127.0.0.1:8095
     python tools/needle_bench.py --lengths 32k,128k,262k --depths 10,50,90 --url http://127.0.0.1:8081
     python tools/needle_bench.py --out needles.json --api-key KEY
 
@@ -24,7 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCES = [("docs", "*.md"), ("src", "*.cpp"), ("src", "*.cu"), ("include", "*.hpp"), ("serve", "*.py"), ("tools", "*.py"),
-           ("third_party/llama.cpp/docs", "*.md")]
+           ("third_party/main/llama.cpp/docs", "*.md")]
 WORDS = ["amber", "falcon", "quartz", "willow", "copper", "harbor", "saffron", "glacier", "orchid", "lantern",
          "meadow", "cobalt", "juniper", "tundra", "velvet", "ember"]
 CHARS_PER_TOKEN = 3.2
@@ -67,7 +70,7 @@ def ask(url: str, key: str, prompt: str, timeout: float) -> tuple[str, int, floa
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--url", default="http://127.0.0.1:8080")
+    ap.add_argument("--url", default="http://127.0.0.1:8095")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--lengths", default="32k", help="comma-separated, e.g. 1k,32k,128k,262k")
     ap.add_argument("--depths", default="10,50,90", help="where the code word sits, percent of the text")
