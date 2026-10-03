@@ -16,7 +16,7 @@ GPU は Intel Arc を 1 枚、OS は Linux を使い、インストールはコ�
 
 > **目次:** [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
-> [開発する人へ](#開発する人へ) · [詳しい説明（英語）](docs/DETAILS.md)
+> [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md)
 
 ## XeStrata とは
 
@@ -40,7 +40,7 @@ Strata との主な違い:
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
-| OS | Linux（WSL は不可）。Ubuntu 26.04 で確かめています。 |
+| OS | Linux（WSL は不可）。Ubuntu 26.04 で確かめ、Fedora 44 でもコンテナで setup と起動を確かめています。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン（XMX）**: XMX のある GPU ではそれを使い、ない GPU では DP4a の命令で計算します。
@@ -50,7 +50,7 @@ Strata との主な違い:
 - **CPU 内蔵のグラフィックス**: 起動とプロンプトの読み込みまでを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
 - **パッケージ**: Intel の GPU のランタイム（Level Zero）と、SYCL のコンパイラが要ります。
-  setup は OS のパッケージを入れないので、[docs/XE.md](docs/XE.md#packages) の表にあるものを先に入れてください。
+  setup は OS のパッケージを入れないので、[docs/XE.ja.md](docs/XE.ja.md#パッケージ) の表にあるものを先に入れてください。
 
 ## モデルの選び方
 
@@ -65,7 +65,7 @@ Strata との主な違い:
 
 モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
 **省 RAM モード**で動きます。このモードでは、エキスパートを RAM にコピーせずにモデルのファイルから読みます
-（[詳細](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)）。
+（[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
 
 **版:**
 
@@ -77,13 +77,13 @@ Strata との主な違い:
   答える前の思考が短く、答えが早く出ます。品質はほぼ同じで、IQ3_S はありません。このモデル自身のライセンスに従います。
 - **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（実験的）: 元のモデルの 4 ビット版です。
   ダウンロードは 111 GB です。エキスパートが 77 GB あり、RAM に入りきらない分は答えている間に SSD から読むので、
-  2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)）。
+  2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
 迷ったら **IQ2_XS** を選んでください。RAM が 32 GB しかない PC では、Coder が選べます。
 あとから別のモデルを足すときは `./setup.sh --setup` を実行します。
 
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
-変換の手順は [docs/ORCA.md](docs/ORCA.md) にあります。
+変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。
 
 ## インストール
 
@@ -96,14 +96,14 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
    - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
    - **画像**: 画像も読ませるかどうか。
    - **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
-     [説明](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default)を読んでください。
+     [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
 
 setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んでエンジンをビルドし、モデルをダウンロードして起動します。
 ブラウザで `http://127.0.0.1:8095` が開きます。
 
 - **コンパイラ**: 自由ソフトウェアのコンパイラ（intel/llvm の DPC++、ディストリビューションの `dpclang++`）を使います。
   そのコンパイラでは GPU の XMX が使えないとき、setup は次のどれにするかを尋ねます
-  （[詳細](docs/XE.md#the-sycl-compiler)）。
+  （[詳細](docs/XE.ja.md#sycl-のコンパイラ)）。
    - XMX なしでビルドする。
    - 新しい intel/llvm をこの場でビルドする（`--intel-llvm-build`）。
    - 止める。
@@ -135,7 +135,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
   `chat.py` の `/think low`、アプリの「reasoning effort」の設定で変えられます。Off がいちばん速く、難しい質問には High が向きます。
 - **画像**: チャットの画面では **Picture** を押します。`chat.py` では `/image <パス>` と入力します。アプリでは添付します。
 - **スマートフォンや別の PC から**: `./setup.sh --setup --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
-  サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.md#using-it)）。
+  サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.ja.md#ストリーミングと接続)）。
 
 **知っておくと良いこと**: 要求は 1 つずつ処理します。会話の最初のメッセージはすべて読み込みますが、
 そのあとは会話を覚えておき、新しく足された部分だけを読むので、続きの返事はすぐに始まります。
@@ -153,7 +153,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
 **GPU が見つからない、使えないと言われた**
 次の 3 つを確かめてください。
 
-- Intel の GPU のランタイムが入っているか確かめてください（[docs/XE.md](docs/XE.md#packages)）。
+- Intel の GPU のランタイムが入っているか確かめてください（[docs/XE.ja.md](docs/XE.ja.md#パッケージ)）。
 - 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`）を開けるか確かめてください（`render` グループ）。
 - 単体の GPU が OS から見えないときは、BIOS の Above 4G Decoding と Re-Size BAR を確かめてください。
 
@@ -179,7 +179,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`./setup.sh` で長い文脈を選び直してください。
 
 **解決しないとき**
-[詳しい対処の表（英語）](docs/DETAILS.md#troubleshooting)を見てください。それでも解決しなければ
+[詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
 [issue](https://github.com/MistVVK/XeStrata/issues) を立て、XeStrata のフォルダにある `xestrata-<モデル>.log` を添付してください。
 
 ## しくみ
@@ -199,8 +199,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **長い文章は大きな塊で読みます**（一度に最大 8,192 トークン）。
 
 Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU は DP4a の命令で計算します。
-各部分の詳しい説明は [docs/DETAILS.md](docs/DETAILS.md#how-it-works)（英語）、Intel の GPU での実装と確かめたことは
-[docs/XE.md](docs/XE.md)（英語）にあります。
+各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ)、Intel の GPU での実装と確かめたことは
+[docs/XE.ja.md](docs/XE.ja.md) にあります。
 
 ## 開発する人へ
 
@@ -208,11 +208,11 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
    - free（既定）: 自由ソフトウェアだけでビルドします。コンパイラは intel/llvm の DPC++ です。
    - nonfree（`-DSTRATA_NONFREE=ON`）: Intel oneAPI の icpx なども使えます。
    - どちらの方式でもビルドでき、テストが通る状態を保ちます。
-- **手順**: ビルドの手順は [docs/XE.md](docs/XE.md#build-and-run)、開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は
-  [docs/DEVTOOLS.md](docs/DEVTOOLS.md) にあります。
+- **手順**: ビルドの手順は [docs/XE.ja.md](docs/XE.ja.md#ビルド)、開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は
+  [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
-- **README**: この日本語版（README.ja.md）を先に書き、英語版（README.md）はその訳です。
+- **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。
 
 ## クレジット
 
@@ -226,7 +226,7 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 - **使っている部品**: [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、
   [HyperQwen](https://github.com/syv-ai/HyperQwen)。
-- 詳しくは [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses)（英語）にあります。
+- 詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
 ## ライセンス
 
