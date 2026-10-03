@@ -5,6 +5,12 @@
 # (https://reuse.software). A file's own SPDX header wins over these.
 version = 1
 
+# License overview and upstream notices
+[[annotations]]
+path = ["NOTICE"]
+SPDX-FileCopyrightText = ["2026 MistVVK and the XeStrata contributors", "2026 Niko1221 and the Strata contributors", "2023-2026 The ggml authors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
+
 # XeStrata's own files without a comment of their own
 [[annotations]]
 path = ["bench/**", "data/**", "docs/paper/**", "serve/web/sprite.svg"]

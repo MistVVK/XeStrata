@@ -794,7 +794,7 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
 
 ## Credits and licenses
 
-XeStrata: [LGPL-3.0-or-later](../LICENSE) (the parts from Strata also under Strata's MIT License, kept in the same file). The model files are not part of it; their licenses apply to them (below).
+XeStrata: [LGPL-3.0-or-later](../COPYING.LESSER) (the parts from Strata also under Strata's MIT License; copyright and MIT notices are in [NOTICE](../NOTICE)). The model files are not part of it; their licenses apply to them (below).
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).

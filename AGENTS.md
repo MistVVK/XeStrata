@@ -29,7 +29,8 @@ Rules:
 
 ## Licenses
 
-XeStrata is under the LGPL, version 3 or later (`LICENSE`, `COPYING.LESSER`, `COPYING`); keep the MIT notice of the parts that come from Strata.
+XeStrata is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and MIT notices are in `NOTICE`.
+Keep the MIT notice of the parts that come from Strata.
 Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
 
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.

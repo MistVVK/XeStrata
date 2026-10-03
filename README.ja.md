@@ -230,10 +230,10 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 
 ## ライセンス
 
-XeStrata は自由ソフトウェアで、[GNU Lesser General Public License の第 3 版以降](LICENSE)
+XeStrata は自由ソフトウェアで、[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)
 （`COPYING.LESSER` と `COPYING`）で配布します。
 
-- **Strata 由来の部分**: Strata の MIT License が引き続き適用されます（これも `LICENSE` にあります）。
+- **Strata 由来の部分**: Strata の MIT License が引き続き適用されます（著作権と MIT の告知は [NOTICE](NOTICE) にあります）。
 - **ほかのプロジェクトの素材**: `third_party/` に、プロジェクトごとのフォルダとライセンスの文書と一緒に置いています。
    - `third_party/main/`: 自由ソフトウェア。ggml の `ggml-common.h`（MIT）と、画面のフォント Outfit
      （SIL Open Font License 1.1）です。ggml から書き写したカーネルは `src/` にあり、ggml の表示を残したうえで LGPL です。
