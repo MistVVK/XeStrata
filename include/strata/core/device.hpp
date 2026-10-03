@@ -1,14 +1,15 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/device.hpp - P2.S1: the device arena and the runtime's device facts.
 //
-// `DeviceArena` is ONE cudaMalloc per planner region with bump sub-allocation below it and no frees.  That is
-// not a simplification for the first version: the memory plan from P1.S9 is fixed at startup, so the set of
-// regions and their sizes is known before anything is allocated, and an allocator that can free would be
-// solving a problem the engine does not have while adding fragmentation and failure modes it does.
+// `DeviceArena` is ONE device allocation per planner region with bump sub-allocation below it and no frees.  That
+// is not a simplification for the first version: the memory plan is fixed at startup, so the set of regions and
+// their sizes is known before anything is allocated, and an allocator that can free would be solving a problem
+// the engine does not have while adding fragmentation and failure modes it does.
 //
-// The reason to get this in early is that the VRAM budget is the binding constraint of the whole design
-// (5.95 GB pooled between KV and the expert cache, 33.97 GB of experts in DRAM).  A runtime that discovers at
-// token 4000 that it has overcommitted has already lost; the plan is printed against `cudaMemGetInfo` at
-// startup so the discrepancy is visible immediately.
+// VRAM is the binding constraint of the whole design (the expert cache takes what the fixed regions leave), so a
+// runtime that discovers at token 4000 that it has overcommitted has already lost.
 #pragma once
 
 #include <cstdint>
@@ -20,31 +21,36 @@ namespace strata::core {
 
 struct DeviceInfo {
     int ordinal = -1;
-    std::string name;
-    int cc_major = 0, cc_minor = 0;
-    uint64_t total_bytes = 0;      // as reported by cudaMemGetInfo at query time
-    uint64_t free_bytes = 0;
-    int driver_version = 0, runtime_version = 0;
-    int multi_processor_count = 0;
+    std::string name, driver_version, platform_version;
+    uint32_t device_id = 0;
+    uint64_t total_bytes = 0, free_bytes = 0;
+    bool free_bytes_known = false;
+    uint32_t compute_units = 0;
+    bool integrated = false;        ///< the processor's own graphics: its memory is the system RAM (Level Zero)
+    std::vector<size_t> subgroup_sizes;
+    bool fp64 = false, host_usm = false, device_usm = false;
 };
 
-// Throws when there is no CUDA device.  The engine targets sm_120 specifically and must say so rather than
-// run slowly on something else: `CMakeLists.txt` already refuses to COMPILE for another architecture, and
-// this is the matching check at run time (a binary can be carried to a different machine).
+// Ordinals refer to supported Intel GPUs exposed by the Level Zero backend.
 DeviceInfo device_info(int ordinal = 0);
 
-class CudaError : public std::runtime_error {
-public:
-    CudaError(const std::string& what, int code) : std::runtime_error(what), code_(code) {}
-    int code() const { return code_; }
+/// A smaller device, for checking the engine's choices on the B70 (AGENTS.md, the first rule):
+/// STRATA_VRAM_LIMIT_MIB caps the memory the engine sees (its total, and its free part as total less what is used),
+/// STRATA_MAX_ALLOC_MIB the largest allocation it assumes.  0 when unset.
+uint64_t vram_limit_bytes();
+uint64_t max_alloc_limit_bytes();
+/// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.
+void apply_vram_limit(uint64_t& free, uint64_t& total);
+/// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
+uint64_t max_alloc_bytes();
 
-private:
-    int code_;
+class DeviceError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
 };
 
-// One cudaMalloc, bump-allocated below.  `poison` fills new allocations with a NaN-ish pattern in a debug
-// build so that reading uninitialised VRAM gives a NaN rather than a plausible number - the same reasoning as
-// the harness work in Phase 1: a wrong value that looks right is the expensive kind.
+// One device USM allocation per planner region. Destruction drains the runtime
+// before freeing it; callers may reuse a suballocation only after its last reader.
 class DeviceArena {
 public:
     explicit DeviceArena(uint64_t bytes, int ordinal = 0, bool poison = false);
@@ -52,12 +58,11 @@ public:
     DeviceArena(const DeviceArena&) = delete;
     DeviceArena& operator=(const DeviceArena&) = delete;
 
-    // `align` must be a power of two; 256 keeps every sub-allocation at a sector boundary.
+    // Alignment applies to the absolute address, including alignments above 4096.
     void* alloc(uint64_t bytes, uint64_t align = 256);
-
     uint64_t capacity() const { return capacity_; }
     uint64_t used() const { return used_; }
-    uint64_t peak() const { return used_; }        // no frees, so used IS the peak
+    uint64_t peak() const { return used_; }
     int ordinal() const { return ordinal_; }
     void* base() const { return base_; }
 
@@ -65,7 +70,6 @@ private:
     void* base_ = nullptr;
     uint64_t capacity_ = 0, used_ = 0;
     int ordinal_ = 0;
-    bool poison_ = false;
 };
 
 }  // namespace strata::core

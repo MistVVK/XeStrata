@@ -1,9 +1,9 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/platform/memory.hpp - plan v0.3 P0.1/P1: keep a large host region resident.
 //
-// `cudaHostRegister` refuses the 31.6 GiB expert arena on Windows, and an unlocked arena is trimmed under memory
-// pressure (the CPU pool then swung 2x between runs). With the n-gram table out of RAM there is headroom to lock
-// it instead: raise the process's minimum working set by the region's size, then VirtualLock it (Windows needs
-// only SeIncreaseWorkingSetPrivilege, which ordinary accounts hold). Linux: mlock.
+// If CUDA cannot register the expert arena, mlock can keep it resident while the CPU pool reads it.
 #pragma once
 
 #include <cstdint>

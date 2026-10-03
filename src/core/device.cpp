@@ -1,0 +1,311 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#include "strata/core/runtime.hpp"
+
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace strata::core {
+namespace {
+// Why a Level Zero GPU cannot run the engine, from what it reports (empty: it can).  The kernels take 16-wide
+// sub-groups, FP16 and device and host USM; nothing is chosen by device ID or name (AGENTS.md).
+std::string unusable(const sycl::device& d) {
+    if (!d.has(sycl::aspect::usm_device_allocations) || !d.has(sycl::aspect::usm_host_allocations))
+        return "no device and host USM";
+    if (!d.has(sycl::aspect::fp16)) return "no FP16";
+    const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
+    if (std::find(sg.begin(), sg.end(), size_t(16)) == sg.end()) return "no 16-wide sub-groups";
+    return {};
+}
+
+// Whether the GPU is the processor's own graphics (its memory is the system RAM), as Level Zero reports it.
+bool integrated(const sycl::device& d) {
+    ze_device_properties_t p;
+    std::memset(&p, 0, sizeof p);
+    p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
+    const auto h = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(d);
+    return zeDeviceGetProperties(h, &p) == ZE_RESULT_SUCCESS && (p.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
+}
+
+std::string pci_of(const sycl::device& d) {
+    if (!d.has(sycl::aspect::ext_intel_pci_address)) return "?";
+    std::string s = d.get_info<sycl::ext::intel::info::device::pci_address>();
+    for (auto& c : s) c = (char) std::tolower((unsigned char) c);
+    return s;
+}
+
+sycl::device select_device() {
+    std::vector<sycl::device> candidates;
+    std::string refused;
+    for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
+        if (d.get_backend() != sycl::backend::ext_oneapi_level_zero ||
+            d.get_info<sycl::info::device::vendor_id>() != 0x8086) continue;
+        if (const std::string why = unusable(d); !why.empty()) {
+            refused += "; " + d.get_info<sycl::info::device::name>() + " (" + pci_of(d) + "): " + why;
+            continue;
+        }
+        candidates.push_back(d);
+    }
+    if (candidates.empty()) throw DeviceError("no usable Intel GPU on Level Zero" + refused);
+    // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
+    if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
+        std::string w = want;
+        for (auto& c : w) c = (char) std::tolower((unsigned char) c);
+        std::vector<sycl::device> match;
+        for (const auto& d : candidates)
+            if (pci_of(d) == w) match.push_back(d);
+        if (match.size() != 1)
+            throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable Intel GPU at that PCI address" +
+                              refused);
+        return match.front();
+    }
+    // Without a choice, a discrete card before the processor's own graphics, then the most compute units, then the
+    // most memory.  The engine drives one GPU.
+    return *std::max_element(candidates.begin(), candidates.end(), [](const sycl::device& x, const sycl::device& y) {
+        const bool ix = integrated(x), iy = integrated(y);
+        if (ix != iy) return ix;
+        const auto cx = x.get_info<sycl::info::device::max_compute_units>();
+        const auto cy = y.get_info<sycl::info::device::max_compute_units>();
+        if (cx != cy) return cx < cy;
+        return x.get_info<sycl::info::device::global_mem_size>() < y.get_info<sycl::info::device::global_mem_size>();
+    });
+}
+
+[[noreturn]] void fatal(const char* message) {
+    std::fprintf(stderr, "Xe runtime: %s; terminating without releasing in-flight allocations\n", message);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
+// The xe driver resets a job after its job_timeout_ms (5 s here, at most 10 s), which completes the event with an
+// error, so a healthy wait - even a drain of many queued jobs - returns well inside this.  A wait that outlives it
+// is stuck in the driver or the host, and only a thread other than the waiter can report that.
+constexpr auto kHangLimit = std::chrono::seconds(120);
+}  // namespace
+
+Runtime& Runtime::get() {
+    static Runtime runtime;
+    return runtime;
+}
+
+sycl::async_handler Runtime::handler() {
+    return [this](sycl::exception_list errors) {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        if (!error_ && errors.size()) error_ = *errors.begin();
+    };
+}
+
+Runtime::Runtime() : device_(select_device()), context_(device_),
+    compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
+    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {}
+
+sycl::queue* Runtime::create_stream() {
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
+}
+
+void Runtime::destroy_stream(sycl::queue* stream) {
+    if (!stream) return;
+    if (!owns(stream) || stream == &compute_ || stream == &transfer_)
+        throw DeviceError("destroy_stream: not an engine stream of the Xe runtime");
+    finish(*stream);
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    streams_.remove_if([stream](const sycl::queue& q) { return &q == stream; });
+}
+
+bool Runtime::owns(const sycl::queue* queue) {
+    if (queue == &compute_ || queue == &transfer_) return true;
+    std::lock_guard<std::mutex> lock(streams_mutex_);
+    for (const auto& q : streams_)
+        if (&q == queue) return true;
+    return false;
+}
+
+sycl::queue& Runtime::stream(void* stream) {
+    if (!stream) return compute_;
+    auto* q = static_cast<sycl::queue*>(stream);
+    if (!owns(q)) throw DeviceError("the stream is not a queue of the Xe runtime");
+    return *q;
+}
+
+Runtime::~Runtime() {
+    try { finish(); }
+    catch (const std::exception& e) { fatal(e.what()); }
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        stop_ = true;
+    }
+    watch_cv_.notify_all();
+    watchdog_.join();
+}
+
+void Runtime::watch() {
+    std::unique_lock<std::mutex> lock(watch_mutex_);
+    while (!watch_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
+        const auto now = std::chrono::steady_clock::now();
+        for (const Waiter& w : waiters_) {
+            if (now - w.since < kHangLimit) continue;
+            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - w.since).count();
+            std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
+                         (long long) seconds, waiters_.size());
+            fatal("GPU wait exceeded the hang limit");
+        }
+    }
+}
+
+void Runtime::check_async() {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    if (error_) std::rethrow_exception(error_);
+}
+
+sycl::event Runtime::copy_async(void* dst, const void* src, uint64_t bytes,
+                               const std::vector<sycl::event>& dependencies) {
+    check_async();
+    return transfer_.memcpy(dst, src, bytes, dependencies);
+}
+
+sycl::event Runtime::compute_after(const std::vector<sycl::event>& dependencies) {
+    check_async();
+    return compute_.ext_oneapi_submit_barrier(dependencies);
+}
+
+void Runtime::wait(sycl::event event, const char* what) {
+    // Blocking in the driver rather than polling keeps the wake-up latency off decode's per-token waits.  A timeout
+    // cannot safely throw and free USM that an unfinished command owns, so a stuck wait ends the process instead.
+    std::list<Waiter>::iterator self;
+    {
+        std::lock_guard<std::mutex> lock(watch_mutex_);
+        self = waiters_.insert(waiters_.end(), Waiter{std::chrono::steady_clock::now(), what});
+    }
+    struct Done {
+        Runtime& r;
+        std::list<Waiter>::iterator it;
+        ~Done() { std::lock_guard<std::mutex> lock(r.watch_mutex_); r.waiters_.erase(it); }
+    } done{*this, self};
+    event.wait_and_throw();
+    check_async();
+}
+
+void Runtime::finish(sycl::queue& queue) {
+    if (!owns(&queue)) throw DeviceError("cannot drain a queue not owned by the Xe runtime");
+    wait(queue.ext_oneapi_submit_barrier(), &queue == &compute_ ? "compute queue drain"
+                                            : &queue == &transfer_ ? "transfer queue drain" : "engine stream drain");
+}
+void Runtime::finish() {
+    finish(compute_);
+    finish(transfer_);
+    std::vector<sycl::queue*> streams;
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        for (auto& q : streams_) streams.push_back(&q);
+    }
+    for (auto* q : streams) finish(*q);
+}
+
+void Runtime::free(void* pointer) noexcept {
+    if (!pointer) return;
+    try {
+        finish();
+        sycl::free(pointer, context_);
+    } catch (const std::exception& e) { fatal(e.what()); }
+}
+
+namespace {
+uint64_t env_mib(const char* name) {
+    const char* v = std::getenv(name);
+    return v ? (uint64_t) std::strtoull(v, nullptr, 10) << 20 : 0;
+}
+}  // namespace
+
+uint64_t vram_limit_bytes() {
+    static const uint64_t v = env_mib("STRATA_VRAM_LIMIT_MIB");
+    return v;
+}
+uint64_t max_alloc_limit_bytes() {
+    static const uint64_t v = env_mib("STRATA_MAX_ALLOC_MIB");
+    return v;
+}
+
+void apply_vram_limit(uint64_t& free, uint64_t& total) {
+    const uint64_t lim = vram_limit_bytes();
+    if (lim == 0 || lim >= total) return;
+    const uint64_t used = total > free ? total - free : 0;
+    total = lim;
+    free = lim > used ? lim - used : 0;
+}
+
+uint64_t max_alloc_bytes() {
+    const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
+    const uint64_t lim = max_alloc_limit_bytes();
+    return lim != 0 && lim < dev ? lim : dev;
+}
+
+DeviceInfo device_info(int ordinal) {
+    if (ordinal != 0) throw DeviceError("only device ordinal 0 is supported");
+    const auto& d = Runtime::get().device();
+    DeviceInfo out;
+    out.ordinal = ordinal;
+    out.name = d.get_info<sycl::info::device::name>();
+    out.device_id = d.has(sycl::aspect::ext_intel_device_id) ? d.get_info<sycl::ext::intel::info::device::device_id>() : 0;
+    out.driver_version = d.get_info<sycl::info::device::driver_version>();
+    out.platform_version = d.get_platform().get_info<sycl::info::platform::version>();
+    out.total_bytes = d.get_info<sycl::info::device::global_mem_size>();
+    if (d.has(sycl::aspect::ext_intel_free_memory)) {
+        try {
+            out.free_bytes = d.get_info<sycl::ext::intel::info::device::free_memory>();
+            out.free_bytes_known = true;
+        } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
+    }
+    uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
+    apply_vram_limit(free, out.total_bytes);
+    if (out.free_bytes_known) out.free_bytes = free;
+    out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
+    out.integrated = integrated(d);
+    out.subgroup_sizes = d.get_info<sycl::info::device::sub_group_sizes>();
+    out.fp64 = d.has(sycl::aspect::fp64);
+    out.host_usm = d.has(sycl::aspect::usm_host_allocations);
+    out.device_usm = d.has(sycl::aspect::usm_device_allocations);
+    return out;
+}
+
+DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison) : capacity_(bytes), ordinal_(ordinal) {
+    if (ordinal != 0 || !bytes || bytes > std::numeric_limits<size_t>::max())
+        throw DeviceError("DeviceArena requires nonzero bytes and device ordinal 0");
+    auto& runtime = Runtime::get();
+    base_ = sycl::aligned_alloc_device(4096, bytes, runtime.device(), runtime.context());
+    if (!base_) throw DeviceError("device USM allocation failed for " + std::to_string(bytes) + " bytes");
+    try {
+        // in 1 GiB pieces: a single memset past 4 GiB never completes on the B70 (see gpu.cpp)
+        if (poison) {
+            sycl::event e;
+            for (uint64_t o = 0; o < bytes; o += 1ull << 30)
+                e = runtime.compute().memset((uint8_t*) base_ + o, 0xff, std::min<uint64_t>(1ull << 30, bytes - o));
+            runtime.wait(e, "arena poison fill");
+        }
+    } catch (...) { runtime.free(base_); base_ = nullptr; throw; }
+}
+
+DeviceArena::~DeviceArena() { Runtime::get().free(base_); }
+
+void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
+    if (!align || (align & (align - 1))) throw DeviceError("alignment must be a power of two");
+    const uintptr_t address = reinterpret_cast<uintptr_t>(base_) + used_;
+    const uint64_t padding = (align - (address & (align - 1))) & (align - 1);
+    if (padding > capacity_ - used_ || bytes > capacity_ - used_ - padding)
+        throw DeviceError("DeviceArena capacity exceeded");
+    const uint64_t offset = used_ + padding;
+    used_ = offset + bytes;
+    return static_cast<uint8_t*>(base_) + offset;
+}
+}  // namespace strata::core

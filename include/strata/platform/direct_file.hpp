@@ -1,9 +1,11 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/platform/direct_file.hpp - plan v0.3 P1/P2: unbuffered asynchronous file reads.
 //
 // The n-gram table (26.8 GiB) stays on the SSD and must never occupy RAM, including the OS file cache. A memory
-// map cannot promise that; an unbuffered read can. On Windows this is FILE_FLAG_NO_BUFFERING | OVERLAPPED with
-// an I/O completion port; on Linux, O_DIRECT preads.  Both issue the reads from a small thread pool (submit only
-// queues), so many reads are in flight: STRATA_IO_THREADS sets its size (default 4 on Windows, 16 on Linux).
+// map cannot promise that; O_DIRECT preads can. A small thread pool issues reads concurrently (submit only
+// queues); STRATA_IO_THREADS sets its size (default 16).
 //
 // Contract of every read: offset, length and buffer address are multiples of `alignment()` (4096 here).
 // Reads past end of file return the bytes that exist; `Completion::bytes` says how many.
