@@ -22,7 +22,7 @@ Rules:
 - XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the nonfree mode can build or run, or that could only go into Debian contrib.
 - A non-free dependency goes only on a path the nonfree mode switches on, off by default, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
 - Keep one code path where both modes can use it: the engine's matrix products are XeStrata's own kernels in both modes, not oneMKL in one of them.
-- Build and test a change to the SYCL code in both modes: a free build (`build/free`, `dpclang++`; or `build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intel-llvm-from-source) describes) and a nonfree one (`build/xe`, icpx). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
+- Build and test a change to the SYCL code in both modes: a free build (`build/free`, `dpclang++`; or `build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a nonfree one (`build/xe`, icpx). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
 - `third_party/nonfree/` (below) stays optional in both modes.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
@@ -52,10 +52,11 @@ Every file under the LGPL starts with its copyright holders and license in SPDX 
 - Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
 - `reuse lint` must pass.
 
-## The README
+## The README and the documents
 
-The README is written in Japanese first: `README.ja.md` is the original and `README.md` its English translation.
-A change goes into `README.ja.md` first and then into `README.md` in the same commit, so the two keep the same sections and content.
+The README and the documents in `docs/` are written in Japanese first: `README.ja.md` and `docs/<NAME>.ja.md` are the originals, and `README.md` and `docs/<NAME>.md` their English translations.
+A change goes into the Japanese file first and then into the English one in the same commit, so the two keep the same sections and content.
+The English files keep the headings that code, records and links point to (`docs/XE.md#packages`, for example); a Japanese file's anchors come from its own headings.
 
 ## Lints
 
