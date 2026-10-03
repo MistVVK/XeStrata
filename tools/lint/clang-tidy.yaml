@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# clang-tidy for XeStrata's C++ and SYCL (tools/lint/run.sh, oneAPI's clang-tidy): bug patterns, performance and the
+# static analyzer; no style checks (the code is formatted by hand)
+# Left out: adjacent parameters of one type (most of the kernels' signatures), the enum base size and integer-to-pointer
+# casts (the arena's alignment), which flag the code's design rather than bugs; reserved identifiers, which the SYCL
+# compiler's own kernel names (_ZTS..., __SYCLKernel) trip once per kernel instantiation.
+Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier'
