@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/prefill/prefill.hpp - plan v0.3 P5: batched prompt processing.
 //
 // The prompt's positions [pos0, pos0 + n) are processed in chunks of `chunk` tokens through all 48 layers, leaving
@@ -34,8 +37,20 @@ struct PrefillStats {
     double ms_ple = 0;
 };
 
+}  // namespace strata::prefill
+namespace strata::core { class MtpDrafter; }
+namespace strata::prefill {
+
 class Prefill {
 public:
+    /// E-9 (upstream c6c6594): the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual
+    /// rows `R_rows` (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs
+    /// and its idle scratch - call it from on_chunk.  false with `err` empty: not applicable here (a streamed K/V,
+    /// another device, too little scratch; STRATA_MTP_BATCH=0), the caller runs the drafter's own pass.  Not
+    /// bit-identical to that pass (FP16 products instead of Q8_1 activations): the drafts may differ, never the
+    /// target's logits.
+    bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                  std::string& err);
     Prefill();
     ~Prefill();
     Prefill(const Prefill&) = delete;
@@ -57,6 +72,11 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+
+    /// Experts a grouped product takes (1-64, default 16): each holds 9.4 MiB of dequantized FP16 weights in the
+    /// region; more of them make fewer, fuller launches.  Set before bytes_needed.
+    static void set_expert_group(int g);
+    static int expert_group();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
