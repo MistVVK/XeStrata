@@ -798,7 +798,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 
 ## しくみ
 
-<p align="center"><img src="paper/tiers.svg" width="760" alt="memory tiers"></p>
+![memory tiers](paper/tiers.svg)
 
 - **GPU（VRAM）**: アテンションと DeltaNet の混合器、ゲートつき残差の重み、ルーター、共有エキスパート、出力ヘッド、MTP の推測の層、KV キャッシュ
   （64K 以上では、いちばんよく読む部分だけ。残りは RAM から流す）を置き、残りの VRAM をよく使うエキスパートで埋めます（**エキスパートのキャッシュ**）。

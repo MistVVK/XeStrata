@@ -510,7 +510,7 @@ GPU の q8_1 の活性化の約束と、CPU の ggml の `vec_dot_type` は、�
 | `native_expert_parity`、`dequant_bf16_test` | 移植済み。`STRATA_NATIVE_EXPERTS` でビルド。モデルのシャードが要るので登録しない。[B70 で確かめたモデル](#b70-で確かめたモデル)のすべてのシャードで通る |
 | `iq_parity` | 移植済みでビルドする。登録しない。`tools/iq_fixture.py` が、固定したモデルのリビジョンの範囲読みから `logs/iq_fixture` を書く。10 の形式すべてが通る。Q6_K と Q8_0 は一覧にない |
 | `ple_parity` | `ple_oracle_vectors.inc` をリポジトリに持つ。全体の確認には実際の表と参照の資産も要る。`unverified` |
-| CPU のエキスパートとプールのテスト、`pool_stress` | この一覧には含めていない。正準形のエキスパートのテストは AVX-512 か pack、またはその両方を要る。AVX-512 の経路は AGENTS.md のとおり Intel SDE で動かす |
+| CPU のエキスパートとプールのテスト、`pool_stress` | この一覧には含めていない。正準形のエキスパートのテストには AVX-512 か pack、またはその両方が要る。AVX-512 の経路は AGENTS.md のとおり Intel SDE で動かす |
 | `serve.test_server`、`serve.test_detok`、`serve.test_mcp` | 模擬のエンジンで通る |
 | `tools/test_iq_pack.py`、`tools/test_shards.py`、`tools/test_calibrate.py` | `python -m unittest` で通る（2026-10-04） |
 | `src/ngram/ple_reader_test.cpp`、`src/platform/memory_test.cpp` | ビルドし直した。`ple_reader_selftest` は通り、`platform_memory_test` は memlock の上限 8 MiB では失敗する。どちらも登録したアリーナの証拠にはならない |

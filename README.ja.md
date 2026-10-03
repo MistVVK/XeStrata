@@ -118,7 +118,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
 
 **更新**: `./update.sh` を実行します。git で取得したものなら `git pull` してから、エンジンと Python のパッケージと
 モデルの設定を更新します（モデルは起動しません）。新しい版をダウンロードして別の場所に展開し、そこで `./setup.sh` を
-実行しても構いません。モデルのファイルは XeStrata のフォルダの隣の `XeStrata-data` に置くので、新しいコピーもそれを見つけて
+実行しても構いません。モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data` に置くので、新しいコピーもそれを見つけて
 同じ設定で動きます。
 
 **自分の PC に合わせる**: `./setup.sh --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
@@ -180,7 +180,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 **解決しないとき**
 [詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
-[issue](https://github.com/MistVVK/XeStrata/issues) を立て、XeStrata のフォルダにある `xestrata-<モデル>.log` を添付してください。
+[issue](https://github.com/MistVVK/XeStrata/issues) を立て、XeStrata のフォルダーにある `xestrata-<モデル>.log` を添付してください。
 
 ## しくみ
 
@@ -234,7 +234,7 @@ XeStrata は自由ソフトウェアで、[GNU Lesser General Public License の
 （`COPYING.LESSER` と `COPYING`）で配布します。
 
 - **Strata 由来の部分**: Strata の MIT License が引き続き適用されます（著作権と MIT の告知は [NOTICE](NOTICE) にあります）。
-- **ほかのプロジェクトの素材**: `third_party/` に、プロジェクトごとのフォルダとライセンスの文書と一緒に置いています。
+- **ほかのプロジェクトの素材**: `third_party/` に、プロジェクトごとのフォルダーとライセンスの文書と一緒に置いています。
    - `third_party/main/`: 自由ソフトウェア。ggml の `ggml-common.h`（MIT）と、画面のフォント Outfit
      （SIL Open Font License 1.1）です。ggml から書き写したカーネルは `src/` にあり、ggml の表示を残したうえで LGPL です。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、

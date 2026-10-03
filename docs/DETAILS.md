@@ -12,7 +12,7 @@ New here? Start with the [README](../README.md): it has everything you need to i
 How the engine runs on Intel GPUs, and how that was checked, is in [XE.md](XE.md).
 The Japanese version ([DETAILS.ja.md](DETAILS.ja.md)) is the original; this is its translation.
 
-> **On this page:** [Speed](#speed-measured) · [Which model?](#which-model) · [What you need](#what-you-need) ·
+> **On this page:** [Speed](#speed-measured) · [Which model](#which-model) · [What you need](#what-you-need) ·
 > [Install and start](#install-and-start) · [Sharing the GPU](#sharing-the-gpu-with-other-programs) ·
 > [API](#using-it) · [MCP tools](#tools-from-mcp-servers) · [Images](#images) · [Troubleshooting](#troubleshooting) ·
 > [How it works](#how-it-works)
@@ -51,7 +51,7 @@ It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
   Measurably less precise on long documents (upstream measured perplexity 8–12% worse; needle tests still pass)
 - `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory
 
-## Which model?
+## Which model
 
 Every model is a compression of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 The original's four sizes are [ISTA-DASLab's GSQ-RCO quantizations](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
@@ -783,7 +783,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 
 ## How it works
 
-<p align="center"><img src="paper/tiers.svg" width="760" alt="memory tiers"></p>
+![memory tiers](paper/tiers.svg)
 
 - **GPU (VRAM):** attention and DeltaNet mixers, the gated-residual weights, routers, shared experts, the output head, the MTP draft layer,
   the KV cache (from 64K only its most-read part; the rest streams from RAM),
