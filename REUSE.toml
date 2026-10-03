@@ -13,7 +13,7 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # XeStrata's own files without a comment of their own
 [[annotations]]
-path = ["bench/**", "data/**", "docs/paper/**", "serve/web/sprite.svg", "tests/data/**", "docs/benchmarks/**"]
+path = ["bench/**", "data/**", "docs/paper/**", "serve/web/sprite.svg", "tests/data/**"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
