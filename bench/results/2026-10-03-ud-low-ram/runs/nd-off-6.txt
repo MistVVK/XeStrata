@@ -1,0 +1,53 @@
+<repo>/engine/strata --pack <data>/packs/unsloth-ud-q4_k_xl --native <data>/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf --ple-gguf <data>/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf --expert-profile <repo>/data/expert-profile.bin --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp <data>/mtp/rt --max-context 131072 --kv int8 --kv-resident 32768 --tokens-file <data>/records/2026-10-03-ud-setup/chat_ids.txt --max-new 64 --dump-logits <data>/records/2026-10-03-ud-setup/nd-off-6.logits --mmap-experts --adapt-every 0
+strata generate: GPU Intel(R) Graphics [0xe223], 256 compute units, 30.3 GiB, matrix engines (XMX) yes
+strata generate: PCIe probe: 42.6 GB/s host->device -> pcie_frac 0.55 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/unsloth-ud-q4_k_xl experts (largest blob 3.99 MB), token embedding Q8_0 in mapped host memory (644 MiB)
+strata generate: 1466 MiB of weights loaded from <data>/packs/unsloth-ud-q4_k_xl (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2948.44 MiB of weights
+strata generate: KV streaming: 32768 of 131072 cells per QSA layer in VRAM, the K/V in 1.55 GiB of pinned RAM
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <data>/models/unsloth/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf
+strata mtp: draft layer loaded, 835 MiB of VRAM (experts 675, dense 111), files read in 0.24 s (3292 MiB/s)
+strata generate: experts via mmap (--mmap-experts: the GGUF files in place, through the OS file cache)
+strata generate: profile <repo>/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: experimental native Q5_K head, 675430400 bytes
+strata generate: expert cache auto: 24.78 GiB free, 700 MiB reserved (+281 MiB for the draft head) -> 6400 slots
+strata generate: expert cache 8137 slots, 23.75 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 8137 of 8137 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 19 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.0)
+strata generate: sampling greedy
+strata generate: token graph hit path: 8137 resident experts, decided on the device
+strata generate: prompt chunk auto: 256 tokens
+strata generate: prompt path borrows 175 cache slots (0.51 GiB)
+strata mtp: draft head over 106299 tokens (275.7 MiB)
+strata generate: 175 lent slots refilled in 75.6 ms
+strata generate: prefill 18 tokens in 1 chunks, 1501.6 ms (12.0 tok/s); experts streamed 2109 (0 by DMA, host 314.8 ms), resident 1823; PLE 4.0 ms
+strata verify: window up to 6 tokens, 95.0 MiB of device buffers
+strata verify: captured the 1-token window (sync ok)
+strata verify: captured the 4-token window (sync ok)
+strata verify: captured the 2-token window (sync ok)
+strata verify: captured the 3-token window (sync ok)
+speculation              25 rounds of 6, drafts accepted 39 of 56 (0.696), 2.56 tokens per round
+window sizes             T1:4 T2:3 T3:1 T4:17 T5:0 T6:0  (min draft probability 0.50)
+suffix drafts            0 windows, drafts accepted 0 of 0
+accepted per round       0:7 1:6 2:3 3:9 4:0 5:0
+verify window            wait for rings 33.822  pool 143.807  host 0.513  commit 0.104 ms/round; CPU experts 8.15 distinct / 12.51 routed per layer
+file tier                9693 blobs assembled from the GGUF files while decoding (30395 MB, 1215.8 MB/round)
+host memory              74 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 18.210  quantize 0.165  down 11.713 ms/round; 41.0 GB/s over the rows phases; CPU pool call 143.789 ms/round
+dispatch                 plan 0.093  activation quantize 0.622  jobs 112.962  run 30.099 ms/round
+pcie experts             0.00 distinct experts per layer read over PCIe (share 141/256 of the misses)
+mtp                      9.470 ms/round drafting (24 rounds), MTP prompt 36.3 ms, 1111 MiB of VRAM
+prompt  : 248045 846 198 814 20139 303 2250 22157 3069 279 12515 369 6105 13 248046 198 248045 74455 198
+output  : 248068 198 760 1156 6587 264 61446 2250 1284 17834 15673 314 3069 279 12515 369 6105 13 353 1144 310 3311 25 37728 17498 11 12870 60845 69377 11 321 3069 6105 11352 80018 13 6558 728 1236 424 2708 11 12995 11 321 6681 2250 22157 13 198 248069 271 29108 4009 7701 4022 694 369 3404 1801 685 314 660 279
+decode                   64 tokens in 4878.9 ms  ->  13.12 tok/s
+prefill                  18 tokens in 1577.2 ms  ->  11.41 tok/s  (time to first token 1723.5 ms)
+logits dumped            <data>/records/2026-10-03-ud-setup/nd-off-6.logits

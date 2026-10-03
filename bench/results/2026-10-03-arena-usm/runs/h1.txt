@@ -1,0 +1,12 @@
+h1-iq2_xs-mmap-1 rc=0 decode                   128 tokens in 1809.1 ms  ->  70.75 tok/s
+h1-iq2_xs-usm-0.15-1 rc=0 decode                   128 tokens in 1758.3 ms  ->  72.80 tok/s
+h1-iq3_s-mmap-1 rc=0 decode                   128 tokens in 2085.2 ms  ->  61.38 tok/s
+h1-iq3_s-usm-0.15-1 rc=0 decode                   128 tokens in 2081.7 ms  ->  61.49 tok/s
+h1-iq2_xs-mmap-2 rc=0 decode                   128 tokens in 1813.9 ms  ->  70.57 tok/s
+h1-iq2_xs-usm-0.15-2 rc=0 decode                   128 tokens in 1768.6 ms  ->  72.38 tok/s
+h1-iq3_s-mmap-2 rc=0 decode                   128 tokens in 2086.9 ms  ->  61.33 tok/s
+h1-iq3_s-usm-0.15-2 rc=0 decode                   128 tokens in 2085.7 ms  ->  61.37 tok/s
+h1-iq2_xs-mmap-3 rc=0 decode                   128 tokens in 1926.6 ms  ->  66.44 tok/s
+h1-iq2_xs-usm-0.15-3 rc=0 decode                   128 tokens in 1766.8 ms  ->  72.45 tok/s
+h1-iq3_s-mmap-3 rc=0 decode                   128 tokens in 2086.0 ms  ->  61.36 tok/s
+h1-iq3_s-usm-0.15-3 rc=0 decode                   128 tokens in 2212.7 ms  ->  57.85 tok/s

@@ -1,0 +1,14 @@
+{
+  "CMakeLists.txt": "0efe088a2fadf39bd8d2392ed4ddc0be5ee15161e164f1d21279ebcc7f25f6c1",
+  "cmake/BUILD.json.in": "073b21f7e9d8d4aabf6026e75f59ad9179ea05688fcf96a31435e619137abe1d",
+  "include/strata/core/device.hpp": "804630e9bde4ce17df803a71dd417c171a1460e14fe48c528bdf7f6bd30fd8b7",
+  "include/strata/core/runtime.hpp": "f892782f08f55b6fa1a504d6b7d6eb2c617b9e6dc9d3ab9701b421a2f949de9c",
+  "include/strata/core/pinned.hpp": "4731a4c411aae60c8b6c36b0d3a4aef0ede1cd76936453aca42857995efbb676",
+  "include/strata/kernels/elementwise.hpp": "d5fe77891a17583653e30ec88d5f7aae3e98f23dbe871a2454c8ed383358c87b",
+  "src/core/device.cpp": "1f4190771c8529f280f134a2c25a5b34a4d02821eac9b03fc01c94d5aecf581b",
+  "src/core/pinned.cpp": "778ffbc61d59dc1b393453e78c2a2d3e034081866bbd990e5c569d98f6afb476",
+  "src/core/device_main.cpp": "7d4dff5da2fae9dad1a9a7bb7fb1c8bb78834909afcf843652a51ec0e5c98f22",
+  "src/core/load_main.cpp": "e7e254eb897620a738c6d7ba7fda2c4bc592ca4b25a3f514c61fb54c1d08203a",
+  "src/kernels/xe/elementwise.cpp": "b59c779b52f7f756d925d32b18b157bbc377dade5bc8433fe71e49bfd1e4dd73",
+  "src/kernels/elementwise_parity.cpp": "7a249070eccc9b3b2fbc67c5ddd8a1f48082e9803cb55284812d7e848ed6adf0"
+}

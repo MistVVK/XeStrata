@@ -1,0 +1,24 @@
+SGM 4 SGN 4 WGN 4 | N 1280 K 2560, 16 experts, 2904 rows (mean 182), 99 row tiles
+  oneMKL, one call per expert     430.0 us    44.3 TFLOP/s
+  grouped XMX, one launch         306.9 us    62.0 TFLOP/s
+  transposed XMX, one launch      591.0 us    32.2 TFLOP/s
+  max |transposed - oneMKL| 2.38e-06
+  max |grouped - oneMKL| 2.38e-06 (max |y| 4.35); max |grouped - CPU double| over 64 samples 5.15e-07
+SGM 4 SGN 4 WGN 8 | N 2560 K 640, 16 experts, 2904 rows (mean 182), 99 row tiles
+  oneMKL, one call per expert     258.9 us    36.8 TFLOP/s
+  grouped XMX, one launch         185.1 us    51.4 TFLOP/s
+  transposed XMX, one launch      336.3 us    28.3 TFLOP/s
+  max |transposed - oneMKL| 5.96e-07
+  max |grouped - oneMKL| 5.96e-07 (max |y| 2.23); max |grouped - CPU double| over 64 samples 1.36e-07
+SGM 4 SGN 4 WGN 4 | N 1280 K 2560, 16 experts, 2904 rows (mean 182), 99 row tiles
+  oneMKL, one call per expert     440.6 us    43.2 TFLOP/s
+  grouped XMX, one launch         306.0 us    62.2 TFLOP/s
+  transposed XMX, one launch      591.1 us    32.2 TFLOP/s
+  max |transposed - oneMKL| 2.38e-06
+  max |grouped - oneMKL| 2.38e-06 (max |y| 4.35); max |grouped - CPU double| over 64 samples 5.15e-07
+SGM 4 SGN 4 WGN 8 | N 2560 K 640, 16 experts, 2904 rows (mean 182), 99 row tiles
+  oneMKL, one call per expert     255.5 us    37.3 TFLOP/s
+  grouped XMX, one launch         191.2 us    49.8 TFLOP/s
+  transposed XMX, one launch      336.9 us    28.2 TFLOP/s
+  max |transposed - oneMKL| 5.96e-07
+  max |grouped - oneMKL| 5.96e-07 (max |y| 2.23); max |grouped - CPU double| over 64 samples 1.36e-07

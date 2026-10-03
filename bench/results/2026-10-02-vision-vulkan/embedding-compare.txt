@@ -1,0 +1,18 @@
+landscape        cap  300 sycl   vs cpu: shape same finite True max|d| 0.1073 relL2 0.0560 row relL2 median 0.0095 max 0.424  cos min 0.9177
+landscape        cap  300 vulkan vs cpu: shape same finite True max|d| 0.0411 relL2 0.0314 row relL2 median 0.0085 max 0.291  cos min 0.9741
+landscape        cap  300 vulkan vs sycl: max|d| 0.1311 relL2 0.0567
+landscape        cap  300 cpu run-to-run max|d| 0
+landscape        cap  300 sycl run-to-run max|d| 0
+landscape        cap  300 vulkan run-to-run max|d| 0
+portrait         cap  300 sycl   vs cpu: shape same finite True max|d| 0.0565 relL2 0.0296 row relL2 median 0.0077 max 0.321  cos min 0.9825
+portrait         cap  300 vulkan vs cpu: shape same finite True max|d| 0.0354 relL2 0.0243 row relL2 median 0.0089 max 0.214  cos min 0.9916
+portrait         cap  300 vulkan vs sycl: max|d| 0.0365 relL2 0.0230
+portrait         cap  300 cpu run-to-run max|d| 0
+portrait         cap  300 sycl run-to-run max|d| 0
+portrait         cap  300 vulkan run-to-run max|d| 0
+landscape-large  cap 1024 sycl   vs cpu: shape same finite True max|d| 0.0698 relL2 0.0406 row relL2 median 0.0230 max 0.554  cos min 0.9368
+landscape-large  cap 1024 vulkan vs cpu: shape same finite True max|d| 0.0330 relL2 0.0273 row relL2 median 0.0121 max 0.391  cos min 0.9615
+landscape-large  cap 1024 vulkan vs sycl: max|d| 0.1028 relL2 0.0412
+landscape-large  cap 1024 cpu run-to-run max|d| 0
+landscape-large  cap 1024 sycl run-to-run max|d| 0
+landscape-large  cap 1024 vulkan run-to-run max|d| 0

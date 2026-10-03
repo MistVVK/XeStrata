@@ -1,0 +1,37 @@
+{
+ "id": "chatcmpl-3181e10382644231a8da7ab6",
+ "object": "chat.completion",
+ "created": 1790747964,
+ "model": "swift-iq2_xs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": " HELLO 4172"
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 325,
+  "completion_tokens": 8,
+  "total_tokens": 333,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 325,
+  "prompt_ms": 1969.1,
+  "prompt_per_token_ms": 6.059,
+  "prompt_per_second": 165.1,
+  "predicted_n": 8,
+  "predicted_ms": 175.2,
+  "predicted_per_token_ms": 21.9,
+  "predicted_per_second": 45.7,
+  "draft_n": 6,
+  "draft_n_accepted": 6
+ }
+}

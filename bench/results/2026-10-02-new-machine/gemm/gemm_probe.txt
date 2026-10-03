@@ -1,0 +1,7 @@
+Intel(R) Graphics [0xe223]
+  gate/up 1280x2560  16 calls (today)                      314.2 us    53.4 TFLOP/s
+  gate/up 1280x2560  1 strided gemm_batch                  154.3 us   108.7 TFLOP/s
+  gate/up 1280x2560  1 big GEMM, same work (T x 16)        124.4 us   134.9 TFLOP/s
+  down 2560x640      16 calls (today)                      176.5 us    47.5 TFLOP/s
+  down 2560x640      1 strided gemm_batch                   84.6 us    99.1 TFLOP/s
+  down 2560x640      1 big GEMM, same work (T x 16)         68.6 us   122.3 TFLOP/s

@@ -1,0 +1,10 @@
+  S2/Q2_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [494.9, 9440]
+  S4/Q4_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-1.524e+04, 1.491e+04]
+  S4/IQ4_NL  128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-2.514e+05, 1.171e+05]
+  S8/Q8_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-1.885e+05, 1.493e+05]
+s_gemv: 4 type cases, 0 rows over tolerance (tol 1.0e-04)
+  S4/Q4_K    128 rows, 0 over tol, worst rel-to-terms 0.000e+00 (rel-to-result 0.000e+00)
+             ref spread [-6.365e+06, 1.949e+07], condition (sum|term|) up to 2.775e+07
+             CPU planes vs CPU raw block: max |diff| = 0.000e+00 -> the test is SELF-CONSISTENT
+s_gemv total: 0 rows over tolerance
+s_gemv_parity OK

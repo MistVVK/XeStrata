@@ -1,0 +1,36 @@
+  per-stream RMSNorm vs whole-stack        yes  (89.6091% apart, floor 5.000%)
+  /hc inside the silu vs outside           yes  (8.1439% apart, floor 5.000%)
+  SiLU on lo / sigmoid on gate, swapped    yes  (91.4869% apart, floor 5.000%)
+  mean over streams vs sum                 yes  (300.0000% apart, floor 50.000%)
+  BF16 vs FP32 activation contracts        yes  (0.1028% apart, floor 0.010%)
+
+  mixed vs reference                       worst 4.853e-08 (mean |ref| 0.2105)
+  inject vs reference                      rel 2.845e-08
+  FP32 activations vs reference: pass (mixed 6.068e-08, inject 9.954e-08)
+  restoring default activation contract: byte-identical
+  weight orientation is observable         yes (56.9% apart)
+  null w_inject writes nothing             yes
+  zero injection -> plain residual add     yes (worst rel 5.948e-08)
+  1*sigmoid vs 2*sigmoid is observable     yes (readings 50% apart, kernel within 4.35e-07)
+  every stream adds the same block output  yes (worst rel 1.070e-07)
+
+  real dims 2560/4/320 BF16 pass (mixed 8.385e-08, inject 1.986e-07)
+
+  real dims 2560/4/320 FP32 pass (mixed 1.812e-07, inject 3.613e-07)
+
+  real dims 2560/4/320 native pinned GR pass (mixed 1.704e-07, inject 1.757e-07)
+  scalar gamma 1.00000000 BF16 activation/capture pass (mixed 0.614394009, ref 0.614394009)
+  scalar final mixer BF16 pass
+  scalar gamma 1.00000000 FP32 activation/capture pass (mixed 0.614636600, ref 0.614636600)
+  scalar final mixer FP32 pass
+  scalar gamma 1.00000000 native pinned GR activation/capture pass (mixed 0.614636600, ref 0.614636600)
+  scalar final mixer native pinned GR pass
+  scalar gamma 1.00390625 BF16 activation/capture pass (mixed 0.616793990, ref 0.616793990)
+  scalar final mixer BF16 pass
+  scalar gamma 1.00390625 FP32 activation/capture pass (mixed 0.617553174, ref 0.617553174)
+  scalar final mixer FP32 pass
+  scalar gamma 1.00390625 native pinned GR activation/capture pass (mixed 0.617553174, ref 0.617553174)
+  scalar final mixer native pinned GR pass
+
+gr_read/gr_write: 0 failures
+gr_parity OK

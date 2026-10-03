@@ -1,0 +1,7 @@
+rows per expert: total 2904, max 363 (mean 182)
+  gate/up  16 calls (today)                            360.4 us    52.8 TFLOP/s (useful)
+  gate/up  group gemm_batch (16 groups, varying T)     411.9 us    46.2 TFLOP/s (useful)
+  gate/up  strided batch padded to max T               302.9 us    62.8 TFLOP/s (useful)
+  down     16 calls (today)                            159.2 us    59.8 TFLOP/s (useful)
+  down     group gemm_batch (16 groups, varying T)     165.2 us    57.6 TFLOP/s (useful)
+  down     strided batch padded to max T               169.2 us    56.3 TFLOP/s (useful)

@@ -1,0 +1,4 @@
+mode 1 seq 1: seen after 6.9 us
+mode 1: 2000/2000 round trips observed, worst answer->done 33.5 us
+mode 3 seq 1: seen after 562.6 us
+mode 3: 2000/2000 round trips observed, worst answer->done 562.6 us

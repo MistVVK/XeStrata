@@ -1,0 +1,15 @@
+The server started with an mmproj path that does not exist (the IQ2_XS vision config otherwise):
+
+server output:
+[strata] images are off: the vision encoder did not start: ERR cannot load the vision encoder <scratch>/vision/no-such-mmproj.gguf
+ready: http://127.0.0.1:8095/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 8192 tokens)
+
+GET /v1/status -> vision:
+{'enabled': True, 'available': False, 'error': 'the vision encoder did not start: ERR cannot load the vision encoder <scratch>/vision/no-such-mmproj.gguf'}
+
+POST /v1/chat/completions with the landscape image -> error:
+{"type": "invalid_request_error", "message": "images are unavailable: the vision encoder did not start: ERR cannot load the vision encoder <scratch>/vision/no-such-mmproj.gguf"}
+
+POST /v1/chat/completions with "Reply with the single word OK." (16 tokens) -> answered:
+{"content": null, "usage": {"prompt_tokens": 59, "completion_tokens": 16, "total_tokens": 75, "prompt_tokens_details": {"cached_tokens": 0}}}
+(content is empty because all 16 tokens were still reasoning)

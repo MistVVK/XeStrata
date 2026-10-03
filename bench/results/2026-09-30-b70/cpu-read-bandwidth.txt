@@ -1,0 +1,10 @@
+round 0  host USM             seq  37.70 GB/s   random-4K  37.61 GB/s
+round 0  mmap 4K (THP off)    seq  38.77 GB/s   random-4K  36.87 GB/s
+round 0  mmap THP (madvise)   seq  37.38 GB/s   random-4K  38.56 GB/s
+round 1  host USM             seq  37.65 GB/s   random-4K  36.56 GB/s
+round 1  mmap 4K (THP off)    seq  38.42 GB/s   random-4K  37.92 GB/s
+round 1  mmap THP (madvise)   seq  38.12 GB/s   random-4K  38.63 GB/s
+round 2  host USM             seq  37.88 GB/s   random-4K  37.42 GB/s
+round 2  mmap 4K (THP off)    seq  38.41 GB/s   random-4K  38.00 GB/s
+round 2  mmap THP (madvise)   seq  38.24 GB/s   random-4K  38.59 GB/s
+AnonHugePages:   8388608 kB

@@ -1,0 +1,80 @@
+== Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf  (1223 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 484, 'F32': 292, 'IQ3_S': 82, 'Q6_K': 71, 'IQ4_XS': 67, 'IQ4_NL': 58, 'Q4_K': 45, 'Q2_0': 38, 'IQ2_XS': 20, 'IQ2_S': 20, 'IQ2_XXS': 18, 'Q5_K': 15, 'IQ3_XXS': 12, 'F16': 1}
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 8 layers [1, 3, 6, 7, 11, 13, 16, 27]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'Q2_0'): 7 layers [8, 18, 20, 22, 23, 24, 33]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'Q2_0'): 6 layers [5, 9, 10, 14, 19, 25]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 6 layers [12, 15, 17, 21, 26, 40]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'IQ4_NL'): 6 layers [28, 30, 32, 34, 37, 43]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'IQ4_NL'): 4 layers [0, 2, 4, 39]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'IQ4_NL'): 4 layers [29, 38, 42, 46]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'IQ4_NL'): 3 layers [35, 44, 47]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'Q2_0'): 3 layers [36, 41, 45]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'IQ4_NL'): 1 layers [31]  gate shape 2560x640x512
+== Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf  (1223 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 484, 'F32': 292, 'Q6_K': 129, 'IQ4_NL': 86, 'Q4_K': 47, 'IQ4_XS': 45, 'IQ2_S': 40, 'Q5_K': 35, 'IQ3_XXS': 34, 'IQ3_S': 20, 'Q2_0': 9, 'F16': 1, 'Q8_0': 1}
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'IQ4_NL'): 15 layers [2, 3, 4, 5, 6, 9, 11, 15, 19, 23, 24, 26]...  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'IQ4_NL'): 14 layers [0, 7, 14, 16, 18, 22, 31, 33, 37, 38, 41, 42]...  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'IQ4_NL'): 9 layers [17, 25, 27, 28, 29, 35, 40, 44, 45]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 5 layers [1, 8, 10, 13, 36]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'Q2_0'): 3 layers [12, 20, 30]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'Q2_0'): 1 layers [21]  gate shape 2560x640x512
+   experts gate/up/down ('IQ4_XS', 'IQ4_XS', 'IQ4_NL'): 1 layers [47]  gate shape 2560x640x512
+== Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf  (1223 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 483, 'F32': 292, 'Q2_0': 202, 'Q3_K': 91, 'IQ4_XS': 56, 'Q4_K': 38, 'Q5_K': 16, 'Q4_0': 16, 'Q6_K': 12, 'Q5_0': 7, 'IQ4_NL': 7, 'Q8_0': 2, 'F16': 1}
+   experts gate/up/down ('Q2_0', 'Q2_0', 'Q2_0'): 48 layers [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]...  gate shape 2560x640x512
+== Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf  (1223 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 256, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 484, 'F32': 292, 'Q6_K': 129, 'IQ4_NL': 86, 'Q4_K': 47, 'IQ4_XS': 45, 'IQ2_S': 40, 'Q5_K': 35, 'IQ3_XXS': 34, 'IQ3_S': 20, 'Q2_0': 9, 'F16': 1, 'Q8_0': 1}
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'IQ4_NL'): 15 layers [2, 3, 4, 5, 6, 9, 11, 15, 19, 23, 24, 26]...  gate shape 2560x640x256
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'IQ4_NL'): 14 layers [0, 7, 14, 16, 18, 22, 31, 33, 37, 38, 41, 42]...  gate shape 2560x640x256
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'IQ4_NL'): 9 layers [17, 25, 27, 28, 29, 35, 40, 44, 45]  gate shape 2560x640x256
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 5 layers [1, 8, 10, 13, 36]  gate shape 2560x640x256
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'Q2_0'): 3 layers [12, 20, 30]  gate shape 2560x640x256
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'Q2_0'): 1 layers [21]  gate shape 2560x640x256
+   experts gate/up/down ('IQ4_XS', 'IQ4_XS', 'IQ4_NL'): 1 layers [47]  gate shape 2560x640x256
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf  (344 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'F32': 108, 'BF16': 107, 'Q2_0': 71, 'Q3_K': 21, 'IQ4_XS': 18, 'Q4_K': 6, 'Q5_K': 3, 'Q4_0': 3, 'IQ4_NL': 2, 'Q5_0': 2, 'Q6_K': 2, 'F16': 1}
+   experts gate/up/down ('Q2_0', 'Q2_0', 'Q2_0'): 13 layers [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]...  gate shape 2560x640x512
+   experts gate/up/down ('-', '-', 'Q2_0'): 1 layers [13]  gate shape ?
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf  (880 tensors)
+   meta: {}
+   types: {'F32': 280, 'BF16': 280, 'Q2_0': 131, 'Q3_K': 70, 'IQ4_XS': 38, 'Q4_K': 32, 'Q5_K': 13, 'Q4_0': 13, 'Q6_K': 10, 'IQ4_NL': 6, 'Q5_0': 5, 'Q8_0': 2}
+   experts gate/up/down ('Q2_0', 'Q2_0', 'Q2_0'): 34 layers [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]...  gate shape 2560x640x512
+   experts gate/up/down ('Q2_0', 'Q2_0', '-'): 1 layers [13]  gate shape 2560x640x512
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf  (342 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 108, 'F32': 108, 'IQ4_XS': 52, 'Q2_0': 16, 'IQ2_S': 14, 'IQ3_S': 12, 'IQ2_XXS': 10, 'IQ4_NL': 9, 'Q6_K': 8, 'Q8_0': 2, 'IQ1_M': 2, 'F16': 1}
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 7 layers [0, 2, 3, 5, 6, 7, 12]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 5 layers [1, 4, 9, 10, 11]  gate shape 2560x640x512
+   experts gate/up/down ('IQ1_M', 'IQ1_M', 'Q2_0'): 1 layers [8]  gate shape 2560x640x512
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf  (882 tensors)
+   meta: {}
+   types: {'F32': 280, 'BF16': 280, 'IQ4_XS': 129, 'IQ2_S': 54, 'Q2_0': 37, 'IQ3_S': 32, 'IQ4_NL': 28, 'Q6_K': 21, 'IQ2_XXS': 12, 'Q8_0': 5, 'IQ1_M': 4}
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 27 layers [15, 16, 17, 20, 21, 22, 23, 24, 25, 26, 28, 31]...  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 6 layers [14, 18, 19, 27, 29, 30]  gate shape 2560x640x512
+   experts gate/up/down ('IQ1_M', 'IQ1_M', 'Q2_0'): 2 layers [13, 37]  gate shape 2560x640x512
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf  (317 tensors)
+   meta: {'general.architecture': 'qwen4exp', 'qwen4exp.block_count': 48, 'qwen4exp.expert_count': 512, 'qwen4exp.expert_used_count': 10}
+   types: {'BF16': 100, 'F32': 100, 'IQ4_XS': 23, 'IQ3_S': 18, 'IQ4_NL': 13, 'IQ2_XS': 12, 'Q2_0': 12, 'Q4_K': 12, 'Q6_K': 11, 'IQ2_XXS': 10, 'Q5_K': 5, 'F16': 1}
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 5 layers [1, 3, 6, 7, 11]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'IQ4_NL'): 3 layers [0, 2, 4]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'Q2_0'): 3 layers [5, 9, 10]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'Q2_0'): 1 layers [8]  gate shape 2560x640x512
+== Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf  (907 tensors)
+   meta: {}
+   types: {'F32': 288, 'BF16': 288, 'IQ3_S': 64, 'Q6_K': 60, 'IQ4_NL': 46, 'IQ4_XS': 44, 'Q4_K': 33, 'Q2_0': 26, 'IQ2_S': 20, 'IQ3_XXS': 12, 'Q5_K': 10, 'IQ2_XXS': 8, 'IQ2_XS': 8}
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'Q2_0'): 6 layers [12, 15, 17, 21, 26, 40]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'Q2_0'): 6 layers [18, 20, 22, 23, 24, 33]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_S', 'IQ3_S', 'IQ4_NL'): 6 layers [28, 30, 32, 34, 37, 43]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_S', 'IQ2_S', 'IQ4_NL'): 4 layers [29, 38, 42, 46]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'Q2_0'): 3 layers [13, 16, 27]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'Q2_0'): 3 layers [14, 19, 25]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'IQ4_NL'): 3 layers [35, 44, 47]  gate shape 2560x640x512
+   experts gate/up/down ('IQ3_XXS', 'IQ3_XXS', 'Q2_0'): 3 layers [36, 41, 45]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XXS', 'IQ2_XXS', 'IQ4_NL'): 1 layers [31]  gate shape 2560x640x512
+   experts gate/up/down ('IQ2_XS', 'IQ2_XS', 'IQ4_NL'): 1 layers [39]  gate shape 2560x640x512
+(orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF: the range read returned HTTP 401 Unauthorized, so no header)

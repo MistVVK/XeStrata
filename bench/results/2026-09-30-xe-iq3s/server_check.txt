@@ -1,0 +1,6 @@
+1. stream: 64 chunks in 3.1 s: 'btractive RYB? User likely expects red, blue, yellow. Could mention depending on model. But asks three primary colors. Answer: red, blue, yellow. Maybe if light'
+2. cancelled after 8 chunks
+2. after the cancel: 2.4 s, usage {'prompt_tokens': 68, 'completion_tokens': 50, 'total_tokens': 118, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 3.2 s, usage {'prompt_tokens': 61, 'completion_tokens': 84, 'total_tokens': 145, 'prompt_tokens_details': {'cached_tokens': 0}}: 'Got it, Aiko. I’ll remember your name in this conversation.'
+3. turn 2: 1.7 s, usage {'prompt_tokens': 95, 'completion_tokens': 44, 'total_tokens': 139, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is Aiko.'
+3. turn 3: 1.9 s, usage {'prompt_tokens': 120, 'completion_tokens': 49, 'total_tokens': 169, 'prompt_tokens_details': {'cached_tokens': 90}}: 'okiA'

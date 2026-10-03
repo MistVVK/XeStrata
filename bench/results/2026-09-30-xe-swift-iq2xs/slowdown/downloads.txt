@@ -1,0 +1,16 @@
+done Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf 2026-09-30T12:49:46+09:00
+linked Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf -> Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+done Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf 2026-09-30T12:58:09+09:00
+linked Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf -> Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+done Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf 2026-09-30T13:13:00+09:00
+linked Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf -> Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+done Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf 2026-09-30T13:24:34+09:00
+linked Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf -> Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+done mmproj-Qwen3.8-Flash-Next-BF16.gguf 2026-09-30T13:24:50+09:00
+done mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf 2026-09-30T13:25:05+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf 2026-09-30T13:35:52+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf 2026-09-30T13:42:39+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf 2026-09-30T13:52:32+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf 2026-09-30T14:02:31+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf 2026-09-30T14:13:53+09:00
+done Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf 2026-09-30T14:20:37+09:00

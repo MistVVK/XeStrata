@@ -1,0 +1,16 @@
+Q6_K    K= 512  vs FP64 rel 5.01e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q6_K    K=4096  vs FP64 rel 5.74e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 7.3e-08  ok
+Q8_0    K= 512  vs FP64 rel 5.64e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q8_0    K=4096  vs FP64 rel 5.22e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 7.3e-08  ok
+Q4_K    K= 512  vs FP64 rel 5.12e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q4_K    K=4096  vs FP64 rel 6.46e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 7.5e-08  ok
+Q5_K    K= 512  vs FP64 rel 5.45e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q5_K    K=4096  vs FP64 rel 5.03e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 6.5e-08  ok
+Q4_0    K= 512  vs FP64 rel 7.91e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q4_0    K=4096  vs FP64 rel 1.16e-02   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 1.1e-07  ok
+Q5_0    K= 512  vs FP64 rel 1.06e-02   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q5_0    K=4096  vs FP64 rel 1.15e-02   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 1.0e-07  ok
+Q2_0    K= 512  vs FP64 rel 5.22e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+Q2_0    K=4096  vs FP64 rel 4.99e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 5.2e-08  ok
+IQ4_XS  K= 512  vs FP64 rel 5.66e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 0.0e+00  ok
+IQ4_XS  K=4096  vs FP64 rel 5.87e-03   ncols 2-8 exact-layout bit diffs 0   upstream-layout rel L1 5.6e-08  ok

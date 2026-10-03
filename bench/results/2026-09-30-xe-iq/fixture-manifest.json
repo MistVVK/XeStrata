@@ -1,0 +1,137 @@
+{
+  "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+  "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+  "rows_per_format": 32,
+  "formats": {
+    "IQ2_XXS": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.1.ffn_gate_exps.weight",
+      "type_id": 16,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 1791743648,
+      "raw_sha256": "02b509a336d571f02126bcce2391ba9722ea3bb0e7b4c9b6a317e320c2b12b17",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ2_XS": {
+      "file": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+      "tensor": "blk.0.ffn_gate_exps.weight",
+      "type_id": 17,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 1227833216,
+      "raw_sha256": "cc01eb2967ab9acab6fd1aa48e469989cc85ffa105b6c6da2df5bdf9c31a1505",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ2_S": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.0.ffn_gate_exps.weight",
+      "type_id": 22,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 957139232,
+      "raw_sha256": "1077fafb9ebf134d2c57c1f862106130df64c999c55a059a5382d3effa7871be",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ3_XXS": {
+      "file": "IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+      "tensor": "blk.35.ffn_gate_exps.weight",
+      "type_id": 18,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 33501048832,
+      "raw_sha256": "ff5db25fd41358ea73a2c2c246f201e2b00637788a0a12ccb347f02a3833e2fc",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ3_S": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.0.attn_gate.weight",
+      "type_id": 21,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 699603232,
+      "raw_sha256": "7c203834a3f3751f0cc4139c7d44e64c95671e2a7432440f89bf0aa6dca5fe52",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ1_M": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.8.ffn_gate_exps.weight",
+      "type_id": 29,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 7496734752,
+      "raw_sha256": "d4e7a75c4e4176f6b43f1db377cc73f4dd4affc92bbf5e5a9ebc08381bced691",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ4_NL": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.0.ffn_down_shexp.weight",
+      "type_id": 20,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 640,
+      "byte_offset": 956217632,
+      "raw_sha256": "39ec96517abcd5b53dadf5b9404859d3d2656e7a7d17e71239f7a2b30de948e5",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "IQ4_XS": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "output.weight",
+      "type_id": 23,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 11024672,
+      "raw_sha256": "b730240fb3811d0c1431b001f2d6362302bb041aaea914f8feced25d9846617e",
+      "reference": "gguf-py quants.dequantize"
+    },
+    "Q2_0": {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "tensor": "blk.0.ffn_down_exps.weight",
+      "type_id": 42,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 640,
+      "byte_offset": 720288032,
+      "raw_sha256": "c115ea2e960ef0fe4d16df537b72a02d8f72edf4cd9dd3c8d0b1226916c0df93",
+      "reference": "definition mirrored from ggml dequantize_row_q2_0"
+    },
+    "Q3_K": {
+      "file": "Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf",
+      "tensor": "token_embd.weight",
+      "type_id": 11,
+      "rows": [
+        0,
+        32
+      ],
+      "cols": 2560,
+      "byte_offset": 461216032,
+      "raw_sha256": "455f1926992c8bb86a9ce772689f4fe9cddf33417cfda4ec283b0b3ba2f2e836",
+      "reference": "gguf-py quants.dequantize"
+    }
+  }
+}

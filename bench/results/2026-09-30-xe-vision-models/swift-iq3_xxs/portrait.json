@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-c4e5b3e57bb84ae7a66aca1a",
+ "object": "chat.completion",
+ "created": 1790748120,
+ "model": "swift-iq3_xxs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content. Let me carefully examine the image.\n\nLooking at the image, I see two main elements. There's a geometric shape at the top and text at the bottom.\n\nThe shape: It's a triangle. The triangle is filled with a solid green color. It appears"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 291,
+  "completion_tokens": 64,
+  "total_tokens": 355,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 291,
+  "prompt_ms": 2402.6,
+  "prompt_per_token_ms": 8.256,
+  "prompt_per_second": 121.1,
+  "predicted_n": 64,
+  "predicted_ms": 1517.5,
+  "predicted_per_token_ms": 23.711,
+  "predicted_per_second": 42.2,
+  "draft_n": 59,
+  "draft_n_accepted": 41
+ }
+}

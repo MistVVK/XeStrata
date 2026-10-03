@@ -1,0 +1,11 @@
+IQ2_XXS  type 16   32 x  2560  dequant rel 0.00e+00  mmvq rel 5.58e-03  ok
+IQ2_XS   type 17   32 x  2560  dequant rel 0.00e+00  mmvq rel 4.43e-03  ok
+IQ2_S    type 22   32 x  2560  dequant rel 0.00e+00  mmvq rel 4.80e-03  ok
+IQ3_XXS  type 18   32 x  2560  dequant rel 0.00e+00  mmvq rel 4.22e-03  ok
+IQ3_S    type 21   32 x  2560  dequant rel 0.00e+00  mmvq rel 4.83e-03  ok
+IQ1_M    type 29   32 x  2560  dequant rel 0.00e+00  mmvq rel 5.82e-03  ok
+IQ4_NL   type 20   32 x   640  dequant rel 0.00e+00  mmvq rel 5.70e-03  ok
+IQ4_XS   type 23   32 x  2560  dequant rel 0.00e+00  mmvq rel 4.86e-03  ok
+Q2_0     type 42   32 x   640  dequant rel 0.00e+00  mmvq rel 5.73e-03  ok
+Q3_K     type 11   32 x  2560  dequant rel 0.00e+00  mmvq rel 5.66e-03  ok
+iq_parity: 0 failures

@@ -1,0 +1,20 @@
+  random normal              blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  small magnitude (1e-6)     blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  all zero                   blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  exact .5 boundaries        blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  one extreme per block      blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+
+quantize_q8_0: 0 failures over 5 distributions x 131072 elements
+  f32->f16 overflow saturates, not NaN         yes (0 of 11 wrong)
+  f16->f32 keeps subnormals                    yes (0x0001 -> 5.96046448e-08, want 2^-24)
+
+Q8_K  (ggml block_q8_K: 292 bytes / 256 elements, {f32 d; i8 qs[256]; i16 bsums[16]})
+  random normal              blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  small magnitude (1e-7)     blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  all zero                   blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+  exact .5 ties (half-to-even) blocks byte-exact (0 bad bytes)   round trip bit-exact (0 differ)
+    tie fixture discriminates 522240 ties, 260096 where half-to-even != half-away (49.8%)
+  -127 vs -128 scale observable yes  (0.915% of magnitude, 172016 bytes differ)
+
+quantize_act: 0 failures over 5 Q8_0 + 4 Q8_K distributions
+quantize_act_parity OK

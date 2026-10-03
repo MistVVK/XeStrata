@@ -1,0 +1,2 @@
+aspect queue_profiling_tag 1
+graph: Profiling information is unavailable for events returned from a submission to a queue in the recording state.

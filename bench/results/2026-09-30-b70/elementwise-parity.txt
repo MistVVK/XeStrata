@@ -1,0 +1,17 @@
+  the fixture crosses the branch               yes (16 above 20, 5 above 88)
+  the fixture's ssm_a is negative              yes (0 of 48 non-negative)
+  gdn_gate vs the reference                    rel 2.515e-08
+  the softplus large-x branch is observable    yes (inf% apart, 4 non-finite, 4 heads differ, first at x = 94.5)
+  exp(gate) < 1 for every head                 yes (0 of 48 not < 1)
+
+  silu vs the double reference                 rel 3.504e-08
+  scale_inplace is exact                       0 of 1024 differ
+  f32_to_f16_bulk uses the shared conversion   0 of 1024 differ
+  sum-vs-mean is observable                    89.36% apart
+  with-w-vs-without-w is observable            70.20% apart
+  rms_norm_weighted vs f64 oracle              rel 3.630e-08  worst 1.660e-07  nonfinite 0
+  a null weight is legal                       0 of 6144 differ
+  embedding gather: 108 row cases, 0 bit mismatches, 0 guard failures, 8141 FMA differences
+
+elementwise: 0 failures
+elementwise_parity OK

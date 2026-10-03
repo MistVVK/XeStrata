@@ -1,0 +1,58 @@
+Strata - Qwen3.8-Flash-Next on a normal PC (Intel Arc Pro B70 + system RAM + CPU)
+
+=== Step 1: checking your PC ===
+  [ok] GPU: Intel Arc Pro B70, 32 GB VRAM, PCI 0000:0a:00.0, PCIe link 16.0 GT/s PCIe x8
+  [ok] RAM: 92 GB
+  [ok] CPU: AMD Ryzen 7 3800XT 8-Core Processor (AVX2)
+
+=== Step 2: your choices ===
+  [ok] model: Qwen3.8-Flash-Next
+
+  1) Q2_0     2-bit, the fastest; download 66 GB, uses ~34 GB of RAM
+  2) IQ2_XS   2-bit i-quant, a little better quality, close in speed; download 68 GB, uses ~36 GB of RAM
+  3) IQ3_XXS  3-bit i-quant, better quality, slower (more CPU work per token); download 76 GB, uses ~43 GB of RAM
+  4) IQ3_S    3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running; download 84 GB, uses ~50 GB of RAM
+  [ok] size: IQ2_XS
+  [ok] context: 8192 tokens
+  [ok] images: on (encoder on the CPU)
+
+  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).
+  It changes how the model answers: its package describes it as a refusal-direction projection (the
+  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it off
+  per chat. Details: data/experimental-speed-projection/README.md
+  [ok] experimental speed projection: off
+
+=== Step 3: Python packages ===
+  [ok] numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil already installed
+
+=== Step 4: the Strata engine ===
+  [ok] llama.cpp 3cf0325 (gguf-py, ggml, mtmd)
+  [ok] build tools present (Intel oneAPI DPC++, oneMKL, g++)
+  Compiling the Strata engine for the B70 (20-40 minutes, once) ...
+  > /usr/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja -S <repo> -B <repo>/build-xe -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=icpx -DCMAKE_C_COMPILER=icx -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_GGML_DIR=<repo>/third_party/llama.cpp
+  > /usr/bin/cmake --build <repo>/build-xe --target strata -j 7
+  Compiling the image encoder for the CPU ...
+  > /usr/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja -S <repo>/tools/vision -B <repo>/build-vision-cpu -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=<repo>/third_party/llama.cpp
+CMAKE_BUILD_TYPE=Release
+  > /usr/bin/cmake --build <repo>/build-vision-cpu --target strata-vision -j 7
+  [ok] engine compiled: <repo>/engine/strata
+  [ok] engine: <repo>/engine/strata
+
+=== Step 5: downloading Qwen3.8-Flash-Next IQ2_XS ===
+  [ok] model files present
+  [ok] vision encoder already downloaded
+  [ok] vision encoder: <data>/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf
+
+=== Step 6: preparing the model for Strata ===
+  [ok] model prepared: <data>/packs/iq2_xs
+  [ok] MTP draft layer: <data>/mtp/rt
+
+=== Step 7: writing the start script ===
+  [ok] start script: run-iq2_xs.sh
+
+All set.
+  API (OpenAI):     http://127.0.0.1:8080/v1   (any API key; model name: anything)
+  API (Anthropic):  http://127.0.0.1:8080/v1/messages
+  Next time:        just run ./setup.sh (or run-iq2_xs.sh) - it starts right away
+  Images:           send them in the chat page, in chat.py (/image <path>) or over the API
+setup rc=0

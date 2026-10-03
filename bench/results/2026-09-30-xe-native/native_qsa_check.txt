@@ -1,0 +1,43 @@
+  rms_norm_weighted cols=256 vs ggml-cpu       2482/6144 bits differ, max |d| 2.384e-07, rel to scale 1.123e-07 (scale 2.123e+00)
+  rms_norm_weighted cols=256 in place vs out of place 0/6144 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 2.123e+00)
+  rms_norm_weighted cols=128 vs ggml-cpu       712/3072 bits differ, max |d| 3.576e-07, rel to scale 1.808e-07 (scale 1.978e+00)
+  rms_norm_weighted cols=128 in place vs out of place 0/3072 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 1.978e+00)
+  rms_norm_weighted cols=2560 vs ggml-cpu      21505/61440 bits differ, max |d| 4.768e-07, rel to scale 1.503e-07 (scale 3.172e+00)
+  rms_norm_weighted cols=2560 in place vs out of place 0/61440 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 3.172e+00)
+  gate_apply vs ggml-cpu                       1579/6144 bits differ, max |d| 4.768e-07, rel to scale 1.422e-07 (scale 3.353e+00)
+  score n=1 bias=0 vs ggml-cpu (unmasked)      0/1 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 0.000e+00)
+  score n=1 bias=0 vs FP64 (unmasked)          0/1 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 0.000e+00)
+    partial block carries the +1e9 mask        yes
+  score n=1 bias=1 vs ggml-cpu (unmasked)      0/1 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 0.000e+00)
+  score n=1 bias=1 vs FP64 (unmasked)          0/1 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 0.000e+00)
+    partial block carries the +1e9 mask        yes
+  score n=7 bias=0 vs ggml-cpu (unmasked)      4/7 bits differ, max |d| 5.960e-08, rel to scale 6.639e-08 (scale 8.977e-01)
+  score n=7 bias=0 vs FP64 (unmasked)          4/7 bits differ, max |d| 5.960e-08, rel to scale 6.639e-08 (scale 8.977e-01)
+    partial block carries the +1e9 mask        yes
+  score n=7 bias=1 vs ggml-cpu (unmasked)      0/7 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 1.204e+00)
+  score n=7 bias=1 vs FP64 (unmasked)          0/7 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 1.204e+00)
+    partial block carries the +1e9 mask        yes
+  score n=400 bias=0 vs ggml-cpu (unmasked)    320/400 bits differ, max |d| 9.537e-07, rel to scale 1.989e-07 (scale 4.794e+00)
+  score n=400 bias=0 vs FP64 (unmasked)        300/400 bits differ, max |d| 9.537e-07, rel to scale 1.989e-07 (scale 4.794e+00)
+  score n=400 bias=1 vs ggml-cpu (unmasked)    264/400 bits differ, max |d| 9.537e-07, rel to scale 1.607e-07 (scale 5.934e+00)
+  score n=400 bias=1 vs FP64 (unmasked)        300/400 bits differ, max |d| 9.537e-07, rel to scale 1.607e-07 (scale 5.934e+00)
+  score n=2051 bias=0 vs ggml-cpu (unmasked)   1524/2051 bits differ, max |d| 1.431e-06, rel to scale 1.766e-07 (scale 8.102e+00)
+  score n=2051 bias=0 vs FP64 (unmasked)       1508/2051 bits differ, max |d| 1.431e-06, rel to scale 1.766e-07 (scale 8.102e+00)
+    partial block carries the +1e9 mask        yes
+  score n=2051 bias=1 vs ggml-cpu (unmasked)   1368/2051 bits differ, max |d| 1.431e-06, rel to scale 1.807e-07 (scale 7.915e+00)
+  score n=2051 bias=1 vs FP64 (unmasked)       1432/2051 bits differ, max |d| 1.192e-06, rel to scale 1.506e-07 (scale 7.915e+00)
+    partial block carries the +1e9 mask        yes
+  score n=9001 bias=0 vs ggml-cpu (unmasked)   6944/9001 bits differ, max |d| 1.907e-06, rel to scale 2.756e-07 (scale 6.920e+00)
+  score n=9001 bias=0 vs FP64 (unmasked)       6896/9001 bits differ, max |d| 1.431e-06, rel to scale 2.067e-07 (scale 6.920e+00)
+    partial block carries the +1e9 mask        yes
+  score n=9001 bias=1 vs ggml-cpu (unmasked)   6252/9001 bits differ, max |d| 1.907e-06, rel to scale 2.301e-07 (scale 8.288e+00)
+  score n=9001 bias=1 vs FP64 (unmasked)       6688/9001 bits differ, max |d| 1.907e-06, rel to scale 2.301e-07 (scale 8.288e+00)
+    partial block carries the +1e9 mask        yes
+  indexer single appends: pooled vs FP64       668/1280 bits differ, max |d| 5.066e-07, rel to scale 2.406e-07 (scale 2.106e+00)
+  indexer batch in chunks of 37 vs single      0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+  indexer batch in chunks of 1 vs single       0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+  indexer batch in chunks of 3 vs single       0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+  indexer batch in chunks of 4 vs single       0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+  indexer batch in chunks of 5 vs single       0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+  indexer batch in chunks of 16 vs single      0/2561 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.000e+01)
+native_qsa_check: 0 failures (criteria: norm and gate within 1e-6 of ggml-cpu, in-place norm bitwise; unmasked scores within 1e-5 of ggml-cpu and FP64 with the partial-block mask present; pooled keys within 1e-5 of FP64; every batch chunking bitwise equal to single appends; all relative to scale)

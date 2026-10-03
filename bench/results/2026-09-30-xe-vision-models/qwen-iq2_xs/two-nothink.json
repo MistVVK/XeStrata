@@ -1,0 +1,37 @@
+{
+ "id": "chatcmpl-1a2af9237f9e41e181defc82",
+ "object": "chat.completion",
+ "created": 1790748324,
+ "model": "qwen3.8-flash-next-iq2_xs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "Here are descriptions of the two images, each in one sentence:\n\n- The first image displays a red circle next to a blue square, with the text \"HELLO 4172\" written below them.\n- The second image features a green triangle positioned above the word \"PELICAN\"."
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 546,
+  "completion_tokens": 63,
+  "total_tokens": 609,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 546,
+  "prompt_ms": 2472.1,
+  "prompt_per_token_ms": 4.528,
+  "prompt_per_second": 220.9,
+  "predicted_n": 63,
+  "predicted_ms": 1547.6,
+  "predicted_per_token_ms": 24.565,
+  "predicted_per_second": 40.7,
+  "draft_n": 59,
+  "draft_n_accepted": 43
+ }
+}

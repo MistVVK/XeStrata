@@ -1,0 +1,6 @@
+unregistered mmap      14.11 GB/s over 51.0 GB
+registration took 1.20 s
+registered mmap        14.41 GB/s over 51.0 GB
+registered mmap        14.41 GB/s over 51.0 GB
+VmLck:	       0 kB
+VmPin:	       0 kB

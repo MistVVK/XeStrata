@@ -1,0 +1,6 @@
+  rope table vs float64 reference   bit-exact (0 of 2048 entries differ, worst 0.0e+00)
+  rope rotation vs host reference   agrees (0 of 49152 over 1e-6, worst rel 0.000e+00)
+  pairing: dim 0 set -> NEOX moves dim 32 (o[half]=0.656987), adjacent would move dim 1 (o[1]=0.000000)   NEOX confirmed
+
+rope: 0 failures
+rope_parity OK

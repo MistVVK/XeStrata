@@ -1,0 +1,8 @@
+
+
+The user wants a description of the image content. I need to identify the text and the shapes/colors present.
+
+Looking at the image: there's a red circle on the left, a blue square on the right, and black text below reading "HELLO 4172".
+
+I should provide a
+

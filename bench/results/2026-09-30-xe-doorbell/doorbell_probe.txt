@@ -1,0 +1,2 @@
+direct: 2000 round trips, 0 payload errors; launch->ring seen median 7.0 us p99 11.8; answer->done median 5.7 us p99 7.0
+graph: 2000 replays, 0 payload errors; launch->ring seen median 8.6 us p99 9.5

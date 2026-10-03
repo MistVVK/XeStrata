@@ -1,0 +1,13 @@
+  silu-on-gate vs silu-on-up is observable yes (100.00% apart)
+  structure vs reference                   worst rel 3.461e-04 over 256 outputs (mean |ref| 4716.8804)
+  the fixture's SwiGLU stays in fp16 range yes (max |h| 677.2, fp16 max 65504)
+  native shared scalar gate: pass (ref rel 0.000e+00, BF16 separation 1.048e-03, missing input refused)
+  native shared captured selection: byte-identical
+  restored shared default: byte-identical
+  routed sum left UNWEIGHTED is observable   yes  (92.39% apart)
+  shared output router-WEIGHTED is observable yes  (84.60% apart)
+  moe_combine vs reference                   rel 0.000e+00
+  a null `shared` is observable              yes (98.62% apart - null shared really omits it)
+
+shared_expert: 0 failures
+shared_expert_parity OK

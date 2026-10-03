@@ -1,0 +1,187 @@
+qsa_parity: n_head 24  n_head_kv 2  head_dim 256  indexer 4x128 r=4 top_k 2048  page (from the shapes) 4   [sparse]
+
+  the fixture's r is the artifact's IDX_BLOCK      ok     r = 4
+  f32->f16 matches numpy's float16 on every vector ok     395 vectors, 125 subnormal
+  f16->f32 is exact on all 65,536 bit patterns     ok     0 wrong
+  kv_append at page_size 1: the pool is BIT-EXACT  ok     0 of 563200 bits wrong
+    the page table is observable at page_size 1    yes    99.99% apart (linear vs declared)
+    kv_gather is BIT-EXACT at page_size 1          ok     0 wrong bits
+  kv_append at page_size 4: the pool is BIT-EXACT  ok     0 of 563200 bits wrong
+    the page table is observable at page_size 4    yes    100.00% apart (linear vs declared)
+    head-major-in-page is observable at page_size 4 yes    74.99% apart (cell-major vs head-major)
+    kv_gather is BIT-EXACT at page_size 4          ok     0 wrong bits
+  kv_append at page_size 512: the pool is BIT-EXACT ok     0 of 563200 bits wrong
+    the page table is observable at page_size 512  yes    99.91% apart (linear vs declared)
+    head-major-in-page is observable at page_size 512 yes    99.76% apart (cell-major vs head-major)
+    kv_gather is BIT-EXACT at page_size 512        ok     0 wrong bits
+  the spare slot's key (rms_norm of cell 0) is BIT-EXACT ok     0 of 128 wrong
+  the spare slot is at row n_bid and nowhere else  ok     10 cells / r=4 -> 2 complete blocks
+  pooled block keys vs the reference               rel/|rope terms| 1.418e-07
+  the incomplete tail is NOT pooled into the spare slot yes    132.46% apart
+  rotating at the block's LAST cell is observable  yes    10.19% apart
+  norm-then-pool vs pool-then-norm is observable   yes    50.78% apart
+  the spare key from the LAST raw key is observable yes    46.03% apart
+  rotating the RAW indexer keys is observable      yes    27.92% apart
+  the rotation's POSITION BASE (pos_base) is observable yes    20.39% apart
+  the 1/r divisor IS observable in the RAW pooled value yes    300.00% apart (sum vs mean, before any norm)
+  the same divisor AFTER the norm                       1.569e-09  <-- below EVERY score tolerance; the divisor cannot be
+                                                        checked downstream at all, which is why the raw value is the
+                                                        only place the mean/sum question is answerable.
+  indexer cell scores vs the reference             rel/Sum|terms| 9.108e-09
+  cells of one block share its score (0..3)        ok     
+  cells 8,9 (the tail) take the SPARE slot's score, not block 1's ok     got[8] == got[9] != got[7]
+  relu PER HEAD vs relu(sum of heads) is observable yes    29.71% apart
+  dropping the relu is observable                  yes    29.71% apart
+  dropping the per-block bias is observable        yes    49.63% apart
+  tail static n=1                                  ok     
+  tail captured n=1                                ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2                                  ok     
+  tail captured n=2                                ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=3                                  ok     
+  tail captured n=3                                ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=4                                  ok     
+  tail captured n=4                                ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=511                                ok     
+  tail captured n=511                              ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=512                                ok     
+  tail captured n=512                              ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=513                                ok     
+  tail captured n=513                              ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2046                               ok     
+  tail captured n=2046                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2047                               ok     
+  tail captured n=2047                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2048                               ok     
+  tail captured n=2048                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2049                               ok     
+  tail captured n=2049                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2050                               ok     
+  tail captured n=2050                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2051                               ok     
+  tail captured n=2051                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2052                               ok     
+  tail captured n=2052                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2053                               ok     
+  tail captured n=2053                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2054                               ok     
+  tail captured n=2054                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2055                               ok     
+  tail captured n=2055                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2056                               ok     
+  tail captured n=2056                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2057                               ok     
+  tail captured n=2057                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2058                               ok     
+  tail captured n=2058                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2059                               ok     
+  tail captured n=2059                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=2060                               ok     
+  tail captured n=2060                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=4095                               ok     
+  tail captured n=4095                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=4096                               ok     
+  tail captured n=4096                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=4097                               ok     
+  tail captured n=4097                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=8191                               ok     
+  tail captured n=8191                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=8192                               ok     
+  tail captured n=8192                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=8193                               ok     
+  tail captured n=8193                             ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=20477                              ok     
+  tail captured n=20477                            ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=20478                              ok     
+  tail captured n=20478                            ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=20479                              ok     
+  tail captured n=20479                            ok     
+    only incomplete cells receive the bias         ok     
+  tail static n=20480                              ok     
+  tail captured n=20480                            ok     
+    only incomplete cells receive the bias         ok     
+  topk_512 n_kv = 1                                ok     1 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 7 (random)                       ok     7 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 2048 (the plan's threshold)      ok     2048 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 2051 (the reference's own bound) ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 2052 (two past the plan's number) ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 5000 (random)                    ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 32768 (= kTopkMaxCells)          ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 with 2052 EQUAL scores (every cell ties) ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 with a 100-cell tie straddling the cut  ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+  topk_512 n_kv = 2048 selects every cell (identity) ok     2048 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+    ...and it really is 0,1,2,...                  ok     
+  topk_512 n_kv = 2051 selects every cell (identity) ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+    ...and it really is 0,1,2,...                  ok     
+  topk_512 n_kv = 2052 is NOT the identity         ok     2051 ids, width = min(n_kv, top_k + r - 1)
+    ...ascending and unique                        ok     
+    ...exactly one cell is dropped, and it is the smallest score ok     1 dropped
+  with every cell selected the loud cell dominates its head 0 yes    out[0][0] = 9.8800
+  with the loud cell unselected it contributes EXACTLY nothing ok     out[0][0] = 1.000000
+  the returned weights sum to 1 per head           max |1 - sum| 1.455e-08
+  q % 2 vs q / 12 for the kv head is observable    yes    81.62% apart
+    (the scale trap is measured on the random fixture) --     this fixture's softmax is saturated
+  attending to the unselected cell is observable   yes    81.62% apart
+  the selected set matches the reference (2100 cells, width 2051) ok     2051 ids
+  the cut                                               THE CUT IS A TIE at 0.000000: 87 selected, 49 rejected
+    ...and the kernel picks the same ones as the reference ok     
+  qsa_attend vs the reference on the SAME fp16 cache rel 8.931e-07
+  omitting 1/sqrt(head_dim) is observable (random fixture) yes    2347.06% apart
+  the fp16 KV cache's OWN cost (f32 keys vs fp16 keys) rel 2.991e-04
+  the returned weights vs the reference (head 0)   rel 2.814e-07
+  qsa_gate_apply vs the double reference           rel (f16 out quant ~2.4e-4) 1.784e-04
+  fp16 gate bits differing from the reference           0 of 6144 (CUDA's double exp vs libm's, in the last bits)
+  the gate from the FIRST half is observable       yes    71.94% apart
+  silu instead of sigmoid on the QSA gate is observable yes    128.41% apart
+  below the bound, dense and sparse are the SAME selection ok     
+  dense differs from sparse at n_kv = 2100 (> 2051) yes    14.62% apart
+  an EMPTY selection gives a zero attention, not a NaN ok     all 6144 elements zero
+
+-- indexer_key_append under graph capture
+  the pooled kernel is capturable              1 nodes for one call
+  the first block's row survives replay B      128 of 128 unchanged
+  the SECOND block's row arrives through the same graph 128 of 128 non-zero
+  the two pooled rows are different keys       128 of 128 differ
+
+qsa: 0 failures
+qsa_parity OK

@@ -1,0 +1,44 @@
+strata generate: PCIe probe: 42.2 GB/s host->device -> pcie_frac 0.55 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/swift-iq2_xs experts (largest blob 1.51 MB), token embedding type 23 in mapped host memory (322 MiB)
+strata generate: 1466 MiB of weights loaded from <data>/packs/swift-iq2_xs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1474.85 MiB of weights
+strata generate: PLE on, table 320001536 rows of <data>/models/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
+strata mtp: draft layer loaded, 799 MiB of VRAM (experts 675, dense 111), files read in 0.91 s (861 MiB/s)
+strata generate: expert arena: one mapping registered for device copies; transparent huge pages requested (madvise); no mlock
+strata generate: loaded 33.02 GiB at 4.30 GiB/s
+strata generate: profile <repo>/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: experimental native Q5_K head, 337715200 bytes
+strata generate: expert cache auto: 26.94 GiB free, 700 MiB reserved -> 18668 slots
+strata generate: expert cache 19544 slots, 26.26 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 19544 of 19544 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 19 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.0)
+strata generate: sampling greedy
+strata generate: token graph hit path: 19544 resident experts, decided on the device
+strata generate: prompt path borrows 176 cache slots (0.24 GiB)
+strata mtp: draft head over 40525 tokens (52.6 MiB)
+strata generate: 176 lent slots refilled in 7.2 ms
+strata generate: prefill 19 tokens in 1 chunks, 507.7 ms (37.4 tok/s); experts streamed 282 (282 by DMA, host 7.4 ms), resident 3810; PLE 2.3 ms
+strata verify: window up to 6 tokens, 56.4 MiB of device buffers
+strata verify: captured the 1-token window (sync ok)
+strata verify: captured the 4-token window (sync ok)
+strata verify: captured the 6-token window (sync ok)
+speculation              46 rounds of 6, drafts accepted 83 of 137 (0.606), 2.80 tokens per round
+suffix drafts            1 windows, drafts accepted 2 of 5
+accepted per round       0:11 1:8 2:6 3:21 4:0 5:0
+verify window            wait for rings 50.941  pool 2.246  host 0.422  commit 1.322 ms/round; CPU experts 0.84 distinct / 1.16 routed per layer
+host memory              60 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 1.047  quantize 0.015  down 0.478 ms/round; 37.5 GB/s over the rows phases; CPU pool call 2.243 ms/round
+dispatch                 plan 0.075  activation quantize 0.363  jobs 0.260  run 1.542 ms/round
+pcie experts             0.00 distinct experts per layer read over PCIe (share 141/256 of the misses)
+mtp                      4.916 ms/round drafting (45 rounds), MTP prompt 21.6 ms, 852 MiB of VRAM
+prompt  : 248045 846 198 60 1156 6587 264 3063 3818 911 279 12515 369 6105 13 248046 198 248045 74455 198
+output  : 248068 198 760 1156 579 1876 369 4847 7132 36412 321 23644 13 6558 728 1380 310 4563 424 25 271 1293 1156 6587 264 3063 3818 911 279 12515 369 6105 1149 271 1919 4816 1040 264 492 24995 11316 13 6558 728 1380 310 13792 424 25 271 12 328 846 6587 264 3063 1 471 6587 310 3063 198 12 328 48041 911 1 471 4590 3818 30 198 12 328 1719 12515 369 6105 1 471 264 4952 883 279 12515 271 2064 579 524 264 2708 3296 466 1622 13 1049 4816 1040 264 4055 11 30656 704 908 11316 13 353 1220 5707 77980 11 23868 279 1876 11 321 2466 364 61535 2394 279 1622 369 23644 13 198 248069 271
+decode                   128 tokens in 2962.9 ms  ->  43.20 tok/s
+prefill                  19 tokens in 515.0 ms  ->  36.90 tok/s  (time to first token 570.1 ms)

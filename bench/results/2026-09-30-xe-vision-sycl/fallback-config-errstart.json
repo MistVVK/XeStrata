@@ -1,0 +1,58 @@
+{
+ "exe": "<repo>/build/xe/strata",
+ "args": [
+  "--pack",
+  "<data>/packs/iq2_xs",
+  "--native",
+  "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+  "--expert-profile",
+  "<repo>/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--mtp",
+  "<data>/mtp/rt",
+  "--max-context",
+  "8192",
+  "--vision",
+  "--vram-reserve-mib",
+  "700"
+ ],
+ "cwd": "<repo>",
+ "tokenizer": "<data>/packs/iq2_xs/tokenizer",
+ "model_name": "qwen3.8-flash-next-iq2_xs",
+ "log": "<scratch>/fb/engine.log",
+ "lib_dirs": [
+  "/opt/intel/oneapi/tcm/1.5/lib",
+  "/opt/intel/oneapi/umf/1.1/lib",
+  "/opt/intel/oneapi/tcm/1.5/env/../lib",
+  "/opt/intel/oneapi/tbb/2023.1/env/../lib/intel64/gcc4.8",
+  "/opt/intel/oneapi/mkl/2026.1/lib",
+  "/opt/intel/oneapi/dnnl/2026.0/lib",
+  "/opt/intel/oneapi/debugger/2026.1/opt/debugger/lib",
+  "/opt/intel/oneapi/compiler/2026.1/opt/compiler/lib",
+  "/opt/intel/oneapi/compiler/2026.1/lib"
+ ],
+ "port": 8080,
+ "vision": {
+  "mmproj": "<data>/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "exe": "<repo>/bench/results/2026-09-30-xe-vision-cpu/failures/enc_err_start.sh",
+  "gpu": true,
+  "max_tokens": 1024,
+  "onednn": false,
+  "fallback": {
+   "exe": "<repo>/engine/strata-vision-cpu",
+   "gpu": false,
+   "max_tokens": 300,
+   "threads": 8
+  }
+ }
+}

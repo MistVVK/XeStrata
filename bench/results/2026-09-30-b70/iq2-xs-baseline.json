@@ -1,0 +1,380 @@
+{
+  "upstream": {
+    "version": "0.1.24",
+    "commit": "3ce2523c2823687de5372be3af58534f56cbf286"
+  },
+  "source_base": "a4f0edb",
+  "ggml_reference_commit": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "repository": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+  "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+  "method": "HTTP range 0..33554431, parse with tools/gguf_reader.py, retain header only",
+  "weights_available": false,
+  "model_inference": "unverified",
+  "tensor_count": 1224,
+  "type_counts": {
+    "IQ4_XS": 181,
+    "BF16": 484,
+    "F32": 292,
+    "IQ3_S": 44,
+    "Q2_0": 53,
+    "IQ4_NL": 37,
+    "IQ2_S": 68,
+    "IQ2_XXS": 22,
+    "Q6_K": 29,
+    "F16": 1,
+    "Q8_0": 7,
+    "IQ1_M": 6
+  },
+  "type_bytes": {
+    "IQ4_XS": 1916446720,
+    "BF16": 1527889920,
+    "F32": 10063360,
+    "IQ3_S": 163187200,
+    "Q2_0": 11326924800,
+    "IQ4_NL": 28833315840,
+    "IQ2_S": 18271436800,
+    "IQ2_XXS": 4757913600,
+    "Q6_K": 94617600,
+    "F16": 81920,
+    "Q8_0": 12185600,
+    "IQ1_M": 1101004800
+  },
+  "tensor_roles": {
+    "output.weight": {
+      "IQ4_XS": 1
+    },
+    "output_hc_down.weight": {
+      "BF16": 1
+    },
+    "output_hc_norm.weight": {
+      "F32": 1
+    },
+    "output_hc_up.weight": {
+      "BF16": 1
+    },
+    "token_embd.weight": {
+      "IQ4_XS": 1
+    },
+    "blk.*.attn_gate.weight": {
+      "IQ3_S": 11,
+      "IQ4_XS": 22,
+      "Q6_K": 3
+    },
+    "blk.*.attn_qkv.weight": {
+      "IQ4_XS": 35,
+      "IQ3_S": 1
+    },
+    "blk.*.ffn_down_exps.weight": {
+      "Q2_0": 48
+    },
+    "blk.*.ffn_down_shexp.weight": {
+      "IQ4_NL": 36,
+      "Q8_0": 7,
+      "Q2_0": 5
+    },
+    "blk.*.ffn_gate_exps.weight": {
+      "IQ2_S": 34,
+      "IQ2_XXS": 11,
+      "IQ1_M": 3
+    },
+    "blk.*.ffn_gate_inp.weight": {
+      "BF16": 48
+    },
+    "blk.*.ffn_gate_inp_shexp.weight": {
+      "BF16": 48
+    },
+    "blk.*.ffn_gate_shexp.weight": {
+      "IQ3_S": 9,
+      "Q6_K": 8,
+      "IQ4_XS": 31
+    },
+    "blk.*.ffn_up_exps.weight": {
+      "IQ2_S": 34,
+      "IQ2_XXS": 11,
+      "IQ1_M": 3
+    },
+    "blk.*.ffn_up_shexp.weight": {
+      "IQ4_XS": 26,
+      "IQ3_S": 14,
+      "Q6_K": 8
+    },
+    "blk.*.hc_attn_down.weight": {
+      "BF16": 48
+    },
+    "blk.*.hc_attn_inject.weight": {
+      "BF16": 48
+    },
+    "blk.*.hc_attn_norm.weight": {
+      "F32": 48
+    },
+    "blk.*.hc_attn_up.weight": {
+      "BF16": 48
+    },
+    "blk.*.hc_ffn_down.weight": {
+      "BF16": 48
+    },
+    "blk.*.hc_ffn_inject.weight": {
+      "BF16": 48
+    },
+    "blk.*.hc_ffn_norm.weight": {
+      "F32": 48
+    },
+    "blk.*.hc_ffn_up.weight": {
+      "BF16": 48
+    },
+    "blk.*.ssm_a": {
+      "F32": 36
+    },
+    "blk.*.ssm_alpha.weight": {
+      "BF16": 36
+    },
+    "blk.*.ssm_beta.weight": {
+      "BF16": 36
+    },
+    "blk.*.ssm_conv1d.weight": {
+      "F32": 36
+    },
+    "blk.*.ssm_dt.bias": {
+      "F32": 36
+    },
+    "blk.*.ssm_norm.weight": {
+      "F32": 36
+    },
+    "blk.*.ssm_out.weight": {
+      "IQ4_XS": 29,
+      "IQ3_S": 6,
+      "Q6_K": 1
+    },
+    "blk.*.ple_conv1d.weight": {
+      "F16": 1
+    },
+    "blk.*.ple_key.weight": {
+      "BF16": 1
+    },
+    "blk.*.ple_norm_conv.weight": {
+      "F32": 1
+    },
+    "blk.*.ple_norm_key.weight": {
+      "F32": 1
+    },
+    "blk.*.ple_norm_query.weight": {
+      "F32": 1
+    },
+    "blk.*.ple_value.weight": {
+      "BF16": 1
+    },
+    "blk.*.attn_k.weight": {
+      "Q6_K": 3,
+      "IQ4_XS": 8,
+      "IQ3_S": 1
+    },
+    "blk.*.attn_k_norm.weight": {
+      "F32": 12
+    },
+    "blk.*.attn_output.weight": {
+      "IQ3_S": 1,
+      "IQ4_XS": 10,
+      "Q6_K": 1
+    },
+    "blk.*.attn_q.weight": {
+      "IQ4_XS": 11,
+      "IQ3_S": 1
+    },
+    "blk.*.attn_q_norm.weight": {
+      "F32": 12
+    },
+    "blk.*.attn_v.weight": {
+      "IQ4_XS": 7,
+      "Q6_K": 5
+    },
+    "blk.*.indexer.k_norm.weight": {
+      "F32": 12
+    },
+    "blk.*.indexer.k_proj.weight": {
+      "BF16": 12
+    },
+    "blk.*.indexer.q_norm.weight": {
+      "F32": 12
+    },
+    "blk.*.indexer.q_proj.weight": {
+      "BF16": 12
+    },
+    "per_layer_token_embd.weight": {
+      "IQ4_NL": 1
+    }
+  },
+  "metadata": {
+    "general.architecture": "qwen4exp",
+    "general.type": "model",
+    "general.sampling.top_k": 20,
+    "general.sampling.top_p": 0.949999988079071,
+    "general.sampling.temp": 1.0,
+    "general.size_label": "512x56B",
+    "qwen4exp.block_count": 48,
+    "qwen4exp.context_length": 262144,
+    "qwen4exp.embedding_length": 2560,
+    "qwen4exp.attention.head_count": 24,
+    "qwen4exp.attention.head_count_kv": 2,
+    "qwen4exp.rope.dimension_sections": [
+      11,
+      11,
+      10,
+      0
+    ],
+    "qwen4exp.rope.freq_base": 10000000.0,
+    "qwen4exp.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "qwen4exp.expert_count": 512,
+    "qwen4exp.expert_used_count": 10,
+    "qwen4exp.attention.key_length": 256,
+    "qwen4exp.attention.value_length": 256,
+    "qwen4exp.expert_feed_forward_length": 640,
+    "qwen4exp.expert_shared_feed_forward_length": 640,
+    "qwen4exp.ssm.conv_kernel": 4,
+    "qwen4exp.ssm.state_size": 128,
+    "qwen4exp.ssm.group_count": 16,
+    "qwen4exp.ssm.time_step_rank": 48,
+    "qwen4exp.ssm.inner_size": 6144,
+    "qwen4exp.full_attention_interval": 4,
+    "qwen4exp.rope.dimension_count": 64,
+    "qwen4exp.hyper_connection.count": 4,
+    "qwen4exp.hyper_connection.low_rank": 320,
+    "qwen4exp.attention.indexer.head_count": 4,
+    "qwen4exp.attention.indexer.key_length": 128,
+    "qwen4exp.attention.indexer.top_k": 2048,
+    "qwen4exp.attention.compress_ratios": [
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4,
+      0,
+      0,
+      0,
+      4
+    ],
+    "qwen4exp.ple.layers": [
+      1
+    ],
+    "qwen4exp.ple.ngram_size": 3,
+    "qwen4exp.ple.heads_per_ngram": 8,
+    "qwen4exp.ple.conv_kernel": 4,
+    "qwen4exp.ple.eos_token_id": 248044,
+    "qwen4exp.embedding_length_per_layer_input": 160,
+    "qwen4exp.ple.layer_multipliers": [
+      23703573157769,
+      20109073645365,
+      8052911324071
+    ],
+    "qwen4exp.ple.head_offsets": [
+      0,
+      20000003,
+      40000026,
+      60000059,
+      80000106,
+      100000165,
+      120000228,
+      140000297,
+      160000374,
+      180000455,
+      200000548,
+      220000655,
+      240000802,
+      260000955,
+      280001114,
+      300001275
+    ],
+    "qwen4exp.ple.head_vocab_sizes": [
+      20000003,
+      20000023,
+      20000033,
+      20000047,
+      20000059,
+      20000063,
+      20000069,
+      20000077,
+      20000081,
+      20000093,
+      20000107,
+      20000147,
+      20000153,
+      20000159,
+      20000161,
+      20000171
+    ],
+    "qwen4exp.ple.image_token_id": 248056,
+    "quantize.imatrix.file": "imatrix-qwen3.8-flash-next.gguf",
+    "quantize.imatrix.dataset": "calib_qwen3.8-flash-next.tokids",
+    "quantize.imatrix.entries_count": 926,
+    "quantize.imatrix.chunks_count": 1000,
+    "general.name": "Qwen3.8-Flash-Next GSQ-RCO",
+    "general.basename": "Qwen3.8-Flash-Next",
+    "general.quantized_by": "ISTA DASLab",
+    "general.repo_url": "https://huggingface.co/ISTA-DASLab",
+    "general.license": "apache-2.0",
+    "general.tags": [
+      "gsq-rco",
+      "ista-daslab"
+    ],
+    "general.description": "GSQ-RCO non-uniform mixed-precision GGUF (Deep Algorithms and Systems Lab, ISTA)",
+    "general.base_model.count": 1,
+    "general.base_model.0.name": "Qwen3.8 Flash Next",
+    "general.base_model.0.organization": "Qwen",
+    "general.base_model.0.repo_url": "https://huggingface.co/Qwen/Qwen3.8-Flash-Next",
+    "general.file_type": 20,
+    "general.quantization_version": 2,
+    "split.no": 0,
+    "split.count": 2,
+    "split.tensors.count": 1224
+  },
+  "shards": [
+    {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+      "header_bytes": 11024672,
+      "header_sha256": "c1ca87eea77d2acb01be8a562b394e64dbff43f516633225b1e7e1f7db9b77ea"
+    },
+    {
+      "file": "IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+      "header_bytes": 192,
+      "header_sha256": "60a762da9127f76c0a895de009e7245566708ee638c2ae57f0c12b20ae948e4d"
+    }
+  ]
+}

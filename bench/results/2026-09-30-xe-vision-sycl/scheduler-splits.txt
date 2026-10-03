@@ -1,0 +1,9 @@
+132:llama_prepare_model_devices: using device SYCL0 (Intel(R) Graphics [0xe223]) (unknown id) - 31930 MiB free
+531:clip_ctx: CLIP using SYCL0 backend
+566:## SPLIT #0: SYCL0 # 2 inputs: [inp_raw (   3M)] [positions (  18K)] 
+1184:reserve_compute_meta:      SYCL0 compute buffer size =    33.88 MiB
+1185:reserve_compute_meta:        CPU compute buffer size =     3.40 MiB
+1189:## SPLIT #0: SYCL0 # 2 inputs: [inp_raw (   3M)] [positions (  18K)] 
+1818:## SPLIT #0: SYCL0 # 2 inputs: [inp_raw (   3M)] [positions (  18K)] 
+nodes in split #0 of the first graph: 617
+node assignments printed with GGML_SCHED_DEBUG=2 over the three graph passes: 1851 on [SYCL0], 0 on [CPU]

@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-550cd6cdf5ab43ea86c3abeb",
+ "object": "chat.completion",
+ "created": 1790747808,
+ "model": "coder-iq1_m",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a one-sentence description for each of the two images. I need to look carefully at both images and produce accurate, concise descriptions.\n\nImage 1: A red circle on the left, a blue square on the right, positioned in the upper portion of a white background. Below them, centered,"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 586,
+  "completion_tokens": 64,
+  "total_tokens": 650,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 586,
+  "prompt_ms": 1570.1,
+  "prompt_per_token_ms": 2.679,
+  "prompt_per_second": 373.2,
+  "predicted_n": 64,
+  "predicted_ms": 1518.4,
+  "predicted_per_token_ms": 23.725,
+  "predicted_per_second": 42.1,
+  "draft_n": 53,
+  "draft_n_accepted": 43
+ }
+}

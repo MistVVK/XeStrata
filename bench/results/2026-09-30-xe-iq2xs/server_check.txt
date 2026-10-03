@@ -1,0 +1,6 @@
+1. stream: 62 chunks in 2.8 s: ') or red, green, blue (light). User likely expects three primary colors. Need maybe mention depending on model. But answer direct. Ensure no analysis in final.\n'
+2. cancelled after 8 chunks
+2. after the cancel: 1.7 s, usage {'prompt_tokens': 68, 'completion_tokens': 33, 'total_tokens': 101, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 2.9 s, usage {'prompt_tokens': 61, 'completion_tokens': 86, 'total_tokens': 147, 'prompt_tokens_details': {'cached_tokens': 0}}: 'Got it, Aiko. I’ll remember your name in this conversation.'
+3. turn 2: 1.6 s, usage {'prompt_tokens': 95, 'completion_tokens': 43, 'total_tokens': 138, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is **Aiko**.'
+3. turn 3: 1.9 s, usage {'prompt_tokens': 121, 'completion_tokens': 58, 'total_tokens': 179, 'prompt_tokens_details': {'cached_tokens': 90}}: 'Your name backwards is **okia**.'

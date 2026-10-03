@@ -1,0 +1,30 @@
+== large_alloc_probe 3 0
+max_mem_alloc_size 30.30 GiB
+malloc 3 GiB -> 0xffffd556b7400000
+memset done in 7.5 ms
+last byte 7
+rc=0
+== large_alloc_probe 5 1
+max_mem_alloc_size 30.30 GiB
+malloc 5 GiB -> 0xffffd556b7400000
+memset done in 8.8 ms
+last byte 7
+rc=0
+== large_alloc_probe 5 2
+max_mem_alloc_size 30.30 GiB
+malloc 5 GiB -> 0xffffd556b7400000
+second malloc -> 0xffffd557f7400000
+memcpy of 5 GiB done
+memset done in 43.4 ms
+last byte 7
+rc=0
+== large_alloc_probe 27 1
+max_mem_alloc_size 30.30 GiB
+malloc 27 GiB -> 0xffffd556b7400000
+memset done in 42.9 ms
+last byte 7
+rc=0
+== large_alloc_probe 5 0
+max_mem_alloc_size 30.30 GiB
+malloc 5 GiB -> 0xffffd556b7400000
+rc=124 (timeout 30 s)

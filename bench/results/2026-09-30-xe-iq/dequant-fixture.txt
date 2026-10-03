@@ -1,0 +1,4 @@
+IQ4_NL  32 x 640  dequant rel 0.00e+00
+IQ4_XS  32 x 2560  dequant rel 0.00e+00
+Q2_0    32 x 640  dequant rel 0.00e+00
+Q3_K    32 x 2560  dequant rel 0.00e+00

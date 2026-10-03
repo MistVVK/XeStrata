@@ -1,0 +1,5 @@
+mmvf  2560 x    48  vs FP64 rel 9.75e-08   multi(2..8) bit diffs vs single 0  ok
+mmvf  2560 x   512  vs FP64 rel 9.99e-08   multi(2..8) bit diffs vs single 0  ok
+mmvf 10240 x   320  vs FP64 rel 1.41e-07   multi(2..8) bit diffs vs single 0  ok
+mmvf   320 x 10240  vs FP64 rel 7.86e-08   multi(2..8) bit diffs vs single 0  ok
+mmvf    62 x     7  vs FP64 rel 6.16e-08   multi(2..8) bit diffs vs single 0  ok

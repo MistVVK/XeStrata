@@ -1,0 +1,4 @@
+  non-vacuity: 4 of 4 codes present, 8 distinct values in the first elements
+dequant_s2: 200000 blocks, 12800000 elements, 0 mismatched
+  bit-exact against the scalar dequantizer that dequant_xcheck proved equal to ggml
+dequant_s2_parity OK

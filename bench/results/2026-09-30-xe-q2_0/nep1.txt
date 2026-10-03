@@ -1,0 +1,7 @@
+          q2_0 AVX-2 down vs ggml down: rel 2.04e-04
+layer  0  q2_0    /q2_0    blob  1382400  cpu rel 1.13e-02  gpu rel 1.13e-02  cpu-gpu 7.06e-08  ok
+          q2_0 AVX-2 down vs ggml down: rel 2.06e-04
+layer 20  q2_0    /q2_0    blob  1382400  cpu rel 1.17e-02  gpu rel 1.17e-02  cpu-gpu 7.55e-08  ok
+          q2_0 AVX-2 down vs ggml down: rel 1.87e-04
+layer 47  q2_0    /q2_0    blob  1382400  cpu rel 1.27e-02  gpu rel 1.27e-02  cpu-gpu 7.46e-08  ok
+native_expert_parity: 0 failures

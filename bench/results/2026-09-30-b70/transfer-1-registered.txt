@@ -1,0 +1,14 @@
+expert arena: 1 layers x 512 blobs x 1382400 B = 0.659 GiB
+before allocation: memlock 8388608 B; VmLck:	       0 kB
+backing: one mapping registered for device copies; transparent huge pages requested (madvise); no mlock
+after load and touch: memlock 8388608 B; VmLck:	       0 kB
+loaded 0.659 GiB in 0.786 s with 8 threads and 16 MiB chunks  ->  0.84 GiB/s
+per-layer checksums (FNV-1a 64):
+  layer 0  5840217a9ddd0383
+
+expert stream (host -> device, one reused destination):
+  1 blob (1.38 MB)   chunk     1.38 MB   13.90 GB/s  (5.273 GiB in 0.407 s)
+  16 blobs (22 MB)   chunk    22.12 MB   14.39 GB/s  (5.273 GiB in 0.394 s)
+  1 layer (707 MB)   chunk   707.79 MB   14.41 GB/s  (1.978 GiB in 0.147 s)
+  whole arena        chunk   707.79 MB   14.41 GB/s  (1.978 GiB in 0.147 s)
+after transfers: memlock 8388608 B; VmLck:	       0 kB

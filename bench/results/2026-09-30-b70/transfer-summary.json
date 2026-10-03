@@ -1,0 +1,117 @@
+{
+  "timestamp": "2026-09-29T21:06:12.169777+00:00",
+  "method": {
+    "order": [
+      "registered",
+      "pageable",
+      "registered",
+      "pageable",
+      "registered",
+      "pageable"
+    ],
+    "warmup": "one untimed pass per chunk size per invocation",
+    "input": "/dev/zero (synthetic; no model or disk bandwidth claim)",
+    "arena_bytes": 707788800,
+    "threads": 8,
+    "command": "strata-load --file /dev/zero --layers 1 --stream [--no-pin]",
+    "link": "PCIe Gen4 x8 (root port 00:03.2, PCIEX16_2)",
+    "registered": "one mmap with MADV_HUGEPAGE, registered with prepare_for_device_copy",
+    "pageable": "std::malloc, unregistered (THP mode madvise, so 4 KB pages)",
+    "statistic_units": "decimal GB/s; samples rounded by the diagnostic to 0.01 GB/s"
+  },
+  "memlock_bytes": 8388608,
+  "rates": {
+    "registered": {
+      "1 blob (1.38 MB)": {
+        "samples": [
+          13.9,
+          13.9,
+          13.9
+        ],
+        "median": 13.9,
+        "min": 13.9,
+        "max": 13.9,
+        "stdev": 0.0
+      },
+      "16 blobs (22 MB)": {
+        "samples": [
+          14.39,
+          14.39,
+          14.38
+        ],
+        "median": 14.39,
+        "min": 14.38,
+        "max": 14.39,
+        "stdev": 0.005773502691896135
+      },
+      "1 layer (707 MB)": {
+        "samples": [
+          14.41,
+          14.41,
+          14.41
+        ],
+        "median": 14.41,
+        "min": 14.41,
+        "max": 14.41,
+        "stdev": 0.0
+      },
+      "whole arena": {
+        "samples": [
+          14.41,
+          14.41,
+          14.41
+        ],
+        "median": 14.41,
+        "min": 14.41,
+        "max": 14.41,
+        "stdev": 0.0
+      }
+    },
+    "pageable": {
+      "1 blob (1.38 MB)": {
+        "samples": [
+          13.47,
+          12.05,
+          13.5
+        ],
+        "median": 13.47,
+        "min": 12.05,
+        "max": 13.5,
+        "stdev": 0.8286334131166405
+      },
+      "16 blobs (22 MB)": {
+        "samples": [
+          10.39,
+          9.12,
+          10.5
+        ],
+        "median": 10.39,
+        "min": 9.12,
+        "max": 10.5,
+        "stdev": 0.7669637105713244
+      },
+      "1 layer (707 MB)": {
+        "samples": [
+          3.87,
+          4.21,
+          4.2
+        ],
+        "median": 4.2,
+        "min": 3.87,
+        "max": 4.21,
+        "stdev": 0.19347695814575266
+      },
+      "whole arena": {
+        "samples": [
+          3.89,
+          5.47,
+          4.19
+        ],
+        "median": 4.19,
+        "min": 3.89,
+        "max": 5.47,
+        "stdev": 0.8391265299901636
+      }
+    }
+  }
+}

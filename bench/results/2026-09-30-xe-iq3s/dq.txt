@@ -1,0 +1,7 @@
+type 14  output.weight                            4 x 2560: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+type 23  token_embd.weight                        4 x 2560: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+type 12  blk.0.attn_gate.weight                   4 x 2560: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+type 20  blk.0.ffn_down_shexp.weight              4 x 640: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+type 13  blk.1.attn_qkv.weight                    4 x 2560: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+type  8  blk.47.ffn_down_shexp.weight             4 x 640: f32 ok (0 off, worst rel 0.00e+00), bf16 ok (0 off)
+dequant_bf16_test: 6 types checked, OK

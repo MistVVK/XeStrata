@@ -1,0 +1,23 @@
+shape                       ncols     MB    us/call       GB/s     loops
+output head        IQ4_XS       1 337.72     2125.3      158.9        20
+output head        IQ4_XS       4 337.72     3271.4      103.2        20
+attn_qkv           IQ4_XS       1  13.93       99.1      140.5       400
+attn_qkv           IQ4_XS       4  13.93      141.2       98.6       400
+ssm_out            IQ4_XS       1   8.36       51.8      161.4       400
+ssm_out            IQ4_XS       4   8.36       60.9      137.1       400
+attn_gate          IQ3_S        1   6.76       42.3      159.6       400
+attn_gate          IQ3_S        4   6.76      155.5       43.5       400
+shexp gate         IQ3_S        1   0.70        6.6      107.4       400
+shexp gate         IQ3_S        4   0.70       20.8       33.8       400
+shexp up           IQ4_XS       1   0.87       10.6       81.7       400
+shexp up           IQ4_XS       4   0.87       18.8       46.3       400
+shexp down         IQ4_NL       1   0.92       20.1       45.9       400
+shexp down         IQ4_NL       4   0.92       27.5       33.5       400
+expert gate        IQ2_S        1   0.52        5.5       95.6       400
+expert gate        IQ2_S        4   0.52       17.1       30.6       400
+expert gate        IQ2_XXS      1   0.42        6.0       69.8       400
+expert gate        IQ2_XXS      4   0.42       18.5       22.8       400
+expert gate        IQ1_M        1   0.36        3.4      104.8       400
+expert gate        IQ1_M        4   0.36        7.2       49.8       400
+expert down        Q2_0         1   0.46       17.5       26.3       400
+expert down        Q2_0         4   0.46       26.1       17.7       400

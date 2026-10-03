@@ -1,0 +1,18 @@
+jit_serve_timed.sh output: the server with strata-iq2_xs.json (the B70 image encoder), time to ready and three requests.
+cold: ~/.cache/neo_compiler_cache moved away first. warm: run again. after-warmup: the cache moved away again,
+setup.warm_up() run on the config (62 s), then the server.
+
+cold ready after 31.4 s
+cold req-text 30.18 s, prompt 1296
+cold req-text2 2.21 s, prompt 57
+cold req-landscape 4.01 s, prompt 371
+warm ready after 20.2 s
+warm req-text 4.20 s, prompt 1296
+warm req-text2 2.21 s, prompt 57
+warm req-landscape 3.74 s, prompt 371
+after-warmup ready after 20.3 s
+after-warmup req-text 4.21 s, prompt 1296
+after-warmup req-text2 2.21 s, prompt 57
+after-warmup req-landscape 3.74 s, prompt 371
+
+The cache after the cold run: 16 MB in 41 files.

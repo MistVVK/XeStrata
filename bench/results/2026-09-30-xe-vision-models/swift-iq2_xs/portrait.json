@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-2e06b1aa3b7c42248bf9b1d9",
+ "object": "chat.completion",
+ "created": 1790747957,
+ "model": "swift-iq2_xs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants me to identify the text, shapes, and colors in the image. Let me look carefully.\n\nThe image shows a white background. There's a green triangle in the upper portion. Below it, in black bold text, is the word \"PELICAN\". There are also thin black bars at the"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 291,
+  "completion_tokens": 64,
+  "total_tokens": 355,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 291,
+  "prompt_ms": 1939.3,
+  "prompt_per_token_ms": 6.664,
+  "prompt_per_second": 150.1,
+  "predicted_n": 64,
+  "predicted_ms": 1732.1,
+  "predicted_per_token_ms": 27.064,
+  "predicted_per_second": 36.9,
+  "draft_n": 71,
+  "draft_n_accepted": 39
+ }
+}

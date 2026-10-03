@@ -1,0 +1,4 @@
+Q2_0    dequant bit mismatches 0 / 131072   mmvq rel 5.81e-03  ok
+IQ4_NL  dequant bit mismatches 0 / 131072   mmvq rel 4.53e-03  ok
+IQ4_XS  dequant bit mismatches 0 / 131072   mmvq rel 4.69e-03  ok
+Q3_K    dequant bit mismatches 0 / 131072   mmvq rel -1.00e+00  ok

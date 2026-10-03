@@ -1,0 +1,6 @@
+1. stream: 64 chunks in 2.8 s: 'green blue; subtractive RYB red yellow blue; CMY cyan magenta yellow. User likely expects red, yellow, blue. We can answer with common primary colors. Ensure no'
+2. cancelled after 8 chunks
+2. after the cancel: 2.1 s, usage {'prompt_tokens': 68, 'completion_tokens': 47, 'total_tokens': 115, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 2.0 s, usage {'prompt_tokens': 61, 'completion_tokens': 44, 'total_tokens': 105, 'prompt_tokens_details': {'cached_tokens': 0}}: 'Got it, Aiko. I’ll remember your name.'
+3. turn 2: 1.7 s, usage {'prompt_tokens': 92, 'completion_tokens': 44, 'total_tokens': 136, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is Aiko.'
+3. turn 3: 3.3 s, usage {'prompt_tokens': 117, 'completion_tokens': 71, 'total_tokens': 188, 'prompt_tokens_details': {'cached_tokens': 87}}: 'Your name spelled backwards is **okiA**.'

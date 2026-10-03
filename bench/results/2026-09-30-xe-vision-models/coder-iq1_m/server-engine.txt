@@ -1,0 +1,46 @@
+load_hparams: Qwen-VL models require at minimum 1024 image tokens to function correctly on grounding tasks
+load_hparams: if you encounter problems with accuracy, try adding --image-min-tokens 1024
+load_hparams: more info: https://github.com/ggml-org/llama.cpp/issues/16842
+
+strata-vision: warmed up at 289 image tokens
+strata generate: PCIe probe: 14.4 GB/s host->device -> pcie_frac 0.30 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/coder-iq1_m experts (largest blob 2.66 MB), token embedding type 23 in mapped host memory (322 MiB)
+strata generate: 1406 MiB of weights loaded from <data>/packs/coder-iq1_m (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights
+strata generate: PLE on, table 320001536 rows of <data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.56 s (1402 MiB/s)
+strata generate: expert arena: one mapping registered for device copies; transparent huge pages requested (madvise); no mlock
+strata generate: loaded 23.42 GiB at 1.86 GiB/s
+strata generate: profile <repo>/data/expert-profile-coder.bin: 12288 ranked pairs, built for 12288 slots
+strata generate: experimental native Q5_K head, 521472000 bytes
+strata generate: expert cache auto: 26.22 GiB free, 700 MiB reserved -> 10299 slots
+strata generate: expert cache 12288 slots, 23.42 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 12288 of 12288 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 7 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.0)
+strata generate: token graph hit path: 12288 resident experts, decided on the device
+strata serve: prompt chunk auto: 8192 tokens
+strata serve: the prompt path borrows 2276 cache slots (4.37 GiB)
+strata verify: window up to 6 tokens, 74.0 MiB of device buffers
+strata mtp: draft head over 40525 tokens (81.2 MiB)
+strata serve: 2695 MiB of VRAM free with everything loaded
+strata verify: captured the 4-token window (sync ok)
+strata verify: captured the 1-token window (sync ok)
+strata verify: captured the 3-token window (sync ok)
+strata serve: prompt 371 tokens = 0 reused + 371 read in 1576 ms (235.5 tok/s), 64 generated in 1619 ms (39.5 tok/s), drafts accepted 46 of 57, 1 checkpoints
+strata serve: decode expert cache hit rate: 100.0% (37440 hits / 37440 lookups)
+strata serve: prompt 291 tokens = 0 reused + 291 read in 1336 ms (217.8 tok/s), 64 generated in 1705 ms (37.5 tok/s), drafts accepted 41 of 62, 1 checkpoints
+strata serve: decode expert cache hit rate: 100.0% (40800 hits / 40800 lookups)
+strata serve: prompt 586 tokens = 0 reused + 586 read in 1570 ms (373.2 tok/s), 64 generated in 1518 ms (42.1 tok/s), drafts accepted 43 of 53, 1 checkpoints
+strata serve: decode expert cache hit rate: 100.0% (35520 hits / 35520 lookups)
+strata verify: captured the 6-token window (sync ok)
+strata serve: prompt 325 tokens = 0 reused + 325 read in 1336 ms (243.3 tok/s), 8 generated in 196 ms (40.8 tok/s), drafts accepted 6 of 6, 1 checkpoints
+strata serve: decode expert cache hit rate: 100.0% (4320 hits / 4320 lookups)
+strata serve: prompt 355 tokens = 318 reused + 37 read in 627 ms (59.1 tok/s), 2 generated in 119 ms (16.8 tok/s), drafts accepted 2 of 3, 2 checkpoints
+strata serve: decode expert cache hit rate: 100.0% (2400 hits / 2400 lookups)

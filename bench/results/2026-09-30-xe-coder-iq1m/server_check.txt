@@ -1,0 +1,6 @@
+1. stream: 64 chunks in 3.0 s: 'r subtractive RYB? User likely expects red, blue, yellow. Could mention depending on context. But asks three primary colors. Answer: red, blue, yellow. Maybe if'
+2. cancelled after 8 chunks
+2. after the cancel: 2.0 s, usage {'prompt_tokens': 68, 'completion_tokens': 35, 'total_tokens': 103, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 2.7 s, usage {'prompt_tokens': 61, 'completion_tokens': 59, 'total_tokens': 120, 'prompt_tokens_details': {'cached_tokens': 0}}: 'Got it, Aiko. I’ll remember your name.'
+3. turn 2: 2.0 s, usage {'prompt_tokens': 92, 'completion_tokens': 49, 'total_tokens': 141, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is Aiko.'
+3. turn 3: 2.9 s, usage {'prompt_tokens': 117, 'completion_tokens': 81, 'total_tokens': 198, 'prompt_tokens_details': {'cached_tokens': 87}}: 'okiA'

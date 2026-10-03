@@ -1,0 +1,4 @@
+
+
+We need answer user's question: "What text is written in the image, and what shapes and colors are in it?" Need describe text and shapes/colors. Need final concise. Image: white background, black top and bottom bars? There is a green triangle centered, text PELICAN in black bold uppercase.
+

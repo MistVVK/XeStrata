@@ -1,0 +1,12 @@
+  IQ4_XS  S4 g32 no-offset     naive 3.337e-07   warp 8.166e-08
+  IQ4_XS  S4 g32 no-offset     Q8_0 act 7.310e-08
+      Q8_K vs fp16 activation  yes (0.6855% apart, tolerance 0.1%)
+  Q4_K    S4 g32 offset        naive 2.931e-07   warp 1.295e-07
+  Q4_K    S4 g32 offset        Q8_0 act 1.072e-07
+      Q8_K vs fp16 activation  yes (1.0580% apart, tolerance 0.1%)
+  Q5_K    S8 g32 offset        naive 3.461e-07   warp 9.222e-08
+  Q5_K    S8 g32 offset        Q8_0 act 8.302e-08
+      Q8_K vs fp16 activation  yes (1.4897% apart, tolerance 0.1%)
+
+s_gemv_q8k: 0 failures
+s_gemv_q8k_parity OK

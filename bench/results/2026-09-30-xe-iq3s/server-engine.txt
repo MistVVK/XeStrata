@@ -1,0 +1,47 @@
+strata generate: PCIe probe: 14.4 GB/s host->device -> pcie_frac 0.30 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/qwen-iq3_s experts (largest blob 2.66 MB), token embedding type 23 in mapped host memory (322 MiB)
+strata generate: 1466 MiB of weights loaded from <data>/packs/qwen-iq3_s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2018.88 MiB of weights
+strata generate: PLE on, table 320001536 rows of <data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf
+strata mtp: draft layer loaded, 809 MiB of VRAM (experts 675, dense 111), files read in 0.55 s (1420 MiB/s)
+strata generate: expert arena: one mapping registered for device copies; transparent huge pages requested (madvise); no mlock
+strata generate: loaded 46.84 GiB at 0.52 GiB/s
+strata generate: profile <repo>/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: experimental native Q5_K head, 521472000 bytes
+strata generate: expert cache auto: 26.16 GiB free, 700 MiB reserved -> 10276 slots
+strata generate: expert cache 13426 slots, 25.48 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 13426 of 13426 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 7 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.0)
+strata generate: token graph hit path: 13426 resident experts, decided on the device
+strata serve: prompt chunk auto: 8192 tokens
+strata serve: the prompt path borrows 2307 cache slots (4.38 GiB)
+strata verify: window up to 6 tokens, 74.0 MiB of device buffers
+strata mtp: draft head over 40525 tokens (81.2 MiB)
+strata serve: 526 MiB of VRAM free with everything loaded
+strata verify: captured the 6-token window (sync ok)
+strata verify: captured the 4-token window (sync ok)
+strata verify: captured the 1-token window (sync ok)
+strata verify: captured the 2-token window (sync ok)
+strata verify: captured the 3-token window (sync ok)
+strata serve: prompt 57 tokens = 0 reused + 57 read in 1102 ms (51.7 tok/s), 64 generated in 1978 ms (32.4 tok/s), drafts accepted 35 of 52, 1 checkpoints
+strata serve: decode expert cache hit rate: 86.7% (33712 hits / 38880 lookups)
+strata serve: prompt 62 tokens = 0 reused + 62 read in 1013 ms (61.2 tok/s), 11 generated in 279 ms (39.4 tok/s), drafts accepted 7 of 9, 1 checkpoints
+strata serve: decode expert cache hit rate: 94.1% (5873 hits / 6240 lookups)
+strata serve: prompt 68 tokens = 0 reused + 68 read in 1103 ms (61.7 tok/s), 50 generated in 1248 ms (40.1 tok/s), drafts accepted 37 of 41, 1 checkpoints
+strata serve: decode expert cache hit rate: 85.0% (23269 hits / 27360 lookups)
+strata serve: suffix drafts: 2 windows, 7 of 10 drafts accepted
+strata serve: prompt 61 tokens = 0 reused + 61 read in 980 ms (62.3 tok/s), 84 generated in 2268 ms (37.0 tok/s), drafts accepted 47 of 59, 1 checkpoints
+strata serve: decode expert cache hit rate: 94.8% (43663 hits / 46080 lookups)
+strata serve: suffix drafts: 1 windows, 1 of 5 drafts accepted
+strata serve: prompt 95 tokens = 56 reused + 39 read in 646 ms (60.4 tok/s), 44 generated in 1075 ms (40.9 tok/s), drafts accepted 28 of 35, 2 checkpoints
+strata serve: decode expert cache hit rate: 96.5% (23612 hits / 24480 lookups)
+strata serve: suffix drafts: 1 windows, 1 of 3 drafts accepted
+strata serve: prompt 120 tokens = 90 reused + 30 read in 529 ms (56.7 tok/s), 49 generated in 1321 ms (37.1 tok/s), drafts accepted 31 of 40, 3 checkpoints
+strata serve: decode expert cache hit rate: 94.5% (27222 hits / 28800 lookups)

@@ -1,0 +1,6 @@
+1. stream: 64 chunks in 2.7 s: 'he most common answer for "primary colors" in everyday contexts (paint, art) is red, yellow, blue (RYB). In additive light (screens), it\'s red, green, blue (RGB'
+2. cancelled after 8 chunks
+2. after the cancel: 1.9 s, usage {'prompt_tokens': 68, 'completion_tokens': 38, 'total_tokens': 106, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 2.3 s, usage {'prompt_tokens': 61, 'completion_tokens': 61, 'total_tokens': 122, 'prompt_tokens_details': {'cached_tokens': 0}}: "Got it, Aiko! I'll remember your name. Nice to meet you! 😊"
+3. turn 2: 1.7 s, usage {'prompt_tokens': 99, 'completion_tokens': 43, 'total_tokens': 142, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is **Aiko**! 😊'
+3. turn 3: 2.2 s, usage {'prompt_tokens': 127, 'completion_tokens': 55, 'total_tokens': 182, 'prompt_tokens_details': {'cached_tokens': 94}}: 'Your name spelled backwards is **okiA**! 😊'

@@ -1,0 +1,21 @@
+landscape        cap  300 nodnn   vs cpu: shape same finite True max|d| 0.1088 relL2 0.0557 row relL2 median 0.0096 max 0.425  cos min 0.9159
+landscape        cap  300 dnn     vs cpu: shape same finite True max|d| 0.0479 relL2 0.0309 row relL2 median 0.0102 max 0.314  cos min 0.9839
+landscape        cap  300 dnnoff  vs cpu: shape same finite True max|d| 0.1088 relL2 0.0557 row relL2 median 0.0096 max 0.425  cos min 0.9159
+landscape        cap  300 nodnn vs dnnoff: max|d| 0 relL2 0
+landscape        cap  300 nodnn vs dnn: max|d| 0.13 relL2 0.05183
+landscape        cap  300 dnn run-to-run max|d| 2.65e-06
+landscape        cap  300 nodnn run-to-run max|d| 0
+portrait         cap  300 nodnn   vs cpu: shape same finite True max|d| 0.0575 relL2 0.0300 row relL2 median 0.0079 max 0.326  cos min 0.9819
+portrait         cap  300 dnn     vs cpu: shape same finite True max|d| 0.1069 relL2 0.0506 row relL2 median 0.0098 max 0.636  cos min 0.9903
+portrait         cap  300 dnnoff  vs cpu: shape same finite True max|d| 0.0575 relL2 0.0300 row relL2 median 0.0079 max 0.326  cos min 0.9819
+portrait         cap  300 nodnn vs dnnoff: max|d| 0 relL2 0
+portrait         cap  300 nodnn vs dnn: max|d| 0.0514 relL2 0.03063
+portrait         cap  300 dnn run-to-run max|d| 0.019
+portrait         cap  300 nodnn run-to-run max|d| 0
+landscape-large  cap 1024 nodnn   vs cpu: shape same finite True max|d| 0.0700 relL2 0.0407 row relL2 median 0.0232 max 0.547  cos min 0.9380
+landscape-large  cap 1024 dnn     vs cpu: shape same finite True max|d| 0.1299 relL2 0.0625 row relL2 median 0.0238 max 0.822  cos min 0.5799
+landscape-large  cap 1024 dnnoff  vs cpu: shape same finite True max|d| 0.0700 relL2 0.0407 row relL2 median 0.0232 max 0.547  cos min 0.9380
+landscape-large  cap 1024 nodnn vs dnnoff: max|d| 0 relL2 0
+landscape-large  cap 1024 nodnn vs dnn: max|d| 0.122 relL2 0.04508
+landscape-large  cap 1024 dnn run-to-run max|d| 0
+landscape-large  cap 1024 nodnn run-to-run max|d| 0

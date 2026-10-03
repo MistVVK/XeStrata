@@ -1,0 +1,6 @@
+
+  [X]  missing: Intel oneAPI (/opt/intel/oneapi/setvars.sh not found)
+       install Intel oneAPI's DPC++/C++ compiler and oneMKL (docs/XE.md lists the packages) and build-essential, then run it again
+
+Setup stopped. Fix the item above and run it again - everything already done is kept and skipped.
+setup rc=1

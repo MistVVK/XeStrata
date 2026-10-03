@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-f9d52d1d41fd42a382a72c3d",
+ "object": "chat.completion",
+ "created": 1790747638,
+ "model": "qwen-q2_0",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "We need answer user's question: \"What text is written in the image, and what shapes and colors are in it?\" Need describe text and shapes/colors. Need final concise but detailed. Image: text \"HELLO 4172\" black. Shapes: red circle on left, blue square on right."
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 371,
+  "completion_tokens": 64,
+  "total_tokens": 435,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 371,
+  "prompt_ms": 3061.9,
+  "prompt_per_token_ms": 8.253,
+  "prompt_per_second": 121.2,
+  "predicted_n": 64,
+  "predicted_ms": 1397.1,
+  "predicted_per_token_ms": 21.83,
+  "predicted_per_second": 45.8,
+  "draft_n": 53,
+  "draft_n_accepted": 43
+ }
+}

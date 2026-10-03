@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-221a54804b2b46339fff8bfa",
+ "object": "chat.completion",
+ "created": 1790746044,
+ "model": "qwen3.8-flash-next-iq2_xs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content. Let me carefully examine the image.\n\nThere are two shapes at the top: on the left, a red circle; on the right, a blue square. Below them, there is text in black bold font reading \"HELLO 4172\".\n\nI"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 1043,
+  "completion_tokens": 64,
+  "total_tokens": 1107,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 1043,
+  "prompt_ms": 3222.7,
+  "prompt_per_token_ms": 3.09,
+  "prompt_per_second": 323.6,
+  "predicted_n": 64,
+  "predicted_ms": 1664.4,
+  "predicted_per_token_ms": 26.006,
+  "predicted_per_second": 38.5,
+  "draft_n": 63,
+  "draft_n_accepted": 40
+ }
+}

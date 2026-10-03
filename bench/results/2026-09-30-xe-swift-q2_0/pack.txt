@@ -1,0 +1,2 @@
+model shards: Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf, Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf
+index.txt: 1079 tensors, 303 served natively, 0 in extra.bin, arena 1.38 GiB

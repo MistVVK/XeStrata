@@ -1,0 +1,3 @@
+xe 96 tokens, ref 96 tokens, first divergence at generated index 61
+reference logits at that position (top 5): [(7736, 25.3874), (279, 25.3363), (9155, 24.4193), (89661, 22.6103), (25303, 16.6621)]
+xe chose 279 logit 25.3363 ; reference chose 7736 logit 25.3874 ; margin 0.0511

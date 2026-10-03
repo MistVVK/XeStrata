@@ -1,0 +1,12 @@
+## nodraft
+xe 96 tokens, ref 96 tokens, first divergence at generated index 25
+reference logits at that position (top 5): [(3387, 25.3851), (20665, 25.1119), (18369, 23.9536), (11991, 23.7732), (12688, 22.839)]
+xe chose 20665 logit 25.1119 ; reference chose 3387 logit 25.3851 ; margin 0.2732
+## suffix
+xe 96 tokens, ref 96 tokens, first divergence at generated index 25
+reference logits at that position (top 5): [(3387, 25.3851), (20665, 25.1119), (18369, 23.9536), (11991, 23.7732), (12688, 22.839)]
+xe chose 20665 logit 25.1119 ; reference chose 3387 logit 25.3851 ; margin 0.2732
+## mtp
+xe 96 tokens, ref 96 tokens, first divergence at generated index 32
+reference logits at that position (top 5): [(5435, 24.2132), (369, 24.0745), (27891, 23.6673), (16661, 21.298), (318, 20.7862)]
+xe chose 369 logit 24.0745 ; reference chose 5435 logit 24.2132 ; margin 0.1387

@@ -1,0 +1,55 @@
+{
+  "os": "Ubuntu 26.04.1 LTS",
+  "kernel": "7.0.0-34-generic",
+  "cpu": "AMD Ryzen 7 3800XT 8-Core Processor",
+  "mem_total_kib": 96661120,
+  "compiler": "Intel oneAPI DPC++ 2026.1.1",
+  "backend": "Level Zero V2",
+  "driver": "1.14.37020",
+  "gpu_device_id": "8086:e223",
+  "reported_memory_bytes": 32530182144,
+  "reported_subgroup_sizes": [
+    16,
+    32
+  ],
+  "pcie_topology": {
+    "board": "ASUS PRIME X570-PRO, BIOS 5044",
+    "slot": "PCIEX16_2 (root port 00:03.2, x8 max)",
+    "link": "16.0 GT/s x8 at 08:00.0 <-> 00:03.2 (kernel log and sysfs)",
+    "note": "0a:00.0 and 09:01.0 report 2.5 GT/s x1: the card's internal switch links, not the host link",
+    "pciex16_1": "trains at x4 with the B70 and below x16 with another card; not used"
+  },
+  "memlock_bytes": 8388608,
+  "build_options": {
+    "STRATA_ENABLE_XE": true,
+    "STRATA_NATIVE_EXPERTS": false,
+    "STRATA_PORTABLE": false,
+    "STRATA_BUILD_TESTS": true
+  },
+  "device_code": "SPIR-V JIT",
+  "float_options": [
+    "-fno-fast-math",
+    "-ffp-contract=off"
+  ],
+  "cpu_only_checks_passed": [
+    "gguf_reader_test",
+    "suffix_drafter_test",
+    "controller_test",
+    "draft_policy_test",
+    "conv_cache_test",
+    "ple_reader_selftest"
+  ],
+  "reference_inputs": "synthetic existing parity fixtures and /dev/zero for bandwidth; no model weights",
+  "full_model_validation": "unverified",
+  "bios": {
+    "above_4g_decoding": "enabled",
+    "resizable_bar": "enabled",
+    "csm": "disabled",
+    "note": "without them BAR0/BAR2 are unassigned and xe probe fails with -5"
+  },
+  "transparent_hugepage": "madvise",
+  "hugetlb_pool_pages": 0,
+  "cpu_only_checks_failed": {
+    "platform_memory_test": "mlock of 256 MiB exceeds RLIMIT_MEMLOCK (8 MiB); environment limit, test unchanged"
+  }
+}

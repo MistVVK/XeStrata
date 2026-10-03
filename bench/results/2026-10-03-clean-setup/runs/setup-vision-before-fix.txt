@@ -1,0 +1,112 @@
+Strata - Qwen3.8-Flash-Next on a normal PC (an Intel GPU + system RAM + CPU)
+
+=== Step 1: checking your PC ===
+  Your Intel GPUs:
+    GPU 0: Intel GPU 0xa780, no VRAM of its own - can be used
+    GPU 1: Intel GPU 0xe223, 32 GB VRAM - can be used
+  [ok] GPU: Intel GPU 0xe223, 32 GB VRAM, PCI 0000:03:00.0, PCIe link 32.0 GT/s PCIe x16
+  [ok] RAM: 92 GB
+  [ok] CPU: Intel(R) Core(TM) i7-14700 (AVX2)
+
+=== Step 2: your choices ===
+  [ok] model: Qwen3.8-Flash-Next
+
+  1) Q2_0     2-bit, the fastest; download 66 GB, uses ~34 GB of RAM
+  2) IQ2_XS   2-bit i-quant, a little better quality, close in speed; download 68 GB, uses ~36 GB of RAM
+  3) IQ3_XXS  3-bit i-quant, better quality, slower (more CPU work per token); download 76 GB, uses ~43 GB of RAM
+  4) IQ3_S    3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running; download 84 GB, uses ~50 GB of RAM
+  [ok] size: IQ2_XS
+
+  Context length = how much text the model can see at once (your chat, files, tool output).
+  Longer needs more VRAM for it, so fewer experts fit on the GPU:
+  1) 8K tokens
+  2) 32K tokens
+  3) 64K tokens
+  4) 128K tokens   (recommended for your GPU)
+  5) 256K tokens
+  6) 384K tokens   (experimental: setup adds rope scaling)
+  7) 512K tokens   (experimental: setup adds rope scaling)
+  [ok] context: 131072 tokens
+  [ok] KV cache: 8-bit
+  [ok] images: on (encoder on the GPU, the CPU encoder as fallback)
+  [ok] experimental speed projection: off
+
+=== Step 3: Python packages ===
+  [ok] numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil already installed
+
+=== Step 4: the Strata engine ===
+  [ok] llama.cpp 3cf0325 (gguf-py, ggml, mtmd)
+  [ok] SYCL compiler: DPC++ compiler 6.2.0 build based on: clang version 21.0.0dpcpp6 (free; no XMX: the slower prompt path)
+  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...
+  > /xs/.venv/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/xs/.venv/bin/ninja -S /xs/tools/vision -B /xs/build-vision-vulkan -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/xs/third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON -DSTRATA_PORTABLE=ON
+-- The C compiler identification is GNU 15.2.0
+-- The CXX compiler identification is GNU 15.2.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- llama.cpp version: 0.4.1-dev
+CMAKE_BUILD_TYPE=Release
+-- Could NOT find Git (missing: GIT_EXECUTABLE) 
+CMake Warning at /xs/third_party/main/llama.cpp/cmake/build-info.cmake:14 (message):
+  Git not found.  Build info will not be accurate.
+Call Stack (most recent call first):
+  /xs/third_party/main/llama.cpp/CMakeLists.txt:150 (include)
+
+
+-- The ASM compiler identification is GNU
+-- Found assembler: /usr/bin/cc
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Warning: ccache not found - consider installing it for faster compilation or disable this warning with GGML_CCACHE=OFF
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mfma;-mbmi2;-mavx;-mavx2 GGML_SSE42;GGML_F16C;GGML_FMA;GGML_BMI2;GGML_AVX;GGML_AVX2
+-- Found Vulkan: /usr/lib/x86_64-linux-gnu/libvulkan.so (found version "1.4.341") found components: glslc missing components: glslangValidator
+-- Vulkan found
+-- GL_KHR_cooperative_matrix supported by glslc
+-- GL_NV_cooperative_matrix2 supported by glslc
+-- GL_NV_cooperative_matrix_decode_vector not supported by glslc
+-- GL_EXT_integer_dot_product supported by glslc
+-- GL_EXT_bfloat16 supported by glslc
+-- GL_EXT_float_e2m1 not supported by glslc
+-- GL_EXT_float_e4m3 supported by glslc
+-- Including Vulkan backend
+-- ggml version: 0.24.0
+-- ggml commit:  unknown
+-- Configuring done (1.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /xs/build-vision-vulkan
+  > /xs/.venv/bin/cmake --build /xs/build-vision-vulkan --target strata-vision -j 7
+[0/2] Re-checking globbed directories...
+[1/449] Creating directories for 'vulkan-shaders-gen'
+[2/449] No download step for 'vulkan-shaders-gen'
+[3/449] No update step for 'vulkan-shaders-gen'
+[4/449] No patch step for 'vulkan-shaders-gen'
+[5/449] Performing configure step for 'vulkan-shaders-gen'
+FAILED: [code=1] llama/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-stamp/vulkan-shaders-gen-configure /xs/build-vision-vulkan/llama/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-stamp/vulkan-shaders-gen-configure 
+cd /xs/build-vision-vulkan/llama/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build && /xs/.venv/lib/python3.14/site-packages/cmake/data/bin/cmake -DCMAKE_INSTALL_PREFIX=/xs/build-vision-vulkan/Release -DCMAKE_INSTALL_BINDIR=. -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN_COOPMAT_GLSLC_SUPPORT=ON -DGGML_VULKAN_COOPMAT2_GLSLC_SUPPORT=ON -DGGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT=ON -DGGML_VULKAN_BFLOAT16_GLSLC_SUPPORT=ON -DGGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT=ON -GNinja -S /xs/third_party/main/llama.cpp/ggml/src/ggml-vulkan/vulkan-shaders -B /xs/build-vision-vulkan/llama/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-build && /xs/.venv/lib/python3.14/site-packages/cmake/data/bin/cmake -E touch /xs/build-vision-vulkan/llama/ggml/src/ggml-vulkan/vulkan-shaders-gen-prefix/src/vulkan-shaders-gen-stamp/vulkan-shaders-gen-configure
+CMake Error: CMake was unable to find a build program corresponding to "Ninja".  CMAKE_MAKE_PROGRAM is not set.  You probably need to select a different build tool.
+CMake Error: CMAKE_C_COMPILER not set, after EnableLanguage
+CMake Error: CMAKE_CXX_COMPILER not set, after EnableLanguage
+-- Configuring incomplete, errors occurred!
+[6/449] Building CXX object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o
+[7/449] Building C object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o
+[8/449] Building CXX object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
+[9/449] Building CXX object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+[10/449] Building C object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
+[11/449] Building CXX object llama/ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
+ninja: build stopped: subcommand failed.
+
+  [X]  command failed (exit 1): cmake
+
+Setup stopped. Fix the item above and run it again - everything already done is kept and skipped.

@@ -1,0 +1,462 @@
+Strata - Qwen3.8-Flash-Next on a normal PC (an Intel GPU + system RAM + CPU)
+
+=== Step 1: checking your PC ===
+  Your Intel GPUs:
+    GPU 0: Intel GPU 0xa780, no VRAM of its own - can be used
+    GPU 1: Intel GPU 0xe223, 32 GB VRAM - can be used
+  [ok] GPU: Intel GPU 0xe223, 32 GB VRAM, PCI 0000:03:00.0, PCIe link 32.0 GT/s PCIe x16
+  [ok] RAM: 92 GB
+  [ok] CPU: Intel(R) Core(TM) i7-14700 (AVX2)
+
+=== Step 2: your choices ===
+  [ok] model: Qwen3.8-Flash-Next
+
+  1) Q2_0     2-bit, the fastest; download 66 GB, uses ~34 GB of RAM
+  2) IQ2_XS   2-bit i-quant, a little better quality, close in speed; download 68 GB, uses ~36 GB of RAM
+  3) IQ3_XXS  3-bit i-quant, better quality, slower (more CPU work per token); download 76 GB, uses ~43 GB of RAM
+  4) IQ3_S    3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running; download 84 GB, uses ~50 GB of RAM
+  [ok] size: IQ2_XS
+
+  Context length = how much text the model can see at once (your chat, files, tool output).
+  Longer needs more VRAM for it, so fewer experts fit on the GPU:
+  1) 8K tokens
+  2) 32K tokens
+  3) 64K tokens
+  4) 128K tokens   (recommended for your GPU)
+  5) 256K tokens
+  6) 384K tokens   (experimental: setup adds rope scaling)
+  7) 512K tokens   (experimental: setup adds rope scaling)
+  [ok] context: 131072 tokens
+  [ok] KV cache: 8-bit
+  [ok] images: off
+  [ok] experimental speed projection: off
+
+=== Step 3: Python packages ===
+  Installing numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil ...
+  > /xs/.venv/bin/python -m pip install --quiet --disable-pip-version-check numpy==2.5.3; python_version >= "3.12" numpy==2.4.6; python_version == "3.11" numpy==2.2.6; python_version < "3.11" jinja2==3.1.6 regex==2026.9.10 pyyaml==6.0.3 tqdm==4.70.1 requests==2.34.2 cmake==4.4.3 ninja==1.13.2 pillow==12.3.0 psutil==7.2.2 markupsafe==3.0.3 certifi==2026.7.22 charset-normalizer==3.5.1 idna==3.20 urllib3==2.8.0
+  [ok] numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil installed
+
+=== Step 4: the Strata engine ===
+  llama.cpp source:     8.4 MB   
+  [ok] llama.cpp source downloaded
+  [ok] llama.cpp 3cf0325 (gguf-py, ggml, mtmd)
+  [ok] SYCL compiler: DPC++ compiler 6.2.0 build based on: clang version 21.0.0dpcpp6 (free; no XMX: the slower prompt path)
+  Compiling the Strata engine for the GPU (20-40 minutes, once) ...
+  > /xs/.venv/bin/cmake -G Ninja -DCMAKE_MAKE_PROGRAM=/xs/.venv/bin/ninja -S /xs -B /xs/build-xe -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/dpclang++ -DCMAKE_C_COMPILER=/usr/bin/dpclang -DSTRATA_NONFREE=OFF -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR=/xs/third_party/main/llama.cpp
+-- The CXX compiler identification is Clang 21.0.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/dpclang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test STRATA_HAVE_SYCL
+-- Performing Test STRATA_HAVE_SYCL - Success
+-- The C compiler identification is Clang 21.0.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/dpclang - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- The ASM compiler identification is Clang with GNU-like command-line
+-- Found assembler: /usr/bin/dpclang
+-- Warning: ccache not found - consider installing it for faster compilation or disable this warning with GGML_CCACHE=OFF
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -msse4.2;-mf16c;-mfma;-mbmi2;-mavx;-mavx2 GGML_SSE42;GGML_F16C;GGML_FMA;GGML_BMI2;GGML_AVX;GGML_AVX2
+-- ggml version: 0.24.0
+-- ggml commit:  unknown
+-- Configuring done (4.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /xs/build-xe
+  > /xs/.venv/bin/cmake --build /xs/build-xe --target strata -j 7
+[1/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o
+[2/108] Building CXX object CMakeFiles/strata_platform.dir/src/platform/memory.cpp.o
+[3/108] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o
+[4/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o
+[5/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
+[6/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+[7/108] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
+[8/108] Building CXX object CMakeFiles/strata_platform.dir/src/platform/direct_file.cpp.o
+[9/108] Linking CXX static library libstrata_platform.a
+[10/108] Building CXX object CMakeFiles/strata_ngram.dir/src/kernels/ngram.cpp.o
+[11/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
+[12/108] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/gguf.cpp.o
+[13/108] Building CXX object CMakeFiles/strata_ngram.dir/src/ngram/ple_reader.cpp.o
+[14/108] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o
+[15/108] Linking CXX static library ggml/src/libggml-base.a
+[16/108] Building CXX object CMakeFiles/strata_core.dir/src/core/layout.cpp.o
+[17/108] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o
+[18/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o
+[19/108] Building CXX object CMakeFiles/strata_core.dir/src/core/graph.cpp.o
+[20/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o
+[21/108] Building CXX object CMakeFiles/strata_core.dir/src/core/weights.cpp.o
+[22/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/iqp.cpp.o
+[23/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o
+[24/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/amx.cpp.o
+[25/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/mmq.cpp.o
+[26/108] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o
+[27/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/vec.cpp.o
+[28/108] Building CXX object CMakeFiles/strata_core.dir/src/core/device.cpp.o
+[29/108] Building CXX object CMakeFiles/strata_core.dir/src/core/pinned.cpp.o
+[30/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/binary-ops.cpp.o
+[31/108] Linking CXX static library libstrata_ngram.a
+[32/108] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/quants.c.o
+[33/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
+[34/108] Building CXX object CMakeFiles/strata_core.dir/src/core/gpu.cpp.o
+[35/108] Linking CXX static library libstrata_core.a
+[36/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/arch/x86/repack.cpp.o
+[37/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/unary-ops.cpp.o
+[38/108] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ops.cpp.o
+[39/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/elementwise.cpp.o
+[40/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/rope.cpp.o
+[41/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/router.cpp.o
+[42/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/bf16_gemv.cpp.o
+[43/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/quantize_act.cpp.o
+[44/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/kv_q8.cpp.o
+[45/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/kv_q4.cpp.o
+[46/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/qsa.cpp.o
+[47/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/iq_kernels.cpp.o
+[48/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/qsa_decode_attn.cpp.o
+[49/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/kv_stream.cpp.o
+[50/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/gdn.cpp.o
+[51/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/cvec.cpp.o
+[52/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/fused_gr.cpp.o
+[53/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/gr.cpp.o
+[54/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/verify_kernels.cpp.o
+[55/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/s2_gemv.cpp.o
+[56/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_gdn.cpp.o
+[57/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/s_gemv.cpp.o
+[58/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/shared_expert.cpp.o
+[59/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/sampler.cpp.o
+[60/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_moe.cpp.o
+[61/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/fused_gdn.cpp.o
+[62/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_gdn_preprocess.cpp.o
+[63/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_qsa.cpp.o
+[64/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_ple_postops.cpp.o
+[65/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_qsa_score.cpp.o
+[66/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_mmvq.cpp.o
+[67/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_qsa_indexer.cpp.o
+[68/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/native_flash_attn.cpp.o
+[69/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/qsa_select.cpp.o
+[70/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/ple.cpp.o
+[71/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/expert.cpp.o
+[72/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/qsa_prompt_attn.cpp.o
+[73/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/s2_expert_grouped.cpp.o
+[74/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/q2_avx2.cpp.o
+[75/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/expert_layout.cpp.o
+[76/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/native_expert.cpp.o
+[77/108] Linking CXX static library ggml/src/libggml-cpu.a
+[78/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/pool.cpp.o
+[79/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/dp4a_gemm.cpp.o
+[80/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/iq_avx512.cpp.o
+[81/108] Building CXX object CMakeFiles/strata_kernels_cpu.dir/src/kernels/cpu/iq_avx2.cpp.o
+[82/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/dequant_bf16.cpp.o
+[83/108] Building CXX object CMakeFiles/strata_kernels.dir/src/kernels/xe/xmx_gemm.cpp.o
+[84/108] Linking CXX static library libstrata_kernels.a
+[85/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/expert_cache.cpp.o
+[86/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/remote_experts.cpp.o
+In file included from /xs/src/core/remote_experts.cpp:9:
+In file included from /xs/include/strata/core/remote_experts.hpp:7:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+In file included from /xs/src/core/remote_experts.cpp:9:
+/xs/include/strata/core/remote_experts.hpp:55:13: warning: private field 'n_expert_' is not used [-Wunused-private-field]
+   55 |     int64_t n_expert_ = 0;
+      |             ^
+/xs/include/strata/core/remote_experts.hpp:56:13: warning: private field 'groups_' is not used [-Wunused-private-field]
+   56 |     int32_t groups_ = 0;
+      |             ^
+/xs/include/strata/core/remote_experts.hpp:63:25: warning: private field 'stream_' is not used [-Wunused-private-field]
+   63 |     strata::gpu::Stream stream_ = nullptr;
+      |                         ^
+/xs/include/strata/core/remote_experts.hpp:64:12: warning: private field 'h_x_' is not used [-Wunused-private-field]
+   64 |     float* h_x_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:65:12: warning: private field 'h_out_' is not used [-Wunused-private-field]
+   65 |     float* h_out_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:66:11: warning: private field 'h_meta_' is not used [-Wunused-private-field]
+   66 |     void* h_meta_ = nullptr;
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:67:12: warning: private field 'd_x_' is not used [-Wunused-private-field]
+   67 |     float* d_x_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:68:12: warning: private field 'z_x_' is not used [-Wunused-private-field]
+   68 |     float* z_x_ = nullptr;     ///< h_x_ as the helper GPU sees it (zero-copy: no input copy per layer)
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:69:12: warning: private field 'z_out_' is not used [-Wunused-private-field]
+   69 |     float* z_out_ = nullptr;   ///< h_out_ as the helper GPU sees it (zero-copy: no result copy)
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:70:10: warning: private field 'zero_copy_' is not used [-Wunused-private-field]
+   70 |     bool zero_copy_ = false;
+      |          ^
+/xs/include/strata/core/remote_experts.hpp:71:12: warning: private field 'd_out_' is not used [-Wunused-private-field]
+   71 |     float* d_out_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:72:14: warning: private field 'd_q8_' is not used [-Wunused-private-field]
+   72 |     uint8_t* d_q8_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:73:12: warning: private field 'd_scales_' is not used [-Wunused-private-field]
+   73 |     float* d_scales_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:74:11: warning: private field 'd_scratch_' is not used [-Wunused-private-field]
+   74 |     void* d_scratch_ = nullptr;
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:75:11: warning: private field 'd_meta_' is not used [-Wunused-private-field]
+   75 |     void* d_meta_ = nullptr;  ///< one contiguous upload of grouped indices, instead of five small copies
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:76:14: warning: private field 'd_start_' is not used [-Wunused-private-field]
+   76 |     int32_t* d_start_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:77:14: warning: private field 'd_dst_' is not used [-Wunused-private-field]
+   77 |     int32_t* d_dst_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:78:14: warning: private field 'd_tok_' is not used [-Wunused-private-field]
+   78 |     int32_t* d_tok_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:79:14: warning: private field 'd_count_' is not used [-Wunused-private-field]
+   79 |     int32_t* d_count_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:80:25: warning: private field 'd_ptr_' is not used [-Wunused-private-field]
+   80 |     unsigned long long* d_ptr_ = nullptr;
+      |                         ^
+21 warnings generated.
+In file included from /xs/src/core/remote_experts.cpp:9:
+In file included from /xs/include/strata/core/remote_experts.hpp:7:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+In file included from /xs/src/core/remote_experts.cpp:9:
+/xs/include/strata/core/remote_experts.hpp:55:13: warning: private field 'n_expert_' is not used [-Wunused-private-field]
+   55 |     int64_t n_expert_ = 0;
+      |             ^
+/xs/include/strata/core/remote_experts.hpp:56:13: warning: private field 'groups_' is not used [-Wunused-private-field]
+   56 |     int32_t groups_ = 0;
+      |             ^
+/xs/include/strata/core/remote_experts.hpp:63:25: warning: private field 'stream_' is not used [-Wunused-private-field]
+   63 |     strata::gpu::Stream stream_ = nullptr;
+      |                         ^
+/xs/include/strata/core/remote_experts.hpp:64:12: warning: private field 'h_x_' is not used [-Wunused-private-field]
+   64 |     float* h_x_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:65:12: warning: private field 'h_out_' is not used [-Wunused-private-field]
+   65 |     float* h_out_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:66:11: warning: private field 'h_meta_' is not used [-Wunused-private-field]
+   66 |     void* h_meta_ = nullptr;
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:67:12: warning: private field 'd_x_' is not used [-Wunused-private-field]
+   67 |     float* d_x_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:68:12: warning: private field 'z_x_' is not used [-Wunused-private-field]
+   68 |     float* z_x_ = nullptr;     ///< h_x_ as the helper GPU sees it (zero-copy: no input copy per layer)
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:69:12: warning: private field 'z_out_' is not used [-Wunused-private-field]
+   69 |     float* z_out_ = nullptr;   ///< h_out_ as the helper GPU sees it (zero-copy: no result copy)
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:70:10: warning: private field 'zero_copy_' is not used [-Wunused-private-field]
+   70 |     bool zero_copy_ = false;
+      |          ^
+/xs/include/strata/core/remote_experts.hpp:71:12: warning: private field 'd_out_' is not used [-Wunused-private-field]
+   71 |     float* d_out_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:72:14: warning: private field 'd_q8_' is not used [-Wunused-private-field]
+   72 |     uint8_t* d_q8_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:73:12: warning: private field 'd_scales_' is not used [-Wunused-private-field]
+   73 |     float* d_scales_ = nullptr;
+      |            ^
+/xs/include/strata/core/remote_experts.hpp:74:11: warning: private field 'd_scratch_' is not used [-Wunused-private-field]
+   74 |     void* d_scratch_ = nullptr;
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:75:11: warning: private field 'd_meta_' is not used [-Wunused-private-field]
+   75 |     void* d_meta_ = nullptr;  ///< one contiguous upload of grouped indices, instead of five small copies
+      |           ^
+/xs/include/strata/core/remote_experts.hpp:76:14: warning: private field 'd_start_' is not used [-Wunused-private-field]
+   76 |     int32_t* d_start_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:77:14: warning: private field 'd_dst_' is not used [-Wunused-private-field]
+   77 |     int32_t* d_dst_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:78:14: warning: private field 'd_tok_' is not used [-Wunused-private-field]
+   78 |     int32_t* d_tok_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:79:14: warning: private field 'd_count_' is not used [-Wunused-private-field]
+   79 |     int32_t* d_count_ = nullptr;
+      |              ^
+/xs/include/strata/core/remote_experts.hpp:80:25: warning: private field 'd_ptr_' is not used [-Wunused-private-field]
+   80 |     unsigned long long* d_ptr_ = nullptr;
+      |                         ^
+21 warnings generated.
+[87/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/expert_source.cpp.o
+In file included from /xs/src/core/expert_source.cpp:5:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+1 warning generated.
+In file included from /xs/src/core/expert_source.cpp:5:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+1 warning generated.
+[88/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/layer.cpp.o
+/xs/src/core/layer.cpp:845:774: warning: unused variable 'n_bid' [-Wunused-variable]
+  845 | bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^~~~~
+/xs/src/core/layer.cpp:845:819: warning: unused variable 'width' [-Wunused-variable]
+  845 | bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ^~~~~
+/xs/src/core/layer.cpp:1167:23: warning: unused variable 'hcd' [-Wunused-variable]
+ 1167 |         const int64_t hcd = strata::kernels::NG_HC_DIM;
+      |                       ^~~
+3 warnings generated.
+/xs/src/core/layer.cpp:845:774: warning: unused variable 'n_bid' [-Wunused-variable]
+  845 | bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^~~~~
+/xs/src/core/layer.cpp:845:819: warning: unused variable 'width' [-Wunused-variable]
+  845 | bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t pos, int32_t pos_base,               const QsaState& st, const QsaBuffers& b, const float* x, float* out, void* stream,               std::string& err, float* dump) {    using namespace strata::kernels;    const QsaShapes s = qsa_shapes(g);    const LayerView v(tables, layer);    const int64_t n_kv = pos + 1;    /* P7 audit: RoPE reads cos/sin row pos_base + pos, and the table holds max_cells rows. */    if ((int64_t) pos_base + pos >= st.max_cells || pos_base < 0) {        err = "qsa_layer: position " + std::to_string((long long) pos_base + pos) + " is outside the RoPE table (" + std::to_string((long long) st.max_cells) + " rows)";        return false;    }    const int64_t n_bid = n_kv / s.idx_block;    const int64_t width = qsa_selection_width(n_kv, s);    const int64_t cap = qsa_selection_width(kTopkMaxCells, s);
+      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   ^~~~~
+/xs/src/core/layer.cpp:1167:23: warning: unused variable 'hcd' [-Wunused-variable]
+ 1167 |         const int64_t hcd = strata::kernels::NG_HC_DIM;
+      |                       ^~~
+3 warnings generated.
+[89/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/session.cpp.o
+[90/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/native_head.cpp.o
+[91/108] Linking CXX static library libstrata_kernels_cpu.a
+[92/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/conversation_memory.cpp.o
+[93/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/native_dense.cpp.o
+[94/108] Building CXX object CMakeFiles/strata_prefill.dir/src/prefill/gemm.cpp.o
+[95/108] Building CXX object CMakeFiles/strata_spec.dir/src/spec/suffix_drafter.cpp.o
+[96/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/conversation_snapshot.cpp.o
+[97/108] Building CXX object CMakeFiles/strata_spec.dir/src/spec/controller.cpp.o
+[98/108] Building CXX object CMakeFiles/strata_spec.dir/src/spec/draft_policy.cpp.o
+[99/108] Linking CXX static library libstrata_spec.a
+[100/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/conversation_state.cpp.o
+[101/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/mtp.cpp.o
+[102/108] Building CXX object CMakeFiles/strata_engine.dir/src/core/verify.cpp.o
+In file included from /xs/src/core/verify.cpp:5:
+In file included from /xs/include/strata/core/verify.hpp:29:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+1 warning generated.
+In file included from /xs/src/core/verify.cpp:5:
+In file included from /xs/include/strata/core/verify.hpp:29:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+1 warning generated.
+[103/108] Linking CXX static library libstrata_engine.a
+[104/108] Building CXX object CMakeFiles/strata_prefill.dir/src/prefill/prefill.cpp.o
+In file included from /xs/src/prefill/prefill.cpp:5:
+In file included from /xs/include/strata/prefill/prefill.hpp:17:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+/xs/src/prefill/prefill.cpp:72:67: warning: unused variable 'NE' [-Wunused-const-variable]
+   72 | constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+      |                                                                   ^~
+In file included from /xs/src/prefill/prefill.cpp:31:
+/xs/include/strata/prefill/moe_mmq.hpp:58:11: warning: private field 'ctx_' is not used [-Wunused-private-field]
+   58 |     void* ctx_ = nullptr;
+      |           ^
+3 warnings generated.
+In file included from /xs/src/prefill/prefill.cpp:5:
+In file included from /xs/include/strata/prefill/prefill.hpp:17:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+/xs/src/prefill/prefill.cpp:72:67: warning: unused variable 'NE' [-Wunused-const-variable]
+   72 | constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+      |                                                                   ^~
+In file included from /xs/src/prefill/prefill.cpp:31:
+/xs/include/strata/prefill/moe_mmq.hpp:58:11: warning: private field 'ctx_' is not used [-Wunused-private-field]
+   58 |     void* ctx_ = nullptr;
+      |           ^
+3 warnings generated.
+[105/108] Building CXX object CMakeFiles/strata_prefill.dir/src/prefill/kernels.cpp.o
+/xs/src/prefill/kernels.cpp:67:8: warning: unused function 'groups_for' [-Wunused-function]
+   67 | size_t groups_for(int64_t n, int t = 256) { return (size_t) ((n + t - 1) / t) * t; }
+      |        ^~~~~~~~~~
+1 warning generated.
+/xs/src/prefill/kernels.cpp:67:8: warning: unused function 'groups_for' [-Wunused-function]
+   67 | size_t groups_for(int64_t n, int t = 256) { return (size_t) ((n + t - 1) / t) * t; }
+      |        ^~~~~~~~~~
+1 warning generated.
+[106/108] Linking CXX static library libstrata_prefill.a
+[107/108] Building CXX object CMakeFiles/strata.dir/src/program/generate.cpp.o
+In file included from /xs/src/program/generate.cpp:24:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+/xs/src/program/generate.cpp:694:5: warning: unused function 'argmax' [-Wunused-function]
+  694 | int argmax(const std::vector<float>& v) {
+      |     ^~~~~~
+2 warnings generated.
+In file included from /xs/src/program/generate.cpp:24:
+/xs/include/strata/core/expert_source.hpp:427:13: warning: 'reads' overrides a member function but is not marked 'override' [-Winconsistent-missing-override]
+  427 |     int64_t reads() const { return reads_; }
+      |             ^
+/xs/include/strata/core/expert_source.hpp:61:21: note: overridden virtual function is here
+   61 |     virtual int64_t reads() const { return 0; }
+      |                     ^
+/xs/src/program/generate.cpp:694:5: warning: unused function 'argmax' [-Wunused-function]
+  694 | int argmax(const std::vector<float>& v) {
+      |     ^~~~~~
+2 warnings generated.
+[108/108] Linking CXX executable strata
+  [ok] engine compiled: /xs/engine/strata
+  [ok] engine: /xs/engine/strata
+
+=== Step 5: downloading Qwen3.8-Flash-Next IQ2_XS ===
+  [ok] model files present
+
+=== Step 6: preparing the model for Strata ===
+  > /xs/.venv/bin/python /xs/tools/iq_pack.py --gguf /models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf --out /data/packs/iq2_xs
+tokenizer/: vocab 248320, merges 247587, pre qwen35, specials {'tokenizer.ggml.eos_token_id': 248046, 'tokenizer.ggml.padding_token_id': 248044, 'tokenizer.ggml.bos_token_id': 248044}
+model shards: Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf, Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+index.txt: 1079 tensors, 302 served natively, 0 in extra.bin, arena 1.43 GiB
+  [ok] model prepared: /data/packs/iq2_xs
+  [ok] MTP draft layer: /data/mtp/rt
+
+=== Step 7: writing the start script ===
+  [ok] KV streaming on: the context's KV cache lives in RAM (1.8 GB), more experts fit in VRAM
+  [ok] start script: run-iq2_xs.sh
+
+All set.
+  API (OpenAI):     http://127.0.0.1:8095/v1   (any API key; model name: anything)
+  API (Anthropic):  http://127.0.0.1:8095/v1/messages
+  Next time:        just run ./setup.sh (or run-iq2_xs.sh) - it starts right away

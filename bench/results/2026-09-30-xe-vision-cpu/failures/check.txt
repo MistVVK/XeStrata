@@ -1,0 +1,8 @@
+enc_err_start.sh: RuntimeError after 0.0 s: the vision encoder did not start: ERR cannot load the vision encoder x
+enc_silent.sh: RuntimeError after 3.0 s: the vision encoder did not start: no answer within 3 s
+ok image: 4
+bad: ValueError after 0.0 s: the image could not be read: cannot read the image /tmp/strata-vision-XXXX/bad4375bb70ea92bcb56d39f95657f83.img; dead=None
+die: ValueError after 0.0 s: the image could not be read: the vision encoder stopped; dead='the vision encoder stopped'
+after: ValueError after 0.0 s: images are unavailable: the vision encoder stopped; dead='the vision encoder stopped'
+hang: ValueError after 0.0 s: images are unavailable: the vision encoder stopped; dead='the vision encoder stopped'
+hang: ValueError after 3.0 s: the image could not be read: the vision encoder did not answer within 3 s; dead='the vision encoder did not answer within 3 s'; alive=False

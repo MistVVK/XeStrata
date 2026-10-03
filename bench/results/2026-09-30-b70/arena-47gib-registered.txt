@@ -1,0 +1,18 @@
+stream_bandwidth: device USM allocation failed for 50960793600 bytes
+expert arena: 72 layers x 512 blobs x 1382400 B = 47.461 GiB
+before allocation: memlock 8388608 B; VmLck:	       0 kB
+backing: one mapping registered for device copies; transparent huge pages requested (madvise); no mlock
+after load and touch: memlock 8388608 B; VmLck:	       0 kB
+loaded 47.461 GiB in 7.929 s with 8 threads and 16 MiB chunks  ->  5.99 GiB/s
+per-layer checksums (FNV-1a 64):
+  layer 0  5840217a9ddd0383
+  layer 1  5840217a9ddd0383
+  layer 2  5840217a9ddd0383
+  layer 3  5840217a9ddd0383
+  ... 68 more (all layers loaded)
+
+expert stream (host -> device, one reused destination):
+  1 blob (1.38 MB)   chunk     1.38 MB   13.91 GB/s  (379.688 GiB in 29.316 s)
+  16 blobs (22 MB)   chunk    22.12 MB   14.39 GB/s  (379.688 GiB in 28.332 s)
+  1 layer (707 MB)   chunk   707.79 MB   14.41 GB/s  (379.688 GiB in 28.288 s)
+after transfers: memlock 8388608 B; VmLck:	       0 kB

@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-22f998c150e64c7d9f4cd74b",
+ "object": "chat.completion",
+ "created": 1790748113,
+ "model": "swift-iq3_xxs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content. I need to identify the text and the shapes with their colors.\n\nLooking at the image: there's a red circle on the left, a blue square on the right, and text below reading \"HELLO 4172\" in black.\n\nLet me"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 371,
+  "completion_tokens": 64,
+  "total_tokens": 435,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 371,
+  "prompt_ms": 2812.7,
+  "prompt_per_token_ms": 7.581,
+  "prompt_per_second": 131.9,
+  "predicted_n": 64,
+  "predicted_ms": 1524.9,
+  "predicted_per_token_ms": 23.827,
+  "predicted_per_second": 42.0,
+  "draft_n": 54,
+  "draft_n_accepted": 43
+ }
+}

@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-32a5c574a0504a8d9c12b279",
+ "object": "chat.completion",
+ "created": 1790747456,
+ "model": "qwen-iq3_s",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a one-sentence description of each image. I need to look carefully at both images and capture the essential visual elements: shapes, colors, text, and layout.\n\nImage 1: A red circle on the left, a blue square on the right, both roughly aligned horizontally near the top. Below"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 586,
+  "completion_tokens": 64,
+  "total_tokens": 650,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 586,
+  "prompt_ms": 3772.5,
+  "prompt_per_token_ms": 6.438,
+  "prompt_per_second": 155.3,
+  "predicted_n": 64,
+  "predicted_ms": 1678.4,
+  "predicted_per_token_ms": 26.225,
+  "predicted_per_second": 38.1,
+  "draft_n": 58,
+  "draft_n_accepted": 44
+ }
+}

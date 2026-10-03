@@ -1,0 +1,9 @@
+read-only kernel: 547.8 GB/s
+read-only kernel: 590.7 GB/s
+read-only kernel: 590.4 GB/s
+dp4a mode 0: 1228.9 Gdot/s
+dp4a mode 1: 5112.6 Gdot/s
+dp4a mode 2: 5140.4 Gdot/s
+dp4a mode 0: 1236.3 Gdot/s
+dp4a mode 1: 5178.9 Gdot/s
+dp4a mode 2: 5181.5 Gdot/s

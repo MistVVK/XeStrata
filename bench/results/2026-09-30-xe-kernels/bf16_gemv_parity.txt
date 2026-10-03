@@ -1,0 +1,11 @@
+  ssm_alpha.weight  [2560, 48]       naive 3.85e-07  warp 9.07e-08  split256 5.99e-08
+      bf16 vs fp16 activation        yes (0.1447% apart)
+  indexer.k_proj   [2560, 128]       naive 8.22e-08  warp 8.22e-08  split256 6.62e-08
+      bf16 vs fp16 activation        yes (0.1561% apart)
+  indexer.q_proj   [2560, 512]       naive 7.73e-08  warp 7.73e-08  split256 7.08e-08
+      bf16 vs fp16 activation        yes (0.1456% apart)
+  ple_value        [2560, 2560]      naive 8.00e-08  warp 8.00e-08  split256 6.80e-08
+      bf16 vs fp16 activation        yes (0.1411% apart)
+
+bf16_gemv: 0 failures
+bf16_gemv_parity OK

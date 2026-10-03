@@ -1,0 +1,4 @@
+s2_gemv: n_in 2560, n_out 640, 0 rows over tolerance, worst rel 0.000e+00 (tol 1.0e-05)
+  reference spread [-1155, 5062]
+  agrees with the scalar decode that dequant_xcheck proved equal to ggml
+s2_gemv_parity OK

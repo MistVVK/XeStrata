@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-9e24bbd4a4314619bb207212",
+ "object": "chat.completion",
+ "created": 1790747254,
+ "model": "qwen-iq3_xxs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a one-sentence description for each of the two images. Let me look carefully at both.\n\nImage 1: There's a red circle on the left and a blue square on the right, positioned side by side in the upper portion. Below them, centered, is the text \"HELLO "
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 586,
+  "completion_tokens": 64,
+  "total_tokens": 650,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 586,
+  "prompt_ms": 2991.9,
+  "prompt_per_token_ms": 5.106,
+  "prompt_per_second": 195.9,
+  "predicted_n": 64,
+  "predicted_ms": 1410.7,
+  "predicted_per_token_ms": 22.042,
+  "predicted_per_second": 45.4,
+  "draft_n": 51,
+  "draft_n_accepted": 46
+ }
+}

@@ -1,0 +1,5 @@
+Intel(R) Graphics [0xe223]
+clock_sub_group 1 clock_work_group 0 clock_device 0
+profiling timer resolution 52 ns
+event profiling: 263438 ns across two tasks
+sub_group clock 10281818794236

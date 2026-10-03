@@ -1,0 +1,6 @@
+1. stream: 63 chunks in 2.9 s: ', yellow, blue (traditional) or red, green, blue (light). User likely expects three primary colors. Answer: red, yellow, blue. Maybe include note? Keep simple.\n'
+2. cancelled after 8 chunks
+2. after the cancel: 2.1 s, usage {'prompt_tokens': 68, 'completion_tokens': 33, 'total_tokens': 101, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 2.7 s, usage {'prompt_tokens': 61, 'completion_tokens': 53, 'total_tokens': 114, 'prompt_tokens_details': {'cached_tokens': 0}}: 'Got it, Aiko. I’ll remember your name.'
+3. turn 2: 1.8 s, usage {'prompt_tokens': 92, 'completion_tokens': 46, 'total_tokens': 138, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is Aiko.'
+3. turn 3: 2.4 s, usage {'prompt_tokens': 117, 'completion_tokens': 60, 'total_tokens': 177, 'prompt_tokens_details': {'cached_tokens': 87}}: 'okiA'

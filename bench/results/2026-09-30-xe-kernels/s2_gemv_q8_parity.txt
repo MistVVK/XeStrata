@@ -1,0 +1,5 @@
+  q8-activation GEMV vs host reference   matches (0 of 64 over 1e-4, worst rel 4.523e-05, mean |ref| 0.290)
+  fp16-activation vs q8-activation       0.8022% of the reference magnitude
+
+s2_gemv_q8: 0 failures
+s2_gemv_q8_parity OK

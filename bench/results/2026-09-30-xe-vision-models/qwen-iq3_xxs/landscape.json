@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-474fbdf5242345a6a993e5eb",
+ "object": "chat.completion",
+ "created": 1790747243,
+ "model": "qwen-iq3_xxs",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "Thinking Process:\n1.  **Analyze the Request:** The user wants to know the text written in the image, and the shapes and colors present in it.\n2.  **Examine the Image:**\n    *   **Text:** \"HELLO 4172\" (located at the"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 371,
+  "completion_tokens": 64,
+  "total_tokens": 435,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 371,
+  "prompt_ms": 2886.3,
+  "prompt_per_token_ms": 7.78,
+  "prompt_per_second": 128.5,
+  "predicted_n": 64,
+  "predicted_ms": 1591.8,
+  "predicted_per_token_ms": 24.872,
+  "predicted_per_second": 40.2,
+  "draft_n": 55,
+  "draft_n_accepted": 46
+ }
+}

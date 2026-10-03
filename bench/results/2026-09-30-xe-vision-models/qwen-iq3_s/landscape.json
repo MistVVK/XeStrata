@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-d7a08c3b2d854712b5a7f3bf",
+ "object": "chat.completion",
+ "created": 1790747440,
+ "model": "qwen-iq3_s",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content. Let me carefully examine the image to extract all relevant details.\n\nLooking at the image, I need to identify:\n1. The text present\n2. The shapes present\n3. The colors of those shapes\n\nExamining the image systematically:\n\nTop portion:"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 371,
+  "completion_tokens": 64,
+  "total_tokens": 435,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 371,
+  "prompt_ms": 6340.3,
+  "prompt_per_token_ms": 17.09,
+  "prompt_per_second": 58.5,
+  "predicted_n": 64,
+  "predicted_ms": 1650.4,
+  "predicted_per_token_ms": 25.788,
+  "predicted_per_second": 38.8,
+  "draft_n": 55,
+  "draft_n_accepted": 45
+ }
+}

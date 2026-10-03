@@ -1,0 +1,6 @@
+
+
+The user wants a description of the image content. I need to identify the text, the shapes, and the colors present.
+
+Looking at the image: there's a green triangle in the upper portion, centered. Below it is the word "PELICAN" in black, bold, uppercase letters. The background
+

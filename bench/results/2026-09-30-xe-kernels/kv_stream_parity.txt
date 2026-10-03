@@ -1,0 +1,8 @@
+kv_stream_parity: streamed vs resident KV, bitwise
+  int8: 306 batches, 703691 block lookups, 71323 misses (89.9% hit), overflow 0, 0 failures
+  int8 ring restore: identical
+  fp16: 306 batches, 672800 block lookups, 69566 misses (89.7% hit), overflow 0, 0 failures
+  fp16 ring restore: identical
+  q4_0: 306 batches, 680672 block lookups, 69184 misses (89.8% hit), overflow 0, 0 failures
+  q4_0 ring restore: identical
+PASS

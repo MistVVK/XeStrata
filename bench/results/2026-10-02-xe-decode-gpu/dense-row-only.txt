@@ -1,0 +1,37 @@
+matrix           type   n_in  n_out    n |     1 col    2 cols    4 cols |     ms@1     ms@2     ms@4  (us per call; ms for all calls)
+output head      14     2560 248320    1 |     874.6     886.9    1216.6 |     0.87     0.89     1.22    596 GB/s at 1 col
+attn_qkv         14     2560  10240   22 |      25.1      33.6      50.7 |     0.55     0.74     1.12    855 GB/s at 1 col
+attn_qkv         13     2560  10240   10 |      47.8      53.0      67.8 |     0.48     0.53     0.68    377 GB/s at 1 col
+attn_qkv         12     2560  10240    2 |      47.9      62.2      77.0 |     0.10     0.12     0.15    308 GB/s at 1 col
+attn_qkv         23     2560  10240    2 |      69.8      75.6      83.3 |     0.14     0.15     0.17    200 GB/s at 1 col
+ssm_out          14     6144   2560   29 |      21.8      29.2      39.9 |     0.63     0.85     1.16    592 GB/s at 1 col
+ssm_out          13     6144   2560    4 |      42.7      49.2      59.9 |     0.17     0.20     0.24    253 GB/s at 1 col
+ssm_out          12     6144   2560    3 |      37.3      48.5      61.6 |     0.11     0.15     0.18    237 GB/s at 1 col
+attn_gate        14     2560   6144   14 |      15.8      20.9      31.2 |     0.22     0.29     0.44    814 GB/s at 1 col
+attn_gate        12     2560   6144   10 |      29.9      38.7      47.7 |     0.30     0.39     0.48    296 GB/s at 1 col
+attn_gate        23     2560   6144    8 |      42.5      46.1      50.9 |     0.34     0.37     0.41    197 GB/s at 1 col
+attn_gate        13     2560   6144    4 |      29.8      33.0      42.2 |     0.12     0.13     0.17    363 GB/s at 1 col
+attn_output      14     6144   2560   11 |      21.6      29.1      39.7 |     0.24     0.32     0.44    596 GB/s at 1 col
+attn_output      12     6144   2560    1 |      37.3      48.5      61.6 |     0.04     0.05     0.06    237 GB/s at 1 col
+attn_q           14     2560  12288    5 |      30.6      40.5      60.9 |     0.15     0.20     0.30    842 GB/s at 1 col
+attn_q           13     2560  12288    3 |      56.4      62.6      80.4 |     0.17     0.19     0.24    383 GB/s at 1 col
+attn_q           23     2560  12288    3 |      83.5      90.4      99.5 |     0.25     0.27     0.30    200 GB/s at 1 col
+attn_q           12     2560  12288    1 |      56.5      73.3      91.7 |     0.06     0.07     0.09    313 GB/s at 1 col
+attn_k           14     2560    512   11 |       3.7       4.2       5.8 |     0.04     0.05     0.06    291 GB/s at 1 col
+attn_v           14     2560    512   10 |       3.7       4.2       5.8 |     0.04     0.04     0.06    290 GB/s at 1 col
+shexp down       20      640   2560   47 |      13.2      13.2      15.5 |     0.62     0.62     0.73     70 GB/s at 1 col
+shexp gate/up    14     2560    640   26 |       4.0       4.5       6.6 |     0.10     0.12     0.17    337 GB/s at 1 col
+shexp gate/up    12     2560    640   30 |       5.1       6.3       8.1 |     0.15     0.19     0.24    181 GB/s at 1 col
+shexp gate/up    23     2560    640   28 |       7.2       7.6       9.1 |     0.20     0.21     0.25    121 GB/s at 1 col
+shexp gate/up    13     2560    640   12 |       4.9       5.7       7.4 |     0.06     0.07     0.09    229 GB/s at 1 col
+router           bf16   2560    512   48 |       4.7       8.8      10.2 |     0.23     0.42     0.49    558 GB/s at 1 col
+indexer q        bf16   2560    512   12 |       4.6       8.6      10.0 |     0.06     0.10     0.12    571 GB/s at 1 col
+indexer k        bf16   2560    128   12 |       3.0       4.8       5.7 |     0.04     0.06     0.07    217 GB/s at 1 col
+ssm alpha/beta   bf16   2560     48   72 |       2.4       4.1       5.0 |     0.17     0.30     0.36    102 GB/s at 1 col
+hc read          bf16  10240    320   96 |      31.1      34.7      45.4 |     2.98     3.33     4.36    425 GB/s at 1 col
+
+per window (ms)            1 col    2 cols   4 cols
+quantized matrices          6.15     7.20     9.44   (2.63 GB, 4.5 ms at 590 GB/s)
+Q8_1 quantize (x300)        0.69     0.71     0.73
+BF16 projections            0.49     0.88     1.04
+hc read                     2.98     3.33     4.36

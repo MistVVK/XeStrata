@@ -1,0 +1,24 @@
+The SVE1 embeddings of the same image from the CPU encoder and the SYCL encoder, both at --max-tokens 300,
+compared in float64 (numpy): shapes, non-finite values, max |difference|, relative L2 and L1 over all values,
+the relative L2 of each row (image token), and the cosine of each row.
+
+landscape cpu (300, 20, 15, 2560) sycl (300, 20, 15, 2560) same shape
+  finite cpu/sycl: True True  max|cpu| 0.4874  max abs diff 0.1088  rel L2 0.05571  rel L1 0.0214
+  per-row rel L2: median 0.00964, max 0.425 (row 115)
+portrait cpu (220, 11, 20, 2560) sycl (220, 11, 20, 2560) same shape
+  finite cpu/sycl: True True  max|cpu| 0.4448  max abs diff 0.05752  rel L2 0.02996  rel L1 0.01557
+  per-row rel L2: median 0.00795, max 0.326 (row 117)
+sycl run-to-run (same image twice): max abs diff 0.0
+
+landscape, the rows that differ most (x, y on the 20 x 15 grid; |row| is the CPU row's L2 norm, median 1.76):
+row  (x,y)   rel    |row|
+ 115 (15, 5) 0.425 1.38
+  71 (11, 3) 0.402 2.54
+  94 (14, 4) 0.327 3.20
+ 174 (14, 8) 0.244 4.82
+ 125 ( 5, 6) 0.197 1.35
+ 135 (15, 6) 0.152 0.78
+ 112 (12, 5) 0.142 1.21
+ 251 (11,12) 0.082 2.96
+rows over 10%: 7 of 300
+cosine: min 0.9159 median 0.99997

@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-eaebaee026694177b6f6c984",
+ "object": "chat.completion",
+ "created": 1790747800,
+ "model": "coder-iq1_m",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content. I need to identify the text, the shapes, and their colors. Let me look carefully.\n\nText: \"HELLO 4172\" in black, bold, sans-serif font, positioned at the bottom.\n\nShapes: On the left, a red"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 371,
+  "completion_tokens": 64,
+  "total_tokens": 435,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 371,
+  "prompt_ms": 1575.5,
+  "prompt_per_token_ms": 4.247,
+  "prompt_per_second": 235.5,
+  "predicted_n": 64,
+  "predicted_ms": 1618.8,
+  "predicted_per_token_ms": 25.294,
+  "predicted_per_second": 39.5,
+  "draft_n": 57,
+  "draft_n_accepted": 46
+ }
+}

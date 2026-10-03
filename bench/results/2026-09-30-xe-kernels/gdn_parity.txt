@@ -1,0 +1,19 @@
+  modulo vs interleave head pairing          yes  (142.03% apart)
+  decay before vs after the update           yes  (76.95% apart)
+
+  o vs reference                             rel 2.115e-07
+  state (read via (S,h_v,S)) vs reference    rel 4.834e-08
+  gate=beta=0 from a zero state is a no-op   yes
+
+  conv weight layout is observable           yes  (182.5% apart)
+  conv out vs reference                      rel 1.812e-08
+  conv state slide (mapped) vs reference     rel 0.000e+00
+
+  eps on sum vs on mean is observable        yes  (1031.4% apart)
+  l2_norm vs reference                       rel 0.000e+00
+
+  out norm (rms * ssm_norm * sigmoid z)      rel 1.425e-08
+  sigmoid vs SiLU on the gate is observable  yes  (86.78% apart)
+
+gdn: 0 failures
+gdn_parity OK

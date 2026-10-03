@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-ea69c7c5cbaa400a818c2a4c",
+ "object": "chat.completion",
+ "created": 1790747450,
+ "model": "qwen-iq3_s",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "The user wants a description of the image content: text, shapes, and colors. Let me look carefully.\n\nThe image has a white background. There's a green triangle in the upper portion, pointing upward (apex at top, base at bottom). Below it is the word \"PELICAN\" in black"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 291,
+  "completion_tokens": 64,
+  "total_tokens": 355,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 291,
+  "prompt_ms": 3251.3,
+  "prompt_per_token_ms": 11.173,
+  "prompt_per_second": 89.5,
+  "predicted_n": 64,
+  "predicted_ms": 1774.2,
+  "predicted_per_token_ms": 27.722,
+  "predicted_per_second": 36.1,
+  "draft_n": 54,
+  "draft_n_accepted": 41
+ }
+}

@@ -1,0 +1,17 @@
+  covers(): steered layers only                                      ok
+project
+    max |err| 4.86e-07, max |h'.v + h.v| 1.63e-06
+  project matches h - s (h.v) v (s = 2)                              ok
+  the component along v is reflected (s = 2)                         ok
+    max |h'.v| 7.61e-07
+  s = 1 projects the direction out                                   ok
+  a layer without a direction is untouched                           ok
+switched off
+  cvec_enabled() follows the switch                                  ok
+  off, no pending write: R unchanged                                 ok
+  off, pending write: bitwise the fused read's folded write          ok
+    write + project: max |err| 4.78e-07
+  on, pending write: the write, then the projection                  ok
+add
+  add is h + d in every stream (bitwise)                             ok
+cvec_parity: all passed

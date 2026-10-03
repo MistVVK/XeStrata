@@ -1,0 +1,38 @@
+{
+ "id": "chatcmpl-13cb889971184495948aa51a",
+ "object": "chat.completion",
+ "created": 1790747648,
+ "model": "qwen-q2_0",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": null,
+    "reasoning_content": "We need answer user's request: \"Describe each of the two images in one sentence.\" Need likely provide two sentences, one per image. Need analyze images. First image: white background, red circle on left, blue square on right, black text \"HELLO 4172\" below. Second: white"
+   },
+   "finish_reason": "length"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 586,
+  "completion_tokens": 64,
+  "total_tokens": 650,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 586,
+  "prompt_ms": 1997.1,
+  "prompt_per_token_ms": 3.408,
+  "prompt_per_second": 293.4,
+  "predicted_n": 64,
+  "predicted_ms": 1412.1,
+  "predicted_per_token_ms": 22.064,
+  "predicted_per_second": 45.3,
+  "draft_n": 58,
+  "draft_n_accepted": 42
+ }
+}

@@ -1,0 +1,6 @@
+  ctx 1000    scores vs FP64 9.206e-08 (rel to scale 7.220e+00); topk 0/6 queries differ, topk_ref 0/6 differ; queries with a threshold tie 0; tc refused yes
+  ctx 2052    scores vs FP64 9.206e-08 (rel to scale 7.220e+00); topk 0/6 queries differ, topk_ref 0/6 differ; queries with a threshold tie 0; tc refused yes
+  ctx 9001    scores vs FP64 1.037e-07 (rel to scale 6.515e+00); topk 0/6 queries differ, topk_ref 0/6 differ; queries with a threshold tie 6; tc refused yes
+  ctx 60001   scores vs FP64 1.118e-07 (rel to scale 7.853e+00); topk 0/6 queries differ, topk_ref 0/6 differ; queries with a threshold tie 6; tc refused yes
+  ctx 140001  scores vs FP64 1.068e-07 (rel to scale 7.327e+00); topk 0/6 queries differ, topk_ref 0/6 differ; queries with a threshold tie 6; tc refused yes
+qsa_select_check: 0 failures (criteria: scores within 1e-5 of FP64 relative to scale; both top-k kernels equal to the host selection rule on the device scores; the TF32 scorer refuses)

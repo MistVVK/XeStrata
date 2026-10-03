@@ -1,0 +1,6 @@
+image before the kill: {"content": null, "reasoning": "The user wants a description of the image content: text, shapes, colors. Let me ", "usage": {"prompt_tokens": 291, "completion_tokens": 64, "total_tokens": 355, "prompt_tokens_details": {"cached_tokens": 0}}}
+killing the encoder (pid 422961)
+image after the kill:  {"type": "invalid_request_error", "message": "the image could not be read: the vision encoder stopped"}
+text after the kill:   {"content": null, "reasoning": "We need to respond to user: \"Reply with the single word OK.\" Need", "usage": {"prompt_tokens": 59, "completion_tokens": 16, "total_tokens": 75, "prompt_tokens_details": {"cached_tokens": 0}}}
+status: {'enabled': True, 'available': False, 'error': 'the vision encoder stopped'}
+left: 0

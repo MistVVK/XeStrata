@@ -1,0 +1,102 @@
+  S2/Q2_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [494.9, 9440]
+  S4/Q4_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-1.524e+04, 1.491e+04]
+  S4/IQ4_NL  128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-2.514e+05, 1.171e+05]
+  S8/Q8_0    128 rows, 0 over tol, worst rel 0.000e+00   ref spread [-1.885e+05, 1.493e+05]
+s_gemv: 4 type cases, 0 rows over tolerance (tol 1.0e-04)
+  S4/Q4_K    128 rows, 0 over tol, worst rel-to-terms 0.000e+00 (rel-to-result 0.000e+00)
+             ref spread [-6.365e+06, 1.949e+07], condition (sum|term|) up to 2.775e+07
+             CPU planes vs CPU raw block: max |diff| = 0.000e+00 -> the test is SELF-CONSISTENT
+s_gemv total: 0 rows over tolerance
+s2_gemv bench  [2560 x 640]  200 iters
+  ms per gemv: min 0.4832  median 0.4858  mean 0.4857
+  min -> 3.4 G weights/s, 1.0 GiB/s of S2 streamed
+  per token: 1440 roles x 0.4832 ms = 695.8 ms  ->  1.4 tok/s (expert matvec only)
+  NOTE: expert matvec ONLY. No attention, no KV, no norm, no router, no sampling, and it
+        assumes every expert is already resident in VRAM at zero cost.
+  quads tpr=32   min 0.0178 ms  ->   92.2 G weights/s   vs naive 27.20x   checked ok
+  quads tpr=64   min 0.0136 ms  ->  120.8 G weights/s   vs naive 35.62x   checked ok
+  quads tpr=128  min 0.0153 ms  ->  107.0 G weights/s   vs naive 31.56x   checked ok
+  fast global tpr=32   min 0.0242 ms  ->   67.7 G weights/s   vs naive 19.96x   checked ok
+  fast global tpr=64   min 0.0175 ms  ->   93.5 G weights/s   vs naive 27.57x   checked ok
+  fast global tpr=128  min 0.0196 ms  ->   83.6 G weights/s   vs naive 24.64x   checked ok
+  fast staged tpr=32   min 0.0497 ms  ->   32.9 G weights/s   vs naive 9.72x   checked ok
+  fast staged tpr=64   min 0.0308 ms  ->   53.2 G weights/s   vs naive 15.69x   checked ok
+  fast staged tpr=128  min 0.0271 ms  ->   60.4 G weights/s   vs naive 17.82x   checked ok
+  split tpr=32   min 0.0201 ms  ->   81.5 G weights/s   speedup vs naive 24.03x
+  quads tpr=32   min 0.0178 ms  ->   91.9 G weights/s   vs naive 27.11x   checked ok
+  quads tpr=64   min 0.0135 ms  ->  121.0 G weights/s   vs naive 35.70x   checked ok
+  quads tpr=128  min 0.0155 ms  ->  105.8 G weights/s   vs naive 31.21x   checked ok
+  fast global tpr=32   min 0.0239 ms  ->   68.4 G weights/s   vs naive 20.18x   checked ok
+  fast global tpr=64   min 0.0174 ms  ->   94.3 G weights/s   vs naive 27.80x   checked ok
+  fast global tpr=128  min 0.0196 ms  ->   83.6 G weights/s   vs naive 24.67x   checked ok
+  fast staged tpr=32   min 0.0497 ms  ->   32.9 G weights/s   vs naive 9.71x   checked ok
+  fast staged tpr=64   min 0.0303 ms  ->   54.0 G weights/s   vs naive 15.93x   checked ok
+  fast staged tpr=128  min 0.0271 ms  ->   60.4 G weights/s   vs naive 17.80x   checked ok
+  split tpr=64   min 0.0153 ms  ->  107.2 G weights/s   speedup vs naive 31.60x
+  quads tpr=32   min 0.0177 ms  ->   92.3 G weights/s   vs naive 27.23x   checked ok
+  quads tpr=64   min 0.0135 ms  ->  121.5 G weights/s   vs naive 35.83x   checked ok
+  quads tpr=128  min 0.0155 ms  ->  106.0 G weights/s   vs naive 31.25x   checked ok
+  fast global tpr=32   min 0.0240 ms  ->   68.2 G weights/s   vs naive 20.10x   checked ok
+  fast global tpr=64   min 0.0176 ms  ->   93.2 G weights/s   vs naive 27.48x   checked ok
+  fast global tpr=128  min 0.0199 ms  ->   82.4 G weights/s   vs naive 24.31x   checked ok
+  fast staged tpr=32   min 0.0497 ms  ->   33.0 G weights/s   vs naive 9.72x   checked ok
+  fast staged tpr=64   min 0.0304 ms  ->   54.0 G weights/s   vs naive 15.92x   checked ok
+  fast staged tpr=128  min 0.0271 ms  ->   60.5 G weights/s   vs naive 17.85x   checked ok
+  split tpr=128  min 0.0181 ms  ->   90.6 G weights/s   speedup vs naive 26.72x
+  quads tpr=32   min 0.0178 ms  ->   92.1 G weights/s   vs naive 27.15x   checked ok
+  quads tpr=64   min 0.0135 ms  ->  121.0 G weights/s   vs naive 35.67x   checked ok
+  quads tpr=128  min 0.0154 ms  ->  106.3 G weights/s   vs naive 31.36x   checked ok
+  fast global tpr=32   min 0.0240 ms  ->   68.2 G weights/s   vs naive 20.11x   checked ok
+  fast global tpr=64   min 0.0176 ms  ->   93.3 G weights/s   vs naive 27.53x   checked ok
+  fast global tpr=128  min 0.0196 ms  ->   83.5 G weights/s   vs naive 24.62x   checked ok
+  fast staged tpr=32   min 0.0497 ms  ->   32.9 G weights/s   vs naive 9.72x   checked ok
+  fast staged tpr=64   min 0.0308 ms  ->   53.1 G weights/s   vs naive 15.67x   checked ok
+  fast staged tpr=128  min 0.0271 ms  ->   60.5 G weights/s   vs naive 17.83x   checked ok
+  split tpr=256  min 0.0181 ms  ->   90.5 G weights/s   speedup vs naive 26.69x
+s2_gemv bench  [640 x 2560]  200 iters
+  ms per gemv: min 0.1270  median 0.1282  mean 0.1282
+  min -> 12.9 G weights/s, 3.8 GiB/s of S2 streamed
+  per token: 1440 roles x 0.1270 ms = 182.9 ms  ->  5.5 tok/s (expert matvec only)
+  NOTE: expert matvec ONLY. No attention, no KV, no norm, no router, no sampling, and it
+        assumes every expert is already resident in VRAM at zero cost.
+  quads tpr=32   min 0.0154 ms  ->  106.2 G weights/s   vs naive 8.23x   checked ok
+  quads tpr=64   min 0.0154 ms  ->  106.2 G weights/s   vs naive 8.23x   checked ok
+  quads tpr=128  min 0.0176 ms  ->   93.1 G weights/s   vs naive 7.22x   checked ok
+  fast global tpr=32   min 0.0194 ms  ->   84.4 G weights/s   vs naive 6.55x   checked ok
+  fast global tpr=64   min 0.0188 ms  ->   87.0 G weights/s   vs naive 6.75x   checked ok
+  fast global tpr=128  min 0.0222 ms  ->   73.7 G weights/s   vs naive 5.71x   checked ok
+  fast staged tpr=32   min 0.0535 ms  ->   30.6 G weights/s   vs naive 2.37x   checked ok
+  fast staged tpr=64   min 0.0382 ms  ->   42.9 G weights/s   vs naive 3.33x   checked ok
+  fast staged tpr=128  min 0.0323 ms  ->   50.8 G weights/s   vs naive 3.94x   checked ok
+  split tpr=32   min 0.0171 ms  ->   95.9 G weights/s   speedup vs naive 7.44x
+  quads tpr=32   min 0.0155 ms  ->  105.8 G weights/s   vs naive 8.21x   checked ok
+  quads tpr=64   min 0.0154 ms  ->  106.3 G weights/s   vs naive 8.24x   checked ok
+  quads tpr=128  min 0.0179 ms  ->   91.7 G weights/s   vs naive 7.11x   checked ok
+  fast global tpr=32   min 0.0194 ms  ->   84.6 G weights/s   vs naive 6.56x   checked ok
+  fast global tpr=64   min 0.0189 ms  ->   86.9 G weights/s   vs naive 6.74x   checked ok
+  fast global tpr=128  min 0.0220 ms  ->   74.4 G weights/s   vs naive 5.77x   checked ok
+  fast staged tpr=32   min 0.0539 ms  ->   30.4 G weights/s   vs naive 2.36x   checked ok
+  fast staged tpr=64   min 0.0383 ms  ->   42.7 G weights/s   vs naive 3.31x   checked ok
+  fast staged tpr=128  min 0.0319 ms  ->   51.3 G weights/s   vs naive 3.98x   checked ok
+  split tpr=64   min 0.0181 ms  ->   90.7 G weights/s   speedup vs naive 7.03x
+  quads tpr=32   min 0.0155 ms  ->  105.7 G weights/s   vs naive 8.20x   checked ok
+  quads tpr=64   min 0.0155 ms  ->  106.0 G weights/s   vs naive 8.22x   checked ok
+  quads tpr=128  min 0.0177 ms  ->   92.8 G weights/s   vs naive 7.20x   checked ok
+  fast global tpr=32   min 0.0190 ms  ->   86.2 G weights/s   vs naive 6.68x   checked ok
+  fast global tpr=64   min 0.0189 ms  ->   86.9 G weights/s   vs naive 6.74x   checked ok
+  fast global tpr=128  min 0.0226 ms  ->   72.5 G weights/s   vs naive 5.62x   checked ok
+  fast staged tpr=32   min 0.0534 ms  ->   30.7 G weights/s   vs naive 2.38x   checked ok
+  fast staged tpr=64   min 0.0383 ms  ->   42.8 G weights/s   vs naive 3.32x   checked ok
+  fast staged tpr=128  min 0.0320 ms  ->   51.2 G weights/s   vs naive 3.97x   checked ok
+  split tpr=128  min 0.0213 ms  ->   76.9 G weights/s   speedup vs naive 5.96x
+  quads tpr=32   min 0.0155 ms  ->  105.6 G weights/s   vs naive 8.19x   checked ok
+  quads tpr=64   min 0.0156 ms  ->  105.3 G weights/s   vs naive 8.16x   checked ok
+  quads tpr=128  min 0.0179 ms  ->   91.6 G weights/s   vs naive 7.10x   checked ok
+  fast global tpr=32   min 0.0196 ms  ->   83.5 G weights/s   vs naive 6.48x   checked ok
+  fast global tpr=64   min 0.0199 ms  ->   82.3 G weights/s   vs naive 6.38x   checked ok
+  fast global tpr=128  min 0.0220 ms  ->   74.4 G weights/s   vs naive 5.77x   checked ok
+  fast staged tpr=32   min 0.0534 ms  ->   30.7 G weights/s   vs naive 2.38x   checked ok
+  fast staged tpr=64   min 0.0381 ms  ->   43.0 G weights/s   vs naive 3.34x   checked ok
+  fast staged tpr=128  min 0.0323 ms  ->   50.8 G weights/s   vs naive 3.94x   checked ok
+  split tpr=256  min 0.0280 ms  ->   58.5 G weights/s   speedup vs naive 4.53x
+split kernel rows disagreeing with the naive reference: 0

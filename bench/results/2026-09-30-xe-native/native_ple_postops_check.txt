@@ -1,0 +1,6 @@
+  single vs FP64, worst of 12 tokens           result 1.090e-07, normalized 1.935e-07 (rel to scale; scale 5.543e+00)
+  batch of 12 vs single calls: result          0/122880 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 5.543e+00)
+  batch of 12 vs single calls: history         0/92160 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 3.392e+00)
+  batch of 1 vs single calls: result           0/122880 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 5.543e+00)
+  batch of 1 vs single calls: history          0/92160 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 3.392e+00)
+native_ple_postops_check: 0 failures (criteria: single-token result and normalized row within 1e-5 of FP64 relative to scale; batches of 12 and 1 bitwise equal to 12 single-token calls, history included)

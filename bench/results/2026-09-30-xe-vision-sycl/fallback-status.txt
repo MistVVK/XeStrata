@@ -1,0 +1,13 @@
+fallback_check.sh output (/v1/status "vision", the running encoder's oneDNN variables, the reply's first characters):
+
+default status vision: {'enabled': True, 'available': True, 'error': None, 'encoder': 'the B70 encoder', 'fallback': None}
+default encoder <repo>/engine/strata-vision-sycl: GGML_SYCL_ENABLE_DNN=0 GGML_SYCL_FA_ONEDNN=0
+default reply: 'The user wants a description of the image content. I need to identify the text and the sha'
+dnn-on status vision: {'enabled': True, 'available': True, 'error': None, 'encoder': 'the B70 encoder with oneDNN', 'fallback': None}
+dnn-on encoder <repo>/engine/strata-vision-sycl: GGML_SYCL_ENABLE_DNN=1 GGML_SYCL_FA_ONEDNN=1
+dnn-on reply: 'The user wants a description of the image content. I need to identify the text and the sha'
+broken status vision: {'enabled': True, 'available': True, 'error': None, 'encoder': 'the CPU encoder', 'fallback': "the B70 encoder with oneDNN: [Errno 2] No such file or directory: '/nonexistent/strata-vision-sycl'; the B70 encoder: [Errno 2] No such file or directory: '/nonexistent/strata-vision-sycl'"}
+broken encoder <repo>/engine/strata-vision-cpu:
+broken reply: 'The user wants a description of the image content. I need to identify the text and the sha'
+errstart status vision: {'enabled': True, 'available': True, 'error': None, 'encoder': 'the CPU encoder', 'fallback': 'the B70 encoder: the vision encoder did not start: ERR cannot load the vision encoder x'}
+errstart reply: 'The user wants a description of the image content. I need to identify the text and the sha'

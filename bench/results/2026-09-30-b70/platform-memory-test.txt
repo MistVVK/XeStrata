@@ -1,0 +1,2 @@
+lock_resident: ok=0 locked=0 MiB (mlock failed (raise ulimit -l))
+platform_memory_test: FAILED

@@ -1,0 +1,4 @@
+timerResolution 19200000 (cycles/s for DEVICE_PROPERTIES_1_2), timestampValidBits 64, kernelTimestampValidBits 64
+terminate called after throwing an instance of 'sycl::_V1::exception'
+  what():  Enqueue process failed.
+level_zero backend failed with error: 44 (UR_RESULT_ERROR_UNSUPPORTED_FEATURE)

@@ -1,0 +1,8 @@
+  conv raw vs ggml-cpu                         0/1024 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.717e+00)
+  conv silu vs ggml-cpu                        507/1024 bits differ, max |d| 2.384e-07, rel to scale 5.100e-08 (scale 4.675e+00)
+  conv history slide (exact)                   0/3072 bits differ, max |d| 0.000e+00, rel to scale 0.000e+00 (scale 4.290e+00)
+  l2_norm vs ggml-cpu rms_norm + scale         1096/4096 bits differ, max |d| 2.980e-08, rel to scale 9.529e-08 (scale 3.128e-01)
+  beta sigmoid vs ggml-cpu                     12/32 bits differ, max |d| 5.960e-08, rel to scale 5.962e-08 (scale 9.998e-01)
+  gate softplus * ssm_a vs ggml-cpu            2/32 bits differ, max |d| 1.192e-07, rel to scale 4.146e-09 (scale 2.876e+01)
+  out_norm vs ggml-cpu                         1739/4096 bits differ, max |d| 1.788e-07, rel to scale 1.259e-07 (scale 1.421e+00)
+native_gdn_preprocess_check: 0 failures (criterion: within 1e-6 of ggml-cpu relative to the output scale; history exact)

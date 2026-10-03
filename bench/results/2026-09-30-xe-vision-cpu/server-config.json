@@ -1,0 +1,42 @@
+{
+ "exe": "<repo>/build/xe/strata",
+ "args": [
+  "--pack",
+  "<data>/packs/iq2_xs",
+  "--native",
+  "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "--ple-gguf",
+  "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf",
+  "--expert-profile",
+  "<repo>/data/expert-profile.bin",
+  "--expert-cache",
+  "auto",
+  "--prefill",
+  "auto",
+  "--spec",
+  "4",
+  "--spec-min-p",
+  "0.5",
+  "--max-context",
+  "8192",
+  "--mtp",
+  "<data>/mtp/rt",
+  "--vision",
+  "--vram-reserve-mib",
+  "700"
+ ],
+ "cwd": "<repo>",
+ "tokenizer": "<data>/packs/iq2_xs/tokenizer",
+ "model_name": "qwen3.8-flash-next-iq2_xs",
+ "log": "<scratch>/vision/server-engine.log",
+ "lib_dirs": [],
+ "port": 8095,
+ "vision": {
+  "exe": "<repo>/build-vision-cpu/bin/strata-vision",
+  "mmproj": "<data>/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "<data>/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf",
+  "gpu": false,
+  "max_tokens": 300,
+  "threads": 8
+ }
+}

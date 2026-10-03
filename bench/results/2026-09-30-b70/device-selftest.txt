@@ -1,0 +1,14 @@
+XeStrata 0.1.0 (backend xe, upstream Strata 0.1.24, 3ce2523)
+device 0: Intel(R) Graphics [0xe223] (8086:e223, Level Zero)
+  compute units       256
+  VRAM total / free   30.296 GiB (32530182144 B) / 30.296 GiB (32530182144 B)
+  driver              1.14.37020
+  platform            1.14
+  host/device USM     yes / yes
+  FP64                yes
+  subgroup sizes      16 32
+  model memory plan   unavailable (no model loaded)
+
+selftest: arena 0.062 GiB (67108864 B), used 0.002 GiB (2097152 B) after two 1 MiB allocations
+selftest: over-allocation refused as required
+strata-device selftest OK

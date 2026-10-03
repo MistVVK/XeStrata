@@ -1,0 +1,2 @@
+start 18:38:46
+end 18:40:08; sha256sum still running: yes

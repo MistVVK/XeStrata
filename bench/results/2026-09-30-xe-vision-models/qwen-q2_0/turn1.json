@@ -1,0 +1,37 @@
+{
+ "id": "chatcmpl-1bb6806c781e43ca8bcfe216",
+ "object": "chat.completion",
+ "created": 1790747651,
+ "model": "qwen-q2_0",
+ "choices": [
+  {
+   "index": 0,
+   "message": {
+    "role": "assistant",
+    "content": "HELLO 4172"
+   },
+   "finish_reason": "stop"
+  }
+ ],
+ "usage": {
+  "prompt_tokens": 325,
+  "completion_tokens": 8,
+  "total_tokens": 333,
+  "prompt_tokens_details": {
+   "cached_tokens": 0
+  }
+ },
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 325,
+  "prompt_ms": 1560.2,
+  "prompt_per_token_ms": 4.801,
+  "prompt_per_second": 208.3,
+  "predicted_n": 8,
+  "predicted_ms": 166.4,
+  "predicted_per_token_ms": 20.8,
+  "predicted_per_second": 48.1,
+  "draft_n": 6,
+  "draft_n_accepted": 6
+ }
+}

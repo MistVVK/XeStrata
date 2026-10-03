@@ -1,0 +1,6 @@
+1. stream: 64 chunks in 2.5 s: 'e color model: additive (RGB) primary colors are red, green, blue; subtractive (CMY) are cyan, magenta, yellow; traditional art (RYB) are red, yellow, blue. The'
+2. cancelled after 8 chunks
+2. after the cancel: 2.2 s, usage {'prompt_tokens': 68, 'completion_tokens': 61, 'total_tokens': 129, 'prompt_tokens_details': {'cached_tokens': 0}}: '42'
+3. turn 1: 1.7 s, usage {'prompt_tokens': 61, 'completion_tokens': 48, 'total_tokens': 109, 'prompt_tokens_details': {'cached_tokens': 0}}: "Got it, Aiko! I'll remember your name. How can I help you today?"
+3. turn 2: 1.7 s, usage {'prompt_tokens': 99, 'completion_tokens': 50, 'total_tokens': 149, 'prompt_tokens_details': {'cached_tokens': 56}}: 'Your name is **Aiko**.'
+3. turn 3: 3.3 s, usage {'prompt_tokens': 125, 'completion_tokens': 117, 'total_tokens': 242, 'prompt_tokens_details': {'cached_tokens': 94}}: 'Your name **Aiko** spelled backwards is **oika**.'
