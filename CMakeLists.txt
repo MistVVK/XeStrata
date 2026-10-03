@@ -6,8 +6,8 @@ project(XeStrata VERSION 0.1.0 LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.24")
-set(STRATA_UPSTREAM_COMMIT "3ce2523")
+set(STRATA_UPSTREAM_VERSION "0.1.38")
+set(STRATA_UPSTREAM_COMMIT "99f3dbd")
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
@@ -78,6 +78,9 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
+  add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
+  target_link_libraries(gguf_split_test PRIVATE strata_artifact)
+  add_test(NAME gguf_split_test COMMAND gguf_split_test)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
@@ -86,6 +89,8 @@ endif()
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the
 # whole point of P1.S9 is that the decision is arithmetic you can check by hand.
+option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
+
 add_library(strata_plan INTERFACE)
 target_include_directories(strata_plan INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_plan INTERFACE strata_warnings)
@@ -105,6 +110,12 @@ add_library(strata_ngram STATIC src/kernels/ngram.cpp src/ngram/ple_reader.cpp)
 target_link_libraries(strata_ngram PUBLIC strata_platform strata_artifact)
 
 # Plan v0.3 P0.1: working-set lock of a host region (CPU only).
+if(STRATA_BUILD_TESTS)
+  add_executable(direct_file_async_test tests/platform/direct_file_async.cpp)
+  target_link_libraries(direct_file_async_test PRIVATE strata_platform)
+  add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+endif()
+
 add_executable(platform_memory_test src/platform/memory_test.cpp)
 target_link_libraries(platform_memory_test PRIVATE strata_platform)
 add_test(NAME platform_memory_test COMMAND platform_memory_test)
@@ -161,6 +172,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
+                                    src/prefill/moe_mmq.cpp src/prefill/moe_fused.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -201,6 +213,26 @@ if(STRATA_ENABLE_XE)
     set_tests_properties(expert_profile_save_test PROPERTIES TIMEOUT 60)
   endif()
   if(STRATA_BUILD_TESTS)
+    add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
+    target_link_libraries(coupled_draft_test PRIVATE strata_engine)
+    add_test(NAME coupled_draft_test COMMAND coupled_draft_test)
+    add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
+    target_link_libraries(pinned_shared_test PRIVATE strata_engine)
+    add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
+    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test)
+      add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
+      target_link_libraries(${core_gpu_test} PRIVATE strata_engine)
+      add_test(NAME ${core_gpu_test} COMMAND ${core_gpu_test})
+      set_tests_properties(${core_gpu_test} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    add_executable(file_expert_source_test tests/core/file_expert_source_test.cpp)
+    target_link_libraries(file_expert_source_test PRIVATE strata_engine)
+    add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
+    if(STRATA_NATIVE_EXPERTS)
+      add_executable(expert_layout_test tests/core/expert_layout_test.cpp)
+      target_link_libraries(expert_layout_test PRIVATE strata_engine)
+      add_test(NAME expert_layout_test COMMAND expert_layout_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
+    endif()
     # a parked conversation's K/V and running state saved and restored byte for byte in every KV format and
     # residency mode (on the GPU), and invalid images refused before any write (host only)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
@@ -213,11 +245,23 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # plan v0.3 P5: batched prompt processing.  The GEMMs are XeStrata's XMX kernels (src/kernels/xe/xmx_gemm.cpp;
-  # cuBLAS in the CUDA build, oneMKL in the first Xe port); llama.cpp's MMQ expert kernels are not ported, so the
-  # prompt path's experts take the FP16 GEMM path (STRATA_PREFILL_MMQ undefined).
+  # the quantized prompt path shares the Xe integer dot products with decode.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
+  target_compile_definitions(strata_prefill PRIVATE STRATA_PREFILL_MMQ)
+  if(STRATA_BUILD_TESTS)
+    foreach(prompt_test prefill_fused_iq_test prefill_fused_moe_test prefill_mmq_kquant_test)
+      add_executable(${prompt_test} tests/xe/${prompt_test}.cpp)
+      target_link_libraries(${prompt_test} PRIVATE strata_prefill ggml-base)
+    endforeach()
+    add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test --no-timing)
+    add_test(NAME prefill_fused_moe_test COMMAND prefill_fused_moe_test --no-timing)
+    add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
+    set_tests_properties(prefill_fused_iq_test prefill_fused_moe_test prefill_mmq_kquant_test
+      PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+  endif()
+
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp)
@@ -354,7 +398,6 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
 # weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
 # with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/main/ggml/VERSION.txt).
-option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
@@ -390,11 +433,13 @@ if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp)
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/main/ggml)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
-  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp PROPERTIES
+                              COMPILE_OPTIONS "-mavx2;-mfma;-mf16c"
+  )
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)

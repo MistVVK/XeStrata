@@ -13,6 +13,7 @@
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/direct_file.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

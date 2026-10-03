@@ -9,6 +9,7 @@
 // smaller index), and lane 0 of a butterfly combines the same lanes in the same order as CUDA's shuffle-down tree.
 #include "strata/kernels/sampler.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/coupled_draft.hpp"
 #include "device_caps.hpp"
 
 #include <cstdlib>
@@ -138,7 +139,7 @@ inline void block_argmax(const sycl::nd_item<1>& it, int n_vocab, float* sv, int
 // top_p, min_p, temperature and one Philox draw over a row's top_k list (ids, logits in the selection order),
 // computed redundantly by every work-item
 template <typename D>
-inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t) {
+inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t, float* probability = nullptr) {
     const float inv_t = pp.temperature > 0.0f ? 1.0f / pp.temperature : 0.0f;
     int n_keep = k;
     float mx = sel_logit[0];
@@ -167,11 +168,13 @@ inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, con
     for (int i = 0; i < n_keep; ++i) sum += sycl::exp((D) scaled(i) - (D) smx);
     const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
     D cum = 0;
-    int pick = sel_ids[n_keep - 1];
+    int selected = n_keep - 1;
+    int pick = sel_ids[selected];
     for (int i = 0; i < n_keep; ++i) {
         cum += sycl::exp((D) scaled(i) - (D) smx) / sum;
-        if ((D) u < cum) { pick = sel_ids[i]; break; }
+        if ((D) u < cum) { pick = sel_ids[i]; selected = i; break; }
     }
+    if (probability) *probability = (float) (sycl::exp((D) scaled(selected) - (D) smx) / sum);
     return pick;
 }
 
@@ -335,7 +338,9 @@ sycl::event split_stage1(sycl::queue& q, const float* logits, int n_tokens, int 
 
 template <typename D>
 sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParams pp, int k, int nb, const float* lv,
-                         const int* li, int* out) {
+                         const int* li, int* out, const SamplerParams* device_params = nullptr,
+                         const int32_t* step_rec = nullptr, const int32_t* sub_to_id = nullptr,
+                         int32_t* ring_out = nullptr, float* probability = nullptr) {
     const int m = nb * k;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> cv(sycl::range<1>((size_t) m), h);
@@ -367,8 +372,18 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
                 }
                 sycl::group_barrier(it.get_group());
             }
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], k, pp, t);
-            if (tid == 0) out[t] = pick;
+            SamplerParams chain = device_params ? *device_params : pp;
+            int keep = device_params ? ((chain.top_k > 0 && chain.top_k < KMAX) ? chain.top_k : KMAX) : k;
+            keep = sycl::min(keep, n_vocab);
+            if (step_rec) chain.counter = core::coupled_draft_counter(step_rec[0]);
+            float prob = 0;
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, &prob);
+            if (tid == 0) {
+                const int id = sub_to_id ? sub_to_id[pick] : pick;
+                out[t] = id;
+                if (ring_out) *ring_out = id;
+                if (probability) *probability = prob;
+            }
         });
     });
 }
@@ -430,6 +445,52 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     }
     const auto e = launch(q, logits, n_tokens, n_vocab, history, history_len, pp, greedy, words, out);
     if (!stream) core::Runtime::get().wait(e, "sample_tokens");
+}
+
+
+size_t coupled_draft_scratch_bytes(int nv) {
+    if (nv <= 0) return 0;
+    const size_t nb = ((size_t) nv + SPLIT_BL - 1) / SPLIT_BL;
+    if (nb * KMAX > SPLIT_MAX) return 0;
+    return nb * KMAX * 8 + (size_t) nv * sizeof(int32_t);
+}
+
+void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
+                         int32_t* ring, int cap, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    q.single_task([=] { *params = *mapped_params; });
+    q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
+        ring[i] = mapped_hist[i];
+    });
+}
+
+void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                          const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec,
+                          void* scratch, int32_t* out_id, float* out_prob, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const int nb = (nv + SPLIT_BL - 1) / SPLIT_BL;
+    const int k = sycl::min(nv, KMAX);
+    auto* lv = static_cast<float*>(scratch);
+    auto* li = reinterpret_cast<int32_t*>(lv + (size_t) nb * KMAX);
+    auto* counts = li + (size_t) nb * KMAX;
+    q.memset(counts, 0, (size_t) nv * sizeof(int32_t));
+    q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
+        const int h = core::coupled_hist_len(params->penalty_last_n, cap);
+        if ((int) i[0] >= h) return;
+        const int id = ring[core::coupled_hist_start(cap, j, h) + i[0]];
+        if (id < 0 || id >= id_vocab) return;
+        const int sub = id_to_sub ? id_to_sub[id] : id;
+        if (sub >= 0 && sub < nv)
+            sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space>(counts[sub]).fetch_add(1);
+    });
+    q.parallel_for(sycl::range<1>((size_t) nv), [=](sycl::id<1> i) {
+        logits[i] = apply_penalties(logits[i], counts[i], *params);
+    });
+    SamplerParams unpenalized;
+    split_stage1(q, logits, 1, nv, nullptr, 0, unpenalized, k, nb, lv, li);
+    const auto launch = xe::has_fp64(q) ? split_stage2<double> : split_stage2<float>;
+    launch(q, 1, nv, unpenalized, k, nb, lv, li, out_id, params, step_rec, sub_to_id, ring + cap + j, out_prob);
 }
 
 }  // namespace strata::kernels

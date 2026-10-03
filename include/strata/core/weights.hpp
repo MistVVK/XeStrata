@@ -116,6 +116,12 @@ public:
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
 
+    /// The `code_bits` field of one row of `<pack_dir>/index.txt`, readable WITHOUT loading anything (0 = the
+    /// pack stores the tensor unquantized, e.g. a --compat-bf16 key; -1 = no such row).  #326: the loader has
+    /// to know this before it builds the skip set.
+    static bool index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
+                                std::string& err);
+
     /// Load every tensor in `<pack_dir>/index.txt` into `arena_base`.
     ///
     /// `arena_bytes` MUST be at least `pool_bytes`; the loader checks rather than trusting the caller,

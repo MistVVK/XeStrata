@@ -22,6 +22,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "strata/kernels/rope_scaling.hpp"
+
 namespace strata::kernels {
 
 /// The table of the CURRENT device (a layer split sets one per device; null = the identity).

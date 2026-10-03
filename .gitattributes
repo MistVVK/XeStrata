@@ -6,3 +6,6 @@ bench/prompts/** -text
 
 # launchers keep their platform line endings wherever the repository is cloned
 *.sh text eol=lf
+
+# Pack fixtures are parsed byte for byte.
+tests/data/native_experts/** -text

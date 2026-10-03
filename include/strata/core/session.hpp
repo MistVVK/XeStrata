@@ -36,6 +36,7 @@ struct SessionState {
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
     float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
 
+    int64_t qsa_alloc = 0;            ///< allocated states, including a partially initialized one
     QsaState* qsa_states = nullptr;      ///< one per QSA layer
     void* qsa_state_arena = nullptr;
     QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
@@ -84,6 +85,9 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k);
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
+/// Unpublish this session's RoPE table before its arena is freed.
+void session_release(SessionState& s);
+
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream);
 
 /// One token: layers 0..47 in order, each a `block_layer`, and the residual is updated in place.

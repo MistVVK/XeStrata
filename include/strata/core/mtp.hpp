@@ -24,6 +24,7 @@
 
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/sampler.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -56,11 +57,10 @@ public:
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
-    /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
-    /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this
-    /// (upstream b981f63).
+    /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
@@ -76,6 +76,16 @@ public:
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
+    /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
+    /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
+    /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
+    void set_draft_sampling(const strata::kernels::SamplerParams& sp);
+    /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
+    /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
+    void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
+    bool coupled() const { return coupled_active_; }
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
@@ -94,9 +104,20 @@ private:
     bool record_forward(int T, int step_row0, strata::gpu::Stream cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
-    bool capture_round(int T, std::string& err);
-    bool capture_step(int j, std::string& err);
+    bool capture_round(int T, bool coupled, std::string& err);
+    bool capture_step(int j, bool coupled, std::string& err);
     strata::gpu::Graph* step_exec_[9] = {};
+    // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
+    // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
+    bool setup_coupled(std::string& err);
+    strata::gpu::Graph* round_exec_c_[9] = {};
+    strata::gpu::Graph* step_exec_c_[9] = {};
+    bool coupled_ok_ = false, coupled_active_ = false;
+    bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
+    int coupled_j_ = 0;
+    strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
+    int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
+    void* cscratch_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;

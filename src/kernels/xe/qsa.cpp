@@ -459,7 +459,8 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                     }
                     const D inv = (D) 1 / sycl::sqrt(ss / (D) idx_dim + (D) eps);
                     dead[d] = (float) (p * inv * (D) w_k_norm[d]);
-                    // rope at position 0 is the identity (cos = 1, sin = 0 exactly), so no rotation is applied
+                    // YaRN scales the rotated dimensions even at position zero.
+                    if (d < n_rot) dead[d] *= cos_tab[d % (n_rot / 2)];
                     pooled[d] = dead[d];
                 }
 

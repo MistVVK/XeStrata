@@ -16,8 +16,8 @@ r[0-9][0-9][0-9]*/
 *.vtune
 
 # created by setup.py on the user's machine
-/.venv/
-/third_party/main/llama.cpp/
+/.venv
+/third_party/main/llama.cpp
 /models/
 /packs/
 /mtp/
@@ -32,9 +32,9 @@ r[0-9][0-9][0-9]*/
 /third_party/main/_unpack/
 
 # lint tools that are not in the distribution's packages (see AGENTS.md, Lints)
-/.lint/
+/.lint
 # developer tools built from source (docs/DEVTOOLS.md)
-/.tools/
+/.tools
 .mypy_cache/
 .ruff_cache/
 # tools/strata_mcp.py: the processes it started and their logs

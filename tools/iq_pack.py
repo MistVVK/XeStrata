@@ -91,7 +91,7 @@ FORM = {
 }
 # PLE key encodings left in the GGUF for the engine's native PLE key (Q2_0; Q8_0 in UD-Q4_K_XL).  Other quantized
 # keys take the BF16 path (--compat-bf16), as before.
-NATIVE_PLE_KEY = {"Q2_0"}   # XeStrata's native PLE key reads Q2_0 only: a Q8_0 key (UD-Q4_K_XL) takes the BF16 path
+NATIVE_PLE_KEY = {"Q2_0", "Q8_0"}
 KIND = {"BF16": "4", "F16": "5", "F32": "2"}
 
 

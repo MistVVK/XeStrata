@@ -86,21 +86,21 @@ bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxe
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
                                const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                               const QsaShapes& s, int64_t max_cells, float freq_base, void* stream) {
+                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
         int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
-        !std::isfinite(freq_base) || freq_base <= 1.0f)
+        rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency and explicit stream");
     const Span spans[] = {{raw,D*4},{relative_pos_device,4},{gamma,D*4},{b.tail,(R-1)*D*4},
         {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
-    const float theta_scale = std::pow(freq_base, -2.0f / ROT);
-    const bool scaled = rope_scaling().type != RopeScalingType::None;
-    const RopeKernelArgs ka = rope_scaling().kernel_args(ROT);
-    const RopeTab tab = rope_table_for(rope_scaling());
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / ROT);
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(ROT);
+    const RopeTab tab = rope_table_for(scaling);
     const int32_t* mtab = mrope_table();
     const int mc = int(max_cells);
     float* tail = b.tail;
@@ -145,17 +145,17 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
 
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
-                                     float freq_base, void* stream) {
+                                     const RopeScaling& scaling, void* stream) {
     if (n <= 0) return;
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT || p0 < 0 || p0 + n > max_cells ||
         max_cells > INT32_MAX || pos_base < 0 || pos_base % R || int64_t(pos_base) + max_cells > INT32_MAX ||
-        !std::isfinite(epsilon) || epsilon <= 0.0f || !std::isfinite(freq_base) || freq_base <= 1.0f)
+        !std::isfinite(epsilon) || epsilon <= 0.0f || rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer (batch): bad geometry, positions or parameters");
     auto& q = queue_for(stream);
-    const float theta_scale = std::pow(freq_base, -2.0f / ROT);
-    const bool scaled = rope_scaling().type != RopeScalingType::None;
-    const RopeKernelArgs ka = rope_scaling().kernel_args(ROT);
-    const RopeTab tab = rope_table_for(rope_scaling());
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / ROT);
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(ROT);
+    const RopeTab tab = rope_table_for(scaling);
     const int32_t* mtab = mrope_table();
     float* tail = b.tail;
     float* dead = b.dead;

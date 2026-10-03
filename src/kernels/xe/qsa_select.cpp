@@ -177,12 +177,13 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 }
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                    const QsaShapes& s, int32_t* ids, void* stream) {
+                    const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
     // keys in registers when every query's blocks fit; the same ids.  STRATA_TOPK_OLD=1: the kernel that reads them
     // from memory on every pass, which a device that takes no TK_T-item work-group runs as well
     static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
-    if (old || max_blocks > int64_t(TK_T) * TK_PER || xe::max_work_group(queue_for(stream)) < (size_t) TK_T) {
+    const int64_t bound = active_blocks > 0 ? std::min(active_blocks, max_blocks) : max_blocks;
+    if (old || bound > int64_t(TK_T) * TK_PER || xe::max_work_group(queue_for(stream)) < (size_t) TK_T) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/iq_kernels.cpp - see include/strata/kernels/iq_kernels.hpp; the Xe port of Strata's src/kernels/cuda/iq_kernels.cu.
 //
@@ -8,7 +9,31 @@
 // MIT license, third_party/main/ggml/LICENSE) through the CUDA version.  The block structs and codebook grids come from
 // its ggml-common.h, included unchanged.  CUDA's integer intrinsics come from cuda_intrinsics.hpp, and a warp is a
 // sub-group of 32 whose butterfly sums run in the CUDA order.
+// MIT License
+//
+// Copyright (c) 2023-2026 The ggml authors
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
 
@@ -342,7 +367,7 @@ template<> struct Split<23> {   // IQ4_XS
     static W load(const void* vbq, int kbx, int iqs) {
         const block_iq4_xs* bq4 = (const block_iq4_xs*) vbq + kbx;
         W r{};
-        for (int j = 0; j < 4; ++j) r.v[j] = get_int_from_table_16(get_int_b4(bq4->qs, iqs + j), kvalues_iq4nl);
+        for (int j = 0; j < 4; ++j) r.v[j] = get_int_from_table_16(get_int_b2(bq4->qs, iqs + j), kvalues_iq4nl);
         r.ls = (((bq4->scales_l[iqs / 8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs / 2)) & 0x03) << 4)) - 32;
         r.d = (float) bq4->d;
         return r;
@@ -646,6 +671,116 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
         c0 += take;
     }
     return e;
+}
+
+// Four prompt rows share each decoded weight row; bounds and destination maps stay on the device.
+template<int TY>
+sycl::event launch_prompt_mmq(sycl::queue& q, const strata::prefill::mmq::Product& p) {
+    constexpr int NC = 4, RPG = 4;
+    const int64_t tm = (p.max_rows + NC - 1) / NC, tn = (p.w_rows + RPG - 1) / RPG;
+    return q.parallel_for(sycl::nd_range<3>({(size_t) p.n, (size_t) tm, (size_t) tn * RPG * kWarp}, {1, 1, (size_t) RPG * kWarp}),
+                          [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const int e = (int) it.get_group(0);
+        const int64_t first = p.bounds[e], end = p.bounds[e+1], r0 = first + (int64_t) it.get_group(1) * NC;
+        const auto sg = it.get_sub_group();
+        const int64_t col = (int64_t) it.get_group(2) * RPG + sg.get_group_linear_id();
+        if (r0 >= end || col >= p.w_rows) return;
+        const uint8_t* row = (const uint8_t*) p.w + (size_t) e * p.expert_bytes + col * (p.w_cols / Fmt<TY>::qk) * Fmt<TY>::bsz;
+        const size_t stride = (size_t) ((p.w_cols + 511) / 512 * 512 / 32);
+        const auto* x = (const block_q8_1*) p.xq + r0 * stride;
+        const block_q8_1* xs[NC];
+        for (int j = 0; j < NC; ++j) xs[j] = x + (r0 + j < end ? j : 0) * stride;
+        float sums[NC];
+        seg_dot_multi<TY, kWarp, NC>(sg, row, xs, (int) sycl::min((int64_t) NC, end-r0),
+                                    (int) (p.w_cols / Fmt<TY>::qk), sg.get_local_linear_id(), sums);
+        if (sg.get_local_linear_id() == 0)
+            for (int j = 0; j < NC && r0 + j < end; ++j) {
+                const int64_t r = r0 + j;
+                p.dst[(p.ids ? p.ids[r] : r) * p.ld_dst + col] = sums[j];
+            }
+    });
+}
+
+// The prompt fused path uses the same q8_1 blocks and integer decoders as decode. A sub-group
+// computes 32 hidden features, applies SwiGLU, and quantizes H before its first global store.
+template<int TY>
+inline float prompt_dot(const uint8_t* row, const block_q8_1* x, int cols) {
+    using F = Fmt<TY>;
+    float sum = 0;
+    for (int b=0; b<cols/F::qk; ++b)
+        for (int part=0; part<F::ipb; ++part)
+            sum += F::dot(block_at<F>(row,b), x+(size_t) b*(F::qk/32), 0, part*F::step);
+    return sum;
+}
+inline float prompt_strata_dot(const uint8_t* blob, const block_q8_1* x, int row, bool down) {
+    const int cols=down ? 640 : 2560, nb=cols/64;
+    const size_t codes=(down ? 1280*640 : 0)+(size_t) row*(cols/4);
+    const size_t scales=1280*640+2560*160+(down ? 1280*40*2 : 0)+(size_t) row*(size_t) nb*2;
+    float sum=0;
+    for (int b=0; b<nb; ++b) {
+        const float d=(float) *reinterpret_cast<const sycl::half*>(blob+scales+(size_t) b*2);
+        for (int h=0; h<2; ++h) {
+            const auto& a=x[2*b+h];
+            int dot=0;
+            for (int j=0; j<8; ++j)
+                dot = dp4a((int) q2_0_bytes(blob[codes+(size_t) b*16+(size_t) h*8+j]), get_int_b4(a.qs,j), dot);
+            sum += d*(float) a.ds[0]*(float) dot;
+        }
+    }
+    return sum;
+}
+template<int TY, bool STRATA=false>
+void prompt_fused_gu(sycl::queue& q, const strata::prefill::fused::Batch& batch,
+                     const strata::prefill::fused::NativeGeom& g, int E, int64_t n, const void* scratch,
+                     const void* xa, const int32_t* src, void* ha) {
+    const int32_t* off=(const int32_t*) scratch+E;
+    (void) n;
+    q.parallel_for(sycl::nd_range<3>({(size_t) (batch.e1-batch.e0), 128, 640}, {1, 1, 128}),
+                   [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int e=batch.e0+(int) it.get_global_id(0),f=(int) it.get_global_id(2);
+        const auto* blob=batch.blob[e-batch.e0];
+        if (!blob) return;
+        for (int64_t r=off[e]+(int64_t) it.get_global_id(1); r<off[e+1]; r+=128) {
+        const auto* x=(const block_q8_1*) xa+(size_t) src[r]*80;
+        float gate, up;
+        if constexpr (STRATA) {
+            gate=prompt_strata_dot(blob,x,2*f,false); up=prompt_strata_dot(blob,x,2*f+1,false);
+        } else {
+            gate=prompt_dot<TY>(blob+(size_t) f*g.gu_row,x,2560);
+            up=prompt_dot<TY>(blob+g.up_off+(size_t) f*g.gu_row,x,2560);
+        }
+        const float value=(gate/(1.0f+sycl::exp(-gate)))*up;
+        const auto sg=it.get_sub_group();
+        const float mx=warp_max(sg,sycl::fabs(value)), sum=warp_sum(sg,value), d=mx/127.0f;
+        auto* out=(block_q8_1*) ha+r*20+f/32;
+        out->qs[f%32]=mx>0 ? (int8_t) sycl::round(value/d) : 0;
+        if (f%32==0) out->ds=ggml_half2(sycl::half(d),sycl::half(sum));
+        }
+    });
+}
+template<int TY, bool STRATA=false>
+void prompt_fused_down(sycl::queue& q, const strata::prefill::fused::Batch& batch,
+                       const strata::prefill::fused::NativeGeom& g, int E, int64_t n,
+                       const void* scratch, const void* ha, float* dm) {
+    const int32_t* off=(const int32_t*) scratch+E;
+    (void) n;
+    q.parallel_for(sycl::nd_range<3>({(size_t) (batch.e1-batch.e0), 128, size_t(2560)*8}, {1, 1, 256}),
+                   [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(32)]] {
+        const int e=batch.e0+(int) it.get_global_id(0),col=(int) it.get_global_id(2)/8;
+        const auto* blob=batch.blob[e-batch.e0];
+        if (!blob) return;
+        for (int64_t r=off[e]+(int64_t) it.get_global_id(1); r<off[e+1]; r+=128) {
+        const auto* x=(const block_q8_1*) ha+r*20;
+        if constexpr (STRATA) {
+            if ((int64_t) it.get_global_id(2)%8==0) dm[r*2560+col]=prompt_strata_dot(blob,x,col,true);
+        } else {
+            const block_q8_1* xs[1]={x}; float out[1];
+            seg_dot_multi<TY,8,1>(it.get_sub_group(),blob+g.down_off+(size_t) col*g.d_row,xs,1,
+                                 640/Fmt<TY>::qk,(int64_t) it.get_global_id(2)%8,out);
+            if ((int64_t) it.get_global_id(2)%8==0) dm[r*2560+col]=out[0];
+        }
+        }
+    });
 }
 
 // ---------------------------------------------------------------- grouped native experts
@@ -1501,3 +1636,63 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 }
 
 }  // namespace strata::kernels
+
+namespace strata::prefill::mmq {
+void Context::run(const Product& p, void* stream) {
+    if (p.total_rows == 0) return;
+    if (!supported(p.type) || !p.w || !p.xq || !p.bounds || !p.dst || p.n <= 0 || p.max_rows <= 0 ||
+        p.w_cols <= 0 || p.w_rows <= 0 || p.ld_dst < p.w_rows || p.w_cols % (p.type == 42 ? 64 :
+            p.type == 20 || p.type == 6 || p.type == 7 || p.type == 8 ? 32 : 256))
+        throw std::invalid_argument("prompt MMQ: invalid product");
+    auto& q = strata::kernels::queue_for(stream);
+    using namespace strata::kernels;
+    switch (p.type) {
+    case 16: launch_prompt_mmq<16>(q, p); break;
+    case 17: launch_prompt_mmq<17>(q, p); break;
+    case 18: launch_prompt_mmq<18>(q, p); break;
+    case 20: launch_prompt_mmq<20>(q, p); break;
+    case 21: launch_prompt_mmq<21>(q, p); break;
+    case 22: launch_prompt_mmq<22>(q, p); break;
+    case 23: launch_prompt_mmq<23>(q, p); break;
+    case 42: launch_prompt_mmq<42>(q, p); break;
+    case 12: launch_prompt_mmq<12>(q, p); break;
+    case 13: launch_prompt_mmq<13>(q, p); break;
+    case 7: launch_prompt_mmq<7>(q, p); break;
+    case 8: launch_prompt_mmq<8>(q, p); break;
+    case 6: launch_prompt_mmq<6>(q, p); break;
+    default: throw std::invalid_argument("prompt MMQ: unsupported type");
+    }
+}
+}  // namespace strata::prefill::mmq
+
+namespace strata::prefill::fused {
+void experts_native(const Batch& b, const NativeGeom& g, int E, int64_t n, const void* scratch,
+                    const void* xa, const int32_t* src, void* ha, float* dm, void* stream) {
+    if (!native_supported(g.gu_type,g.d_type) || b.e0<0 || b.e1>b.e0+kMaxBatch || b.e1>E)
+        throw std::invalid_argument("prompt fused: invalid native batch");
+    if (b.e1==b.e0 || n==0) return;
+    auto& q=strata::kernels::queue_for(stream);
+    using namespace strata::kernels;
+    switch (g.gu_type) {
+    case 16: prompt_fused_gu<16>(q,b,g,E,n,scratch,xa,src,ha); break;
+    case 17: prompt_fused_gu<17>(q,b,g,E,n,scratch,xa,src,ha); break;
+    case 18: prompt_fused_gu<18>(q,b,g,E,n,scratch,xa,src,ha); break;
+    case 21: prompt_fused_gu<21>(q,b,g,E,n,scratch,xa,src,ha); break;
+    case 22: prompt_fused_gu<22>(q,b,g,E,n,scratch,xa,src,ha); break;
+    case 23: prompt_fused_gu<23>(q,b,g,E,n,scratch,xa,src,ha); break;
+    default: throw std::invalid_argument("prompt fused: unsupported gate/up");
+    }
+    if (g.d_type==42) prompt_fused_down<42>(q,b,g,E,n,scratch,ha,dm);
+    else prompt_fused_down<20>(q,b,g,E,n,scratch,ha,dm);
+}
+void experts(const Batch& b, int E, int64_t n, const void* scratch, const void* xa, const int32_t* src,
+             void* ha, float* dm, void* stream) {
+    if (b.e0<0 || b.e1>b.e0+kMaxBatch || b.e1>E) throw std::invalid_argument("prompt fused: invalid batch");
+    if (b.e1==b.e0 || n==0) return;
+    auto& q=strata::kernels::queue_for(stream);
+    using namespace strata::kernels;
+    NativeGeom g;
+    prompt_fused_gu<42,true>(q,b,g,E,n,scratch,xa,src,ha);
+    prompt_fused_down<42,true>(q,b,g,E,n,scratch,ha,dm);
+}
+}  // namespace strata::prefill::fused

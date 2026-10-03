@@ -54,7 +54,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parent
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
@@ -198,7 +198,7 @@ def warn(msg):
     say(f"  [!]  {msg}")
 
 
-def fail(msg, hint=None):
+def fail(msg, hint=None) -> NoReturn:
     say(f"\n  [X]  {msg}")
     if hint:
         say(f"       {hint}")
@@ -1531,6 +1531,17 @@ def draft_vocab_note(vram_gb: float, chosen: str | None) -> list[str]:
             "  fix when the start stops with \"the draft head does not fit\". The model keeps the choice."]
 
 
+def mtp_corrupt(mtp: Path, env=None) -> bool:
+    """#327: True when the MTP tensors an install fetched are not the pinned checkpoint's (tools/mtp_fetch.py verify,
+    which hashes only files that changed since they last checked out).  A mirror that ignored range requests left the
+    shards' starts there instead, and the draft layer built from them accepted nothing - with no error anywhere."""
+    if not (mtp / "tensors").is_dir():
+        return False
+    r = subprocess.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "verify", "--out", str(mtp)], env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    return r.returncode == 3
+
+
 def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
     """The chosen subset into the MTP folder: copied when missing or when another shipped subset is there."""
     new, dst = ROOT / "data" / DRAFT_VOCABS.get(choice, "draft_vocab.bin"), rt / "draft_vocab.bin"
@@ -2259,7 +2270,10 @@ def main() -> int:
     ok(f"model prepared: {pack}")
     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"
-    if not (rt / "experts.bin").exists():
+    corrupt = (rt / "experts.bin").exists() and mtp_corrupt(mtp, env)
+    if corrupt:
+        say("  The MTP tensors differ from the pinned checkpoint; fetching and rebuilding them.")
+    if corrupt or not (rt / "experts.bin").exists():
         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
         say("  only its ~5 GB of MTP tensors are downloaded.")
         run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)

@@ -11,6 +11,7 @@
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/mrope.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -88,6 +89,7 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (g.n_qsa_layers() - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()];
+    s.qsa_alloc = g.n_qsa_layers();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
@@ -108,6 +110,14 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     s.ple_hist = (float*) take(ple_hist_bytes());
     s.R = s.block.R;
     return used;
+}
+
+void session_release(SessionState& s) {
+    for (int64_t i = 0; s.qsa_states && i < s.qsa_alloc; ++i)
+        if (s.qsa_states[i].owns_rope) {
+            strata::kernels::rope_table_release(s.qsa_states[i].cos_tab);
+            s.qsa_states[i].owns_rope = false;
+        }
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {

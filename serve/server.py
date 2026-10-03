@@ -890,6 +890,8 @@ def engine_args(cfg: dict) -> list[str]:
     args = list(cfg["args"])
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
+        args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
     return learned_profile_args(cfg, args)
 
 

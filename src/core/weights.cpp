@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sstream>
 
 #include <unistd.h>
 
@@ -108,6 +109,27 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     std::fclose(f);
     if (pool == 0) { err = "no '# align ... pool ...' header in " + path; return false; }
     out = skip ? compact : pool;
+    return true;
+}
+
+bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
+                                  std::string& err) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    char line[1024];
+    code_bits = -1;
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        std::string row;
+        uint64_t dummy = 0;
+        int64_t ne = 0;
+        int file = 0, kind = 0, bits = 0;
+        std::istringstream fields(line);
+        if (!(fields >> row >> file >> kind >> dummy >> dummy >> dummy >> dummy >> ne >> ne >> bits)) continue;
+        if (name == row) { code_bits = bits; break; }
+    }
+    std::fclose(f);
     return true;
 }
 

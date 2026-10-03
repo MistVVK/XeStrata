@@ -663,6 +663,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
                                           hc.data(), hs.data());
         strata::gpu::copy(st.cos_tab, hc.data(), hc.size() * 4);
         strata::gpu::copy(st.sin_tab, hs.data(), hs.size() * 4);
+        st.owns_rope = true;
         if (s.n_rot == 64)   // the native and prompt-path rope kernels read it with STRATA_ROPE_TABLE=1 (mrope.hpp)
             strata::kernels::rope_table_set(st.cos_tab, st.sin_tab, (int) max_cells, strata::kernels::rope_scaling());
     }
@@ -847,7 +848,7 @@ const auto normalize_rotate = [&](float* data, const WeightRef* norm, int rows, 
     try {
         if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, RMS_EPS, stream);
         else rms_norm_weighted(data, (const float*) norm->data, rows, cols, RMS_EPS, stream);
-        if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, (float) qsa_freq_base(), st.pos_dev, stream);
+        if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), st.pos_dev, stream);
         else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, st.pos_dev, stream);
         return true;
     } catch (const std::exception& error) {
@@ -915,7 +916,7 @@ if (st.kv_hybrid) {
 }    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    {        const uint64_t nvk = (uint64_t) g.n_head_kv * g.head_dim;        const uint64_t base = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim + 2 * nvk + 8;        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.k_pool, base, nvk / 2, stream);        if (!st.kv_int8 && !st.kv_hybrid) dump_slot(dump, g, layer, (const float*) st.v_pool, base + nvk / 2, nvk / 2, stream);        dump_slot(dump, g, layer, b.vcur, base + nvk, nvk, stream);        dump_slot(dump, g, layer, b.kcur, base + 2 * nvk, nvk, stream);    }    {        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};        if (native_qsa_indexer_enabled()) {
     try {
         native_qsa_indexer_append(b.idx_raw, st.step + kStepPos, pos_base,
-            (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, (float) qsa_freq_base(), stream);
+            (const float*) w_ikn->data, RMS_EPS, ib, s, st.max_cells, rope_scaling(), stream);
     } catch (const std::exception& error) { err = v.name("native_indexer") + ": " + error.what(); return false; }
 } else indexer_key_append(b.idx_raw, st.pos_dev, pos_base, (const float*) w_ikn->data, RMS_EPS, ib, s,
                           st.cos_tab, st.sin_tab, stream);    }

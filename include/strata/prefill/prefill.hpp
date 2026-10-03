@@ -56,6 +56,11 @@ public:
     Prefill(const Prefill&) = delete;
     Prefill& operator=(const Prefill&) = delete;
 
+    /// Frees every buffer, stream and event `init` made (as the destructor does) and starts over empty, so `init` can
+    /// run again - with a smaller chunk when the first one did not fit.  The stage range (`set_stage`) and the
+    /// callbacks stay.  The device `init` ran on must be current.
+    void reset();
+
     /// `host_res`: the static residency table (n_layers x n_expert, slot or -1) or null; `cache` its slots.
     /// `borrow`/`borrow_bytes`: device memory to carve every buffer from (the top slots of the expert cache,
     /// lent for the prompt and refilled after it); null = allocate normally.
@@ -72,6 +77,9 @@ public:
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
     static double pinned_share();
+    /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
+    /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
+    static void set_ring_override(int slots);
 
     /// Experts a grouped product takes (1-64, default 16): each holds 9.4 MiB of dequantized FP16 weights in the
     /// region; more of them make fewer, fuller launches.  Set before bytes_needed.
@@ -79,7 +87,7 @@ public:
     static int expert_group();
 
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).
-    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk);
+    static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool has_source = false);
 
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
@@ -119,6 +127,7 @@ private:
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
+    void release();                          // the destructor's cleanup (also `reset`'s)
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;

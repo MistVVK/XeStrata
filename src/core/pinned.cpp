@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
@@ -17,6 +18,11 @@
 #include <thread>
 
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
 
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
 
@@ -132,6 +138,109 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
            "): pinned and readable by GPU kernels";
 }
 
+namespace {
+constexpr uint64_t kArenaHeaderBytes = 4096;
+struct SharedArenaHeader {
+    char magic[16] = "STRATA-ARENA-V1";
+    uint32_t version = 1, header_bytes = kArenaHeaderBytes;
+    uint64_t arena_bytes = 0, pack_hash = 0;
+    uint64_t reserved[4] = {};   // reserved[0]: durable population completion
+};
+void arena_lock(int fd) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (errno != EWOULDBLOCK && errno != EINTR) throw DeviceError("shared arena: file lock failed");
+        if (std::chrono::steady_clock::now() >= end) throw DeviceError("shared arena: population lock timed out");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+}  // namespace
+
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
+                         const std::string& file, uint64_t pack_hash) : capacity(bytes), bounds_(bounds) {
+    (void) max_pinned_bytes;   // Xe registers every slice, bounded by the device's largest allocation.
+    if (!bytes || bytes > (uint64_t) std::numeric_limits<off_t>::max() - kArenaHeaderBytes - kHugePage)
+        throw DeviceError("shared arena: invalid size");
+    shared_fd_ = open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (shared_fd_ < 0) throw DeviceError("shared arena: cannot open backing file");
+    try {
+        arena_lock(shared_fd_);
+        shared_locked_ = true;
+        struct stat st{};
+        if (fstat(shared_fd_, &st) != 0) throw DeviceError("shared arena: cannot size backing file");
+        SharedArenaHeader hdr;
+        if (st.st_size == 0) {
+            hdr.arena_bytes = bytes; hdr.pack_hash = pack_hash;
+            if (ftruncate(shared_fd_, (off_t) (bytes + kArenaHeaderBytes)) != 0 ||
+                pwrite(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr || fdatasync(shared_fd_) != 0)
+                throw DeviceError("shared arena: cannot initialize header");
+        } else {
+            if ((uint64_t) st.st_size != bytes + kArenaHeaderBytes) {
+                note = "shared arena: file size differs from expected arena size";
+            } else if (pread(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr ||
+                       std::memcmp(hdr.magic, "STRATA-ARENA-V1", 16) != 0 || hdr.version != 1 ||
+                       hdr.header_bytes != kArenaHeaderBytes || hdr.arena_bytes != bytes) {
+                note = "shared arena: incompatible header";
+            } else if (hdr.pack_hash != pack_hash) {
+                note = "shared arena: pack hash mismatch";
+            }
+            if (!note.empty()) {
+                flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+                ::close(shared_fd_); shared_fd_ = -1;
+                return;
+            }
+        }
+        // Reserve the address range first: file offset 4096 can still start at a 2 MiB-aligned virtual address.
+        map_bytes_ = (size_t) bytes + kHugePage;
+        map_ = mmap(nullptr, map_bytes_, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (map_ == MAP_FAILED) { map_ = nullptr; throw DeviceError("shared arena: address reservation failed"); }
+        base = (void*) (((uintptr_t) map_ + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
+        if (mmap(base, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shared_fd_,
+                 (off_t) kArenaHeaderBytes) == MAP_FAILED) {
+            base = nullptr; throw DeviceError("shared arena: mapping failed");
+        }
+        const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+        register_pieces((uint8_t*) base, bytes, bounds, reg_);
+        registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
+        backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
+        note = "shared file mapping registered in device-sized slices; no mlock";
+        flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+    } catch (...) {
+        for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
+        reg_.clear();
+        if (map_) munmap(map_, map_bytes_);
+        map_ = base = nullptr;
+        ::close(shared_fd_); shared_fd_ = -1;
+        throw;
+    }
+}
+
+bool PinnedArena::begin_shared_population() {
+    if (shared_fd_ < 0) return true;
+    arena_lock(shared_fd_); shared_locked_ = true;
+    SharedArenaHeader hdr;
+    if (pread(shared_fd_, &hdr, sizeof hdr, 0) != (ssize_t) sizeof hdr)
+        throw DeviceError("shared arena: cannot read population state");
+    if (hdr.reserved[0] == 1) {
+        flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+        return false;
+    }
+    return true;
+}
+
+void PinnedArena::publish_shared() {
+    if (shared_fd_ < 0) return;
+    if (!shared_locked_) throw DeviceError("shared arena: population lock is not held");
+    // The complete body must reach storage before another process can observe its completion record.
+    if (msync(base, (size_t) capacity, MS_SYNC) != 0 || fdatasync(shared_fd_) != 0)
+        throw DeviceError("shared arena: cannot persist populated weights");
+    const uint64_t complete = 1;
+    if (pwrite(shared_fd_, &complete, sizeof complete, offsetof(SharedArenaHeader, reserved)) !=
+            (ssize_t) sizeof complete || fdatasync(shared_fd_) != 0)
+        throw DeviceError("shared arena: cannot publish completed weights");
+    flock(shared_fd_, LOCK_UN); shared_locked_ = false;
+}
+
 uint8_t* PinnedArena::at(uint64_t off) const {
     if (layer_base.empty()) return (uint8_t*) base + off;
     size_t l = (size_t) (std::upper_bound(bounds_.begin(), bounds_.end() - 1, off) - bounds_.begin());
@@ -140,6 +249,7 @@ uint8_t* PinnedArena::at(uint64_t off) const {
 }
 
 PinnedArena::~PinnedArena() {
+    if (shared_fd_ >= 0) ::close(shared_fd_);
     if (!layer_base.empty()) {
         for (uint8_t* p : layer_base) Runtime::get().free(p);
         return;

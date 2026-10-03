@@ -9,6 +9,7 @@
 // The products run on the XMX engines (strata/kernels/xmx_gemm.hpp).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 

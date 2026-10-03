@@ -5,6 +5,7 @@
 #include "strata/platform/memory.hpp"
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace strata::platform {
 
@@ -20,6 +21,17 @@ LockResult lock_resident(void* p, uint64_t bytes) {
 
 void unlock_resident(void* p, uint64_t bytes) {
     if (p != nullptr && bytes != 0) munlock(p, bytes);
+}
+
+bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    why = "DXGI is Windows-only";
+    return false;
+}
+
+uint64_t total_physical_memory() {
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+    return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
 }
 
 }  // namespace strata::platform

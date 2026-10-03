@@ -18,6 +18,8 @@
 #include "strata/kernels/s_gemv.hpp"
 
 #include "parity_device.hpp"
+#include "strata/core/gpu.hpp"
+#include <stdexcept>
 
 #include <cmath>
 #include <cstdio>
@@ -27,6 +29,10 @@
 #include <vector>
 
 namespace {
+void check(bool ok, const char* operation) {
+    if (!ok) throw std::runtime_error(std::string(operation) + ": " + strata::gpu::last_error());
+}
+
 
 using strata::kernels::SForm;
 using strata::kernels::Codebook;
@@ -68,9 +74,111 @@ struct Case {
     bool has_offset;
 };
 
+/// THE RAGGED LAST BLOCK.  The split kernels give each warp one row and a block eight warps, so with
+/// `n_out % 8 != 0` the last block holds warps that have no row.  Those warps used to return BEFORE the
+/// codebook barrier - undefined behaviour that every real shape (a multiple of 8) avoided.  Here `n_out` is
+/// deliberately ragged, every row is checked against the host reference over the same bytes, and a guard
+/// band past `n_out` must come back untouched: a warp without a row must neither hang the block nor write.
+/// (`compute-sanitizer --tool synccheck` on this binary is the direct check of the barrier itself.)
+int ragged_rows(const Case& cs, long long n_out) {
+    const long long n_in = 512;
+    const long long guard = 64;
+    std::mt19937 rng(77 + (unsigned) n_out);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> xf((size_t) n_in);
+    for (auto& v : xf) v = g(rng);
+    SForm f;
+    f.code_bits = cs.bits;
+    f.code_bias = cs.bias;
+    f.group_elems = cs.group;
+    f.codebook = cs.cb;
+    f.has_offset = cs.has_offset;
+    const int per_byte = 8 / cs.bits;
+    std::vector<uint8_t> codes((size_t) (n_out * n_in / per_byte));
+    for (auto& v : codes) v = (uint8_t) (rng() & 0xFF);
+    const long long n_groups = n_in / cs.group;
+    std::vector<float> scales((size_t) (n_out * n_groups)), offs((size_t) (n_out * n_groups));
+    for (auto& v : scales) v = 0.01f + 0.001f * (float) (rng() % 20);
+    for (auto& v : offs) v = 0.2f * g(rng);
+
+    float* d_xf = nullptr;
+    uint8_t *d_xk = nullptr, *d_x0 = nullptr, *d_codes = nullptr;
+    float *d_scales = nullptr, *d_offs = nullptr, *d_y = nullptr;
+    std::vector<uint8_t> xk((size_t) (n_in / 256) * 292), x0((size_t) (n_in / 32) * 34);
+    check(strata::gpu::alloc_device(&d_xf, (size_t) n_in * 4), "rxf");
+    check(strata::gpu::alloc_device(&d_xk, xk.size()), "rxk");
+    check(strata::gpu::alloc_device(&d_x0, x0.size()), "rx0");
+    check(strata::gpu::alloc_device(&d_codes, codes.size()), "rcodes");
+    check(strata::gpu::alloc_device(&d_scales, scales.size() * 4), "rscales");
+    check(strata::gpu::alloc_device(&d_offs, offs.size() * 4), "roffs");
+    check(strata::gpu::alloc_device(&d_y, (size_t) (n_out + guard) * 4), "ry");
+    check(strata::gpu::copy(d_xf, xf.data(), (size_t) n_in * 4), "rcxf");
+    check(strata::gpu::copy(d_codes, codes.data(), codes.size()), "rcc");
+    check(strata::gpu::copy(d_scales, scales.data(), scales.size() * 4), "rcs");
+    check(strata::gpu::copy(d_offs, offs.data(), offs.size() * 4), "rco");
+    strata::kernels::quantize_q8_K(d_xf, d_xk, n_in, nullptr);
+    strata::kernels::quantize_q8_0(d_xf, d_x0, n_in, nullptr);
+    check(strata::gpu::copy(xk.data(), d_xk, xk.size()), "rcxk");
+    check(strata::gpu::copy(x0.data(), d_x0, x0.size()), "rcx0");
+
+    int bad = 0;
+    for (int kind = 0; kind < 2; ++kind) {           // 0: Q8_K activation, 1: Q8_0 activation
+        std::vector<float> want((size_t) n_out);
+        std::vector<double> mag((size_t) n_out);   // sum |w_i a_i| per row: a row whose sum cancels near 0
+        for (long long o = 0; o < n_out; ++o) {    // must not turn f32 rounding into a relative failure
+            double acc = 0, am = 0;
+            for (long long i = 0; i < n_in; ++i) {
+                double a;
+                if (kind == 0) {
+                    a = q8k_at(xk, i);
+                } else {
+                    const uint8_t* blk = x0.data() + (size_t) (i / 32) * 34;
+                    uint16_t dbits;
+                    std::memcpy(&dbits, blk, 2);
+                    a = (double) strata::kernels::f32_from_f16(dbits) * (double) ((const int8_t*) (blk + 2))[i % 32];
+                }
+                const double wa = weight_at(codes, scales, offs, f, n_in, o, i) * a;
+                acc += wa;
+                am += std::fabs(wa);
+            }
+            want[(size_t) o] = (float) acc;
+            mag[(size_t) o] = am;
+        }
+        // the guard band holds a NaN pattern; any write there shows up as a changed bit
+        std::vector<uint32_t> sentinel((size_t) (n_out + guard), 0x7FC0DEADu);
+        check(strata::gpu::copy(d_y, sentinel.data(), sentinel.size() * 4), "rsent");
+        if (kind == 0)
+            strata::kernels::s_gemv_q8k_split(d_xk, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
+                                              n_out, f, nullptr);
+        else
+            strata::kernels::s_gemv_q8_0_split(d_x0, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
+                                               n_out, f, nullptr);
+        check(strata::gpu::device_sync(), "ragged split");
+        std::vector<uint32_t> got_bits(sentinel.size());
+        check(strata::gpu::copy(got_bits.data(), d_y, got_bits.size() * 4), "rcy");
+        double m = 0, d = 0;
+        for (long long o = 0; o < n_out; ++o) {
+            float v;
+            std::memcpy(&v, &got_bits[(size_t) o], 4);
+            m += mag[(size_t) o];
+            d += std::fabs((double) want[(size_t) o] - (double) v);
+        }
+        long long touched = 0;
+        for (long long o = n_out; o < n_out + guard; ++o) touched += got_bits[(size_t) o] != 0x7FC0DEADu;
+        const double rel = d / (m > 1e-30 ? m : 1e-30);
+        const bool ok = rel <= 1e-5 && touched == 0;
+        std::printf("  %-28s %s n_out %3lld: rel %.3e, guard words written %lld  %s\n", cs.what,
+                    kind == 0 ? "Q8_K" : "Q8_0", n_out, rel, touched, ok ? "ok" : "*** WRONG ***");
+        if (!ok) ++bad;
+    }
+    strata::gpu::free(d_xf); strata::gpu::free(d_xk); strata::gpu::free(d_x0); strata::gpu::free(d_codes); strata::gpu::free(d_scales); strata::gpu::free(d_offs);
+    strata::gpu::free(d_y);
+    return bad;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
@@ -222,8 +330,17 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- 4. output widths that are NOT a multiple of the eight rows per block
+    std::printf("\n");
+    for (const Case& cs : cases)
+        for (long long n_out : {1LL, 7LL, 9LL, 61LL}) bad += ragged_rows(cs, n_out);
+
     std::printf("\ns_gemv_q8k: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("s_gemv_q8k_parity OK\n");
     return 0;
+}
+ catch (const std::exception& error) {
+    std::fprintf(stderr, "%s\n", error.what());
+    return 1;
 }

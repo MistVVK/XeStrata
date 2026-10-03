@@ -29,6 +29,7 @@
 // kernel. This is that first step, and the step it unblocks is the one that can be measured.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>

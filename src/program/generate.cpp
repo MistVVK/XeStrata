@@ -49,6 +49,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -70,6 +71,7 @@
 #include <chrono>
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -97,6 +99,42 @@ bool refill_blocking() {
 }
 
 using Clock = std::chrono::steady_clock;
+
+// The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
+// by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
+// the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
+// them into `in`'s place in RAM.  The RAM copy then again holds exactly the experts no core slot does, and no swap
+// reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
+// on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
+// GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
+template <class Swap>
+bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
+                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
+                          strata::gpu::Stream stream) {
+    if (!src.complement_ready() || swaps.empty()) return true;
+    struct Staged { int32_t layer, in, out; int64_t q; };
+    std::vector<Staged> staged;
+    std::vector<Swap> kept;
+    kept.reserve(swaps.size());
+    for (const Swap& s : swaps) {
+        if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        const int64_t q = (int64_t) staged.size();
+        if (q >= src.exchange_capacity()) continue;
+        const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
+        if (slot < 0) continue;
+        if (strata::gpu::copy_async(src.exchange_buffer(q), cache.device_slot(slot), (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), stream) != true)
+            return false;
+        staged.push_back({s.layer, s.in, s.out, q});
+        kept.push_back(s);
+    }
+    if (!staged.empty()) {
+        if (strata::gpu::stream_sync(stream) != true) return false;
+        for (const Staged& x : staged)
+            if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
+    }
+    swaps.swap(kept);
+    return true;
+}
 
 struct Options {
     std::string pack = "pack/full";
@@ -200,6 +238,11 @@ struct Options {
     /// The low-RAM mode's resident copy: GiB of RAM for the experts the GPU cache does not hold (0 = none; < 0 =
     /// --resident-experts: as much as the free RAM allows)
     double resident_gib = 0;
+    bool resident_cpu_experts = false;
+    bool resident_pin = false;
+    std::string shared_expert_arena;
+    bool coupled_draft = strata::core::coupled_draft_env();
+    strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -486,7 +529,11 @@ void usage() {
                  "  --resident-budget-gib N  with it: the experts the GPU cache does not hold copied into RAM\n"
                  "                       in the profile's order while they fit N GiB (at most the free RAM\n"
                  "                       less 8 GiB); the rest are read from the files\n"
-                 "  --resident-experts   the same with as much RAM as is free (less 8 GiB)\n");
+                 "  --resident-experts   the same with as much RAM as is free (less 8 GiB)\n"
+                 "  --resident-cpu-experts  cache the static GPU cache's misses in ordinary RAM (with --mmap-experts)\n"
+                 "  --shared-expert-arena FILE  share completed expert weights between Linux processes\n"
+                 "  --pool-affinity all|auto|p-cores  CPU worker placement (default: all)\n"
+                 "  --coupled-draft / --no-coupled-draft  sample MTP drafts with the target's chain (default: off)\n");
 }
 
 /// A blob for a copy that is not over at once (a queued or asynchronous fill, a long loop of blocking ones): the
@@ -1102,6 +1149,17 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else if (a == "--gpu-stages") o.gpu_stages = true;
+        else if (a == "--pool-affinity") {
+            const std::string v = next("--pool-affinity");
+            if (v == "auto") o.pool_affinity = strata::kernels::cpu::PoolAffinity::Auto;
+            else if (v == "all") o.pool_affinity = strata::kernels::cpu::PoolAffinity::All;
+            else if (v == "p-cores") o.pool_affinity = strata::kernels::cpu::PoolAffinity::PCores;
+            else { std::fprintf(stderr, "strata generate: --pool-affinity needs all, auto or p-cores\n"); return 2; }
+        }
+        else if (a == "--coupled-draft") o.coupled_draft = true;
+        else if (a == "--no-coupled-draft") o.coupled_draft = false;
+        else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
+        else if (a == "--resident-cpu-experts") { o.mmap_experts = o.resident_cpu_experts = true; o.resident_gib = -1; }
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--resident-experts") { o.mmap_experts = true; o.resident_gib = -1; }
         else if (a == "--resident-budget-gib") {
@@ -1185,6 +1243,14 @@ int main(int argc, char** argv) {
                                  "distinct GPU per K in --split-device (1..%d; or 0 with one K: the same GPU)\n", n_dev - 1);
             return 2;
         }
+    }
+    strata::core::set_coupled_draft(o.coupled_draft);
+    if (o.mmap_experts && !o.shared_expert_arena.empty()) {
+        std::fprintf(stderr, "strata generate: --shared-expert-arena cannot use --mmap-experts\n"); return 2;
+    }
+    if (o.resident_cpu_experts && (!o.mmap_experts || o.expert_profile.empty() || !split_devs.empty())) {
+        std::fprintf(stderr, "strata generate: --resident-cpu-experts needs --mmap-experts and a static --expert-profile\n");
+        return 2;
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
@@ -1517,6 +1583,9 @@ int main(int argc, char** argv) {
         if (!o.native_head_gguf.empty()) skip.insert("output.weight");
         // the PLE module validates its canonical key at construction (8 MB); a native pack has none to load
         if (!native_pack) skip.erase("blk.1.ple_key.weight");
+        else if (!strata::core::NativeDense::keep_unquantized_ple_key(o.pack, skip, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+        }
         if (native_pack) skip.insert("token_embd.weight");
     }
     uint64_t pool_bytes = 0;
@@ -2022,10 +2091,14 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: experts via mmap (--mmap-experts: %s, through the OS file cache)\n",
                      src.gguf_mode() ? "the GGUF files in place" : "experts.bin");
+        if (const char* v = std::getenv("STRATA_FETCH_THREADS")) {
+            const long threads = std::strtol(v, nullptr, 10);
+            if (threads > 0) src.set_fetch_threads((int) std::min<long>(threads, std::numeric_limits<int>::max()));
+        }
         srcp = &src;
     } else {
         arena_src.set_gguf(o.native_preset);   // plan v0.3 P6: a native pack may take its experts from shard 1
-        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err)) {
+        if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
@@ -2035,7 +2108,7 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
@@ -2445,38 +2518,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
     }
-    // The low-RAM mode's resident copy (upstream 872af82 / 3889344): the experts the GPU cache does not hold, in
-    // the profile's order, copied into RAM while they fit the budget; the rest stay on the files.  The budget is
-    // clamped to the free RAM less 8 GiB (the OS, the engine, and the file cache the rest is read through).
-    if (o.resident_gib != 0 && srcp == &src) {
-        uint64_t avail = 0;
-        {
-            std::ifstream mi("/proc/meminfo");
-            for (std::string l; std::getline(mi, l);)
-                if (l.rfind("MemAvailable:", 0) == 0) avail = (uint64_t) std::strtoull(l.c_str() + 13, nullptr, 10) << 10;
-        }
-        const uint64_t headroom = 8ull << 30;
-        const uint64_t room = avail > headroom ? avail - headroom : 0;
-        uint64_t budget = o.resident_gib < 0 ? room : (uint64_t) (o.resident_gib * 1073741824.0);
-        if (budget > room) {
-            std::fprintf(stderr, "strata generate: the resident budget is %.1f GiB, the free RAM allows %.1f: using %.1f\n",
-                         (double) budget / 1073741824.0, (double) room / 1073741824.0, (double) room / 1073741824.0);
-            budget = room;
-        }
-        const auto t0 = Clock::now();
-        if (!src.set_resident(budget, profile, (size_t) prefilled, 8, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "strata generate: %lld experts the GPU cache does not hold are resident in RAM (%.2f GiB, "
-                             "copied in %.1f s, %s); the rest are read from the files\n",
-                     (long long) src.resident_count(), (double) src.resident_bytes() / 1073741824.0,
-                     std::chrono::duration<double>(Clock::now() - t0).count(),
-                     src.resident_count() == 0 ? "nothing to copy"
-                     : src.resident_locked()   ? "locked"
-                                               : "NOT locked - it may be swapped out: raise `ulimit -l`");
-        mem_mark("the resident experts");
-    }
+
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
@@ -2618,6 +2660,31 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
+    // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
+    // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
+    strata::core::RouterLookahead lookahead;
+    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }()) {
+        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
+        bool ok = true;
+        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
+            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
+                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
+            if (!ok) break;
+            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
+            ok = strata::gpu::copy(routers[(size_t) l].data(), w->data, (size_t) w->bytes) == true;
+        }
+        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
+        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? (int) std::strtol(kv, nullptr, 10) : 10, &src, err)) {
+            drive.d.lookahead = &lookahead;
+            std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+        } else {
+            std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
+                         ok ? err.c_str() : "the routers are not BF16 in the arena");
+            err.clear();
+        }
+    }
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.
@@ -3279,7 +3346,7 @@ int main(int argc, char** argv) {
         strata::prefill::Prefill::set_pinned_share(total ? (double) pinned / (double) total : 1.0);
     }
     auto lend_slots = [&](int64_t c) -> int64_t {
-        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c);
+        const uint64_t need = strata::prefill::Prefill::bytes_needed(g, ss, c, srcp != nullptr);
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
         int64_t k = (int64_t) ((need + (uint64_t) blob - 1) / (uint64_t) blob);
         if (xcache.slot_offsets() != nullptr) {   // sized slots: take slots from the end until they hold `need`
@@ -3333,6 +3400,23 @@ int main(int argc, char** argv) {
         }
         return 0;
     };
+    if ((o.resident_cpu_experts || o.resident_gib != 0) && srcp == &src) {
+        const uint64_t budget = o.resident_gib < 0 ? strata::core::FileExpertSource::kResidentWhatFits
+                                : (uint64_t) (o.resident_gib * 1073741824.0);
+        int64_t lend_from = -1;
+        if (o.prefill_chunk > 0 && !o.no_prefill_borrow && d_res && xcache.slots() > 0) {
+            int64_t chunk = o.prefill_chunk;
+            const int64_t slots = plan_lend(chunk);
+            if (slots > 0) lend_from = xcache.slots() - slots;
+        }
+        if (!src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, 8ull << 30, budget, &profile) ||
+            (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
+            std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
+        }
+        std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
+                     (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
+        mem_mark("the resident experts");
+    }
     if (o.serve) {
         if (o.spec < 2 || o.mtp.empty() || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -3741,6 +3825,7 @@ int main(int argc, char** argv) {
                 }
             for (auto& st : stages) st->adapt_live = false;
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            src.commit_exchanges();
             pending.clear();
             res_upload();
         };
@@ -3772,6 +3857,7 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             bool main_live = false;
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -4428,6 +4514,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             ver.set_sampling(req_sp);
+            mtp.set_draft_sampling(req_sp);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
@@ -4616,6 +4703,8 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
+                if (hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
@@ -5197,6 +5286,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the verifier and the drafter's binding");
+        if (use_mtp) mtp.set_draft_sampling(sp);
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
@@ -5237,6 +5327,7 @@ int main(int argc, char** argv) {
             if (trace_adapt)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
             for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            src.commit_exchanges();
             pending.clear();
             if (d_res != nullptr)
                 strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
@@ -5278,6 +5369,7 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -5703,6 +5795,7 @@ int main(int argc, char** argv) {
     strata::gpu::free(d_logits);
     strata::gpu::free(d_emb);
     strata::gpu::free(d_parts);
+    strata::core::session_release(ss);
     strata::gpu::free(sbuf);
     strata::gpu::free(arena);
     return 0;

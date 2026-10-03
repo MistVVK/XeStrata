@@ -138,10 +138,10 @@ void native_rope_set_enabled(bool value) { native_enabled.store(value, std::memo
 bool native_rope_enabled() { return native_enabled.load(std::memory_order_relaxed); }
 
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
-                       int n_rot, float freq_base, const int* positions, void* stream) {
+                       int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !out || !positions || !stream || rows < 1 || rows > 65535 ||
         (head_dim != 128 && head_dim != 256) || n_rot != 64 ||
-        !std::isfinite(freq_base) || freq_base <= 1.0f ||
+        rope_scaling_invalid(scaling) != nullptr ||
         reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(out) % 4 ||
         reinterpret_cast<uintptr_t>(positions) % 4) {
         throw std::invalid_argument("native RoPE requires aligned F32 rows, width 128/256, rotation 64, valid base and explicit stream");
@@ -154,12 +154,12 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     }
     auto& q = queue_for(stream);
     // Match pinned host-side float powf before device powf/trigonometry.
-    const float theta_scale = std::pow(freq_base, -2.0f / n_rot);
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
     const int32_t* mtab = mrope_table();
     const int width = head_dim;
-    const bool scaled = rope_scaling().type != RopeScalingType::None;
-    const RopeKernelArgs ka = rope_scaling().kernel_args(n_rot);
-    const RopeTab tab = rope_table_for(rope_scaling());
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(n_rot);
+    const RopeTab tab = rope_table_for(scaling);
     q.parallel_for(sycl::range<2>((size_t) rows, (size_t) width / 2), [=](sycl::id<2> id) {
         const int row = (int) id[0], pair = (int) id[1];
         const size_t start = size_t(row) * width;

@@ -165,8 +165,8 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                PleOut& out, void* scratch, void* stream) {
     const bool native_key = w.key_native_data != nullptr && w.key_bf16 == nullptr;
     if (native_key && (!emb || !hidden || !hist_rows || !out.result || !scratch || !stream ||
-                       !w.key_native_q8_1 || w.key_native_type != 42))
-        throw std::invalid_argument("ple_block: native key requires Q2_0 weights, input/output, private scratch and explicit stream");
+                       !w.key_native_q8_1 || (w.key_native_type != 42 && w.key_native_type != 18 && w.key_native_type != 23 && w.key_native_type != 8)))
+        throw std::invalid_argument("ple_block: native key requires supported native weights, input/output, private scratch and explicit stream");
     if (emb == nullptr || hidden == nullptr || hist_rows == nullptr || out.result == nullptr) return;
     const int n_embd = NG_N_EMBD, hc = NG_HC, hc_dim = NG_HC_DIM;
     static_assert(NG_N_EMBD == 2560 && NG_HC_DIM == 10240, "native PLE key geometry changed");

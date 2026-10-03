@@ -23,13 +23,17 @@
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/fused_gr.hpp"
 
 #include "parity_device.hpp"
+#include "strata/core/gpu.hpp"
+#include <stdexcept>
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -37,6 +41,10 @@
 #include <vector>
 
 namespace {
+void check(bool ok, const char* operation) {
+    if (!ok) throw std::runtime_error(std::string(operation) + ": " + strata::gpu::last_error());
+}
+
 
 /// The same rule the kernel uses, on the host - `ref/quant.py::bf16`.
 float to_bf16(float f) {
@@ -261,9 +269,161 @@ int scalar_activation_contract() {
     return bad;
 }
 
+int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
+                           const uint16_t* d_inject, float eps) {
+    using namespace strata::kernels;
+    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
+    std::mt19937 rng(0x6f8a);  // NOLINT(bugprone-random-generator-seed): reproducible parity fixture.
+    std::normal_distribution<float> normal(0.0f, 0.3f);
+    std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
+    for (auto& x : r) x = normal(rng);
+    for (auto& x : bo) x = normal(rng);
+    for (auto& x : inj) x = normal(rng);
+
+    float *d_r = nullptr, *d_r_out = nullptr, *d_bo = nullptr, *d_inj = nullptr;
+    float *d_lo = nullptr, *d_rs = nullptr, *d_inj_out = nullptr, *d_mixed = nullptr, *d_xn = nullptr;
+    check(strata::gpu::alloc_device(&d_r, r.size() * sizeof(float)), "multi R");
+    check(strata::gpu::alloc_device(&d_r_out, r.size() * sizeof(float)), "multi R_out");
+    check(strata::gpu::alloc_device(&d_bo, bo.size() * sizeof(float)), "multi bo");
+    check(strata::gpu::alloc_device(&d_inj, inj.size() * sizeof(float)), "multi inj");
+    check(strata::gpu::alloc_device(&d_lo, (size_t) T * LR * sizeof(float)), "multi lo");
+    check(strata::gpu::alloc_device(&d_rs, (size_t) T * HC * sizeof(float)), "multi rs");
+    check(strata::gpu::alloc_device(&d_inj_out, (size_t) T * HC * sizeof(float)), "multi injection");
+    check(strata::gpu::alloc_device(&d_mixed, (size_t) T * N * sizeof(float)), "multi mixed");
+    check(strata::gpu::alloc_device(&d_xn, (size_t) T * D * sizeof(float)), "multi xn");
+    check(strata::gpu::copy(d_r, r.data(), r.size() * sizeof(float)), "multi copy R");
+    check(strata::gpu::copy(d_bo, bo.data(), bo.size() * sizeof(float)), "multi copy bo");
+    check(strata::gpu::copy(d_inj, inj.data(), inj.size() * sizeof(float)), "multi copy inj");
+
+    std::vector<FusedGrArgs> args(T);
+    for (int t = 0; t < T; ++t) {
+        auto& a = args[t];
+        a.R = d_r + (size_t) t * D;
+        a.R_out = d_r_out + (size_t) t * D;
+        a.apply = true;
+        a.bo_prev = d_bo + (size_t) t * N;
+        a.inj_prev = d_inj + (size_t) t * HC;
+        a.w_norm = d_norm;
+        a.w_down = d_down;
+        a.w_up = d_up;
+        a.w_inject = d_inject;
+        a.eps = eps;
+        a.lo = d_lo + (size_t) t * LR;
+        a.rs = d_rs + (size_t) t * HC;
+        a.inject_out = d_inj_out + (size_t) t * HC;
+        a.mixed = d_mixed + (size_t) t * N;
+    }
+
+    struct Snapshot {
+        std::vector<float> r_out, lo, rs, inject, mixed;
+    };
+    auto snapshot = [&]() {
+        Snapshot s;
+        s.r_out.resize((size_t) T * D);
+        s.lo.resize((size_t) T * LR);
+        s.rs.resize((size_t) T * HC);
+        s.inject.resize((size_t) T * HC);
+        s.mixed.resize((size_t) T * N);
+        check(strata::gpu::copy(s.r_out.data(), d_r_out, s.r_out.size() * sizeof(float)), "multi read R_out");
+        check(strata::gpu::copy(s.lo.data(), d_lo, s.lo.size() * sizeof(float)), "multi read lo");
+        check(strata::gpu::copy(s.rs.data(), d_rs, s.rs.size() * sizeof(float)), "multi read rs");
+        check(strata::gpu::copy(s.inject.data(), d_inj_out, s.inject.size() * sizeof(float)), "multi read inject");
+        check(strata::gpu::copy(s.mixed.data(), d_mixed, s.mixed.size() * sizeof(float)), "multi read mixed");
+        return s;
+    };
+    // the split read (STRATA_GR_V3=1) sums in another order than the single-token kernel: equal within float
+    // rounding, not to the bit, so it is compared with a relative tolerance; the default kernels bit for bit
+    static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && (int) std::strtol(v, nullptr, 10) != 0; }();
+    auto close = [](const std::vector<float>& x, const std::vector<float>& y) {
+        double worst = 0.0, mag = 1e-30;
+        for (size_t i = 0; i < x.size(); ++i) {
+            worst = std::max(worst, (double) std::fabs(x[i] - y[i]));
+            mag = std::max(mag, (double) std::fabs(y[i]));
+        }
+        if (worst > 2e-6 * mag)
+            std::printf("    tolerance: worst %.3e of max |ref| %.3e (rel %.3e), n %zu\n", worst, mag, worst / mag, x.size());
+        return worst <= 2e-6 * mag;
+    };
+    auto same = [&](const Snapshot& a, const Snapshot& b) {
+        if (v3)   // `lo` is the default kernels' workspace between down and up; the split read keeps it in shared memory
+            return close(a.r_out, b.r_out) && close(a.rs, b.rs) && close(a.inject, b.inject) && close(a.mixed, b.mixed);
+        return std::memcmp(a.r_out.data(), b.r_out.data(), a.r_out.size() * sizeof(float)) == 0 &&
+               std::memcmp(a.lo.data(), b.lo.data(), a.lo.size() * sizeof(float)) == 0 &&
+               std::memcmp(a.rs.data(), b.rs.data(), a.rs.size() * sizeof(float)) == 0 &&
+               std::memcmp(a.inject.data(), b.inject.data(), a.inject.size() * sizeof(float)) == 0 &&
+               std::memcmp(a.mixed.data(), b.mixed.data(), a.mixed.size() * sizeof(float)) == 0;
+    };
+
+    strata::gpu::Stream stream = nullptr;
+    check(((stream = strata::gpu::stream_create()) != nullptr), "multi stream");
+    // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
+    fused_gr_read_multi(args.data(), T, d_xn, stream);
+    check(strata::gpu::stream_sync(stream), "multi max-T sync");
+    const Snapshot multi = snapshot();
+    for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
+    check(strata::gpu::stream_sync(stream), "single reference sync");
+    const Snapshot single = snapshot();
+    int bad = 0;
+    if (!same(multi, single)) {
+        std::printf("  fused GR multi max-T differs from single-token calls\n");
+        ++bad;
+    }
+
+    strata::gpu::Graph* graph = nullptr;
+    strata::gpu::Graph* graph_exec = nullptr;
+    check(strata::gpu::begin_capture(stream), "multi graph begin");
+    fused_gr_read_multi(args.data(), T, d_xn, stream);
+    check(strata::gpu::end_capture(stream, &graph), "multi graph end");
+    graph_exec = graph; graph = nullptr;
+    check(strata::gpu::graph_launch(graph_exec, stream), "multi graph initial replay");
+    check(strata::gpu::stream_sync(stream), "multi graph initial sync");
+    const Snapshot captured = snapshot();
+    if (!same(multi, captured)) {
+        std::printf("  fused GR multi captured graph differs from direct max-T call\n");
+        ++bad;
+    }
+
+    // Reuse the same captured pointers with new payloads; then independently run the single-token path again.
+    for (size_t i = 0; i < r.size(); ++i) r[i] = -0.7f * r[i] + 0.001f * (float) (i % 17);
+    for (size_t i = 0; i < bo.size(); ++i) bo[i] = -0.4f * bo[i] + 0.02f;
+    for (size_t i = 0; i < inj.size(); ++i) inj[i] += 0.3f;
+    check(strata::gpu::copy_async(d_r, r.data(), r.size() * sizeof(float), stream), "multi replay R");
+    check(strata::gpu::copy_async(d_bo, bo.data(), bo.size() * sizeof(float), stream), "multi replay bo");
+    check(strata::gpu::copy_async(d_inj, inj.data(), inj.size() * sizeof(float), stream), "multi replay inj");
+    check(strata::gpu::graph_launch(graph_exec, stream), "multi graph changed replay");
+    check(strata::gpu::stream_sync(stream), "multi graph changed sync");
+    const Snapshot replay = snapshot();
+    if (std::memcmp(multi.mixed.data(), replay.mixed.data(), multi.mixed.size() * sizeof(float)) == 0) {
+        std::printf("  fused GR graph replay ignored changed inputs\n");
+        ++bad;
+    }
+    for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
+    check(strata::gpu::stream_sync(stream), "changed single reference sync");
+    if (!same(replay, snapshot())) {
+        std::printf("  fused GR changed graph replay differs from single-token calls\n");
+        ++bad;
+    }
+
+    std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
+                bad == 0 ? "pass" : "FAIL");
+    strata::gpu::graph_destroy(graph_exec);
+    strata::gpu::graph_destroy(graph);
+    strata::gpu::stream_destroy(stream);
+    strata::gpu::free(d_xn);
+    strata::gpu::free(d_mixed);
+    strata::gpu::free(d_inj_out);
+    strata::gpu::free(d_rs);
+    strata::gpu::free(d_lo);
+    strata::gpu::free(d_inj);
+    strata::gpu::free(d_bo);
+    strata::gpu::free(d_r_out);
+    strata::gpu::free(d_r);
+    return bad;
+}
+
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
@@ -273,7 +433,7 @@ int main(int argc, char** argv) {
     const long long n_embd = 256, hc = 4, hc_lr = 32;
     const long long hc_dim = hc * n_embd;
     const float eps = 1e-6f;
-    std::mt19937 rng(1234);
+    std::mt19937 rng(1234);  // NOLINT(bugprone-random-generator-seed): reproducible parity fixture.
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
     // Weights are BF16-VALUED f32, which is what the pack holds for a BF16 source type.  Generating plain f32
@@ -535,7 +695,7 @@ int main(int argc, char** argv) {
     // Workspace sizing and every full weight row must agree with the model geometry.
     {
         const long long rn = 2560, rhc = 4, rlr = 320, rdim = rhc * rn;
-        std::mt19937 rrng(99);
+        std::mt19937 rrng(99);  // NOLINT(bugprone-random-generator-seed): reproducible parity fixture.
         std::normal_distribution<float> rg(0.0f, 1.0f);
         auto rbf16 = [&](size_t n, float sigma) {
             std::vector<float> v(n);
@@ -594,6 +754,7 @@ int main(int argc, char** argv) {
                         activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
+        bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
         select_activation_mode(0);
         }
 
@@ -602,4 +763,8 @@ int main(int argc, char** argv) {
     if (bad) return 1;
     if (selftest) std::printf("gr_parity OK\n");
     return 0;
+}
+ catch (const std::exception& error) {
+    std::fprintf(stderr, "%s\n", error.what());
+    return 1;
 }

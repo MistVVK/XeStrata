@@ -11,6 +11,7 @@
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
 //   2. the new and old outputs agree to a relative 1e-4 of the output scale;
 // then times both over a prompt chunk (the old one in batches of 32, as prefill.cpp calls it).
+// HIP builds (S6): the same checks for the RDNA4 matrix-core kernel (STRATA_HIP_WMMA), skipped (77) off gfx12.
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"

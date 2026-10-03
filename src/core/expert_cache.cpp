@@ -145,6 +145,7 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 
 ExpertCache::~ExpertCache() { close(); }
 
+
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
@@ -230,7 +231,14 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     slots_ = (int64_t) slot_bytes.size();
     blob_ = mx;
     off_ = std::move(off);
+    // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
+    // "slots", so its seeds are not slot indices
     layer_next_.assign((size_t) (n_layers > 0 ? n_layers : 0), 0);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        int64_t lo = 0, hi = 0;
+        layer_slot_range(l, lo, hi);
+        layer_next_[(size_t) l] = (int32_t) lo;
+    }
     return true;
 }
 

@@ -55,10 +55,10 @@ class CompatibilityTests(unittest.TestCase):
             source = root / "model.gguf"
             values = np.linspace(-1, 1, 256, dtype=np.float32).reshape(2, 128)
             router = np.full((2, 128), 0.10001, dtype=np.float32)
-            # XeStrata: a Q8_0 PLE key takes the BF16 path (its native PLE key reads Q2_0 only)
-            names = ["blk.0.hc_attn_down.weight", "output_hc_up.weight", "blk.0.ssm_alpha.weight",
-                     "blk.3.indexer.q_proj.weight", "blk.1.ple_value.weight", "blk.1.ple_key.weight"]
+            names = ["blk.0.hc_attn_down.weight", "output_hc_up.weight",
+                     "blk.0.ssm_alpha.weight", "blk.3.indexer.q_proj.weight", "blk.1.ple_value.weight"]
             write_gguf(source, [(n, values, Q.Q8_0) for n in names] + [
+                ("blk.1.ple_key.weight", values, Q.Q8_0),
                 ("blk.0.ffn_gate_inp.weight", router, Q.F32),
                 ("blk.0.attn_qkv.weight", values, Q.Q8_0),
                 ("per_layer_token_embd.weight", values, Q.Q8_0),
@@ -83,14 +83,14 @@ class CompatibilityTests(unittest.TestCase):
                 self.assertEqual(row[2], "4")
                 offset, size = int(row[3]), int(row[4])
                 np.testing.assert_array_equal(np.frombuffer(dense[offset:offset + size], dtype=np.uint16), expected)
-            for name in ["blk.0.attn_qkv.weight"]:
+            for name in ["blk.0.attn_qkv.weight", "blk.1.ple_key.weight"]:   # a Q8_0 PLE key stays native
                 native = rows[name]
                 self.assertEqual(native[2], "0")
                 self.assertEqual(native[4], "0")
                 self.assertEqual(native[9], "8")
             self.assertNotIn("per_layer_token_embd.weight", rows)
             self.assertEqual(source.read_bytes(), before)
-            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 7)
+            self.assertEqual(len(json.loads((root / "compat-bf16.json").read_text())["tensors"]), 6)
             conv = json.loads((root / "conversions.json").read_text())
             self.assertEqual(sorted(r["name"] for r in conv["tensors"]), sorted(names + ["blk.0.ffn_gate_inp.weight"]))
 
@@ -124,7 +124,7 @@ class CompatibilityTests(unittest.TestCase):
 
     def test_q2_ple_and_large_tensors_stay_native(self):
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q2_0"))
-        self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q8_0"))   # XeStrata: no native Q8_0 key
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q8_0"))
         self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ3_XXS"))
         for name in ["blk.0.ffn_gate_exps.weight", "token_embd.weight", "output.weight",
                      "per_layer_token_embd.weight", "blk.0.attn_qkv.weight"]:
@@ -317,12 +317,12 @@ class ConversionTests(unittest.TestCase):
             rc, log, *_ = pack_one(Path(tmp), tensors)
             self.assertEqual(rc, 1)
             self.assertIn("use --compat-bf16", log)
-            self.assertIn("ple_key", log)            # XeStrata: a Q8_0 key needs the BF16 path too (native key: Q2_0)
+            self.assertNotIn("ple_key", log)                                      # the Q8_0 key stays native
             rc, log, rows, dense, conv = pack_one(Path(tmp), tensors, True)
             self.assertEqual(rc, 0, log)
-            self.assertEqual(rows["blk.1.ple_key.weight"][2], "4")
+            self.assertEqual(rows["blk.1.ple_key.weight"][2], "0")
             recs = {r["name"]: r for r in conv["tensors"]}
-            self.assertEqual(set(recs), {"blk.1.ple_value.weight", "blk.2.hc_attn_up.weight", "blk.1.ple_key.weight"})
+            self.assertEqual(set(recs), {"blk.1.ple_value.weight", "blk.2.hc_attn_up.weight"})
             deq = quants.dequantize(quants.quantize(v, Q.Q8_0), Q.Q8_0).ravel()
             got = (stored(rows, dense, "blk.1.ple_value.weight", "<u2").astype(np.uint32) << 16).view(np.float32)
             r = recs["blk.1.ple_value.weight"]

@@ -23,4 +23,13 @@ LockResult lock_resident(void* p, uint64_t bytes);
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
+/// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
+/// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
+/// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and
+/// `why` says so) when the query is not possible - always elsewhere than Windows.
+bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
+
+/// The machine's physical RAM in bytes (0 when unknown).
+uint64_t total_physical_memory();
+
 }  // namespace strata::platform

@@ -117,7 +117,7 @@ enum class PleIo { Direct, Mmap };
 
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
-    uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
+    uint32_t max_inflight = 256;     ///< outstanding SSD reads (decode needs 16; a prompt chunk saturates the SSD at 256)
     uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
     /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on

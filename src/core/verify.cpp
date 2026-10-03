@@ -518,7 +518,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
                     if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
                     else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, (float) qsa_freq_base(), pos, cs);
+                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
                     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
@@ -563,7 +563,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 for (int t = tb; t < te; ++t)
                     native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              (float) qsa_freq_base(), cs);
+                                              rope_scaling(), cs);
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
@@ -944,7 +944,7 @@ bool Verifier::capture_commit(std::string& err) {
                 for (int64_t t = 0; t < MT; ++t)
                     native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
                                               (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              (float) qsa_freq_base(), cs_);
+                                              rope_scaling(), cs_);
                 ++qsa_index;
             }
         }

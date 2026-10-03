@@ -36,6 +36,12 @@ inline int64_t progress_now_ms() {
 using DiagFn = void (*)(std::FILE*);
 inline std::atomic<DiagFn>& diag_pool_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 inline std::atomic<DiagFn>& diag_verify_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
+/// #267: what a path that ends the engine runs first - it releases the GPU's spin waits on host flags (the verify
+/// window's), so no kernel stays resident while the process goes away (on Windows that left the GPU "lost").
+inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
+inline void release_gpu_waits(std::FILE* f) {
+    if (auto fn = release_gpu_fn().load()) fn(f);
+}
 
 inline Progress& progress() {
     static Progress p;

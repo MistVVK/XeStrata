@@ -561,14 +561,63 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     }();
     const bool pipe = pipe_on;   // the kernel takes a copy
     static_assert(CB * RG == S, "one q and one k value a work-item");
-    if (gdn_lane_ok(q))
+    static const bool keyhead=[] { const char* v=std::getenv("STRATA_GDN_KEYHEAD"); return v && std::strtol(v, nullptr, 10)!=0; }();
+    const size_t kh_local=((size_t) 2*S+size_t(2)*(HV/HK)*RG*CB)*sizeof(float);
+    if (keyhead && pipe && q.get_device().get_info<sycl::info::device::local_mem_size>()>=kh_local &&
+        q.get_device().get_info<sycl::info::device::max_work_group_size>()>=(size_t) CB*RG) {
+        q.submit([&](sycl::handler& hd) {
+            sycl::local_accessor<float,1> sq(sycl::range<1>(S),hd),sk(sycl::range<1>(S),hd),
+                rkv(sycl::range<1>((size_t) (HV/HK)*RG*CB),hd),ro(sycl::range<1>((size_t) (HV/HK)*RG*CB),hd);
+            hd.parallel_for(sycl::nd_range<1>((size_t) HK*NCB*CB*RG,size_t(CB)*RG),
+                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                constexpr int VPK=HV/HK;
+                const int qh=(int) it.get_group(0)/NCB,cb=(int) it.get_group(0)%NCB;
+                const int tid=(int) it.get_local_id(0),c=tid%CB,rg=tid/CB,col=cb*CB+c;
+                const size_t rs=(size_t) HV*S;
+                float values[VPK][RPG];
+                for (int j=0;j<VPK;++j) {
+                    const float* base=state+((size_t) (rg*RPG)*HV+qh+(int64_t) j*HK)*S+col;
+                    for (int r=0;r<RPG;++r) values[j][r]=base[r*rs];
+                }
+                for (int64_t t=0;t<T;++t) {
+                    sycl::group_barrier(it.get_group());
+                    sq[tid]=h[t*C+(int64_t) qh*S+tid]; sk[tid]=h[t*C+(int64_t) HK*S+(int64_t) qh*S+tid];
+                    sycl::group_barrier(it.get_group());
+                    float decay[VPK],delta[VPK],out[VPK]={};
+                    for (int j=0;j<VPK;++j) {
+                        decay[j]=sycl::exp(gate[t*HV+qh+(int64_t) j*HK]);
+                        float kv=0;
+                        for (int r=0;r<RPG;++r) kv=sycl::fma(values[j][r],sk[rg*RPG+r],kv);
+                        rkv[(j*RG+rg)*CB+c]=kv;
+                    }
+                    sycl::group_barrier(it.get_group());
+                    for (int j=0;j<VPK;++j) {
+                        const float sum=rkv[j*RG*CB+c]+rkv[(j*RG+1)*CB+c]+rkv[(j*RG+2)*CB+c]+rkv[(j*RG+3)*CB+c];
+                        delta[j]=(h[t*C+2*(int64_t) HK*S+(int64_t) (qh+(int64_t) j*HK)*S+col]-decay[j]*sum)*beta[t*HV+qh+(int64_t) j*HK];
+                    }
+                    for (int r=0;r<RPG;++r) for (int j=0;j<VPK;++j) {
+                        values[j][r]=sycl::fma(decay[j],values[j][r],sk[rg*RPG+r]*delta[j]);
+                        out[j]=sycl::fma(values[j][r],sq[rg*RPG+r],out[j]);
+                    }
+                    for (int j=0;j<VPK;++j) ro[(j*RG+rg)*CB+c]=out[j];
+                    sycl::group_barrier(it.get_group());
+                    if (rg<VPK) y[t*HV*S+(int64_t) (qh+(int64_t) rg*HK)*S+col]=
+                        (ro[rg*RG*CB+c]+ro[(rg*RG+1)*CB+c]+ro[(rg*RG+2)*CB+c]+ro[(rg*RG+3)*CB+c])*sycl::rsqrt((float) S);
+                }
+                for (int j=0;j<VPK;++j) {
+                    float* base=state+((size_t) (rg*RPG)*HV+qh+(int64_t) j*HK)*S+col;
+                    for (int r=0;r<RPG;++r) base[r*rs]=values[j][r];
+                }
+            });
+        });
+    } else     if (gdn_lane_ok(q))
         q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
     else q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * CB), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int head = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
-            const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
+            const int head = (int) (int) it.get_group(0) / NCB, cb = (int) (int) it.get_group(0) % NCB;
+            const int tid = (int) (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
             const int qh = head % HK;
             float s[RPG];
             float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
@@ -626,7 +675,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
+            const int64_t t = (int64_t) (int) it.get_group(0);
             const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
             const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
             const float oc = y[at];
@@ -693,8 +742,8 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            float* r = x + (int64_t) it.get_group(0) * ld;
-            const int tid = (int) it.get_local_id(0);
+            float* r = x + (int64_t) (int) it.get_group(0) * ld;
+            const int tid = (int) (int) it.get_local_id(0);
             float ss = 0.0f;
             for (int64_t c = tid; c < cols; c += 256) ss += r[c] * r[c];
             const float s = sycl::rsqrt(block_sum(it, ss, &sh[0]) / (float) cols + eps);
@@ -703,12 +752,12 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
         });
     });
 }
-void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, float freq_base, void* stream) {
-    const float theta_scale = std::pow(freq_base, -2.0f / 64.0f);
+void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream) {
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / 64.0f);
     const int32_t* mtab = strata::kernels::mrope_table();
-    const bool scaled = strata::kernels::rope_scaling().type != strata::kernels::RopeScalingType::None;
-    const strata::kernels::RopeKernelArgs ka = strata::kernels::rope_scaling().kernel_args(64);
-    const strata::kernels::RopeTab tab = strata::kernels::rope_table_for(strata::kernels::rope_scaling());
+    const bool scaled = scaling.type != strata::kernels::RopeScalingType::None;
+    const strata::kernels::RopeKernelArgs ka = scaling.kernel_args(64);
+    const strata::kernels::RopeTab tab = strata::kernels::rope_table_for(scaling);
     Q(stream).parallel_for(sycl::range<2>((size_t) (T * heads), 32), [=](sycl::id<2> id) {
         const int64_t row = (int64_t) id[0];   // t * heads + h
         const int pair = (int) id[1];          // 0..31

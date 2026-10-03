@@ -6,6 +6,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 #include <cpuid.h>
 #include <fstream>
 #include <sstream>
@@ -37,6 +39,61 @@ bool cpu_avx512_ok() {
         return ((ebx >> 16) & 1u) && ((ebx >> 30) & 1u) && ((ebx >> 31) & 1u) && ((ecx >> 11) & 1u) && ((ecx >> 1) & 1u);
     }();
     return ok;
+}
+
+bool cpu_avx2_ok() {
+    static const bool ok = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, (int) sub);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(0, 0);
+        if (r[0] < 7) return false;
+        cpuid(1, 0);
+        const unsigned ecx1 = r[2];
+        // FMA (12), OSXSAVE (27), AVX (28), F16C (29)
+        if (!((ecx1 >> 12) & 1u) || !((ecx1 >> 27) & 1u) || !((ecx1 >> 28) & 1u) || !((ecx1 >> 29) & 1u)) return false;
+#if defined(_MSC_VER)
+        const unsigned long long xcr0 = _xgetbv(0);
+#else
+        unsigned lo = 0, hi = 0;
+        __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+        const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+        if ((xcr0 & 0x6) != 0x6) return false;            // the OS saves the SSE and AVX state
+        cpuid(7, 0);
+        return ((r[1] >> 5) & 1u) != 0;                    // AVX2
+    }();
+    return ok;
+}
+
+std::string cpu_name() {
+    unsigned r[12] = {};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuid(x, (int) 0x80000000u);
+    if ((unsigned) x[0] < 0x80000004u) return "unknown";
+    for (unsigned i = 0; i < 3; ++i) {
+        __cpuid(x, (int) (0x80000002u + i));
+        for (int j = 0; j < 4; ++j) r[i * 4 + j] = (unsigned) x[j];
+    }
+#else
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    __cpuid(0x80000000u, a, b, c, d);
+    if (a < 0x80000004u) return "unknown";
+    for (unsigned i = 0; i < 3; ++i) __cpuid(0x80000002u + i, r[(size_t) i * 4], r[(size_t) i * 4 + 1], r[(size_t) i * 4 + 2], r[(size_t) i * 4 + 3]);
+#endif
+    char s[49] = {};
+    std::memcpy(s, r, 48);
+    std::string name(s);
+    const size_t b0 = name.find_first_not_of(' '), b1 = name.find_last_not_of(' ');
+    return b0 == std::string::npos ? std::string("unknown") : name.substr(b0, b1 - b0 + 1);
 }
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
@@ -92,6 +149,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
                 if (up || xs) {
                     const char* num = line.c_str() + (up ? sizeof up_tag : sizeof xs_tag) - 1;
                     const int v = (int) std::strtol(num, nullptr, 10);
+                    L.version = up ? v : 4;
                     if (v > (up ? 4 : 1)) {
                         err = std::string("native_experts.txt is ") + (up ? "v" : "xs") + std::to_string(v) +
                               "; this engine reads upstream's v2-v4 and XeStrata's xs1 (repack with this "

@@ -9,13 +9,21 @@
 // The cos/sin table is built on the HOST in float64 (see Strata's src/kernels/cuda/rope.cu for why) and the kernel is
 // a pure rotation over it.  The table depends on (n_rot, theta, position) and not on the token, so it is worth
 // caching; `build_rope_table` fills `max_pos` positions of `n_rot/2` pairs each.
+//
+// ROPE SCALING RIDES IN THE TABLE, NOT IN THE KERNEL.  The kernels below read cos/sin values and
+// cannot tell a scaled table from an unscaled one - with scaling on, the scaled angles (and YaRN's
+// mscale magnitude correction, folded into the same values) simply ARE the table.  That is why
+// neither `rope_neox_apply` nor the indexer's pooling kernel takes any scaling argument: the config
+// enters once, here, at build time (`rope_scaling.hpp`).
 #pragma once
 
 #include "strata/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 
-#if defined(__CUDACC__)
+#include "strata/kernels/rope_scaling.hpp"
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #define STRATA_ROPE_HD __host__ __device__
 #else
 #define STRATA_ROPE_HD

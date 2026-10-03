@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways, on real GGUF rows.
+// src/kernels/native_expert_parity.cpp - plan v0.3 P6: one native expert three ways.
 //
-//     build/native_expert_parity <shard1.gguf> [layer ...]
+//     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
+//     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
+//     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
@@ -17,6 +19,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
@@ -25,6 +28,8 @@
 
 #include "parity_device.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>

@@ -45,6 +45,11 @@ struct PinnedArena {
     // and readable by GPU kernels at the same address (a registered mapping is for copies only, and one host USM
     // block may not exceed max_mem_alloc_size).  The layers are then not adjacent: address them with `at`.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad = 0, bool host_usm = false);
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
+                const std::string& shared_file, uint64_t pack_hash);
+    /// Holds the shared file's population lock until publish_shared() or destruction. False: already complete.
+    bool begin_shared_population();
+    void publish_shared();
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
@@ -57,6 +62,8 @@ struct PinnedArena {
     std::vector<uint8_t*> layer_base;   // host USM blocks, one per layer (empty: one mapping)
 
 private:
+    int shared_fd_ = -1;
+    bool shared_locked_ = false;
     std::vector<uint64_t> bounds_;
     void* map_ = nullptr;          // the mapping `base` is aligned inside
     size_t map_bytes_ = 0;

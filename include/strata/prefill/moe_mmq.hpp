@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/prefill/moe_mmq.hpp - prompt-speed plan step 2b: the prompt path's experts through llama.cpp's MMQ
-// kernels (ggml-cuda mmq.cuh, MIT): the weights stay quantized and the activations are rounded to q8_1, the
-// products run on int8 tensor cores.  The dequantize-to-FP16 + cuBLAS path wrote ~10 MB of FP16 per expert and
-// multiplied in FP16; this reads the ~1.4-2 MB expert once.  A group of experts is gathered into one buffer
-// (`gather_*`, one launch per expert as its blob arrives) and multiplied in one launch per product.
+// The Xe prompt path keeps GGUF weights quantized and multiplies q8_1 activation rows with
+// the integer dot products used by decode. IQ1_M layers keep the FP16 path.
 #pragma once
 
 #include <cstddef>
@@ -13,10 +10,12 @@
 
 namespace strata::prefill::mmq {
 
-/// This build has the MMQ path (the ggml sources were available to the build).
+/// This build has the Xe quantized prompt products.
 bool built();
-/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
+/// Supported GGUF weight types; IQ1_M is not covered.
 bool supported(int ggml_type);
+/// Supported type and a positive row count; these kernels need no weight tile in local memory.
+bool fits(int ggml_type, int64_t w_rows);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
@@ -45,11 +44,11 @@ struct Product {
     int64_t ld_dst = 0;
 };
 
-/// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
+/// One launch context per prompt path.
 class Context {
 public:
-    Context();
-    ~Context();
+    Context() = default;
+    ~Context() = default;
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     void run(const Product& p, void* stream);
@@ -59,6 +58,16 @@ public:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
+/// gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate at +0, up at
+/// +up_off, down at +down_off) to gu_dst + q * gu_stride and d_dst + q * d_stride - the same bytes as one gather_native
+/// each.  Every pointer, offset and size 16-byte aligned (false otherwise: nothing launched, gather one at a time).
+constexpr int kGatherGroupMax = 16;
+struct GatherGroup {
+    const uint8_t* blob[kGatherGroupMax] = {};
+    int first = 0, n = 0;
+};
+bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);

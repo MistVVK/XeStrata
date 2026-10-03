@@ -20,9 +20,10 @@ namespace {
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
-    // The native PLE kernel accepts Q2_0. Other quantized keys can be converted to BF16 by iq_pack;
-    // keep their packed bytes resident instead of overriding them with an unsupported native key.
-    if (name == "blk.1.ple_key.weight") return include_ple_key && tensor.type == 42;   // 42 = Q2_0
+    // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
+    // fallback.
+    if (name == "blk.1.ple_key.weight")
+        return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
@@ -54,6 +55,16 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         err = std::string("native dense: ") + error.what();
         return false;
     }
+}
+
+bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
+                                           std::string& err) {
+    const std::string ple_tensor = "blk.1.ple_key.weight";
+    if (!skip.count(ple_tensor)) return true;
+    int code_bits = -1;
+    if (!WeightTable::index_code_bits(pack_dir, ple_tensor, code_bits, err)) return false;
+    if (code_bits == 0) skip.erase(ple_tensor);
+    return true;
 }
 
 NativeDense::~NativeDense() {
@@ -143,6 +154,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
+                // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
+                if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {

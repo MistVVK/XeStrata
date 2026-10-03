@@ -103,6 +103,194 @@ struct GrMulti {
 
 }  // namespace
 
+namespace {
+constexpr int PR = LR+HC;
+constexpr int R2 = 1;
+template<int S>
+void read_v3(sycl::queue& q, const GrMulti& m) {
+    float* part = m.xn;
+    float* ssg = part+(size_t) m.T*HC*S*PR;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float,1> xs(sycl::range<1>((size_t) kFusedGrMaxT*N/S),h);
+        sycl::local_accessor<float,2> red(sycl::range<2>(WARPS,kFusedGrMaxT),h);
+        h.parallel_for(sycl::nd_range<2>({(size_t) (DOWN_BLOCKS+1)*THREADS, (size_t) HC*S},{THREADS,1}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg=it.get_sub_group();
+            const int t=(int) it.get_local_id(0),lane=(int) sg.get_local_linear_id(),warp=(int) sg.get_group_linear_id();
+    const int T = m.T;
+    // S = 2: each stream's 2560 columns in two halves ((int) it.get_group(1) = stream * S + half): twice the blocks
+    constexpr int SL = N / S, TQS = SL / 8 / 32;
+    const int rg = (int) it.get_group(0), c = (int) it.get_group(1) / S, h = (int) it.get_group(1) - ((int) it.get_group(1) / S) * S;
+    constexpr int NDB = LR / (WARPS * R2);          // down row blocks per stream; block NDB = the inject rows
+    const bool inject_block = rg == NDB;
+    // warp w owns rows row0 + w * R2 + r (r < R2); the inject block: warps 0-3, one row each
+    const int row0 = inject_block ? warp : (rg * WARPS + warp) * R2;
+    const int nrows = inject_block ? ((m.a[0].w_inject != nullptr && warp < HC) ? 1 : 0) : R2;
+    const bool active = nrows > 0;
+    const uint16_t* wbase = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+    uint4 wv[R2][TQS];
+#pragma unroll
+    for (int r = 0; r < R2; ++r) {
+        if (r >= nrows) break;
+        const uint4* w4 = reinterpret_cast<const uint4*>(wbase + (size_t) (row0 + r) * D + (size_t) c * N + (size_t) h * SL);
+#pragma unroll
+        for (int q = 0; q < TQS; ++q) wv[r][q] = *(w4 + lane + (ptrdiff_t) 32 * q);
+    }
+    float ssp[kFusedGrMaxT];
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        ssp[k] = 0.0f;
+        if (k >= T) continue;
+        const FusedGrArgs& a = m.a[k];
+        const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+        const float4* R4 = reinterpret_cast<const float4*>(a.R + (size_t) c * N + (size_t) h * SL);
+        const float4* G4 = reinterpret_cast<const float4*>(a.w_norm + (size_t) c * N + (size_t) h * SL);
+        const float4* B4 = a.apply ? reinterpret_cast<const float4*>(a.bo_prev + (size_t) h * SL) : nullptr;
+        float4* X4 = reinterpret_cast<float4*>(&xs[(size_t) k * SL]);
+        for (int i = t; i < SL / 4; i += THREADS) {
+            float4 r = R4[i];
+            if (a.apply) {
+                const float4 b = B4[i];
+                r.x() = sycl::fma(b.x(), gw, r.x()); r.y() = sycl::fma(b.y(), gw, r.y());
+                r.z() = sycl::fma(b.z(), gw, r.z()); r.w() = sycl::fma(b.w(), gw, r.w());
+            }
+            const float4 g = G4[i];
+            ssp[k] += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+            X4[i] = float4(r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+        }
+    }
+#pragma unroll
+    for (int k = 0; k < kFusedGrMaxT; ++k) {
+        if (k >= T) break;
+        const float v = warp_sum(sg,ssp[k]);
+        if (lane == 0) red[warp][k] = v;
+    }
+    sycl::group_barrier(it.get_group());
+    if (rg == 0 && t < T) {
+        float sum = 0.0f;
+        for (int w = 0; w < WARPS; ++w) sum += red[w][t];
+        ssg[(t * HC + c) * S + h] = sum;
+    }
+    if (!active) return;
+#pragma unroll
+    for (int r = 0; r < R2; ++r) {
+        if (r >= nrows) break;
+        float acc[kFusedGrMaxT];
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) acc[k] = 0.0f;
+#pragma unroll
+        for (int q = 0; q < TQS; ++q) {
+            const int j = lane + 32 * q;
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k)
+                if (k < T) acc[k] += dot8(wv[r][q], &xs[(size_t) k * SL + (size_t) j * 8]);
+        }
+        const int prow = inject_block ? LR + warp : row0 + r;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            const float v = warp_sum(sg,acc[k]);
+            if (lane == 0) part[(((size_t) k * HC + c) * S + h) * PR + prow] = v;
+        }
+    }
+        });
+    });
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float,2> lo(sycl::range<2>(kFusedGrMaxT,LR),h), rsS(sycl::range<2>(kFusedGrMaxT,HC),h);
+        sycl::local_accessor<float,3> g(sycl::range<3>(kFusedGrMaxT,HC,UPM_COLS),h);
+        h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS*THREADS,THREADS),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg=it.get_sub_group();
+            const int t=(int) it.get_local_id(0),lane=(int) sg.get_local_linear_id(),warp=(int) sg.get_group_linear_id();
+    const int T = m.T;
+    const int d0 = (int) it.get_group(0) * UPM_COLS;
+    constexpr int RPW = HC * UPM_COLS / WARPS;     // 8 rows per warp
+    if (t < T * HC) {
+        const int k = t / HC, c = t - k * HC;
+        float ss = 0.0f;
+#pragma unroll
+        for (int h = 0; h < S; ++h) ss += ssg[t * S + h];
+        const float r = sycl::rsqrt(ss / (float) N + m.a[k].eps);
+        rsS[k][c] = r;
+        if ((int) it.get_group(0) == 0) m.a[k].rs[c] = r;
+    }
+    sycl::group_barrier(it.get_group());
+    for (int i = t; i < T * LR; i += THREADS) {
+        const int k = i / LR, r = i - k * LR;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) {
+            float p = 0.0f;
+#pragma unroll
+            for (int h = 0; h < S; ++h) p += part[(((size_t) k * HC + c) * S + h) * PR + r];
+            sum = sycl::fma(rsS[k][c], p, sum);
+        }
+        const float x = sum / (float) HC;
+        lo[k][r] = x / (1.0f + sycl::exp(-x));
+        if ((int) it.get_group(0) == 0) m.a[k].lo[r] = lo[k][r];
+    }
+    if ((int) it.get_group(0) == 0 && t < T * HC) {
+        const int k = t / HC, cc = t - k * HC;
+        if (m.a[k].w_inject != nullptr) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < HC; ++c) {
+                float p = 0.0f;
+#pragma unroll
+                for (int h = 0; h < S; ++h) p += part[(((size_t) k * HC + c) * S + h) * PR + LR + cc];
+                sum = sycl::fma(rsS[k][c], p, sum);
+            }
+            m.a[k].inject_out[cc] = sum;
+        }
+    }
+    sycl::group_barrier(it.get_group());
+#pragma unroll
+    for (int q = 0; q < RPW; ++q) {
+        const int r = warp + q * WARPS;
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        const uint4 wa = *(w4 + lane);
+        const uint4 wb = lane < LR / 8 - 32 ? *(w4 + 32 + lane) : uint4(0,0,0,0);
+        float rv = 0.0f, wn = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < kFusedGrMaxT && lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, &lo[k][(size_t) lane * 8]);
+            if (lane < LR / 8 - 32) acc += dot8(wb, &lo[k][(size_t) (32 + lane) * 8]);
+            acc = warp_sum(sg,acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < kFusedGrMaxT && lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsS[lane][c];
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    sycl::group_barrier(it.get_group());
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) sum += g[k][c][col];
+        m.a[k].mixed[d0 + col] = sum / (float) HC;
+    }
+        });
+    });
+}
+}  // namespace
+
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr)
@@ -120,6 +308,13 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.T = n_tok;
     auto& q = queue_for(stream);
 
+    static const bool v3=[] { const char* v=std::getenv("STRATA_GR_V3"); return v && std::strtol(v, nullptr, 10)!=0; }();
+    if (v3) {
+        const size_t limit=q.get_device().get_info<sycl::info::device::local_mem_size>();
+        const size_t extra=(size_t) WARPS*kFusedGrMaxT*sizeof(float);
+        if ((size_t) kFusedGrMaxT*N*sizeof(float)+extra<=limit) { read_v3<1>(q,m); if (!stream) core::Runtime::get().finish(q); return; }
+        if ((size_t) kFusedGrMaxT*(N/2)*sizeof(float)+extra<=limit) { read_v3<2>(q,m); if (!stream) core::Runtime::get().finish(q); return; }
+    }
     // Step 1 of the single-token down kernel, one group per token and stream (upstream dbb1c23's split: T groups
     // left most of the GPU idle).  A work-item visits its stream's elements in the order norm_step does and the
     // eight sub-group partials are added in the same order, so rs and xn (the product, then the scale) are its bits.

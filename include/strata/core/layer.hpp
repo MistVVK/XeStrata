@@ -243,6 +243,7 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
+    bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
     float* sin_tab = nullptr;
 
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
