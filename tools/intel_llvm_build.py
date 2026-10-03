@@ -113,10 +113,13 @@ def build(tag: str, keep_build: bool) -> None:
     else:
         run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
     # The configuration downloads what its release pins (Level Zero's headers and loader: the runtime adapter needs
-    # newer ones than Ubuntu 26.04's 1.28; emhash), all free software; giving it the distribution's failed.
-    if not (BUILD / "build.ninja").exists():
+    # newer ones than Ubuntu 26.04's 1.28; emhash), all free software; giving it the distribution's failed.  Forced:
+    # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed)
+    cache = BUILD / "CMakeCache.txt"
+    if not (BUILD / "build.ninja").exists() or not cache.exists() or \
+            "SYCL_UR_FORCE_FETCH_LEVEL_ZERO:BOOL=ON" not in cache.read_text(errors="replace"):
         run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release",
-             f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}"])
+             f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON"])
     jobs = max(2, min(os.cpu_count() or 4, int(ram_gb() // 3)))
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
@@ -168,7 +171,10 @@ def main() -> None:
     have = finished()
     if have is None:
         fail(f"no finished build in {INSTALL}")
-    if not any(g.get("fp16") == "1" and g.get("bf16") == "1" for g in have.get("gpus", [])):
+    if not have.get("gpus"):
+        say("note: this build's SYCL runtime lists no GPU (xmx_probe): the GPU's Level Zero driver (Intel's "
+            "compute-runtime) is missing or too old for it")
+    elif not any(g.get("fp16") == "1" and g.get("bf16") == "1" for g in have.get("gpus", [])):
         say("note: no GPU reports FP16 and BF16 matrix engines to this build (xmx_probe); the engine will run its "
             "products without XMX")
     say(str(INSTALL))

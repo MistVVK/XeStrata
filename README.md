@@ -40,7 +40,7 @@ How it differs from Strata:
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
-| OS | Linux (not WSL). Checked on Ubuntu 26.04. |
+| OS | Linux (not WSL). Checked on Ubuntu 26.04; setup and a start also checked on Fedora 44 in a container. |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
 - **Matrix engines (XMX):** a GPU with XMX uses them; one without computes with DP4a instructions.
@@ -137,7 +137,7 @@ fastest (about 5-10 minutes).
   `/think low` in `chat.py`, or with your app's "reasoning effort" setting. Off is fastest; High suits hard questions.
 - **Pictures:** in the chat page, click **Picture**; in `chat.py`, type `/image <path>`; in apps, attach them.
 - **From a phone or another PC:** run `./setup.sh --setup --host 0.0.0.0 --api-key <secret>` and open the address
-  the server window prints ([details](docs/DETAILS.md#using-it)).
+  the server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
 **Good to know:** it answers one request at a time. The first message of a conversation is read in full; after that
 it keeps the conversation and reads only what is new, so follow-ups start right away.
@@ -217,11 +217,7 @@ what has been checked in [docs/XE.md](docs/XE.md).
   [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
-- **Upstream integration:** the single-GPU features from Strata 0.1.38 are ported to Xe. `--coupled-draft`
-  samples MTP drafts with the target model's sampling chain; `--pool-affinity` selects CPU pool placement.
-  Quantized prompt products are enabled with `STRATA_PREFILL_MMQ=1`, fused MoE with `STRATA_PF_FUSED=1`.
-  Both are disabled by default.
-- **The README:** the Japanese one (README.ja.md) is written first, and this English one is its translation.
+- **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits
 

@@ -763,22 +763,34 @@ def icpx_compiler() -> dict | None:
             "nonfree": True}
 
 
-def probe_xmx(comp: dict, pci: str | None) -> bool:
-    """Whether the GPU at `pci` reports the matrix engines to this compiler's SYCL runtime (tools/xmx_probe.cpp)."""
+def probe_gpu(comp: dict, pci: str | None) -> dict | None:
+    """What the GPU at `pci` reports to this compiler's SYCL runtime (tools/xmx_probe.cpp): its fields ("fp16",
+    "bf16": "1" for the matrix engines), {} when the runtime lists no such GPU, None when the probe did not build."""
     with tempfile.TemporaryDirectory() as d:
         exe = Path(d) / "xmx_probe"
         r = subprocess.run([comp["cxx"], "-fsycl", str(ROOT / "tools" / "xmx_probe.cpp"), "-o", str(exe)],
                            capture_output=True, text=True, env=comp["env"])
         if r.returncode != 0:
             warn(f"{Path(comp['cxx']).name} could not build the XMX probe: {(r.stderr or r.stdout).strip()[-300:]}")
-            return False
+            return None
         r = subprocess.run([str(exe)], capture_output=True, text=True, env=comp["env"], timeout=120)
+    seen = {}
     for line in r.stdout.splitlines():
         f = dict(x.split("=", 1) for x in line.split(" name=")[0].split() if "=" in x)
         if pci is None or f.get("pci") == pci:
-            if f.get("fp16") == "1" and f.get("bf16") == "1":
-                return True
-    return False
+            if has_xmx(f):
+                return f
+            seen = f
+    return seen
+
+
+def has_xmx(probed: dict | None) -> bool:
+    return probed is not None and probed.get("fp16") == "1" and probed.get("bf16") == "1"
+
+
+def probe_xmx(comp: dict, pci: str | None) -> bool:
+    """Whether the GPU at `pci` reports the matrix engines to this compiler's SYCL runtime."""
+    return has_xmx(probe_gpu(comp, pci))
 
 
 def build_intel_llvm(a) -> Path:
@@ -812,23 +824,35 @@ def choose_compiler(a, pci: str | None) -> dict:
         comp = free_compiler(build_intel_llvm(a))
         llvm_dir = str(INTEL_LLVM_DEFAULT)
     icpx = icpx_compiler() if nonfree else None
-    if comp is None and icpx is None:
-        fail("no SYCL compiler for the engine",
-             FREE_HOW + (f"\n       or {ICPX_HOW}" if nonfree else "\n       (--nonfree also allows Intel's icpx)"))
-    if comp is not None and probe_xmx(comp, pci):
+    if comp is None:
+        if icpx is None:
+            fail("no SYCL compiler for the engine",
+                 FREE_HOW + (f"\n       or {ICPX_HOW}" if nonfree else "\n       (--nonfree also allows Intel's icpx)"))
+        comp = icpx
+    probed = probe_gpu(comp, pci)
+    icpx_probed = probe_gpu(icpx, pci) if icpx is not None and icpx is not comp and not has_xmx(probed) else None
+    if has_xmx(probed):
         xmx = True
-    elif icpx is not None and probe_xmx(icpx, pci):
-        if comp is not None:
-            say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using icpx (--nonfree)")
-        comp, xmx = icpx, True
+    elif icpx is not None and has_xmx(icpx_probed):
+        say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using icpx (--nonfree)")
+        comp, probed, xmx = icpx, icpx_probed, True
     else:
-        comp = comp or icpx
         xmx = False
+    if probed == {}:
+        # an XMX question would not help here: no compiler makes the engine run on a GPU its driver does not list
+        # (seen on openSUSE Leap 16, whose compute-runtime 25.18 lists no Arc Pro B70)
+        fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
+             f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
+             "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for this "
+             "GPU: install a newer one (docs/XE.md#packages) and run setup again")
+    built_here = Path(comp["cxx"]).parent.parent == INTEL_LLVM_DEFAULT
     if not xmx and not allow_no_xmx:
         say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX (its "
             "matrix engines): the engine would run, but its prompt processing about 1.6 times slower.")
         choices = {"1": "build without XMX", "2": "build intel/llvm 7 or later here and use it (13 minutes on 28 "
                    "threads, 3.5 GB)", "3": "stop"}
+        if built_here:                                 # it is already the intel/llvm built here
+            del choices["2"]
         if nonfree and icpx is None:
             choices = {"0": "install Intel's icpx (not free software) and run setup again", **choices}
         for k, v in choices.items():
@@ -838,8 +862,8 @@ def choose_compiler(a, pci: str | None) -> dict:
             fail("install icpx, then run setup again", ICPX_HOW)
         if pick == "3":
             fail("stopped: no XMX for this GPU",
-                 "build intel/llvm here (--intel-llvm-build), or accept the slower prompt path (--allow-no-xmx)" +
-                 (f"; or {ICPX_HOW}" if nonfree else ""))
+                 ("" if built_here else "build intel/llvm here (--intel-llvm-build), or ") +
+                 "accept the slower prompt path (--allow-no-xmx)" + (f"; or {ICPX_HOW}" if nonfree else ""))
         if pick == "2":
             comp = free_compiler(build_intel_llvm(a))
             llvm_dir = str(INTEL_LLVM_DEFAULT)
