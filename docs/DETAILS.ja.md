@@ -27,24 +27,6 @@ Intel の GPU での実装と、それをどう確かめたかは [XE.ja.md](XE.
 ほかの GPU では測っていません。
 Strata（CUDA）の README にある RTX での数字は、XeStrata には当てはまりません。
 
-### 今のエンジンでの速さ
-
-次の値は、比べやすいようにエキスパートのキャッシュを `--expert-cache 10000` に固定し、貪欲生成で、2 回ずつ測ったものです。
-
-| 測ったこと | IQ2_XS | IQ3_S |
-| --- | ---: | ---: |
-| デコード、MTP あり、128 トークン（トークン/秒） | 72.88 / 72.06 | 62.85 / 62.94 |
-| 26,292 トークンのプロンプトの読み込み（トークン/秒） | — | 1,552.10 / 1,550.80 |
-| その先頭の 12,000 トークンの読み込み（トークン/秒） | — | 1,308.61 / 1,304.47 |
-| 温度 0.7、top_k 40、top_p 0.95 でのデコード、MTP あり（トークン/秒） | — | 65.86 / 65.87 |
-
-記録は、デコードが[こちら](../bench/results/2026-10-02-decode-upstream/README.md)、プロンプトが[こちら](../bench/results/2026-10-03-prompt-upstream/README.md)です。
-プロンプトは `--prefill auto` で読み、26,292 トークンなら 1 つの塊（26,368 トークン）にまとめて読みます。
-ほかのモデルは、今のエンジンではまだ測っていません。
-
-デコードの速さは、書く文章によっても変わります。
-推測の候補が多く当たるほど速くなるので、同じプロンプトでも答えが違えば数 % 動きます。
-
 ### 小さい GPU と XMX のない GPU
 
 B70 を小さい GPU に見せた設定（`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`、VRAM 8 GB、XMX なし）で、
@@ -804,7 +786,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `the engine stopped unexpectedly (exit code ...)` | 答えの途中でエンジンのプロセスが終わりました。たいていは RAM 不足で、Linux がいちばん大きなプログラムを終わらせます（`journalctl -k \| grep -i -E 'killed process\|out of memory'`）。次の要求で、エンジンは自分で起動し直します。繰り返すなら、ほかのプログラムを閉じるか、小さい大きさを選びます。server は、モデルのエキスパートがほかのために約 6 GB の RAM を残さないとき、起動時に警告します。 |
 | 出力が遅く、ディスクのランプが点きっぱなし | 空いている RAM が足りません。ほかのプログラムを閉じるか、Q2_0 か IQ2_XS を選びます。 |
 | `prompt ... exceeds the context` | 要求が、選んだ文脈より長くなっています。もっと大きな `--context` で setup をやり直します。 |
-| 上の表より遅い | GPU に挿したモニターやほかの GPU のプログラムが、エキスパートのキャッシュから VRAM を取っています。定格より遅い RAM（BIOS の XMP を確かめる）は、CPU の分を遅くします。XMX なしでビルドしていないかは、setup の `SYCL compiler: ...` の行で確かめます。 |
+| 思ったより遅い | GPU に挿したモニターやほかの GPU のプログラムが、エキスパートのキャッシュから VRAM を取っています。定格より遅い RAM（BIOS の XMP を確かめる）は、CPU の分を遅くします。XMX なしでビルドしていないかは、setup の `SYCL compiler: ...` の行で確かめます。 |
 | `this server was started without the vision encoder` | 文章だけで setup したモデルです。`--vision gpu` で setup をやり直します。 |
 | 画像が断られる、`cannot read the image` | Pillow で開けない画像のファイルです（JPEG、PNG、WebP、GIF、BMP、TIFF、AVIF は使えます）。 |
 | 画像が遅い | エンコーダーが CPU で動いています。`--vision gpu` で setup をやり直します。 |

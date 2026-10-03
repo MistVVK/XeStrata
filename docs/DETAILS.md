@@ -27,23 +27,6 @@ and the model files on a CPU-attached Gen4 x4 NVMe.
 Other GPUs have not been measured.
 The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 
-### Speed with the current engine
-
-These numbers were measured with the expert cache fixed (`--expert-cache 10000`) to compare runs, greedy, twice each.
-
-| What | IQ2_XS | IQ3_S |
-| --- | ---: | ---: |
-| Decode with MTP, 128 tokens (tokens/s) | 72.88 / 72.06 | 62.85 / 62.94 |
-| Reading a 26,292-token prompt (tokens/s) | — | 1,552.10 / 1,550.80 |
-| Reading its first 12,000 tokens (tokens/s) | — | 1,308.61 / 1,304.47 |
-| Decode with MTP at temperature 0.7, top_k 40, top_p 0.95 (tokens/s) | — | 65.86 / 65.87 |
-
-The records: [decode](../bench/results/2026-10-02-decode-upstream/README.md), [prompts](../bench/results/2026-10-03-prompt-upstream/README.md).
-Prompts are read with `--prefill auto`, which reads the 26,292 tokens as one chunk (26,368 tokens).
-The other models have not been measured with the current engine yet.
-
-Decode speed also depends on the text: the more drafts are accepted, the faster it runs, so a different answer to the same prompt moves it by a few percent.
-
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
@@ -788,7 +771,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer, usually out of RAM (Linux ends the biggest program: `journalctl -k \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats, close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
 | Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
-| Slower than the tables | A monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM below its rated speed (check XMP in the BIOS) slows the CPU half. Check setup's `SYCL compiler: ...` line for a build without XMX. |
+| Slower than expected | A monitor plugged into the GPU and other GPU programs take VRAM from the expert cache; RAM below its rated speed (check XMP in the BIOS) slows the CPU half. Check setup's `SYCL compiler: ...` line for a build without XMX. |
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow | The encoder runs on the CPU: run setup again with `--vision gpu`. |
