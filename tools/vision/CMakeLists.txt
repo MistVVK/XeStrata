@@ -1,18 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
 # the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
 #
-#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
-#         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native]
-#   cmake --build build-vision --target strata-vision
+#   cmake -S tools/vision -B build-vision-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/main/llama.cpp
+#   cmake --build build-vision-cpu --target strata-vision
+#
+# On the GPU through Vulkan (ggml-vulkan; free software: Mesa's drivers, libvulkan-dev, glslc):
+#   cmake -S tools/vision -B build-vision-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
+#
+# On the Intel GPU through SYCL (ggml-sycl, which needs oneMKL: the nonfree build only), in oneAPI's environment:
+#   cmake -S tools/vision -B build-vision-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_NONFREE=ON -DSTRATA_VISION_SYCL=ON \
+#         -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
-
-set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
-option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
-option(STRATA_PORTABLE "build for other PCs: AVX2 baseline, static MSVC runtime" OFF)
-if(STRATA_PORTABLE AND MSVC)
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "Strata vision supports Linux only")
 endif()
+
+set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/main/llama.cpp" CACHE PATH "llama.cpp checkout")
+option(STRATA_VISION_VULKAN "run the vision encoder on the GPU through Vulkan (builds ggml-vulkan)" OFF)
+option(STRATA_VISION_SYCL "run the vision encoder on the Intel GPU through SYCL (ggml-sycl; needs icpx and oneMKL)"
+       OFF)
+# AGENTS.md: the free build (the default) uses free software only; ggml-sycl links oneMKL, which is not
+option(STRATA_NONFREE "allow non-free build tools and libraries (icpx, oneMKL)" OFF)
+if(STRATA_VISION_SYCL AND NOT STRATA_NONFREE)
+  message(FATAL_ERROR "STRATA_VISION_SYCL needs oneMKL, which is not free software: use STRATA_VISION_VULKAN, or allow "
+                      "it with -DSTRATA_NONFREE=ON")
+endif()
+if(STRATA_VISION_SYCL AND STRATA_VISION_VULKAN)
+  message(FATAL_ERROR "choose one of STRATA_VISION_SYCL and STRATA_VISION_VULKAN")
+endif()
+option(STRATA_PORTABLE "ggml for any AVX2 CPU; OFF: -march=native" ON)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
@@ -26,7 +48,7 @@ set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
 set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 if(STRATA_PORTABLE)
   set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-  set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no vcomp140.dll / libgomp needed on the user's PC
+  set(GGML_OPENMP OFF CACHE BOOL "" FORCE)        # no libgomp needed on the user's PC
   foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
     set(${_f} ON CACHE BOOL "" FORCE)
   endforeach()
@@ -34,7 +56,8 @@ else()
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 endif()
 set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA ${STRATA_VISION_CUDA} CACHE BOOL "" FORCE)
+set(GGML_SYCL ${STRATA_VISION_SYCL} CACHE BOOL "" FORCE)
+set(GGML_VULKAN ${STRATA_VISION_VULKAN} CACHE BOOL "" FORCE)
 
 add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 

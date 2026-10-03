@@ -1,11 +1,17 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // tools/vision/strata_vision.cpp - the image half of Strata's multimodal path.
 //
 // Turns an image into the embeddings the text model reads in place of its <|image_pad|> tokens, with llama.cpp's
 // mtmd library and the model's mmproj file (vision encoder + projector).  The engine does the rest: it places the
 // rows at the image's pad tokens and gives them their 2-D M-RoPE positions (see --serve GENI in generate.cpp).
 //
-//   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu] [--threads N]
-//                 [--max-tokens N]
+//   strata-vision --mmproj <mmproj.gguf> --model <text model .gguf, first split> [--gpu [--gpu-pci ADDR]]
+//                 [--threads N] [--max-tokens N]
+//
+// --gpu-pci takes the GPU whose PCI address (domain:bus:device.function) is ADDR; without it, mtmd takes the backend's
+// first GPU, which with Vulkan can be the CPU's integrated graphics or another vendor's card.
 //
 // Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
@@ -49,6 +55,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 int main(int argc, char** argv) {
     std::string mmproj, model;
     bool gpu = false;
+    std::string gpu_pci;
     int threads = 0, max_tokens = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -59,13 +66,14 @@ int main(int argc, char** argv) {
         if (a == "--mmproj") mmproj = next();
         else if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
+        else if (a == "--gpu-pci") gpu_pci = next();
         else if (a == "--threads") threads = std::atoi(next().c_str());
         else if (a == "--max-tokens") max_tokens = std::atoi(next().c_str());
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty() || model.empty()) {
-        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
-                             "[--max-tokens N]\n");
+        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu [--gpu-pci ADDR]] "
+                             "[--threads N] [--max-tokens N]\n");
         return 2;
     }
     llama_log_set(quiet_log, nullptr);
@@ -79,6 +87,19 @@ int main(int argc, char** argv) {
 
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu = gpu;
+    if (gpu && !gpu_pci.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count() && cp.device == nullptr; ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(d, &props);
+            if (props.device_id != nullptr && gpu_pci == props.device_id) cp.device = d;
+        }
+        if (cp.device == nullptr) {
+            std::printf("ERR no GPU at PCI address %s\n", gpu_pci.c_str());
+            std::fflush(stdout);
+            return 1;
+        }
+    }
     cp.print_timings = false;
     cp.warmup = false;
     if (threads > 0) cp.n_threads = threads;
@@ -101,8 +122,7 @@ int main(int argc, char** argv) {
     if (n_embd <= 0) { std::printf("ERR the vision encoder has no projection_dim\n"); std::fflush(stdout); return 1; }
     // Warm up at the LARGEST picture before READY: the encoder's GPU work buffers are allocated now, not at the first
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
-    // what is really left; allocating ~1 GB later, on a GPU the engine has filled, made Windows page GPU memory and
-    // the engine crawl to a standstill.  (A square image well above any cap; mtmd scales it to the token limit.)
+    // what is really left. (A square image well above any cap; mtmd scales it to the token limit.)
     {
         const uint32_t side = 2048;
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
@@ -122,6 +142,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata-vision: warmed up at %d image tokens\n", warm_tokens);
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
+        // READY tells the server the encoder's buffers are allocated, and it starts the engine on what is left: an
+        // encoder whose warm-up failed has not allocated them and would fail its first picture anyway
+        if (warm_tokens <= 0) {
+            std::printf("ERR the warm-up encode failed\n");
+            std::fflush(stdout);
+            return 1;
+        }
     }
     std::printf("READY %d\n", n_embd);
     std::fflush(stdout);
