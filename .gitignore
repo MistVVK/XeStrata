@@ -25,15 +25,11 @@ r[0-9][0-9][0-9]*/
 /xestrata-*.json
 /xestrata-*.log
 
-# setup.py outputs (engine, downloads) and release builds
+# setup.py outputs (engine, downloads)
 /engine/
-/dist/
 *.done
 /third_party/main/*.zip
 /third_party/main/_unpack/
-
-# private notes (pending items)
-/.todo.md
 
 # lint tools that are not in the distribution's packages (see AGENTS.md, Lints)
 /.lint/
