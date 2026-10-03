@@ -172,7 +172,6 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-load PRIVATE strata_core)
 
   add_library(strata_kernels STATIC src/kernels/xe/elementwise.cpp src/kernels/xe/iq_kernels.cpp
-                                    src/prefill/moe_mmq.cpp src/prefill/moe_fused.cpp
                                     src/kernels/xe/native_mmvq.cpp src/kernels/xe/rope.cpp
                                     src/kernels/xe/router.cpp src/kernels/xe/bf16_gemv.cpp
                                     src/kernels/xe/quantize_act.cpp src/kernels/xe/qsa.cpp
@@ -245,23 +244,12 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # plan v0.3 P5: batched prompt processing.  The GEMMs are XeStrata's XMX kernels (src/kernels/xe/xmx_gemm.cpp;
-  # the quantized prompt path shares the Xe integer dot products with decode.
+  # cuBLAS in the CUDA build, oneMKL in the first Xe port); llama.cpp's MMQ expert kernels are not ported, so the
+  # prompt path's experts take the FP16 GEMM path (STRATA_PREFILL_MMQ undefined).  Upstream 0.1.38's quantized and
+  # fused expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
-  target_compile_definitions(strata_prefill PRIVATE STRATA_PREFILL_MMQ)
-  if(STRATA_BUILD_TESTS)
-    foreach(prompt_test prefill_fused_iq_test prefill_fused_moe_test prefill_mmq_kquant_test)
-      add_executable(${prompt_test} tests/xe/${prompt_test}.cpp)
-      target_link_libraries(${prompt_test} PRIVATE strata_prefill ggml-base)
-    endforeach()
-    add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test --no-timing)
-    add_test(NAME prefill_fused_moe_test COMMAND prefill_fused_moe_test --no-timing)
-    add_test(NAME prefill_mmq_kquant_test COMMAND prefill_mmq_kquant_test)
-    set_tests_properties(prefill_fused_iq_test prefill_fused_moe_test prefill_mmq_kquant_test
-      PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-  endif()
-
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp)

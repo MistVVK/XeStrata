@@ -29,7 +29,6 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
-#include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/kernels.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -454,7 +453,7 @@ const MmqPlan& mmq_plan() {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
-        const bool on = mmq::built() && (env ? std::strtol(env, nullptr, 10) != 0 : fused::requested());
+        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fallback = !on || layers <= 0;
@@ -470,35 +469,20 @@ const MmqPlan& mmq_plan() {
     }();
     return plan;
 }
-bool fused_layout(size_t T) {
-    if (!fused::enabled() || (int64_t) T < STREAM_ALL_MIN || ring_slots(T) <= STAGE || mmq_plan().fallback) return false;
-    const auto& lay = strata::kernels::cpu::expert_layout();
-    for (const auto& f : lay.fmt) if (!fused::native_supported(f.gu_type,f.d_type)) return false;
-    return true;
-}
-struct MoeBufs { size_t gu,h,xq,hq; };
-MoeBufs moe_bufs(size_t T, int64_t E) {
-    if (!fused_layout(T)) return {T*K*1280,T*K*640,mmq::q8_bytes((int64_t) T*K,N),mmq::q8_bytes((int64_t) T*K,640)};
-    const size_t small=(size_t) STREAM_ALL_MIN-1;
-    return {std::max(small*K*1280,(fused::group_bytes((int64_t) T*K,(int) E)+3)/4),
-            std::max(small*K*640,(fused::act_bytes((int64_t) T*K,640)+3)/4),
-            std::max(mmq::q8_bytes((int64_t) small*K,N),fused::act_bytes((int64_t) T,N)),mmq::q8_bytes((int64_t) small*K,640)};
-}
-uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool has_source) {
+uint64_t moe_set_bytes(size_t T, int64_t n_expert) {
     const MmqPlan& mp = mmq_plan();
-    const MoeBufs mb = has_source ? moe_bufs(T,n_expert) : MoeBufs{T*K*1280,T*K*640,mmq::q8_bytes((int64_t) T*K,N),mmq::q8_bytes((int64_t) T*K,640)};
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
     if (mp.fallback) a.take<uint16_t>(T * K * N, ok);
-    a.take<float>(mb.gu, ok);
+    a.take<float>(T * K * 1280, ok);
     if (mp.fallback) a.take<uint16_t>(T * K * 640, ok);
     a.take<float>(T * K * N, ok); a.take<float>(T * 640, ok);
     a.take<float>(T * 640, ok); a.take<uint16_t>(T * 640, ok); a.take<float>(T * N, ok); a.take<float>(T, ok);
     if (mp.any) {
-        a.take<uint8_t>(mb.xq, ok);
-        a.take<float>(mb.h, ok);
-        a.take<uint8_t>(mb.hq, ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+        a.take<float>(T * K * 640, ok);
+        a.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
     }
     return a.used;
 }
@@ -621,7 +605,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, m.src != nullptr)});
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert)});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         m.region = base;
         m.region_bytes = region;
@@ -644,16 +628,15 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.slot_dev = c.take<int32_t>(T * K, ok); m.src_dev = c.take<int32_t>(T * K, ok);
         const MmqPlan& mp = mmq_plan();
         m.Xs = mp.fallback ? c.take<uint16_t>(T * K * N, ok) : nullptr;
-        const MoeBufs mb = m.src ? moe_bufs(T,g.n_expert) : MoeBufs{T*K*1280,T*K*640,mmq::q8_bytes((int64_t) T*K,N),mmq::q8_bytes((int64_t) T*K,640)};
-        m.GU = c.take<float>(mb.gu, ok);
+        m.GU = c.take<float>(T * K * 1280, ok);
         m.Hh = mp.fallback ? c.take<uint16_t>(T * K * 640, ok) : nullptr;
         m.Dm = c.take<float>(T * K * N, ok);
         m.sgate = c.take<float>(T * 640, ok); m.sup = c.take<float>(T * 640, ok); m.sh_h = c.take<uint16_t>(T * 640, ok);
         m.shared = c.take<float>(T * N, ok); m.sg = c.take<float>(T, ok);
         if (mp.any) {
-            m.Xq = c.take<uint8_t>(mb.xq, ok);
-            m.H = c.take<float>(mb.h, ok);
-            m.Hq = c.take<uint8_t>(mb.hq, ok);
+            m.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), N), ok);
+            m.H = c.take<float>(T * K * 640, ok);
+            m.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) (T * K), 640), ok);
         }
         if (base == nullptr) ok = false;
     }
@@ -861,7 +844,7 @@ void Prefill::set_expert_group(int g) { g_expert_group = std::clamp(g, 1, 64); }
 int Prefill::expert_group() { return g_expert_group; }
 double Prefill::pinned_share() { return g_pinned_share; }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool has_source) {
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk) {
     // the same allocation sequence as `init`, counted
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -880,7 +863,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[0].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert, has_source)}), ok);
+                                       moe_set_bytes(T, g.n_expert)}), ok);
     o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
     o.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
     o.take<int32_t>((size_t) g.n_expert + 1, ok);
@@ -1547,15 +1530,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (wgi->kind != core::WeightKind::Bf16InF32) { err = "prefill: shared gate is not BF16"; return false; }
                     m.gemm.bf16(m.mixed_bf, (const uint16_t*) wgi->data, m.sg, T, 1, N);
                     if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, true);
-                    const auto& lay = strata::kernels::cpu::expert_layout();
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
-                    const bool fused_l = stream_all && use_mmq && fused::enabled() &&
-                        (!lay.native || fused::native_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type));
-                    if (fused_l) {
-                        fused::group(m.ids, T*K, K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
-                        fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
-                        std::fill(m.cnt.begin(), m.cnt.end(), 1); // fixed streamed walk; counts stay on the GPU
-                    } else {
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
                     strata::gpu::copy_async(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs);
@@ -1567,7 +1541,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                         ++m.cnt[(size_t) e];
                     }
-                    }
+                    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
                     // The experts, in id order: resident ones from VRAM, the others through the staging ring.  F8:
                     // first, out of that order, the resident experts of at most kIqGemmTileRows rows, whose products
                     // iq_gemm_grouped_f16 takes straight from their GGUF blocks in the cache (dequantized in local
@@ -1580,7 +1555,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
                     }();
                     const strata::kernels::cpu::NativeFmt* ffmt = lay.native ? &lay.fmt[(size_t) l] : nullptr;
-                    const bool fuse_res = fused_on && !fused_l && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
+                    const bool fuse_res = fused_on && !use_mmq && ffmt != nullptr && m.host_res && m.cache &&
                                           strata::kernels::xmx_available(strata::kernels::XmxType::f16) &&
                                           ffmt->up_off == (size_t) ffmt->n_ff * ffmt->gu_row &&
                                           strata::kernels::iq_gemm_grouped_ok(ffmt->gu_type, 2 * ffmt->n_ff, ffmt->n_embd) &&
@@ -1593,7 +1568,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0 && fusable(e)) order.push_back(e);
                     const size_t nf = order.size();
                     for (int32_t e = 0; e < m.g->n_expert; ++e) if (m.cnt[(size_t) e] > 0 && !fusable(e)) order.push_back(e);
-                    if (!fused_l) {
                     {
                         int32_t at = 0;
                         for (const int32_t e : order) { m.off[(size_t) e] = at; at += m.cnt[(size_t) e]; }
@@ -1608,15 +1582,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     }
                     strata::gpu::copy_async(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, m.cs);
                     strata::gpu::copy_async(m.src_dev, m.src_host.data(), (size_t) T * K * 4, m.cs);
-                    }
                     const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
                     const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                     const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                     pt.mark(kPfGather, cs);
-                    if (fused_l) {
-                        // Routing and activation quantization were enqueued before the streamed walk.
-                    } else if (use_mmq) {
+                    if (use_mmq) {
                         // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
                         mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
                         // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
@@ -1717,18 +1688,6 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
                         pt.mark(kPfDequant, cs);
-                        if (fused_l) {
-                            fused::Batch batch;
-                            batch.e0 = order[j]; batch.e1 = batch.e0+1; batch.blob[0] = blob_dev;
-                            if (lay.native) {
-                                const auto& f = lay.fmt[(size_t) l];
-                                fused::NativeGeom ng{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
-                                fused::experts_native(batch, ng, (int) m.g->n_expert, T*K, m.GU, m.Xq, m.src_dev, m.H,
-                                                      m.Dm, m.cs);
-                            } else fused::experts(batch, (int) m.g->n_expert, T*K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
-                            if (slot >= 0) strata::gpu::event_record(m.used[slot], m.cs);
-                            return true;
-                        }
                         if (use_mmq) {
                             // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                             const size_t q = j % MMQ_GROUP;
@@ -1854,8 +1813,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (float v : h) c += !std::isfinite(v);
                             return c;
                         };
-                        const int64_t bgu = fused_l ? 0 : bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
-                        const int64_t bh = m.H && !fused_l ? bad(m.H, T * K * 640) : -1;
+                        const int64_t bgu = bad(m.GU, T * K * 1280), bdm = bad(m.Dm, T * K * N), bbo = bad(m.bo, T * N);
+                        const int64_t bh = m.H ? bad(m.H, T * K * 640) : -1;
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
