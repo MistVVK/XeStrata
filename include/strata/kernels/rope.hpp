@@ -1,12 +1,17 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/rope.hpp - NEOX partial RoPE, host-callable (P2.S2).
 //
 // Pairing is NEOX: (i, i + n_rot/2), NOT the adjacent pair (2i, 2i+1).  The rotation is PARTIAL - only the
 // first n_rot of head_dim are touched, 64 of 256 in this artifact - and the tail passes through.
 //
-// The cos/sin table is built on the HOST in float64 (see src/kernels/cuda/rope.cu for why) and the kernel is
+// The cos/sin table is built on the HOST in float64 (see Strata's src/kernels/cuda/rope.cu for why) and the kernel is
 // a pure rotation over it.  The table depends on (n_rot, theta, position) and not on the token, so it is worth
 // caching; `build_rope_table` fills `max_pos` positions of `n_rot/2` pairs each.
 #pragma once
+
+#include "strata/kernels/rope_scaling.hpp"
 
 #include <cstdint>
 
@@ -37,6 +42,10 @@ STRATA_ROPE_HD inline void rope_neox_pair(float a, float b, float c, float s, fl
 }
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab);
+
+/// The same table under the process's rope scaling (rope_scaling.hpp).  For RopeScalingType::None this is the
+/// five-argument builder above (called as it is); for linear and YaRN the scaled angles, YaRN's magnitude included.
+void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float* cos_tab, float* sin_tab);
 
 // `x` and `out` are (rows, head_dim) and `pos` is (rows,) - one position per row, so a batch of heads at
 // different sequence positions is one call.  `cos_tab`/`sin_tab` are (max_pos, n_rot/2).  `out` may equal `x`.

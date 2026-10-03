@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/gdn.hpp - the gated delta-net (GDN) layer's non-projection parts, P2.S2.
 //
 // Transcribed from `ref/gdn.py`, which is itself transcribed from `build_layer_attn_linear` and

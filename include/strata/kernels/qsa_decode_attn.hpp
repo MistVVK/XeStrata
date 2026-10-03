@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/qsa_decode_attn.hpp - plan v0.3 P3/P7: split-K decode attention over the selected cells.
 //
 // The first attention kernel runs one block per query head (24 blocks on a 48-SM part), reads each key row with one

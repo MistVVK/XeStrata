@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/s2_gemv_parity.cpp - P2.S2's parity test for the S2 GEMV.
 //
 // The reference is the same CHAIN as the decode test: `strata::dequantize_q2_0` is a scalar transcription that
@@ -12,7 +15,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/s2_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -24,13 +27,6 @@
 namespace {
 
 constexpr int QK = 64;
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 // FP16 patterns, and they are deliberately NOT all powers of two.
 //
@@ -115,19 +111,18 @@ int main(int argc, char** argv) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "copy scales");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * sizeof(uint16_t)));
+    d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+    d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+    d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), x.size() * sizeof(uint16_t));
+    strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+    strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
 
     strata::kernels::s2_gemv(d_x, d_codes, d_scales, d_y, n_in, n_out);
 
     std::vector<float> got((size_t) n_out);
-    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
 
     long long bad = 0, first_bad = -1;
     double worst = 0.0;
@@ -165,9 +160,5 @@ int main(int argc, char** argv) {
     std::printf("  agrees with the scalar decode that dequant_xcheck proved equal to ggml\n");
     if (selftest) std::printf("s2_gemv_parity OK\n");
 
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_y);
     return 0;
 }

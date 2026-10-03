@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/s2_gemv.hpp - the S2 GEMV, host-callable (P2.S2).
 //
 // The expert matvec is the hottest thing in the engine: every token runs 48 layers x 10 experts x 3 roles of

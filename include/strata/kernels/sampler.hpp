@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/sampler.hpp - the sampler chain, host-callable (P2.S2).
 //
 //     penalties -> top_k -> top_p -> min_p -> temperature -> pick
 //
 // llama.cpp's default chain (issue #53): ONE penalties stage, first, and temperature AFTER the truncation filters;
-// top_p cuts before min_p.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
+// top_p cuts before min_p.  `Strata's src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
 #pragma once
 
 #include <algorithm>

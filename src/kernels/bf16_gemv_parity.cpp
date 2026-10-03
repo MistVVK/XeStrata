@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV.
 //
 // THREE THINGS ARE CHECKED, and the third is the one the engine's correctness rests on:
@@ -14,7 +17,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -27,13 +30,6 @@ namespace {
 
 using strata::kernels::bf16_from_f32;
 using strata::kernels::f32_from_bf16;
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     double d = 0, m = 0;
@@ -93,21 +89,18 @@ int main(int argc, char** argv) {
         std::vector<float> want;
         reference(x, w, s.n_in, s.n_out, want);
 
-        uint16_t *d_x = nullptr, *d_w = nullptr;
-        float *d_y = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 2), "x");
-        check(cudaMalloc(&d_w, w.size() * 2), "w");
-        check(cudaMalloc(&d_y, (size_t) s.n_out * 4), "y");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "cx");
-        check(cudaMemcpy(d_w, w.data(), w.size() * 2, cudaMemcpyHostToDevice), "cw");
+        strata::parity::Device dev;
+        uint16_t* d_x = dev.upload(x);
+        uint16_t* d_w = dev.upload(w);
+        float* d_y = dev.alloc<float>((size_t) s.n_out);
 
         std::vector<float> naive((size_t) s.n_out), warp((size_t) s.n_out), split((size_t) s.n_out);
         strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-        check(cudaMemcpy(naive.data(), d_y, naive.size() * 4, cudaMemcpyDeviceToHost), "cy1");
+        strata::parity::copy_out(naive.data(), d_y, naive.size());
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
-        check(cudaMemcpy(warp.data(), d_y, warp.size() * 4, cudaMemcpyDeviceToHost), "cy2");
+        strata::parity::copy_out(warp.data(), d_y, warp.size());
         strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
-        check(cudaMemcpy(split.data(), d_y, split.size() * 4, cudaMemcpyDeviceToHost), "cy3");
+        strata::parity::copy_out(split.data(), d_y, split.size());
 
         const double rn = rel_l1(want, naive), rw = rel_l1(want, warp), rs = rel_l1(want, split);
         std::printf("  %-34s naive %.2e  warp %.2e  split256 %.2e\n", s.what, rn, rw, rs);
@@ -128,17 +121,16 @@ int main(int argc, char** argv) {
             // Round the fp16 value to bf16 - i.e. give the kernel a bf16 activation whose VALUES came through
             // fp16.  That is the whole difference between the two contracts at this call site.
             for (size_t i = 0; i < fp16_as_f32.size(); ++i) x[i] = bf16_from_f32(fp16_as_f32[i]);
-            check(cudaMemcpy(d_x, x.data(), x.size() * 2, cudaMemcpyHostToDevice), "cx2");
+            strata::parity::copy_in(d_x, x.data(), x.size());
             std::vector<float> rival((size_t) s.n_out);
             strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-            check(cudaMemcpy(rival.data(), d_y, rival.size() * 4, cudaMemcpyDeviceToHost), "cy4");
+            strata::parity::copy_out(rival.data(), d_y, rival.size());
             const double r = rel_l1(want, rival);
             const bool visible = r > 1e-4;
             std::printf("      %-30s %s (%.4f%% apart)\n", "bf16 vs fp16 activation",
                         visible ? "yes" : "*** NO ***", r * 100);
             if (!visible) ++bad;
         }
-        cudaFree(d_x); cudaFree(d_w); cudaFree(d_y);
     }
 
     std::printf("\nbf16_gemv: %d failures\n", bad);

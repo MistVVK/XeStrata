@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/dequant_s2_parity.cpp - P2.S2's parity test for the S2 decode.
 //
 // THE REFERENCE IS THE CHAIN, NOT A SECOND OPINION.  `strata::dequantize_q2_0` (include/strata/artifact/
@@ -9,7 +12,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/dequant_s2.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -20,13 +23,6 @@
 namespace {
 
 constexpr int QK = 64;
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 // fp16 patterns that are finite, normal and exactly representable.  Random 16-bit patterns would include NaN
 // and infinity, and a NaN makes `!=` true for a reason that has nothing to do with the kernel - the test
@@ -80,17 +76,16 @@ int main(int argc, char** argv) {
 
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_out = nullptr;
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_out, cpu.size() * sizeof(float)), "cudaMalloc out");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "copy scales");
+    d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+    d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+    d_out = static_cast<decltype(d_out)>(strata::parity::alloc_bytes(cpu.size() * sizeof(float)));
+    strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+    strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
 
     strata::kernels::dequant_s2(d_codes, d_scales, d_out, n_blocks);
 
     std::vector<float> gpu(cpu.size());
-    check(cudaMemcpy(gpu.data(), d_out, gpu.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    strata::parity::copy_bytes_out(gpu.data(), d_out, gpu.size() * sizeof(float));
 
     long long bad = 0, first_bad = -1;
     for (size_t i = 0; i < cpu.size(); ++i) {
@@ -136,8 +131,5 @@ int main(int argc, char** argv) {
     std::printf("  bit-exact against the scalar dequantizer that dequant_xcheck proved equal to ggml\n");
     if (selftest) std::printf("dequant_s2_parity OK\n");
 
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_out);
     return 0;
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/s2_expert_grouped.hpp - R4's GPU expert tier.
 //
 // **WHAT THIS IS FOR.** The CPU expert pool is the engine's largest single cost - 663.6 MB of expert bytes per

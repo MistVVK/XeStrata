@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/s2_gemv_q8_parity.cpp - the Q8_0-activation GEMV, and the size of the gap it closes.
 //
 // THREE CHECKS:
@@ -13,7 +16,7 @@
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/s2_gemv_q8.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -21,17 +24,6 @@
 #include <cstring>
 #include <random>
 #include <vector>
-
-namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
-
-}  // namespace
 
 int main(int argc, char** argv) {
     bool selftest = false;
@@ -57,21 +49,21 @@ int main(int argc, char** argv) {
     uint8_t* d_act = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y_fp16 = nullptr, *d_y_q8 = nullptr;
-    check(cudaMalloc(&d_x, (size_t) n_in * sizeof(float)), "m x");
-    check(cudaMalloc(&d_act, (size_t) (n_in / 32) * 34), "m act");
-    check(cudaMalloc(&d_codes, codes.size()), "m codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "m scales");
-    check(cudaMalloc(&d_y_fp16, (size_t) n_out * sizeof(float)), "m y1");
-    check(cudaMalloc(&d_y_q8, (size_t) n_out * sizeof(float)), "m y2");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "c x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "c codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice), "c scales");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes((size_t) n_in * sizeof(float)));
+    d_act = static_cast<decltype(d_act)>(strata::parity::alloc_bytes((size_t) (n_in / 32) * 34));
+    d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+    d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+    d_y_fp16 = static_cast<decltype(d_y_fp16)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+    d_y_q8 = static_cast<decltype(d_y_q8)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), x.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+    strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
 
     strata::kernels::quantize_q8_0(d_x, d_act, n_in, nullptr);
 
     // ---- host reference: quantize the activation with the project's own rule, then dot
     std::vector<uint8_t> h_act((size_t) (n_in / 32) * 34);
-    check(cudaMemcpy(h_act.data(), d_act, h_act.size(), cudaMemcpyDeviceToHost), "c act back");
+    strata::parity::copy_bytes_out(h_act.data(), d_act, h_act.size());
     auto act_val = [&](long long i) {
         const uint8_t* blk = &h_act[(size_t) (i / 32) * 34];
         const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
@@ -101,7 +93,7 @@ int main(int argc, char** argv) {
     }
     strata::kernels::s2_gemv_q8(d_act, d_codes, d_scales, d_y_q8, n_in, n_out, tpr, nullptr);
     std::vector<float> got((size_t) n_out);
-    check(cudaMemcpy(got.data(), d_y_q8, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "c y2");
+    strata::parity::copy_bytes_out(got.data(), d_y_q8, got.size() * sizeof(float));
 
     int bad = 0;
     double worst = 0.0, sum_abs = 0.0;
@@ -153,12 +145,12 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> hx((size_t) n_in);
     for (long long i = 0; i < n_in; ++i) hx[(size_t) i] = f32_to_f16(x[(size_t) i]);
     uint16_t* d_hx = nullptr;
-    check(cudaMalloc(&d_hx, hx.size() * sizeof(uint16_t)), "m hx");
-    check(cudaMemcpy(d_hx, hx.data(), hx.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c hx");
+    d_hx = static_cast<decltype(d_hx)>(strata::parity::alloc_bytes(hx.size() * sizeof(uint16_t)));
+    strata::parity::copy_bytes_in(d_hx, hx.data(), hx.size() * sizeof(uint16_t));
     strata::kernels::SForm form{2, -1, 64, strata::kernels::Codebook::Affine, false};
     strata::kernels::s_gemv_split(d_hx, d_codes, d_scales, nullptr, d_y_fp16, n_in, n_out, form, tpr);
     std::vector<float> y16((size_t) n_out);
-    check(cudaMemcpy(y16.data(), d_y_fp16, y16.size() * sizeof(float), cudaMemcpyDeviceToHost), "c y1");
+    strata::parity::copy_bytes_out(y16.data(), d_y_fp16, y16.size() * sizeof(float));
 
     double diff = 0.0;
     for (long long o = 0; o < n_out; ++o) {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/router_top10_parity.cpp - P2.S2's parity test for the MoE router.
 //
 // The reference here is a HOST implementation of `ref/moe.py::router` written from the same specification the
@@ -11,7 +14,7 @@
 // model's geometry - see below - so the absence of a clamp test is a proven fact rather than an omission.
 #include "strata/kernels/router_top10.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,13 +25,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 constexpr double RENORM_CLAMP = 6.103515625e-05;      // 2**-14
 
@@ -69,16 +65,13 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
         reference(&logits[(size_t) t * n_expert], n_expert, k, &r_ids[(size_t) t * k], &r_w[(size_t) t * k]);
     }
 
-    float* d_l = nullptr;
-    int* d_ids = nullptr;
-    float* d_w = nullptr;
-    check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
-    check(cudaMalloc(&d_ids, h_ids.size() * sizeof(int)), "malloc ids");
-    check(cudaMalloc(&d_w, h_w.size() * sizeof(float)), "malloc w");
-    check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
+    strata::parity::Device dev;
+    float* d_l = dev.upload(logits);
+    int* d_ids = dev.alloc<int>(h_ids.size());
+    float* d_w = dev.alloc<float>(h_w.size());
     strata::kernels::router_top10(d_l, n_tokens, n_expert, k, d_ids, d_w, nullptr);
-    check(cudaMemcpy(h_ids.data(), d_ids, h_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), "back ids");
-    check(cudaMemcpy(h_w.data(), d_w, h_w.size() * sizeof(float), cudaMemcpyDeviceToHost), "back w");
+    strata::parity::copy_out(h_ids.data(), d_ids, h_ids.size());
+    strata::parity::copy_out(h_w.data(), d_w, h_w.size());
 
     long long id_bad = 0, w_bad = 0;
     double worst = 0;
@@ -101,9 +94,6 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     }
     std::printf("  %-26s ids %s (%lld bad)   weights worst rel %.3e (%lld over tol)   |sum-1| %.1e\n", name,
                 id_bad ? "*** WRONG ***" : "exact", id_bad, worst, w_bad, worst_sum);
-    cudaFree(d_l);
-    cudaFree(d_ids);
-    cudaFree(d_w);
     return (int) (id_bad + w_bad);
 }
 

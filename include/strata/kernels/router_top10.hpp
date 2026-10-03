@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/router_top10.hpp - the MoE router, host-callable (P2.S2).
 //
 // logits (n_tokens, n_expert) -> the top-k experts per token with renormalised weights.  Semantics are

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
 //
 // `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
@@ -20,7 +23,7 @@
 // filled with a value that encodes its own coordinates.
 #include "strata/kernels/gdn.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -31,13 +34,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 float sigmoid_f(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
@@ -160,26 +156,26 @@ int main(int argc, char** argv) {
         // the kernel
         float *d_st = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_g = nullptr, *d_b = nullptr,
               *d_o = nullptr;
-        check(cudaMalloc(&d_st, st_dev.size() * 4), "st");
-        check(cudaMalloc(&d_q, q.size() * 4), "q");
-        check(cudaMalloc(&d_k, k.size() * 4), "k");
-        check(cudaMalloc(&d_v, v.size() * 4), "v");
-        check(cudaMalloc(&d_g, gate.size() * 4), "g");
-        check(cudaMalloc(&d_b, beta.size() * 4), "b");
-        check(cudaMalloc(&d_o, (size_t) h_v * S * 4), "o");
-        check(cudaMemcpy(d_st, st_dev.data(), st_dev.size() * 4, cudaMemcpyHostToDevice), "cst");
-        check(cudaMemcpy(d_q, q.data(), q.size() * 4, cudaMemcpyHostToDevice), "cq");
-        check(cudaMemcpy(d_k, k.data(), k.size() * 4, cudaMemcpyHostToDevice), "ck");
-        check(cudaMemcpy(d_v, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "cv");
-        check(cudaMemcpy(d_g, gate.data(), gate.size() * 4, cudaMemcpyHostToDevice), "cg");
-        check(cudaMemcpy(d_b, beta.data(), beta.size() * 4, cudaMemcpyHostToDevice), "cb");
+        d_st = static_cast<decltype(d_st)>(strata::parity::alloc_bytes(st_dev.size() * 4));
+        d_q = static_cast<decltype(d_q)>(strata::parity::alloc_bytes(q.size() * 4));
+        d_k = static_cast<decltype(d_k)>(strata::parity::alloc_bytes(k.size() * 4));
+        d_v = static_cast<decltype(d_v)>(strata::parity::alloc_bytes(v.size() * 4));
+        d_g = static_cast<decltype(d_g)>(strata::parity::alloc_bytes(gate.size() * 4));
+        d_b = static_cast<decltype(d_b)>(strata::parity::alloc_bytes(beta.size() * 4));
+        d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes((size_t) h_v * S * 4));
+        strata::parity::copy_bytes_in(d_st, st_dev.data(), st_dev.size() * 4);
+        strata::parity::copy_bytes_in(d_q, q.data(), q.size() * 4);
+        strata::parity::copy_bytes_in(d_k, k.data(), k.size() * 4);
+        strata::parity::copy_bytes_in(d_v, v.data(), v.size() * 4);
+        strata::parity::copy_bytes_in(d_g, gate.data(), gate.size() * 4);
+        strata::parity::copy_bytes_in(d_b, beta.data(), beta.size() * 4);
 
         strata::kernels::GdnShapes sh{S, h_k, h_v};
         strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
 
         std::vector<float> got_o((size_t) h_v * S), got_st(st_dev.size());
-        check(cudaMemcpy(got_o.data(), d_o, got_o.size() * 4, cudaMemcpyDeviceToHost), "cgo");
-        check(cudaMemcpy(got_st.data(), d_st, got_st.size() * 4, cudaMemcpyDeviceToHost), "cgst");
+        strata::parity::copy_bytes_out(got_o.data(), d_o, got_o.size() * 4);
+        strata::parity::copy_bytes_out(got_st.data(), d_st, got_st.size() * 4);
 
         // o, and the STATE read back through the declared layout
         const double rel_o = rel_l1(want_o, got_o);
@@ -204,12 +200,12 @@ int main(int argc, char** argv) {
         // PROPERTY 4 setup) - a cheap independent invariant that no layout can fake
         {
             std::vector<float> zero(st_dev.size(), 0.0f), zg((size_t) h_v, 0.0f), zb((size_t) h_v, 0.0f);
-            check(cudaMemcpy(d_st, zero.data(), zero.size() * 4, cudaMemcpyHostToDevice), "z0");
-            check(cudaMemcpy(d_g, zg.data(), zg.size() * 4, cudaMemcpyHostToDevice), "z1");
-            check(cudaMemcpy(d_b, zb.data(), zb.size() * 4, cudaMemcpyHostToDevice), "z2");
+            strata::parity::copy_bytes_in(d_st, zero.data(), zero.size() * 4);
+            strata::parity::copy_bytes_in(d_g, zg.data(), zg.size() * 4);
+            strata::parity::copy_bytes_in(d_b, zb.data(), zb.size() * 4);
             strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
             std::vector<float> zz(zero.size());
-            check(cudaMemcpy(zz.data(), d_st, zz.size() * 4, cudaMemcpyDeviceToHost), "z3");
+            strata::parity::copy_bytes_out(zz.data(), d_st, zz.size() * 4);
             double nz = 0;
             for (float x : zz) nz += std::fabs(x);
             const bool ok = nz == 0.0;
@@ -218,8 +214,7 @@ int main(int argc, char** argv) {
         }
 
         // ephemeral state: unchanged when the state is untouched but beta=1 — the delta rule writing k*d
-        cudaFree(d_st); cudaFree(d_q); cudaFree(d_k); cudaFree(d_v); cudaFree(d_g); cudaFree(d_b); cudaFree(d_o);
-    }
+        }
 
     // ================= 2. the conv =================
     {
@@ -280,24 +275,23 @@ int main(int argc, char** argv) {
         }
 
         float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr;
-        check(cudaMalloc(&d_cs, cs.size() * 4), "cs");
-        check(cudaMalloc(&d_x, x.size() * 4), "cx");
-        check(cudaMalloc(&d_w, kW.size() * 4), "cw");
-        check(cudaMalloc(&d_o, (size_t) C * 4), "co");
-        check(cudaMemcpy(d_cs, cs.data(), cs.size() * 4, cudaMemcpyHostToDevice), "ccs");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "ccx");
-        check(cudaMemcpy(d_w, kW.data(), kW.size() * 4, cudaMemcpyHostToDevice), "ccw");
+        d_cs = static_cast<decltype(d_cs)>(strata::parity::alloc_bytes(cs.size() * 4));
+        d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
+        d_w = static_cast<decltype(d_w)>(strata::parity::alloc_bytes(kW.size() * 4));
+        d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes((size_t) C * 4));
+        strata::parity::copy_bytes_in(d_cs, cs.data(), cs.size() * 4);
+        strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
+        strata::parity::copy_bytes_in(d_w, kW.data(), kW.size() * 4);
         strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
         std::vector<float> got((size_t) C), got_cs(cs.size());
-        check(cudaMemcpy(got.data(), d_o, got.size() * 4, cudaMemcpyDeviceToHost), "cgo");
-        check(cudaMemcpy(got_cs.data(), d_cs, got_cs.size() * 4, cudaMemcpyDeviceToHost), "cgs");
+        strata::parity::copy_bytes_out(got.data(), d_o, got.size() * 4);
+        strata::parity::copy_bytes_out(got_cs.data(), d_cs, got_cs.size() * 4);
         const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs);
         std::printf("  %-42s rel %.3e\n", "conv out vs reference", rel_out);
         std::printf("  %-42s rel %.3e\n", "conv state slide (mapped) vs reference", rel_cs);
         if (!(rel_out <= 1e-6)) { std::printf("    *** conv out ***\n"); ++bad; }
         if (!(rel_cs <= 1e-6)) { std::printf("    *** conv state ***\n"); ++bad; }
-        cudaFree(d_cs); cudaFree(d_x); cudaFree(d_w); cudaFree(d_o);
-    }
+        }
 
     // ================= 3. l2_norm =================
     {
@@ -329,15 +323,14 @@ int main(int argc, char** argv) {
         if (!(rel_trap > 0.05)) ++bad;
 
         float* d_x = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 4), "lx");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "lcx");
+        d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
+        strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
         strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
         std::vector<float> got(x.size());
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "lcg");
+        strata::parity::copy_bytes_out(got.data(), d_x, got.size() * 4);
         const double rel = rel_l1(x_ref, got);
         std::printf("  %-42s rel %.3e\n", "l2_norm vs reference", rel);
         if (!(rel <= 1e-6)) ++bad;
-        cudaFree(d_x);
     }
 
     // ================= 4. the closing norm =================
@@ -357,16 +350,16 @@ int main(int argc, char** argv) {
                                               sigmoid_f(z[(size_t) (h * S2 + i)]);
         }
         float *d_o = nullptr, *d_z = nullptr, *d_sn = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_o, o.size() * 4), "no");
-        check(cudaMalloc(&d_z, z.size() * 4), "nz");
-        check(cudaMalloc(&d_sn, sn.size() * 4), "ns");
-        check(cudaMalloc(&d_y, y_ref.size() * 4), "ny");
-        check(cudaMemcpy(d_o, o.data(), o.size() * 4, cudaMemcpyHostToDevice), "nco");
-        check(cudaMemcpy(d_z, z.data(), z.size() * 4, cudaMemcpyHostToDevice), "ncz");
-        check(cudaMemcpy(d_sn, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice), "ncs");
+        d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes(o.size() * 4));
+        d_z = static_cast<decltype(d_z)>(strata::parity::alloc_bytes(z.size() * 4));
+        d_sn = static_cast<decltype(d_sn)>(strata::parity::alloc_bytes(sn.size() * 4));
+        d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes(y_ref.size() * 4));
+        strata::parity::copy_bytes_in(d_o, o.data(), o.size() * 4);
+        strata::parity::copy_bytes_in(d_z, z.data(), z.size() * 4);
+        strata::parity::copy_bytes_in(d_sn, sn.data(), sn.size() * 4);
         strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
         std::vector<float> got(y_ref.size());
-        check(cudaMemcpy(got.data(), d_y, got.size() * 4, cudaMemcpyDeviceToHost), "ncy");
+        strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel = rel_l1(y_ref, got);
         std::printf("\n  %-42s rel %.3e\n", "out norm (rms * ssm_norm * sigmoid z)", rel);
         if (!(rel <= 1e-6)) ++bad;
@@ -387,8 +380,7 @@ int main(int argc, char** argv) {
         std::printf("  %-42s %-4s (%.2f%% apart)\n", "sigmoid vs SiLU on the gate is observable",
                     rel_silu > 0.05 ? "yes" : "*** NO ***", rel_silu * 100);
         if (!(rel_silu > 0.05)) ++bad;
-        cudaFree(d_o); cudaFree(d_z); cudaFree(d_sn); cudaFree(d_y);
-    }
+        }
 
     std::printf("\ngdn: %d failures\n", bad);
     if (bad) return 1;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/rope_parity.cpp - P2.S2's parity test for NEOX partial RoPE.
 //
 // TWO CHECKS, deliberately separated so each can be tight:
@@ -14,7 +17,7 @@
 // happily accept.
 #include "strata/kernels/rope.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -24,18 +27,7 @@
 #include <string>
 #include <vector>
 
-namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
-
-}  // namespace
-
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
@@ -92,20 +84,15 @@ int main(int argc, char** argv) {
         }
     }
 
-    float *d_x = nullptr, *d_out = nullptr, *d_cos = nullptr, *d_sin = nullptr;
-    int* d_pos = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(float)), "malloc x");
-    check(cudaMalloc(&d_out, ref.size() * sizeof(float)), "malloc out");
-    check(cudaMalloc(&d_cos, hcos.size() * sizeof(float)), "malloc cos");
-    check(cudaMalloc(&d_sin, hsin.size() * sizeof(float)), "malloc sin");
-    check(cudaMalloc(&d_pos, pos.size() * sizeof(int)), "malloc pos");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_cos, hcos.data(), hcos.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cos");
-    check(cudaMemcpy(d_sin, hsin.data(), hsin.size() * sizeof(float), cudaMemcpyHostToDevice), "copy sin");
-    check(cudaMemcpy(d_pos, pos.data(), pos.size() * sizeof(int), cudaMemcpyHostToDevice), "copy pos");
+    strata::parity::Device dev;
+    float* d_x = dev.upload(x);
+    float* d_out = dev.alloc<float>(ref.size());
+    float* d_cos = dev.upload(hcos);
+    float* d_sin = dev.upload(hsin);
+    int* d_pos = dev.upload(pos);
     strata::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
     std::vector<float> got(ref.size());
-    check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "back");
+    strata::parity::copy_out(got.data(), d_out, got.size());
 
     // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  *c - b*s is one of the expressions the compiler is free to
     // contract into an FMA, and the host and device compilers choose differently - so a handful of values
@@ -145,13 +132,13 @@ int main(int argc, char** argv) {
         std::vector<float> e((size_t) head_dim, 0.0f);
         e[0] = 1.0f;
         std::vector<float> o((size_t) head_dim, 0.0f);
-        check(cudaMemcpy(d_x, e.data(), e.size() * sizeof(float), cudaMemcpyHostToDevice), "copy e");
+        strata::parity::copy_in(d_x, e.data(), e.size());
         // position 7, NOT position 0: at pos 0 sin is exactly 0, so dim half legitimately does not move and
         // the check would report the correct kernel as wrong.  The first version made exactly that mistake.
         int p7 = 7;
-        check(cudaMemcpy(d_pos, &p7, sizeof(int), cudaMemcpyHostToDevice), "copy p7");
+        strata::parity::copy_in(d_pos, &p7, 1);
         strata::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
-        check(cudaMemcpy(o.data(), d_out, o.size() * sizeof(float), cudaMemcpyDeviceToHost), "back e");
+        strata::parity::copy_out(o.data(), d_out, o.size());
         int moved[4] = {0, 0, 0, 0};       // dims 0, 1, half, half+1
         const float* chk[4] = {&e[0], &e[1], &e[half], &e[half + 1]};
         (void) chk;
@@ -168,4 +155,7 @@ int main(int argc, char** argv) {
     if (bad) return 1;
     if (selftest) std::printf("rope_parity OK\n");
     return 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "rope_parity: %s\n", e.what());
+    return 1;
 }

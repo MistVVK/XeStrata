@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/s_gemv_q8k_parity.cpp - the Q8_K activation path of `s_gemv`.
 //
 // THE POINT OF THIS KERNEL IS A CONTRACT, so the test is built around the contract rather than around the
@@ -14,7 +17,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -27,13 +30,6 @@ namespace {
 
 using strata::kernels::SForm;
 using strata::kernels::Codebook;
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 /// The host decode, transcribed from `docs/pack-format.md`'s rule: `value = cb[code] * scale + offset`, with
 /// the integer bias applied INSIDE the integer domain before the one multiply.
@@ -118,11 +114,11 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> xq8k((size_t) (n_in / 256) * 292);
         float* d_xf = nullptr;
         uint8_t* d_xq = nullptr;
-        check(cudaMalloc(&d_xf, (size_t) n_in * 4), "xf");
-        check(cudaMalloc(&d_xq, xq8k.size()), "xq");
-        check(cudaMemcpy(d_xf, xf.data(), (size_t) n_in * 4, cudaMemcpyHostToDevice), "cxf");
+        d_xf = static_cast<decltype(d_xf)>(strata::parity::alloc_bytes((size_t) n_in * 4));
+        d_xq = static_cast<decltype(d_xq)>(strata::parity::alloc_bytes(xq8k.size()));
+        strata::parity::copy_bytes_in(d_xf, xf.data(), (size_t) n_in * 4);
         strata::kernels::quantize_q8_K(d_xf, d_xq, n_in, nullptr);
-        check(cudaMemcpy(xq8k.data(), d_xq, xq8k.size(), cudaMemcpyDeviceToHost), "cxq");
+        strata::parity::copy_bytes_out(xq8k.data(), d_xq, xq8k.size());
 
         // ---- host reference in double, over the same bytes
         std::vector<float> want((size_t) n_out, 0.0f);
@@ -136,21 +132,21 @@ int main(int argc, char** argv) {
         // ---- device
         uint8_t* d_codes = nullptr;
         float *d_scales = nullptr, *d_offs = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_codes, codes.size()), "codes");
-        check(cudaMalloc(&d_scales, scales.size() * 4), "scales");
-        check(cudaMalloc(&d_offs, offs.size() * 4), "offs");
-        check(cudaMalloc(&d_y, (size_t) n_out * 4), "y");
-        check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "cc");
-        check(cudaMemcpy(d_scales, scales.data(), scales.size() * 4, cudaMemcpyHostToDevice), "cs");
-        check(cudaMemcpy(d_offs, offs.data(), offs.size() * 4, cudaMemcpyHostToDevice), "co");
+        d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+        d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * 4));
+        d_offs = static_cast<decltype(d_offs)>(strata::parity::alloc_bytes(offs.size() * 4));
+        d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes((size_t) n_out * 4));
+        strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+        strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * 4);
+        strata::parity::copy_bytes_in(d_offs, offs.data(), offs.size() * 4);
 
         std::vector<float> naive((size_t) n_out), warp((size_t) n_out);
         strata::kernels::s_gemv_q8k(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out,
                                     f, nullptr);
-        check(cudaMemcpy(naive.data(), d_y, (size_t) n_out * 4, cudaMemcpyDeviceToHost), "cy1");
+        strata::parity::copy_bytes_out(naive.data(), d_y, (size_t) n_out * 4);
         strata::kernels::s_gemv_q8k_split(d_xq, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in,
                                           n_out, f, nullptr);
-        check(cudaMemcpy(warp.data(), d_y, (size_t) n_out * 4, cudaMemcpyDeviceToHost), "cy2");
+        strata::parity::copy_bytes_out(warp.data(), d_y, (size_t) n_out * 4);
 
         double mag = 0, d1 = 0, d2 = 0;
         for (long long o = 0; o < n_out; ++o) {
@@ -170,9 +166,9 @@ int main(int argc, char** argv) {
         {
             std::vector<uint8_t> xq0((size_t) (n_in / 32) * 34);
             uint8_t* d_x0 = nullptr;
-            check(cudaMalloc(&d_x0, xq0.size()), "x0");
+            d_x0 = static_cast<decltype(d_x0)>(strata::parity::alloc_bytes(xq0.size()));
             strata::kernels::quantize_q8_0(d_xf, d_x0, n_in, nullptr);
-            check(cudaMemcpy(xq0.data(), d_x0, xq0.size(), cudaMemcpyDeviceToHost), "cx0");
+            strata::parity::copy_bytes_out(xq0.data(), d_x0, xq0.size());
 
             // the host reference over the SAME Q8_0 bytes, with the same weight decode
             std::vector<float> want0((size_t) n_out, 0.0f);
@@ -191,7 +187,7 @@ int main(int argc, char** argv) {
             strata::kernels::s_gemv_q8_0_split(d_x0, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y,
                                                n_in, n_out, f, nullptr);
             std::vector<float> got0((size_t) n_out);
-            check(cudaMemcpy(got0.data(), d_y, (size_t) n_out * 4, cudaMemcpyDeviceToHost), "cy0");
+            strata::parity::copy_bytes_out(got0.data(), d_y, (size_t) n_out * 4);
             double m0 = 0, dd0 = 0;
             for (long long o = 0; o < n_out; ++o) {
                 m0 += std::fabs((double) want0[(size_t) o]);
@@ -202,7 +198,6 @@ int main(int argc, char** argv) {
                 std::printf("    *** the Q8_0 activation loader is WRONG ***\n");
                 ++bad;
             }
-            check(cudaFree(d_x0), "fx0");
         }
 
         // ---- 3. THE Q8_K vs FP16 GAP, on a K-quant weight - the case the contract decision needs
@@ -210,12 +205,12 @@ int main(int argc, char** argv) {
             std::vector<uint16_t> x16((size_t) n_in);
             for (long long i = 0; i < n_in; ++i) x16[(size_t) i] = strata::kernels::f16_from_f32(xf[(size_t) i]);
             uint16_t* d_x16 = nullptr;
-            check(cudaMalloc(&d_x16, (size_t) n_in * 2), "x16");
-            check(cudaMemcpy(d_x16, x16.data(), (size_t) n_in * 2, cudaMemcpyHostToDevice), "cx16");
+            d_x16 = static_cast<decltype(d_x16)>(strata::parity::alloc_bytes((size_t) n_in * 2));
+            strata::parity::copy_bytes_in(d_x16, x16.data(), (size_t) n_in * 2);
             std::vector<float> fp16out((size_t) n_out);
             strata::kernels::s_gemv(d_x16, d_codes, d_scales, cs.has_offset ? d_offs : nullptr, d_y, n_in, n_out,
                                     f);
-            check(cudaMemcpy(fp16out.data(), d_y, (size_t) n_out * 4, cudaMemcpyDeviceToHost), "cy3");
+            strata::parity::copy_bytes_out(fp16out.data(), d_y, (size_t) n_out * 4);
             double dd = 0;
             for (long long o = 0; o < n_out; ++o)
                 dd += std::fabs((double) naive[(size_t) o] - (double) fp16out[(size_t) o]);
@@ -224,9 +219,7 @@ int main(int argc, char** argv) {
             std::printf("      %-24s %s (%.4f%% apart, tolerance 0.1%%)\n", "Q8_K vs fp16 activation",
                         visible ? "yes" : "*** NO ***", rel * 100);
             if (!visible) ++bad;
-            cudaFree(d_x16);
         }
-        cudaFree(d_xf); cudaFree(d_xq); cudaFree(d_codes); cudaFree(d_scales); cudaFree(d_offs); cudaFree(d_y);
     }
 
     std::printf("\ns_gemv_q8k: %d failures\n", bad);

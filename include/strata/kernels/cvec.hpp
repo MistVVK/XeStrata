@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/cvec.hpp - a control vector on the residual stream: the engine's side of llama.cpp's
 // `llama_adapter_cvec` with the `--cvec-mode` / `--cvec-dir` extension of the `experimental-speed-projection`
 // package (its `02-cvec-projection-mode.patch`, and `01-qwen4exp-cvec-hooks.patch` for WHERE it applies).

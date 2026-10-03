@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/dequant_bf16_test.cpp - plan v0.3 P5: the device dequantizers against the artifact's validated CPU
 // dequantizers (`strata/artifact/dequant.hpp`), on one real tensor of every type the model uses.
 //
@@ -9,7 +12,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -64,22 +67,17 @@ int main(int argc, char** argv) {
             const int64_t rows = (std::min<int64_t>)(4, (int64_t) t.shape[1]);
             const int64_t row_bytes = cols / be * bb;
             const uint8_t* host = (const uint8_t*) gguf.tensor_data(t);
-            void* d_blocks = nullptr;
-            float* d_f = nullptr;
-            uint16_t* d_h = nullptr;
-            cudaMalloc(&d_blocks, (size_t) (rows * row_bytes));
-            cudaMalloc(&d_f, (size_t) (rows * cols) * 4);
-            cudaMalloc(&d_h, (size_t) (rows * cols) * 2);
-            cudaMemcpy(d_blocks, host, (size_t) (rows * row_bytes), cudaMemcpyHostToDevice);
+            namespace par = strata::parity;
+            void* d_blocks = par::alloc_bytes((size_t) (rows * row_bytes));
+            auto* d_f = static_cast<float*>(par::alloc_bytes((size_t) (rows * cols) * 4));
+            auto* d_h = static_cast<uint16_t*>(par::alloc_bytes((size_t) (rows * cols) * 2));
+            par::copy_bytes_in(d_blocks, host, (size_t) (rows * row_bytes));
             strata::kernels::dequant_f32(type, d_blocks, 0, rows, cols, d_f, nullptr);
             strata::kernels::dequant_bf16(type, d_blocks, 0, rows, cols, d_h, nullptr);
             std::vector<float> gf((size_t) (rows * cols));
             std::vector<uint16_t> gh((size_t) (rows * cols));
-            cudaMemcpy(gf.data(), d_f, gf.size() * 4, cudaMemcpyDeviceToHost);
-            cudaMemcpy(gh.data(), d_h, gh.size() * 2, cudaMemcpyDeviceToHost);
-            cudaFree(d_blocks);
-            cudaFree(d_f);
-            cudaFree(d_h);
+            par::copy_bytes_out(gf.data(), d_f, gf.size() * 4);
+            par::copy_bytes_out(gh.data(), d_h, gh.size() * 2);
             std::vector<float> ref((size_t) (rows * cols));
             for (int64_t r = 0; r < rows; ++r)
                 for (int64_t b = 0; b < cols / be; ++b)

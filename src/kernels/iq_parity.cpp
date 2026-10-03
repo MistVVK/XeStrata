@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/iq_parity.cpp - plan v0.3 P6: the i-quant kernels against gguf-py on real rows.
 //
 //     python tools/iq_fixture.py --out logs/iq_fixture && build/iq_parity logs/iq_fixture
@@ -7,7 +10,9 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/runtime.hpp"
+
+#include <memory>
 
 #include <cmath>
 #include <cstdio>
@@ -15,12 +20,34 @@
 #include <string>
 #include <vector>
 
-int main(int argc, char** argv) {
+namespace {
+using strata::core::Runtime;
+
+// Device buffers live until the harness ends; copies go through the runtime's queues in order.
+struct Device {
+    std::vector<std::unique_ptr<strata::core::DeviceArena>> arenas;
+    template<class T> T* alloc(size_t bytes) {
+        arenas.push_back(std::make_unique<strata::core::DeviceArena>(bytes));
+        return static_cast<T*>(arenas.back()->base());
+    }
+};
+void upload(void* dst, const void* src, size_t bytes) {
+    auto& runtime = Runtime::get();
+    runtime.wait(runtime.copy_async(dst, src, bytes), "iq_parity upload");
+}
+void download(void* dst, const void* src, size_t bytes) {
+    auto& runtime = Runtime::get();
+    const auto produced = runtime.compute().ext_oneapi_submit_barrier();
+    runtime.wait(runtime.copy_async(dst, src, bytes, {produced}), "iq_parity download");
+}
+}  // namespace
+
+int main(int argc, char** argv) try {
     const std::string dir = argc > 1 ? argv[1] : "logs/iq_fixture";
     const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K"};
     int failures = 0;
-    cudaStream_t s;
-    cudaStreamCreate(&s);
+    void* s = &Runtime::get().compute();
+    Device dev;
     for (const char* nm : names) {
         std::FILE* f = std::fopen((dir + "/" + nm + ".bin").c_str(), "rb");
         std::FILE* g = std::fopen((dir + "/" + nm + ".f32").c_str(), "rb");
@@ -34,16 +61,14 @@ int main(int argc, char** argv) {
         std::fread(ref.data(), 4, ref.size(), g);
         std::fclose(f);
         std::fclose(g);
-        void* dw = nullptr;
-        float* dq = nullptr;
-        cudaMalloc(&dw, raw.size());
-        cudaMalloc(&dq, ref.size() * 4);
-        cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+        void* dw = dev.alloc<uint8_t>(raw.size());
+        float* dq = dev.alloc<float>(ref.size() * 4);
+        upload(dw, raw.data(), raw.size());
         double dq_err = 0.0;
         if (strata::kernels::iq_supported(type) && ((size_t) rows * cols) % 256 == 0) {
             strata::kernels::iq_dequant_f32(type, dw, (int64_t) rows * cols, dq, s);
             std::vector<float> got(ref.size());
-            cudaMemcpy(got.data(), dq, got.size() * 4, cudaMemcpyDeviceToHost);
+            download(got.data(), dq, got.size() * 4);
             double num = 0, den = 0;
             for (size_t i = 0; i < ref.size(); ++i) { num += std::fabs(got[i] - ref[i]); den += std::fabs(ref[i]); }
             dq_err = num / (den + 1e-30);
@@ -53,20 +78,16 @@ int main(int argc, char** argv) {
         std::normal_distribution<float> nd(0.f, 1.f);
         std::vector<float> x((size_t) 2 * cols);
         for (auto& v : x) v = nd(rng);
-        float* dx = nullptr;
-        void* xq = nullptr;
-        float* dy = nullptr;
-        cudaMalloc(&dx, x.size() * 4);
-        cudaMalloc(&xq, (size_t) 2 * cols / 32 * 36);
-        cudaMalloc(&dy, (size_t) 2 * rows * 4);
-        cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
+        float* dx = dev.alloc<float>(x.size() * 4);
+        void* xq = dev.alloc<uint8_t>((size_t) 2 * cols / 32 * 36);
+        float* dy = dev.alloc<float>((size_t) 2 * rows * 4);
+        upload(dx, x.data(), x.size() * 4);
         strata::kernels::quantize_q8_1_rows(dx, 2, cols, xq, s);
         try {
             strata::kernels::native_mmvq(type, dw, xq, dy, cols, rows, 2, s);
         } catch (const std::exception& e) { std::printf("%-8s mmvq: %s\n", nm, e.what()); ++failures; continue; }
         std::vector<float> y((size_t) 2 * rows);
-        cudaStreamSynchronize(s);
-        cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
+        download(y.data(), dy, y.size() * 4);
         double num = 0, den = 0;
         for (int c = 0; c < 2; ++c)
             for (int r = 0; r < rows; ++r) {
@@ -80,8 +101,10 @@ int main(int argc, char** argv) {
         std::printf("%-8s type %2d %4d x %5d  dequant rel %.2e  mmvq rel %.2e  %s\n", nm, type, rows, cols, dq_err, mm_err,
                     ok ? "ok" : "FAIL");
         if (!ok) ++failures;
-        cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(xq); cudaFree(dy);
     }
     std::printf("iq_parity: %d failures\n", failures);
     return failures ? 1 : 0;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "iq_parity: %s\n", e.what());
+    return 1;
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cvec_parity.cpp - the control vector kernel (strata/kernels/cvec.hpp) against a host reference.
 //   1. project: h - s (h.v) v per stream and token, against double precision; the steered component is gone.
 //   2. add: h + d.
@@ -8,7 +11,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -23,26 +26,19 @@ namespace {
 
 int g_fail = 0;
 
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "CUDA error in %s: %s\n", w, cudaGetErrorString(e));
-        std::exit(2);
-    }
-}
-
 template <typename T>
 T* dalloc(size_t n) {
     T* p = nullptr;
-    ck(cudaMalloc(&p, n * sizeof(T)), "malloc");
+    p = static_cast<decltype(p)>(strata::parity::alloc_bytes(n * sizeof(T)));
     return p;
 }
 
 template <typename T>
-void up(T* d, const std::vector<T>& h) { ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "up"); }
+void up(T* d, const std::vector<T>& h) { strata::parity::copy_bytes_in(d, h.data(), h.size() * sizeof(T)); }
 template <typename T>
 std::vector<T> down(const T* d, size_t n) {
     std::vector<T> h(n);
-    ck(cudaMemcpy(h.data(), d, n * sizeof(T), cudaMemcpyDeviceToHost), "down");
+    strata::parity::copy_bytes_out(h.data(), d, n * sizeof(T));
     return h;
 }
 
@@ -87,7 +83,7 @@ int main() {
     std::printf("project\n");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "project");
+    strata::parity::sync();
     {
         const auto got = down(dR, R.size());
         double worst = 0.0, worst_dot = 0.0;
@@ -116,7 +112,7 @@ int main() {
     if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "project s=1");
+    strata::parity::sync();
     {
         const auto got = down(dR, R.size());
         double worst = 0.0;
@@ -133,7 +129,7 @@ int main() {
     // ---- 4. a layer without a direction
     up(dR, R);
     k::cvec_apply(dR, kOff, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "off layer");
+    strata::parity::sync();
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "a layer without a direction is untouched");
 
     // ---- 3. switched off
@@ -142,7 +138,7 @@ int main() {
     check(!k::cvec_enabled(), "cvec_enabled() follows the switch");
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "off");
+    strata::parity::sync();
     check(std::memcmp(down(dR, R.size()).data(), R.data(), R.size() * 4) == 0, "off, no pending write: R unchanged");
     {
         // the fused read's folded write, one token at a time, against the kernel's write-only pass
@@ -174,7 +170,7 @@ int main() {
         }
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(cudaDeviceSynchronize(), "write only");
+        strata::parity::sync();
         const auto fused = down(dF, R.size()), mine = down(dR, R.size());
         check(std::memcmp(fused.data(), mine.data(), R.size() * 4) == 0,
               "off, pending write: bitwise the fused read's folded write");
@@ -182,7 +178,7 @@ int main() {
         // on, with the write: the write, then the projection (reference from the fused result)
         up(dR, R);
         k::cvec_apply(dR, kLayer, T, D, dbo, N, dinj, HC, true, nullptr);
-        ck(cudaDeviceSynchronize(), "write+project");
+        strata::parity::sync();
         const auto both = down(dR, R.size());
         double worst = 0.0;
         for (int64_t t = 0; t < T; ++t)
@@ -205,7 +201,7 @@ int main() {
     if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
-    ck(cudaDeviceSynchronize(), "add");
+    strata::parity::sync();
     {
         const auto got = down(dR, R.size());
         bool same = true;

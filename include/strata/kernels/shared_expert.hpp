@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/shared_expert.hpp - the shared expert, host-callable (P2.S2).
 //
 //     h = silu(x @ gate_shexp.T) * (x @ up_shexp.T)      <- SILU ON GATE

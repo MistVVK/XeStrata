@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/kv_stream.hpp - KV streaming for the QSA layers (docs/kv-streaming-design.md).
 //
 // A streamed QSA layer keeps its AUTHORITATIVE K/V in pinned, device-mapped host memory, laid out exactly as a

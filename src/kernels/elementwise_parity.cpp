@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/elementwise_parity.cpp - P2.S5's test for the layer glue.
 //
 // The ops are small; the CONVENTIONS in them are not, and each one is a place where a plausible reading
@@ -10,12 +13,14 @@
 //   2. `ssm_a` IS NEGATIVE.  `gate = softplus(...) * ssm_a`, so `exp(gate) < 1` and the state DECAYS.  A
 //      fixture with a positive `ssm_a` would still produce finite output and the recurrence would blow up
 //      instead of decaying, so the sign is checked as a property and not assumed.
-//   3. `silu` IS COMPUTED IN DOUBLE then cast, because `ref/gdn.py`'s numpy does.  f32 `expf` differs in the
-//      last bits, and the test measures that rather than asserting it away.
+//   3. The SiLU oracle computes in double, then casts. The GPU must meet its existing error bound.
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/runtime.hpp"
+#include "strata/core/pinned.hpp"
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+#include <memory>
 
 #include <cmath>
 #include <cstdio>
@@ -27,12 +32,39 @@
 
 namespace {
 
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+using strata::core::Runtime;
+
+// The fixtures and oracles stay on the CPU. Transfers use explicit host USM and
+// bridge the copy and compute queues through events before either buffer is reused.
+struct DeviceBuffers {
+    std::vector<std::unique_ptr<strata::core::DeviceArena>> arenas;
+    template<class T> void allocate(T** pointer, size_t bytes) {
+        arenas.push_back(std::make_unique<strata::core::DeviceArena>(bytes));
+        *pointer = static_cast<T*>(arenas.back()->base());
     }
-}
+};
+
+struct Transfers {
+    std::vector<std::unique_ptr<strata::core::PinnedArena>> sources;
+
+    void upload(void* dst, const void* src, size_t bytes) {
+        auto& runtime = Runtime::get();
+        sources.push_back(std::make_unique<strata::core::PinnedArena>(bytes));
+        void* staging = sources.back()->base;
+        std::memcpy(staging, src, bytes);
+        const auto copied = runtime.copy_async(dst, staging, bytes);
+        runtime.compute_after({copied});
+    }
+
+    void download(void* dst, const void* src, size_t bytes) {
+        auto& runtime = Runtime::get();
+        strata::core::PinnedArena staging(bytes);
+        const auto produced = runtime.compute().ext_oneapi_submit_barrier();
+        runtime.wait(runtime.copy_async(staging.base, src, bytes, {produced}));
+        std::memcpy(dst, staging.base, bytes);
+        sources.clear();
+    }
+};
 
 double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     double d = 0, m = 0;
@@ -45,12 +77,14 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int run(int argc, char** argv) {
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
         else { std::fprintf(stderr, "usage: elementwise_parity [--selftest]\n"); return 2; }
     }
+    DeviceBuffers buffers;
+    Transfers transfers;
     int bad = 0;
     const int64_t H_V = 48;
 
@@ -98,20 +132,20 @@ int main(int argc, char** argv) {
         if (positive) ++bad;
 
         float *d_a = nullptr, *d_dt = nullptr, *d_sa = nullptr, *d_g = nullptr;
-        check(cudaMalloc(&d_a, n * 4), "a");
-        check(cudaMalloc(&d_dt, n * 4), "dt");
-        check(cudaMalloc(&d_sa, n * 4), "sa");
-        check(cudaMalloc(&d_g, n * 4), "g");
-        check(cudaMemcpy(d_a, alpha.data(), n * 4, cudaMemcpyHostToDevice), "ca");
-        check(cudaMemcpy(d_dt, dt.data(), n * 4, cudaMemcpyHostToDevice), "cd");
-        check(cudaMemcpy(d_sa, a.data(), n * 4, cudaMemcpyHostToDevice), "cs");
+        buffers.allocate(&d_a, n * 4);
+        buffers.allocate(&d_dt, n * 4);
+        buffers.allocate(&d_sa, n * 4);
+        buffers.allocate(&d_g, n * 4);
+        transfers.upload(d_a, alpha.data(), n * 4);
+        transfers.upload(d_dt, dt.data(), n * 4);
+        transfers.upload(d_sa, a.data(), n * 4);
         strata::kernels::gdn_gate(d_a, d_dt, d_sa, d_g, 1, H_V, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_g, n * 4, cudaMemcpyDeviceToHost), "cg");
+        transfers.download(got.data(), d_g, n * 4);
 
         const double rel = rel_l1(want, got);
         std::printf("  %-44s rel %.3e\n", "gdn_gate vs the reference", rel);
-        // double softplus and double multiply on both sides, then one cast
+        // The CPU reference uses double; the GPU must meet the same error bound.
         if (!(rel <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
 
         // TRAP: no large-x branch.  `log1p(exp(x))` in f32, with no `x > 20` path.
@@ -151,7 +185,6 @@ int main(int argc, char** argv) {
                         over ? "*** NO ***" : "yes", over, n);
             if (over) ++bad;
         }
-        cudaFree(d_a); cudaFree(d_dt); cudaFree(d_sa); cudaFree(d_g);
     }
 
     // ---- 2. silu, in double then cast
@@ -166,15 +199,14 @@ int main(int argc, char** argv) {
             want[(size_t) i] = (float) (v / (1.0 + std::exp(-v)));
         }
         float* d_x = nullptr;
-        check(cudaMalloc(&d_x, n * 4), "sx");
-        check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "csx");
+        buffers.allocate(&d_x, n * 4);
+        transfers.upload(d_x, x.data(), n * 4);
         strata::kernels::silu_inplace(d_x, n, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "csg");
+        transfers.download(got.data(), d_x, n * 4);
         const double rel = rel_l1(want, got);
-        std::printf("\n  %-44s rel %.3e\n", "silu (double) vs the reference", rel);
+        std::printf("\n  %-44s rel %.3e\n", "silu vs the double reference", rel);
         if (!(rel <= 1e-7)) { std::printf("    *** over 1e-7 ***\n"); ++bad; }
-        cudaFree(d_x);
     }
 
     // ---- 3. scale and the f32->f16 bridge
@@ -187,12 +219,12 @@ int main(int argc, char** argv) {
 
         float* d_x = nullptr;
         uint16_t* d_h = nullptr;
-        check(cudaMalloc(&d_x, n * 4), "ex");
-        check(cudaMalloc(&d_h, n * 2), "eh");
-        check(cudaMemcpy(d_x, x.data(), n * 4, cudaMemcpyHostToDevice), "cex");
+        buffers.allocate(&d_x, n * 4);
+        buffers.allocate(&d_h, n * 2);
+        transfers.upload(d_x, x.data(), n * 4);
         strata::kernels::scale_inplace(d_x, n, s, nullptr);
         std::vector<float> got((size_t) n);
-        check(cudaMemcpy(got.data(), d_x, n * 4, cudaMemcpyDeviceToHost), "ceg");
+        transfers.download(got.data(), d_x, n * 4);
         int diff = 0;
         for (int i = 0; i < n; ++i) if (got[(size_t) i] != want[(size_t) i]) ++diff;
         std::printf("  %-44s %d of %d differ\n", "scale_inplace is exact", diff, n);
@@ -200,13 +232,12 @@ int main(int argc, char** argv) {
 
         strata::kernels::f32_to_f16_bulk(d_x, d_h, n, nullptr);
         std::vector<uint16_t> h((size_t) n);
-        check(cudaMemcpy(h.data(), d_h, n * 2, cudaMemcpyDeviceToHost), "ceh");
+        transfers.download(h.data(), d_h, n * 2);
         int hbad = 0;
         for (int i = 0; i < n; ++i)
             if (h[(size_t) i] != strata::kernels::f16_from_f32(got[(size_t) i])) ++hbad;
         std::printf("  %-44s %d of %d differ\n", "f32_to_f16_bulk uses the shared conversion", hbad, n);
         if (hbad) ++bad;
-        cudaFree(d_x); cudaFree(d_h);
     }
 
     // ---- 4. rms_norm_weighted, and the TWO RIVAL READINGS it exists to be told apart from.
@@ -264,13 +295,13 @@ int main(int argc, char** argv) {
 
         float* d_x = nullptr;
         float* d_w = nullptr;
-        check(cudaMalloc(&d_x, x.size() * 4), "m rmsx");
-        check(cudaMalloc(&d_w, w.size() * 4), "m rmsw");
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx");
-        check(cudaMemcpy(d_w, w.data(), w.size() * 4, cudaMemcpyHostToDevice), "c rmsw");
+        buffers.allocate(&d_x, x.size() * 4);
+        buffers.allocate(&d_w, w.size() * 4);
+        transfers.upload(d_x, x.data(), x.size() * 4);
+        transfers.upload(d_w, w.data(), w.size() * 4);
         strata::kernels::rms_norm_weighted(d_x, d_w, rows, cols, eps, nullptr);
         std::vector<float> got((size_t) (rows * cols));
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsg");
+        transfers.download(got.data(), d_x, got.size() * 4);
 
         const double r_got = rel(want, got);
         double worst = 0;
@@ -295,24 +326,21 @@ int main(int argc, char** argv) {
         // and it is a fixture bug rather than a kernel bug: the oracle reads the ORIGINAL `x`, so the two
         // sides were never looking at the same input.
         const std::vector<float> want_null = ref(false, false);
-        check(cudaMemcpy(d_x, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "c rmsx2");
+        transfers.upload(d_x, x.data(), x.size() * 4);
         strata::kernels::rms_norm_weighted(d_x, nullptr, rows, cols, eps, nullptr);
-        check(cudaMemcpy(got.data(), d_x, got.size() * 4, cudaMemcpyDeviceToHost), "c rmsn");
+        transfers.download(got.data(), d_x, got.size() * 4);
         int null_bad = 0;
         for (size_t i = 0; i < got.size(); ++i)
             if (std::fabs((double) got[i] - (double) want_null[i]) > 1e-6) ++null_bad;
         std::printf("  %-44s %d of %zu differ\n", "a null weight is legal", null_bad, got.size());
         if (null_bad) ++bad;
-        cudaFree(d_x);
-        cudaFree(d_w);
     }
 
     // Packed embedding rows: every code width, scale-group size, optional offset,
-    // row boundary and partial CUDA block. Compare bits with a scalar CPU decoder.
+    // row boundary and partial work group. Compare bits with a scalar CPU decoder.
     // Volatile materializes the multiply so this oracle cannot silently use FMA.
     {
-        cudaStream_t stream;
-        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "embedding stream");
+        auto* stream = &Runtime::get().compute();
         std::mt19937 rng(77);
         std::uniform_real_distribution<float> values(-2.0f, 2.0f);
         int mismatches = 0, guards = 0, fma_diff = 0, cases = 0;
@@ -339,14 +367,14 @@ int main(int argc, char** argv) {
                     offsets[0] = 0.0f;
                     uint8_t* dc = nullptr;
                     float *ds = nullptr, *dof = nullptr, *out = nullptr;
-                    check(cudaMalloc(&dc, codes.size()), "embedding codes");
-                    check(cudaMalloc(&ds, scales.size() * sizeof(float)), "embedding scales");
-                    check(cudaMalloc(&dof, offsets.size() * sizeof(float)), "embedding offsets");
-                    check(cudaMalloc(&out, ((size_t) n + 2) * sizeof(float)), "embedding output");
-                    check(cudaMemcpyAsync(dc, codes.data(), codes.size(), cudaMemcpyHostToDevice, stream), "embedding codes upload");
-                    check(cudaMemcpyAsync(ds, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding scales upload");
-                    check(cudaMemcpyAsync(dof, offsets.data(), offsets.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding offsets upload");
-                    check(cudaStreamSynchronize(stream), "embedding upload sync");
+                    buffers.allocate(&dc, codes.size());
+                    buffers.allocate(&ds, scales.size() * sizeof(float));
+                    buffers.allocate(&dof, offsets.size() * sizeof(float));
+                    buffers.allocate(&out, ((size_t) n + 2) * sizeof(float));
+                    transfers.upload(dc, codes.data(), codes.size());
+                    transfers.upload(ds, scales.data(), scales.size() * sizeof(float));
+                    transfers.upload(dof, offsets.data(), offsets.size() * sizeof(float));
+                    Runtime::get().finish(*stream);
 
                     for (const bool with_offset : {false, true}) {
                         for (int row = 0; row < 3; ++row) {
@@ -360,13 +388,13 @@ int main(int argc, char** argv) {
                                 const float fused = std::fma(code, scales[gi], offset);
                                 if (std::memcmp(&fused, &want[(size_t) i], sizeof(float)) != 0) ++fma_diff;
                             }
-                            check(cudaMemcpyAsync(out, got.data(), got.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "embedding output guards");
+                            transfers.upload(out, got.data(), got.size() * sizeof(float));
                             strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                 ds + (size_t) row * row_groups,
                                 with_offset ? dof + (size_t) row * row_groups : nullptr,
                                 n, bits, bias, group, out + 1, stream);
-                            check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding result");
-                            check(cudaStreamSynchronize(stream), "embedding sync");
+                            transfers.download(got.data(), out, got.size() * sizeof(float));
+                            Runtime::get().finish(*stream);
                             for (int i = 0; i < n; ++i) {
                                 if (std::memcmp(&want[(size_t) i], &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
                             }
@@ -376,34 +404,31 @@ int main(int argc, char** argv) {
                             // Capturing the gather proves that it has no hidden synchronization.
                             // A following scale also checks that it uses the caller's stream.
                             if (row == 1) {
-                                cudaGraph_t graph;
-                                cudaGraphExec_t exec;
-                                check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "embedding capture");
+                                namespace exp = sycl::ext::oneapi::experimental;
+                                exp::command_graph graph(stream->get_context(), stream->get_device());
+                                graph.begin_recording(*stream);
                                 strata::kernels::embedding_gather(dc + (size_t) row * row_bytes,
                                     ds + (size_t) row * row_groups,
                                     with_offset ? dof + (size_t) row * row_groups : nullptr,
                                     n, bits, bias, group, out + 1, stream);
                                 strata::kernels::scale_inplace(out + 1, n, 2.0f, stream);
-                                check(cudaStreamEndCapture(stream, &graph), "embedding capture end");
-                                check(cudaGraphInstantiate(&exec, graph, 0), "embedding instantiate");
-                                check(cudaGraphLaunch(exec, stream), "embedding replay");
-                                check(cudaMemcpyAsync(got.data(), out, got.size() * sizeof(float), cudaMemcpyDeviceToHost, stream), "embedding graph result");
-                                check(cudaStreamSynchronize(stream), "embedding graph sync");
+                                graph.end_recording(*stream);
+                                auto executable = graph.finalize();
+                                stream->ext_oneapi_graph(executable);
+                                transfers.download(got.data(), out, got.size() * sizeof(float));
+                                Runtime::get().finish(*stream);
                                 for (int i = 0; i < n; ++i) {
                                     const float expected = want[(size_t) i] * 2.0f;
                                     if (std::memcmp(&expected, &got[(size_t) i + 1], sizeof(float)) != 0) ++mismatches;
                                 }
                                 if (got.front() != -12345.0f || got.back() != -12345.0f) ++guards;
-                                check(cudaGraphExecDestroy(exec), "embedding exec destroy");
-                                check(cudaGraphDestroy(graph), "embedding graph destroy");
                             }
                         }
                     }
-                    cudaFree(dc); cudaFree(ds); cudaFree(dof); cudaFree(out);
                 }
             }
         }
-        check(cudaStreamDestroy(stream), "embedding stream destroy");
+        Runtime::get().finish(*stream);
         std::printf("  embedding gather: %d row cases, %d bit mismatches, %d guard failures, %d FMA differences\n",
                     cases, mismatches, guards, fma_diff);
         if (mismatches || guards || fma_diff == 0) ++bad;
@@ -413,4 +438,12 @@ int main(int argc, char** argv) {
     if (bad) return 1;
     if (selftest) std::printf("elementwise_parity OK\n");
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try { return run(argc, argv); }
+    catch (const std::exception& e) {
+        std::fprintf(stderr, "elementwise_parity: %s\n", e.what());
+        return 1;
+    }
 }

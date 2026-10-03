@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/ple.hpp - P2.S4: the PLE block's GPU half (`build_ple`, qwen4exp.cpp L1206-1293).
 //
 // One token, sixteen gathered rows of 160 -> a residual-stack update:

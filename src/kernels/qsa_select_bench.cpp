@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/qsa_select_bench.cpp - the prompt path's QSA selection (qsa_select.hpp) timed per stage, block scores
 // (the warp kernel and the tensor-core one) and top-k, for a batch of consecutive queries at a given context, and
 // the two scorers compared: score difference and how many selections differ (GPU, synthetic, no model).

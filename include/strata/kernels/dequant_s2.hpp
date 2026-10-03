@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/dequant_s2.hpp - the S2 decode, host-callable.
 //
 // S2 is Q2_0's canonical form and 31.64 GiB of the artifact is Q2_0, so this is the hottest decode in the

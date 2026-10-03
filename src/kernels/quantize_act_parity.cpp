@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/quantize_act_parity.cpp - P2.S2's parity test for the Q8_0 activation quantizer.
 //
 // THE CHECK IS ON THE BYTES, not on the round-tripped values.  `ref/quant.py::q8_0`'s central finding is that
@@ -14,7 +17,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -26,13 +29,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 // THE CONVERSIONS COME FROM `f16_bits.hpp`, and this test used to carry its own.  The private `f16_bits_to_f32`
 // below flushed fp16 SUBNORMALS to zero, and the private encoder returned NaN for finite fp16 overflow - both
@@ -77,24 +73,24 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     float* d_x = nullptr;
     uint8_t* d_b = nullptr;
     float* d_back = nullptr;
-    check(cudaMalloc(&d_x, (size_t) n * sizeof(float)), "malloc x");
-    check(cudaMalloc(&d_b, g_blocks.size()), "malloc blocks");
-    check(cudaMalloc(&d_back, (size_t) n * sizeof(float)), "malloc back");
-    check(cudaMemcpy(d_x, x.data(), (size_t) n * sizeof(float), cudaMemcpyHostToDevice), "copy x");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes((size_t) n * sizeof(float)));
+    d_b = static_cast<decltype(d_b)>(strata::parity::alloc_bytes(g_blocks.size()));
+    d_back = static_cast<decltype(d_back)>(strata::parity::alloc_bytes((size_t) n * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), (size_t) n * sizeof(float));
     // PROBE: does the DEVICE hold what the host thinks it sent?  The scale byte differs with the SAME
     // exponent and a zeroed mantissa, which says the kernel's amax differs from the host's on identical
     // input - so the first thing to rule out is the copy itself.
     {
         std::vector<float> rt((size_t) n);
-        check(cudaMemcpy(rt.data(), d_x, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost), "probe copy back");
+        strata::parity::copy_bytes_out(rt.data(), d_x, (size_t) n * sizeof(float));
         long long diff = 0;
         for (long long i = 0; i < n; ++i) if (std::memcmp(&rt[(size_t) i], &x[(size_t) i], 4) != 0) ++diff;
         if (diff) std::printf("    PROBE: device x differs from host x in %lld of %lld elements\n", diff, n);
     }
     strata::kernels::quantize_q8_0(d_x, d_b, n, nullptr);
     strata::kernels::dequant_q8_0(d_b, d_back, n, nullptr);
-    check(cudaMemcpy(g_blocks.data(), d_b, g_blocks.size(), cudaMemcpyDeviceToHost), "back blocks");
-    check(cudaMemcpy(g_back.data(), d_back, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost), "back vals");
+    strata::parity::copy_bytes_out(g_blocks.data(), d_b, g_blocks.size());
+    strata::parity::copy_bytes_out(g_back.data(), d_back, (size_t) n * sizeof(float));
 
     long long byte_bad = 0, val_bad = 0;
     if (check_bytes) {
@@ -124,9 +120,6 @@ int run_case(const char* name, const std::vector<float>& x, bool check_bytes) {
     std::printf("  %-26s blocks %s (%lld bad bytes)   round trip %s (%lld differ)\n", name,
                 !check_bytes ? "not compared" : (byte_bad ? "*** WRONG ***" : "byte-exact"), byte_bad,
                 val_bad ? "*** WRONG ***" : "bit-exact", val_bad);
-    cudaFree(d_x);
-    cudaFree(d_b);
-    cudaFree(d_back);
     return (int) (byte_bad + val_bad);
 }
 
@@ -184,14 +177,14 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
     float* d_x = nullptr;
     uint8_t* d_b = nullptr;
     float* d_back = nullptr;
-    check(cudaMalloc(&d_x, (size_t) n * sizeof(float)), "malloc x");
-    check(cudaMalloc(&d_b, g_blocks.size()), "malloc blocks");
-    check(cudaMalloc(&d_back, (size_t) n * sizeof(float)), "malloc back");
-    check(cudaMemcpy(d_x, x.data(), (size_t) n * sizeof(float), cudaMemcpyHostToDevice), "copy x");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes((size_t) n * sizeof(float)));
+    d_b = static_cast<decltype(d_b)>(strata::parity::alloc_bytes(g_blocks.size()));
+    d_back = static_cast<decltype(d_back)>(strata::parity::alloc_bytes((size_t) n * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), (size_t) n * sizeof(float));
     strata::kernels::quantize_q8_K(d_x, d_b, n, nullptr);
     strata::kernels::dequant_q8_K(d_b, d_back, n, nullptr);
-    check(cudaMemcpy(g_blocks.data(), d_b, g_blocks.size(), cudaMemcpyDeviceToHost), "back blocks");
-    check(cudaMemcpy(g_back.data(), d_back, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost), "back vals");
+    strata::parity::copy_bytes_out(g_blocks.data(), d_b, g_blocks.size());
+    strata::parity::copy_bytes_out(g_back.data(), d_back, (size_t) n * sizeof(float));
 
     long long byte_bad = 0, val_bad = 0, first_bad = -1;
     if (check_bytes)
@@ -225,9 +218,6 @@ int run_case_k(const char* name, const std::vector<float>& x, bool check_bytes, 
             std::printf("      d: ref %.9g  got %.9g\n", (double) rd, (double) gd);
         }
     }
-    cudaFree(d_x);
-    cudaFree(d_b);
-    cudaFree(d_back);
     return (int) (byte_bad + val_bad);
 }
 

@@ -1,7 +1,11 @@
-// src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the tensor-core prompt attention (qsa_prompt_attn.hpp)
-// against the FP32 kernel it replaces (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the prompt attention on the matrix engines (XMX on Xe,
+// tensor cores in Strata's CUDA build; qsa_prompt_attn.hpp) against the FP32 kernel it replaces
+// (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
 //
-// Int8 and FP16 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
+// Int8, FP16 and Q4_0 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
 // widest, a recent window plus older cells that drift slowly from one query to the next, so neighbours share most
 // of them as they do in a real prompt; short contexts take every cell). Checks:
 //   1. against FP64, the new kernel's error is no larger than a small multiple of the old kernel's (both FP32 math);
@@ -11,33 +15,34 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/kv_q4.hpp"
 
-#include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include "strata/kernels/f16_bits.hpp"
+#include "parity_device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
 namespace k = strata::kernels;
 
 namespace {
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
-}
-template <typename T> T* up(const std::vector<T>& h) {
-    T* d = nullptr;
-    ck(cudaMalloc(&d, h.size() * sizeof(T) + 64), "malloc");
-    ck(cudaMemcpy(d, h.data(), h.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
+namespace par = strata::parity;
+template <typename T> T* up(par::Device& dev, const std::vector<T>& h) {
+    T* d = dev.alloc<T>(h.size() + 64 / sizeof(T));
+    par::copy_in(d, h.data(), h.size());
     return d;
 }
-float h2f(uint16_t b) { __half h; *reinterpret_cast<uint16_t*>(&h) = b; return __half2float(h); }
-uint16_t f2h(float f) { __half h = __float2half(f); return *reinterpret_cast<uint16_t*>(&h); }
+float h2f(uint16_t b) { return k::f32_from_f16(b); }
+uint16_t f2h(float f) { return k::f16_from_f32(f); }
 
-int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
+int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2 q4_0
+    par::Device dev;
     const k::QsaShapes s = k::qsa_real_shapes();
     const int64_t HD = s.head_dim, NKV = s.n_head_kv, NH = s.n_head, PS = s.page_size;
     const int64_t pages = (ctx + PS - 1) / PS, rows = pages * NKV * PS;
@@ -48,7 +53,22 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
     // pools; page table a shuffled permutation (the readers must follow it)
     std::vector<int8_t> kq, vq;
     std::vector<uint16_t> ks, vs, kh, vh;
-    if (fmt == 1) {
+    std::vector<uint8_t> k4, v4;   // q4_0: 8 blocks of {fp16 d, 16 code bytes} per row (kv_q4.hpp)
+    constexpr int64_t B4 = 18, ROW4 = 8 * B4;
+    if (fmt == 2) {
+        std::uniform_int_distribution<int> byte(0, 255);
+        // the scales as a q4_0 pool holds them: signed (ggml's d = max / -8) and spread over two decades, so a chunk's
+        // cells mix signs and magnitudes (a positive-only bound on them overflowed FP16 on real K/V)
+        std::uniform_real_distribution<float> lg(std::log(0.01f), std::log(1.0f));
+        auto sc4 = [&](std::mt19937& r) { return std::exp(lg(r)) * (byte(r) & 1 ? -1.0f : 1.0f); };
+        k4.resize(rows * ROW4); v4.resize(rows * ROW4);
+        for (auto* pool : {&k4, &v4})
+            for (int64_t b = 0; b < rows * 8; ++b) {
+                const uint16_t d = f2h(sc4(rng));
+                std::memcpy(pool->data() + b * B4, &d, 2);
+                for (int j = 0; j < 16; ++j) (*pool)[b * B4 + 2 + j] = (uint8_t) byte(rng);
+            }
+    } else if (fmt == 1) {
         kq.resize(rows * HD); vq.resize(rows * HD); ks.resize(rows * 4); vs.resize(rows * 4);
         for (auto& x : kq) x = (int8_t) code(rng);
         for (auto& x : vq) x = (int8_t) code(rng);
@@ -96,34 +116,44 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
         std::copy(v.begin(), v.end(), sel);
     }
     k::QsaAttnPools pl;
-    if (fmt == 1) { pl.k_q = up(kq); pl.v_q = up(vq); pl.k_scale = up(ks); pl.v_scale = up(vs); }
-    else { pl.k_pool = up(kh); pl.v_pool = up(vh); }
-    pl.page_table = up(table);
-    const int32_t* d_ids = up(ids);
-    const int32_t* d_steps = up(steps);
-    const float* d_q = up(q);
-    float *d_old = nullptr, *d_new = nullptr, *scratch = nullptr;
+    if (fmt == 2) { pl.k_q4 = up(dev, k4); pl.v_q4 = up(dev, v4); }
+    else if (fmt == 1) { pl.k_q = up(dev, kq); pl.v_q = up(dev, vq); pl.k_scale = up(dev, ks); pl.v_scale = up(dev, vs); }
+    else { pl.k_pool = up(dev, kh); pl.v_pool = up(dev, vh); }
+    // a q4_0 value: block d / 32 of the row, element j = d % 32 in the low nibble of byte j (j < 16), else the high
+    // nibble of byte j - 16, minus 8, times the block's scale
+    auto q4v = [&](const std::vector<uint8_t>& pool, int64_t row, int64_t d) {
+        const uint8_t* blk = pool.data() + row * ROW4 + (d / 32) * B4;
+        uint16_t sc;
+        std::memcpy(&sc, blk, 2);
+        const int j = (int) (d % 32);
+        const int code = j < 16 ? (blk[2 + j] & 0x0F) : (blk[2 + j - 16] >> 4);
+        return (double) (code - 8) * h2f(sc);
+    };
+    pl.page_table = up(dev, table);
+    const int32_t* d_ids = up(dev, ids);
+    const int32_t* d_steps = up(dev, steps);
+    const float* d_q = up(dev, q);
     const int64_t batch = 32;
-    ck(cudaMalloc(&d_old, nq * NH * HD * 4), "malloc");
-    ck(cudaMalloc(&d_new, nq * NH * HD * 4), "malloc");
-    ck(cudaMalloc(&scratch, batch * k::qsa_decode_attn_scratch_floats(cap, s) * 4), "malloc");
+    float* d_old = dev.alloc<float>((size_t) (nq * NH * HD));
+    float* d_new = dev.alloc<float>((size_t) (nq * NH * HD));
+    float* scratch = dev.alloc<float>((size_t) (batch * k::qsa_decode_attn_scratch_floats(cap, s)));
     auto old_run = [&]() {
         for (int64_t t0 = 0; t0 < nq; t0 += batch)
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
-                                     scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
+                                     scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), par::stream());
     };
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
-            std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
+        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+            std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (or the device has no XMX)\n");
             std::exit(2);
         }
     };
     old_run();
     new_run();
-    ck(cudaDeviceSynchronize(), "run");
+    par::sync();
     std::vector<float> o((size_t) (nq * NH * HD)), nw(o.size());
-    ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
-    ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down");
+    par::copy_out(o.data(), d_old, o.size());
+    par::copy_out(nw.data(), d_new, nw.size());
     // 1. FP64 reference on a sample of queries
     double err_old = 0, err_new = 0, ref_scale = 0;
     for (int64_t i = 0; i < nq; i += std::max<int64_t>(1, nq / 16)) {
@@ -137,7 +167,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
                 const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
                 double a = 0;
                 for (int64_t d = 0; d < HD; ++d) {
-                    const double kv = fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
+                    const double kv = fmt == 2 ? q4v(k4, row, d)
+                                      : fmt == 1 ? (double) kq[row * HD + d] * h2f(ks[row * 4 + d / 64]) : h2f(kh[row * HD + d]);
                     a += (double) q[(i * NH + h) * HD + d] * kv;
                 }
                 sco[c] = a / 16.0;
@@ -149,7 +180,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
                 double a = 0;
                 for (int64_t c = 0; c < w; ++c) {
                     const int64_t cell = sel[c], row = ((int64_t) table[cell / PS] * NKV + kvh) * PS + cell % PS;
-                    const double vv = fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
+                    const double vv = fmt == 2 ? q4v(v4, row, d)
+                                      : fmt == 1 ? (double) vq[row * HD + d] * h2f(vs[row * 4 + d / 64]) : h2f(vh[row * HD + d]);
                     a += sco[c] * vv;
                 }
                 const double r = a / l;
@@ -167,41 +199,33 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
         scale = std::max(scale, (double) std::fabs(o[i]));
     }
     // 3. speed
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0);
-    cudaEventCreate(&e1);
-    float ms_old = 0, ms_new = 0;
-    cudaEventRecord(e0);
-    for (int r = 0; r < reps; ++r) old_run();
-    cudaEventRecord(e1);
-    ck(cudaEventSynchronize(e1), "time");
-    cudaEventElapsedTime(&ms_old, e0, e1);
-    cudaEventRecord(e0);
-    for (int r = 0; r < reps; ++r) new_run();
-    cudaEventRecord(e1);
-    ck(cudaEventSynchronize(e1), "time");
-    cudaEventElapsedTime(&ms_new, e0, e1);
+    auto timed = [&](auto f) {
+        par::sync();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < reps; ++r) f();
+        par::sync();
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    };
+    const double ms_old = timed(old_run), ms_new = timed(new_run);
     const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
     const bool ok2 = diff <= 1e-4 * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",
-                ok1 && ok2 ? "PASS" : "FAIL", fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
+                ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
                 err_new, ref_scale, diff, diff / scale, ms_old / reps, ms_new / reps, ms_old / ms_new);
-    cudaFree((void*) d_ids); cudaFree((void*) d_steps); cudaFree((void*) d_q); cudaFree(d_old); cudaFree(d_new);
-    cudaFree(scratch);
-    cudaFree((void*) pl.k_q); cudaFree((void*) pl.v_q); cudaFree((void*) pl.k_scale); cudaFree((void*) pl.v_scale);
-    cudaFree((void*) pl.k_pool); cudaFree((void*) pl.v_pool); cudaFree((void*) pl.page_table);
     return ok1 && ok2 ? 0 : 1;
 }
 }  // namespace
 
 int main(int argc, char** argv) {
-    const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
-    const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
-    const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
+    const int64_t ctx = argc > 1 ? std::strtoll(argv[1], nullptr, 10) : 32768;
+    const int64_t nq = argc > 2 ? std::strtoll(argv[2], nullptr, 10) : 2048;
+    const int reps = argc > 3 ? (int) std::strtol(argv[3], nullptr, 10) : 5;
     int fails = 0;
     fails += run(1, ctx, nq, reps);
     fails += run(0, ctx, nq, reps);
+    fails += run(2, ctx, nq, reps);   // Q4_0 KV
+    fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
     fails += run(1, 2100, std::min<int64_t>(nq, 256), reps);    // the identity-to-sparse edge
     std::printf("FAILURES: %d\n", fails);

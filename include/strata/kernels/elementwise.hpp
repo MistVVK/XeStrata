@@ -1,4 +1,7 @@
-﻿// include/strata/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs, P2.S5.
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/kernels/elementwise.hpp - the small ops a LAYER needs between its GEMVs, P2.S5.
 //
 // These are not interesting kernels and that is why they are in one file with one parity test: they are the
 // glue in the per-layer graph, and glue that is written inline at each call site is glue with several
@@ -22,6 +25,10 @@
 #include <cstdint>
 
 namespace strata::kernels {
+
+// Xe entry points take &core::Runtime::get().compute() as the opaque stream.
+// A null stream uses that queue and waits for completion. Unported entry points
+// are not linked into strata_kernels yet.
 
 /// Decode one canonical embedding row already selected by the caller. Codes are
 /// packed low bits first (2, 4 or 8 bits); scales/offsets are FP32 per group.
@@ -99,8 +106,7 @@ void doorbell_ring(uint32_t* d_seq, void* stream);
 void doorbell_wait(const uint32_t* d_flag, const uint32_t* d_seq, void* stream);
 
 /// Plan v0.3 P3 token graph: copy `n` floats from MAPPED pinned host memory (`src` is its device pointer) into
-/// device memory with a kernel, so the handoff stays on the compute queue (a memcpy node is a copy-engine
-/// operation, which WDDM submits separately and which measured 67 flushes per token).
+/// device memory with a kernel, so the handoff stays on the compute queue.
 void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream);
 /// `rows` rows of `width` floats from mapped memory, except the rows listed in hit_rows[0, *count) (device),
 /// which are written +0.0 instead (a verify window's GPU-computed entries: the pool leaves zeros there).

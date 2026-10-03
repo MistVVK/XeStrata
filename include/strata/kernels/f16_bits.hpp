@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/f16_bits.hpp - the fp16 conversions, written out, as bits.
 //
 // WHY THIS IS NOT `__float2half`.  Round 193 found `__float2half` producing 0x2600 for a value whose correct
 // fp16 encoding is 0x26DB, and 0x3C01 for a value that is exactly 1.0 - i.e. wrong bits, not a rounding
 // difference.  The cause was never isolated (it is either `__float2half` itself or `__half_as_ushort`), so
-// `src/kernels/cuda/quantize_act.cu` replaced it with the version below, which then came out byte-exact over
+// `Strata's src/kernels/cuda/quantize_act.cu` replaced it with the version below, which then came out byte-exact over
 // all 20,480 blocks of the fixture.  `shared_expert.cu` carries the same function privately for the same
 // reason.  Three copies of a converter whose failure mode is silent wrong bits is two copies too many, so the
 // copy lives here and the kernel and its TEST both include it - with the test checking it against vectors

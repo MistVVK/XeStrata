@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/qsa.hpp - the QSA (full-attention) layer's cache, indexer and attention, P2.S2.
 //
 // Spec of record: `ref/qsa.py` (whose own selftest carries eleven PROPERTY checks) and `ref/model.py::_qsa` /
@@ -87,6 +90,8 @@
 // The RAW tail is fp32 for the same reason and because it is only `idx_block - 1` rows.
 #pragma once
 
+#include "strata/kernels/rope_scaling.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -118,8 +123,9 @@ inline QsaShapes qsa_real_shapes() {
 
 /// The one legal RMSNorm epsilon for this artifact (`attention.layer_norm_rms_epsilon`).
 inline float qsa_rms_eps() { return 1e-6f; }
-/// `rope.freq_base`, no rope.scaling keys, so freq_scale = 1 and no YaRN.
-inline double qsa_freq_base() { return 1e7; }
+/// `rope.freq_base` (1e7, the model file's; --rope-freq-base overrides it): the process's rope configuration
+/// (rope_scaling.hpp), whose scaling the rotation kernels apply themselves.
+inline double qsa_freq_base() { return rope_scaling().freq_base; }
 
 /// The selection width: `min(n_kv, idx_top_k + idx_block - 1)`.
 ///

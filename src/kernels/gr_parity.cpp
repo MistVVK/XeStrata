@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/gr_parity.cpp - P2.S2's test for the gated residual / hyper-connection.
 //
 // `ref/gr.py` opens by listing the details "a prose reading gets wrong", and every one of them is a reading
@@ -21,7 +24,9 @@
 //      Asserted as a property, not as a value, because that is what the source comment claims.
 #include "strata/kernels/gr.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
+
+#include <sycl/ext/oneapi/experimental/graph.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -32,13 +37,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 /// The same rule the kernel uses, on the host - `ref/quant.py::bf16`.
 float to_bf16(float f) {
@@ -171,12 +169,12 @@ int scalar_activation_contract() {
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t* d_weights = nullptr;
     void* d_scratch = nullptr;
-    check(cudaMalloc(&d_R, 2 * sizeof(float)), "scalar R");
-    check(cudaMalloc(&d_norm, 2 * sizeof(float)), "scalar norm");
-    check(cudaMalloc(&d_mixed, 2 * sizeof(float)), "scalar mixed");
-    check(cudaMalloc(&d_inject, sizeof(float)), "scalar inject");
-    check(cudaMalloc(&d_weights, 10 * sizeof(uint16_t)), "scalar weights");
-    check(cudaMalloc(&d_scratch, gr_workspace_bytes(sh)), "scalar scratch");
+    d_R = static_cast<decltype(d_R)>(strata::parity::alloc_bytes(2 * sizeof(float)));
+    d_norm = static_cast<decltype(d_norm)>(strata::parity::alloc_bytes(2 * sizeof(float)));
+    d_mixed = static_cast<decltype(d_mixed)>(strata::parity::alloc_bytes(2 * sizeof(float)));
+    d_inject = static_cast<decltype(d_inject)>(strata::parity::alloc_bytes(sizeof(float)));
+    d_weights = static_cast<decltype(d_weights)>(strata::parity::alloc_bytes(10 * sizeof(uint16_t)));
+    d_scratch = static_cast<decltype(d_scratch)>(strata::parity::alloc_bytes(gr_workspace_bytes(sh)));
     GrWorkspace ws;
     gr_workspace_init(sh, d_scratch, ws);
     const float ones[] = {1.0f, 1.0f};
@@ -185,38 +183,38 @@ int scalar_activation_contract() {
         bf16_bits(1.5f), 0, bf16_bits(1.5f), 0, // both gate rows consume lo[0]
         bf16_bits(2.0f), 0                     // injection: 2*xn[0]
     };
-    check(cudaMemcpy(d_R, ones, sizeof(ones), cudaMemcpyHostToDevice), "scalar upload R");
-    check(cudaMemcpy(d_weights, weights, sizeof(weights), cudaMemcpyHostToDevice), "scalar upload weights");
-    cudaStream_t stream;
-    check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "scalar stream");
+    strata::parity::copy_bytes_in(d_R, ones, sizeof(ones));
+    strata::parity::copy_bytes_in(d_weights, weights, sizeof(weights));
+    namespace sx = sycl::ext::oneapi::experimental;
+    auto& cq = strata::core::Runtime::get().compute();
+    void* stream = &cq;
     int bad = 0;
     for (float gamma : {1.0f, 1.00390625f}) {
         const float gammas[] = {gamma, gamma};
-        check(cudaMemcpy(d_norm, gammas, sizeof(gammas), cudaMemcpyHostToDevice), "scalar upload norm");
+        strata::parity::copy_bytes_in(d_norm, gammas, sizeof(gammas));
         float mixed_by_mode[3][2] = {}, inject_by_mode[3] = {};
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(cudaStreamSynchronize(stream), "scalar warmup");
-            cudaGraph_t graph;
-            cudaGraphExec_t executable;
-            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "scalar capture begin");
+            strata::parity::sync();
+            sx::command_graph graph(cq.get_context(), cq.get_device());
+            graph.begin_recording(cq);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(cudaStreamEndCapture(stream, &graph), "scalar capture end");
-            check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "scalar instantiate");
+            graph.end_recording(cq);
+            auto executable = graph.finalize();
             // Changing both host options after capture cannot change the graph's selected kernels.
             select_activation_mode((mode + 1) % 3);
             // Warmup results must not make a missing/no-op captured launch pass.
             // Poison the outputs and intermediate workspace before replay.
-            check(cudaMemsetAsync(d_mixed, 0xa5, 2 * sizeof(float), stream), "scalar poison mixed");
-            check(cudaMemsetAsync(d_inject, 0xa5, sizeof(float), stream), "scalar poison inject");
-            check(cudaMemsetAsync(d_scratch, 0xa5, ws.bytes, stream), "scalar poison workspace");
-            check(cudaGraphLaunch(executable, stream), "scalar replay");
-            check(cudaStreamSynchronize(stream), "scalar replay sync");
-            check(cudaMemcpy(mixed_by_mode[mode], d_mixed, 2 * sizeof(float), cudaMemcpyDeviceToHost), "scalar mixed copy");
-            check(cudaMemcpy(&inject_by_mode[mode], d_inject, sizeof(float), cudaMemcpyDeviceToHost), "scalar inject copy");
+            cq.memset(d_mixed, 0xa5, 2 * sizeof(float));
+            cq.memset(d_inject, 0xa5, sizeof(float));
+            cq.memset(d_scratch, 0xa5, ws.bytes);
+            cq.ext_oneapi_graph(executable);
+            strata::parity::sync();
+            strata::parity::copy_bytes_out(mixed_by_mode[mode], d_mixed, 2 * sizeof(float));
+            strata::parity::copy_bytes_out(&inject_by_mode[mode], d_inject, sizeof(float));
             const float activation = mode ? gamma : to_bf16(gamma);
             const float projection = activation * 0.5f;
             const float lo = projection / (1.0f + std::exp(-projection));
@@ -235,18 +233,16 @@ int scalar_activation_contract() {
                         gamma, activation_mode_name(mode), ok ? "pass" : "FAIL",
                         mixed_by_mode[mode][0], expected_mixed);
             if (!ok) ++bad;
-            check(cudaGraphExecDestroy(executable), "scalar graph exec destroy");
-            check(cudaGraphDestroy(graph), "scalar graph destroy");
 
             const float sentinel = -73.25f;
-            check(cudaMemcpy(d_inject, &sentinel, sizeof(float), cudaMemcpyHostToDevice), "scalar sentinel");
+            strata::parity::copy_bytes_in(d_inject, &sentinel, sizeof(float));
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            check(cudaStreamSynchronize(stream), "scalar final mixer sync");
+            strata::parity::sync();
             float final_mixed[2] = {}, untouched = 0.0f;
-            check(cudaMemcpy(final_mixed, d_mixed, sizeof(final_mixed), cudaMemcpyDeviceToHost), "scalar final mixed");
-            check(cudaMemcpy(&untouched, d_inject, sizeof(float), cudaMemcpyDeviceToHost), "scalar sentinel copy");
+            strata::parity::copy_bytes_out(final_mixed, d_mixed, sizeof(final_mixed));
+            strata::parity::copy_bytes_out(&untouched, d_inject, sizeof(float));
             const bool final_ok = std::memcmp(final_mixed, mixed_by_mode[mode], sizeof(final_mixed)) == 0 && untouched == sentinel;
             std::printf("  scalar final mixer %s %s\n", activation_mode_name(mode), final_ok ? "pass" : "FAIL");
             if (!final_ok) ++bad;
@@ -262,9 +258,6 @@ int scalar_activation_contract() {
         }
     }
     select_activation_mode(0);
-    check(cudaStreamDestroy(stream), "scalar stream destroy");
-    cudaFree(d_R); cudaFree(d_norm); cudaFree(d_mixed); cudaFree(d_inject);
-    cudaFree(d_weights); cudaFree(d_scratch);
     return bad;
 }
 
@@ -320,29 +313,29 @@ int main(int argc, char** argv) {
     // ---- device side
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t *d_down = nullptr, *d_up = nullptr, *d_inj = nullptr;
-    check(cudaMalloc(&d_R, R.size() * sizeof(float)), "m R");
-    check(cudaMalloc(&d_norm, w_norm.size() * sizeof(float)), "m norm");
-    check(cudaMalloc(&d_down, q_down.size() * sizeof(uint16_t)), "m down");
-    check(cudaMalloc(&d_up, q_up.size() * sizeof(uint16_t)), "m up");
-    check(cudaMalloc(&d_inj, q_inject.size() * sizeof(uint16_t)), "m inj");
-    check(cudaMalloc(&d_mixed, (size_t) n_embd * sizeof(float)), "m mixed");
-    check(cudaMalloc(&d_inject, (size_t) hc * sizeof(float)), "m inject");
-    check(cudaMemcpy(d_R, R.data(), R.size() * sizeof(float), cudaMemcpyHostToDevice), "c R");
-    check(cudaMemcpy(d_norm, w_norm.data(), w_norm.size() * sizeof(float), cudaMemcpyHostToDevice), "c norm");
-    check(cudaMemcpy(d_down, q_down.data(), q_down.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c down");
-    check(cudaMemcpy(d_up, q_up.data(), q_up.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c up");
-    check(cudaMemcpy(d_inj, q_inject.data(), q_inject.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "c inj");
+    d_R = static_cast<decltype(d_R)>(strata::parity::alloc_bytes(R.size() * sizeof(float)));
+    d_norm = static_cast<decltype(d_norm)>(strata::parity::alloc_bytes(w_norm.size() * sizeof(float)));
+    d_down = static_cast<decltype(d_down)>(strata::parity::alloc_bytes(q_down.size() * sizeof(uint16_t)));
+    d_up = static_cast<decltype(d_up)>(strata::parity::alloc_bytes(q_up.size() * sizeof(uint16_t)));
+    d_inj = static_cast<decltype(d_inj)>(strata::parity::alloc_bytes(q_inject.size() * sizeof(uint16_t)));
+    d_mixed = static_cast<decltype(d_mixed)>(strata::parity::alloc_bytes((size_t) n_embd * sizeof(float)));
+    d_inject = static_cast<decltype(d_inject)>(strata::parity::alloc_bytes((size_t) hc * sizeof(float)));
+    strata::parity::copy_bytes_in(d_R, R.data(), R.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_norm, w_norm.data(), w_norm.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_down, q_down.data(), q_down.size() * sizeof(uint16_t));
+    strata::parity::copy_bytes_in(d_up, q_up.data(), q_up.size() * sizeof(uint16_t));
+    strata::parity::copy_bytes_in(d_inj, q_inject.data(), q_inject.size() * sizeof(uint16_t));
 
     const strata::kernels::GrShapes sh{n_embd, hc, hc_lr};
     // DEVICE memory: the workspace is written by the kernel.
     void* d_ws_raw = nullptr;
-    check(cudaMalloc(&d_ws_raw, strata::kernels::gr_workspace_bytes(sh)), "m ws");
+    d_ws_raw = static_cast<decltype(d_ws_raw)>(strata::parity::alloc_bytes(strata::kernels::gr_workspace_bytes(sh)));
     strata::kernels::GrWorkspace ws;
     strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
     strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
     std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
-    check(cudaMemcpy(got_mixed.data(), d_mixed, got_mixed.size() * sizeof(float), cudaMemcpyDeviceToHost), "c mixed");
-    check(cudaMemcpy(got_inject.data(), d_inject, got_inject.size() * sizeof(float), cudaMemcpyDeviceToHost), "c inject");
+    strata::parity::copy_bytes_out(got_mixed.data(), d_mixed, got_mixed.size() * sizeof(float));
+    strata::parity::copy_bytes_out(got_inject.data(), d_inject, got_inject.size() * sizeof(float));
 
     int bad = 0;
 
@@ -407,8 +400,8 @@ int main(int argc, char** argv) {
         reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, fp32, wm, wi);
         strata::kernels::gr_set_fp32_activations(true);
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        check(cudaMemcpy(gm.data(), d_mixed, gm.size() * sizeof(float), cudaMemcpyDeviceToHost), "FP32 mixed");
-        check(cudaMemcpy(gi.data(), d_inject, gi.size() * sizeof(float), cudaMemcpyDeviceToHost), "FP32 inject");
+        strata::parity::copy_bytes_out(gm.data(), d_mixed, gm.size() * sizeof(float));
+        strata::parity::copy_bytes_out(gi.data(), d_inject, gi.size() * sizeof(float));
         strata::kernels::gr_set_fp32_activations(false);
         const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
         const bool ok = rm <= 1e-4 && ri <= 1e-4;
@@ -416,8 +409,8 @@ int main(int argc, char** argv) {
                     ok ? "pass" : "FAIL", rm, ri);
         if (!ok) ++bad;
         strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        check(cudaMemcpy(gm.data(), d_mixed, gm.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored mixed");
-        check(cudaMemcpy(gi.data(), d_inject, gi.size() * sizeof(float), cudaMemcpyDeviceToHost), "restored inject");
+        strata::parity::copy_bytes_out(gm.data(), d_mixed, gm.size() * sizeof(float));
+        strata::parity::copy_bytes_out(gi.data(), d_inject, gi.size() * sizeof(float));
         const bool restored = std::memcmp(gm.data(), got_mixed.data(), gm.size() * sizeof(float)) == 0 &&
                               std::memcmp(gi.data(), got_inject.data(), gi.size() * sizeof(float)) == 0;
         std::printf("  restoring default activation contract: %s\n", restored ? "byte-identical" : "FAIL");
@@ -430,8 +423,8 @@ int main(int argc, char** argv) {
     // output.  Feed transposed copies through the same code path and require the answer to differ.
     {
         uint16_t *d_down_bad = nullptr, *d_up_bad = nullptr;
-        check(cudaMalloc(&d_down_bad, q_down.size() * sizeof(uint16_t)), "m down_bad");
-        check(cudaMalloc(&d_up_bad, q_up.size() * sizeof(uint16_t)), "m up_bad");
+        d_down_bad = static_cast<decltype(d_down_bad)>(strata::parity::alloc_bytes(q_down.size() * sizeof(uint16_t)));
+        d_up_bad = static_cast<decltype(d_up_bad)>(strata::parity::alloc_bytes(q_up.size() * sizeof(uint16_t)));
         std::vector<uint16_t> tr_down(q_down.size()), tr_up(q_up.size());
         for (long long k = 0; k < hc_lr; ++k)
             for (long long i = 0; i < hc_dim; ++i)
@@ -439,28 +432,27 @@ int main(int argc, char** argv) {
         for (long long i = 0; i < hc_dim; ++i)
             for (long long k = 0; k < hc_lr; ++k)
                 tr_up[(size_t) (k * hc_dim + i)] = q_up[(size_t) (i * hc_lr + k)];
-        check(cudaMemcpy(d_down_bad, tr_down.data(), tr_down.size() * 2, cudaMemcpyHostToDevice), "cb d");
-        check(cudaMemcpy(d_up_bad, tr_up.data(), tr_up.size() * 2, cudaMemcpyHostToDevice), "cb u");
+        strata::parity::copy_bytes_in(d_down_bad, tr_down.data(), tr_down.size() * 2);
+        strata::parity::copy_bytes_in(d_up_bad, tr_up.data(), tr_up.size() * 2);
         std::vector<float> bad_mixed((size_t) n_embd);
         float* d_bad = nullptr;
-        check(cudaMalloc(&d_bad, bad_mixed.size() * sizeof(float)), "m bad");
+        d_bad = static_cast<decltype(d_bad)>(strata::parity::alloc_bytes(bad_mixed.size() * sizeof(float)));
         strata::kernels::gr_read(d_R, d_norm, d_down_bad, d_up_bad, d_inj, eps, sh, ws, d_bad, d_inject,
                                  nullptr);
-        check(cudaMemcpy(bad_mixed.data(), d_bad, bad_mixed.size() * sizeof(float), cudaMemcpyDeviceToHost), "cb b");
+        strata::parity::copy_bytes_out(bad_mixed.data(), d_bad, bad_mixed.size() * sizeof(float));
         const double rel = rel_diff(want_mixed, bad_mixed);
         const bool visible = rel > 0.05;
         std::printf("  %-40s %s (%.1f%% apart)\n", "weight orientation is observable",
                     visible ? "yes" : "*** NO ***", rel * 100);
         if (!visible) ++bad;
-        cudaFree(d_down_bad); cudaFree(d_up_bad); cudaFree(d_bad);
-    }
+        }
 
     // ---- the FINAL mixer passes w_inject = nullptr, and then nothing may be written
     float sentinel = -12345.0f;
-    check(cudaMemcpy(d_inject, &sentinel, sizeof(float), cudaMemcpyHostToDevice), "c sentinel");
+    strata::parity::copy_bytes_in(d_inject, &sentinel, sizeof(float));
     strata::kernels::gr_read(d_R, d_norm, d_down, d_up, nullptr, eps, sh, ws, d_mixed, d_inject, nullptr);
     float after = 0.0f;
-    check(cudaMemcpy(&after, d_inject, sizeof(float), cudaMemcpyDeviceToHost), "c after");
+    strata::parity::copy_bytes_out(&after, d_inject, sizeof(float));
     const bool untouched = (after == sentinel);
     std::printf("  %-40s %s\n", "null w_inject writes nothing", untouched ? "yes" : "*** NO ***");
     if (!untouched) ++bad;
@@ -470,17 +462,17 @@ int main(int argc, char** argv) {
     for (auto& x : block_out) x = gauss(rng);
     std::vector<float> zero_inj((size_t) hc, 0.0f);
     float *d_Rw = nullptr, *d_bo = nullptr, *d_zi = nullptr, *d_outw = nullptr;
-    check(cudaMalloc(&d_Rw, R.size() * sizeof(float)), "m Rw");
-    check(cudaMalloc(&d_bo, block_out.size() * sizeof(float)), "m bo");
-    check(cudaMalloc(&d_zi, zero_inj.size() * sizeof(float)), "m zi");
-    check(cudaMalloc(&d_outw, R.size() * sizeof(float)), "m outw");
-    check(cudaMemcpy(d_Rw, R.data(), R.size() * sizeof(float), cudaMemcpyHostToDevice), "c Rw");
-    check(cudaMemcpy(d_bo, block_out.data(), block_out.size() * sizeof(float), cudaMemcpyHostToDevice), "c bo");
-    check(cudaMemcpy(d_zi, zero_inj.data(), zero_inj.size() * sizeof(float), cudaMemcpyHostToDevice), "c zi");
+    d_Rw = static_cast<decltype(d_Rw)>(strata::parity::alloc_bytes(R.size() * sizeof(float)));
+    d_bo = static_cast<decltype(d_bo)>(strata::parity::alloc_bytes(block_out.size() * sizeof(float)));
+    d_zi = static_cast<decltype(d_zi)>(strata::parity::alloc_bytes(zero_inj.size() * sizeof(float)));
+    d_outw = static_cast<decltype(d_outw)>(strata::parity::alloc_bytes(R.size() * sizeof(float)));
+    strata::parity::copy_bytes_in(d_Rw, R.data(), R.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_bo, block_out.data(), block_out.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_zi, zero_inj.data(), zero_inj.size() * sizeof(float));
 
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
     std::vector<float> got_write((size_t) hc_dim);
-    check(cudaMemcpy(got_write.data(), d_outw, got_write.size() * sizeof(float), cudaMemcpyDeviceToHost), "c outw");
+    strata::parity::copy_bytes_out(got_write.data(), d_outw, got_write.size() * sizeof(float));
 
     double worst_plain = 0;
     for (long long c = 0; c < hc; ++c)
@@ -521,9 +513,9 @@ int main(int argc, char** argv) {
     // a non-zero injection: every stream receives the SAME block output, differing only by weight
     std::vector<float> inj((size_t) hc);
     for (auto& x : inj) x = gauss(rng) * 3.0f;
-    check(cudaMemcpy(d_zi, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice), "c inj2");
+    strata::parity::copy_bytes_in(d_zi, inj.data(), inj.size() * sizeof(float));
     strata::kernels::gr_write(d_Rw, d_bo, d_zi, sh, d_outw, nullptr);
-    check(cudaMemcpy(got_write.data(), d_outw, got_write.size() * sizeof(float), cudaMemcpyDeviceToHost), "c outw2");
+    strata::parity::copy_bytes_out(got_write.data(), d_outw, got_write.size() * sizeof(float));
     double worst_stream = 0;
     for (long long c = 0; c < hc; ++c) {
         const double w = 2.0 / (1.0 + std::exp(-(double) inj[(size_t) c] / (double) hc));
@@ -567,30 +559,30 @@ int main(int argc, char** argv) {
 
         float *dR = nullptr, *dN = nullptr, *dM = nullptr, *dI = nullptr;
         uint16_t *dD = nullptr, *dU = nullptr, *dJ = nullptr;
-        check(cudaMalloc(&dR, rR.size() * 4), "rR");
-        check(cudaMalloc(&dN, rnorm.size() * 4), "rN");
-        check(cudaMalloc(&dD, qd.size() * 2), "rD");
-        check(cudaMalloc(&dU, qu.size() * 2), "rU");
-        check(cudaMalloc(&dJ, qi.size() * 2), "rJ");
-        check(cudaMalloc(&dM, (size_t) rn * 4), "rM");
-        check(cudaMalloc(&dI, (size_t) rhc * 4), "rI");
-        check(cudaMemcpy(dR, rR.data(), rR.size() * 4, cudaMemcpyHostToDevice), "crR");
-        check(cudaMemcpy(dN, rnorm.data(), rnorm.size() * 4, cudaMemcpyHostToDevice), "crN");
-        check(cudaMemcpy(dD, qd.data(), qd.size() * 2, cudaMemcpyHostToDevice), "crD");
-        check(cudaMemcpy(dU, qu.data(), qu.size() * 2, cudaMemcpyHostToDevice), "crU");
-        check(cudaMemcpy(dJ, qi.data(), qi.size() * 2, cudaMemcpyHostToDevice), "crJ");
+        dR = static_cast<decltype(dR)>(strata::parity::alloc_bytes(rR.size() * 4));
+        dN = static_cast<decltype(dN)>(strata::parity::alloc_bytes(rnorm.size() * 4));
+        dD = static_cast<decltype(dD)>(strata::parity::alloc_bytes(qd.size() * 2));
+        dU = static_cast<decltype(dU)>(strata::parity::alloc_bytes(qu.size() * 2));
+        dJ = static_cast<decltype(dJ)>(strata::parity::alloc_bytes(qi.size() * 2));
+        dM = static_cast<decltype(dM)>(strata::parity::alloc_bytes((size_t) rn * 4));
+        dI = static_cast<decltype(dI)>(strata::parity::alloc_bytes((size_t) rhc * 4));
+        strata::parity::copy_bytes_in(dR, rR.data(), rR.size() * 4);
+        strata::parity::copy_bytes_in(dN, rnorm.data(), rnorm.size() * 4);
+        strata::parity::copy_bytes_in(dD, qd.data(), qd.size() * 2);
+        strata::parity::copy_bytes_in(dU, qu.data(), qu.size() * 2);
+        strata::parity::copy_bytes_in(dJ, qi.data(), qi.size() * 2);
 
         const strata::kernels::GrShapes rsh{rn, rhc, rlr};
         void* rws_raw = nullptr;
-        check(cudaMalloc(&rws_raw, strata::kernels::gr_workspace_bytes(rsh)), "m rws");
+        rws_raw = static_cast<decltype(rws_raw)>(strata::parity::alloc_bytes(strata::kernels::gr_workspace_bytes(rsh)));
         strata::kernels::GrWorkspace rws;
         strata::kernels::gr_workspace_init(rsh, rws_raw, rws);
         for (int mode = 0; mode < 3; ++mode) {
             select_activation_mode(mode);
             strata::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, nullptr);
             std::vector<float> gm((size_t) rn), gi((size_t) rhc);
-            check(cudaMemcpy(gm.data(), dM, gm.size() * 4, cudaMemcpyDeviceToHost), "cgm");
-            check(cudaMemcpy(gi.data(), dI, gi.size() * 4, cudaMemcpyDeviceToHost), "cgi");
+            strata::parity::copy_bytes_out(gm.data(), dM, gm.size() * 4);
+            strata::parity::copy_bytes_out(gi.data(), dI, gi.size() * 4);
 
             Opts precision;
             precision.round_activation = mode == 0;
@@ -603,9 +595,7 @@ int main(int argc, char** argv) {
             if (!ok) ++bad;
         }
         select_activation_mode(0);
-        cudaFree(rws_raw);
-        cudaFree(dR); cudaFree(dN); cudaFree(dD); cudaFree(dU); cudaFree(dJ); cudaFree(dM); cudaFree(dI);
-    }
+        }
 
     bad += scalar_activation_contract();
     std::printf("\ngr_read/gr_write: %d failures\n", bad);

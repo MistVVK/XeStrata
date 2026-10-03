@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/sampler_parity.cpp - P2.S2's test for the sampler chain.
 //
 // THE CHECK THAT MATTERS IS THAT THE ORDER IS OBSERVABLE.  A sampler in the wrong order still returns a valid
@@ -10,7 +13,7 @@
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,13 +25,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 // The host reference for the specified order: top_k -> top_p -> temperature -> argmax.
 // `temp_first` swaps the first and last stages, which is the intuitive-but-wrong order.
@@ -104,29 +100,26 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
         const std::vector<int>& want, const std::vector<int>& hist = {}, int hist_len = 0) {
     float* d_l = nullptr;
     int* d_o = nullptr;
-    check(cudaMalloc(&d_l, logits.size() * sizeof(float)), "malloc logits");
-    check(cudaMalloc(&d_o, (size_t) n_tokens * sizeof(int)), "malloc out");
-    check(cudaMemcpy(d_l, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice), "copy");
+    d_l = static_cast<decltype(d_l)>(strata::parity::alloc_bytes(logits.size() * sizeof(float)));
+    d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes((size_t) n_tokens * sizeof(int)));
+    strata::parity::copy_bytes_in(d_l, logits.data(), logits.size() * sizeof(float));
     // -1 in every output slot first: a row the kernel leaves unwritten can never match (a verify window reads
     // every row, so "no output" is a wrong answer, not a skipped one)
-    check(cudaMemset(d_o, 0xFF, (size_t) n_tokens * sizeof(int)), "fill out");
+    { std::vector<unsigned char> z_((size_t) n_tokens * sizeof(int), (unsigned char) (0xFF)); strata::parity::copy_bytes_in(d_o, z_.data(), (size_t) n_tokens * sizeof(int)); }
     int* d_h = nullptr;
     if (hist_len > 0) {
-        check(cudaMalloc(&d_h, hist.size() * sizeof(int)), "malloc hist");
-        check(cudaMemcpy(d_h, hist.data(), hist.size() * sizeof(int), cudaMemcpyHostToDevice), "copy hist");
+        d_h = static_cast<decltype(d_h)>(strata::parity::alloc_bytes(hist.size() * sizeof(int)));
+        strata::parity::copy_bytes_in(d_h, hist.data(), hist.size() * sizeof(int));
     }
     strata::kernels::sample_tokens(d_l, n_tokens, (int) (logits.size() / n_tokens), d_h, hist_len, p, d_o,
                                    nullptr);
     std::vector<int> got((size_t) n_tokens);
-    check(cudaMemcpy(got.data(), d_o, got.size() * sizeof(int), cudaMemcpyDeviceToHost), "back");
+    strata::parity::copy_bytes_out(got.data(), d_o, got.size() * sizeof(int));
     int bad = 0;
     for (int t = 0; t < n_tokens; ++t) if (got[(size_t) t] != want[(size_t) t]) ++bad;
     std::printf("  %-34s %s (%d of %d differ)", name, bad ? "*** WRONG ***" : "matches", bad, n_tokens);
     if (bad) std::printf("   first: want %d got %d", want[0], got[0]);
     std::printf("\n");
-    cudaFree(d_l);
-    cudaFree(d_o);
-    if (d_h) cudaFree(d_h);
     return bad;
 }
 
@@ -335,15 +328,15 @@ int main(int argc, char** argv) {
         std::vector<int> wa((size_t) NT);
         for (int t = 0; t < NT; ++t) wa[(size_t) t] = reference_pick({l.begin() + (size_t) t * NV, l.begin() + (size_t) (t + 1) * NV}, a, false);
         float* d_l = nullptr; int *d_a = nullptr, *d_b = nullptr;
-        check(cudaMalloc(&d_l, l.size() * sizeof(float)), "m1");
-        check(cudaMalloc(&d_a, (size_t) NT * sizeof(int)), "m2");
-        check(cudaMalloc(&d_b, (size_t) NT * sizeof(int)), "m3");
-        check(cudaMemcpy(d_l, l.data(), l.size() * sizeof(float), cudaMemcpyHostToDevice), "c1");
+        d_l = static_cast<decltype(d_l)>(strata::parity::alloc_bytes(l.size() * sizeof(float)));
+        d_a = static_cast<decltype(d_a)>(strata::parity::alloc_bytes((size_t) NT * sizeof(int)));
+        d_b = static_cast<decltype(d_b)>(strata::parity::alloc_bytes((size_t) NT * sizeof(int)));
+        strata::parity::copy_bytes_in(d_l, l.data(), l.size() * sizeof(float));
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, a, d_a, nullptr);
         strata::kernels::sample_tokens(d_l, NT, NV, nullptr, 0, b, d_b, nullptr);
         std::vector<int> ga((size_t) NT), gb((size_t) NT);
-        check(cudaMemcpy(ga.data(), d_a, ga.size() * sizeof(int), cudaMemcpyDeviceToHost), "g1");
-        check(cudaMemcpy(gb.data(), d_b, gb.size() * sizeof(int), cudaMemcpyDeviceToHost), "g2");
+        strata::parity::copy_bytes_out(ga.data(), d_a, ga.size() * sizeof(int));
+        strata::parity::copy_bytes_out(gb.data(), d_b, gb.size() * sizeof(int));
         int mismatch = 0, wrong = 0;
         for (int t = 0; t < NT; ++t) {
             if (ga[(size_t) t] != gb[(size_t) t]) ++mismatch;
@@ -353,8 +346,7 @@ int main(int argc, char** argv) {
                     "greedy ignores the seed", (!mismatch && !wrong) ? "matches" : "*** WRONG ***", mismatch,
                     wrong);
         bad += mismatch + wrong;
-        cudaFree(d_l); cudaFree(d_a); cudaFree(d_b);
-    }
+        }
 
 
     // ---- fixture 4: PENALTIES.  Two sub-cases, each built so the rule it tests decides the answer.
@@ -823,27 +815,26 @@ int main(int argc, char** argv) {
         std::vector<float> uniform(count * vocab, 0.0f);
         float* input = nullptr;
         int* output = nullptr;
-        check(cudaMalloc(&input, uniform.size() * sizeof(float)), "counter logits");
-        check(cudaMalloc(&output, count * sizeof(int)), "counter output");
-        check(cudaMemcpy(input, uniform.data(), uniform.size() * sizeof(float), cudaMemcpyHostToDevice), "counter upload");
+        input = static_cast<decltype(input)>(strata::parity::alloc_bytes(uniform.size() * sizeof(float)));
+        output = static_cast<decltype(output)>(strata::parity::alloc_bytes(count * sizeof(int)));
+        strata::parity::copy_bytes_in(input, uniform.data(), uniform.size() * sizeof(float));
         strata::kernels::SamplerParams p;
         p.top_k = vocab; p.top_p = 1.0f; p.seed = 123; p.counter = (uint64_t(1) << 32) + 7;
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
         std::vector<int> batch(count), singles(count), repeated(count);
-        check(cudaMemcpy(batch.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter batch");
+        strata::parity::copy_bytes_out(batch.data(), output, count * sizeof(int));
         for (int i = 0; i < count; ++i) {
             auto one = p; one.counter += i;
             strata::kernels::sample_tokens(input, 1, vocab, nullptr, 0, one, output + i, nullptr);
         }
-        check(cudaMemcpy(singles.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter singles");
+        strata::parity::copy_bytes_out(singles.data(), output, count * sizeof(int));
         strata::kernels::sample_tokens(input, count, vocab, nullptr, 0, p, output, nullptr);
-        check(cudaMemcpy(repeated.data(), output, count * sizeof(int), cudaMemcpyDeviceToHost), "counter repeated");
+        strata::parity::copy_bytes_out(repeated.data(), output, count * sizeof(int));
         bool varies = false;
         for (int i = 1; i < count; ++i) varies |= batch[i] != batch[0];
         const bool valid = batch == singles && batch == repeated && varies;
         std::printf("  sampler draw counter segmentation/repeat: %s\n", valid ? "PASS" : "FAIL");
         bad += !valid;
-        cudaFree(input); cudaFree(output);
     }
 
     std::printf("\nsampler: %d failures\n", bad);

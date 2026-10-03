@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include <cstddef>
@@ -108,5 +111,19 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+
+// Q6_K with each row's blocks split into four arrays: the row's ql (128 bytes a block), then its qh (64), its
+// scales (16) and its d (2), each in block order.  A Q6_K block is 210 bytes, so in GGUF order every other block
+// starts on a two-byte boundary and each 32-bit weight load becomes two 16-bit ones; split, every load is aligned
+// and the kernel reads the row at about twice the speed.  The same lanes do the same arithmetic in the same order,
+// so the results are bitwise those of GGUF-order Q6_K.  Not a GGML type: the engine's own ID, which every
+// consumer (native_mmvq, dequant_f16/bf16/f32) must handle by name.  Never written to a file.
+// XeStrata's own type IDs live from kXeTypeBase ("XS" << 16) on, apart from ggml's and upstream Strata's (below 100).
+constexpr int kXeTypeBase = 0x58530000;
+constexpr int kNativeQ6KRows = kXeTypeBase + 1;
+// Rewrites Q6_K rows (n_in / 256 blocks each, an even count so every row starts 4-byte aligned) in place into the
+// kNativeQ6KRows layout.  Throws on an odd block count; the caller then keeps GGUF order.
+bool native_q6_k_rows_ok(int n_in) noexcept;
+void native_q6_k_to_rows(void* weights, int n_in, int n_out, void* stream);
 
 } // namespace strata::kernels

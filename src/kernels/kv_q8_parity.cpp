@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/kv_q8_parity.cpp - plan v0.3 P7: INT8 KV append/gather against a host reference (GPU, no model).
 //
 // Appends random K/V cells at scattered positions through a non-identity page table into both the INT8 pools
@@ -10,7 +13,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -23,10 +26,7 @@ namespace k = strata::kernels;
 
 namespace {
 int g_fail = 0;
-void ck(cudaError_t e, const char* w) {
-    if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
-}
-template <typename T> T* dalloc(size_t n) { T* p = nullptr; ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc"); ck(cudaMemset(p, 0, n * sizeof(T) + 64), "memset"); return p; }
+template <typename T> T* dalloc(size_t n) { T* p = nullptr; p = static_cast<decltype(p)>(strata::parity::alloc_bytes(n * sizeof(T) + 64)); { std::vector<unsigned char> z_(n * sizeof(T) + 64, (unsigned char) (0)); strata::parity::copy_bytes_in(p, z_.data(), n * sizeof(T) + 64); } return p; }
 }  // namespace
 
 int main() {
@@ -38,7 +38,7 @@ int main() {
     std::vector<int32_t> table(pages);
     for (int i = 0; i < pages; ++i) table[i] = (i * 5 + 3) % pages;            // a non-identity permutation
     int32_t* d_table = dalloc<int32_t>(pages);
-    ck(cudaMemcpy(d_table, table.data(), pages * 4, cudaMemcpyHostToDevice), "table");
+    strata::parity::copy_bytes_in(d_table, table.data(), pages * 4);
     int8_t *kq = dalloc<int8_t>((size_t) cells * H * D), *vq = dalloc<int8_t>((size_t) cells * H * D);
     uint16_t *ks = dalloc<uint16_t>((size_t) cells * H * G), *vs = dalloc<uint16_t>((size_t) cells * H * G);
     uint16_t *kp = dalloc<uint16_t>((size_t) cells * H * D), *vp = dalloc<uint16_t>((size_t) cells * H * D);
@@ -59,20 +59,20 @@ int main() {
         if (n % 13 == 0) std::fill(kv.begin(), kv.begin() + 64, 0.f);              // an all-zero group
         hk[pos] = kv; hv[pos] = vv;
         int32_t hstep[k::kStepCount] = {pos, pos + 1, 0, 0};
-        ck(cudaMemcpy(step, hstep, sizeof hstep, cudaMemcpyHostToDevice), "step");
-        ck(cudaMemcpy(kcur, kv.data(), kv.size() * 4, cudaMemcpyHostToDevice), "k");
-        ck(cudaMemcpy(vcur, vv.data(), vv.size() * 4, cudaMemcpyHostToDevice), "v");
+        strata::parity::copy_bytes_in(step, hstep, sizeof hstep);
+        strata::parity::copy_bytes_in(kcur, kv.data(), kv.size() * 4);
+        strata::parity::copy_bytes_in(vcur, vv.data(), vv.size() * 4);
         k::kv_append_q8_step(kq, vq, ks, vs, d_table, step, kcur, vcur, s, nullptr);
         k::kv_append_step(kp, vp, d_table, step, kcur, vcur, s, nullptr);
-        ck(cudaDeviceSynchronize(), "append");
+        strata::parity::sync();
     }
     // 1. codes and scales bitwise vs the host reference
     std::vector<int8_t> hkq((size_t) cells * H * D), hvq(hkq.size());
     std::vector<uint16_t> hks((size_t) cells * H * G), hvs(hks.size());
-    ck(cudaMemcpy(hkq.data(), kq, hkq.size(), cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hvq.data(), vq, hvq.size(), cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hks.data(), ks, hks.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-    ck(cudaMemcpy(hvs.data(), vs, hvs.size() * 2, cudaMemcpyDeviceToHost), "d2h");
+    strata::parity::copy_bytes_out(hkq.data(), kq, hkq.size());
+    strata::parity::copy_bytes_out(hvq.data(), vq, hvq.size());
+    strata::parity::copy_bytes_out(hks.data(), ks, hks.size() * 2);
+    strata::parity::copy_bytes_out(hvs.data(), vs, hvs.size() * 2);
     long bad_codes = 0;
     for (int n = 0; n < n_fill; ++n) {
         const int pos = positions[n];
@@ -104,17 +104,17 @@ int main() {
         const int n_ids = 1 + (int) (rng() % max_ids);
         std::vector<int32_t> ids(n_ids);
         for (auto& id : ids) id = positions[rng() % n_fill];
-        ck(cudaMemcpy(d_ids, ids.data(), n_ids * 4, cudaMemcpyHostToDevice), "ids");
+        strata::parity::copy_bytes_in(d_ids, ids.data(), n_ids * 4);
         int32_t hstep[k::kStepCount] = {0, 0, 0, n_ids};
-        ck(cudaMemcpy(step, hstep, sizeof hstep, cudaMemcpyHostToDevice), "step");
+        strata::parity::copy_bytes_in(step, hstep, sizeof hstep);
         k::kv_gather_q8_step(kq, vq, ks, vs, d_table, d_ids, step, max_ids, s, k8, v8, nullptr);
         k::kv_gather_step(kp, vp, d_table, d_ids, step, max_ids, s, k16, v16, nullptr);
-        ck(cudaDeviceSynchronize(), "gather");
+        strata::parity::sync();
         std::vector<uint16_t> a8((size_t) n_ids * H * D), b8(a8.size()), a16(a8.size()), b16(a8.size());
-        ck(cudaMemcpy(a8.data(), k8, a8.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(b8.data(), v8, b8.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(a16.data(), k16, a16.size() * 2, cudaMemcpyDeviceToHost), "d2h");
-        ck(cudaMemcpy(b16.data(), v16, b16.size() * 2, cudaMemcpyDeviceToHost), "d2h");
+        strata::parity::copy_bytes_out(a8.data(), k8, a8.size() * 2);
+        strata::parity::copy_bytes_out(b8.data(), v8, b8.size() * 2);
+        strata::parity::copy_bytes_out(a16.data(), k16, a16.size() * 2);
+        strata::parity::copy_bytes_out(b16.data(), v16, b16.size() * 2);
         for (int j = 0; j < n_ids; ++j)
             for (int h = 0; h < H; ++h) {
                 const long long row = ((long long) table[ids[j] / P] * H + h) * P + ids[j] % P;

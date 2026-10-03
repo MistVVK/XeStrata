@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/bf16_gemv.hpp - the GEMV for a BF16 weight, P2.S5.
 //
 // WHY THIS EXISTS WHEN `s_gemv` ALREADY DOES.  `s_gemv` decodes the S-family canonical forms (S2/S4/S8) from

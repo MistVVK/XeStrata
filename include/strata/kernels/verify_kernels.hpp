@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/verify_kernels.hpp - plan v0.3 P6: kernels for the speculative VERIFY window, where T
 // tokens (the last accepted token and T-1 drafts) go through a layer at once.
 //
@@ -38,8 +41,15 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
-/// the GPU's %globaltimer (ns) into buf[i] (a one-thread kernel: the verify window's stage profiler).
+/// Whether a running kernel sees the host's write to host memory, as wait_flag_ge needs: a kernel rings, then spins
+/// (bounded) on a flag the host sets once it has seen the ring.  The UHD 770 sees neither direction while the
+/// kernel runs (the verify window then runs in host-launched segments); the B70 sees both.  Synchronizes `stream`.
+bool doorbell_visible(void* stream);
+/// The device clock into buf[i] (a one-thread kernel: the verify window's stage profiler).  CUDA wrote %globaltimer
+/// in ns; SYCL's device-scope clock counts ticks of an unspecified rate, so stamps are only compared with each other.
 void gpu_stamp(unsigned long long* buf, int i, void* stream);
+/// Whether the device has the device-scope clock gpu_stamp reads (the B70 does not).
+bool gpu_stamp_available();
 
 // ---- perf-review E-6: a layer whose routed experts are all in VRAM needs nothing from the host
 /// One group's plan, built on the device when every routed expert of its n*k entries is resident: the host pool's

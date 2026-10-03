@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/s2_gemv_q8.hpp - the S2 GEMV over Q8_0-QUANTIZED activations.
 //
 // `ggml_mul_mat` converts src1 to the weight's `vec_dot_type`, which for Q2_0 is Q8_0.  The other CUDA kernels

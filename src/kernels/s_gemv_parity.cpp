@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/s_gemv_parity.cpp - P2.S2's parity test for the S-family GEMV.
 //
 // Four source types, chosen to cover every branch the kernel has:
@@ -20,7 +23,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/kernels/s_gemv.hpp"
 
-#include <cuda_runtime.h>
+#include "parity_device.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -33,13 +36,6 @@
 #include <vector>
 
 namespace {
-
-void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) {
-        std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
-    }
-}
 
 // Finite, exactly representable fp16 patterns WITH full mantissas.  Not powers of two: with only powers of
 // two every product is exact and the comparison cannot round, which is how the first version of s2_gemv's test
@@ -234,20 +230,18 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_offsets = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-    check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-    check(cudaMalloc(&d_offsets, offsets.size() * sizeof(float)), "cudaMalloc offsets");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "copy scales");
-    check(cudaMemcpy(d_offsets, offsets.data(), offsets.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "copy offsets");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * sizeof(uint16_t)));
+    d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+    d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+    d_offsets = static_cast<decltype(d_offsets)>(strata::parity::alloc_bytes(offsets.size() * sizeof(float)));
+    d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), x.size() * sizeof(uint16_t));
+    strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+    strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
+    strata::parity::copy_bytes_in(d_offsets, offsets.data(), offsets.size() * sizeof(float));
     strata::kernels::s_gemv(d_x, d_codes, d_scales, d_offsets, d_y, n_in, n_out, form);
     std::vector<float> got((size_t) n_out);
-    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+    strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
 
     // THE ERROR IS MEASURED AGAINST sum|term|, NOT AGAINST THE RESULT.  A dot product of 2560 signed terms
     // cancels, so `|ref-got| / |ref|` is a statement about the condition number, not about the kernel: a row
@@ -283,11 +277,6 @@ void test_q4k(long long n_in, long long n_out, double tol, int* total_bad) {
         std::exit(1);
     }
     *total_bad += (int) bad;
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_offsets);
-    cudaFree(d_y);
 }
 
 }  // namespace
@@ -313,14 +302,13 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     uint16_t* d_x = nullptr;
     uint8_t* d_codes = nullptr;
     float *d_scales = nullptr, *d_y = nullptr;
-    check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "bench x");
-    check(cudaMalloc(&d_codes, codes.size()), "bench codes");
-    check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "bench scales");
-    check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "bench y");
-    check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "bench copy x");
-    check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "bench copy codes");
-    check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "bench copy scales");
+    d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * sizeof(uint16_t)));
+    d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+    d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+    d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+    strata::parity::copy_bytes_in(d_x, x.data(), x.size() * sizeof(uint16_t));
+    strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+    strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
 
     for (int i = 0; i < 3; ++i) strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
 
@@ -358,8 +346,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
     // sums in a different order - so this is a relative comparison, not bit equality.
     strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, form);
     std::vector<float> ref_naive((size_t) n_out);
-    check(cudaMemcpy(ref_naive.data(), d_y, ref_naive.size() * sizeof(float), cudaMemcpyDeviceToHost),
-          "copy naive reference");
+    strata::parity::copy_bytes_out(ref_naive.data(), d_y, ref_naive.size() * sizeof(float));
 
     // ---- the row-split variant, same planes, same process -------------------
     // Swept rather than guessed: more threads per row buys parallelism and costs a deeper reduction.
@@ -379,8 +366,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
 
         // correctness of the thing being timed
         std::vector<float> got((size_t) n_out);
-        check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
-              "copy split result");
+        strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
         long long bad = 0;
         double worst = 0.0;
         for (long long o = 0; o < n_out; ++o) {
@@ -410,8 +396,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                                       std::chrono::steady_clock::now() - q0).count());
                 }
                 std::sort(qms.begin(), qms.end());
-                check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                      "copy quads result");
+                strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
                 long long qbad = 0;
                 double qworst = 0.0;
                 for (long long o = 0; o < n_out; ++o) {
@@ -442,8 +427,7 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
                                           std::chrono::steady_clock::now() - q0).count());
                     }
                     std::sort(fms.begin(), fms.end());
-                    check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                          "copy fast result");
+                    strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
                     long long fbad = 0;
                     for (long long o = 0; o < n_out; ++o) {
                         const double a = ref_naive[(size_t) o], b = got[(size_t) o];
@@ -463,11 +447,6 @@ void bench_s2_gemv(long long n_in, long long n_out, int iters, int* split_bad) {
         std::printf("  split tpr=%-4d min %.4f ms  -> %6.1f G weights/s   speedup vs naive %.2fx\n", tpr,
                     sms.front(), weights / sms.front() / 1e6, sp);
     }
-
-    cudaFree(d_x);
-    cudaFree(d_codes);
-    cudaFree(d_scales);
-    cudaFree(d_y);
 }
 
 int main(int argc, char** argv) {
@@ -566,17 +545,16 @@ int main(int argc, char** argv) {
         uint16_t* d_x = nullptr;
         uint8_t* d_codes = nullptr;
         float *d_scales = nullptr, *d_y = nullptr;
-        check(cudaMalloc(&d_x, x.size() * sizeof(uint16_t)), "cudaMalloc x");
-        check(cudaMalloc(&d_codes, codes.size()), "cudaMalloc codes");
-        check(cudaMalloc(&d_scales, scales.size() * sizeof(float)), "cudaMalloc scales");
-        check(cudaMalloc(&d_y, (size_t) n_out * sizeof(float)), "cudaMalloc y");
-        check(cudaMemcpy(d_x, x.data(), x.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy x");
-        check(cudaMemcpy(d_codes, codes.data(), codes.size(), cudaMemcpyHostToDevice), "copy codes");
-        check(cudaMemcpy(d_scales, scales.data(), scales.size() * sizeof(float), cudaMemcpyHostToDevice),
-              "copy scales");
+        d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * sizeof(uint16_t)));
+        d_codes = static_cast<decltype(d_codes)>(strata::parity::alloc_bytes(codes.size()));
+        d_scales = static_cast<decltype(d_scales)>(strata::parity::alloc_bytes(scales.size() * sizeof(float)));
+        d_y = static_cast<decltype(d_y)>(strata::parity::alloc_bytes((size_t) n_out * sizeof(float)));
+        strata::parity::copy_bytes_in(d_x, x.data(), x.size() * sizeof(uint16_t));
+        strata::parity::copy_bytes_in(d_codes, codes.data(), codes.size());
+        strata::parity::copy_bytes_in(d_scales, scales.data(), scales.size() * sizeof(float));
         strata::kernels::s_gemv(d_x, d_codes, d_scales, nullptr, d_y, n_in, n_out, tc.form);
         std::vector<float> got((size_t) n_out);
-        check(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy back");
+        strata::parity::copy_bytes_out(got.data(), d_y, got.size() * sizeof(float));
 
         long long bad = 0;
         double worst = 0.0;
@@ -598,11 +576,6 @@ int main(int argc, char** argv) {
             return 1;
         }
         total_bad += (int) bad;
-
-        cudaFree(d_x);
-        cudaFree(d_codes);
-        cudaFree(d_scales);
-        cudaFree(d_y);
     }
 
     std::printf("s_gemv: %zu type cases, %d rows over tolerance (tol %.1e)\n", cases.size(), total_bad, tol);
