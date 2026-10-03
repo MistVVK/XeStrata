@@ -51,6 +51,11 @@ Every file under the LGPL starts with its copyright holders and license in SPDX 
 - Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
 - `reuse lint` must pass.
 
+## The README
+
+The README is written in Japanese first: `README.ja.md` is the original and `README.md` its English translation.
+A change goes into `README.ja.md` first and then into `README.md` in the same commit, so the two keep the same sections and content.
+
 ## Lints
 
 Before committing, run `tools/lint/run.sh` from the repository root: without arguments it lints the files that differ from HEAD (changed or new), or the files given.
