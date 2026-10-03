@@ -1,0 +1,62 @@
+{#-
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-#}
+{#- serve/test_chat_template.jinja - a small ChatML template for the server's tests, written for XeStrata (LGPL-3.0-or-later).
+    It renders the forms the server reads back: <|im_start|>role ... <|im_end|> turns, images as
+    <|vision_start|><|image_pad|><|vision_end|>, tool calls as <tool_call><function=NAME><parameter=P>, reasoning in
+    <think>...</think>, and the template kwargs enable_thinking and reasoning_effort.  The engine itself uses the model's own
+    template from its pack. -#}
+{%- macro body(c) -%}
+    {%- if c is string -%}
+        {{- c -}}
+    {%- elif c -%}
+        {%- for part in c -%}
+            {%- if part.type == 'image' -%}
+                {{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+            {%- elif part.type == 'text' -%}
+                {{- part.text -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set first_system = messages and messages[0].role == 'system' -%}
+{%- if first_system or tools or reasoning_effort is defined -%}
+    {{- '<|im_start|>system\n' -}}
+    {%- if first_system -%}{{- body(messages[0].content) -}}{%- endif -%}
+    {%- if reasoning_effort is defined -%}{{- '\nThinking level: ' ~ reasoning_effort -}}{%- endif -%}
+    {%- if tools -%}
+        {{- '\nTools you may call, one <tool_call> block each:\n' -}}
+        {%- for t in tools -%}{{- (t.function if t.function is defined else t) | tojson -}}{{- '\n' -}}{%- endfor -%}
+    {%- endif -%}
+    {{- '<|im_end|>\n' -}}
+{%- endif -%}
+{%- for m in messages -%}
+    {%- if loop.first and first_system -%}
+    {%- elif m.role == 'assistant' -%}
+        {{- '<|im_start|>assistant\n' -}}
+        {%- if m.reasoning_content -%}{{- '<think>\n' ~ m.reasoning_content ~ '\n</think>\n\n' -}}{%- endif -%}
+        {{- body(m.content) -}}
+        {%- for call in m.tool_calls or [] -%}
+            {%- set f = call.function if call.function is defined else call -%}
+            {{- '\n<tool_call>\n<function=' ~ f.name ~ '>\n' -}}
+            {%- for k, v in (f.arguments or {}).items() -%}
+                {{- '<parameter=' ~ k ~ '>\n' -}}{{- v if v is string else v | tojson -}}{{- '\n</parameter>\n' -}}
+            {%- endfor -%}
+            {{- '</function>\n</tool_call>' -}}
+        {%- endfor -%}
+        {{- '<|im_end|>\n' -}}
+    {%- elif m.role == 'tool' -%}
+        {{- '<|im_start|>user\n<tool_response>\n' -}}{{- body(m.content) -}}{{- '\n</tool_response><|im_end|>\n' -}}
+    {%- else -%}
+        {{- '<|im_start|>' ~ m.role ~ '\n' -}}{{- body(m.content) -}}{{- '<|im_end|>\n' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|>assistant\n' -}}
+    {%- if enable_thinking is defined and enable_thinking is false -%}
+        {{- '<think>\n\n</think>\n\n' -}}
+    {%- else -%}
+        {{- '<think>\n' -}}
+    {%- endif -%}
+{%- endif -%}

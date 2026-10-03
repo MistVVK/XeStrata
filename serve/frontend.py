@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/frontend.py - plan v0.3 P8: the request/response layer between API clients and the engine.
 
 Everything here is text: no model, no GPU. The engine consumes token ids and produces text deltas; this module
@@ -25,12 +28,17 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 
 # ------------------------------------------------------------------------------------------------ template
+class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
+    """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
+    client gets a 400 with the template's message instead of a dropped connection (#365)."""
+
+
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
     def __init__(self, path: str | Path):
         def raise_exception(message):
-            raise jinja2.exceptions.TemplateError(message)
+            raise TemplateRequestError(message)
 
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
@@ -138,10 +146,27 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
+def _object_list(value, name: str) -> list[dict]:
+    """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
+    double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
+    string is decoded.  Anything that is still not a list of objects is a ValueError, which the server answers with
+    a 400 naming the field.  None (or no field) is an empty list, as a missing field always was."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise ValueError(f"{name} must be a list of objects (a string was sent that is not JSON)") from None
+    if not isinstance(value, list) or not all(isinstance(m, dict) for m in value):
+        raise ValueError(f"{name} must be a list of objects")
+    return value
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
-    for m in req.get("messages", []):
+    for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
         if role == "developer":
             role = "system"
@@ -150,8 +175,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
             calls = []
-            for c in m["tool_calls"]:
+            for c in _object_list(m["tool_calls"], "tool_calls"):
                 fn = c.get("function", c)
+                if not isinstance(fn, dict):
+                    raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
                 args = fn.get("arguments")
                 if isinstance(args, str):               # the template requires a mapping, not a JSON string
                     args = json.loads(args) if args.strip() else {}
@@ -173,19 +200,21 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     return _late_system_to_user(messages), tools, kwargs
 
 
-def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """Anthropic Messages -> (template messages, template tools, template kwargs)."""
+def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+    """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
+    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
+    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system", "content": _text_of(system)})
-    for m in req.get("messages", []):
+    for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
         if m.get("role") == "user" and _has_image(content) and not any(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content or []):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
         text, reasoning, calls = [], [], []
@@ -219,6 +248,14 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
+    elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
+        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
+        # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
+        # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
+        # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
+        # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
+        # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
+        kwargs["enable_thinking"] = False
     return _late_system_to_user(messages), tools, kwargs
 
 
@@ -242,6 +279,61 @@ CALL_START = "<tool_call>"
 CALL_END = "</tool_call>"
 
 
+PARAM_END = "</parameter>"
+FUNC_END = "</function>"
+
+
+def param_end(text: str, final: bool = False) -> int:
+    """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
+    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
+    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    at = text.find(PARAM_END)
+    while at >= 0:
+        after = text[at + len(PARAM_END):].lstrip()
+        if after.startswith(("<parameter=", FUNC_END)):
+            return at
+        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
+            return at if final else -2
+        at = text.find(PARAM_END, at + 1)
+    return -1
+
+
+def call_end(text: str) -> int:
+    """Where a tool call's body ends (#210): the `</tool_call>` after the call's own `</function>`, found by walking
+    its parameters with param_end, so a value may contain either tag.  -1: not complete yet.  A body that is not in
+    the call format ends at the first `</tool_call>`, as before."""
+    s = text.lstrip()
+    pos = len(text) - len(s)
+    if not s.startswith("<function="):
+        return text.find(CALL_END) if not "<function=".startswith(s) else -1
+    gt = text.find(">", pos)
+    if gt < 0:
+        return -1
+    pos = gt + 1
+    while True:
+        rest = text[pos:]
+        s = rest.lstrip()
+        pos += len(rest) - len(s)
+        if s.startswith("<parameter="):
+            gt = text.find(">", pos)
+            if gt < 0:
+                return -1
+            end = param_end(text[gt + 1:])
+            if end < 0:
+                return -1
+            pos = gt + 1 + end + len(PARAM_END)
+        elif s.startswith(FUNC_END):
+            rest = text[pos + len(FUNC_END):]
+            s = rest.lstrip()
+            if s.startswith(CALL_END):
+                return pos + len(FUNC_END) + len(rest) - len(s)
+            return -1 if CALL_END.startswith(s) else text.find(CALL_END, pos)
+        elif not s or "<parameter=".startswith(s) or FUNC_END.startswith(s):
+            return -1
+        else:
+            return text.find(CALL_END, pos)
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -257,9 +349,9 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = rest.find("</parameter>")
+        end = param_end(rest, final=True)
         value = rest[:end] if end >= 0 else rest
-        rest = rest[end + len("</parameter>"):] if end >= 0 else ""
+        rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
@@ -351,16 +443,17 @@ class OutputParser:
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
-                end = rest.find("</parameter>")
+                end = param_end(rest)
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len("</parameter>")
+                    self.sp += end + len(PARAM_END)
                     self.ss = "between"
                     continue
-                safe = len(rest) - self._hold(rest, ("</parameter>",))
+                # an undecided </parameter> (-2) is held from its start, like a tag still arriving
+                safe = rest.find(PARAM_END) if end == -2 else len(rest) - self._hold(rest, (PARAM_END,))
                 if safe > 0 and rest[safe - 1] == "\n":   # may be the trailing newline before </parameter>
                     safe -= 1
                 if safe > 0:
@@ -368,7 +461,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = rest.find("</parameter>")
+                end = param_end(rest)
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -381,7 +474,7 @@ class OutputParser:
                 except ValueError:
                     v = value
                 args(json.dumps(v, ensure_ascii=False))
-                self.sp += end + len("</parameter>")
+                self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
                 return out
@@ -449,7 +542,7 @@ class OutputParser:
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
             else:
-                i = self.buf.find(CALL_END)
+                i = call_end(self.buf)
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
@@ -471,12 +564,13 @@ class OutputParser:
                 self.state, self.lead = "content", True
 
     def finish(self) -> list[Event]:
-        """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
+        """End of generation: flush whatever is held (an unterminated tool call is returned as content; one that was
+        already announced stays unfinished: its JSON is not closed and no "tool_call" follows it, #211)."""
         out = []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
-            out += self._close_scan()
-            out.append(Event("tool_call", call=self.scall))
+            if self.ss == "done":               # only its </tool_call> is missing: the call itself is whole
+                out.append(Event("tool_call", call=self.scall))
             self.buf = ""
             self._reset_scan()
             return out

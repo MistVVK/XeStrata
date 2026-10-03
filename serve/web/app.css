@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors */
+/* SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors */
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /* Strata web app - layout on top of tokens.css + components.css (the Strata UI kit). Colours, type, radii and
    shadows come only from the kit's tokens. */
 [hidden] { display: none !important; }
@@ -92,6 +95,11 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
 .st-metric__spark { display: block; overflow: visible; }
+.speed-values { display: flex; justify-content: space-between; gap: var(--st-s-3); }
+.speed-values > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.speed-values > div:last-child { text-align: right; }
+.speed-values .st-metric__value { font-size: clamp(20px, 2.2vw, var(--st-fs-stat)); }
+.st-metric__spark .speed-prefill { color: color-mix(in srgb, var(--st-accent) 65%, black); }
 .st-metric__spark[data-tone="warn"] { color: var(--st-warn); }
 .st-metric__spark[data-tone="info"] { color: var(--st-info); }
 .monitor-row { display: grid; grid-template-columns: minmax(260px, 1fr) minmax(0, 2.4fr); gap: var(--st-s-4); }

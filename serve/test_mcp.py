@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/test_mcp.py - tools from MCP servers (serve/mcp.py) and the web app's tool loop, against the mock engine and
 the fake MCP server in serve/mcp_fake_server.py (no GPU, no pack, no MCP SDK).
 
@@ -254,7 +257,7 @@ class ToolLoop(unittest.TestCase):
     def start(self, *scripts, delay_s=0.0):
         tok = ByteTokenizer()
         self.engine = ScriptedEngine(tok, list(scripts), delay_s=delay_s)
-        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = Service(self.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         self.svc.mcp = self.hub
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
@@ -297,6 +300,19 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("<function=fake__echo>\n<parameter=text>\nhello from the tool\n</parameter>", second)
         self.assertIn("<tool_response>\nhello from the tool\n</tool_response>", second)
         self.assertEqual(cs[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[1]))
+
+    def test_a_call_the_output_ends_inside_is_not_run(self):
+        """#211: the model's turn ends inside an MCP call: nothing runs (it used to run with no arguments)."""
+        script = call_script("fake__echo", text="hello from the tool")
+        self.start(script[:script.index("from the tool")], "</think>\n\nnever")
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp], ["start"])        # the web app shows it as "Not run" at the end
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertNotIn('"call"', Path(self.log.name).read_text())    # nothing ran
+        self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")
 
     def test_non_stream(self):
         self.start(call_script("fake__add", a=2, b=3), "</think>\n\n5.")
@@ -414,7 +430,7 @@ class ToolLoop(unittest.TestCase):
 class NoServers(unittest.TestCase):
     def test_opt_in_without_servers_is_a_plain_chat(self):
         tok = ByteTokenizer()
-        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc = Service(ScriptedEngine(tok, ["</think>\n\nhi"]), tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
         httpd = serve(svc, port=0)
         try:
             base = f"http://127.0.0.1:{httpd.server_address[1]}"

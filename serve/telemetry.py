@@ -1,16 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/telemetry.py - hardware readings for the web app's Monitor tab (idea from PR #22 by code-martin).
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
-- GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
-  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.
+- GPU: the Intel GPU on the xe driver, from Linux (temperature and power from hwmon, the PCIe link, the load of this
+  user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip package is
+  needed.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
-  the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
+  Linux /proc and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
 
 import collections
 import ctypes
+import glob
 import os
 import platform
 import sys
@@ -20,99 +25,201 @@ import time
 HISTORY = 60
 
 
-# ------------------------------------------------------------------------------------------------ NVML
-class _Nvml:
-    class Util(ctypes.Structure):
-        _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+# ------------------------------------------------------------------------------------------------ the Intel GPU
+class _ZesPciAddress(ctypes.Structure):
+    _fields_ = [("domain", ctypes.c_uint32), ("bus", ctypes.c_uint32), ("device", ctypes.c_uint32),
+                ("function", ctypes.c_uint32)]
 
-    class Mem(ctypes.Structure):
-        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
-    def __init__(self, index=0):
-        self.lib = self.dev = None
-        names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
-                                          "NVIDIA Corporation", "NVSMI", "nvml.dll")] if os.name == "nt" \
-            else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
-        for n in names:
-            try:
-                self.lib = ctypes.CDLL(n)
-                break
-            except OSError:
-                continue
-        if self.lib is None:
-            return
+class _ZesPciSpeed(ctypes.Structure):
+    _fields_ = [("gen", ctypes.c_int32), ("width", ctypes.c_int32), ("max_bandwidth", ctypes.c_int64)]
+
+
+class _ZesPciProps(ctypes.Structure):    # zes_pci_properties_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("address", _ZesPciAddress),
+                ("max_speed", _ZesPciSpeed), ("bw", ctypes.c_uint8), ("pkt", ctypes.c_uint8),
+                ("replay", ctypes.c_uint8)]
+
+
+class _ZesMemState(ctypes.Structure):    # zes_mem_state_t
+    _fields_ = [("stype", ctypes.c_uint32), ("pnext", ctypes.c_void_p), ("health", ctypes.c_int32),
+                ("free", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+
+class _Zes:
+    """The device's VRAM through Level Zero's management API (sysman, libze_loader.so.1, which the GPU runtime
+    installs) through ctypes: the reading Linux's sysfs does not give for the xe driver."""
+
+    STYPE_PCI_PROPERTIES, STYPE_MEM_STATE = 0x2, 0x1E
+
+    def __init__(self, pci):
+        self.mems = []
         try:
-            init = getattr(self.lib, "nvmlInit_v2", None) or self.lib.nvmlInit
-            if init() != 0:
-                self.lib = None
+            self.lib = ctypes.CDLL("libze_loader.so.1")
+            if self.lib.zesInit(ctypes.c_uint32(0)) != 0:
                 return
-            h = ctypes.c_void_p()
-            get = getattr(self.lib, "nvmlDeviceGetHandleByIndex_v2", None) or self.lib.nvmlDeviceGetHandleByIndex
-            if get(ctypes.c_uint(index), ctypes.byref(h)) != 0:
-                self.lib = None
+            n = ctypes.c_uint32(0)
+            if self.lib.zesDriverGet(ctypes.byref(n), None) != 0 or n.value == 0:
                 return
-            self.dev = h
-        except (AttributeError, OSError):
-            self.lib = None
+            drivers = (ctypes.c_void_p * n.value)()
+            self.lib.zesDriverGet(ctypes.byref(n), drivers)
+            for drv in drivers:
+                m = ctypes.c_uint32(0)
+                if self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), None) != 0:
+                    continue
+                devs = (ctypes.c_void_p * m.value)()
+                self.lib.zesDeviceGet(ctypes.c_void_p(drv), ctypes.byref(m), devs)
+                for dev in devs:
+                    props = _ZesPciProps(stype=self.STYPE_PCI_PROPERTIES)
+                    if self.lib.zesDevicePciGetProperties(ctypes.c_void_p(dev), ctypes.byref(props)) != 0:
+                        continue
+                    a = props.address
+                    if f"{a.domain:04x}:{a.bus:02x}:{a.device:02x}.{a.function:x}" != pci:
+                        continue
+                    k = ctypes.c_uint32(0)
+                    self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), None)
+                    mods = (ctypes.c_void_p * k.value)()
+                    self.lib.zesDeviceEnumMemoryModules(ctypes.c_void_p(dev), ctypes.byref(k), mods)
+                    self.mems = list(mods)
+        except (OSError, AttributeError):
+            self.mems = []
+
+    def read(self):
+        """(used, total) bytes over the device's memory modules, or (None, None)."""
+        free = total = 0
+        for mod in self.mems:
+            st = _ZesMemState(stype=self.STYPE_MEM_STATE)
+            try:
+                if self.lib.zesMemoryGetState(ctypes.c_void_p(mod), ctypes.byref(st)) != 0:
+                    return None, None
+            except (OSError, AttributeError):
+                return None, None
+            free += st.free
+            total += st.size
+        return (total - free, total) if total else (None, None)
+
+
+def _read(path, conv=int):
+    try:
+        with open(path, encoding="ascii") as f:
+            return conv(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+class _XeGpu:
+    """An Intel GPU on the xe driver: temperature and power from Linux's sysfs (hwmon), the PCIe link from the PCI
+    path, the load from the DRM clients' fdinfo, the VRAM through sysman.  `pci` is the card's address as the config
+    gives it (setup's gpu_pci); without one, the first card on the xe driver."""
+    LINK_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}
+
+    def __init__(self, pci=None):
+        self.dev = None
+        for card in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+            dev = os.path.realpath(os.path.join(card, "device"))
+            if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) != "xe":
+                continue
+            if pci is None or os.path.basename(dev) == pci:
+                self.dev = dev
+                break
+        if self.dev is None:
+            return
+        self.pci = os.path.basename(self.dev)
+        hw = glob.glob(os.path.join(self.dev, "hwmon", "hwmon*"))
+        self.hwmon = hw[0] if hw else None
+        self.zes = _Zes(self.pci)
+        self._prev = None   # (time, energy uJ)
+        self._cycles = {}   # DRM client id -> (engine cycles, total cycles)
 
     def ok(self):
-        return self.lib is not None and self.dev is not None
-
-    def _uint(self, fn, *args):
-        v = ctypes.c_uint()
-        try:
-            return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
-        except (AttributeError, OSError):
-            return None
+        return self.dev is not None
 
     def name(self):
-        buf = ctypes.create_string_buffer(96)
-        try:
-            if self.lib.nvmlDeviceGetName(self.dev, buf, ctypes.c_uint(96)) == 0:
-                return buf.value.decode(errors="replace")
-        except (AttributeError, OSError):
-            pass
-        return None
+        if not self.ok():
+            return None
+        return f"Intel GPU {_read(os.path.join(self.dev, 'device'), str) or ''} at {self.pci}".replace("0x", "")
+
+    def _link(self):
+        """The card's widest link up its PCI path: a card with a switch of its own reports x1 on its own port."""
+        best, p = None, self.dev
+        while p.startswith("/sys/devices/pci"):
+            speed = _read(os.path.join(p, "current_link_speed"), str)
+            width = _read(os.path.join(p, "current_link_width"))
+            top = _read(os.path.join(p, "max_link_speed"), str)
+            if speed and width:
+                g = self.LINK_GEN.get(speed.split()[0])
+                gmax = self.LINK_GEN.get(top.split()[0]) if top else None
+                if g and (best is None or (g * width) > best[0] * best[1]):
+                    best = (g, width, gmax)
+            p = os.path.dirname(p)
+        return best or (None, None, None)
+
+    def _busy(self):
+        """The render and compute engines' load from this user's processes on the card: the xe driver counts each
+        DRM client's engine cycles in /proc/<pid>/fdinfo (the card-wide load needs root on this driver)."""
+        now = {}
+        for f in glob.glob("/proc/[0-9]*/fdinfo/*"):
+            try:
+                with open(f, encoding="ascii", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if "drm-driver:\txe" not in text or f"drm-pdev:\t{self.pci}" not in text:
+                continue
+            kv = {}
+            for line in text.splitlines():
+                k, _, v = line.partition(":")
+                kv.setdefault(k, v.strip())
+            cid = kv.get("drm-client-id")
+            try:
+                busy = sum(int(kv.get(f"drm-cycles-{e}", "0")) for e in ("rcs", "ccs"))
+                total = int(kv.get("drm-total-cycles-ccs") or kv.get("drm-total-cycles-rcs") or 0)
+            except ValueError:
+                continue
+            if cid and total:
+                now[cid] = (busy, total)
+        prev, self._cycles = self._cycles, now
+        spans = [now[c][1] - prev[c][1] for c in now if c in prev and now[c][1] > prev[c][1]]
+        if not spans:
+            return 0.0 if not now else None
+        used = sum(max(0, now[c][0] - prev[c][0]) for c in now if c in prev)
+        return max(0.0, min(100.0, 100.0 * used / max(spans)))
 
     def read(self):
         out = {}
-        u = self.Util()
-        try:
-            if self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)) == 0:
-                out["util"] = u.gpu
-        except (AttributeError, OSError):
-            pass
-        m = self.Mem()
-        try:
-            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
-                out["mem_used"], out["mem_total"] = m.used, m.total
-        except (AttributeError, OSError):
-            pass
-        out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
-        mw = self._uint("nvmlDeviceGetPowerUsage")
-        out["power"] = mw / 1000.0 if mw is not None else None
-        lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
-        out["power_limit"] = lim / 1000.0 if lim is not None else None
-        out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
-        out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
-        out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
-        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
-        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
-        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
-        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        t = time.time()
+        energy = _read(os.path.join(self.hwmon, "energy1_input")) if self.hwmon else None
+        prev, self._prev = self._prev, (t, energy)
+        out["util"] = self._busy()
+        if prev and t > prev[0] and energy is not None and prev[1] is not None and energy >= prev[1]:
+            out["power"] = (energy - prev[1]) / 1e6 / (t - prev[0])
+        if self.hwmon:
+            temps = [_read(f) for f in glob.glob(os.path.join(self.hwmon, "temp*_input"))]
+            temps = [v / 1000.0 for v in temps if v]
+            out["temp"] = max(temps) if temps else None
+            cap = _read(os.path.join(self.hwmon, "power1_cap"))
+            out["power_limit"] = cap / 1e6 if cap else None
+        out["mem_used"], out["mem_total"] = self.zes.read()
+        out["pcie_gen"], out["pcie_width"], out["pcie_gen_max"] = self._link()
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
         return out
+
+
+def free_vram_mib(gpu_pci=None):
+    """Free VRAM of the card (by PCI address, None: the first on the xe driver) in MiB, or None when it cannot be
+    read."""
+    g = _XeGpu(gpu_pci)
+    if not g.ok():
+        return None
+    r = g.read()
+    if r.get("mem_total") is None or r.get("mem_used") is None:
+        return None
+    return int((r["mem_total"] - r["mem_used"]) >> 20)
 
 
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
-    if os.name == "nt":
-        try:
-            import winreg
-            k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-            return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
-        except OSError:
-            pass
-    elif os.path.exists("/proc/cpuinfo"):
+    if os.path.exists("/proc/cpuinfo"):
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
@@ -126,11 +233,6 @@ class _CpuRamFallback:
         self.prev = self._times()
 
     def _times(self):
-        if os.name == "nt":
-            idle, kern, user = (ctypes.c_ulonglong() for _ in range(3))
-            if ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user)):
-                return idle.value, kern.value + user.value           # kernel time includes idle
-            return None
         try:
             f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
             return f[3] + f[4], sum(f)
@@ -146,18 +248,6 @@ class _CpuRamFallback:
 
     @staticmethod
     def ram():
-        if os.name == "nt":
-            class MS(ctypes.Structure):
-                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-            m = MS()
-            m.dwLength = ctypes.sizeof(MS)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
-                return m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys
-            return None, None
         try:
             info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
             total = int(info["MemTotal"].split()[0]) * 1024
@@ -169,17 +259,14 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
-        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
-        engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
-        the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
+    def __init__(self, extra=None, gpu_pci=None):
+        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_pci`: the PCI address
+        of the card the engine runs on (setup's gpu_pci), or None for the first card on the xe driver."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, _Nvml(i)) for i in idx]
+        self.gpus = [(0, _XeGpu(gpu_pci))]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         try:
@@ -256,7 +343,7 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s"):
+                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             time.sleep(1.0)

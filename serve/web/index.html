@@ -1,16 +1,21 @@
 <!doctype html>
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 <html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Strata</title>
+<title>XeStrata</title>
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
 <script>
   // the theme before the first paint: the saved choice, else the system's
   try {
-    const t = localStorage.getItem("strata.theme") ||
+    const t = localStorage.getItem("xestrata.theme") ||
       (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     document.documentElement.dataset.theme = t;
   } catch (e) {}
@@ -18,7 +23,7 @@
 </head>
 <body>
 <header class="st-header">
-  <span class="st-header__brand">Strata</span>
+  <span class="st-header__brand">XeStrata</span>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
@@ -159,7 +164,7 @@
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
         <p class="muted small">Chats, settings and the key are kept in this browser only.
-          <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata on GitHub</a></p>
+          <a href="https://github.com/MistVVK/XeStrata" target="_blank" rel="noopener noreferrer">XeStrata on GitHub</a></p>
       </div>
     </div>
   </section>

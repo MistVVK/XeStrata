@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """The streaming detokenizer (perf-review F-1): the incremental one emits exactly what the old re-decode did, token
 by token, and its cost per token does not grow with the reply.
 
@@ -101,6 +104,152 @@ class Detok(unittest.TestCase):
         late = time.perf_counter() - t0
         self.assertLess(late / 100, 0.0002, "a token after 16K tokens costs more than 0.2 ms")
         self.assertLess(late, early * 5 + 0.002)
+
+
+# ------------------------------------------------------------------ #268: the heap BPE for long words
+_REAL: list = []
+
+
+def real_tokenizer():
+    """The pack's tokenizer, loaded once for every class that needs it (None when there is no pack here)."""
+    if not _REAL:
+        t = find_tokenizer()
+        if t is None:
+            _REAL.append(None)
+        else:
+            import json
+            import strata_tokenizer as ST
+            vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
+            toks = [None] * len(vocab)
+            for s, i in vocab.items():
+                toks[i] = s
+            _REAL.append(ST.Tokenizer(toks, (t / "merges.txt").read_text(encoding="utf-8").split("\n"),
+                                      json.loads((t / "token_type.json").read_text())))
+    return _REAL[0]
+
+
+def random_text(rng, n_pieces=40):
+    """Strings shaped to make one pre-token piece long or awkward: CJK and Hangul runs (syllables and conjoining
+    jamo), letters under stacks of combining marks, URLs, minified code, digits, emoji, whitespace, specials."""
+    def run(lo, hi, k):
+        return "".join(chr(rng.randint(lo, hi)) for _ in range(k))
+
+    kinds = [
+        lambda: run(0x4E00, 0x9FFF, rng.randint(1, 400)),                       # CJK
+        lambda: run(0xAC00, 0xD7A3, rng.randint(1, 200)),                       # Hangul syllables
+        lambda: "".join(chr(0x1100 + rng.randrange(19)) + chr(0x1161 + rng.randrange(21))
+                        for _ in range(rng.randint(1, 60))),                    # conjoining jamo
+        lambda: "".join(rng.choice("aeiouxyz") + run(0x0300, 0x036F, rng.randint(0, 4))
+                        for _ in range(rng.randint(1, 80))),                    # combining marks
+        lambda: "https://example.com/" + "/".join(run(0x61, 0x7A, rng.randint(1, 12))
+                                                  for _ in range(rng.randint(1, 20))) + "?q=" + run(0x30, 0x39, 8),
+        lambda: "".join(rng.choice(["var ", "a=", "b", "(", ")", "{", "}", ";", "function", "return", "x", "+",
+                                    "!0", "void 0", ",", ".", "[", "]", "=>", "&&"])
+                        for _ in range(rng.randint(1, 300))),
+        lambda: run(0x30, 0x39, rng.randint(1, 50)),
+        lambda: rng.choice([" ", "  ", "\n", "\n\n", "\t", "\r\n", " \n "]) * rng.randint(1, 30),
+        lambda: rng.choice(["\U0001f600", "\U0001f30a", "\U0001f469‍\U0001f4bb", "é", "ß"]) * rng.randint(1, 30),
+        lambda: rng.choice(["<|im_end|>", "<|im_start|>", "<think>", "</think>", "<tool_call>", "<|im_sta"]),
+        lambda: "a" * rng.randint(60, 300),
+        lambda: run(0x20, 0x7E, rng.randint(1, 200)),
+    ]
+    return "".join(rng.choice(kinds)() for _ in range(rng.randint(1, n_pieces)))
+
+
+def encode_with(tok, text, parse_special, heap_min):
+    tok.HEAP_MIN = heap_min
+    try:
+        return tok.encode(text, parse_special=parse_special)
+    finally:
+        del tok.HEAP_MIN
+
+
+def synthetic_tokenizer(seed=268, n_merges=1500):
+    """A small byte-level BPE vocabulary with merges learned (randomly) from random_text, and a few specials of
+    both kinds - so the parity test runs without a pack."""
+    import strata_tokenizer as ST
+    rng = random.Random(seed)
+    tokens = sorted(set(ST.BYTE_TO_UNICODE.values()))
+    have, merges = set(tokens), []
+    words = []
+    for _ in range(60):
+        for piece in ST.regex.compile(ST.QWEN35_PATTERN).findall(random_text(rng, 10)):
+            words.append([ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8")])
+    words = [w for w in words if len(w) > 1]
+    while len(merges) < n_merges:
+        w = rng.choice(words)
+        if len(w) < 2:
+            continue
+        i = rng.randrange(len(w) - 1)
+        a, b = w[i], w[i + 1]
+        w[i:i + 2] = [a + b]                        # learn in place, so later merges build on earlier ones
+        if a + b in have or f"{a} {b}" in merges:
+            continue
+        merges.append(f"{a} {b}")
+        tokens.append(a + b)
+        have.add(a + b)
+    types = [1] * len(tokens)
+    for lit, ty in [("<|im_end|>", 3), ("<|im_start|>", 3), ("<think>", 4), ("</think>", 4), ("<tool_call>", 4)]:
+        tokens.append(lit)
+        types.append(ty)
+    return ST.Tokenizer(tokens, merges, types)
+
+
+class HeapBpe(unittest.TestCase):
+    """#268: words longer than HEAP_MIN symbols merge with a heap; the ids must be exactly the scan's."""
+
+    def parity(self, tok, texts):
+        for k, text in enumerate(texts):
+            for ps in (False, True):
+                old = encode_with(tok, text, ps, 10 ** 9)           # the scan for every word
+                self.assertEqual(encode_with(tok, text, ps, 0), old, f"text {k} parse_special={ps}")   # the heap
+                self.assertEqual(tok.encode(text, parse_special=ps), old, f"text {k} parse_special={ps}")
+
+    def test_words_directly(self):
+        tok = synthetic_tokenizer()
+        rng = random.Random(1)
+        import strata_tokenizer as ST
+        for _ in range(300):
+            for piece in ST.regex.compile(ST.QWEN35_PATTERN).findall(random_text(rng, 8)):
+                word = "".join(ST.BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                tok.HEAP_MIN = 10 ** 9
+                try:
+                    old = tok._bpe(word)
+                finally:
+                    del tok.HEAP_MIN
+                self.assertEqual(tok._bpe_heap(word), old, repr(piece[:40]))
+
+    def test_synthetic_vocab(self):
+        tok = synthetic_tokenizer()
+        rng = random.Random(2)
+        self.parity(tok, [random_text(rng) for _ in range(60)] + ["a" * 5000, "ab" * 3000, ""])
+
+    @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
+    def test_pack_vocab(self):
+        tok = real_tokenizer()
+        rng = random.Random(3)
+        fixed = ["你好，世界" * 150, "한국어 텍스트" * 100,
+                 "é́̂" * 200, "x" * 5000,
+                 "https://example.com/" + "a/b-c_d.e?f=g&h=i#j" * 60,
+                 "!function(e){var t={};function n(r){if(t[r])return t[r].exports}}" * 30,
+                 "<|im_start|>user\n日本語" * 40 + "<|im_end|><think>" + "漢" * 300]
+        self.parity(tok, fixed + [random_text(rng) for _ in range(40)])
+
+    def check_speed(self, tok):
+        rng = random.Random(4)
+        text = "".join(chr(rng.randint(0x4E00, 0x9FFF)) for _ in range(8192))       # one 24K-byte piece
+        t0 = time.perf_counter()
+        ids = tok.encode(text)
+        took = time.perf_counter() - t0
+        self.assertEqual(tok.decode(ids), text)
+        self.assertLess(took, 1.0, f"an 8K-character CJK run took {took:.2f} s")
+
+    def test_speed_synthetic(self):
+        self.check_speed(synthetic_tokenizer())
+
+    @unittest.skipIf(find_tokenizer() is None, "no pack tokenizer here")
+    def test_speed_pack(self):
+        self.check_speed(real_tokenizer())
 
 
 if __name__ == "__main__":

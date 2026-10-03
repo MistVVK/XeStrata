@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""A tiny terminal chat for a running Strata server (start it with run-<model>.bat / run-<model>.sh first).
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+"""A tiny terminal chat for a running Strata server (start it with run-<model>.sh first).
 
-    python chat.py [--port 8080] [--think none|low|medium|high]
+    python chat.py [--port 8095] [--think none|low|medium|high]
 
 Type a message and press Enter.  /image <path> attaches a picture to your next message (when the server was set up
 with images), /think <none|low|medium|high> sets how long the model thinks first, /reset starts a new conversation,
@@ -34,7 +37,7 @@ def stream(url, messages, think, max_tokens):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--think", default="medium", choices=["none", "low", "medium", "high"],
                     help="how long the model thinks before answering (none = answer directly)")

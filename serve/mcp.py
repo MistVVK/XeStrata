@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/mcp.py - tools from MCP (Model Context Protocol) servers for the web app's chats.
 
 The user lists servers in the run config (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` block pasted as is) or
@@ -92,21 +95,16 @@ class StdioTransport:
         env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (self.cfg.get("env") or {}).items()})
         command = str(self.cfg["command"])
-        # On Windows `npx`, `uvx` and friends are .cmd files that CreateProcess finds only with their extension
         exe = shutil.which(command, path=env.get("PATH")) or command
-        extra = {}
-        if os.name == "nt":
-            extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        else:
-            extra["start_new_session"] = True           # its own process group, so close() ends its children too
         try:
             self.proc = subprocess.Popen([exe, *[str(a) for a in self.cfg.get("args") or []]], stdin=subprocess.PIPE,
                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.cfg.get("cwd") or None,
-                                         env=env, **extra)
+                                         env=env, start_new_session=True)
         except OSError as e:
             raise McpError(f"could not start {command!r}: {e}") from None
+        self._err_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        self._err_reader.start()
         threading.Thread(target=self._read, daemon=True).start()
-        threading.Thread(target=self._read_stderr, daemon=True).start()
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None and not getattr(self, "ended", False)
@@ -141,6 +139,9 @@ class StdioTransport:
                 if isinstance(m, dict):
                     self._dispatch(m)
         self.ended = True
+        # the server's last log line says why it stopped: let the stderr reader take it first (the pipe closes with
+        # the process), or the error raced it and said only "the server stopped"
+        self._err_reader.join(1.0)
         code = self.proc.poll()
         err = McpError(f"the server stopped{f' (exit code {code})' if code is not None else ''}{self._tail()}")
         with self.lock:
@@ -224,15 +225,11 @@ class StdioTransport:
     @staticmethod
     def _kill_tree(p):
         try:
-            if os.name == "nt":                          # npx.cmd -> node: end the whole tree
-                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=10)
-            else:
-                os.killpg(p.pid, signal.SIGTERM)
-                try:
-                    p.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    os.killpg(p.pid, signal.SIGKILL)
+            os.killpg(p.pid, signal.SIGTERM)
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
         except (OSError, subprocess.SubprocessError):
             pass
         try:
@@ -263,7 +260,7 @@ class HttpTransport:
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-             "User-Agent": "strata", **self.headers}
+             "User-Agent": "xestrata", **self.headers}
         if self.session:
             h["Mcp-Session-Id"] = self.session
         if self.protocol:
@@ -398,7 +395,7 @@ class McpServer:
         try:
             t.start()
             res = t.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
-                                           "clientInfo": {"name": "strata", "title": "Strata", "version": "1"}},
+                                           "clientInfo": {"name": "xestrata", "title": "XeStrata", "version": "1"}},
                             timeout)
             t.protocol = str(res.get("protocolVersion") or PROTOCOL)
             self.info = {k: v for k, v in (res.get("serverInfo") or {}).items() if k in ("name", "title", "version")}
