@@ -168,7 +168,10 @@ def main() -> None:
     have = finished()
     if have is None:
         fail(f"no finished build in {INSTALL}")
-    if not any(g.get("fp16") == "1" and g.get("bf16") == "1" for g in have.get("gpus", [])):
+    if not have.get("gpus"):
+        say("note: this build's SYCL runtime lists no GPU (xmx_probe): the GPU's Level Zero driver (Intel's "
+            "compute-runtime) is missing or too old for it")
+    elif not any(g.get("fp16") == "1" and g.get("bf16") == "1" for g in have.get("gpus", [])):
         say("note: no GPU reports FP16 and BF16 matrix engines to this build (xmx_probe); the engine will run its "
             "products without XMX")
     say(str(INSTALL))
