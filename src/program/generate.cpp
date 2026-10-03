@@ -1187,7 +1187,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool multi_gpu = !split_devs.empty() && !split_same;
-    // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
+    // the helper-GPU expert caches (--expert-cache-remote, upstream's docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
