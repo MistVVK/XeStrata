@@ -22,9 +22,6 @@
 #include <immintrin.h>
 
 #include <cmath>
-#include <cstdlib>
-#include <climits>
-#include <algorithm>
 #include <cstring>
 
 namespace strata::kernels::cpu {
@@ -81,24 +78,6 @@ inline float hsum8(__m256 v) {
     s = _mm_hadd_ps(s, s);
     s = _mm_hadd_ps(s, s);
     return _mm_cvtss_f32(s);
-}
-
-// E-2 (iq_avx512.cpp) on the AVX-2 path: the pool streams the expert rows from DRAM at ~25 GB/s (4 KB pages
-// when large pages are refused), so ask for the bytes a few blocks before the decode needs them - 2048 B is
-// two gate/up rows ahead, a row is ~1 KB.  Same switch as the AVX-512 kernels: STRATA_IQ_PREFETCH is the
-// distance in bytes, 0 = off, default 2048.  Measured on a Zen 3 5700X3D (no AVX-512) on IQ3_S decode: -4% on
-// the gate/up phase, +1.0 GB/s over the rows, -1.3% ms/round end to end.  The non-temporal hint measured
-// worse than T0 at the same distance, so this keeps T0.
-int configured_prefetch_ahead() noexcept {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH");
-    return v ? (int) std::clamp<long>(std::strtol(v, nullptr, 10), 0, INT_MAX) : 2048;
-}
-const int prefetch_ahead = configured_prefetch_ahead();
-
-inline void rows_ahead(const uint8_t* p) {
-    if (prefetch_ahead <= 0) return;
-    _mm_prefetch((const char*) p, _MM_HINT_T0);
-    _mm_prefetch((const char*) p + 64, _MM_HINT_T0);
 }
 
 // ---- per format: one 32-value half (values 64*j + 32*half .. +31) -> grid magnitudes, sign vector, scales
@@ -212,7 +191,6 @@ inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y,
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * Fmt32<TY>::bytes;
-        rows_ahead(blk + prefetch_ahead);
         __m256i acci[NT];
         for (int t = 0; t < NT; ++t) acci[t] = _mm256_setzero_si256();
         for (int j = 0; j < 4; ++j) {
@@ -277,7 +255,6 @@ inline void row_dot_iq2xs(const uint8_t* row, int nblocks, const block_q8_K* con
     for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * 74;
-        rows_ahead(blk + prefetch_ahead);
         // the 8 scale bytes -> 16 half-scales of 2*s+1, interleaved [a0, b0, a1, b1, ...] (ggml's unpack)
         __m128i st = _mm_set1_epi64x((long long) u64(blk + 66));
         st = _mm_unpacklo_epi8(_mm_and_si128(st, m4), _mm_and_si128(_mm_srli_epi16(st, 4), m4));
@@ -433,7 +410,6 @@ void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* con
         for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
         for (int ib = 0; ib < nb; ++ib) {
             const uint8_t* blk = row + (size_t) ib * sizeof(block_iq4_nl);
-            rows_ahead(blk + prefetch_ahead);
             const __m128i bits = _mm_loadu_si128((const __m128i*) (blk + 2));
             const __m128i lo = _mm_and_si128(bits, m4b);                      // values 0..15
             const __m128i hi = _mm_and_si128(_mm_srli_epi16(bits, 4), m4b);    // values 16..31
