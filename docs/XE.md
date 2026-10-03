@@ -5,7 +5,39 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 # XeStrata on Intel GPUs
 
 XeStrata 0.1.0 runs Strata's engine on Intel GPUs through Level Zero and SYCL. It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's. It chooses its paths from what the GPU reports (AGENTS.md, the first rule): a GPU without the matrix engines (XMX) takes the DP4a paths. The setup models listed under [Models](#models-on-the-b70), the prompt path and decode, MTP and prompt-lookup drafts, KV streaming, the server, and images through the image encoder.
-The upstream reference is Strata 0.1.24 at `3ce2523c2823687de5372be3af58534f56cbf286`.
+The upstream reference is Strata 0.1.38 at `99f3dbd0b21d1401b3769e0c0d963913607f380b`.
+
+## Integration through Strata 0.1.38
+
+The single-GPU Linux changes are carried into the Xe backend. The merge retains the original upstream history;
+CUDA, HIP, Windows and multi-GPU implementations are outside this port.
+
+- MTP supports `--coupled-draft` and `--no-coupled-draft`, including the draft vocabulary map and penalty history.
+  A server config can set `coupled_draft`; explicit engine arguments take precedence.
+- `--pool-affinity all|auto|p-cores` selects from the allowed CPU set and Linux topology reports. AVX2 remains the
+  baseline; the K-quant batched CPU products are optional (`STRATA_KQ256=1`).
+- The file expert tier supports `--resident-budget-gib`, `--resident-experts` and `--resident-cpu-experts`.
+  A shared expert arena (`--shared-expert-arena PATH`) publishes completion under a file lock after its data is
+  flushed. The reader verifies the pack identity before reusing it.
+- `STRATA_PREFILL_MMQ=1` keeps supported expert weights quantized in the prompt path. `STRATA_PF_FUSED=1` groups
+  routing and fuses the expert products with SwiGLU and activation quantization for streamed chunks of at least
+  2048 tokens; unsupported formats and shorter chunks retain the existing path.
+- `STRATA_GDN_KEYHEAD=1` shares prompt q/k inputs across the value heads. `STRATA_GR_V3=1` selects the tiled
+  hyper-connection read where reported local memory permits it. These numerical paths are off by default.
+- Native PLE keys accept Q2_0, IQ3_XXS, IQ4_XS and Q8_0. A packed BF16 PLE key remains authoritative. Native RoPE
+  uses the request's scaling configuration. MTP downloads verify the pinned checkpoint and reject invalid ranges.
+
+Validation of this integration used both free DPC++ and nonfree icpx builds. The default IQ2_XS real-model run
+matched the pre-merge eight-token output exactly. With the 8 GiB VRAM / 4 GiB allocation limits, XMX disabled and
+two CPU workers, coupled and uncoupled seeded runs produced the same sixteen tokens. The optional prompt paths
+accepted a 2626-token input and returned `2` for `1 + 1`. The UHD 770 free build and B70 nonfree build also returned
+`2` using a two-token MTP window. The UHD nonfree run with a four-token window aborted in the Intel runtime;
+that configuration remains `unverified`.
+
+The existing numerical tests, real ten-format quantization fixtures, eight ASan/UBSan tests and AVX-512 expert /
+pool self-tests under Intel SDE passed. Server tests passed. The tools suite retains the pre-existing MCP table
+mismatch (`test_builtin_table_matches_setup`); its assertion was not changed. Full real-model coverage of every
+quantization format, shared arenas across processes and adaptive resident exchanges remains `unverified`.
 The CUDA build is retired and its sources are removed; upstream Strata (`3ce2523`) keeps them, and the Xe sources name the CUDA file each one ports.
 A smaller card is checked by making the B70 look like one: `STRATA_VRAM_LIMIT_MIB` caps the memory the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and `STRATA_NO_XMX=1` takes the paths without the matrix engines. The processor's own graphics (a UHD 770 here) is used as a second, real configuration for checks only.
 
@@ -237,8 +269,8 @@ The name describes the quantization budget of a mixed-precision model.
 The native expert oracle in `src/kernels/native_expert_parity.cpp` uses ggml dequantization and host FP64 dot products before comparing CPU and GPU paths.
 Its existing per-expert relative L1 bound is `3e-2`, not a universal kernel tolerance.
 The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` must remain explicit.
-The former prefill MMQ build also depended on ggml-cuda; retaining ggml-cpu alone does not replace it.
-Choosing ggml-sycl versus custom Xe MMQ and introducing oneMKL dense baselines belong to the following kernel phase.
+The former prefill MMQ build depended on ggml-cuda. The Xe prompt path now uses its own quantized products,
+sharing the decode integer dots; it does not link ggml-cuda or require oneMKL.
 
 ## Existing validation inventory
 

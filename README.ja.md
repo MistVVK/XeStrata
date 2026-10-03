@@ -212,6 +212,9 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
   [docs/DEVTOOLS.md](docs/DEVTOOLS.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
+- **upstream の取り込み**: Strata 0.1.38 の単一GPU向け機能をXeへ移しています。`--coupled-draft` はMTPの
+  サンプリングを対象モデルに合わせ、`--pool-affinity` はCPUプールの配置を選びます。量子化したプロンプト計算は
+  `STRATA_PREFILL_MMQ=1`、融合MoEは `STRATA_PF_FUSED=1` で有効にします。どちらも既定では無効です。
 - **README**: この日本語版（README.ja.md）を先に書き、英語版（README.md）はその訳です。
 
 ## クレジット

@@ -217,6 +217,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
   [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
+- **Upstream integration:** the single-GPU features from Strata 0.1.38 are ported to Xe. `--coupled-draft`
+  samples MTP drafts with the target model's sampling chain; `--pool-affinity` selects CPU pool placement.
+  Quantized prompt products are enabled with `STRATA_PREFILL_MMQ=1`, fused MoE with `STRATA_PF_FUSED=1`.
+  Both are disabled by default.
 - **The README:** the Japanese one (README.ja.md) is written first, and this English one is its translation.
 
 ## Credits
