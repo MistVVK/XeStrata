@@ -561,56 +561,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     }();
     const bool pipe = pipe_on;   // the kernel takes a copy
     static_assert(CB * RG == S, "one q and one k value a work-item");
-    static const bool keyhead=[] { const char* v=std::getenv("STRATA_GDN_KEYHEAD"); return v && std::strtol(v, nullptr, 10)!=0; }();
-    const size_t kh_local=((size_t) 2*S+size_t(2)*(HV/HK)*RG*CB)*sizeof(float);
-    if (keyhead && pipe && q.get_device().get_info<sycl::info::device::local_mem_size>()>=kh_local &&
-        q.get_device().get_info<sycl::info::device::max_work_group_size>()>=(size_t) CB*RG) {
-        q.submit([&](sycl::handler& hd) {
-            sycl::local_accessor<float,1> sq(sycl::range<1>(S),hd),sk(sycl::range<1>(S),hd),
-                rkv(sycl::range<1>((size_t) (HV/HK)*RG*CB),hd),ro(sycl::range<1>((size_t) (HV/HK)*RG*CB),hd);
-            hd.parallel_for(sycl::nd_range<1>((size_t) HK*NCB*CB*RG,size_t(CB)*RG),
-                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
-                constexpr int VPK=HV/HK;
-                const int qh=(int) it.get_group(0)/NCB,cb=(int) it.get_group(0)%NCB;
-                const int tid=(int) it.get_local_id(0),c=tid%CB,rg=tid/CB,col=cb*CB+c;
-                const size_t rs=(size_t) HV*S;
-                float values[VPK][RPG];
-                for (int j=0;j<VPK;++j) {
-                    const float* base=state+((size_t) (rg*RPG)*HV+qh+(int64_t) j*HK)*S+col;
-                    for (int r=0;r<RPG;++r) values[j][r]=base[r*rs];
-                }
-                for (int64_t t=0;t<T;++t) {
-                    sycl::group_barrier(it.get_group());
-                    sq[tid]=h[t*C+(int64_t) qh*S+tid]; sk[tid]=h[t*C+(int64_t) HK*S+(int64_t) qh*S+tid];
-                    sycl::group_barrier(it.get_group());
-                    float decay[VPK],delta[VPK],out[VPK]={};
-                    for (int j=0;j<VPK;++j) {
-                        decay[j]=sycl::exp(gate[t*HV+qh+(int64_t) j*HK]);
-                        float kv=0;
-                        for (int r=0;r<RPG;++r) kv=sycl::fma(values[j][r],sk[rg*RPG+r],kv);
-                        rkv[(j*RG+rg)*CB+c]=kv;
-                    }
-                    sycl::group_barrier(it.get_group());
-                    for (int j=0;j<VPK;++j) {
-                        const float sum=rkv[j*RG*CB+c]+rkv[(j*RG+1)*CB+c]+rkv[(j*RG+2)*CB+c]+rkv[(j*RG+3)*CB+c];
-                        delta[j]=(h[t*C+2*(int64_t) HK*S+(int64_t) (qh+(int64_t) j*HK)*S+col]-decay[j]*sum)*beta[t*HV+qh+(int64_t) j*HK];
-                    }
-                    for (int r=0;r<RPG;++r) for (int j=0;j<VPK;++j) {
-                        values[j][r]=sycl::fma(decay[j],values[j][r],sk[rg*RPG+r]*delta[j]);
-                        out[j]=sycl::fma(values[j][r],sq[rg*RPG+r],out[j]);
-                    }
-                    for (int j=0;j<VPK;++j) ro[(j*RG+rg)*CB+c]=out[j];
-                    sycl::group_barrier(it.get_group());
-                    if (rg<VPK) y[t*HV*S+(int64_t) (qh+(int64_t) rg*HK)*S+col]=
-                        (ro[rg*RG*CB+c]+ro[(rg*RG+1)*CB+c]+ro[(rg*RG+2)*CB+c]+ro[(rg*RG+3)*CB+c])*sycl::rsqrt((float) S);
-                }
-                for (int j=0;j<VPK;++j) {
-                    float* base=state+((size_t) (rg*RPG)*HV+qh+(int64_t) j*HK)*S+col;
-                    for (int r=0;r<RPG;++r) base[r*rs]=values[j][r];
-                }
-            });
-        });
-    } else if (gdn_lane_ok(q))
+    if (gdn_lane_ok(q))
         q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
     else q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
