@@ -242,7 +242,6 @@ struct Options {
     bool resident_pin = false;
     std::string shared_expert_arena;
     bool coupled_draft = strata::core::coupled_draft_env();
-    strata::kernels::cpu::PoolAffinity pool_affinity = strata::kernels::cpu::PoolAffinity::All;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -532,7 +531,6 @@ void usage() {
                  "  --resident-experts   the same with as much RAM as is free (less 8 GiB)\n"
                  "  --resident-cpu-experts  cache the static GPU cache's misses in ordinary RAM (with --mmap-experts)\n"
                  "  --shared-expert-arena FILE  share completed expert weights between Linux processes\n"
-                 "  --pool-affinity all|auto|p-cores  CPU worker placement (default: all)\n"
                  "  --coupled-draft / --no-coupled-draft  sample MTP drafts with the target's chain (default: off)\n");
 }
 
@@ -1149,13 +1147,6 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else if (a == "--gpu-stages") o.gpu_stages = true;
-        else if (a == "--pool-affinity") {
-            const std::string v = next("--pool-affinity");
-            if (v == "auto") o.pool_affinity = strata::kernels::cpu::PoolAffinity::Auto;
-            else if (v == "all") o.pool_affinity = strata::kernels::cpu::PoolAffinity::All;
-            else if (v == "p-cores") o.pool_affinity = strata::kernels::cpu::PoolAffinity::PCores;
-            else { std::fprintf(stderr, "strata generate: --pool-affinity needs all, auto or p-cores\n"); return 2; }
-        }
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
@@ -2108,7 +2099,7 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker, o.pool_affinity);
+    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.

@@ -12,7 +12,6 @@
 #include <immintrin.h>
 
 #include <cstdio>
-#include <fstream>
 #include <cstdlib>
 
 #include <pthread.h>
@@ -26,29 +25,22 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 }
 }  // namespace
 
-CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
-    CpuTopology topo;
+std::vector<int> physical_cores(bool skip_first) {
+    std::vector<int> cores;
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
-    // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
-    // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
+    // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
+    // (package, core); the first allowed CPU of each pair is kept, so a taskset
     // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
-    auto topo_read = [](int cpu, const char* what) -> long {
+    auto topo = [](int cpu, const char* what) -> long {
         char path[96];
         std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
         long v = -1;
-        std::ifstream f(path);
-        if (!(f >> v)) v = -1;
+        if (std::FILE* f = std::fopen(path, "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
         return v;
     };
-    auto cap_read = [](int cpu) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
-        long v = -1;
-        std::ifstream f(path);
-        if (!(f >> v)) v = -1;
-        return v;
-    };
-
     std::vector<int> allowed;
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -58,94 +50,18 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     } else {
         for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) allowed.push_back((int) i);
     }
-
-    struct CoreLinux {
-        int cpu = -1;
-        long pkg = -1;
-        long core = -1;
-        long cap = -1;
-        bool is_sibling = false;
-    };
-    std::vector<CoreLinux> all_cpus;
-    std::vector<std::pair<long, long>> seen_phys;
-    long max_cap = 0, min_cap = 1000000;
-
+    std::vector<std::pair<long, long>> seen;
     for (int cpu : allowed) {
-        CoreLinux cl;
-        cl.cpu = cpu;
-        cl.pkg = topo_read(cpu, "physical_package_id");
-        cl.core = topo_read(cpu, "core_id");
-        cl.cap = cap_read(cpu);
-        if (cl.cap > 0) {
-            max_cap = (std::max)(max_cap, cl.cap);
-            min_cap = (std::min)(min_cap, cl.cap);
+        const long pkg = topo(cpu, "physical_package_id"), core = topo(cpu, "core_id");
+        if (pkg >= 0 && core >= 0) {
+            const std::pair<long, long> key{pkg, core};
+            if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;   // an SMT sibling
+            seen.push_back(key);
         }
-        if (cl.pkg >= 0 && cl.core >= 0) {
-            const std::pair<long, long> key{cl.pkg, cl.core};
-            if (std::find(seen_phys.begin(), seen_phys.end(), key) != seen_phys.end()) {
-                cl.is_sibling = true;
-            } else {
-                seen_phys.push_back(key);
-            }
-        }
-        all_cpus.push_back(cl);
+        cores.push_back(cpu);
     }
-
-    topo.is_hybrid = (max_cap > 0 && max_cap > min_cap);
-    if (topo.is_hybrid) {
-        for (const auto& cl : all_cpus) {
-            if (cl.cap == max_cap) {
-                if (!cl.is_sibling) topo.p_cores++;
-                topo.p_threads++;
-            } else {
-                if (!cl.is_sibling) topo.e_cores++;
-            }
-        }
-    } else {
-        topo.p_cores = (int) seen_phys.size();
-        topo.p_threads = (int) all_cpus.size();
-    }
-
-    if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        for (const auto& cl : all_cpus) {
-            if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
-        }
-        if (skip_first && !topo.worker_cores.empty()) {
-            topo.host_core = topo.worker_cores.front();
-            topo.worker_cores.erase(topo.worker_cores.begin());
-        }
-        return topo;
-    }
-
-    // Hybrid CPU on Linux:
-    std::vector<int> p_primaries;
-    std::vector<int> p_siblings;
-    std::vector<int> e_cores;
-
-    for (const auto& cl : all_cpus) {
-        if (cl.cap == max_cap) {
-            if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
-            else p_siblings.push_back(cl.cpu);
-        } else {
-            e_cores.push_back(cl.cpu);
-        }
-    }
-
-    if (skip_first && !p_primaries.empty()) {
-        topo.host_core = p_primaries.front();
-        p_primaries.erase(p_primaries.begin());
-    }
-
-    for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
-    for (int cpu : p_siblings) topo.worker_cores.push_back(cpu);
-    if (affinity != PoolAffinity::PCores) {
-        for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
-    }
-    return topo;
-}
-
-std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
-    return detect_cpu_topology(skip_first, affinity).worker_cores;
+    if (skip_first && !cores.empty()) cores.erase(cores.begin());
+    return cores;
 }
 
 namespace {
@@ -213,17 +129,11 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity)
-    : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
-    if (n_workers > 0) {
-        n_ = n_workers;
-    } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
-        n_ = (std::max)(1, topo_.p_cores - 1);
-    } else {
-        n_ = (int) topo_.worker_cores.size();
-    }
+    const std::vector<int> cores = physical_cores(true);
+    n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
@@ -235,7 +145,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
+        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core);
             worker(i);
