@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-FileCopyrightText: 2023-2026 The ggml authors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/expert.cpp - P2.S3: the Q2_0 expert kernel, promoted from bench/micro/cpu_s2.cpp.
 //
 // The body is the validated kernel, moved rather than rewritten: it carries the P0.T2 parity result
@@ -6,11 +10,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 
 #include <immintrin.h>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
 #include <cpuid.h>
-#endif
 
 #include <cmath>
 #include <atomic>
@@ -352,17 +352,11 @@ const char* CpuFeatures::reason() const {
 CpuFeatures cpu_features() {
     CpuFeatures f;
     int reg[4] = {0, 0, 0, 0};
-#if defined(_MSC_VER)
-    __cpuid(reg, 0);
-    if (reg[0] < 7) return f;
-    __cpuidex(reg, 7, 0);
-#else
     unsigned r[4] = {0, 0, 0, 0};
     __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
     if (r[0] < 7) return f;
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
     for (int i = 0; i < 4; ++i) reg[i] = (int) r[i];
-#endif
     const unsigned ebx = (unsigned) reg[1], ecx = (unsigned) reg[2];
     f.avx512f = (ebx >> 16) & 1u;
     f.avx512bw = (ebx >> 30) & 1u;
@@ -429,8 +423,8 @@ void act_quant_q8_1(const float* x, int n, ActQ& a) {
         for (int j = 0; j < QKA; ++j) {
             // **`std::lround` IS A FUNCTION CALL AND IT COST 51 us PER LAYER.**  Measured: quantizing 2560
             // floats took 51.3 us - 20 ns per element, about 60 cycles for a fabs, a multiply and a round.
-            // `lround` respects the current rounding mode, so MSVC cannot inline it to a single instruction
-            // and emits a call per element.  48 layers x 51.3 us = 2.46 ms/token, which is 8.6% of the whole
+            // `lround` respects the current rounding mode and can emit a call per element.
+            // 48 layers x 51.3 us = 2.46 ms/token, which is 8.6% of the whole
             // CPU expert term and is pure overhead.
             //
             // `t + copysign(0.5, t)` is EXACTLY `lround`'s rule - round half AWAY FROM ZERO - and it is

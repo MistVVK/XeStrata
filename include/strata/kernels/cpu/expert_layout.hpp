@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/cpu/expert_layout.hpp - plan v0.3 P6: where each routed expert lives in experts.bin.
 //
 // A Q2_0 pack (tools/strata_pack.py) has one blob size for every layer, `BLOB`, in the Strata expert form.  A
@@ -23,8 +26,9 @@ struct ExpertLayout {
     /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in the model's shard 1, so
     /// the arena can be filled from the GGUF itself when the pack has no experts.bin (3 x n_layers, 0 = unknown).
     std::vector<uint64_t> gguf_off;
-    /// Per layer, the GGUF file (a name beside the --native shard) that holds its experts when the model's
-    /// shards split the layers (Swift's GGUFs: layers 13-47 in shard 2).  Empty = the --native shard itself.
+    /// Per layer, the GGUF files (names beside the --native shard) that hold its gate / up / down tensors when
+    /// the model's shards split the layers (Swift's GGUFs: layers 13-47 in shard 2, and layer 13's down tensor in
+    /// shard 1) (3 x n_layers).  Empty = the --native shard itself.
     std::vector<std::string> gguf_file;
     uint64_t max_blob = BLOB;
     uint64_t total = 0;                   ///< experts.bin size

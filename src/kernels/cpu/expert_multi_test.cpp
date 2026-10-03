@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/expert_multi_test.cpp - plan v0.3 P6: one expert, several tokens (CPU only, synthetic data).
 //
 //   expert_multi_test              bitwise check: s2_expert_vnni_multi vs s2_expert_vnni_q per token, n = 1..8
@@ -32,7 +35,12 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    c::cpu_require_expert_support();
+    // The kernels under test are AVX-512 only (canonical packs); an AVX-2 CPU runs native packs, whose expert rows
+    // native_expert_parity checks.  77 is CTest's SKIP_RETURN_CODE for this test: skipped, neither failed nor passed.
+    if (const c::CpuFeatures f = c::cpu_features(); !f.usable()) {
+        std::printf("expert_multi_test: skipped, this CPU cannot run the AVX-512 expert kernel (%s)\n", f.reason());
+        return 77;
+    }
     std::mt19937 rng(9);
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;
     const int E = bench ? (argc > 2 ? std::atoi(argv[2]) : 256) : 4;

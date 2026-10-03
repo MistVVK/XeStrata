@@ -1,14 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cstdio>
 #include <cstdlib>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <immintrin.h>
-#else
 #include <cpuid.h>
-#endif
 #include <fstream>
 #include <sstream>
 
@@ -24,25 +22,15 @@ bool cpu_avx512_ok() {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
-#if defined(_MSC_VER)
-            int x[4];
-            __cpuidex(x, (int) leaf, (int) sub);
-            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
-#else
             __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
-#endif
         };
         cpuid(0, 0);
         if (r[0] < 7) return false;
         cpuid(1, 0);
         if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
-#if defined(_MSC_VER)
-        const unsigned long long xcr0 = _xgetbv(0);
-#else
         unsigned lo = 0, hi = 0;
         __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
         const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
-#endif
         if ((xcr0 & 0xE6) != 0xE6) return false;          // the OS saves the AVX-512 state
         cpuid(7, 0);
         const unsigned ebx = r[1], ecx = r[2];
@@ -95,6 +83,22 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
             if (!line.empty() && line[0] == '#') {
+                // The version: upstream Strata's "# strata native experts vN" (v2-v4 known) or XeStrata's own
+                // "# xestrata native experts xsN" (xs1), numbered apart so neither is taken for the other.  A
+                // version this engine does not know may mean columns it would misread, so it is refused.
+                static const char up_tag[] = "# strata native experts v", xs_tag[] = "# xestrata native experts xs";
+                const bool up = line.compare(0, sizeof up_tag - 1, up_tag) == 0;
+                const bool xs = line.compare(0, sizeof xs_tag - 1, xs_tag) == 0;
+                if (up || xs) {
+                    const char* num = line.c_str() + (up ? sizeof up_tag : sizeof xs_tag) - 1;
+                    const int v = (int) std::strtol(num, nullptr, 10);
+                    if (v > (up ? 4 : 1)) {
+                        err = std::string("native_experts.txt is ") + (up ? "v" : "xs") + std::to_string(v) +
+                              "; this engine reads upstream's v2-v4 and XeStrata's xs1 (repack with this "
+                              "checkout's tools/iq_pack.py)";
+                        return false;
+                    }
+                }
                 // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
                 // fewer experts than the canonical geometry the caller passes, which is a compile-time
                 // default, so the header wins.
@@ -122,10 +126,35 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             L.gguf_off[(size_t) (3 * l)] = go;
             L.gguf_off[(size_t) (3 * l + 1)] = uo;
             L.gguf_off[(size_t) (3 * l + 2)] = dox;
-            std::string file;             // v3: the shard that holds this layer (a file name beside --native)
-            if (ss >> file) {
-                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) n_layers, std::string());
-                L.gguf_file[(size_t) l] = file;
+            // The shards (file names beside --native): one for the layer, or one per role as "gate,up,down" (an
+            // empty field for the --native shard: upstream's v4 and XeStrata's xs1), or as three names apart with
+            // "-" for it (XeStrata's packs before xs1, which said v4).  A GGUF name has no comma or space.
+            std::vector<std::string> files;
+            for (std::string file; ss >> file;) files.push_back(file);
+            if (files.size() == 1 && files[0].find(',') != std::string::npos) {
+                const std::string col = files[0];
+                files.clear();
+                for (size_t from = 0;;) {
+                    const size_t comma = col.find(',', from);
+                    files.push_back(col.substr(from, comma == std::string::npos ? comma : comma - from));
+                    if (comma == std::string::npos) break;
+                    from = comma + 1;
+                }
+            }
+            for (auto& f : files)
+                if (f == "-") f.clear();
+            if (files.size() == 1) {
+                const std::string one = files[0];
+                files.assign(3, one);
+            }
+            if (!files.empty() && files.size() != 3) {
+                err = "native_experts.txt: layer " + std::to_string(l) + ": the shard column is one name, "
+                      "gate,up,down or three names, not: " + line;
+                return false;
+            }
+            if (!files.empty()) {
+                if (L.gguf_file.empty()) L.gguf_file.assign((size_t) (3 * n_layers), std::string());
+                for (int r = 0; r < 3; ++r) L.gguf_file[(size_t) (3 * l + r)] = files[(size_t) r];
             }
         }
         L.fmt[(size_t) l] = f;

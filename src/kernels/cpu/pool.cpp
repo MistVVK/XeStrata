@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
@@ -11,13 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <pthread.h>
 #include <sched.h>
-#endif
 
 namespace strata::kernels::cpu {
 
@@ -29,35 +27,9 @@ constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
 
 std::vector<int> physical_cores(bool skip_first) {
     std::vector<int> cores;
-#if defined(_WIN32)
-    // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on
-    // every SMT machine half of them are siblings - pinning one worker to each of the first N would put two
-    // workers on each physical core and halve the bandwidth the expert kernel is bound by.
-    DWORD len = 0;
-    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) {
-        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back((int) i);
-    } else {
-        std::vector<char> buf(len);
-        if (GetLogicalProcessorInformationEx(RelationProcessorCore,
-                                             (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
-            const char* p = buf.data();
-            const char* end = p + len;
-            while (p < end) {
-                const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
-                if (e->Relationship == RelationProcessorCore) {
-                    const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
-                    for (int bit = 0; bit < 64; ++bit)
-                        if (g.Mask & (1ull << bit)) { cores.push_back((int) (g.Group * 64 + bit)); break; }
-                }
-                p += e->Size;
-            }
-        }
-    }
-#else
     // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
-    // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
-    // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
+    // load/store bandwidth, so a worker on each would put two workers on one core. sysfs names each CPU's
+    // (package, core); the first allowed CPU of each pair is kept, so a taskset
     // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
     auto topo = [](int cpu, const char* what) -> long {
         char path[96];
@@ -88,7 +60,6 @@ std::vector<int> physical_cores(bool skip_first) {
         }
         cores.push_back(cpu);
     }
-#endif
     if (skip_first && !cores.empty()) cores.erase(cores.begin());
     return cores;
 }
@@ -97,26 +68,16 @@ namespace {
 
 void pin_this_thread(int core) {
     if (core < 0) return;
-#if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
-#else
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(core, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-#endif
 }
 
 }  // namespace
 
 long long pin_current_thread(int core) {
     if (core < 0) return -1;
-#if defined(_WIN32)
-    // `SetThreadAffinityMask` RETURNS the previous mask, or 0 on failure - so 0 doubles as the error, which is
-    // why the caller must not treat it as a restorable value.
-    const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
-    return prev == 0 ? -1 : (long long) prev;
-#else
     cpu_set_t prev;
     CPU_ZERO(&prev);
     if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
@@ -125,20 +86,15 @@ long long pin_current_thread(int core) {
         if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
     pin_this_thread(core);
     return (long long) mask;
-#endif
 }
 
 void restore_thread_affinity(long long previous) {
     if (previous <= 0) return;
-#if defined(_WIN32)
-    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
-#else
     cpu_set_t set;
     CPU_ZERO(&set);
     for (int i = 0; i < 64; ++i)
         if ((previous >> i) & 1) CPU_SET(i, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
-#endif
 }
 
 namespace {

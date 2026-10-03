@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/native_expert.cpp - plan v0.3 P6: native (GGUF-form) experts on the CPU through ggml-cpu.
 // See the header.  Nothing here is Strata arithmetic: the activation quantizers and the row dot products are
 // ggml-cpu's, so an IQ expert computes what llama.cpp's CPU backend computes for it.
@@ -84,12 +87,17 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
     static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
     static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
-    if (nt >= 2 && iq512_supported(f.gu_type)) {   // one token: ggml-cpu is as fast or faster
-        if (avx512) {
+    // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
+    // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
+    // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
+    static const bool cpu512 = cpu_avx512_ok();
+    if (nt >= 2 && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
+        // one token: ggml-cpu is as fast or faster
+        if (avx512 && iq512_supported(f.gu_type)) {
             iq512_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }
-        if (avx2) {
+        if (avx2 && iq256_supported(f.gu_type)) {
             iq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
             return;
         }

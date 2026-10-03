@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/cpu/expert.hpp - P2.S3: the CPU expert path.
 //
 // This is the Q2_0 expert kernel promoted out of `bench/micro/cpu_s2.cpp`, which is the instrument that
@@ -78,8 +81,8 @@ struct ExpertScratch {
 };
 
 /// Runtime CPU feature check.  The kernel uses AVX512-VNNI + AVX512-VBMI + AVX512VL, and code compiled with
-/// `/arch:AVX512` can emit AVX-512 anywhere in its translation unit, so a machine without them must be
-/// REFUSED rather than silently run.  `s2_expert_scalar` is the fallback and exists for tests.
+/// AVX-512 compiler options can emit those instructions anywhere in the translation unit, so a machine without
+/// them must be REFUSED rather than silently run. `s2_expert_scalar` is the fallback and exists for tests.
 struct CpuFeatures {
     bool avx512f = false;
     bool avx512bw = false;
