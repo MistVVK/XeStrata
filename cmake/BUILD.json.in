@@ -1,0 +1,9 @@
+{
+  "name": "XeStrata",
+  "version": "@PROJECT_VERSION@",
+  "backend": "xe",
+  "upstream": {"name": "Strata", "version": "@STRATA_UPSTREAM_VERSION@", "commit": "@STRATA_UPSTREAM_COMMIT@"},
+  "compiler": {"id": "@CMAKE_CXX_COMPILER_ID@", "version": "@CMAKE_CXX_COMPILER_VERSION@"},
+  "device_code": "SPIR-V JIT",
+  "scope": "device, host memory, transfers, elementwise parity; no inference executable"
+}
