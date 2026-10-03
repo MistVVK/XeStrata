@@ -51,7 +51,7 @@ sudo apt install git cmake ninja-build g++ python3 libhwloc-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update
 ```
 
-Its configuration downloads what the release pins (Level Zero's headers and loader, newer than Ubuntu 26.04's 1.28; emhash), all free software, so it needs the network. The toolchain is `.tools/intel-llvm/install/bin/clang++`, its runtime `.tools/intel-llvm/install/lib/libsycl.so`; configure the engine with `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` and run it with that `lib/` on `LD_LIBRARY_PATH`.
+Its configuration downloads what the release pins (Level Zero's headers and loader, newer than Ubuntu 26.04's 1.28; emhash), all free software, so it needs the network. The script makes it fetch Level Zero even when one is installed (`SYCL_UR_FORCE_FETCH_LEVEL_ZERO`): without `pkg-config` the runtime adapter takes an installed loader without checking its version, and Debian 13's 1.20 failed to compile. The toolchain is `.tools/intel-llvm/install/bin/clang++`, its runtime `.tools/intel-llvm/install/lib/libsycl.so`; configure the engine with `-DCMAKE_CXX_COMPILER=$PWD/.tools/intel-llvm/install/bin/clang++` and run it with that `lib/` on `LD_LIBRARY_PATH`.
 On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes; the clone (2.8 GB) and `install/` (0.7 GB) stay, the build tree is deleted (its size was not measured). Its runtime gives the Arc Pro B70 XMX (FP16 and BF16), which 6.2's does not.
 
 ## Intel SDE (the AVX-512 paths)
