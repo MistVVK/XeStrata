@@ -71,9 +71,6 @@ struct NativeExpertLayout {
 /// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
 bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
-/// Whether `native_expert_grouped` has kernels for this gate/up and down type pair at these dimensions, and the
-/// prompt path's dequantizer takes both (checked for every layer at startup, before anything is allocated).
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept;
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);

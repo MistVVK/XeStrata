@@ -610,14 +610,14 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                 }
             });
         });
-    } else     if (gdn_lane_ok(q))
+    } else if (gdn_lane_ok(q))
         q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
     else q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * CB), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int head = (int) (int) it.get_group(0) / NCB, cb = (int) (int) it.get_group(0) % NCB;
-            const int tid = (int) (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
+            const int head = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
+            const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
             const int qh = head % HK;
             float s[RPG];
             float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
@@ -675,7 +675,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) (int) it.get_group(0);
+            const int64_t t = (int64_t) it.get_group(0);
             const int head = (int) it.get_group(1), col = (int) it.get_local_id(1);
             const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
             const float oc = y[at];
@@ -742,8 +742,8 @@ void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, 
     Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            float* r = x + (int64_t) (int) it.get_group(0) * ld;
-            const int tid = (int) (int) it.get_local_id(0);
+            float* r = x + (int64_t) it.get_group(0) * ld;
+            const int tid = (int) it.get_local_id(0);
             float ss = 0.0f;
             for (int64_t c = tid; c < cols; c += 256) ss += r[c] * r[c];
             const float s = sycl::rsqrt(block_sum(it, ss, &sh[0]) / (float) cols + eps);
