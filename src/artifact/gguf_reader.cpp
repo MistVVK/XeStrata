@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/artifact/gguf_reader.cpp - the `strata-gguf` CLI.  The reader itself is header-only in
 // include/strata/artifact/gguf_reader.hpp; this file is just the entry point, so it cannot drift
 // from the library it exercises.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/spec/controller.hpp - plan v0.3 P6: which drafter, and how many draft tokens, this step.
 //
 // Each step the controller maximizes  E[tokens committed] / T(step)  over the choices

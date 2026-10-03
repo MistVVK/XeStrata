@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/graph.hpp - P2.S5: the GraphRegistry.
 //
 // `GraphRegistry`: capture/replay wrappers keyed by `(layer_type, n_tokens)`, with static input/output
@@ -10,8 +13,7 @@
 // 1. **THE WAIT MUST POLL THE DRIVER, NOT MEMORY.**  The phase's host loop says "spin on
 //    doorbell_seq == expected ... no cudaStreamSynchronize anywhere".  A spin that only reads memory NEVER
 //    RUNS THE KERNEL: 5,907,703 spins over 500 ms, and the datum flips to 1 the instant anything calls into
-//    the driver and never before.  On Windows the display driver model BATCHES command submission, and a
-//    thread that only reads memory gives it no reason to flush.  Hence `wait_ms`, which polls an event -
+//    the driver and never before. Hence `wait_ms`, which polls an event -
 //    a QUERY and not a blocking sync, so P2.X3's "zero synchronization calls in the layer loop" still holds,
 //    and it costs 0.021 ms.
 //
@@ -38,7 +40,7 @@
 #include <string>
 #include <vector>
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 namespace strata::core {
 
@@ -46,7 +48,7 @@ namespace strata::core {
 enum class LayerType : int { GDN = 0, QSA = 1 };
 inline const char* to_string(LayerType t) { return t == LayerType::GDN ? "GDN" : "QSA"; }
 
-/// One recorded graph.  Move-only: it owns a `cudaGraphExec_t` and an event, and two owners would
+/// One recorded graph.  Move-only: it owns an executable graph and an event, and two owners would
 /// double-destroy.
 class CapturedGraph {
 public:
@@ -65,6 +67,9 @@ public:
     /// to be replayed happily forever.
     bool end(void* stream, std::string& err);
 
+    /// Stops a recording in progress and discards it.
+    void abandon(void* stream);
+
     /// Replay.  Does not synchronise.
     bool launch(void* stream, std::string& err) const;
 
@@ -78,9 +83,10 @@ public:
 
 private:
     void reset();
-    cudaGraph_t graph_ = nullptr;
-    cudaGraphExec_t exec_ = nullptr;
-    cudaEvent_t done_ = nullptr;
+    gpu::Graph* exec_ = nullptr;
+    gpu::Event* done_ = nullptr;
+    bool capturing_ = false;
+    void* capture_stream_ = nullptr;   // the stream a recording in progress belongs to
     size_t nodes_ = 0;
 };
 

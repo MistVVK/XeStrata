@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
+#include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <utility>
 #include <cstring>
 
@@ -67,6 +72,77 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
     return true;
 }
 
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior) {
+    const size_t n = (size_t) (n_layers * n_expert);
+    std::vector<int64_t> prior_rank(n, INT64_MAX);
+    for (size_t r = 0; r < prior.size(); ++r) {
+        const auto [l, e] = prior[r];
+        if (l >= 0 && l < n_layers && e >= 0 && e < n_expert) {
+            int64_t& pr = prior_rank[(size_t) (l * n_expert + e)];
+            if (pr == INT64_MAX) pr = (int64_t) r;
+        }
+    }
+    std::vector<int64_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = (int64_t) i;
+    auto res = [&](int64_t i) { return (size_t) i < resident.size() && resident[(size_t) i] != 0; };
+    auto ht = [&](int64_t i) { return (size_t) i < heat.size() ? heat[(size_t) i] : 0.0; };
+    std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+        if (res(a) != res(b)) return res(a);
+        if (ht(a) != ht(b)) return ht(a) > ht(b);
+        if (prior_rank[(size_t) a] != prior_rank[(size_t) b]) return prior_rank[(size_t) a] < prior_rank[(size_t) b];
+        return a < b;
+    });
+    std::vector<std::pair<int32_t, int32_t>> ranked(n);
+    for (size_t r = 0; r < n; ++r)
+        ranked[r] = {(int32_t) (order[r] / n_expert), (int32_t) (order[r] % n_expert)};
+    return ranked;
+}
+
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535) {
+        err = "write_expert_profile: the model's layout does not fit the format";
+        return false;
+    }
+    std::vector<int32_t> table((size_t) (n_layers * n_expert), -1);
+    std::vector<uint16_t> pairs;
+    pairs.reserve(ranked.size() * 2);
+    for (size_t r = 0; r < ranked.size(); ++r) {
+        const auto [l, e] = ranked[r];
+        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
+            err = "write_expert_profile: a ranked pair is out of range";
+            return false;
+        }
+        table[(size_t) (l * n_expert + e)] = (int32_t) r;
+        pairs.push_back((uint16_t) l);
+        pairs.push_back((uint16_t) e);
+    }
+    const uint32_t hdr[5] = {1u, (uint32_t) n_layers, (uint32_t) n_expert, (uint32_t) ranked.size(),
+                             (uint32_t) ranked.size()};
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile: cannot create " + tmp;
+        return false;
+    }
+    // the format is little-endian (make_profile.py's "<"): so is every machine this engine runs on
+    bool ok = std::fwrite("STRP", 1, 4, f) == 4 && std::fwrite(hdr, 4, 5, f) == 5 &&
+              (pairs.empty() || std::fwrite(pairs.data(), 2, pairs.size(), f) == pairs.size()) &&
+              std::fwrite(table.data(), 4, table.size(), f) == table.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);   // replaces an existing file (MoveFileEx / rename(2))
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        err = "write_expert_profile: cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
 ExpertCache::~ExpertCache() { close(); }
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
@@ -90,7 +166,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+    if (strata::gpu::mem_info(&free_b, &total_b)) {
         if ((uint64_t) free_b < want) {
             char buf[320];
             std::snprintf(buf, sizeof buf,
@@ -104,18 +180,18 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    if (!strata::gpu::alloc_device((void**) &base_, (size_t) want)) {
         base_ = nullptr;
         char buf[256];
-        std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
-                      (double) want / 1073741824.0, cudaGetErrorString(cudaGetLastError()));
+        std::snprintf(buf, sizeof buf, "ExpertCache: device allocation of %.2f GiB failed: %s",
+                      (double) want / 1073741824.0, strata::gpu::last_error());
         err = buf;
         return false;
     }
     // Zeroed so a slot read before it is filled is a DETERMINISTIC wrong answer rather than whatever the
     // allocator handed back.  A stale block of a previous process's memory would still sum to finite floats.
-    if (cudaMemset(base_, 0, (size_t) want) != cudaSuccess) {
-        err = "ExpertCache: cudaMemset of the slot arena failed";
+    if (!strata::gpu::memset(base_, 0, (size_t) want)) {
+        err = std::string("ExpertCache: zeroing the slot arena failed: ") + strata::gpu::last_error();
         close();
         return false;
     }
@@ -161,7 +237,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 void ExpertCache::close() {
     off_.clear();
     if (base_ != nullptr) {
-        cudaFree(base_);
+        strata::gpu::free(base_);
         base_ = nullptr;
     }
     residency_.clear();
@@ -235,10 +311,9 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
         err = "ExpertCache::fill_slot: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice,
-                                          (cudaStream_t) stream);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot: ") + cudaGetErrorString(e);
+    const bool e = strata::gpu::copy_async(dst, host_blob, n, stream);
+    if (!e) {
+        err = std::string("ExpertCache::fill_slot: ") + strata::gpu::last_error();
         return false;
     }
     ++fills_;
@@ -256,9 +331,9 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpy(dst, host_blob, n, cudaMemcpyHostToDevice);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot_blocking: ") + cudaGetErrorString(e);
+    const bool e = strata::gpu::copy(dst, host_blob, n);
+    if (!e) {
+        err = std::string("ExpertCache::fill_slot_blocking: ") + strata::gpu::last_error();
         return false;
     }
     ++fills_;
@@ -273,9 +348,9 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
                              : "ExpertCache::fill_slot_queued: the host blob is null";
         return false;
     }
-    const cudaError_t e = cudaMemcpyAsync(dst, host_blob, n, cudaMemcpyHostToDevice, (cudaStream_t) 0);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::fill_slot_queued: ") + cudaGetErrorString(e);
+    const bool e = strata::gpu::copy_async(dst, host_blob, n, 0);
+    if (!e) {
+        err = std::string("ExpertCache::fill_slot_queued: ") + strata::gpu::last_error();
         return false;
     }
     ++fills_;
@@ -283,9 +358,9 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
 }
 
 bool ExpertCache::sync_queued(std::string& err) {
-    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::sync_queued: ") + cudaGetErrorString(e);
+    const bool e = strata::gpu::stream_sync(0);
+    if (!e) {
+        err = std::string("ExpertCache::sync_queued: ") + strata::gpu::last_error();
         return false;
     }
     return true;
@@ -302,9 +377,9 @@ bool ExpertCache::verify_slot(int32_t slot, const uint8_t* host_blob, std::strin
     // has happened is not a check.  It also synchronises the fills queued before it, which is what makes the
     // comparison meaningful.
     std::vector<uint8_t> got((size_t) nb);
-    const cudaError_t e = cudaMemcpy(got.data(), src, (size_t) nb, cudaMemcpyDeviceToHost);
-    if (e != cudaSuccess) {
-        err = std::string("ExpertCache::verify_slot: ") + cudaGetErrorString(e);
+    const bool e = strata::gpu::copy(got.data(), src, (size_t) nb);
+    if (!e) {
+        err = std::string("ExpertCache::verify_slot: ") + strata::gpu::last_error();
         return false;
     }
     if (std::memcmp(got.data(), host_blob, (size_t) nb) != 0) {

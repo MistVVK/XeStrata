@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/artifact/gguf_reader.hpp - generated from src/artifact/gguf_reader.cpp by
 // scripts/split_artifact.py.  Header-only on purpose: the reader is one translation unit's worth of
 // code with no state to hide, and a header-only split cannot introduce a duplicate-symbol or
@@ -18,7 +21,7 @@
 // already established independently (1,223 / 1 tensors; 202 Q2_0 in shard 1). Agreement with those
 // numbers is the test.
 //
-// Build: scripts/build_artifact.bat        Run: gguf_reader.exe <file.gguf> [--check]
+// Run: strata-gguf <file.gguf> [--check]
 
 #include <cstdint>
 #include <cstdio>
@@ -27,18 +30,16 @@
 #include <vector>
 #include <map>
 #include <set>
+#include "strata/artifact/gguf_split.hpp"
 #include <stdexcept>
 #include <algorithm>
+#include <limits>
+#include <memory>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 namespace strata {
 
@@ -89,6 +90,8 @@ inline const char* ggml_type_name(uint32_t t) {
         return "IQ2_S";
     case 23:
         return "IQ4_XS";
+    case 24:
+        return "I8";
     case 30:
         return "BF16";
     case 34:
@@ -196,6 +199,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 29:   // IQ1_M
         elems = 256;
         bytes = 56;
+        return true;
+    case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
+        elems = 1;
+        bytes = 1;
         return true;
     case 42:
         elems = 64;
@@ -339,6 +346,7 @@ public:
     uint32_t version() const { return version_; }
     uint64_t data_start() const { return data_start_; }
     uint64_t file_size() const { return size_; }
+    const std::string& path() const { return path_; }
 
     const TensorInfo* find(const std::string& name) const {
         for (const auto& t : tensors_)
@@ -359,27 +367,6 @@ public:
 
 private:
     void open() {
-#ifdef _WIN32
-        HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                               FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
-        LARGE_INTEGER li{};
-        GetFileSizeEx(h, &li);
-        size_ = (uint64_t)li.QuadPart;
-        HANDLE m = CreateFileMappingA(h, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!m) {
-            CloseHandle(h);
-            throw std::runtime_error("CreateFileMapping failed");
-        }
-        base_ = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
-        if (!base_) {
-            CloseHandle(m);
-            CloseHandle(h);
-            throw std::runtime_error("MapViewOfFile failed");
-        }
-        map_ = m;
-        file_ = h;
-#else
         int fd = ::open(path_.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error("cannot open " + path_);
         fd_ = fd;
@@ -389,18 +376,11 @@ private:
         void* p = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
         if (p == MAP_FAILED) throw std::runtime_error("mmap failed");
         base_ = (const uint8_t*)p;
-#endif
         parse();
     }
     void close() {
-#ifdef _WIN32
-        if (base_) UnmapViewOfFile(base_);
-        if (map_) CloseHandle((HANDLE)map_);
-        if (file_) CloseHandle((HANDLE)file_);
-#else
         if (base_) munmap((void*)base_, size_);
         if (fd_ >= 0) ::close(fd_);
-#endif
     }
 
     void parse() {
@@ -447,12 +427,7 @@ private:
     const uint8_t* base_ = nullptr;
     uint64_t size_ = 0, data_start_ = 0, alignment_ = 32;
     uint32_t version_ = 0;
-#ifdef _WIN32
-    void* file_ = nullptr;
-    void* map_ = nullptr;
-#else
     int fd_ = -1;
-#endif
     std::vector<TensorInfo> tensors_;
     std::map<std::string, MetaValue> meta_;
 };
@@ -489,5 +464,103 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     }
     return {}; // empty == ok
 }
+
+// Bytes of a tensor's payload from its shape and block geometry; 0 when the type is unknown, a row is not whole
+// blocks, or the count overflows.
+inline uint64_t tensor_payload_bytes(const TensorInfo& t) {
+    int be = 0, bb = 0;
+    if (t.shape.empty() || !block_geometry(t.type, be, bb) || t.shape[0] % (uint64_t) be) return 0;
+    uint64_t elements = 1;
+    for (uint64_t d : t.shape) {
+        if (d == 0 || elements > (std::numeric_limits<uint64_t>::max)() / d) return 0;
+        elements *= d;
+    }
+    const uint64_t blocks = elements / (uint64_t) be;
+    if (blocks > (std::numeric_limits<uint64_t>::max)() / (uint64_t) bb) return 0;
+    return blocks * (uint64_t) bb;
+}
+
+// The shards of one model (strata::gguf_split_paths), opened together; tensors are looked up across all of them.
+// From eddoursul/Strata 8029fa9, with the split-key validation of #255 (gopinath87607) made a property of the
+// model rather than of one loader: a split GGUF carries the model's metadata (general.architecture and the
+// qwen4exp keys) in its FIRST shard only, and the later shards just declare split.count / split.no /
+// split.tensors.count.  Unsloth's UD-Q4_K_XL is the extreme case: shard 1 holds the metadata and no tensor at
+// all, and output.weight, token_embd.weight and the PLE table live in shard 2.  So the architecture is checked
+// on `meta()` and a tensor is read from the shard that holds it.
+//
+// Refused at construction: a later shard whose split keys disagree with shard 1's (another model's shard, or a
+// shard renamed into the family), a split model whose tensor directories do not add up to split.tensors.count,
+// and a tensor name present in two shards (GGUF has no index to say which one is meant).
+class GgufModel {
+public:
+    explicit GgufModel(const std::vector<std::string>& paths) {
+        if (paths.empty()) throw std::runtime_error("GGUF: a model needs at least one shard");
+        for (const auto& p : paths) shards_.push_back(std::make_unique<GgufFile>(p));
+        validate_split();
+        for (size_t i = 0; i < shards_.size(); ++i)
+            for (const auto& t : shards_[i]->tensors()) {
+                const auto ins = index_.emplace(t.name, std::make_pair(i, &t));
+                if (!ins.second)
+                    throw std::runtime_error("GGUF: tensor " + t.name + " is in two shards (" +
+                                             shards_[ins.first->second.first]->path() + " and " +
+                                             shards_[i]->path() + ")");
+            }
+    }
+    /// Opens every shard of the model that `any_shard` belongs to (throws when one is missing).
+    static GgufModel open(const std::string& any_shard) { return GgufModel(gguf_split_paths(any_shard)); }
+
+    size_t size() const { return shards_.size(); }
+    const GgufFile& shard(size_t i) const { return *shards_[i]; }
+    /// The metadata shard: general.architecture and the model's keys.
+    const GgufFile& meta() const { return *shards_[0]; }
+    /// The tensor named `name` (its shard index in `*shard`), or nullptr.
+    const TensorInfo* find(const std::string& name, size_t* shard = nullptr) const {
+        const auto it = index_.find(name);
+        if (it == index_.end()) return nullptr;
+        if (shard) *shard = it->second.first;
+        return it->second.second;
+    }
+    /// Whether `t` (a tensor of shard `s`) has a known byte count that lies inside its file.
+    bool in_bounds(const TensorInfo& t, size_t s) const {
+        const GgufFile& g = *shards_[s];
+        const uint64_t bytes = tensor_payload_bytes(t);
+        const uint64_t payload = g.file_size() - g.data_start();
+        return bytes != 0 && t.offset <= payload && bytes <= payload - t.offset;
+    }
+
+private:
+    void validate_split() const {
+        const size_t n = shards_.size();
+        const MetaValue* count0 = shards_[0]->get("split.count");
+        if (n == 1) {
+            if (count0 && count0->u > 1)
+                throw std::runtime_error("GGUF: " + shards_[0]->path() + " is shard 1 of " + std::to_string(count0->u) +
+                                         ", but it was opened as a whole model");
+            return;
+        }
+        if (!shards_[0]->get("general.architecture"))
+            throw std::runtime_error("GGUF: " + shards_[0]->path() + " has no general.architecture; the first shard "
+                                     "of a split model carries the metadata");
+        const MetaValue* total = shards_[0]->get("split.tensors.count");
+        uint64_t tensors = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const GgufFile& g = *shards_[i];
+            const MetaValue* count = g.get("split.count");
+            const MetaValue* no = g.get("split.no");
+            const MetaValue* tc = g.get("split.tensors.count");
+            if (!count || !no || count->u != n || no->u != i || (total && (!tc || tc->u != total->u)))
+                throw std::runtime_error("GGUF: " + g.path() + " does not declare itself shard " + std::to_string(i + 1) +
+                                         " of " + std::to_string(n) + " of this model (split.count / split.no / "
+                                         "split.tensors.count)");
+            tensors += g.tensors().size();
+        }
+        if (total && tensors != total->u)
+            throw std::runtime_error("GGUF: the " + std::to_string(n) + " shards hold " + std::to_string(tensors) +
+                                     " tensors, but split.tensors.count is " + std::to_string(total->u));
+    }
+
+    std::vector<std::unique_ptr<GgufFile>> shards_;
+    std::map<std::string, std::pair<size_t, const TensorInfo*>> index_;
+};
 
 } // namespace strata

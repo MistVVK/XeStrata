@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/verify.hpp - plan v0.3 P6: the speculative VERIFY window.
 //
 // T tokens at consecutive positions p0 .. p0+T-1 - the last accepted token and T-1 drafts - go through all 48
@@ -28,7 +31,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 #include <cstdint>
 #include <string>
@@ -67,6 +70,9 @@ public:
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
+    /// The head's raw logits for the first `rows` tokens of the last window (the last stage's head):
+    /// `rows` x n_vocab floats into `host`.  For --dump-logits; call after `run`, before the next window.
+    bool read_logits(int rows, float* host, std::string& err) const;
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -109,6 +115,22 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+    /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
+    /// the same queue and the drafter reads nothing it writes, so it overlaps the draft.  Whoever reads or writes the
+    /// session from another queue or the host afterwards (a new request, a checkpoint, the prompt path, the end of a
+    /// run) calls wait_commit() first (upstream 42b4299, a454dbb).  STRATA_COMMIT_SYNC=1 keeps the wait.
+    static void set_commit_async(bool on);
+    /// Waits for the last commit graph when commit() did not (an event recorded after it, not the whole device);
+    /// false with `err` when it failed.  Free when nothing is pending.
+    bool wait_commit(std::string& err);
+
+    /// Measurement hook (STRATA_LOGPOS, upstream 06b82fe / 5e14c19): after run(), one line per row t of the last
+    /// window's head - "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra", and with
+    /// STRATA_LOGPOS_TOPK=K the K most likely tokens as `id:logprob` - where row t is the distribution at pos0 + t,
+    /// targets[t] the token at pos0 + t + 1, extra_logprob that of `extra_id` in the row, and the last column the
+    /// target's log-probability renormalized over every token but `extra_id` (nan when they do not apply).
+    bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
+                         std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -129,8 +151,8 @@ public:
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
     int64_t windows = 0;
-    /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
-    /// window), as one line; empty when off.
+    /// STRATA_VERIFY_PROFILE=1 - GPU stage counts since the last call (millions of device-clock ticks per
+    /// window), as one line; empty when off, unsupported, or no windows have been profiled.
     std::string profile_report();
 
 private:
@@ -155,8 +177,9 @@ private:
     void* next_user_ = nullptr;
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     bool capture_commit(std::string& err);
-    bool record_window(int T, cudaStream_t cs, std::string& err);
-    static constexpr int kProfPer = 32;              // stamps per layer
+    bool record_window(int T, strata::gpu::Stream cs, std::string& err);
+    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second half's up-stamp
+                                                     // at slot 32 = the next layer's slot 0: upstream e5b47dd)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
@@ -173,9 +196,15 @@ private:
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
-    cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t commit_exec_ = nullptr;
+    strata::gpu::Stream cs_ = nullptr;
+    strata::gpu::Graph* exec_[9] = {};
+    strata::gpu::Graph* commit_exec_ = nullptr;
+    // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as
+    // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
+    // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.
+    bool segmented_ = false;
+    std::vector<strata::gpu::Graph*> segs_[9];
+    std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T
@@ -191,7 +220,9 @@ private:
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
-    cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    strata::gpu::Event* commit_done_ = nullptr;   // recorded after an async commit (set_commit_async)
+    bool commit_pending_ = false;
+    strata::gpu::Stream copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
@@ -223,6 +254,7 @@ private:
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
+    static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;

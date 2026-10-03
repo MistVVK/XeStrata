@@ -1,9 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
-
-#include <cuda_runtime.h>
 
 #include <cstdint>
 #include <string>
@@ -48,38 +49,15 @@ public:
     double ms_wait() const { return ms_wait_; }
 
 private:
+    // the Xe runtime has no helper GPU (src/core/remote_experts.cpp): only what the accessors above report
     int device_ = -1;
-    int64_t n_expert_ = 0;
-    int32_t groups_ = 0;
     int64_t computed_ = 0;
     int64_t launched_layers_ = 0;
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
     ExpertCache cache_;
-    cudaStream_t stream_ = nullptr;
-    float* h_x_ = nullptr;
-    float* h_out_ = nullptr;
-    void* h_meta_ = nullptr;
-    float* d_x_ = nullptr;
-    float* z_x_ = nullptr;     ///< h_x_ as the helper GPU sees it (zero-copy: no input copy per layer)
-    float* z_out_ = nullptr;   ///< h_out_ as the helper GPU sees it (zero-copy: no result copy)
-    bool zero_copy_ = false;
-    float* d_out_ = nullptr;
-    uint8_t* d_q8_ = nullptr;
-    float* d_scales_ = nullptr;
-    void* d_scratch_ = nullptr;
-    void* d_meta_ = nullptr;  ///< one contiguous upload of grouped indices, instead of five small copies
-    int32_t* d_start_ = nullptr;
-    int32_t* d_dst_ = nullptr;
-    int32_t* d_tok_ = nullptr;
-    int32_t* d_count_ = nullptr;
-    unsigned long long* d_ptr_ = nullptr;
     std::vector<uint8_t> owned_;
-    std::vector<uint8_t> layers_present_;
-    std::vector<int32_t> group_of_, group_id_;
-    std::vector<int32_t> start_, dst_, tok_, original_row_;
-    std::vector<unsigned long long> ptr_;
 };
 
 } // namespace strata::core

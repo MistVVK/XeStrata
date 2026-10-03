@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/concurrent_main.cpp - do the CPU expert path and the GPU stream path actually run at once?
 //
 // L9 concluded that the two miss paths are INDEPENDENT RESOURCES - 42.55 GB/s of DRAM bandwidth for the CPU

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/plan/plan.hpp - P1.S9 census + memory planner.
 //
 // This is the component that makes one binary adapt to the GPU it is running on.  The engine has 33.97 GB of

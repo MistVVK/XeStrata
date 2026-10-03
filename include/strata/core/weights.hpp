@@ -1,4 +1,7 @@
-﻿// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/core/weights.hpp - the dense weights, loaded into VRAM in ENGINE form.
 //
 // The pack is the ARTIFACT's business; this is the ENGINE's.  The differences are deliberate, and they run in
 // BOTH directions:

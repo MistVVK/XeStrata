@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/expert_cache.hpp - R4: the VRAM-resident expert tier.
 //
 // **WHY THIS EXISTS, IN ONE PARAGRAPH.** The CPU expert pool is the engine's largest single cost: measured,
@@ -53,6 +56,24 @@ inline constexpr int32_t kNotResident = -1;
 /// running rather than by re-deriving what the file claims.
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
+
+/// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
+/// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
+/// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine
+/// started from: an expert this run never routed keeps its old place), then by index.  A start from it begins
+/// where this one ended; one with more slots adds the hottest of the rest, one with fewer keeps the hottest.
+/// `resident` and `heat`: n_layers x n_expert entries (`heat` may be empty: no counts, the prior decides).
+std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, int64_t n_expert,
+                                                              const std::vector<uint8_t>& resident,
+                                                              const std::vector<double>& heat,
+                                                              const std::vector<std::pair<int32_t, int32_t>>& prior);
+
+/// #477: writes `ranked` in tools/make_profile.py's format, byte for byte: `STRP`, `1, n_layers, n_expert,
+/// n_ranked, n_ranked` (uint32), the pairs (uint16 layer, uint16 expert), then the n_layers x n_expert int32 table
+/// of each pair's rank (-1: not ranked).  Atomically: a `<path>.tmp` beside it, renamed over `path` once complete,
+/// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
+bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
+                          const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
 class ExpertCache {
 public:

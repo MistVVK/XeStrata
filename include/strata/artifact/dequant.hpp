@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 // src/artifact/dequant.cpp - P1.S3: scalar reference dequantizers, transcribed from ggml.
 //

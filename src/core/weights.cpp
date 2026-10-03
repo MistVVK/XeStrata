@@ -1,21 +1,21 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 #include <chrono>
+#include <cinttypes>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-#if defined(_WIN32)
-#include <io.h>
-#else
 #include <unistd.h>
-#endif
 
 namespace strata::core {
 namespace {
@@ -71,15 +71,8 @@ const char* file_name(int id) {
     }
 }
 
-/// UTF-16 path for CreateFile-free portability: the loader uses `std::fopen`, which on Windows takes an ANSI
-/// path.  The pack lives beside the executable in practice, but a pack under a user directory with a
-/// non-ASCII name would silently fail to open, so the caller gets the errno rather than a null pointer.
 bool read_at(std::FILE* f, uint64_t off, void* dst, size_t n, std::string& err, const char* what) {
-#if defined(_WIN32)
-    if (_fseeki64(f, (long long) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#else
     if (fseeko(f, (off_t) off, SEEK_SET) != 0) { err = std::string(what) + ": seek failed"; return false; }
-#endif
     if (std::fread(dst, 1, n, f) != n) { err = std::string(what) + ": short read"; return false; }
     return true;
 }
@@ -141,7 +134,8 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         // The format is written by tools/pack_index.py and is space-separated with no quoting; a name with a
         // space in it would break the parse, which is why the parser REFUSES rather than taking what it got.
         const int n = std::sscanf(line,
-                                  "%255s %d %d %llu %llu %llu %llu %lld %lld %d %d %d %d %d %llu %llu %llu %d %d",
+                                  "%255s %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNd64 " %" SCNd64
+                                  " %d %d %d %d %d %" SCNu64 " %" SCNu64 " %" SCNu64 " %d %d",
                                   name, &r.file, &kind, &r.src_off, &r.src_bytes, &r.dst_off, &r.dst_bytes,
                                   &r.ne0, &r.ne1, &r.code_bits, &r.code_bias, &r.group_elems, &r.codebook,
                                   &r.has_offset, &r.codes_bytes, &r.scales_bytes, &r.offset_bytes,
@@ -199,11 +193,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     // one of the 90 widened tensors - a heap corruption that would have been blamed on whatever ran next.
     void* stage_in = nullptr;
     void* stage_out = nullptr;
-    if (cudaHostAlloc(&stage_in, CHUNK, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(&stage_out, CHUNK * 2, cudaHostAllocDefault) != cudaSuccess) {
-        err = "cudaHostAlloc for the staging buffers failed";
-        if (stage_in) cudaFreeHost(stage_in);
-        if (stage_out) cudaFreeHost(stage_out);
+    if (!strata::gpu::alloc_host(&stage_in, CHUNK) ||
+        !strata::gpu::alloc_host(&stage_out, CHUNK * 2)) {
+        err = std::string("host allocation for the staging buffers failed: ") + strata::gpu::last_error();
+        if (stage_in) strata::gpu::free(stage_in);
+        if (stage_out) strata::gpu::free(stage_out);
         return false;
     }
 
@@ -246,7 +240,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         if (r.code_bits != 0 && r.dst_bytes == 0) {
             // plan v0.3 P6: a native pack's row that carries a shape only - the GGUF form must serve it
             err = r.name + ": this pack holds the tensor only in its GGUF form (run with --native SHARD1)";
-            cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+            strata::gpu::free(stage_in); strata::gpu::free(stage_out);
             return false;
         }
         if (r.file != cur_file) {
@@ -254,7 +248,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             const char* fn = file_name(r.file);
             const std::string p = pack_dir + "/" + (fn ? fn : "?");
             cur = std::fopen(p.c_str(), "rb");
-            if (!cur) { err = "cannot open " + p; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+            if (!cur) { err = "cannot open " + p; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
             cur_file = r.file;
         }
 
@@ -317,14 +311,14 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
             err = buf;
             bad = true;
         }
-        if (bad) { cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+        if (bad) { strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
 
         for (int si = 0; si < n_segs; ++si) {
             const Seg& s = segs[si];
             const bool widening = (s.conv == Conv::WidenF16);
             if (widening && (s.src_bytes & 1ull)) {
                 err = r.name + ": an fp16 plane with an odd source byte count";
-                cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                strata::gpu::free(stage_in); strata::gpu::free(stage_out);
                 return false;
             }
             uint64_t done = 0;
@@ -333,11 +327,11 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 // WIDENING NEVER SPLITS AN ELEMENT.  CHUNK is even, so a full chunk cannot, but the tail of a
                 // plane whose length is odd would - and half an fp16 is a plausible-looking scale.
                 if (widening && (n & 1ull)) {
-                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; cudaFreeHost(stage_in); cudaFreeHost(stage_out); return false; }
+                    if (n == 1) { err = r.name + ": an fp16 plane ending on a half element"; strata::gpu::free(stage_in); strata::gpu::free(stage_out); return false; }
                     n -= 1;
                 }
                 if (!read_at(cur, r.src_off + s.src_off + done, stage_in, (size_t) n, err, r.name.c_str())) {
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                    strata::gpu::free(stage_in); strata::gpu::free(stage_out);
                     return false;
                 }
                 const uint8_t* src = (const uint8_t*) stage_in;
@@ -398,10 +392,9 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
                 }
 
                 const double u0 = now_ms();
-                if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
-                    cudaSuccess) {
-                    err = "cudaMemcpy failed for " + r.name;
-                    cudaFreeHost(stage_in); cudaFreeHost(stage_out);
+                if (!strata::gpu::copy(dst_base + r.dst_off + out_at, host_src, out_bytes)) {
+                    err = "device copy failed for " + r.name + ": " + strata::gpu::last_error();
+                    strata::gpu::free(stage_in); strata::gpu::free(stage_out);
                     return false;
                 }
                 upload_ms += now_ms() - u0;
@@ -438,13 +431,13 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
         }
     }
     if (cur) std::fclose(cur);
-    cudaFreeHost(stage_in);
-    cudaFreeHost(stage_out);
+    strata::gpu::free(stage_in);
+    strata::gpu::free(stage_out);
 
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if (!strata::gpu::device_sync()) { err = std::string("device sync after the load failed: ") + strata::gpu::last_error(); return false; }
     return true;
 }
 

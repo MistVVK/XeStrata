@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/native_head.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 #include <climits>
 #include <cstring>
 #include <exception>
@@ -11,8 +15,8 @@
 namespace strata::core {
 
 NativeHead::~NativeHead() {
-    if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (scratch_) strata::gpu::free(scratch_);
+    if (weights_) strata::gpu::free(weights_);
 }
 
 bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std::string& err) {
@@ -22,15 +26,15 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         return false;
     }
     try {
-        strata::GgufFile gguf(path);
-        err = strata::check_architecture(gguf);
+        // The architecture is the metadata shard's; output.weight comes from whichever shard of `path`'s model
+        // holds it (shard 2 of Unsloth's UD-Q4_K_XL, whose shard 1 holds no tensor; upstream 02cfe36).  GgufModel
+        // refuses a missing shard and a duplicate across shards.
+        const strata::GgufModel model = strata::GgufModel::open(path);
+        err = strata::check_architecture(model.meta());
         if (!err.empty()) return false;
-        const strata::TensorInfo* tensor = nullptr;
-        for (const auto& candidate : gguf.tensors()) {
-            if (candidate.name != "output.weight") continue;
-            if (tensor) { err = "native head: duplicate output.weight"; return false; }
-            tensor = &candidate;
-        }
+        size_t at = 0;
+        const strata::TensorInfo* tensor = model.find("output.weight", &at);
+        const strata::GgufFile& gguf = model.shard(at);
         if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
             tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
@@ -44,23 +48,30 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         }
         void* weights = nullptr;
         void* scratch = nullptr;
-        cudaError_t status = cudaMalloc(&weights, bytes);
-        if (status == cudaSuccess)
-            status = cudaMalloc(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
-        if (status == cudaSuccess)
-            status = cudaMemcpy(weights, gguf.tensor_data(*tensor), bytes, cudaMemcpyHostToDevice);
-        if (status != cudaSuccess) {
-            if (scratch) cudaFree(scratch);
-            if (weights) cudaFree(weights);
-            err = std::string("native head upload: ") + cudaGetErrorString(status);
+        bool status = strata::gpu::alloc_device(&weights, bytes);
+        if (status)
+            status = strata::gpu::alloc_device(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
+        if (status)
+            status = strata::gpu::copy(weights, gguf.tensor_data(*tensor), bytes);
+        if (!status) {
+            if (scratch) strata::gpu::free(scratch);
+            if (weights) strata::gpu::free(weights);
+            err = std::string("native head upload: ") + strata::gpu::last_error();
             return false;
+        }
+        int type = (int) tensor->type;
+        if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) n_in)) {   // aligned loads (native_mmvq.hpp)
+            sycl::queue& q = strata::core::Runtime::get().compute();
+            strata::kernels::native_q6_k_to_rows(weights, (int) n_in, (int) n_out, &q);
+            q.wait();
+            type = strata::kernels::kNativeQ6KRows;
         }
         weights_ = weights;
         scratch_ = scratch;
         bytes_ = bytes;
         n_in_ = (int) n_in;
         n_out_ = (int) n_out;
-        type_ = (int) tensor->type;
+        type_ = type;
         return true;
     } catch (const std::exception& error) {
         err = std::string("native head: ") + error.what();
@@ -84,11 +95,6 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         err = std::string("native head launch: ") + error.what();
         return false;
     }
-    const cudaError_t status = cudaPeekAtLastError();
-    if (status != cudaSuccess) {
-        err = std::string("native head launch: ") + cudaGetErrorString(status);
-        return false;
-    }
     return true;
 }
 
@@ -101,31 +107,39 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
-    if (host_) cudaFreeHost(host_);
+    if (host_) strata::gpu::free(host_);
 }
 
 bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab, std::string& err) {
     try {
-        strata::GgufFile gguf(path);
-        const strata::TensorInfo* t = nullptr;
-        for (const auto& c : gguf.tensors())
-            if (c.name == "token_embd.weight") t = &c;
+        // token_embd.weight from whichever shard of `path`'s model holds it (upstream 02cfe36)
+        const strata::GgufModel model = strata::GgufModel::open(path);
+        size_t at = 0;
+        const strata::TensorInfo* t = model.find("token_embd.weight", &at);
+        const strata::GgufFile& gguf = model.shard(at);
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
+            !strata::kernels::embed_type_supported((int) t->type) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;
         }
         row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
-        if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+        // the table is copied out of the mapping below: a truncated shard must be an error, not a read past EOF
+        if (!model.in_bounds(*t, at) || strata::tensor_payload_bytes(*t) != bytes_) {
+            err = "native embedding: token_embd.weight's payload is truncated or not " + std::to_string(bytes_) +
+                  " B (" + gguf.path() + ")";
+            bytes_ = 0;
+            return false;
+        }
+        if (!strata::gpu::alloc_host(&host_, bytes_)) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";
             return false;
         }
         std::memcpy(host_, gguf.tensor_data(*t), bytes_);
         void* d = nullptr;
-        if (cudaHostGetDevicePointer(&d, host_, 0) != cudaSuccess) {
+        if (!strata::gpu::device_pointer(&d, host_)) {
             err = "native embedding: no device alias for the mapped table";
             return false;
         }

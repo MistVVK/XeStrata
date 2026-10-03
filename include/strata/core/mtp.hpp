@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/mtp.hpp - plan v0.3 P6: the MTP draft layer on the GPU.
 //
 // The model ships one multi-token-prediction layer (vLLM 0.30.0 `qwen4_exp` MTP; transcribed and validated in
@@ -22,7 +25,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 #include <cstdint>
 #include <string>
@@ -54,6 +57,10 @@ public:
     /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
     void kv_restore(int64_t upto);
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
+    /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
+    /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this
+    /// (upstream b981f63).
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
@@ -73,13 +80,23 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
 
+    /// E-9 (upstream c6c6594): the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its
+    /// tensors, its K/V state, the first cell a round can still read, its device, and a wait for its own stream.
+    const float* tensor_f32(const char* name) const { return f32(name); }
+    const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
+    const void* tensor_q8(const char* name) const { return q8(name); }
+    QsaState& kv_state_rw() { return st_; }
+    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    int device() const { return device_; }
+    bool idle(std::string& err);
+
 private:
-    bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    bool record_forward(int T, int step_row0, strata::gpu::Stream cs, std::string& err);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
-    cudaGraphExec_t step_exec_[9] = {};
+    strata::gpu::Graph* step_exec_[9] = {};
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
@@ -94,12 +111,12 @@ private:
     int max_drafts_ = 1 << 30;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
-    cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    strata::gpu::Stream cs_ = nullptr;
+    strata::gpu::Graph* prefill_exec_[9] = {};
+    strata::gpu::Graph* prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[9] = {};
+    strata::gpu::Graph* round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;

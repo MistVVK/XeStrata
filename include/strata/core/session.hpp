@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/session.hpp - ONE TOKEN through all 48 layers, and the doorbell protocol between them.
 //
 // P2.S5's host loop, and the first place the engine runs a whole forward pass rather than one block.  What it
@@ -17,7 +20,7 @@
 #include "strata/core/hit_hook.hpp"
 #include "strata/core/layer.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 #include <cstdint>
 #include <string>
@@ -111,7 +114,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
 /// of them while a block makes ~45.  Replaying the 43-node block graph measured **1.585 ms against 2.393 ms**
 /// for the same work as direct launches - a 1.51x that is pure launch overhead.
 struct SessionGraphs {
-    cudaGraphExec_t* execs = nullptr;   ///< one per layer, in layer order
+    strata::gpu::Graph** execs = nullptr;   ///< one per layer, in layer order
     int64_t n = 0;
     /// **THE SECOND GRAPH PER LAYER: `moe_finish` + `gr_write`, launched AFTER the host has run the pool.**
     ///
@@ -123,7 +126,7 @@ struct SessionGraphs {
     /// inside `pre[l]` - the shared expert, and nothing else, because everything after the combine depends on
     /// `parts`.  **A per-layer CPU pool cannot be hidden behind a strictly serial residual chain**, which is
     /// why the CPU term is answered by Phase 3's VRAM cache and not by this pipeline.
-    cudaGraphExec_t* posts = nullptr;
+    strata::gpu::Graph** posts = nullptr;
     bool captured = false;
     /// THE DEVICE ADDRESS THE GRAPHS WERE CAPTURED WITH.  The host loop copies each layer's expert outputs
     /// here before launching the next layer, and a graph bakes the POINTER, so it has to be this one.
@@ -170,9 +173,9 @@ struct SessionGraphs {
     /// has ~7 more nodes than prefix 4, so the two differ in launch setup as well as in execution - and the
     /// difference attributed ALL of it to stage 4, the router. Capturing prefix 5 the same way as the others
     /// makes the two comparable and the difference purely stage 4's.
-    cudaGraphExec_t* preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
-    cudaGraphExec_t* preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
-    cudaGraphExec_t* preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
+    strata::gpu::Graph** preP[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    strata::gpu::Graph** preA = nullptr;   ///< `half == 1`: gr_read -> attention -> gr_write   (the MIXER)
+    strata::gpu::Graph** preB = nullptr;   ///< `half == 2`: gr_read -> moe_route              (FFN front + ROUTER)
     bool split_captured = false;
 
     /// How many times `session_loop` has run.  `rings_mid_graph` and `ms_to_ring` are CUMULATIVE and the loop
@@ -193,7 +196,7 @@ struct SessionGraphs {
     ///   * `ms_to_ring` - launch -> ring observed. The GPU is working (or already finished) here.
     ///   * `ms_host`    - ring observed -> `pre[l+1]` launched. **The GPU has nothing queued and is IDLE for
     ///                    all of this unless `pre[l]`'s tail still covers it.** This is
-    ///                    `cudaMemcpyAsync(parts)` + `cudaGraphLaunch(post[l])` + `cudaGraphLaunch(pre[l+1])` +
+    ///                    `cudaMemcpyAsync(parts)` + `strata::gpu::graph_launch(post[l])` + `strata::gpu::graph_launch(pre[l+1])` +
     ///                    `cudaEventRecord`, and if it is the large half then the fix is fewer driver calls
     ///                    (R2.4), not a faster kernel.
     ///
@@ -344,7 +347,7 @@ using PoolFn = void (*)(void* user, const float* x_f, const int32_t* ids, const 
 struct SessionLoopScratch {
     float* y_miss = nullptr;        ///< pinned host staging for the pool's answer, `parts_bytes` long
     size_t parts_bytes = 0;
-    cudaEvent_t probe = nullptr;
+    strata::gpu::Event* probe = nullptr;
     long long pinned_core = -1;     ///< the affinity to restore, or -1 if the host was never pinned
     bool pinned = false;
 
@@ -360,8 +363,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 
 // ================================ plan v0.3 P3: THE WHOLE TOKEN AS ONE GRAPH ================================
 //
-// Under WDDM every graph launch costs ~0.3-0.4 ms of submission latency, and the per-layer loop above makes 96
-// of them per token: measured 48.6 ms/token for 12 ms of GPU kernels and 27 ms of pool.  The token graph holds
+// The per-layer loop above makes 96 graph launches per token. The token graph holds
 // all 48 layers.  Between `pre[l]` (which rings the doorbell) and the parts copy, a one-thread kernel waits ON
 // THE DEVICE until the host writes the ring value into `db.h_flag`; the host only polls rings, runs the pool
 // and writes flags, with no driver call in the loop (bench/micro/device_wait.cu: 5.2 us per handoff).
@@ -372,7 +374,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
 // Same kernels, same order per layer as `session_loop`, so the token is bitwise the same.  No VRAM expert tier
 // yet (the hit decision is a host step between ring and post); the caller falls back to `session_loop` then.
 struct TokenGraph {
-    cudaGraphExec_t exec = nullptr;
+    strata::gpu::Graph* exec = nullptr;
     bool captured = false;
     int64_t n_layers = 0;
     const float* y_src = nullptr;    ///< the pinned host staging the graph's H2D copies read (baked in)

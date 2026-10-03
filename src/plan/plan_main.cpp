@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/plan/plan_main.cpp - the `strata-plan` CLI: print the memory plan, or say why it does not close.
 //
 // The engine must adapt to the GPU it is running on, so the plan is computed from measured free VRAM and the

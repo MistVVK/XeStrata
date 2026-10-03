@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/spec/draft_policy.cpp - see include/strata/spec/draft_policy.hpp.
 #include "strata/spec/draft_policy.hpp"
 

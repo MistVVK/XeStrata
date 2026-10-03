@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/progress.hpp - issue #29: whether a request is still moving, and where it is.
 //
 // The engine's host loop and the GPU wait on each other through flags; a protocol bug there does not crash, it
@@ -19,6 +22,7 @@ struct Progress {
     std::atomic<bool> busy{false};
     std::atomic<const char*> where{"idle"};
     std::atomic<int64_t> detail{-1};
+    std::atomic<int64_t> chunk{-1};      ///< the prompt chunk (its first position) a batched-read stage is in
     std::atomic<int64_t> since_ms{0};    ///< when `where` was set (steady clock): how long a stage has lasted
     std::atomic<uint64_t> ticks{0};      ///< layers served: a window that still moves, slowly, against one that stopped
 };
@@ -38,10 +42,11 @@ inline Progress& progress() {
     return p;
 }
 
-inline void progress_at(const char* where, int64_t detail = -1) {
+inline void progress_at(const char* where, int64_t detail = -1, int64_t chunk = -1) {
     Progress& p = progress();
     p.where.store(where, std::memory_order_relaxed);
     p.detail.store(detail, std::memory_order_relaxed);
+    p.chunk.store(chunk, std::memory_order_relaxed);
     p.since_ms.store(progress_now_ms(), std::memory_order_relaxed);
 }
 

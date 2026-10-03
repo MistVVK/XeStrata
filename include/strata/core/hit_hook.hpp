@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/hit_hook.hpp - R4.2c: the seam between the host loop and the VRAM expert tier.
 //
 // **IT IS ITS OWN HEADER BECAUSE BOTH SIDES NEED IT AND NEITHER SHOULD OWN IT.**  `session.hpp` declares the

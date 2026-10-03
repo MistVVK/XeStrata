@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/spec/draft_policy_test.cpp - DraftPolicy: when does a lookup window beat the MTP's?
 //
 // Simulated rounds with the costs measured on the RTX 5070 (window-cost: ~10 ms more per token) check that

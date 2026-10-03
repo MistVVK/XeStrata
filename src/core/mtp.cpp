@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
 #include "strata/core/on_device.hpp"
@@ -54,9 +57,9 @@ struct Bump {
 };
 
 bool mapped(size_t bytes, void** h, void** d) {
-    if (cudaHostAlloc(h, bytes, cudaHostAllocMapped) != cudaSuccess) return false;
+    if (!strata::gpu::alloc_host(h, bytes)) return false;
     std::memset(*h, 0, bytes);
-    return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
+    return strata::gpu::device_pointer(d, *h);
 }
 
 strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
@@ -69,19 +72,11 @@ strata::kernels::QsaShapes shapes_of(const ModelGeometry& g) {
     return s;
 }
 
-// 64-bit seek/tell on a `FILE*`: `fseek`/`ftell` take a 32-bit `long` on Windows and would wrap past 2 GiB.
-#if defined(_WIN32)
-#define STRATA_FILE_SEEK64(f, o, w) _fseeki64((f), (long long) (o), (w))
-#define STRATA_FILE_TELL64(f) _ftelli64(f)
-#else
 #define STRATA_FILE_SEEK64(f, o, w) fseeko((f), (off_t) (o), (w))
 #define STRATA_FILE_TELL64(f) ftello(f)
-#endif
 
 bool read_file(const std::string& path, std::vector<uint8_t>& out) {
-    // Loader fix (0.1.15+loaderfix.2): `ifstream::read` reaches the disk as 4095-byte reads on MSVC - the same
-    // split `load_experts_ranges` had - so the drafter's 111 MiB dense blob paid 4 KiB per operation on a cold
-    // start.  `fread` passes a request bigger than the stream buffer straight to `ReadFile()`.
+    // Read the dense blob in large chunks through fread.
     FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) return false;
     // A `FILE*` has no destructor and the short-read path below returns early: the guard closes on every path.
@@ -99,22 +94,22 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace
 
 MtpDrafter::~MtpDrafter() {
-    if (cs_) cudaStreamSynchronize(cs_);
-    for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
-    if (pf_dev_) cudaFree(pf_dev_);
-    for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
-    for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
-    if (cs_) cudaStreamDestroy(cs_);
-    if (dense_) cudaFree(dense_);
-    if (experts_) cudaFree(experts_);
-    if (state_arena_) cudaFree(state_arena_);
-    if (arena_) cudaFree(arena_);
-    if (head_logits_) cudaFree(head_logits_);
-    if (dhead_) cudaFree(dhead_);
-    if (dvocab_) cudaFree(dvocab_);
+    if (cs_) strata::gpu::stream_sync(cs_);
+    for (auto& e : prefill_exec_) if (e) strata::gpu::graph_destroy(e);
+    for (auto& e : prefill_dev_exec_) if (e) strata::gpu::graph_destroy(e);
+    if (pf_dev_) strata::gpu::free(pf_dev_);
+    for (auto& e : round_exec_) if (e) strata::gpu::graph_destroy(e);
+    for (auto& e : step_exec_) if (e) strata::gpu::graph_destroy(e);
+    if (cs_) strata::gpu::stream_destroy(cs_);
+    if (dense_) strata::gpu::free(dense_);
+    if (experts_) strata::gpu::free(experts_);
+    if (state_arena_) strata::gpu::free(state_arena_);
+    if (arena_) strata::gpu::free(arena_);
+    if (head_logits_) strata::gpu::free(head_logits_);
+    if (dhead_) strata::gpu::free(dhead_);
+    if (dvocab_) strata::gpu::free(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
-    for (void* h : hosts) if (h) cudaFreeHost(h);
+    for (void* h : hosts) if (h) strata::gpu::free(h);
 }
 
 const float* MtpDrafter::f32(const char* name) const {
@@ -132,7 +127,7 @@ const void* MtpDrafter::q8(const char* name) const {
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
-    cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
+    device_ = 0;   // one Xe device: a layer split across GPUs is not supported (OnDevice)
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;
@@ -156,35 +151,32 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
-        if (alloc != cudaSuccess) {
+        if (!strata::gpu::alloc_device((void**) &dense_, blob.size())) {
             size_t free_bytes = 0, total_bytes = 0;
-            const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
-            err = "mtp: dense weights allocation failed (" + std::string(cudaGetErrorString(alloc)) +
-                  "), requested " + std::to_string(blob.size() >> 20) + " MiB, CUDA0 free " +
-                  (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
+            const bool info = strata::gpu::mem_info(&free_bytes, &total_bytes);
+            err = "mtp: dense weights allocation failed (" + std::string(strata::gpu::last_error()) +
+                  "), requested " + std::to_string(blob.size() >> 20) + " MiB, device free " +
+                  (info ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+        strata::gpu::copy(dense_, blob.data(), blob.size());
         vram_ += blob.size();
     }
     // ---- the 512 routed experts, one blob each
     {
         const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
-        // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
-        // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
         FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
         if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
         struct Closer {
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        if (!strata::gpu::alloc_device((void**) &experts_, bytes)) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
             if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+            strata::gpu::copy(experts_ + off, chunk.data(), n);
             off += n;
         }
         vram_ += bytes;
@@ -200,22 +192,33 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
-    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : 0;
+    // Without a window shorter than the context there is no ring, and the K/V stays whole in VRAM: ring 0 would
+    // plan the main layers' streamed map, whose blocks only kv_stream_resolve makes resident, and the drafter
+    // never resolves.
+    int64_t ring = (window > 0 && window < max_cells) ? window + 4 * (int64_t) max_t + 64 : -1;
+    // K8V4 never applies to the drafter (its attention paths take whole formats only): under --kv k8v4 its state is
+    // plain INT8, whatever ring shape it takes (upstream 2aa8f72)
+    const bool kv_hybrid_was = qsa_kv_hybrid(), kv_int8_was = qsa_kv_int8();
+    qsa_set_kv_hybrid(false);
+    if (kv_hybrid_was) qsa_set_kv_int8(true);
+    struct Restore {
+        bool h, i;
+        ~Restore() { qsa_set_kv_int8(i); qsa_set_kv_hybrid(h); }
+    } restore{kv_hybrid_was, kv_int8_was};
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
-    if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+    if (!strata::gpu::alloc_device(&state_arena_, sb)) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
-        cudaGetLastError();
-        cudaFree(state_arena_);
+        strata::gpu::free(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
-        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+        if (!strata::gpu::alloc_device(&state_arena_, sb)) { err = "mtp: the K/V state does not fit"; return false; }
         if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
     }
     qsa_state_zero(st_, g, nullptr);
-    cudaDeviceSynchronize();
+    strata::gpu::device_sync();
     vram_ += sb;
 
     // ---- buffers
@@ -262,8 +265,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     };
     Bump count;
     carve(count);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) { err = "mtp: buffers do not fit"; return false; }
-    cudaMemset(arena_, 0, count.used);
+    if (!strata::gpu::alloc_device(&arena_, count.used)) { err = "mtp: buffers do not fit"; return false; }
+    strata::gpu::memset(arena_, 0, count.used);
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
@@ -272,9 +275,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         std::vector<int32_t> id((size_t) (T * (uint64_t) cap_));
         for (uint64_t t = 0; t < T; ++t)
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
-        cudaMemcpy(ident_, id.data(), id.size() * 4, cudaMemcpyHostToDevice);
+        strata::gpu::copy(ident_, id.data(), id.size() * 4);
     }
-    if (cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking) != cudaSuccess) { err = "mtp: stream"; return false; }
+    if (!(cs_ = strata::gpu::stream_create())) { err = "mtp: stream"; return false; }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
@@ -283,6 +286,57 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                                    1048576.0 / files_s : 0.0);
     return true;
 }
+
+uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
+    uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
+    if (dhead_ == nullptr) {
+        if (std::FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long size = std::ftell(f);
+            std::fclose(f);
+            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+        }
+    }
+    return bytes;
+}
+
+namespace {
+// #474 (upstream f2aaba1): what to change when the draft head's token subset does not fit the VRAM left - a smaller
+// subset that setup ships (data/draft_vocab_*.bin; their token counts below), and how to pick it.  Text only, after
+// the failure: nothing changes for a start that fits.
+void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
+    size_t free_b = 0, total_b = 0;
+    const bool have_free = strata::gpu::mem_info(&free_b, &total_b);
+    auto mib = [&](int64_t n) { return (double) (n * row_bytes) / 1048576.0; };
+    std::string free_s;
+    if (have_free) {
+        char b[64];
+        std::snprintf(b, sizeof(b), " and %.0f MiB is free", (double) free_b / 1048576.0);
+        free_s = b;
+    }
+    std::fprintf(stderr, "strata mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
+                 (long long) n_tokens, mib(n_tokens), free_s.c_str());
+    struct Subset { const char* name; int64_t tokens; const char* what; };
+    static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
+                                     {"en", 40525, "English and code"}};
+    std::string opts;
+    for (const Subset& s : smaller)
+        if (s.tokens < n_tokens) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "%s--draft-vocab %s (%s, ~%.0f MiB)", opts.empty() ? "" : " or ", s.name,
+                          s.what, mib(s.tokens));
+            opts += b;
+        }
+    if (!opts.empty())
+        std::fprintf(stderr, "strata mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Run ./setup.sh once "
+                             "with it (./setup.sh --draft-vocab en) and the model keeps it (\"draft_vocab\" in its "
+                             "xestrata-*.json config); or a smaller --context in setup.\n",
+                     opts.c_str());
+    else
+        std::fprintf(stderr, "strata mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
+                             "--context (or closing what else uses the GPU) leaves it room.\n");
+}
+}  // namespace
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err) {
     const OnDevice on_device(device_);
@@ -294,7 +348,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     n_vocab_ = wo->ne1;
     if (head == nullptr || !head->loaded()) { err = "mtp: the draft layer needs the native head (--native)"; return false; }
     if (head_logits_ == nullptr &&
-        cudaMalloc((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float)) != cudaSuccess) {
+        !strata::gpu::alloc_device((void**) &head_logits_, (size_t) max_t_ * (size_t) n_vocab_ * sizeof(float))) {
         err = "mtp: the draft logits do not fit";
         return false;
     }
@@ -304,14 +358,15 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
             const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (cudaMalloc((void**) &dvocab_, raw.size()) != cudaSuccess ||
-                cudaMalloc((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes)) != cudaSuccess) {
+            if (!strata::gpu::alloc_device((void**) &dvocab_, raw.size()) ||
+                !strata::gpu::alloc_device((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes))) {
                 err = "mtp: the draft head does not fit";
+                draft_head_hint(n_dvocab_, row_bytes);
                 return false;
             }
-            cudaMemcpy(dvocab_, raw.data(), raw.size(), cudaMemcpyHostToDevice);
+            strata::gpu::copy(dvocab_, raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            cudaDeviceSynchronize();
+            strata::gpu::device_sync();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
@@ -321,7 +376,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
-bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::string& err) {
+bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, std::string& err) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -382,9 +437,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
-            if (st_.kv_q4) {   // Q4_0 KV (kv_q4.hpp): rotated K and V
+            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp)
                 fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
                 fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
+            }
+            if (st_.kv_q4) {
                 kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
                                   vcur_ + t * NKV * HD, s, cs, &st_.host);
             } else if (st_.kv_int8)
@@ -398,18 +455,17 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
         for (int t = 0; t < T; ++t) {
             float* qc = qcur_ + t * NH * HD;
-            if (cudaMemcpy2DAsync(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4,
-                                  (size_t) NH, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+            if (!strata::gpu::copy2d_async(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) NH, cs)) {
                 err = "mtp: q split failed";
                 return false;
             }
             norm_rope(qc, f32("self_attn.q_norm.weight"), (int) NH, (int) HD, pos + t * NH);
-            if (st_.kv_q4) fwht256_inplace_cuda(qc, NH, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(qc, NH, cs);
         }
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
-        if (st_.kv_q4) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+        if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         for (int t = 0; t < T; ++t)
             native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH, (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
@@ -481,22 +537,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
 }
 
 namespace {
-bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+bool finish_capture(strata::gpu::Stream cs, bool ok, strata::gpu::Graph*& exec, const char* what, std::string& err) {
     if (!ok) {
-        if (graph) cudaGraphDestroy(graph);
+        strata::gpu::abandon_capture(cs);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
-        if (graph) cudaGraphDestroy(graph);
-        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
+    if (!strata::gpu::end_capture(cs, &exec)) {
+        err = std::string("mtp: ") + what + " capture: " + strata::gpu::last_error();
         return false;
     }
-    cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    cudaGraphUpload(exec, cs);
-    cudaStreamSynchronize(cs);
+    strata::gpu::stream_sync(cs);
     return true;
 }
 }  // namespace
@@ -504,7 +554,7 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
     if (prefill_exec_[T]) return true;
     using namespace strata::kernels;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
@@ -514,7 +564,7 @@ bool MtpDrafter::capture_prefill(int T, std::string& err) {
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
     if (prefill_dev_exec_[T]) return true;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
     return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
 }
@@ -523,7 +573,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
     if (round_exec_[T]) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     bool ok = true;
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
@@ -552,7 +602,7 @@ bool MtpDrafter::capture_step(int j, std::string& err) {
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
-    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+    if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
     copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
     bool ok = record_forward(1, row, cs_, err);
@@ -567,7 +617,16 @@ void MtpDrafter::kv_restore(int64_t upto) {
     const strata::kernels::QsaShapes s = shapes_of(*g_);
     const int64_t b1 = (upto + s.page_size - 1) / s.page_size, b0 = std::max<int64_t>(0, b1 - st_.n_slots);
     strata::kernels::kv_ring_restore(qsa_attn_pools(st_), st_.host, qsa_kv_format(st_), b0, b1, st_.n_slots, s, cs_);
-    cudaStreamSynchronize(cs_);
+    strata::gpu::stream_sync(cs_);
+}
+
+bool MtpDrafter::idle(std::string& err) {
+    const OnDevice on_device(device_);
+    if (cs_ && !strata::gpu::stream_sync(cs_)) {
+        err = std::string("mtp: its stream failed: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
 }
 
 bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
@@ -575,7 +634,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
-    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    const int64_t skip_below = first_needed();
     // E-4: every group's token / step / position records uploaded at once; each group is then device copies and a
     // graph on the one stream, with a single sync at the end (a group of <= max_t rows used to be staged in mapped
     // memory and synced before the next: ~5,500 host round trips on a 32K prompt).  The same work in the same
@@ -584,10 +643,10 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {
-            if (pf_dev_) cudaFree(pf_dev_);
+            if (pf_dev_) strata::gpu::free(pf_dev_);
             pf_dev_ = nullptr;
             pf_cap_ = 0;
-            if (cudaMalloc((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t)) != cudaSuccess) {
+            if (!strata::gpu::alloc_device((void**) &pf_dev_, (size_t) (n * per_row) * sizeof(int32_t))) {
                 err = "mtp prefill: the input records do not fit";
                 return false;
             }
@@ -606,7 +665,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             stp[i * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < NHp; ++h) ps[i * NHp + h] = (int32_t) cell;
         }
-        if (cudaMemcpyAsync(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cudaMemcpyHostToDevice, cs_) != cudaSuccess) {
+        if (!strata::gpu::copy_async(pf_dev_, rec.data(), rec.size() * sizeof(int32_t), cs_)) {
             err = "mtp prefill: the input records upload failed";
             return false;
         }
@@ -615,20 +674,19 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
         const int32_t* d_ps = d_stp + 4 * n;
         for (int64_t c = 0; c < n; c += max_t_) {
             const int T = (int) std::min<int64_t>(max_t_, n - c);
-            if (cell0 + c + T <= first_needed) continue;
+            if (cell0 + c + T <= skip_below) continue;
             if (!capture_prefill_dev(T, err)) return false;
-            if (cudaMemcpyAsync(tok_, d_tk + c, (size_t) T * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(step_, d_stp + c * 4, (size_t) T * 16, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-                cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
-                                cs_) != cudaSuccess ||
-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
-                err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+            if (!strata::gpu::copy_async(tok_, d_tk + c, (size_t) T * 4, cs_) ||
+                !strata::gpu::copy_async(step_, d_stp + c * 4, (size_t) T * 16, cs_) ||
+                !strata::gpu::copy_async(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cs_) ||
+                !strata::gpu::copy_async(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cs_) ||
+                !strata::gpu::graph_launch(prefill_dev_exec_[T], cs_)) {
+                err = std::string("mtp prefill: ") + strata::gpu::last_error();
                 return false;
             }
         }
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+        if (!strata::gpu::stream_sync(cs_)) {
+            err = std::string("mtp prefill: ") + strata::gpu::last_error();
             return false;
         }
         ms_prefill += ms_since(t0);
@@ -636,7 +694,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     }
     for (int64_t c = 0; c < n; c += max_t_) {
         const int T = (int) std::min<int64_t>(max_t_, n - c);
-        if (cell0 + c + T <= first_needed) continue;
+        if (cell0 + c + T <= skip_below) continue;
         if (!capture_prefill(T, err)) return false;
         for (int t = 0; t < T; ++t) {
             const int64_t cell = cell0 + c + t;
@@ -647,11 +705,10 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
             h_step_[t * 4 + 3] = (int32_t) (cell + 1);
             for (int64_t h = 0; h < g_->n_head; ++h) h_pos_[t * g_->n_head + h] = (int32_t) cell;
         }
-        if (cudaMemcpyAsync(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cudaMemcpyDeviceToDevice,
-                            cs_) != cudaSuccess ||
-            cudaGraphLaunch(prefill_exec_[T], cs_) != cudaSuccess ||
-            cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
+        if (!strata::gpu::copy_async(Rin_, R_rows + (size_t) c * HCN, (size_t) T * HCN * sizeof(float), cs_) ||
+            !strata::gpu::graph_launch(prefill_exec_[T], cs_) ||
+            !strata::gpu::stream_sync(cs_)) {
+            err = std::string("mtp prefill: ") + strata::gpu::last_error();
             return false;
         }
     }
@@ -681,8 +738,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     h_row_[0] = a;
     h_row_[1] = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (cudaGraphLaunch(round_exec_[T], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
-        err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+    if (!strata::gpu::graph_launch(round_exec_[T], cs_) || !strata::gpu::stream_sync(cs_)) {
+        err = std::string("mtp draft: ") + strata::gpu::last_error();
         return false;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
@@ -694,8 +751,8 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!capture_step(j, err)) return false;
         put(max_t_ + j - 1, p + a + j);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+        if (!strata::gpu::graph_launch(step_exec_[j], cs_) || !strata::gpu::stream_sync(cs_)) {
+            err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
@@ -716,8 +773,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)
-        if (cudaMemcpy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float),
-                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+        if (!strata::gpu::copy((void*) (window_R_ + (size_t) t * HCN), R_row, (size_t) HCN * sizeof(float))) {
             err = "mtp: staging the first residual failed";
             return false;
         }

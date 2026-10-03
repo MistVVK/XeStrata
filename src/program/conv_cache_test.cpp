@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/program/conv_cache_test.cpp - the conversation cache's retention policy: the shared root survives,
 // the leaves rotate by least recent use.
 //

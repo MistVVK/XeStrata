@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/overlap_main.cpp - `strata-overlap`: does streaming an expert overlap with computing on it?
 //
 // THE ARCHITECTURE'S CENTRAL PREMISE.  Only (1 - h) of a token's expert weights are in VRAM, so the rest must

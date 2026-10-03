@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/layer.hpp - one GDN LAYER, composed.  P2.S5's mixer.
 //
 // This is the first place in the engine where the kernels are COMPOSED rather than tested individually, so
@@ -40,6 +43,8 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <string>
 
@@ -211,6 +216,13 @@ struct QsaState {
     bool kv_q4 = false;
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
+    /// Hybrid K8V4 (qsa_set_kv_hybrid, upstream 2aa8f72): K in INT8 (unrotated, so the scores stay INT8's), V in
+    /// rotated Q4_0 (kv_q4.hpp): 816 B per cell.  Uses k_q / k_scale and v_q4.  Mode 0 only (no KV streaming); the
+    /// MTP drafter's state stays INT8.
+    bool kv_hybrid = false;
+    /// K and V stored after the Hadamard rotation (kv_q4.hpp): Q4_0 always, INT8 with STRATA_KV_ROT=1 (upstream
+    /// 270650e); the queries are rotated alike and the attention output back
+    bool kv_rot = false;
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
@@ -272,12 +284,22 @@ uint64_t qsa_kv_host_bytes();
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
+/// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
+void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).
+/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0, 816 B per cell.  Not with --kv-resident.
+void qsa_set_kv_hybrid(bool enabled);
+bool qsa_kv_hybrid();
+/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4).  A hybrid
+/// state is mode 0 only and never reaches them: refused rather than read with a wrong layout.
 inline int qsa_kv_format(const QsaState& st) {
+    if (st.kv_hybrid) {
+        std::fprintf(stderr, "strata: qsa_kv_format: a hybrid K8V4 state must never reach the block movers\n");
+        std::exit(1);
+    }
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
@@ -367,8 +389,7 @@ bool qsa_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 ///
 ///   * **THE WAIT MUST POLL THE DRIVER.**  Round 195: a host spin that only reads a memory location never runs
 ///     the kernel - 5,907,703 spins over 500 ms and the datum flips the instant `cudaStreamSynchronize` is
-///     called and never before, because on Windows the driver BATCHES command submission and a memory-only
-///     spin gives it no reason to flush.  So `h_seq` is read AND `cudaEventQuery` is called, which is a query
+///     called and never before. So `h_seq` is read AND `cudaEventQuery` is called, which is a query
 ///     and not a blocking sync - P2.X3's "zero synchronization calls in the layer loop" still holds.
 ///   * **THE WRITE MUST BE CAPTURABLE, AND A KERNEL IS.**  Round 199: `cudaEventRecord` inside a capture is
 ///     SILENTLY DROPPED - 2 nodes for two kernels plus an event record, and the event never completed across a

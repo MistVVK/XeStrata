@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/artifact/gguf_reader_test.cpp - the reader refuses what it cannot arbitrate (synthetic GGUF, no model,
 // no GPU).
 //
@@ -7,8 +10,7 @@
 //      lookup that silently picks by position.
 //
 // The fixture is a minimal GGUF v3 written here (header, no metadata, two F32[8] tensors, 32-byte
-// alignment), so the test needs neither gguf-py nor a shard.  The file is closed before it is removed:
-// on Windows an open mapping keeps it.
+// alignment), so the test needs neither gguf-py nor a shard. The file is closed before it is removed.
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cstdint>

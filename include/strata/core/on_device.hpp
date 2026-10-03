@@ -1,20 +1,20 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
-// Multi-GPU: make `device` current for a scope and restore the caller's device after it.  An object that owns CUDA
-// streams, graphs and buffers on one device (a verify stage, the drafter) wraps its public calls in this, so the
-// caller's thread may be on any device.  A negative device, or the device already current, does nothing.
+// Multi-GPU: make `device` current for a scope.  The Xe runtime drives exactly one device (docs/XE.md), so device 0 and
+// a negative device are the current one and do nothing; any other device is refused where the object that owns it is
+// created (a layer split across GPUs is not supported).
 
-#include <cuda_runtime.h>
+#include <stdexcept>
 
 namespace strata::core {
 
 struct OnDevice {
-    int previous = -1;
     explicit OnDevice(int device) {
-        int cur = 0;
-        if (device >= 0 && cudaGetDevice(&cur) == cudaSuccess && cur != device && cudaSetDevice(device) == cudaSuccess)
-            previous = cur;
+        if (device > 0) throw std::runtime_error("OnDevice: the Xe engine drives one device; device " +
+                                                 std::to_string(device) + " is not available");
     }
-    ~OnDevice() { if (previous >= 0) cudaSetDevice(previous); }
     OnDevice(const OnDevice&) = delete;
     OnDevice& operator=(const OnDevice&) = delete;
 };

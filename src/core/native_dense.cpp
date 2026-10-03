@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
 #include <algorithm>
 #include <climits>
 #include <exception>
@@ -25,7 +29,7 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
-struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
+struct DeviceFree { void operator()(void* p) const { if (p) strata::gpu::free(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
     WeightRef* ref;
@@ -53,8 +57,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 }
 
 NativeDense::~NativeDense() {
-    if (scratch_) cudaFree(scratch_);
-    for (void* p : weights_) cudaFree(p);
+    if (scratch_) strata::gpu::free(scratch_);
+    for (void* p : weights_) strata::gpu::free(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -62,6 +66,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
+        sycl::queue& compute = strata::core::Runtime::get().compute();
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
@@ -146,23 +151,29 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
+                bool status = strata::gpu::alloc_device(&allocation, bytes);
                 DevicePtr data(allocation);
-                if (status == cudaSuccess)
-                    status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
-                if (status != cudaSuccess) {
-                    err = "native dense upload " + tensor.name + ": " + cudaGetErrorString(status); return false;
+                if (status)
+                    status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
+                if (!status) {
+                    err = "native dense upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
+                }
+                int type = (int) tensor.type;
+                if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) ref.ne0)) {   // aligned loads
+                    strata::kernels::native_q6_k_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                    type = strata::kernels::kNativeQ6KRows;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
+                pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
         }
+        compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+        const bool status = strata::gpu::alloc_device(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
-        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
+        if (!status) { err = std::string("native dense scratch: ") + strata::gpu::last_error(); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         for (auto& item : pending) {

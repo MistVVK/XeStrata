@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
 #include "strata/core/progress.hpp"
@@ -9,7 +12,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/ngram.hpp"
 
-#include <cuda_runtime.h>
+#include "strata/core/gpu.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -20,7 +23,7 @@
 
 // `_mm_pause` for the doorbell spin.  Guarded because it is x86-only; a target without it still builds, the
 // spin is just less polite to the pipeline.
-#if defined(_MSC_VER) || defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #define STRATA_SPIN_PAUSE() _mm_pause()
 #else
@@ -108,18 +111,17 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
 }
 
 void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, void* stream) {
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     // the residual: `hc` copies of the one vector a caller hands in.  A real sequence's first token is the
     // embedding broadcast to every stream, which is the reference's own initial condition.
     if (R_init != nullptr) {
         for (int64_t c = 0; c < g.hc; ++c)
-            cudaMemcpyAsync(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4,
-                            cudaMemcpyDeviceToDevice, cs);
+            strata::gpu::copy_async(s.block.R + (size_t) c * g.n_embd, R_init, (size_t) g.n_embd * 4, cs);
     } else {
-        cudaMemsetAsync(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
+        strata::gpu::memset_async(s.block.R, 0, (size_t) g.hc * g.n_embd * 4, cs);
     }
     // every GDN layer's recurrence and conv history
-    cudaMemsetAsync(s.gdn_state, 0, (size_t) g.n_gdn_layers() * gdn_state_floats(g) * 4, cs);
+    strata::gpu::memset_async(s.gdn_state, 0, (size_t) g.n_gdn_layers() * gdn_state_floats(g) * 4, cs);
     // and every QSA layer's cache and indexer
     for (int64_t i = 0; i < g.n_qsa_layers(); ++i) qsa_state_zero(s.qsa_states[i], g, stream);
     // **AND THE PLE'S CONV HISTORY AND TOKEN WINDOW.**  A sequence that started with a warm history would
@@ -127,7 +129,7 @@ void session_zero(SessionState& s, const ModelGeometry& g, const float* R_init, 
     // so a stale one is a real contribution and not a zero.  The token window resets to `NG_HIST`-many nulls
     // for the same reason: `ngram_rows` treats a missing predecessor as the EOS cut, which is what a sequence
     // boundary IS.
-    cudaMemsetAsync(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
+    strata::gpu::memset_async(s.ple_hist, 0, (size_t) ple_hist_bytes(), cs);
     s.ple_prev[0] = -1;
     s.ple_prev[1] = -1;
     s.ple_token = -1;
@@ -162,15 +164,15 @@ void stage_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionS
 bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionState& s, const float* parts,
                      SessionGraphs& gr, std::string& err, bool split) {
     if (gr.captured) return true;
-    gr.execs = new cudaGraphExec_t[(size_t) g.n_layers];
-    gr.posts = new cudaGraphExec_t[(size_t) g.n_layers];
+    gr.execs = new strata::gpu::Graph*[(size_t) g.n_layers];
+    gr.posts = new strata::gpu::Graph*[(size_t) g.n_layers];
     for (int64_t i = 0; i < g.n_layers; ++i) gr.posts[i] = nullptr;
     if (split) {
-        gr.preA = new cudaGraphExec_t[(size_t) g.n_layers];
-        gr.preB = new cudaGraphExec_t[(size_t) g.n_layers];
+        gr.preA = new strata::gpu::Graph*[(size_t) g.n_layers];
+        gr.preB = new strata::gpu::Graph*[(size_t) g.n_layers];
         for (int64_t i = 0; i < g.n_layers; ++i) { gr.preA[i] = nullptr; gr.preB[i] = nullptr; }
         for (int k = 0; k < 5; ++k) {
-            gr.preP[k] = new cudaGraphExec_t[(size_t) g.n_layers];
+            gr.preP[k] = new strata::gpu::Graph*[(size_t) g.n_layers];
             for (int64_t i = 0; i < g.n_layers; ++i) gr.preP[k][i] = nullptr;
         }
     }
@@ -187,14 +189,14 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
         // the CPU pool on what it published; `post` combines those experts with THIS layer's weights.  Capturing
         // them together is what the old single graph could not do, and the reason it could not is that
         // `moe_combine` needs the pool's answer and the pool needs the router's.
-        auto capture = [&](bool post, cudaGraphExec_t* out, const char* what, int half = 0,
+        auto capture = [&](bool post, strata::gpu::Graph** out, const char* what, int half = 0,
                            int stage_prefix = 0) -> bool {
-            cudaStream_t cs = nullptr;
-            if (cudaStreamCreate(&cs) != cudaSuccess) {
+            strata::gpu::Stream cs = nullptr;
+            if (!(cs = strata::gpu::stream_create())) {
                 err = std::string("session_capture: stream create failed");
                 return false;
             }
-            if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            if (!strata::gpu::begin_capture(cs)) {
                 err = "session_capture: begin failed at layer " + std::to_string(l);
                 return false;
             }
@@ -207,22 +209,19 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
                                                   s.block, (void*) cs, err, s.db, s.ple.ready() ? &s.ple : nullptr,
                                                   half, stage_prefix);
             if (!ok) {
+                strata::gpu::abandon_capture(cs);
+                strata::gpu::stream_destroy(cs);
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " + err;
                 return false;
             }
-            cudaGraph_t graph = nullptr;
-            const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-            cudaStreamDestroy(cs);
-            if (ce != cudaSuccess) {
+            // an executable graph replays on any stream of the runtime, so the recording stream can go
+            const bool ce = strata::gpu::end_capture(cs, out);
+            strata::gpu::stream_destroy(cs);
+            if (!ce) {
                 err = "session_capture: " + std::string(what) + " layer " + std::to_string(l) + ": " +
-                      cudaGetErrorString(ce) + " (a synchronous call in the layer?)";
+                      strata::gpu::last_error() + " (a synchronous call in the layer?)";
                 return false;
             }
-            if (cudaGraphInstantiate(out, graph, 0) != cudaSuccess) {
-                err = "session_capture: instantiate failed at layer " + std::to_string(l);
-                return false;
-            }
-            cudaGraphDestroy(graph);
             return true;
         };
         if (!capture(/*post=*/false, &gr.execs[l], "pre")) return false;
@@ -247,12 +246,12 @@ bool session_capture(const WeightTable& tables, const ModelGeometry& g, SessionS
 bool session_replay(const ModelGeometry& g, int64_t pos, int32_t pos_base, SessionState& s, SessionGraphs& gr,
                     void* stream, std::string& err) {
     if (!gr.captured || gr.n != g.n_layers) { err = "session_replay: not captured"; return false; }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay: layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
+        const bool e = strata::gpu::graph_launch(gr.execs[l], cs);
+        if (!e) {
+            err = "session_replay: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
             return false;
         }
     }
@@ -265,19 +264,19 @@ bool session_replay_full(const ModelGeometry& g, int64_t pos, int32_t pos_base, 
         err = "session_replay_full: not captured with post graphs";
         return false;
     }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     stage_token(g, pos, pos_base, s);
     for (int64_t l = 0; l < g.n_layers; ++l) {
         // `pre[l]` then `post[l]`, in the order `session_loop` uses.  The two are ordered on one stream, and
         // `post[l]` reads what `pre[l]` wrote, so they cannot be reordered or run concurrently.
-        cudaError_t e = cudaGraphLaunch(gr.execs[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay_full: pre[" + std::to_string(l) + "]: " + cudaGetErrorString(e);
+        bool e = strata::gpu::graph_launch(gr.execs[l], cs);
+        if (!e) {
+            err = "session_replay_full: pre[" + std::to_string(l) + "]: " + strata::gpu::last_error();
             return false;
         }
-        e = cudaGraphLaunch(gr.posts[l], cs);
-        if (e != cudaSuccess) {
-            err = "session_replay_full: post[" + std::to_string(l) + "]: " + cudaGetErrorString(e);
+        e = strata::gpu::graph_launch(gr.posts[l], cs);
+        if (!e) {
+            err = "session_replay_full: post[" + std::to_string(l) + "]: " + strata::gpu::last_error();
             return false;
         }
     }
@@ -291,40 +290,40 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
         err = "session_replay_stages: not captured with the split";
         return false;
     }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     stage_token(g, pos, pos_base, s);
 
     // Four events PER LAYER rather than four reused ones: reusing them would need a synchronisation after
     // every layer to read them before the next launch overwrote them, and a per-layer sync would report the
     // serialised time rather than the graph's.
     const int64_t n = g.n_layers;
-    std::vector<cudaEvent_t> ev((size_t) (n * 4));
+    std::vector<strata::gpu::Event*> ev((size_t) (n * 4));
     for (auto& e : ev) {
-        if (cudaEventCreate(&e) != cudaSuccess) { err = "session_replay_stages: event create"; return false; }
+        if (!strata::gpu::event_create(&e)) { err = "session_replay_stages: event create"; return false; }
     }
     struct Free {
-        std::vector<cudaEvent_t>* v;
-        ~Free() { for (auto& e : *v) cudaEventDestroy(e); }
+        std::vector<strata::gpu::Event*>* v;
+        ~Free() { for (auto& e : *v) strata::gpu::event_destroy(e); }
     } frees{&ev};
 
     for (int64_t l = 0; l < n; ++l) {
-        cudaEventRecord(ev[(size_t) (l * 4 + 0)], cs);
-        if (cudaGraphLaunch(gr.preA[l], cs) != cudaSuccess) { err = "stages: preA"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 1)], cs);
-        if (cudaGraphLaunch(gr.preB[l], cs) != cudaSuccess) { err = "stages: preB"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 2)], cs);
-        if (cudaGraphLaunch(gr.posts[l], cs) != cudaSuccess) { err = "stages: post"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 3)], cs);
+        strata::gpu::event_record(ev[(size_t) (l * 4 + 0)], cs);
+        if (!strata::gpu::graph_launch(gr.preA[l], cs)) { err = "stages: preA"; return false; }
+        strata::gpu::event_record(ev[(size_t) (l * 4 + 1)], cs);
+        if (!strata::gpu::graph_launch(gr.preB[l], cs)) { err = "stages: preB"; return false; }
+        strata::gpu::event_record(ev[(size_t) (l * 4 + 2)], cs);
+        if (!strata::gpu::graph_launch(gr.posts[l], cs)) { err = "stages: post"; return false; }
+        strata::gpu::event_record(ev[(size_t) (l * 4 + 3)], cs);
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "stages: final sync"; return false; }
+    if (!strata::gpu::stream_sync(cs)) { err = "stages: final sync"; return false; }
 
     mixer_per_layer.assign((size_t) n, 0.0);
     ms_ffn = 0; ms_post = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0;
-        cudaEventElapsedTime(&a, ev[(size_t) (l * 4 + 0)], ev[(size_t) (l * 4 + 1)]);
-        cudaEventElapsedTime(&b, ev[(size_t) (l * 4 + 1)], ev[(size_t) (l * 4 + 2)]);
-        cudaEventElapsedTime(&c, ev[(size_t) (l * 4 + 2)], ev[(size_t) (l * 4 + 3)]);
+        strata::gpu::event_elapsed_ms(&a, ev[(size_t) (l * 4 + 0)], ev[(size_t) (l * 4 + 1)]);
+        strata::gpu::event_elapsed_ms(&b, ev[(size_t) (l * 4 + 1)], ev[(size_t) (l * 4 + 2)]);
+        strata::gpu::event_elapsed_ms(&c, ev[(size_t) (l * 4 + 2)], ev[(size_t) (l * 4 + 3)]);
         mixer_per_layer[(size_t) l] = (double) a;
         ms_ffn += b; ms_post += c;
     }
@@ -348,35 +347,35 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
         return false;
     }
     if (k < 1 || k > 5) { err = "session_replay_stage_sweep: k must be 1..5"; return false; }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     stage_token(g, pos, pos_base, s);
 
-    cudaEvent_t a, b;
-    if (cudaEventCreate(&a) != cudaSuccess || cudaEventCreate(&b) != cudaSuccess) {
+    strata::gpu::Event *a, *b;
+    if (!strata::gpu::event_create(&a) || !strata::gpu::event_create(&b)) {
         err = "session_replay_stage_sweep: event create";
         return false;
     }
-    cudaEventRecord(a, cs);
+    strata::gpu::event_record(a, cs);
     for (int64_t l = 0; l < g.n_layers; ++l) {
-        const cudaError_t e = cudaGraphLaunch(gr.preP[k - 1][l], cs);
-        if (e != cudaSuccess) {
-            cudaEventDestroy(a);
-            cudaEventDestroy(b);
-            err = std::string("session_replay_stage_sweep: launch: ") + cudaGetErrorString(e);
+        const bool e = strata::gpu::graph_launch(gr.preP[k - 1][l], cs);
+        if (!e) {
+            strata::gpu::event_destroy(a);
+            strata::gpu::event_destroy(b);
+            err = std::string("session_replay_stage_sweep: launch: ") + strata::gpu::last_error();
             return false;
         }
     }
-    cudaEventRecord(b, cs);
-    if (cudaStreamSynchronize(cs) != cudaSuccess) {
-        cudaEventDestroy(a);
-        cudaEventDestroy(b);
+    strata::gpu::event_record(b, cs);
+    if (!strata::gpu::stream_sync(cs)) {
+        strata::gpu::event_destroy(a);
+        strata::gpu::event_destroy(b);
         err = "session_replay_stage_sweep: sync";
         return false;
     }
     float v = 0;
-    cudaEventElapsedTime(&v, a, b);
-    cudaEventDestroy(a);
-    cudaEventDestroy(b);
+    strata::gpu::event_elapsed_ms(&v, a, b);
+    strata::gpu::event_destroy(a);
+    strata::gpu::event_destroy(b);
     ms = (double) v;
     return true;
 }
@@ -388,59 +387,59 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
         err = "session_replay_stage_prefixes: not captured with the split";
         return false;
     }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     stage_token(g, pos, pos_base, s);
     const int64_t n = g.n_layers;
     const size_t r_floats = (size_t) g.hc * (size_t) g.n_embd;
 
     float* saved = nullptr;
-    if (cudaMalloc((void**) &saved, r_floats * sizeof(float)) != cudaSuccess) {
+    if (!strata::gpu::alloc_device((void**) &saved, r_floats * sizeof(float))) {
         err = "session_replay_stage_prefixes: could not save the residual";
         return false;
     }
-    std::vector<cudaEvent_t> ev((size_t) (n * 6));
+    std::vector<strata::gpu::Event*> ev((size_t) (n * 6));
     bool ev_ok = true;
-    for (auto& e : ev) if (cudaEventCreate(&e) != cudaSuccess) { ev_ok = false; break; }
+    for (auto& e : ev) if (!strata::gpu::event_create(&e)) { ev_ok = false; break; }
     if (!ev_ok) {
-        for (auto& e : ev) cudaEventDestroy(e);
-        cudaFree(saved);
+        for (auto& e : ev) strata::gpu::event_destroy(e);
+        strata::gpu::free(saved);
         err = "session_replay_stage_prefixes: event create";
         return false;
     }
     struct Cleanup {
-        std::vector<cudaEvent_t>* v;
+        std::vector<strata::gpu::Event*>* v;
         float* p;
-        ~Cleanup() { for (auto& e : *v) cudaEventDestroy(e); cudaFree(p); }
+        ~Cleanup() { for (auto& e : *v) strata::gpu::event_destroy(e); strata::gpu::free(p); }
     } cleanup{&ev, saved};
 
     double t[5] = {0, 0, 0, 0, 0};
     mixer_per_layer.assign((size_t) n, 0.0);
     for (int64_t l = 0; l < n; ++l) {
         // The residual as this layer receives it, before any prefix has advanced it.
-        cudaMemcpyAsync(saved, s.block.R, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
+        strata::gpu::copy_async(saved, s.block.R, r_floats * sizeof(float), cs);
         for (int k = 1; k <= 5; ++k) {
-            if (k > 1) cudaMemcpyAsync(s.block.R, saved, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
-            cudaEventRecord(ev[(size_t) (l * 6 + k - 1)], cs);
-            const cudaGraphExec_t ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
-            const cudaError_t e = cudaGraphLaunch(ge, cs);
-            if (e != cudaSuccess) {
+            if (k > 1) strata::gpu::copy_async(s.block.R, saved, r_floats * sizeof(float), cs);
+            strata::gpu::event_record(ev[(size_t) (l * 6 + k - 1)], cs);
+            const strata::gpu::Graph* ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
+            const bool e = strata::gpu::graph_launch(ge, cs);
+            if (!e) {
                 err = std::string("session_replay_stage_prefixes: launch prefix ") + std::to_string(k) + ": " +
-                      cudaGetErrorString(e);
+                      strata::gpu::last_error();
                 return false;
             }
         }
-        cudaEventRecord(ev[(size_t) (l * 6 + 5)], cs);
+        strata::gpu::event_record(ev[(size_t) (l * 6 + 5)], cs);
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "prefixes: final sync"; return false; }
+    if (!strata::gpu::stream_sync(cs)) { err = "prefixes: final sync"; return false; }
 
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     for (int64_t l = 0; l < n; ++l) {
         float a = 0, b = 0, c = 0, d = 0, e = 0;
-        cudaEventElapsedTime(&a, ev[(size_t) (l * 6 + 0)], ev[(size_t) (l * 6 + 1)]);
-        cudaEventElapsedTime(&b, ev[(size_t) (l * 6 + 1)], ev[(size_t) (l * 6 + 2)]);
-        cudaEventElapsedTime(&c, ev[(size_t) (l * 6 + 2)], ev[(size_t) (l * 6 + 3)]);
-        cudaEventElapsedTime(&d, ev[(size_t) (l * 6 + 3)], ev[(size_t) (l * 6 + 4)]);
-        cudaEventElapsedTime(&e, ev[(size_t) (l * 6 + 4)], ev[(size_t) (l * 6 + 5)]);
+        strata::gpu::event_elapsed_ms(&a, ev[(size_t) (l * 6 + 0)], ev[(size_t) (l * 6 + 1)]);
+        strata::gpu::event_elapsed_ms(&b, ev[(size_t) (l * 6 + 1)], ev[(size_t) (l * 6 + 2)]);
+        strata::gpu::event_elapsed_ms(&c, ev[(size_t) (l * 6 + 2)], ev[(size_t) (l * 6 + 3)]);
+        strata::gpu::event_elapsed_ms(&d, ev[(size_t) (l * 6 + 3)], ev[(size_t) (l * 6 + 4)]);
+        strata::gpu::event_elapsed_ms(&e, ev[(size_t) (l * 6 + 4)], ev[(size_t) (l * 6 + 5)]);
         t1 += a; t2 += b; t3 += c; t4 += d; t5 += e;
         mixer_per_layer[(size_t) l] = (double) c;   // prefix 3 IS the mixer: stages 0..2
     }
@@ -455,28 +454,28 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
 
 void session_graphs_free(SessionGraphs& gr) {
     if (gr.execs) {
-        for (int64_t i = 0; i < gr.n; ++i) cudaGraphExecDestroy(gr.execs[i]);
+        for (int64_t i = 0; i < gr.n; ++i) strata::gpu::graph_destroy(gr.execs[i]);
         delete[] gr.execs;
     }
     if (gr.posts) {
         for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.posts[i] != nullptr) cudaGraphExecDestroy(gr.posts[i]);
+            if (gr.posts[i] != nullptr) strata::gpu::graph_destroy(gr.posts[i]);
         delete[] gr.posts;
     }
     if (gr.preA) {
         for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preA[i] != nullptr) cudaGraphExecDestroy(gr.preA[i]);
+            if (gr.preA[i] != nullptr) strata::gpu::graph_destroy(gr.preA[i]);
         delete[] gr.preA;
     }
     if (gr.preB) {
         for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preB[i] != nullptr) cudaGraphExecDestroy(gr.preB[i]);
+            if (gr.preB[i] != nullptr) strata::gpu::graph_destroy(gr.preB[i]);
         delete[] gr.preB;
     }
     for (int k = 0; k < 5; ++k) {
         if (gr.preP[k] == nullptr) continue;
         for (int64_t i = 0; i < gr.n; ++i)
-            if (gr.preP[k][i] != nullptr) cudaGraphExecDestroy(gr.preP[k][i]);
+            if (gr.preP[k][i] != nullptr) strata::gpu::graph_destroy(gr.preP[k][i]);
         delete[] gr.preP[k];
         gr.preP[k] = nullptr;
     }
@@ -497,13 +496,13 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
     }
     parts_bytes = parts_bytes_in;
     // MAPPED as well as pinned: the token graph's handoff kernel reads it through its device pointer.
-    if (cudaHostAlloc((void**) &y_miss, parts_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
-        err = "SessionLoopScratch: cudaHostAlloc for the pool's staging failed";
+    if (!strata::gpu::alloc_host((void**) &y_miss, parts_bytes)) {
+        err = std::string("SessionLoopScratch: host allocation for the pool's staging failed: ") + strata::gpu::last_error();
         return false;
     }
     std::memset(y_miss, 0, parts_bytes);
-    if (cudaEventCreate(&probe) != cudaSuccess) {
-        err = "SessionLoopScratch: cudaEventCreate failed";
+    if (!strata::gpu::event_create(&probe)) {
+        err = "SessionLoopScratch: event create failed";
         free();
         return false;
     }
@@ -529,8 +528,8 @@ void SessionLoopScratch::free() {
         pinned = false;
         pinned_core = -1;
     }
-    if (probe != nullptr) { cudaEventDestroy(probe); probe = nullptr; }
-    if (y_miss != nullptr) { cudaFreeHost(y_miss); y_miss = nullptr; }
+    if (probe != nullptr) { strata::gpu::event_destroy(probe); probe = nullptr; }
+    if (y_miss != nullptr) { strata::gpu::free(y_miss); y_miss = nullptr; }
     parts_bytes = 0;
 }
 
@@ -541,7 +540,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     if (gr.parts_dev == nullptr) { err = "session_loop: the graphs were captured without a parts buffer"; return false; }
     if (s.db == nullptr) { err = "session_loop: no doorbell; the loop has nothing to poll"; return false; }
 
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     const int64_t k = s.k;
     const size_t parts_bytes = (size_t) k * g.n_embd * 4;
     ++gr.calls_total;
@@ -595,11 +594,11 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     // doorbell's `h_x_f` is `cudaHostAlloc(Mapped)` for exactly this reason and this buffer is the same kind of
     // object.
     float* y_miss = scratch->y_miss;
-    cudaEvent_t probe = scratch->probe;
+    strata::gpu::Event* probe = scratch->probe;
 
     // the first layer has no previous layer's experts: `y_miss` starts at zero, which is what "hits are empty
     // in this phase" means once every miss has been computed
-    cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+    strata::gpu::copy_async(gr.parts_dev, y_miss, parts_bytes, cs);
     doorbell_reset(*s.db);
     uint32_t expected = 0;
 
@@ -611,20 +610,20 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
     // "the input to layer 0 is already wrong" from "layer 0 is wrong".
     if (dump_layers != nullptr) {
         const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-        const cudaError_t de = cudaMemcpyAsync(dump_layers, s.R, n * sizeof(float), cudaMemcpyDeviceToHost, cs);
-        if (de != cudaSuccess) {
-            err = "session_loop: dump the input residual: " + std::string(cudaGetErrorString(de));
+        const bool de = strata::gpu::copy_async(dump_layers, s.R, n * sizeof(float), cs);
+        if (!de) {
+            err = "session_loop: dump the input residual: " + std::string(strata::gpu::last_error());
             return false;
         }
     }
     {
         const auto t0 = std::chrono::steady_clock::now();
-        const cudaError_t le = cudaGraphLaunch(gr.execs[0], cs);
-        if (le != cudaSuccess) {
-            err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(le));
+        const bool le = strata::gpu::graph_launch(gr.execs[0], cs);
+        if (!le) {
+            err = "session_loop: launch pre[0]: " + std::string(strata::gpu::last_error());
             return false;
         }
-        cudaEventRecord(probe, cs);
+        strata::gpu::event_record(probe, cs);
         (void) t0;
     }
 
@@ -648,16 +647,13 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             // is entered.  The fence and the volatile read are kept because they are correct and cost nothing -
             // without them the ring's ordering against `x_f`/`ids`/`weights` is unstated - but they do not
             // remove the need for the call, and nothing here should be read as claiming they do.
-            const cudaError_t q = cudaEventQuery(probe);
+            // On Xe the event query also enters the driver; a failed query surfaces at the next runtime wait.
+            const bool done = strata::gpu::event_query(probe);
             if (!rang && *seq >= want) {
                 rang = true;
-                mid_graph = (q != cudaSuccess);
+                mid_graph = !done;
             }
-            if (q == cudaSuccess) break;                 // the graph has ended
-            if (q != cudaErrorNotReady) {
-                err = "session_loop: query at layer " + std::to_string(l) + ": " + cudaGetErrorString(q);
-                return false;
-            }
+            if (done) break;              // the graph has ended
             if (rang) break;                             // rung, and the graph is still running: the overlap
             STRATA_SPIN_PAUSE();
         }
@@ -688,15 +684,15 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // `sum_j w_{l+1}[j] * expert_{ids_l,j}(x_l)` - both the selection and the input one layer stale while
         // the weights were current.  It produced finite, fluent, deterministic tokens that were not the
         // model's, and no timing test could see it.
-        cudaMemcpyAsync(gr.parts_dev, y_miss, parts_bytes, cudaMemcpyHostToDevice, cs);
+        strata::gpu::copy_async(gr.parts_dev, y_miss, parts_bytes, cs);
         // ---- **AND THEN THE COMBINE.**  Stream-ordered after the copy above, so `hit_out` is added to misses
         // that are already in `parts`, and before `post[l]`, whose `moe_combine` reads the sum.  A no-op when
         // there is no VRAM tier or nothing is resident, which is every layer until the cache warms.
         if (hits != nullptr) hits(user, cs, HitPhase::Combine, nullptr, 0);
         {
-            const cudaError_t pe = cudaGraphLaunch(gr.posts[l], cs);
-            if (pe != cudaSuccess) {
-                err = "session_loop: launch post[" + std::to_string(l) + "]: " + cudaGetErrorString(pe);
+            const bool pe = strata::gpu::graph_launch(gr.posts[l], cs);
+            if (!pe) {
+                err = "session_loop: launch post[" + std::to_string(l) + "]: " + strata::gpu::last_error();
                 return false;
             }
         }
@@ -706,17 +702,16 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // `dump_layers` in session.hpp for why this is an enqueue and not a read.
         if (dump_layers != nullptr) {
             const size_t n = (size_t) g.hc * (size_t) g.n_embd;
-            const cudaError_t de = cudaMemcpyAsync(dump_layers + (size_t) (l + 1) * n, s.R, n * sizeof(float),
-                                                   cudaMemcpyDeviceToHost, cs);
-            if (de != cudaSuccess) {
-                err = "session_loop: dump layer " + std::to_string(l) + ": " + cudaGetErrorString(de);
+            const bool de = strata::gpu::copy_async(dump_layers + (size_t) (l + 1) * n, s.R, n * sizeof(float), cs);
+            if (!de) {
+                err = "session_loop: dump layer " + std::to_string(l) + ": " + strata::gpu::last_error();
                 return false;
             }
         }
         if (!overlap) {
             // THE COMPARISON ARM.  The same sequence with the pipeline removed: the CPU does not start until the
             // layer is over, so nothing overlaps and the difference is attributable to the doorbell alone.
-            if (cudaStreamSynchronize(cs) != cudaSuccess) {
+            if (!strata::gpu::stream_sync(cs)) {
                 err = "session_loop: sync at layer " + std::to_string(l);
                 return false;
             }
@@ -725,12 +720,12 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // the two are ordered on one stream and `pre[l+1]`'s first use of `bb.mixed`/`bb.inject` is its own
         // `gr_read`, which comes after `post[l]` has consumed them.
         if (l + 1 < g.n_layers) {
-            const cudaError_t ne = cudaGraphLaunch(gr.execs[l + 1], cs);
-            if (ne != cudaSuccess) {
-                err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + cudaGetErrorString(ne);
+            const bool ne = strata::gpu::graph_launch(gr.execs[l + 1], cs);
+            if (!ne) {
+                err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + strata::gpu::last_error();
                 return false;
             }
-            cudaEventRecord(probe, cs);
+            strata::gpu::event_record(probe, cs);
         }
         // ---- **THE SECOND HALF OF THE ROUND TRIP, AND THE HALF NOTHING WAS MEASURING.**
         //
@@ -743,14 +738,14 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // exists to show what the pipeline is worth, and hiding its cost here would defeat the comparison.
         gr.ms_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ring).count();
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "session_loop: final sync"; return false; }
+    if (!strata::gpu::stream_sync(cs)) { err = "session_loop: final sync"; return false; }
     return true;
 }
 
 bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t pos, int32_t pos_base,
                    SessionState& s, const float* parts, void* stream, bool sync_every_layer,
                    std::string& err) {
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     int64_t qsa_index = 0;
     int64_t gdn_index = 0;
 
@@ -781,9 +776,9 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
             // P2.X3 forbids in the fast path.  It exists to turn an ASYNCHRONOUS error - a kernel reading a
             // buffer a later layer wrote, or an out-of-range launch - into a failure AT THE LAYER THAT CAUSED
             // IT, instead of a wrong number 40 layers later or at the end of the token.
-            const cudaError_t e = cudaStreamSynchronize(cs);
-            if (e != cudaSuccess) {
-                err = "layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
+            const bool e = strata::gpu::stream_sync(cs);
+            if (!e) {
+                err = "layer " + std::to_string(l) + ": " + strata::gpu::last_error();
                 return false;
             }
         }
@@ -809,14 +804,14 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         return false;
     }
     float* y_dev = nullptr;
-    if (cudaHostGetDevicePointer((void**) &y_dev, const_cast<float*>(y_miss_host), 0) != cudaSuccess || !y_dev) {
+    if (!strata::gpu::device_pointer((void**) &y_dev, const_cast<float*>(y_miss_host)) || !y_dev) {
         err = "session_capture_token: the parts staging is not mapped pinned memory";
         return false;
     }
-    cudaStream_t cs = nullptr;
-    if (cudaStreamCreate(&cs) != cudaSuccess) { err = "session_capture_token: stream create failed"; return false; }
-    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-        cudaStreamDestroy(cs);
+    strata::gpu::Stream cs = nullptr;
+    if (!(cs = strata::gpu::stream_create())) { err = "session_capture_token: stream create failed"; return false; }
+    if (!strata::gpu::begin_capture(cs)) {
+        strata::gpu::stream_destroy(cs);
         err = "session_capture_token: begin capture failed";
         return false;
     }
@@ -840,7 +835,7 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
                                                     hits->x_scale);
         }
         strata::kernels::doorbell_wait(s.db->d_flag, s.db->d_seq, (void*) cs);
-        // A kernel, not a memcpy node: a copy-engine node splits the WDDM submission (measured 67 flushes/token).
+        // A kernel keeps this copy on the compute queue, in the same graph as the surrounding work.
         strata::kernels::copy_from_mapped(parts_dev, y_dev, (int64_t) (parts_bytes / sizeof(float)), (void*) cs);
         if (hits != nullptr)
             strata::kernels::moe_hit_add(parts_dev, hits->hit_out, hits->d_dst, hits->d_count, s.k, g.n_embd, (void*) cs);
@@ -848,18 +843,15 @@ bool session_capture_token(const WeightTable& tables, const ModelGeometry& g, Se
         if (!ok) { err = "session_capture_token: post layer " + std::to_string(l) + ": " + err; break; }
         if (qsa) ++qsa_index;
     }
-    cudaGraph_t graph = nullptr;
-    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-    cudaStreamDestroy(cs);
-    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess) {
-        err = std::string("session_capture_token: end capture: ") + cudaGetErrorString(ce);
+    if (!ok) {
+        strata::gpu::abandon_capture(cs);
+        strata::gpu::stream_destroy(cs);
         return false;
     }
-    const cudaError_t ie = cudaGraphInstantiate(&tg.exec, graph, 0);
-    cudaGraphDestroy(graph);
-    if (ie != cudaSuccess) {
-        err = std::string("session_capture_token: instantiate: ") + cudaGetErrorString(ie);
+    const bool ce = strata::gpu::end_capture(cs, &tg.exec);
+    strata::gpu::stream_destroy(cs);
+    if (!ce) {
+        err = std::string("session_capture_token: end capture: ") + strata::gpu::last_error();
         return false;
     }
     tg.captured = true;
@@ -873,13 +865,13 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                        PoolFn pool, void* user, float* y_miss_host, void* stream, std::string& err) {
     if (!tg.captured) { err = "session_run_token: not captured"; return false; }
     if (y_miss_host != tg.y_src) { err = "session_run_token: the staging buffer is not the captured one"; return false; }
-    cudaStream_t cs = (cudaStream_t) stream;
+    strata::gpu::Stream cs = stream;
     ++tg.calls;
     stage_token(g, pos, pos_base, s);
     doorbell_reset(*s.db);
-    const cudaError_t le = cudaGraphLaunch(tg.exec, cs);
-    if (le != cudaSuccess) { err = std::string("session_run_token: launch: ") + cudaGetErrorString(le); return false; }
-    (void) cudaStreamQuery(cs);                     // one flush, so WDDM submits the graph now
+    const bool le = strata::gpu::graph_launch(tg.exec, cs);
+    if (!le) { err = std::string("session_run_token: launch: ") + strata::gpu::last_error(); return false; }
+    (void) strata::gpu::stream_idle(cs);                     // enter the driver before polling the mapped doorbell
     static const int flush_us = [] {
         const char* e = std::getenv("STRATA_TG_FLUSH_US");
         return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
@@ -901,10 +893,8 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
                 // A slow ring: flush the submission queue once more, and notice a fault or a finished graph.
                 last_flush = now;
                 ++tg.flushes;
-                const cudaError_t q = cudaStreamQuery(cs);
-                if (q != cudaErrorNotReady && *seq < want) {
-                    err = "session_run_token: layer " + std::to_string(l) + " never rang (" +
-                          (q == cudaSuccess ? std::string("graph finished") : std::string(cudaGetErrorString(q))) + ")";
+                if (strata::gpu::stream_idle(cs) && *seq < want) {
+                    err = "session_run_token: layer " + std::to_string(l) + " never rang (graph finished)";
                     return false;
                 }
             }
@@ -924,15 +914,15 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         tg.ms_pool += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
     progress_at("token: waiting for the GPU to finish the token");
-    const cudaError_t se = cudaStreamSynchronize(cs);
-    if (se != cudaSuccess) { err = std::string("session_run_token: ") + cudaGetErrorString(se); return false; }
+    const bool se = strata::gpu::stream_sync(cs);
+    if (!se) { err = std::string("session_run_token: ") + strata::gpu::last_error(); return false; }
     progress_at("decode");
     progress_beat();
     return true;
 }
 
 void token_graph_free(TokenGraph& tg) {
-    if (tg.exec) cudaGraphExecDestroy(tg.exec);
+    if (tg.exec) strata::gpu::graph_destroy(tg.exec);
     tg = TokenGraph{};
 }
 
