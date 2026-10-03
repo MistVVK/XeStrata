@@ -224,15 +224,10 @@ The packages for the image encoders and running on Fedora's own kernel are not c
 
 #### Other distributions
 
-Two more distributions were tried the same way on the same day.
-Neither runs as it is.
-
-- **openSUSE Leap 16.0**: its compute-runtime (`libze_intel_gpu1`) is 25.18, too old to list the Arc Pro B70.
-  intel/llvm builds, but setup stops because it sees no GPU.
-- **Debian 13**: there is no Level Zero driver for Intel GPUs in main, contrib or backports.
-  The compute-runtime .deb packages Intel publishes on GitHub (MIT) did install.
-  With Debian's old `libze-dev` 1.20.6 in place, intel/llvm built with the current `tools/intel_llvm_build.py`, which fetches Level Zero.
-  Starting the engine was not tried.
+openSUSE Leap 16.0 was tried the same way on the same day.
+It does not run as it is:
+its compute-runtime (`libze_intel_gpu1`) is 25.18, too old to list the Arc Pro B70.
+intel/llvm builds, but setup stops because it sees no GPU.
 
 What any distribution needs:
 

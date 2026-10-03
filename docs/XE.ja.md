@@ -228,15 +228,10 @@ intel/llvm v7.1.1 のビルドに 14 分かかり、B70 に XMX が使えて、�
 
 #### ほかのディストリビューション
 
-同じ日に、同じ方法で 2 つのディストリビューションも試しました。
-どちらも、そのままでは動きません。
-
-- **openSUSE Leap 16.0**: compute-runtime（`libze_intel_gpu1`）が 25.18 と古く、Arc Pro B70 を列挙しません。
-  intel/llvm のビルドは通りますが、setup は GPU が見えないとして止まります。
-- **Debian 13**: main にも contrib にも backports にも、Intel の GPU の Level Zero のドライバーがありません。
-  Intel が GitHub で配る compute-runtime の .deb（MIT）は入れられました。
-  Debian の `libze-dev` は 1.20.6 と古いままですが、Level Zero を取ってくる今の `tools/intel_llvm_build.py` で、intel/llvm のビルドは通りました。
-  エンジンの起動は試していません。
+同じ日に、同じ方法で openSUSE Leap 16.0 も試しました。
+そのままでは動きません。
+compute-runtime（`libze_intel_gpu1`）が 25.18 と古く、Arc Pro B70 を列挙しないためです。
+intel/llvm のビルドは通りますが、setup は GPU が見えないとして止まります。
 
 要るのは次の 4 つです。
 
