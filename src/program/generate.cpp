@@ -2660,31 +2660,6 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
-    // CS-T: routing-aware prefetch of the file tier (the GGUF in place): the next layer's router on this layer's MoE
-    // input predicts its experts and their pages are warmed meanwhile.  It only warms pages; STRATA_LOOKAHEAD=0 is
-    // the A/B arm, STRATA_LOOKAHEAD_K the experts per token (default 10).
-    strata::core::RouterLookahead lookahead;
-    if (srcp == &src && src.warms() && [] { const char* v = std::getenv("STRATA_LOOKAHEAD"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }()) {
-        std::vector<std::vector<uint16_t>> routers((size_t) g.n_layers);
-        bool ok = true;
-        for (int64_t l = 0; l < g.n_layers && ok; ++l) {
-            const strata::core::WeightRef* w = wt.find("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
-            ok = w != nullptr && w->kind == strata::core::WeightKind::Bf16InF32 &&
-                 w->bytes == (uint64_t) (g.n_expert * g.n_embd) * 2;
-            if (!ok) break;
-            routers[(size_t) l].resize((size_t) (g.n_expert * g.n_embd));
-            ok = strata::gpu::copy(routers[(size_t) l].data(), w->data, (size_t) w->bytes) == true;
-        }
-        const char* kv = std::getenv("STRATA_LOOKAHEAD_K");
-        if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? (int) std::strtol(kv, nullptr, 10) : 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            std::fprintf(stderr, "strata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
-        } else {
-            std::fprintf(stderr, "strata generate: routing-aware prefetch off (%s)\n",
-                         ok ? err.c_str() : "the routers are not BF16 in the arena");
-            err.clear();
-        }
-    }
     // ---- R4.2c: THE HIT PATH.  Every one of these is required for `hits_ready()`, which is all-or-nothing on
     // purpose: a half-configured hit path would compute some experts twice and others not at all, and a token
     // built on that is wrong rather than refused.

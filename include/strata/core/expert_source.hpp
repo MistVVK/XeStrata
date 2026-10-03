@@ -34,7 +34,6 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <string>
@@ -140,49 +139,6 @@ public:
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
-    /// CS-T: the experts of `layer` a predictor expects next - a source that reads a file may start reading their
-    /// pages now, in the background.  Only warms: what `blob` returns is unchanged.  Default: nothing.
-    virtual void warm(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
-    /// Whether `warm` does anything (the predictor is not run otherwise).
-    virtual bool warms() const { return false; }
-};
-
-/// CS-T, routing-aware prefetch of the file tier: when the CPU pool starts layer `l`, a worker thread applies layer
-/// l+1's router (BF16, host copy) to layer l's MoE input - the residual stream changes little from one layer to the
-/// next - takes each token's top `k` experts, drops the ones the GPU cache or the RAM copy holds, and asks the
-/// source to `warm` the rest, so their pages are on the way while layer l computes.  A prediction only warms pages:
-/// it never changes which experts are computed or how.
-class RouterLookahead {
-public:
-    RouterLookahead() = default;
-    ~RouterLookahead();
-    RouterLookahead(const RouterLookahead&) = delete;
-    RouterLookahead& operator=(const RouterLookahead&) = delete;
-    /// `routers[l]`: layer l's ffn_gate_inp as BF16 bits, n_expert rows of n_embd.
-    bool start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k, ExpertSource* src,
-               std::string& err);
-    /// Layer `layer`'s MoE input for `n_tok` tokens (host floats): predict and warm layer + 1.  Never waits: a
-    /// prediction still running for an earlier layer makes this one skip.
-    void submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res);
-    int64_t predicted() const { return predicted_.load(std::memory_order_relaxed); }
-    int64_t skipped() const { return skipped_.load(std::memory_order_relaxed); }
-    double busy_ms() const { return (double) busy_us_.load(std::memory_order_relaxed) / 1000.0; }
-
-private:
-    void run();
-    std::vector<std::vector<uint16_t>> routers_;
-    int64_t n_embd_ = 0, n_expert_ = 0;
-    int k_ = 10;
-    ExpertSource* src_ = nullptr;
-    std::thread thread_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool quit_ = false, pending_ = false, busy_ = false;
-    int64_t layer_ = -1, n_tok_ = 0;
-    const int32_t* host_res_ = nullptr;
-    std::vector<float> x_;
-    std::atomic<int64_t> predicted_{0}, skipped_{0};
-    std::atomic<uint64_t> busy_us_{0};
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -216,7 +172,6 @@ struct GpuPlanSink {
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
-    RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
     RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
@@ -497,14 +452,6 @@ public:
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
-    /// CS-T: the GGUF in place asks the OS for the predicted experts' pages (PrefetchVirtualMemory on Windows,
-    /// madvise(WILLNEED) elsewhere), skipping the RAM copy's.
-    void warm(int64_t layer, const int64_t* experts, int64_t n) override;
-    /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return !role_ptr_.empty() && direct_.empty(); }
-    /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
-    int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
-    int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
@@ -553,8 +500,6 @@ private:
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
-    std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
-    std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
     uint64_t stage_seq_ = 0;

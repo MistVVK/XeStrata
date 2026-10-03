@@ -13,7 +13,6 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
-#include "strata/kernels/cpu/kq_avx2.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -439,9 +438,6 @@ void FileExpertSource::close() {
         stage_grew_ = false;
     }
     ram_reads_.store(0);
-    warm_stamp_.reset();
-    warm_hits_.store(0);
-    warm_count_.store(0);
     file_read_bytes_.store(0);
     file_blob_bytes_.store(0);
     file_us_.store(0);
@@ -520,7 +516,6 @@ bool FileExpertSource::open_gguf(std::string& err) {
         }
     }
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
-    warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
     return true;
 }
@@ -658,10 +653,6 @@ void FileExpertSource::prefetch(int64_t layer, const int64_t* experts, int64_t n
             bool fill = false;
             if (!claim_stage(layer * n_expert_ + e, v, fill) && fill) {
                 todo.push_back({v, layer, e, stage_buf_[v].get()});
-                if (warm_stamp_) {
-                    const uint32_t s = warm_stamp_[index].load(std::memory_order_relaxed);
-                    if (s != 0 && (uint64_t) s + 3 >= epoch_ + 1) warm_hits_.fetch_add(1, std::memory_order_relaxed);
-                }
             }
         }
     }
@@ -733,112 +724,6 @@ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     (void) fills; (void) n;
     return false;
-}
-
-void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
-    if (role_ptr_.empty() || n <= 0 || layer < 0 || layer >= n_layers_) return;
-    uint32_t stamp;
-    {
-        std::lock_guard<std::mutex> lk(stage_mu_);
-        stamp = (uint32_t) epoch_ + 1;
-    }
-    for (int64_t j = 0; j < n; ++j) {
-        const int64_t e = experts[j];
-        if (e < 0 || e >= n_expert_) continue;
-        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-        if (complement_ready_ && index < complement_offsets_.size() && complement_offsets_[index] != kNoComplement)
-            continue;                                                    // in the RAM copy
-        if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
-        warm_count_.fetch_add(1, std::memory_order_relaxed);
-        for (int r = 0; r < 3; ++r) {
-            const size_t i = (size_t) (3 * layer + r);
-            const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * role_bytes_[i]);
-            const uintptr_t pg = 4096, a = (uintptr_t) p & ~(pg - 1);
-            (void) madvise((void*) a, (size_t) ((uintptr_t) p + role_bytes_[i] - a), MADV_WILLNEED);
-        }
-    }
-}
-
-RouterLookahead::~RouterLookahead() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        quit_ = true;
-    }
-    cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
-}
-
-bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t n_embd, int64_t n_expert, int k,
-                            ExpertSource* src, std::string& err) {
-    if (src == nullptr || !src->warms()) { err = "RouterLookahead: the expert source does not warm"; return false; }
-    if (n_embd % 8 != 0) { err = "RouterLookahead: n_embd is not a multiple of 8"; return false; }
-    for (const auto& r : routers)
-        if (r.size() != (size_t) (n_embd * n_expert)) { err = "RouterLookahead: a router of another shape"; return false; }
-    routers_ = std::move(routers);
-    n_embd_ = n_embd;
-    n_expert_ = n_expert;
-    k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
-    src_ = src;
-    x_.assign((size_t) (8 * n_embd), 0.f);
-    thread_ = std::thread([this] { run(); });
-    return true;
-}
-
-void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const int32_t* host_res) {
-    if (layer + 1 >= (int64_t) routers_.size() || n_tok <= 0 || x == nullptr) return;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
-        n_tok_ = std::min<int64_t>(n_tok, 8);
-        std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
-        layer_ = layer + 1;
-        host_res_ = host_res;
-        pending_ = true;
-    }
-    cv_.notify_one();
-}
-
-void RouterLookahead::run() {
-    std::vector<float> logits((size_t) (8 * n_expert_));
-    std::vector<int32_t> order((size_t) n_expert_);
-    std::vector<int64_t> want;
-    for (;;) {
-        int64_t layer, nt;
-        const int32_t* host_res;
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] { return quit_ || pending_; });
-            if (quit_) return;
-            pending_ = false;
-            busy_ = true;
-            layer = layer_;
-            nt = n_tok_;
-            host_res = host_res_;
-        }
-        const auto t0 = std::chrono::steady_clock::now();
-        want.clear();
-        strata::kernels::cpu::bf16_rows_dot_multi(routers_[(size_t) layer].data(), (int) n_expert_, (int) n_embd_,
-                                                  x_.data(), (int) nt, logits.data());
-        for (int64_t t = 0; t < nt; ++t) {
-            const float* lt = logits.data() + (size_t) (t * n_expert_);
-            for (int64_t e = 0; e < n_expert_; ++e) order[(size_t) e] = (int32_t) e;
-            std::partial_sort(order.begin(), order.begin() + k_, order.end(),
-                              [&](int32_t a, int32_t b) { return lt[(size_t) a] > lt[(size_t) b]; });
-            for (int j = 0; j < k_; ++j) {
-                const int64_t e = order[(size_t) j];
-                if (host_res != nullptr && host_res[(size_t) (layer * n_expert_ + e)] >= 0) continue;   // on the GPU
-                if (std::find(want.begin(), want.end(), e) == want.end()) want.push_back(e);
-            }
-        }
-        src_->warm(layer, want.data(), (int64_t) want.size());
-        predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
-        busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
-                           std::memory_order_relaxed);
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            busy_ = false;
-        }
-    }
 }
 
 void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k) {
@@ -1494,7 +1379,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if (d.lookahead) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);
     if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
