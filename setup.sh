@@ -1,6 +1,10 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # Strata for Linux: the first run installs everything and starts the model; later runs just start it.
-# Needs only an NVIDIA driver. Python (with venv) is installed through apt/dnf if it is missing (asks for sudo).
+# Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through apt/dnf if
+# it is missing (asks for sudo).
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
 # python3-venv package), and a venv made without it has no pip
