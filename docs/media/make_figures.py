@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """docs/media/make_figures.py - the README's "How does it work?" illustrations, in the Strata app's style: its colors
 (serve/web/tokens.css), its icons (serve/web/sprite.svg) and its font (Outfit, embedded, SIL OFL 1.1).  Light and dark
 follow the reader's system setting.

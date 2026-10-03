@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # CUDA1–3 expert experiment
 
 CUDA0 keeps the dense layers, KV/state, MTP and its existing expert cache. Up to
@@ -34,28 +39,16 @@ compute capacity.
 
 The experiment requires the corresponding visible CUDA devices and a CUDA
 enabled build. Each card must keep at least 512 MiB free. Tiers must be enabled
-in order. On Windows, CUDA registration of the host expert arena is capped at
-8 GiB to leave room for the contexts and MTP on CUDA0. The rest remains
-available to the CPU pool; the PCIe expert path is available only for the
-registered layers. Without secondary GPUs, the original uncapped registration
-behavior applies.
-
-On an existing Linux installation, apply the patch to its source tree, then run:
+in order. On an existing Linux installation, run:
 
 ```sh
 ./setup.sh --setup --gpu1-experts 5000 --gpu2-experts 5000 --gpu3-experts 5000
 ```
 
-On Windows, from PowerShell in the installation folder:
-
-```powershell
-.\START-HERE.bat --setup --gpu1-experts 5000 --gpu2-experts 5000 --gpu3-experts 5000
-```
-
 To test the layer placement instead, add `--gpu-placement layer` to the setup
 command. To go back, run the same command with `--gpu-placement stripe`. After
 the new engine is built, the mode can also be changed without a rebuild: edit
-`--expert-cache-remote-placement` in `strata-iq3_xxs.json` from `layer` to
+`--expert-cache-remote-placement` in `xestrata-iq3_xxs.json` from `layer` to
 `stripe` or vice versa and restart the server. If the argument is absent, the
 default is `stripe`.
 
@@ -64,7 +57,7 @@ installation when prompted. Setup recompiles the engine, updates its server
 configuration, and starts it. Later starts keep those settings. To tune the
 slots without recompiling, edit the values after `--expert-cache-device1`,
 `--expert-cache-device2` and `--expert-cache-device3` in the stored
-`strata-iq3_xxs.json`, then restart with `.\run-iq3_xxs.bat`.
+`xestrata-iq3_xxs.json`, then restart with `./run-iq3_xxs.sh`.
 
 Compare identical requests at one, two and four GPUs, preferably with several
 repeats. VRAM use alone does not show useful offload: compare the per-request

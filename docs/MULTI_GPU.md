@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Strata on two or three GPUs (layer split)
 
 One model can run across several NVIDIA cards in one PC. The layers are split into contiguous ranges, one per GPU:
@@ -12,7 +17,7 @@ needed; cards on x4 or x1 slots work, and the PCIe share of each card is probed 
 
 ## Using it
 
-**Nothing to type.** `START-HERE.bat` (Linux: `./setup.sh`) lists your NVIDIA cards and says for each one whether
+**Nothing to type.** `./setup.sh` lists your NVIDIA cards and says for each one whether
 Strata can use it:
 
 ```
@@ -46,7 +51,7 @@ now on; the answer is kept.
   own prompt buffers);
 - AMD and Intel GPUs, and a mix of NVIDIA with them.
 
-Or edit an existing config (`strata-*.json`), then restart:
+Or edit an existing config (`xestrata-*.json`), then restart:
 
 ```json
 "gpu": [0, 2],
@@ -89,13 +94,11 @@ into the card that owns the layer.
   - the older helper-GPU caches (`--expert-cache-remote`, docs/SECOND_GPU.md): they take the visible GPUs no stage
     runs on, and hold only experts no stage's cache holds. On the test rig, a 2080 Ti helper made decoding slower,
     as it did without a split: its per-layer round trip costs more than the CPU pool needs for those experts.
-- `--mmap-experts` needs a canonical pack (`experts.bin`), with or without a split; a native (IQ) pack says so at
-  start.
+- `--mmap-experts` reads a canonical pack's `experts.bin`, or a native (IQ) pack's experts from the GGUF files in
+  place (`--native`); the native case with a split has not been run (unverified).
 - The prompt path has its own buffers on every card (1.5 GB each at the default 2048-token chunk; `--prefill 1024`
   halves that) instead of borrowing cache slots as one card does. An explicit `--expert-cache` on the first card is
   capped to leave room for them.
-- On Windows only 8 GiB of the expert arena is pinned (more, mapped into two GPU contexts, leaves WDDM refusing
-  allocations); the PCIe share covers those layers.
 - Every card needs compute capability 8.0 (RTX 30 or newer). A Turing card (RTX 20, sm_75) builds only with the
   experimental `-DSTRATA_EXPERIMENTAL_SM75=ON`.
 

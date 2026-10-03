@@ -1,10 +1,15 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Strata - the details
 
 The technical side of Strata: every measured number, the API, images, all settings and how the engine works.
 New here? Start with the [README](../README.md) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
-> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
+> [Requirements](#before-you-start) · [Install](#install-and-start) · [API](#using-it) ·
 > [MCP tools](#tools-from-mcp-servers) · [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
@@ -16,6 +21,8 @@ RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows, engine 0.1
 (`--prefill auto`, 8-bit KV above 4K, KV streaming from 64K). One code-agent prompt per length, 256 generated tokens,
 MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt). The IQ2_XS row was
 measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
+
+These figures were measured on Windows; Linux results may differ.
 
 ### Prompt processing (tokens/s)
 
@@ -53,10 +60,10 @@ for the original model, not for Swift 1.5.
 **KV streaming (engine 0.1.5):** at 64K and more, setup keeps the context's KV cache in RAM and only the part the
 attention reads in VRAM (`--kv-resident 32768`), so more experts fit on the GPU. Q2_0 at 262K: 50.9 -> 62.6 tokens/s
 (1,589 -> 3,872 experts in VRAM); at 128K about +6%. The attention reads exactly the same values (only where the KV lives changes); it
-costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `START-HERE.bat --setup` once to turn
+costs ~13.7 KB of RAM per context token (1.7 GB at 128K). Existing installs: run `./setup.sh --setup` once to turn
 it on.
 
-**4-bit KV cache (engine 0.1.8, optional):** `START-HERE.bat --setup` asks above 8K context (or pass `--kv q4_0`). It
+**4-bit KV cache (engine 0.1.8, optional):** `./setup.sh --setup` asks above 8K context (or pass `--kv q4_0`). It
 halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR #21), about 4% faster at 128K, but it
 is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
 Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
@@ -73,7 +80,7 @@ whole chunk at once; unpinned experts are copied by helper threads. Measured on 
 353 -> 438 tokens/s, 6,927 tokens 529 -> 1,077, 28,584 tokens 584 -> 1,249. Output speed is unchanged. Needles 5/5
 (1K-262K). Details and the quality check:
 [`bench/results/2026-09-28-prefill-speed`](../bench/results/2026-09-28-prefill-speed/README.md). Existing installs
-switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The raw numbers:
+switch to `--prefill auto` the next time `./setup.sh` starts them. The raw numbers:
 [`bench/results/`](../bench/results/). The [paper](paper/Strata-Paper.pdf) explains every number.
 
 ## Other GPUs (estimated)
@@ -124,7 +131,7 @@ reads hit the GPU on a 12 GB card). Images work; the experimental speed projecti
 for the full model).
 
 ```
-START-HERE.bat --setup --family coder
+./setup.sh --setup --family coder
 ```
 
 ### Or: Swift 1.5 (a fine-tune that thinks shorter)
@@ -141,8 +148,51 @@ output tokens in 28 s, the original **2,682** in 46 s - most of the difference f
 thought about for 1,524 tokens. Not a benchmark, but consistent with the claim.
 
 ```
-START-HERE.bat --setup --family swift --model IQ2_XS
+./setup.sh --setup --family swift --model IQ2_XS
 ```
+
+### Or: Unsloth's UD-Q4_K_XL (EXPERIMENTAL)
+
+**[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** is a 4-bit file of the original
+model in four shards (111 GB). Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 GB PC
+holds. Setup downloads the shards from a pinned revision and checks their SHA-256 once, then packs the model with
+`--compat-bf16` (its Q8_0 hyper-connection projections become BF16, the form the engine reads). The engine reads
+the experts from the GGUF files in place. It keeps a RAM budget of them, the most-used first after the ones the GPU
+holds (`--resident-budget-gib N`). Setup chooses the RAM less 24 GB for N, less the KV cache when that lives in RAM:
+36 GiB on a 64 GB PC with a 128K context. The rest come from the SSD while it answers. No images yet.
+
+```sh
+./setup.sh --setup --family unsloth
+```
+
+Measured on an Arc Pro B70 (32 GB) and an i7-14700 with 96 GB of RAM, setup's configuration, 64 generated tokens
+of a short chat, every run from a cold OS cache (`bench/results/2026-10-03-ud-low-ram`):
+
+| | Decode tokens/s |
+| --- | ---: |
+| RAM budget 66 GiB (setup's choice for this PC): every expert the GPU does not hold in RAM | 24.3 / 23.5 |
+| RAM budget 36 GiB in a 62 GiB memory cgroup (setup's choice for a 64 GB PC) | 17.2 / 17.2 |
+| No RAM budget (`--mmap-experts`): every expert the GPU does not hold read through the OS file cache | 10.0-11.1 |
+
+The answers were the same tokens in every run. The quality has not been measured on Arc against llama.cpp
+(unverified).
+
+### Less RAM than the model: the low-RAM mode
+
+Every other model keeps all of its experts in RAM and the GPU holds a copy of the most-used ones. When the experts
+do not fit the RAM (with ~10 GB left for the rest) but the GPU can hold enough of them, setup chooses the low-RAM
+mode (`--low-ram auto`, the default). The engine then reads the experts from the model files instead of copying them
+all into RAM: a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`. If the
+experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`). Otherwise
+they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
+`--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.
+
+The engine locks the experts it keeps in RAM (`mlock`) so the OS does not swap them out: on this PC, 3-4.6 GiB of an
+unlocked 40 GiB copy went to swap and decoding ran at half speed. That needs a memlock limit (`ulimit -l`) as large
+as the copy; setup warns when the limit is small. Raise it with `memlock` in `/etc/security/limits.conf` or
+`DefaultLimitMEMLOCK` in systemd's `user.conf`, then log in again. The processor's own graphics share the RAM, so
+they never take the low-RAM mode. Setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less
+~5 GB) and has not been checked on an Arc card (unverified).
 
 ## Before you start
 
@@ -155,23 +205,21 @@ You need **only an NVIDIA driver** (version 580 or newer; update it with the NVI
 | RAM | **64 GB** recommended (see the table above). |
 | CPU | x86-64 with AVX2 (any Intel/AMD desktop CPU from the last ~8 years). AVX-512 (Ryzen 7000/9000) is a bit faster. |
 | Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
-| OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
+| OS | Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 
 What the first start installs: in this folder `.venv/`, `engine/` and `third_party/`; the model files (`models/`,
-`packs/`, `mtp/`, 70-120 GB) in **`Strata-data` next to this folder**, so a new copy of Strata (an update unzipped
-elsewhere) finds them and sets itself up the same way. The place is remembered per user (`%APPDATA%\Strata\settings.json`,
-`~/.config/strata/settings.json`); `--data-dir` chooses another. Installs from before 0.1.16 are moved there by the next
+`packs/`, `mtp/`, 70-120 GB) in **`XeStrata-data` next to this folder**, so a new copy of XeStrata (an update unzipped
+elsewhere) finds them and sets itself up the same way. The place is remembered per user (`~/.config/xestrata/settings.json`); `--data-dir` chooses another. To move the files later, move the folder yourself and run `./setup.sh --setup --data-dir <new place>` once: setup finds the files there and writes the configs again. Installs from before 0.1.16 are moved there by the next
 start (a rename on the same drive; files on another drive are used where they are).
-Python 3.12 if you have none (for your user account, no admin), a private Python environment, NVIDIA's CUDA libraries
+Python 3.10 or newer if you have none, a private Python environment, NVIDIA's CUDA libraries
 (from pip, ~0.4 GB), the ready-made Strata engine for RTX 30/40/50, the model and the MTP draft layer. If no
-ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
-Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
+ready-made engine fits your PC, it offers to install the build tools (`build-essential` + CUDA on Ubuntu) and compiles the engine for your GPU (asks first; 20-40 minutes once).
 
 ---
 
-## Windows
+## Install and start
 
-### Double-click `START-HERE.bat`
+### Run `./setup.sh`
 
 **The first time** it asks four questions and does the rest:
 
@@ -181,7 +229,7 @@ Windows, `build-essential` + CUDA on Ubuntu) and compiles the engine for your GP
 4. **Images?** yes / no (see [Images](#images-vision)).
 
 Then it downloads and prepares everything (the model is 66-76 GB, so the first start takes a while; an interrupted
-download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8080`, the Strata
+download continues where it stopped) and **starts the model**: your browser opens `http://127.0.0.1:8095`, the Strata
 app. It has three tabs:
 - **Chat:** streaming answers, the model's thinking (folded away once it answers), code with a copy button, pictures when
   images are on, and sampling and thinking-level settings. Chats stay in your browser.
@@ -189,24 +237,36 @@ app. It has three tabs:
   VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
 - **About:** the model and engine settings, and the addresses to connect other apps.
 
-`http://127.0.0.1:8080/?q=your question` opens it with a new chat already asking. The API is at
-`http://127.0.0.1:8080/v1` for your apps.
+`http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking. The API is at
+`http://127.0.0.1:8095/v1` for your apps.
 
-**Every time after that**, `START-HERE.bat` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
+**Every time after that**, `./setup.sh` just starts the model (30-90 s to load 34-43 GB into RAM). Nothing is
 downloaded again. Closing the window stops the model.
 
 ```
-START-HERE.bat --setup                          install another model, or change context / images
-SETUP.bat                                       the same (double-click it)
-START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
-START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
-START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
-START-HERE.bat --port 8081                      another port
-START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
-START-HERE.bat --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
+./setup.sh --setup                          install another model, or change context / images
+./setup.sh --model IQ2_XS --context 32768 --vision yes --yes     no questions
+./setup.sh --gguf-dir /data/models/IQ2_XS       use GGUF files you already have
+./setup.sh --data-dir /data/XeStrata-data         keep the model files somewhere else
+./setup.sh --port 8081                      another port
+./setup.sh --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
+./setup.sh --vram-reserve-mib 2048          leave 2 GB of VRAM free for other programs (remembered)
+./setup.sh --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
 ```
 
-With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
+**Leaving VRAM for other programs (upstream #493):** XeStrata fills the graphics card's free VRAM with experts (the
+expert cache) and leaves `--vram-reserve-mib` MiB free: 700 by default. For a game, a 3D program or another model
+beside it, leave more: `./setup.sh --vram-reserve-mib 2048` writes it into the model's `xestrata-<model>.json` and
+starts it; at setup (`--setup --vram-reserve-mib 2048`) it goes into the new config. By hand: add
+`"--vram-reserve-mib", "2048"` to the config's `"args"` list and restart. The expert cache is then that much smaller,
+so answers can be a little slower.
+
+**Model files downloaded by hand, or from a mirror (upstream #495):** setup's step 5 prints the folder it expects
+them in (`XeStrata-data/models/<SIZE>/`): put them there with their original names, or point setup at them with
+`--gguf-dir`. To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com
+./setup.sh`): the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
+
+With more than one model installed, it asks which one to start. `run-<model>.sh` starts a model directly.
 
 **Tuning for your PC (`--calibrate`, engine 0.1.19).** Three engine settings depend on the PC more than on the model:
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
@@ -215,65 +275,79 @@ With more than one model installed, it asks which one to start. `run-<model>.bat
 - how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
 
 The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
-install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
+install; `./setup.sh --calibrate` does it any time. It measures the output
 speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
 (in the settings file next to the data folder's record), so updates keep it.
-
-### Running it at startup (Task Scheduler)
-
-To have the model up at logon, people start the serve from **Task Scheduler** (or a service). Beware: Windows
-throttles such contexts, and the model's ~40 GB expert load then crawls at **~0.05 GiB/s (13-14 minutes)**
-instead of **~1.4-1.5 GiB/s (~35 seconds)** - a 24x slower start. Measured on an RTX 5070 Ti + Ryzen 7 9800X3D
-+ NVMe, same binary, same args, same cache state:
-
-| How the serve starts | Expert load |
-| --- | ---: |
-| Double-click / terminal / SSH | 1.42-1.52 GiB/s (~35 s) |
-| Task Scheduler with its defaults | 0.05 GiB/s (821-841 s) |
-| Task Scheduler with the two settings below | 1.42 GiB/s (35 s) |
-
-In the task's properties set both of these (the defaults are the opposite):
-
-- **Priority level: Normal** (Options tab; the default is Below normal), and
-- **Run with highest privileges** (General tab; without it the task runs with a limited user token - which
-  also strips `SeLockMemoryPrivilege`, the privilege Windows large pages need).
-
-(Both were changed at once, so the isolated effect of each is not measured.) If the model still starts
-slowly, the engine prints a hint under its `loaded ... GiB at ...` line naming this cause.
 
 ### Chat in the terminal (optional)
 
 ```
-.venv\Scripts\python chat.py
+.venv/bin/python chat.py
 ```
 
 ---
 
-## Linux
+### Distribution notes
 
-```bash
-./setup.sh
-```
-
-The same questions, the same automatic install (it uses `sudo apt` for Python and, only if it has to compile,
-for the build tools), and the same start: `http://127.0.0.1:8080`. Later runs of `./setup.sh` (or `./run-<model>.sh`)
-start the model directly. Options as on Windows (`./setup.sh --setup`, `--model Q2_0 --yes`, `--gguf-dir /data/Q2_0`).
-Terminal chat: `.venv/bin/python chat.py`.
+Setup uses `sudo apt` for Python and, when it must compile, for the build tools. Later runs of `./setup.sh` or
+`./run-<model>.sh` start the model directly. Terminal chat: `.venv/bin/python chat.py`.
 
 - **Updating:** `git pull`, then `./setup.sh`: it compiles the engine again when its source changed (a minute or
   two for the changed files). If that compile fails, it says so and starts the engine you had.
 - **Other distributions** (Arch, Fedora, ...): install the C++ compiler and the CUDA Toolkit 13 with your package
   manager first (Arch: `sudo pacman -S base-devel cuda`); setup finds `nvcc` on PATH, in `/usr/local/cuda*` and in
   `/opt/cuda*`, and does the rest.
-- **WSL** works (Ubuntu 24.04 tested), with one limit: the NVIDIA driver pins only about 1 GB of RAM there, so KV
-  streaming (`--kv-resident`) is off and the KV cache stays in VRAM, and the experts are copied to the GPU from
-  unpinned RAM (slower prompts than native Linux).
+
+---
+
+## Sharing the GPU with other programs (optional)
+
+By default the model stays loaded until you close Strata. On a PC that also games, renders or runs another model
+server, three server options (all off by default; also as keys in `strata-<model>.json`) give the VRAM back:
+
+| Option | Config key | What it does |
+| --- | --- | --- |
+| `--idle-unload 600` | `"idle_unload_s": 600` | unload the model after 600 s without requests; the next request loads it again |
+| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | load an unloaded model only when that much VRAM is free on its GPU (read through Level Zero's sysman; it waits up to 15 s for memory being given back), else answer **503** "the GPU is in use by another program" |
+| `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | a command run before the model is loaded again, e.g. one that unloads another server's model |
+
+`POST /unload` unloads it now (`409` while a request is running) and `POST /load` loads it ahead of a request (both
+with `Content-Type: application/json`, e.g. `curl -X POST -H "Content-Type: application/json" localhost:8080/unload`);
+`/health` says `"loaded"`, `/v1/models` lists it as `unloaded` (like llama.cpp's router), `/props` sets
+`is_sleeping` and the Monitor shows the state. Unloading ends the engine process - and the image encoder, when images
+are on; it is started again first, as at a start - so their VRAM and RAM go straight back. The model files stay in
+the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere.
+
+`serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true` in that config) starts
+the HTTP API without starting the engine; the first generation request loads it the same way, including
+`before_load` and `min_free_vram_mib`. This is text-only: a vision configuration with lazy startup is refused.
+`POST /v1/load` and `/v1/unload` are JSON forms of the same controls for integrations, accepting `{}` or
+`{"model":"<configured model>"}` and returning the model's status. They need the API key (when one is set),
+`application/json`, and no foreign browser Origin; they answer **409** while a request is running or queued and
+**404** for an unknown model. `/api/health` is the same as `/health`; `/v1/status` reports `loaded` and `auto_load`.
+
+**Keep what the expert cache learned across restarts (opt-in, upstream #477):** a start fills the GPU's expert
+cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use.
+With `"expert_profile_save": "expert-profile-learned.bin"` in `xestrata-<model>.json` the engine saves that as a
+profile - the experts in VRAM first, then the routing it counted since the start, then the shipped order - on a
+clean exit and every 10 minutes between requests (`"expert_profile_save_every": 5` for another interval, `0` for
+exit only), written to a temporary file and renamed, so a crash never leaves half a file. The next start begins from
+it instead of the config's `--expert-profile` when it is a profile of the same model (else from the config's, as
+before). A relative path is in the XeStrata folder; one file per model, and a profile per project works the same way
+(point the key at another file). The file is a fingerprint of what you used the model for: it stays on your PC.
+Without the key nothing is counted or written. Setup rewrites the config when run again: add the key again then.
+
+**When the draft head does not fit (upstream #474):** the MTP draft layer's head covers a token subset
+(`./setup.sh --draft-vocab cjk|cyrillic|en`; the default includes Chinese, Japanese and Korean, up to ~348 MiB of
+VRAM). When the start stops with "the draft head does not fit", the engine says how much the head needs, how much
+VRAM is free and which smaller subset fits, and the server's start error repeats it; setup suggests
+`--draft-vocab en` on cards under 14 GB (only a suggestion: nothing changes unless you pass it).
 
 ---
 
 ## Using it
 
-The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or edit the run script).
+The server listens on `http://127.0.0.1:8095` (change with `--port` in setup, or edit the run script).
 
 | API | Endpoint |
 | --- | --- |
@@ -288,13 +362,13 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 ```bash
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+curl http://127.0.0.1:8095/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "strata", "messages": [{"role": "user", "content": "Write a haiku about GPUs."}], "max_tokens": 512 }'
 ```
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+client = OpenAI(base_url="http://127.0.0.1:8095/v1", api_key="none")
 r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": "Hello!"}])
 print(r.choices[0].message.content)
 ```
@@ -311,30 +385,105 @@ print(r.choices[0].message.content)
   Without a setting the model uses its own default, **high**. `none` answers at once (fastest); `low` keeps the thinking
   short. The levels are instructions the model was trained with, not a hard token limit: on easy questions all three
   think briefly, on hard ones `high` thinks longest and is most accurate.
+- **A hard thinking budget (opt-in).** `"reasoning_budget_tokens": N` in a request (OpenAI or Anthropic) caps the
+  thinking at N tokens: when it gets there the server ends it with a short wrap-up line and `</think>`, and the model
+  answers from there (the engine continues from what it already holds, so nothing is read again). The wrap-up is
+  part of the thinking the client sees and counts as output tokens. `"reasoning_budget_tokens": N` in
+  `strata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget. Off by default;
+  Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no
+  `"thinking"`, effort or budget thinks as the model's template does. `"anthropic_thinking": "on_request"` in
+  `strata-<model>.json` renders such a request without thinking - Anthropic's own rule, and what Claude Code's short
+  helper calls (a session title in a few dozen tokens) need. `POST /v1/messages/count_tokens` renders and tokenizes a
+  request as `/v1/messages` would, without running the model.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
-- **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
-- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
+- **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
+- **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`);
+  the field names are OpenCode's, so check its config docs if your version differs:
+
+  ```jsonc
+  {
+    "$schema": "https://opencode.ai/config.json",
+    "provider": {
+      "xestrata": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "XeStrata (local)",
+        "options": { "baseURL": "http://127.0.0.1:8095/v1", "apiKey": "none" },  // or your api_key
+        "models": {
+          "xestrata": {
+            "name": "Qwen3.8-Flash-Next (XeStrata)",
+            // context: what you chose in setup; output: what one reply may use (prompt + output must fit)
+            "limit": { "context": 262144, "output": 32768 },
+            "options": { "reasoningEffort": "high" },                  // sent as reasoning_effort
+            "variants": {                                              // switch between them in OpenCode
+              "low": { "reasoningEffort": "low" },
+              "medium": { "reasoningEffort": "medium" },
+              "none": { "reasoningEffort": "none" }
+            }
+          }
+        }
+      }
+    },
+    "model": "xestrata/xestrata"
+  }
+  ```
+
+  Set `limit.context` to the context you chose in setup: OpenCode compacts the conversation before it gets there.
+  Keep `limit.output` well under it: a request whose prompt plus `max_tokens` runs past the context is refused (see
+  **Context** below), or add `"fit_max_tokens": true` to `xestrata-<model>.json`. For a hard cap on the thinking, add
+  `"reasoning_budget_tokens": N` to `xestrata-<model>.json` (see above).
+- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and
   `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
   `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
   can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
   `--fit-max-tokens` to `serve/server.py`). A prompt that leaves no room at all is still refused.
+- **Model aliases.** `"aliases": ["qwen", "local-model"]` in `strata-<model>.json` lists the model under those names
+  too in `/v1/models` (each with its own `id`, and in the model's `aliases`), like llama-server's `--alias`; a request
+  naming one is answered under that name. Any other name is still served, as before.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
-  run setup with `START-HERE.bat --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
+  run setup with `./setup.sh --setup --host 0.0.0.0 --api-key some-long-secret` (or add `"host": "0.0.0.0"` and
   `"api_key": "..."` to `strata-<model>.json`). The server window then prints this PC's addresses
-  (`from other devices: http://192.168.x.x:8080/`); open that on the other device, or use `.../v1` as an API base URL.
-  On Windows the firewall blocks it until you allow it: accept its prompt for Python (private networks), or run
-  `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
-  in an admin PowerShell, and make sure the network is set to Private.
+  (`from other devices: http://192.168.x.x:8095/`); open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):
-  `cloudflared tunnel --url http://127.0.0.1:8080`. **Set a key first**, or anyone with the link can use your PC:
+  `cloudflared tunnel --url http://127.0.0.1:8095`. **Set a key first**, or anyone with the link can use your PC:
   add `"api_key": "some-long-secret"` to `strata-<model>.json` (or set the `STRATA_API_KEY` environment variable);
-  clients then send it as their API key.
+  clients then send it as their API key.  An API key that is given but empty refuses to start the server (it would switch authentication off).
+  Streamed answers carry `X-Accel-Buffering: no`, so nginx-style proxies pass each token on at once. The web app's
+  settings and MCP tools only answer Strata's own page: when you open it through a proxy or tunnel whose address
+  differs, add that address, e.g. `"trusted_origins": ["https://strata.example.com"]`.
+  With the key set, any `Host` name reaches the server (see Host names below).
+- **From web apps in a browser (CORS).** Off by default. `"cors_origins": ["https://chat.example.com"]` lets pages of
+  those origins call `/v1/*` from the browser (Open WebUI's direct connections, browser extensions); `["*"]` lets any
+  page do it - only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools.
+- **Host names (DNS rebinding).** A web page of another site can point its own name at `127.0.0.1` and then reach
+  this server as if it were its own, so without an API key the server answers only requests whose `Host` is a name
+  it knows (with a key the check is off: such a page cannot send the key, and tunnels and proxies that pass their
+  own name on keep working):
+  `localhost` (and `*.localhost`), any IP address (`127.0.0.1`, `[::1]`, `192.168.x.x`, ...), the address it
+  listens on and, when it listens beyond this PC (`0.0.0.0` or a LAN address), this PC's name (`mypc`, `mypc.local`)
+  and `host.docker.internal`; any port. Others get **403** naming the setting, and the server window prints one line
+  for each. Reach it under another name (a reverse proxy that keeps the name, a tunnel, a DNS name on your network,
+  another container's name for it)? Add the name: `"allowed_hosts": ["strata.example.com"]` in
+  `xestrata-<model>.json` or `STRATA_ALLOWED_HOSTS=strata.example.com` (comma-separated); `".example.com"` allows that
+  name and every name below it, and `["*"]` turns the check off (so does setting `api_key`). The hosts of
+  `trusted_origins` count as allowed. Requests without a `Host` header (HTTP/1.0 clients) pass.
+- **Web pages without an API key.** Without `api_key`, a `POST` to `/v1/*` that carries an `Origin` header (a
+  browser page sent it) is answered only for Strata's own page, pages on `localhost` or an allowed host name (any
+  port), the origins in `trusted_origins` or `cors_origins`, and browser extensions and desktop apps
+  (`chrome-extension://`, `moz-extension://`, `app://`: no web site can send those), and only with a JSON body; any
+  other page, and `Origin: null`, gets **403**. Clients that send no `Origin` (curl, the OpenAI and Anthropic SDKs,
+  other servers) are not affected. With
+  an API key, the key decides. `POST /unload` and `POST /load` take `Content-Type: application/json` from Strata's
+  own page (or no `Origin`), like `/settings`.
+- **One line per request.** `STRATA_REQUEST_LINES=1` in the server's environment prints each finished request's
+  numbers from the engine's log (`request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s
+  decode Y tok/s`), for a supervisor that only sees the server's output.
 
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
@@ -346,8 +495,27 @@ prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that 
 system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
 `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
+**Several conversations (opt-in, upstream's conversation parking).** Add `--conversation-cache-mib 8192
+--conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at
+most 8 GiB of RAM. When a request continues another conversation than the one the engine holds, the engine copies
+the held one aside first (its K/V cache, running state and checkpoints) and puts back a parked one whose tokens
+start the request, instead of reading it again: a chat and an agent's subagent can alternate without re-reading each
+other. Requests still run one at a time, and nothing tells conversations apart but their tokens, pictures and
+control-vector setting. The default is 0 (off); `--prompt-cache 0` turns it off too, and it refuses a layer split.
+Parked conversations are not kept across restarts. Before each copy the engine checks that
+`--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (`MemAvailable`). If it does not, or the copy
+does not fit the budget, it skips parking and reads the prompt as before. The oldest parked conversation is
+dropped first. A copy that fails to go back stops the engine instead of letting it answer from half a state. After a
+restore, the K/V pages a conversation has not changed are reused for its next copy
+(`STRATA_SNAPSHOT_FULL_CAPTURE=1` turns that off).
+Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) is 251 MiB parked, copied out in
+70-104 ms and back in 21-23 ms. Its answers and state match a run without parking byte for byte with FP16, INT8
+(also with KV streaming), Q4_0 and K8V4 KV, and with INT8 on the small configuration (8 GB, no XMX). With parking off, the engine gives the
+same tokens and state as the engine before the change.
+
 **Current limits (v1):** one request at a time, and one conversation's history in the KV cache at a time (switching
-between two chats re-reads the part where they diverge; the shared prefix, such as the system prompt, is reused); images
+between two chats re-reads the part where they diverge unless parking is on; the shared prefix, such as the system
+prompt, is reused); images
 only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
@@ -360,6 +528,40 @@ suppresses what the model itself just said, not the prompt alone. Since engine 0
 the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
 each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
 without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+---
+
+### JSON response formats
+
+`POST /v1/chat/completions` accepts `response_format: {"type":"json_object"}` or
+`{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
+The schema must describe an object at its root. Local `#` references work; remote references are refused.
+`json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install
+"jsonschema>=4.23,<5"`; setup does not add it); without it the answer is only checked to be one JSON object, and the
+server says so once.
+
+This is **schema prompting followed by server validation**, not grammar-constrained decoding. One generation
+is made per request, with no hidden retry. Successful responses contain a validated JSON object. Malformed JSON,
+duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with
+`error.code: structured_output_failed`; invalid request schemas return **400**. JSON formats combined with
+tools/MCP are refused explicitly. Without `response_format`, ordinary text and tool behavior stays the same.
+Structured SSE buffers the answer while sending keep-alive comments, emits the content only after validation, then
+usage/timings and `[DONE]`; a failure emits an SSE error and `[DONE]` without invalid content.
+`/v1/status.structured_output` advertises the formats, the validation method and the buffered streaming.
+
+### API request monitor
+
+Off by default, since it keeps prompts and answers in memory: turn it on with `"api_monitor": true` in
+`strata-<model>.json` (or `serve/server.py --api-monitor`); otherwise nothing is recorded and the endpoints below
+answer 404. `/api-monitor` shows the model state, load/unload controls, active and queued requests, their request
+bodies, output, reasoning and non-stream response bodies, with the queue, load, first-token and decode times apart.
+`GET /api/requests` returns compact summaries and `GET /api/requests?id=<id>` one retained request; both use the API
+key check. It keeps the newest **100 requests in memory** until the server restarts, at most **262,144 characters
+per field** (with visible truncation flags). Headers are not recorded, and the monitor's key is kept in the tab's
+session storage. Treat the history as sensitive when the server is reachable from a network: set an API key.
+
+`GET /metrics` also lists each recent request's speculative drafts, `drafts_offered` and `drafts_accepted` (`null`
+when the engine did not report them), and their sums since the server started in `totals`.
 
 ---
 
@@ -405,6 +607,33 @@ from other devices, set an API key.
 
 ---
 
+## Manage Strata from your AI assistant (MCP server)
+
+`tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.
+Once it is added, you can ask your assistant "install Strata for this PC", "start Strata" or "is Strata running?".
+In Claude Code, add it with:
+
+```bash
+claude mcp add xestrata -- python3 /path/to/XeStrata/tools/strata_mcp.py
+```
+
+Other clients take the same command (`python3` with the script's path) in their MCP settings, as a stdio server.
+
+It has eight tools: status (the running model, what is installed, the hardware, a recommended size), the model
+list, install, start, stop, logs, a speed test, and connection settings for other apps.
+
+Install runs `setup.py` with `--yes --no-start` in the background. Before it downloads anything, it shows the plan
+and waits for your OK. Start and stop work like the run scripts and the server's own unload. No tool takes a shell
+command or a free path: every argument is checked against setup's own choices, and the only path (install's
+`data_dir`) must be the data folder, a folder inside the XeStrata folder, or a new folder named `XeStrata...` outside
+the system folders. The MCP server only ends processes it started itself (it keeps their process id and start time
+in `.strata-mcp/`). It uses only Python's standard library, so it works before `.venv` exists.
+
+This is the opposite direction from [Tools from MCP servers](#tools-from-mcp-servers) above, where the Strata model
+calls *your* MCP tools.
+
+---
+
 ## Images (vision)
 
 The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
@@ -435,7 +664,7 @@ you> What is the total on this receipt?
 ```python
 import base64
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+client = OpenAI(base_url="http://127.0.0.1:8095/v1", api_key="none")
 img = base64.b64encode(open("photo.jpg", "rb").read()).decode()
 r = client.chat.completions.create(model="strata", messages=[{"role": "user", "content": [
     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}},
@@ -483,7 +712,7 @@ test images.
 
 **This is an experiment, not a finished feature.** It ships with Strata but stays off unless you turn it on.
 
-A 480 KB control vector for Qwen3.8-Flash-Next (`data/experimental-speed-projection/`, see its README). After each
+A 480 KB control vector for Qwen3.8-Flash-Next (`third_party/nonfree/experimental-speed-projection/`, see its README; under the Qwen Community License, so it is kept apart from the rest and XeStrata runs without it). After each
 of layers 4-44 the engine removes one direction from every hyper-connection stream of the residual: `h -= (h . v) v`,
 one unit vector `v` per layer, exactly as llama.cpp does with the package's `--cvec-mode project` patches.
 
@@ -494,12 +723,12 @@ behaviour - you are responsible for what the model writes with it on. It also sh
 chat's tokens/s does with it on depends on the text the model writes (length, repetition, how well the drafts land),
 so measure it on your own prompts; the Monitor marks every request ESP or stock.
 
-**Turning it on (at setup).** `START-HERE.bat --setup` asks "Turn on the experimental speed projection?" (default:
+**Turning it on (at setup).** `./setup.sh --setup` asks "Turn on the experimental speed projection?" (default:
 no), or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF). Only for the original
 Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) into `strata-<model>.json`:
 
 ```
---control-vector-scaled <Strata>\data\experimental-speed-projection\Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
+--control-vector-scaled <Strata>/third_party/nonfree/experimental-speed-projection/Qwen3.8-Flash-Next-experimental-speed-projection.gguf:1.0
 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer
 ```
 
@@ -522,11 +751,10 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 
 | Symptom | What to do |
 | --- | --- |
-| `the NVIDIA driver is too old` | Update the driver (NVIDIA App or nvidia.com/drivers), restart, run `START-HERE.bat` again. |
+| `the NVIDIA driver is too old` | Update the driver (NVIDIA App or nvidia.com/drivers), restart, run `./setup.sh` again. |
 | Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
-| `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
-| `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
-| `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set the page file to "System managed" (System > About > Advanced system settings > Performance > Advanced > Virtual memory) and restart. Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
+| `port 8095 is already in use` | Strata is already running (look for its window), or another program uses the port: `./setup.sh --port 8081`. |
+| `cudaHostRegister ... out of memory` in the log | The engine tries to pin the experts in per-layer slices instead. Only a problem if the load then fails. |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer - usually out of RAM (Linux ends the biggest program: `sudo dmesg \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats: close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
@@ -536,9 +764,10 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | `this server was started without the vision encoder` | The model was set up for text only: run setup again with `--vision gpu`. |
 | A picture is refused or `cannot read the image` | The file is not a picture Pillow can open (JPEG, PNG, WebP, GIF, BMP, TIFF, AVIF work). |
 | Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
-| A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `START-HERE.bat` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
-| Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
-| `out of memory: cudaFuncSetAttribute` in the log (IQ3_XXS, long prompt) | Fixed in engine 0.1.15: CUDA loaded a kernel's code when it was first needed, and mid-prompt there was no VRAM left for it. Run `START-HERE.bat` (Windows) or `./setup.sh` (Linux) once to update. |
+| A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `./setup.sh` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
+| Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults): attach the report. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
+| `the engine said nothing for ... s during the request` or `... did not finish the request after it was stopped (STOP)` | Issue #481: the engine and the server lost step (the engine waits for its next command, the server for the request's end; GPU at 0 %, nothing in the log). The server ends the engine after 300 s without a line from it during a request (while a prompt is read: each chunk may take three times the previous one's time, the first one up to its tokens at 50 tok/s more), the request ends with an error and the next request starts the engine again. `"engine_silence_s": 600` in `strata-<model>.json` sets the time (0 = wait forever, as before). If you see it, please add the end of the engine log to #481. |
+| `out of memory: cudaFuncSetAttribute` in the log (IQ3_XXS, long prompt) | Fixed in engine 0.1.15: CUDA loaded a kernel's code when it was first needed, and mid-prompt there was no VRAM left for it. Run `./setup.sh` once to update. |
 | Anything else | The engine log is `strata-<model>.log` in this folder. |
 
 ---
@@ -565,7 +794,7 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
 
 ## Credits and licenses
 
-Strata itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
+XeStrata: [LGPL-3.0-or-later](../LICENSE) (the parts from Strata also under Strata's MIT License, kept in the same file). The model files are not part of it; their licenses apply to them (below).
 
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
@@ -576,10 +805,10 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and
   dequantizers transcribed in `src/kernels/cuda/iq_kernels.cu`, the CPU backend linked for the i-quant experts, the
   `mtmd` library behind the image encoder (`tools/vision/`), and `gguf-py` used by the tools. See
-  `third_party/ggml/LICENSE`.
+  `third_party/main/ggml/LICENSE`.
 - Ideas from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see
-  `serve/web/fonts/OFL.txt`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
-- The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0,
-  made from the model's activations (see its README).
+  `third_party/main/outfit/OFL.txt`; without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
+- `third_party/nonfree/`: Qwen Community License 1.0, not free; XeStrata runs without it. It holds the experimental speed projection's vector,
+  made from the model's activations, and the original model's chat template (see its README).

@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # OrcaRouter IQ3_XXS compatibility
 
 Validated on Linux with an RTX 5090 (32 GB), Ryzen 9 9950X3D and 128 GB RAM on 2026-09-27.
@@ -65,17 +70,17 @@ needs about 49.8 GiB of available system RAM, plus draft/runtime buffers and oth
   "model_name": "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
   "log": "strata-orca-iq3_xxs.log",
   "host": "127.0.0.1",
-  "port": 8080
+  "port": 8095
 }
 ```
 
 Run from the repository root:
 
 ```sh
-.venv/bin/python -m serve.server --engine strata --config strata-orca-iq3_xxs.json --port 8080
+.venv/bin/python -m serve.server --engine strata --config strata-orca-iq3_xxs.json --port 8095
 ```
 
-The web interface is at `http://127.0.0.1:8080`; API clients use `http://127.0.0.1:8080/v1`.
+The web interface is at `http://127.0.0.1:8095`; API clients use `http://127.0.0.1:8095/v1`.
 Vision is not configured in this text-only example. Performance of the original GSQ-RCO model
 does not establish this fine-tune's speed or accuracy.
 
@@ -93,3 +98,11 @@ does not establish this fine-tune's speed or accuracy.
   PID stayed unchanged. These are smoke tests, not a quality benchmark or a full-context stress test.
 - With the configuration above, a 111-token explanation generated at 77.7 tokens/s (engine decode timing);
   total request time was 1.77 seconds. This single short measurement is not a general throughput claim.
+
+## Q4_K_S (unverified)
+
+The same repository's **Q4_K_S** (three shards, about 112 GB) has Q4_K gate/up experts, Q5_0 or Q5_1 down
+experts, some Q5_1 dense projections and a Q5_0 PLE table (upstream d652cd6). The engine has GPU kernels for
+each of these (`native_expert_parity --synthetic q4_K/q5_0` and `q4_K/q5_1` check them against ggml), and the
+Q5_0 table is read through the mapped reader only (`--ple-io mmap`). Pack it the same way, with `--compat-bf16`;
+Strata finds the other shards by name. Running the real files has not been checked here.
