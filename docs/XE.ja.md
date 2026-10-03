@@ -111,8 +111,7 @@ icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_C
 - **GPU のコード**: デバイスのコードは SPIR-V の JIT です。
   ドライバーが各カーネルを初めて使うときにコンパイルし、`~/.cache/neo_compiler_cache` に保存します。
   AOT や配布用のパッケージは作りません。
-  そのため、まだコンパイルしていないカーネルを使うモデルの初回は時間がかかります。
-  IQ3_XXS では、最初のトークンまで 0.6 秒のところが 30 秒かかりました（[記録](../bench/results/2026-09-30-xe-iq3xxs/README.md)）。
+  そのため、まだコンパイルしていないカーネルを使うモデルの初回は、最初のトークンまで時間がかかります。
   setup は最後にモデルを一度起動し、長い質問と画像を送って、このコンパイルを済ませます
   （[記録](../bench/results/2026-09-30-xe-setup/README.md#compiling-the-gpu-code-at-setup-added-later-on-2026-09-30)）。
   `--no-warmup` で省けます。
@@ -206,8 +205,6 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 Ubuntu 26.04 の `dpclang-6` 6.2.0 では、B70 に XMX が使えません。
 XMX を使うには、`--intel-llvm-build` で intel/llvm をビルドするか、nonfree で icpx を使います。
 `dpclang-6` のまま進めるなら `--allow-no-xmx` を付けます。
-
-[setup の記録](../bench/results/2026-09-30-xe-setup/README.md) は、free のビルドができる前に、2 つの画像エンコーダーで setup を最後まで通したものです。
 
 #### Fedora 44
 
@@ -418,7 +415,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
 起動時に、出力ヘッドを GPU に上げる確保が断られることがあります。
 そのとき空いている VRAM は約 27 GiB あり、いつもアリーナをデバイスへのコピー用に登録した直後の、最初のデバイスの確保です。
 同じ設定でもう一度起動すると、普通に動きます。
-古い機械で 2 回、新しい機械で約 120 回の起動のうち 3 回起きました
+新しい開発機では、約 120 回の起動のうち 3 回起きました
 （[記録](../bench/results/2026-10-02-new-machine/README.md#the-output-heads-vram-refusal)）。
 原因は `unverified` です。
 

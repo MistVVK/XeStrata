@@ -27,39 +27,22 @@ and the model files on a CPU-attached Gen4 x4 NVMe.
 Other GPUs have not been measured.
 The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 
-### Decode and prompt reading per model
+### Speed with the current engine
 
-On 2026-10-02 every model was measured under the same conditions ([record](../bench/results/2026-10-02-new-machine/README.md#decode-on-every-model)).
-Decode: greedy, `--spec 4`, the expert cache `auto`, 128 tokens written for a 20-token prompt, measured twice.
-Prompt reading: a 26,292-token prompt, `--prefill auto --max-context 32768 --kv int8`, with MTP, measured once.
+These numbers were measured with the expert cache fixed (`--expert-cache 10000`) to compare runs, greedy, twice each.
 
-| Model | Decode, no drafts (tokens/s) | Decode, MTP (tokens/s) | 26K-token prompt (tokens/s) |
-| --- | ---: | ---: | ---: |
-| Qwen IQ2_XS | 17.05 / 16.97 | 44.14 / 44.14 | 1,016 |
-| Qwen IQ3_XXS | 16.19 / 15.93 | 43.41 / 38.00 | 939 |
-| Qwen IQ3_S | 15.19 / 15.04 | 33.67 / 33.87 | 867 |
-| Qwen Q2_0 | 17.33 / 17.34 | 49.35 / 49.47 | 1,108 |
-| Coder IQ1_M | 14.16 / 14.15 | 33.76 / 33.74 | 1,235 |
-| Swift IQ2_XS | 17.05 / 17.09 | 43.16 / 43.20 | 1,025 |
-| Swift IQ3_XXS | 16.15 / 15.80 | 39.47 / 39.50 | 940 |
-| Swift Q2_0 | 17.33 / 17.32 | 43.20 / 43.21 | 1,115 |
+| What | IQ2_XS | IQ3_S |
+| --- | ---: | ---: |
+| Decode with MTP, 128 tokens (tokens/s) | 72.88 / 72.06 | 62.85 / 62.94 |
+| Reading a 26,292-token prompt (tokens/s) | — | 1,552.10 / 1,550.80 |
+| Reading its first 12,000 tokens (tokens/s) | — | 1,308.61 / 1,304.47 |
+| Decode with MTP at temperature 0.7, top_k 40, top_p 0.95 (tokens/s) | — | 65.86 / 65.87 |
 
-Without drafts every model waits on the GPU; the CPU pool takes 0.6–6.6 ms of each round.
+The records: [decode](../bench/results/2026-10-02-decode-upstream/README.md), [prompts](../bench/results/2026-10-03-prompt-upstream/README.md).
+Prompts are read with `--prefill auto`, which reads the 26,292 tokens as one chunk (26,368 tokens).
+The other models have not been measured with the current engine yet.
+
 Decode speed also depends on the text: the more drafts are accepted, the faster it runs, so a different answer to the same prompt moves it by a few percent.
-
-### Later improvements
-
-After that table, ports of upstream's changes and XeStrata's own work made it faster.
-The numbers below were measured with the expert cache fixed (`--expert-cache 10000`) to compare runs.
-That is a different condition from the table above (`auto`), so the two are not directly comparable.
-
-- **Prompt chunks up to 32768 tokens**: `--prefill auto` may now pick chunks of 32768 or 16384 tokens.
-  IQ3_S reads the 26,292-token prompt at 1,552 tokens/s instead of 1,084 (+43%), its first 12,000 tokens at 1,309 instead of 978.
-  The numbers before and after, with the other changes, are in [the record](../bench/results/2026-10-03-prompt-upstream/README.md).
-- **Decode**: with MTP, 128 tokens, IQ2_XS writes 72.88 / 72.06 tokens/s and IQ3_S 62.85 / 62.94
-  ([record](../bench/results/2026-10-02-decode-upstream/README.md)).
-- **Sampling with a temperature**: top_k is now selected across the GPU in two stages.
-  IQ3_S, MTP, temperature 0.7: 65.86 tokens/s instead of 51.98 (+26%).
 
 ### Small cards and GPUs without XMX
 
@@ -128,7 +111,6 @@ setup's first question also offers **[Swift 1.5](https://huggingface.co/ukisai/S
 UkisAI's fine-tune of Qwen3.8-Flash-Next, trained to reach the answer with much less thinking.
 Its authors report 63% fewer thinking tokens, answers 1.8× sooner, and under 1% accuracy loss.
 The same architecture; three sizes (Q2_0, IQ2_XS, IQ3_XXS; no IQ3_S); its own image encoder.
-On the B70 it runs at nearly the original's speed (the table above).
 Its authors recommend **IQ2_XS** (their Q2_0 is marked experimental).
 Its license is the Swift Open License 1.0: read it on the model page.
 

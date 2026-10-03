@@ -108,8 +108,7 @@ With icpx: `source /opt/intel/oneapi/setvars.sh`, then `-DCMAKE_CXX_COMPILER=icp
   The AVX-512 translation units are compiled separately and chosen at run time.
 - **GPU code**: device code is SPIR-V, compiled by the driver (JIT) when each kernel is first used and kept in `~/.cache/neo_compiler_cache`.
   No AOT and no distribution packaging.
-  So the first run of a model whose kernels were not compiled before takes longer:
-  on IQ3_XXS the first token came after 30 s instead of 0.6 s ([record](../bench/results/2026-09-30-xe-iq3xxs/README.md)).
+  So the first run of a model whose kernels were not compiled before takes longer to its first token.
   setup therefore ends by starting the model once and asking it a long question and a picture
   ([record](../bench/results/2026-09-30-xe-setup/README.md#compiling-the-gpu-code-at-setup-added-later-on-2026-09-30));
   `--no-warmup` skips it.
@@ -202,8 +201,6 @@ in a container with only this column and `python3-venv`, setup ran from start to
 Ubuntu 26.04's `dpclang-6` 6.2.0 gives the B70 no XMX.
 For XMX, build intel/llvm with `--intel-llvm-build`, or use icpx in the nonfree mode.
 To go on with `dpclang-6`, pass `--allow-no-xmx`.
-
-[The setup record](../bench/results/2026-09-30-xe-setup/README.md) ran setup end to end with both image encoders, before the free build existed.
 
 #### Fedora 44
 
@@ -408,7 +405,7 @@ To compare outputs across machines or settings, fix it with `--expert-cache N`.
 Sometimes the upload of the output head is refused VRAM at start.
 About 27 GiB is free then, and it is always the first device allocation after the arena is registered for device copies.
 The same settings then start normally.
-It happened twice on the old machine and 3 times in about 120 starts on the new one
+On the development machine it happened 3 times in about 120 starts
 ([record](../bench/results/2026-10-02-new-machine/README.md#the-output-heads-vram-refusal)).
 The cause is `unverified`.
 
