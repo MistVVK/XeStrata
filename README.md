@@ -217,6 +217,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
+- **Upstream integration:** the single-GPU features of Strata 0.1.38 are carried into Xe. `--coupled-draft` samples
+  MTP drafts with the target model's sampling chain. Of the paths meant to be faster, only those measured faster on
+  Xe are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0138)).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits

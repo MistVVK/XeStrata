@@ -11,7 +11,8 @@ How to use it is in the [README](../README.md) and the [details](DETAILS.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
 XeStrata 0.1.0 runs Strata's engine on Intel GPUs through Level Zero and SYCL.
-It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`).
+It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.38
+([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
 
@@ -23,6 +24,54 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.1.38
+
+Of upstream Strata's changes up to 0.1.38 (`99f3dbd0b21d1401b3769e0c0d963913607f380b`), the single-GPU Linux ones are carried into Xe.
+The upstream history is kept as a merge.
+The CUDA, HIP, Windows and multi-GPU implementations are not carried.
+
+Carried:
+
+- `--coupled-draft`: MTP drafts are sampled with the target model's sampling chain (off by default; `--no-coupled-draft` turns it off explicitly).
+  This includes the draft vocabulary map and the penalty history.
+  A server config can set `coupled_draft`; engine arguments take precedence.
+- `--resident-budget-gib`, `--resident-experts` and `--resident-cpu-experts` for the file expert tier.
+- `--shared-expert-arena PATH`: completed expert weights shared between Linux processes.
+  The data is flushed before completion is published under a file lock.
+  The reader verifies the pack's identity before reusing it.
+- Native PLE keys accept Q2_0, IQ3_XXS, IQ4_XS and Q8_0.
+  A BF16 PLE key in the pack is used when there is one.
+- Native RoPE follows the request's scaling configuration.
+- MTP downloads verify the pinned checkpoint and refuse invalid ranges.
+
+The paths meant to be faster are not carried: measured on the B70, none was faster ([record](../bench/results/2026-10-04-upstream-0138/README.md)).
+
+| Path | On the B70 |
+| --- | --- |
+| Quantized expert products in the prompt path (`STRATA_PREFILL_MMQ`) | 0.34x of the default XMX FP16 path |
+| Fused MoE (`STRATA_PF_FUSED`) | 0.25x of the default path |
+| GDN key-head sharing (`STRATA_GDN_KEYHEAD`) | 0.54x of the default path |
+| Split hyper-connection read (`STRATA_GR_V3`) | Decode about 18% slower |
+| P-core / E-core placement of the CPU pool (`--pool-affinity`) | Decode 1–4% slower |
+| AVX2 multi-token K-quant products (`STRATA_KQ256`) | Within the spread |
+| Software prefetch in the AVX2 IQ kernels | Within the spread |
+| Routing-aware prefetch of the file tier (`STRATA_LOOKAHEAD`) | Decode about 2% slower |
+
+The quantized products and the fused MoE compute on the decode kernels' DP4a dots, without XMX.
+A GPU with XMX therefore reads the prompt faster on the default path.
+
+The integration builds in both modes, free (dpclang++) and nonfree (icpx), and both pass the 52 CTest cases.
+The default configuration's output (IQ2_XS, nonfree) was compared with the pre-integration build (`bae99bd`).
+32 tokens from an 18-token chat were the same in both of two runs.
+16 tokens from a 4,095-token prompt were the same in all three pre-integration runs.
+After the integration, two of three runs matched them and one differed from the first token ([Why outputs change from run to run](#why-outputs-change-from-run-to-run)).
+Under Intel SDE (`-icx`), the AVX-512 paths pass `expert_multi_test` and `native_expert_parity --synthetic` (iq3_xxs/iq4_nl, q4_K/q5_1).
+`expert_parity` and `pool_test` were skipped: there is no canonical pack.
+The integration commit checked that, with the 8 GiB limit, no XMX and two CPU workers, the same 16 tokens come out with and without `--coupled-draft`.
+On the UHD 770 the free build answered with a two-token MTP window.
+The nonfree build's four-token window stopped inside the Intel runtime and is `unverified`.
+Real-model checks of every quantization format, shared arenas across processes and the resident exchanges are also `unverified`.
 
 ## Build and run
 

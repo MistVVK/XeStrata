@@ -11,7 +11,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md) にあります。
 
 XeStrata 0.1.0 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。
-移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）です。
+移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.38 までの変更の一部を取り込んでいます
+（[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
 
@@ -24,6 +25,54 @@ CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe �
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
+
+## Strata 0.1.38 の取り込み
+
+upstream の Strata 0.1.38（`99f3dbd0b21d1401b3769e0c0d963913607f380b`）までの変更のうち、単一の GPU と Linux に関わるものを Xe に移しています。
+upstream の履歴はマージとして残しています。
+CUDA、HIP、Windows、複数の GPU の実装は移していません。
+
+移したものは次のとおりです。
+
+- `--coupled-draft`: MTP の下書きを、対象モデルと同じサンプリングで引きます（既定は無効、`--no-coupled-draft` で明示的に無効）。
+  下書きの語彙の対応表とペナルティの履歴も含みます。
+  サーバーの設定では `coupled_draft` で指定でき、エンジンの引数があればそちらが優先されます。
+- ファイルから読むエキスパートの層の `--resident-budget-gib`、`--resident-experts`、`--resident-cpu-experts`。
+- `--shared-expert-arena PATH`: 完成したエキスパートの重みを Linux のプロセスの間で共有します。
+  データを書き出してから、ファイルのロックの下で完成を公開します。
+  読む側は pack の同一性を確かめてから使います。
+- ネイティブの PLE キーは Q2_0、IQ3_XXS、IQ4_XS、Q8_0 を受け付けます。
+  BF16 の PLE キーが pack にあれば、そちらを使います。
+- ネイティブの RoPE は、要求のスケーリングの設定に従います。
+- MTP のダウンロードは、固定したチェックポイントかどうかを確かめ、不正な範囲を拒みます。
+
+速くするための経路は、B70 で測って速くならなかったので移していません（[記録](../bench/results/2026-10-04-upstream-0138/README.md)）。
+
+| 経路 | B70 での結果 |
+| --- | --- |
+| プロンプトの量子化したエキスパートの積（`STRATA_PREFILL_MMQ`） | 既定の XMX の FP16 の経路の 0.34 倍 |
+| 融合 MoE（`STRATA_PF_FUSED`） | 既定の経路の 0.25 倍 |
+| GDN の key-head の共有（`STRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
+| hyper-connection の分割読み出し（`STRATA_GR_V3`） | decode が約 18% 遅い |
+| CPU のプールの P コアと E コアの配置（`--pool-affinity`） | decode が 1〜4% 遅い |
+| K-quant の AVX2 の多トークンの積（`STRATA_KQ256`） | 差はばらつきの範囲 |
+| AVX2 の IQ カーネルのソフトウェアのプリフェッチ | 差はばらつきの範囲 |
+| ファイルの層のルーティングによる先読み（`STRATA_LOOKAHEAD`） | decode が約 2% 遅い |
+
+量子化した積と融合 MoE は、XMX を使わずに decode と同じ DP4a の内積で計算します。
+そのため、XMX のある GPU では既定の経路に勝てません。
+
+取り込みは free（dpclang++）と nonfree（icpx）の両方でビルドし、どちらも CTest の 52 件が通ります。
+既定の構成（IQ2_XS、nonfree）の出力は、取り込み前（`bae99bd`）と比べました。
+18 トークンのチャットから 32 トークンを生成すると、2 回とも一致しました。
+4,095 トークンのプロンプトから 16 トークンを生成すると、取り込み前は 3 回とも同じでした。
+取り込み後は 3 回のうち 2 回が一致し、1 回は最初のトークンから違いました（[実行ごとに出力が変わる理由](#実行ごとに出力が変わる理由)）。
+AVX-512 の経路は Intel SDE（`-icx`）で、`expert_multi_test` と `native_expert_parity --synthetic`（iq3_xxs/iq4_nl、q4_K/q5_1）が通ります。
+`expert_parity` と `pool_test` は正準形の pack がないので飛ばしました。
+統合のコミットでは、8 GiB の制限、XMX なし、CPU のワーカー 2 つの構成で、`--coupled-draft` の有無で同じ 16 トークンが出ることを確かめました。
+UHD 770 では free のビルドが 2 トークンの MTP の窓で答えました。
+nonfree のビルドの 4 トークンの窓は Intel のランタイムの中で止まり、`unverified` です。
+すべての量子化の形式での実モデルの確認、プロセスをまたぐ共有アリーナ、常駐の入れ替えも `unverified` です。
 
 ## ビルド
 
