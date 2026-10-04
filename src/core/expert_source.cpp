@@ -1999,8 +1999,18 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             ? new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, host_usm)
             : new PinnedArena(want + (uint64_t) blob, bounds, 0, shared_arena_file, pack_hash);
     } catch (const std::exception& e) {
-        err = std::string("ArenaExpertSource: ") + e.what();
-        return false;
+        // a runtime without the registration (intel/llvm's CUDA adapter has no urUSMImportExp) takes host USM
+        if (!shared_arena_file.empty() || host_usm) {
+            err = std::string("ArenaExpertSource: ") + e.what();
+            return false;
+        }
+        std::fprintf(stderr, "strata: %s; the expert arena takes host USM instead\n", e.what());
+        try {
+            a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, /*host_usm=*/true);
+        } catch (const std::exception& e2) {
+            err = std::string("ArenaExpertSource: ") + e.what() + "; host USM: " + e2.what();
+            return false;
+        }
     }
     if (!a->valid()) {
         delete a;
