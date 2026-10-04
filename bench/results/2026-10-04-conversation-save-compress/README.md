@@ -6,9 +6,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 `--conversation-save` ([docs/DETAILS.md](../../../docs/DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) writes each conversation's running states and K/V uncompressed.
 Its file format leaves a codec field in every part, so a part could be stored compressed later.
-This record measures whether that pays: it does not, so every part stays uncompressed (codec 0).
-
-The rule set before measuring: a setting is taken for a part only if the whole file gets at least 20% smaller and restoring it takes no longer than reading it uncompressed.
+This record measures whether that pays.
+No setting met the rule set before measuring (the whole file at least 20% smaller, restoring no slower), so the default stays uncompressed;
+compressing the parts that do compress became an opt-in, `--conversation-save-compress` ([below](#the-option)).
 
 ## The files
 
@@ -66,12 +66,33 @@ The fast settings are within 0.003 of these.
 ## Restoring
 
 Reading the files with `dd iflag=direct bs=16M` (no page cache) ran at 5.0-5.4 GB/s.
-The engine itself read 471 MiB in 279 ms (1.7 GB/s) with the page cache dropped, then restored it to the GPU in 41 ms: the engine's buffered reads, not the NVMe, set the restore time.
+The engine itself read 471 MiB in 271-279 ms (1.7 GB/s) with the page cache dropped, then restored it to the GPU in 41 ms.
+The NVMe does not set that time: asking the kernel to read the whole file ahead (`POSIX_FADV_WILLNEED`) changed nothing, and from the page cache the same read took 190-220 ms (sizing the buffers, copying, the checksum).
 A 12-15% smaller file would save about 40 ms of a 0.3 s restore, and the restore replaces 7.9 s of reading the prompt again.
 
 Writing on the request path, when the RAM cache pushed a conversation out, took 120 ms for 304 MiB, including the `fsync`; at exit, 96-320 ms for 225-823 MiB.
 
-## Decision
+## The option
 
-No part reaches the 20% the rule asks for, so the files stay uncompressed and the build takes no new library.
-The codec field stays in the format, so a future model whose state compresses better can use it without a new version.
+`--conversation-save-compress` (config key `"conversation_save_compress"`, off by default) compresses only the parts that gain: the DeltaNet states, the indexer rows, and K/V when it is FP16.
+1-byte K/V codes and the small parts (about 1 MiB) are written as they are.
+Each part is cut into 16 MiB chunks (a `ConversationBuffer` segment) compressed with c-blosc2's ZSTD at level 1 after its byte shuffle, on every CPU the process may use.
+The engine builds it in only when CMake finds libblosc2 (Debian / Ubuntu `libblosc2-dev`, 2.23.0 here); without it the engine refuses the option.
+
+Expected from the table above: INT8 9K 0.905, INT8 33K 0.931, FP16 9K 0.855, Q4_0 9K 0.880 of the uncompressed size.
+
+Measured in the engine on the B70, the INT8 conversation of 9,183 tokens with two checkpoints, the page cache dropped before each read:
+
+| | Uncompressed | Compressed |
+| --- | --- | --- |
+| File | 471 MiB | 421 MiB (0.894) |
+| Read back | 271-279 ms | 295-297 ms |
+| Written at exit | 191-201 ms | 231 ms |
+
+The answers after the restart matched the run without it; a compressed file with two flipped bytes was caught by its checksum, deleted, and the prompt read again.
+
+The first compressed runs wrote in 463-476 ms and read in 379-391 ms, slower than in a standalone program over the same code (+25 ms writing, +20 ms reading).
+The serve loop pins its thread to one core (`SessionLoopScratch`, so its spin does not take a worker's cycles), and the c-blosc2 threads it started inherited that one core.
+The disk code now opens the thread to the CPUs the process had at start while c-blosc2 runs, and pins it back after.
+
+Debian's c-blosc2 2.23 decompressed the running states at 34 GB/s on 28 threads into a reused 16 MiB buffer, 4.2 GB/s on one; PyPI's 3.3.5 measured above is no faster where it matters.
