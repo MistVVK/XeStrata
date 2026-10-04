@@ -15,7 +15,7 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
 # measured the two decode equally fast, and a native build can stop running when the CPU is changed (Strata's own
 # AVX-512 kernels are per-file and chosen at run time either way).
 option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
-# The free build (the default) uses free software only, as Debian main requires (AGENTS.md): intel/llvm's DPC++
+# The free build (the default) uses free software only, free enough for Debian main (AGENTS.md): intel/llvm's DPC++
 # (clang++ with -fsycl; Debian and Ubuntu package it as dpclang++).  ON allows the non-free tools and libraries:
 # Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others).
 option(STRATA_NONFREE "allow non-free build tools and libraries (Intel oneAPI's icpx)" OFF)

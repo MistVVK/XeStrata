@@ -18,7 +18,7 @@ The routed experts, which oneMKL multiplied one call per expert, are multiplied 
 | oneMKL (`a6c8eea`) | 1053.5 / 1051.9 | 19.4 / 19.4 |
 | XMX kernels, G = 16 | 1020.5 / 1015.7 | 19.2 / 19.0 |
 
-The prompt path is 3.3% slower than with oneMKL; the user chose to take the change for Debian main and win the speed back afterwards.
+The prompt path is 3.3% slower than with oneMKL; the user chose to take the change, so the engine is free enough for Debian main, and win the speed back afterwards.
 
 - Output: after the 26,292-token prompt the 24 generated tokens are the same as oneMKL's (`xmx-chk-*`); the logits differ by at most 3.1 (a different order of the FP32 sums over 26k tokens). Two runs of the new build give identical logits
 - CTest (31 tests; `expert_multi_test` skipped without AVX-512), `iq_parity` and `native_expert_parity` on the IQ3_S file pass
