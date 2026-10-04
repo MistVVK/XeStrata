@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/mma_gemm.cpp - see mma_gemm.hpp.
 //
-// A work-group of 2 x 2 sub-groups computes a tile of Y of 4 x 4 matrix tiles (64 x 64 with NVIDIA's 16 x 16, 32 x 32
-// with Intel Xe-HPG's 8 x 8), each sub-group 2 x 2 of them.  K advances 32 values at a time: the work-group copies the
-// step's rows of X into local memory, zero past the last row (so any row count works, the experts' groups too), and
-// every sub-group loads its A tiles from there and its B tiles straight from W's rows (B is W^T, column-major).  The
-// accumulators go out through local memory as well, row by row, so the rows past the last one are not written.  A
-// first version, to be measured against cuBLAS on an NVIDIA GPU: no prefetch, no double buffering.
+// A work-group of 2 x 2 sub-groups computes a tile of Y of 4 x 4 matrix tiles (64 x 64 with NVIDIA's 16 x 16), each
+// sub-group 2 x 2 of them.  K advances 32 values at a time: the work-group copies the step's rows of X into local
+// memory, zero past the last row (so any row count works, the experts' groups too), and every sub-group loads its A
+// tiles from there and its B tiles straight from W's rows (B is W^T, column-major).  The accumulators go out through
+// local memory as well, row by row, so the rows past the last one are not written.  A first version, to be measured
+// against cuBLAS on an NVIDIA GPU: no prefetch, no double buffering.
 #include "mma_gemm.hpp"
 #include "device_target.hpp"
 
@@ -23,25 +23,25 @@ namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 using bf16_t = sycl::ext::oneapi::bfloat16;
 
-// A joint_matrix tile shape and the sub-group size it is built for: Intel Xe2's 8 x 16 x 16 on 16 lanes (to check this
-// code there; xmx_gemm.cpp's kernels are the fast ones on Xe2), Intel Xe-HPG's 8 x 8 x 16 on 8 (the Arc A series,
-// whose runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp).
-// wg: the work-group's sub-groups a side; st: a sub-group's tiles a side.
+// A joint_matrix tile shape and the sub-group size it is built for: Intel's 8 x 16 x 16 on 16 lanes (to check this
+// code on an Intel GPU; xmx_gemm.cpp's kernels are the fast ones there) and NVIDIA's 16 x 16 x 16 on 32 (a warp).
 struct Shape {
-    int m, n, k, sg, wg, st;
+    int m, n, k, sg;
 };
-constexpr Shape kShapes[] = {{8, 16, 16, 16, 2, 2}, {8, 8, 16, 8, 8, 2}, {16, 16, 16, 32, 2, 2}};
+constexpr Shape kShapes[] = {{8, 16, 16, 16}, {16, 16, 16, 32}};
 
+constexpr int NSGM = 2, NSGN = 2, NSG = NSGM * NSGN;   // sub-groups a work-group
+constexpr int SGM = 2, SGN = 2;                         // tiles a sub-group
 constexpr int KC = 32;                                  // K a step
 
-// Whether this device compile carries shape S's kernels: Intel's shapes only Intel's, NVIDIA's only the others (an
+// Whether this device compile carries shape S's kernels: Intel's shape only Intel's, NVIDIA's only the others (an
 // AMD GPU has joint_matrix on CDNA's matrix cores only, which these shapes are not).
 template<int S>
 constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
     return false;
 #else
-    return kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
+    return kShapes[S].sg == 16 ? !STRATA_DEVICE_NOT_INTEL : true;
 #endif
 }
 
@@ -57,8 +57,6 @@ inline auto global(const E* p) {
 template<int S, typename E, bool ACC>
 struct Kernel {
     static constexpr int TM = kShapes[S].m, TN = kShapes[S].n, TK = kShapes[S].k, SG = kShapes[S].sg;
-    static constexpr int NSGM = kShapes[S].wg, NSGN = kShapes[S].wg, NSG = NSGM * NSGN;
-    static constexpr int SGM = kShapes[S].st, SGN = kShapes[S].st;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     const E* X;
     const E* W;
@@ -137,8 +135,8 @@ sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, flo
     const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<E, 1> as(sycl::range<1>(KT::WM * KC), h);
-        sycl::local_accessor<float, 1> cs(sycl::range<1>(KT::NSG * KT::TM * KT::TN), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * tiles_n) * KT::NSG * KT::SG, (size_t) KT::NSG * KT::SG),
+        sycl::local_accessor<float, 1> cs(sycl::range<1>(NSG * KT::TM * KT::TN), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * tiles_n) * NSG * KT::SG, (size_t) NSG * KT::SG),
                        KT{X, W, w_stride, Y, ldy, bounds, T, N, K, tiles_m, tiles_n, as, cs});
     });
 }
@@ -188,8 +186,7 @@ template<typename E>
 sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
                      int64_t ldy, const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, bool accumulate) {
     if (s == 0) return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    if (s == 1) return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
 }
 
 }  // namespace
