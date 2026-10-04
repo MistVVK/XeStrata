@@ -4,7 +4,7 @@
 // src/core/device_main.cpp - `strata-device`: report the GPU and exercise the arena.
 //
 // On its own so it can run without the model.  It is also the run-time half of the device policy: the runtime
-// selects one Intel GPU by what it reports (STRATA_GPU_PCI, else a discrete card with the most compute units) and refuses one without
+// selects one GPU by what it reports (STRATA_GPU_PCI, else a discrete card with the most memory) and refuses one without
 // what the kernels need.
 #include "strata/core/device.hpp"
 
@@ -38,7 +38,8 @@ int main(int argc, char** argv) {
     try {
         const strata::core::DeviceInfo d = strata::core::device_info(0);
         std::puts(version);
-        std::printf("device %d: %s (8086:%04x, Level Zero)\n", d.ordinal, d.name.c_str(), d.device_id);
+        std::printf("device %d: %s (%04x:%04x, %s)\n", d.ordinal, d.name.c_str(), d.vendor_id, d.device_id,
+                    d.backend.c_str());
         std::printf("  compute units       %u\n  integrated          %s\n", d.compute_units, d.integrated ? "yes" : "no");
         std::printf("  VRAM total / free   %s / %s\n", human(d.total_bytes).c_str(),
                     d.free_bytes_known ? human(d.free_bytes).c_str() : "unavailable");

@@ -18,19 +18,40 @@
 
 namespace strata::core {
 namespace {
-// Why a Level Zero GPU cannot run the engine, from what it reports (empty: it can).  The kernels take 16-wide
-// sub-groups, FP16 and device and host USM; nothing is chosen by device ID or name (AGENTS.md).
+// The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
+// same Intel GPU is listed by OpenCL as well, which the engine does not use.
+bool engine_backend(const sycl::device& d) {
+    const auto b = d.get_backend();
+    return b == sycl::backend::ext_oneapi_level_zero || b == sycl::backend::ext_oneapi_cuda ||
+           b == sycl::backend::ext_oneapi_hip;
+}
+
+// A kernel with no work, built for the device to learn whether the binary carries code for it: a CUDA or HIP GPU
+// is listed whenever the runtime has the backend, also by a build without that target (STRATA_CUDA_ARCHS).
+struct ProbeKernel;
+
+// Why a GPU cannot run the engine, from what it reports (empty: it can).  The kernels take 32-wide sub-groups, FP16
+// and device and host USM; nothing is chosen by device ID or name (AGENTS.md).
 std::string unusable(const sycl::device& d) {
     if (!d.has(sycl::aspect::usm_device_allocations) || !d.has(sycl::aspect::usm_host_allocations))
         return "no device and host USM";
     if (!d.has(sycl::aspect::fp16)) return "no FP16";
     const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sg.begin(), sg.end(), size_t(16)) == sg.end()) return "no 16-wide sub-groups";
+    if (std::find(sg.begin(), sg.end(), size_t(32)) == sg.end()) return "no 32-wide sub-groups";
+    try {
+        const sycl::context ctx(d);
+        (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(ctx, {d},
+                                                                       {sycl::get_kernel_id<ProbeKernel>()});
+    } catch (const sycl::exception& e) {
+        return std::string("this build has no code for it (") + e.what() + ")";
+    }
     return {};
 }
 
-// Whether the GPU is the processor's own graphics (its memory is the system RAM), as Level Zero reports it.
+// Whether the GPU is the processor's own graphics (its memory is the system RAM).  Level Zero reports it; the other
+// backends have no such query, and their GPUs are taken as discrete cards.
 bool integrated(const sycl::device& d) {
+    if (d.get_backend() != sycl::backend::ext_oneapi_level_zero) return false;
     ze_device_properties_t p;
     std::memset(&p, 0, sizeof p);
     p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
@@ -49,15 +70,14 @@ sycl::device select_device() {
     std::vector<sycl::device> candidates;
     std::string refused;
     for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
-        if (d.get_backend() != sycl::backend::ext_oneapi_level_zero ||
-            d.get_info<sycl::info::device::vendor_id>() != 0x8086) continue;
+        if (!engine_backend(d)) continue;
         if (const std::string why = unusable(d); !why.empty()) {
             refused += "; " + d.get_info<sycl::info::device::name>() + " (" + pci_of(d) + "): " + why;
             continue;
         }
         candidates.push_back(d);
     }
-    if (candidates.empty()) throw DeviceError("no usable Intel GPU on Level Zero" + refused);
+    if (candidates.empty()) throw DeviceError("no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
     if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;
@@ -66,20 +86,25 @@ sycl::device select_device() {
         for (const auto& d : candidates)
             if (pci_of(d) == w) match.push_back(d);
         if (match.size() != 1)
-            throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable Intel GPU at that PCI address" +
+            throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
                               refused);
         return match.front();
     }
-    // Without a choice, a discrete card before the processor's own graphics, then the most compute units, then the
-    // most memory.  The engine drives one GPU.
+    // Without a choice, a discrete card before the processor's own graphics, then the most memory, then the most
+    // compute units (whose size differs between GPU makers, so they only break a tie).  The engine drives one GPU.
     return *std::max_element(candidates.begin(), candidates.end(), [](const sycl::device& x, const sycl::device& y) {
         const bool ix = integrated(x), iy = integrated(y);
         if (ix != iy) return ix;
-        const auto cx = x.get_info<sycl::info::device::max_compute_units>();
-        const auto cy = y.get_info<sycl::info::device::max_compute_units>();
-        if (cx != cy) return cx < cy;
-        return x.get_info<sycl::info::device::global_mem_size>() < y.get_info<sycl::info::device::global_mem_size>();
+        const auto mx = x.get_info<sycl::info::device::global_mem_size>();
+        const auto my = y.get_info<sycl::info::device::global_mem_size>();
+        if (mx != my) return mx < my;
+        return x.get_info<sycl::info::device::max_compute_units>() < y.get_info<sycl::info::device::max_compute_units>();
     });
+}
+
+// Instantiates ProbeKernel for the device compilers; never run.
+[[maybe_unused]] void probe_kernel_instance(sycl::queue& q) {
+    q.single_task<ProbeKernel>([] {});
 }
 
 [[noreturn]] void fatal(const char* message) {
@@ -257,6 +282,11 @@ DeviceInfo device_info(int ordinal) {
     DeviceInfo out;
     out.ordinal = ordinal;
     out.name = d.get_info<sycl::info::device::name>();
+    out.backend = d.get_backend() == sycl::backend::ext_oneapi_level_zero ? "Level Zero"
+                  : d.get_backend() == sycl::backend::ext_oneapi_cuda  ? "CUDA"
+                  : d.get_backend() == sycl::backend::ext_oneapi_hip   ? "HIP"
+                                                                       : "other";
+    out.vendor_id = d.get_info<sycl::info::device::vendor_id>();
     out.device_id = d.has(sycl::aspect::ext_intel_device_id) ? d.get_info<sycl::ext::intel::info::device::device_id>() : 0;
     out.driver_version = d.get_info<sycl::info::device::driver_version>();
     out.platform_version = d.get_platform().get_info<sycl::info::platform::version>();

@@ -22,7 +22,8 @@ namespace strata::core {
 struct DeviceInfo {
     int ordinal = -1;
     std::string name, driver_version, platform_version;
-    uint32_t device_id = 0;
+    std::string backend;            ///< "Level Zero", "CUDA" or "HIP"
+    uint32_t vendor_id = 0, device_id = 0;   ///< device_id: Intel GPUs only (0 elsewhere)
     uint64_t total_bytes = 0, free_bytes = 0;
     bool free_bytes_known = false;
     uint32_t compute_units = 0;
@@ -31,7 +32,7 @@ struct DeviceInfo {
     bool fp64 = false, host_usm = false, device_usm = false;
 };
 
-// Ordinals refer to supported Intel GPUs exposed by the Level Zero backend.
+// Ordinal 0 is the GPU the runtime selected (src/core/device.cpp, select_device).
 DeviceInfo device_info(int ordinal = 0);
 
 /// A smaller device, for checking the engine's choices on the B70 (AGENTS.md, the first rule):
