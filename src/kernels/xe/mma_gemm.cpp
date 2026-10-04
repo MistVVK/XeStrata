@@ -20,6 +20,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -133,6 +134,7 @@ struct Kernel {
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr int LDA = KC, LDB = PACKED ? KC : KC + PAD;   // A's row stride; B's (column-major) row stride
     static constexpr int ASZ = WM * LDA, BSZ = WN * LDB;           // a buffer's elements
+    static constexpr size_t LOCAL = (2 * ASZ + 2 * BSZ) * sizeof(uint16_t) + (size_t) NSG * TM * TN * sizeof(float);
     const E* X;
     const E* W;
     int64_t w_stride;
@@ -259,40 +261,48 @@ bool env_on(const char* name) {
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
-// The first shape the device reports for the input type, or -1.  The engine drives one device, so the first call's
-// answer holds.
+bool groups_layout_fits(int s, const sycl::queue& q);
+
+// The first shape the device reports for the input type whose layout for the experts' groups (the smaller one) it
+// runs, or -1.  The engine drives one device, so the first call's answer holds.
 int shape(const sycl::queue& q, bool bf16) {
-    static const auto pick = [](const sycl::device& d, mx::matrix_type in) {
+    static const auto pick = [](const sycl::queue& qq, mx::matrix_type in) {
         for (int s = 0; s < (int) std::size(kShapes); ++s)
-            if (reported(d, in, kShapes[s])) return s;
+            if (reported(qq.get_device(), in, kShapes[s])) return groups_layout_fits(s, qq) ? s : -1;
         return -1;
     };
-    static const int f16 = pick(q.get_device(), mx::matrix_type::fp16);
-    static const int b16 = pick(q.get_device(), mx::matrix_type::bf16);
+    static const int f16 = pick(q, mx::matrix_type::fp16);
+    static const int b16 = pick(q, mx::matrix_type::bf16);
     return bf16 ? b16 : f16;
 }
 
-// Whether the device builds shape S's dense layout: one with the large register file fails to build where the device
-// lacks the mode, so one such kernel is built here, once, before any is launched; without it a product takes the
-// groups' layout, which needs no large register file.
-template<int S>
-bool dense_layout_ok(const sycl::queue& q) {
-    if constexpr (!kShapes[S].dense.grf) {
-        return true;
-    } else {
-        static const bool ok = [&q] {
-            try {
-                (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
-                    q.get_context(), {q.get_device()}, {sycl::get_kernel_id<Kernel<S, sycl::half, false, false>>()});
-                return true;
-            } catch (const sycl::exception& e) {
-                std::fprintf(stderr, "strata: the GPU does not build mma_gemm's kernel with the large register file "
-                             "(%s): its products take the smaller layout\n", e.what());
-                return false;
-            }
-        }();
-        return ok;
-    }
+// Whether shape S's layout for a product (GROUPED false) or for the experts' groups fits the device: its local memory
+// and its work-group size, as the device reports them.  A layout in the large register file takes at most a quarter
+// of the device's largest work-group: on the A380 (1,024) 256 lanes ran, and 512 lost the device although the kernel
+// reported taking them (kernel_device_specific::work_group_size), so the kernel's own report does not guard it.  The
+// kernels are not built to check them: built beforehand (in the engine's context or one of its own), the products ran
+// 3% slower on the A380.  A device without the large register file fails the build at the first launch (run).
+template<int S, bool GROUPED>
+bool layout_fits(const sycl::queue& q) {
+    using KT = Kernel<S, sycl::half, false, GROUPED>;
+    static const bool ok = [&q] {
+        const sycl::device d = q.get_device();
+        const char* what = GROUPED ? "the experts' groups" : "a product";
+        const size_t local = d.get_info<sycl::info::device::local_mem_size>();
+        const size_t wg = d.get_info<sycl::info::device::max_work_group_size>() / (KT::L.grf ? 4 : 1);
+        if (local >= KT::LOCAL && wg >= (size_t) KT::NSG * KT::SG) return true;
+        std::fprintf(stderr, "strata: mma_gemm's layout for %s needs %zu bytes of local memory and work-groups of %d, "
+                     "the GPU has %zu and %zu%s\n", what, KT::LOCAL, KT::NSG * KT::SG, local, wg,
+                     KT::L.grf ? " (a quarter of its largest, with the large register file)" : "");
+        return false;
+    }();
+    return ok;
+}
+
+bool groups_layout_fits(int s, const sycl::queue& q) {
+    if (s == 0) return layout_fits<0, true>(q);
+    if (s == 1) return layout_fits<1, true>(q);
+    return layout_fits<2, true>(q);
 }
 
 template<int S, typename E>
@@ -301,12 +311,21 @@ sycl::event run(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_
     const auto* x = reinterpret_cast<const E*>(X);
     const auto* w = reinterpret_cast<const E*>(W);
     if (bounds) return launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
-    const bool dense = dense_layout_ok<S>(q);
-    if (accumulate)
-        return dense ? launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
-                     : launch<S, E, true, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
-    return dense ? launch<S, E, false, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
-                 : launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+    // a product's layout until it fails to launch (the large register file not built: the launch throws before anything
+    // is queued), then the groups' layout
+    static std::atomic<bool> dense = layout_fits<S, false>(q);
+    if (dense.load(std::memory_order_relaxed)) {
+        try {
+            return accumulate ? launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
+                              : launch<S, E, false, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+        } catch (const sycl::exception& e) {
+            if (dense.exchange(false))
+                std::fprintf(stderr, "strata: mma_gemm's layout for a product did not launch (%s): its products take "
+                             "the experts' layout\n", e.what());
+        }
+    }
+    return accumulate ? launch<S, E, true, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
+                      : launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
 }
 
 template<typename E>

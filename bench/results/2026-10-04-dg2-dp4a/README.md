@@ -93,6 +93,16 @@ A GPU that does not build the large register file takes the groups' layout for a
 The same code on the B70 with `STRATA_MMA=1` (Xe2's 8 x 16 x 16, untuned 2 x 2 sub-groups) ran 15–24 T/s against 9–15 before (XMX's own kernels 120–170, so the B70 keeps them),
 and on an RTX 4070 (16 x 16 x 16, untuned) 16–27 T/s with a relative error of 0.0004%.
 
+## Whether a layout fits the GPU
+
+A layout is taken only where it fits what the GPU reports, else the next one (a product's layout, then the experts', then DP4a):
+
+- Local memory: a product's layout takes 56 KiB on the A380 (two buffers of X 8 KiB and of W 16 KiB, the accumulators' way out 8 KiB), the experts' 24 KiB; the device's `local_mem_size` (64 KiB on the A380)
+- Work-group size: in the large register file at most a quarter of the device's largest work-group (`max_work_group_size`, 1,024 on the A380).
+  8 x 8 sub-groups of 8 lanes (512) in the large register file lost the A380 (`UR_RESULT_ERROR_DEVICE_LOST`) although the kernel reported taking 512 (`kernel_device_specific::work_group_size`); 4 x 8 (256) run
+- The checks read the device's reports without building the kernels: building them beforehand to ask the kernel (in the engine's context, or in one of its own) made the products 3% slower on the A380 (14.0 ms against 13.6, two builds each, three alternating rounds); why is not known
+- Checked on the A380 by forcing each: a product's layout over its local memory took the experts' layout (the same outputs); both over it took DP4a; the 8 x 8 sub-groups were refused before launching
+
 ## Not checked
 
 - The whole engine on the A380 (a model loaded, an answer)
