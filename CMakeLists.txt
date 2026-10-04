@@ -201,7 +201,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                                   src/core/conversation_memory.cpp)
+                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
