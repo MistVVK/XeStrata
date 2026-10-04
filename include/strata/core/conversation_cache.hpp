@@ -96,6 +96,16 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+// #342: whether a conversation's live tokens or checkpoint chain hold the checkpoint `c` (tokens and images)
+inline bool conversation_chain_holds(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
+                                     const std::vector<ConversationImageKey>& images,
+                                     const std::vector<ConversationCheckpoint>& checkpoints) {
+    if (c.ids == ids && c.imgs == images) return true;
+    for (const auto& k : checkpoints)
+        if (k.ids == c.ids && k.imgs == c.imgs) return true;
+    return false;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -155,11 +165,13 @@ public:
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
+    // `evicted`: receives the conversations pushed out (--conversation-save writes them, then frees them).
+    bool make_room(size_t incoming, size_t held = 0, std::vector<SavedConversation>* evicted = nullptr) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             bytes_ -= entries_.front().bytes();
+            if (evicted) evicted->push_back(std::move(entries_.front()));
             entries_.pop_front();
             ++evictions_;
         }
@@ -175,19 +187,14 @@ public:
     // shares the system prompt's root with it), is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
-        auto held = [&](const ConversationCheckpoint& c) {
-            if (c.ids == ids && c.imgs == images) return true;
-            for (const auto& k : checkpoints)
-                if (k.ids == c.ids && k.imgs == c.imgs) return true;
-            return false;
-        };
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
             const ConversationCheckpoint* deepest = nullptr;
             for (const auto& c : e.checkpoints)
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
+            if (e.cvec == cvec && deepest && !deepest->ids.empty() &&
+                conversation_chain_holds(*deepest, ids, images, checkpoints)) {
                 bytes_ -= e.bytes();
                 entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
                 ++dropped;
@@ -199,12 +206,13 @@ public:
         return dropped;
     }
     size_t superseded() const { return superseded_; }
+    const std::deque<SavedConversation>& entries() const { return entries_; }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    bool put(SavedConversation&& image, size_t held = 0, std::vector<SavedConversation>* evicted = nullptr) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
+        if (!make_room(n, held, evicted)) return false;
         entries_.push_back(std::move(image));
         bytes_ += n;
         return true;
