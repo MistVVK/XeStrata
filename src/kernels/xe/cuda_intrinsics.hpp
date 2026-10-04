@@ -5,20 +5,25 @@
 // __dp4a is SPIR-V's non-saturating 4x8-bit dot product (SPV_KHR_integer_dot_product, enabled for the device
 // compile in CMakeLists.txt), which the B70 runs 4.2 times faster than the byte loop it replaces; CUDA's __dp4a
 // does not saturate either, so the sum is the same integer.  The others are written out with their PTX meaning.
+// Compiled for NVIDIA GPUs (__NVPTX__), __dp4a and __byte_perm are the PTX instructions themselves.
 #pragma once
 
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
 
-#ifdef __SYCL_DEVICE_ONLY__
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__)
 extern SYCL_EXTERNAL int __spirv_SDotKHR(int a, int b, int packed_format);   // 0: PackedVectorFormat4x8Bit
 #endif
 
 namespace strata::kernels::xe {
 
 inline int dp4a(int a, int b, int c) {
-#ifdef __SYCL_DEVICE_ONLY__
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    int r;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#elif defined(__SYCL_DEVICE_ONLY__)
     return c + __spirv_SDotKHR(a, b, 0);
 #else
     for (int k = 0; k < 4; ++k) c += (int) (int8_t) (a >> (8 * k)) * (int) (int8_t) (b >> (8 * k));
@@ -31,6 +36,9 @@ inline int dp4a(int a, int b, int c) {
 // several instructions on Xe, and the i-quant decoders call this per weight word (the B70's expert kernels were
 // bound by these integer instructions, not by memory: bench/results/2026-10-02-xe-decode-gpu).
 inline uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    return __nvvm_prmt(x, y, s & 0x7777u);   // prmt's default mode; bit 3 of each selector (sign replication) unused
+#else
     uint32_t r = 0;
     for (int i = 0; i < 4; ++i) {
         const uint32_t sel = (s >> (4 * i)) & 7;
@@ -38,6 +46,7 @@ inline uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
         r |= ((src >> (8 * (sel & 3))) & 0xFF) << (8 * i);
     }
     return r;
+#endif
 }
 
 // __vcmpne4: 0xFF in every byte where a and b differ.

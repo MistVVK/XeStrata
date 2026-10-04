@@ -12,6 +12,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
 #include "dp4a_gemm.hpp"
+#include "device_target.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -32,7 +33,7 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 constexpr int TM = 8, TN = 16, TK = 16;     // one XMX tile (FP16 and BF16)
 constexpr int SGM = 4, SGN = 4;             // accumulators a sub-group
 constexpr int MS = TM * SGM, NS = TN * SGN; // a sub-group's tile of Y: 32 x 64
-constexpr int KC = 32;                      // K a prefetch step
+[[maybe_unused]] constexpr int KC = 32;     // K a prefetch step (unused where the device compile leaves out tile())
 
 // A matrix prefetch takes 1, 2, 4, 8, 16 or 32 rows: the largest of them in R.
 template<int R>
@@ -44,6 +45,7 @@ inline auto global(const E* p) {
         const_cast<E*>(p));
 }
 
+#if !STRATA_DEVICE_NOT_INTEL
 // One sub-group's tile at (m0, n0) of a WM x WN work-group tile at (wm0, wn0).  CM / CN: the tile may cross the last
 // row / column, so its loads and stores are the bounds-checked ones (the others read past nothing).  ACC: Y += the
 // product (a template argument: as a run-time flag the default products ran 6 times slower).
@@ -117,8 +119,9 @@ inline void tile_any(sycl::sub_group sg, int sgid, const E* X, const E* W, float
     if (wm0 + WM <= T && wn0 + WN <= N) tile<E, WM, WN, PD, false, false, ACC>(sg, sgid, X, W, Y, T, N, K, ldy, wm0, wn0);
     else tile<E, WM, WN, PD, true, true, ACC>(sg, sgid, X, W, Y, T, N, K, ldy, wm0, wn0);
 }
+#endif
 
-constexpr int GM = 2;   // row tiles a strip
+[[maybe_unused]] constexpr int GM = 2;   // row tiles a strip (unused in the device compiles for other GPUs)
 
 // The kernels are functors whose properties ask for the large register file (the 16 accumulators and their operands
 // spill with 128 registers) and 16-wide sub-groups.  Their arguments are their own members: a functor wrapping the
@@ -135,12 +138,16 @@ struct GemmKernel {
     float* Y;
     int64_t T, N, K, ldy, nM, nN;
     void operator()(sycl::nd_item<1> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
         const auto sg = it.get_sub_group();
         const int64_t g = (int64_t) it.get_group(0);
         const int64_t strip = g / (GM * nN), r = g % (GM * nN);
         const int64_t gm = std::min<int64_t>(GM, nM - strip * GM);
         const int64_t tm = strip * GM + r % gm, tn = r / gm;
         tile_any<E, WM, WN, PD, ACC>(sg, (int) sg.get_group_linear_id(), X, W, Y, T, N, K, ldy, tm * WM, tn * WN);
+#endif
     }
     STRATA_XMX_PROPERTIES
 };
@@ -153,6 +160,9 @@ struct GroupedKernel {
     const int32_t* bounds;
     int64_t w_stride, tiles_m, nN, N, K;
     void operator()(sycl::nd_item<1> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
         const auto sg = it.get_sub_group();
         const int64_t g = (int64_t) it.get_group(0);
         const int64_t ex = g / (tiles_m * nN), r = g % (tiles_m * nN), tm = r / nN, tn = r % nN;
@@ -160,6 +170,7 @@ struct GroupedKernel {
         if (tm * WM >= rows) return;   // the expert has fewer rows than the launch allows for
         tile_any<sycl::half, WM, WN, PD>(sg, (int) sg.get_group_linear_id(), X + row0 * K, W + ex * w_stride,
                                          Y + row0 * N, rows, N, K, N, tm * WM, tn * WN);
+#endif
     }
     STRATA_XMX_PROPERTIES
 };
@@ -313,7 +324,7 @@ sycl::event rows_kernel(sycl::queue& q, bool half, const uint16_t* X, const uint
     const bool vec = K % 8 == 0 && ((uintptr_t) X | (uintptr_t) W) % 16 == 0;
     const int64_t nb = (N + NB - 1) / NB;
     return q.parallel_for(
-        sycl::nd_range<2>({(size_t) T, (size_t) nb * SG}, {1, SG}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+        sycl::nd_range<2>({(size_t) T, (size_t) nb * SG}, {1, SG}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const auto sg = it.get_sub_group();
             const int64_t r = (int64_t) it.get_group(0), n0 = (int64_t) it.get_group(1) * NB;
             const int lane = (int) sg.get_local_linear_id();

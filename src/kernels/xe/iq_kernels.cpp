@@ -34,6 +34,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
+#include "device_target.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -1110,7 +1111,8 @@ namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 
-constexpr int GT_M = 8, GT_N = 16, GT_K = 16, G_SGM = 4, G_SGN = 4;
+// [[maybe_unused]]: the device compiles for other GPUs leave out the code that uses GT_K (device_target.hpp)
+[[maybe_unused]] constexpr int GT_M = 8, GT_N = 16, GT_K = 16, G_SGM = 4, G_SGN = 4;
 constexpr int G_MS = GT_M * G_SGM, G_NS = GT_N * G_SGN;
 
 // The 8 values a dequantizer hands one work-item, kept in registers: one run of 8, or two runs of 4 that are 16 apart
@@ -1186,6 +1188,7 @@ struct IqGemmKernel {
         }
     }
 
+#if !STRATA_DEVICE_NOT_INTEL
     // One block of K for a sub-group's tile with all its 32 rows (WHOLE) or not.
     template<bool WHOLE>
     void block(sycl::sub_group sg, const sycl::half* x, int64_t rows, int64_t m0, int nl, int64_t k0,
@@ -1231,8 +1234,12 @@ struct IqGemmKernel {
             sycl::group_barrier(it.get_group());
         }
     }
+#endif
 
     void operator()(sycl::nd_item<1> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
         const auto sg = it.get_sub_group();
         const int64_t g = (int64_t) it.get_group(0);
         const int64_t ex = g / (tiles_m * nN), r = g % (tiles_m * nN), tm = r / nN, tn = r % nN;
@@ -1259,6 +1266,7 @@ struct IqGemmKernel {
                 if (whole) mx::joint_matrix_store(sg, c[i][j], gy + m * ldy + n, ldy, mx::layout::row_major);
                 else ix::joint_matrix_store_checked(sg, c[i][j], gy, ldy, mx::layout::row_major, rows, N, m, n);
             }
+#endif
     }
     auto get(syclex::properties_tag) const {
         return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<16>};

@@ -23,6 +23,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
+#include "device_target.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -48,13 +49,14 @@ constexpr int NSG = 2 * NG;       // sub-groups: a group's dims x a tile of 8 ro
 constexpr int WG = NSG * SGS;     // work-items
 constexpr int QS = HD + 8;        // row strides in halves (16-byte aligned rows)
 constexpr int KR = HD + 8;
-constexpr int TM = 8, TN = 16, TK = 16;
-constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
+// [[maybe_unused]]: the device compiles for other GPUs leave out the kernel that uses these (device_target.hpp)
+[[maybe_unused]] constexpr int TM = 8, TN = 16, TK = 16;
+[[maybe_unused]] constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 // Lazy rescaling (as FlashAttention-3): a row's softmax reference moves only when a score exceeds it by more than
 // 2^TAU, so p <= 2^TAU, and p' = p * vscale / (largest V scale so far) * 2^(14 - TAU) stays within FP16.  Most chunks
 // then change no reference and leave the output unscaled.
-constexpr float TAU = 8.0f;
-constexpr float PSCALE = 16384.0f / 256.0f;   // 2^(14 - TAU)
+[[maybe_unused]] constexpr float TAU = 8.0f;
+[[maybe_unused]] constexpr float PSCALE = 16384.0f / 256.0f;   // 2^(14 - TAU)
 
 // a local accessor's element `off` (row-major) as the multi_ptr joint_matrix loads from and stores to
 template<typename A>
@@ -124,6 +126,9 @@ struct PromptAttn {
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
     void operator()(sycl::nd_item<2> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
         const auto grp = it.get_group();
         const auto sg = it.get_sub_group();
         const int64_t qi = (int64_t) it.get_group(0), kvh = (int64_t) it.get_group(1);
@@ -374,6 +379,7 @@ struct PromptAttn {
                     out[r * HD + g * 64 + nt * TN + (int) col] = l > 0.0f ? x * unit / l : 0.0f;
                 }
             });
+#endif
     }
     // the large register file, which holds q, the output and the chunk's tiles: the default one ran 30 ms against 21
     // (B70, int8, 2,048 queries over 32K cells).  The caller runs this kernel only where xmx_available(), which

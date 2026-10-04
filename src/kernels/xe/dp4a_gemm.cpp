@@ -10,6 +10,7 @@
 // largest shapes and no faster on the experts', before counting the quantization (bench/results/2026-10-02-dp4a).
 #include "dp4a_gemm.hpp"
 #include "cuda_intrinsics.hpp"
+#include "device_target.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -62,7 +63,7 @@ sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t
         sycl::local_accessor<int, 2> xs(sycl::range<2>(8, BM), h), ws(sycl::range<2>(8, BN), h);
         sycl::local_accessor<float, 1> xds(sycl::range<1>(BM), h), wds(sycl::range<1>(BN), h);
         h.parallel_for(sycl::nd_range<2>({(size_t) (G * tiles_m * TS), (size_t) (tiles_n * TS)}, {TS, TS}),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const int64_t g = (int64_t) it.get_group(0), ex = g / tiles_m, m0 = g % tiles_m * BM;
             const int64_t n0 = (int64_t) it.get_group(1) * BN;
             const int64_t r0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - r0 : rows_max;
