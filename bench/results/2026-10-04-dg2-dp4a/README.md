@@ -2,7 +2,7 @@
 SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 SPDX-License-Identifier: LGPL-3.0-or-later
 -->
-# The DP4a products on the Arc A series (Xe-HPG) — 2026-10-04
+# The prompt path's products on the Arc A series (Xe-HPG) — 2026-10-04
 
 On the Arc A380 the prompt path's products through DP4a (`src/kernels/xe/dp4a_gemm.cpp`) took 2 seconds for a 4096 x 2560 x 2560 product, which the B70 does in 2.6 ms.
 The cause was the 128 x 64 tile (8 x 4 outputs a work-item): its 64 accumulators a work-item spilled on the 8-wide EUs of Xe-HPG.
@@ -48,8 +48,40 @@ On the B70 the code it runs is the same; alternating runs of the build before an
 | 16 experts of 160 rows, 1280 x 2560 | 21.7 ms | 8.2 ms |
 | 16 experts of 160 rows, 2560 x 640 | 10.3 ms | 3.9 ms |
 
-DP4a quantizes both sides to int8 and is less exact (relative error against FP64 0.53%, against 0.0001% for `mma_gemm`), but faster, so the Arc A series takes it, and `mma_gemm` does not carry the 8 x 8 x 16 shape until it runs faster than this.
+DP4a quantizes both sides to int8 and is less exact (relative error against FP64 0.53%, against 0.0001% for `mma_gemm`), but was faster then, so `mma_gemm`'s 8 x 8 x 16 shape was taken out until it ran faster.
 Its work-group size mattered (2 x 2 sub-groups 125 ms, 4 x 4 79 ms, 8 x 8 53 ms for the first product), and 4 x 4 tiles a sub-group spilled (99 ms).
+
+## mma_gemm made faster
+
+`mma_gemm` read W (B, column-major) straight from global memory in every sub-group, and copied only X into local memory.
+Each step below was measured on the 4096 x 2560 x 2560 product, the outputs the same bits throughout:
+
+| Step | A380 |
+| --- | --- |
+| As above (W from global memory, 8 x 8 sub-groups) | 52 ms |
+| W into local memory too, column-major, 16 bytes a work-item | 116 ms |
+| W transposed into local memory (B row-major) | 33 ms |
+| W in Intel's VNNI-packed layout in local memory | 23 ms |
+| The packed stores of neighbouring lanes side by side | 21 ms |
+| Two buffers (the next step loaded while this one is multiplied) | 20 ms |
+
+- K steps of 64 instead of 32 were no faster (23.0 ms against 23.2), 4 x 4 tiles a sub-group spilled again (86–90 ms)
+- The experts' groups of 160 rows take a shorter work-group tile (2 x 8 sub-groups, 32 rows) than a product (8 x 8, 128 rows): 7.0 ms against 9.2 for 16 experts of 1280 x 2560, 23 ms against 20 for the dense product
+
+Against DP4a, two alternating rounds (ms):
+
+| Product | mma_gemm | DP4a |
+| --- | --- | --- |
+| 4096 x 2560 x 2560 | 19.6–19.7 | 20.7–20.8 |
+| 4096 x 10240 x 2560 | 80.9–81.5 | 87.4–92.0 |
+| 4096 x 2560 x 6144 | 49.5–49.6 | 55.7–56.1 |
+| 512 x 2560 x 2560 | 2.6–2.8 | 2.9 |
+| 16 experts of 160 rows, 1280 x 2560 | 7.1 | 8.1–8.8 |
+| 16 experts of 160 rows, 2560 x 640 | 3.5 | 3.8–3.9 |
+
+So the Arc A series takes `mma_gemm` again, 5–17% faster and exact to 0.0001%.
+The same code on the B70 with `STRATA_MMA=1` (Xe2's 8 x 16 x 16, untuned 2 x 2 sub-groups) ran 15–24 T/s against 9–15 before (XMX's own kernels 120–170, so the B70 keeps them),
+and on an RTX 4070 (16 x 16 x 16, untuned) 16–27 T/s with a relative error of 0.0004%.
 
 ## Not checked
 
