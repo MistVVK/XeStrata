@@ -361,13 +361,16 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) fail("fetch_blobs: blob size must be a multiple of 16");
     const long long per = (long long) (blob_bytes / 16);
-    auto* d = reinterpret_cast<sycl::uint4*>(dst);
+    // a 16-byte clang vector: through sycl::uint4, NVPTX moved each 16 bytes as two 8-byte loads, and these loads
+    // cross PCIe (RTX 4070: 858 us a call against upstream's 801)
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    auto* d = reinterpret_cast<u32x4*>(dst);
     const size_t items = 48 * 8 * 256;
     const auto e = Q(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
         const long long total = (long long) *n * per;
         for (long long i = (long long) id[0]; i < total; i += (long long) items) {
             const long long k = i / per, off = i - k * per;
-            d[i] = reinterpret_cast<const sycl::uint4*>(src[k])[off];
+            d[i] = reinterpret_cast<const u32x4*>(src[k])[off];
         }
     });
     done(stream, e, "fetch_blobs");
