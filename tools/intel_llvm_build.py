@@ -38,6 +38,16 @@ REPO = "https://github.com/intel/llvm.git"
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
 TAG = "v7.1.1"
 
+# Fixes the release lacks (its sycl branch too, on 2026-10-05), applied to the clone before the configuration: an id,
+# the file, the text it replaces and the replacement.  A finished install records the ids it was built with.
+SOURCE_FIXES = [
+    # the CUDA and HIP adapters copied the command-buffer's map of sync points for every node they added, so finalizing
+    # a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms)
+    (f"{a}-sync-points", f"unified-runtime/source/adapters/{a}/command_buffer.cpp",
+     "  auto SyncPoints = CommandBuffer->SyncPoints;\n", "  const auto &SyncPoints = CommandBuffer->SyncPoints;\n")
+    for a in ("cuda", "hip")
+]
+
 
 def set_out(out: Path) -> None:
     global OUT, BUILD, INSTALL, RECORD
@@ -139,6 +149,19 @@ def contrib_options() -> list:
     return opts + [f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"]
 
 
+def fix_sources() -> None:
+    for _, rel, old, new in SOURCE_FIXES:
+        path = SRC / rel
+        text = path.read_text()
+        if new in text:
+            continue
+        if old not in text:
+            fail(f"{rel}: the text a fix replaces is not there",
+                 "a newer intel/llvm may have it fixed: check SOURCE_FIXES")
+        path.write_text(text.replace(old, new, 1))
+        say(f"fixed {rel}")
+
+
 def build(tag: str, keep_build: bool, contrib: bool) -> None:
     need = missing_prerequisites()
     if need:
@@ -150,9 +173,12 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
                               text=True).stdout.strip()
         if have != tag:
             run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", "tag", tag])
+            # the fixed files back to the release first
+            run(["git", "-C", SRC, "checkout", "--", *sorted({rel for _, rel, _, _ in SOURCE_FIXES})])
             run(["git", "-C", SRC, "checkout", "--detach", tag])
     else:
         run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
+    fix_sources()
     # The configuration downloads what its release pins (Level Zero's headers and loader: the runtime adapter needs
     # newer ones than Ubuntu 26.04's 1.28; emhash), all free software; giving it the distribution's failed.  Forced:
     # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed)
@@ -168,7 +194,8 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
-    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "built": time.strftime("%Y-%m-%d %H:%M"),
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [f[0] for f in SOURCE_FIXES],
+                                  "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
                                   "gpus": gpus}, indent=1))
     if not keep_build:
@@ -204,7 +231,13 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            say(f"intel/llvm {a.tag} is already built in {INSTALL}")
+            missing = [f[0] for f in SOURCE_FIXES if f[0] not in have.get("fixes", [])]
+            if not missing:
+                say(f"intel/llvm {a.tag} is already built in {INSTALL}")
+            elif ask(f"intel/llvm {a.tag} is built without the fixes {', '.join(missing)}; build it again with them? "
+                     "build = with the fixes (with --keep-build's tree, minutes), keep = as it is", ["build", "keep"],
+                     "build", a.yes) == "build":
+                build(a.tag, a.keep_build, a.contrib)
         elif version_key(have.get("tag", "")) < version_key(a.tag):
             choice = ask(f"intel/llvm {have.get('tag')} is built; build {a.tag} over it? "
                          "keep = use the one built, build = build the new one", ["keep", "build"], "keep", a.yes)

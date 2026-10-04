@@ -92,6 +92,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   HIP には上の 4 つだけで足ります（rocThrust は要りません）。
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - v7.1.1 の `configure.py` は AMD の libclc の対象名を `amdgcn--amdhsa` としていて、libclc が受け付けないので、スクリプトが `amdgcn-amd-amdhsa` で上書きします。
+- スクリプトは、リリースにない修正（`SOURCE_FIXES`）をソースに当ててからビルドし、当てた修正を `install/XESTRATA.json` に残します。
+  修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
+  今の修正は 1 つです。CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
+  intel/llvm の `sycl` ブランチでも直っていません（2026-10-05）。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
