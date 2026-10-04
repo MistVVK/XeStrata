@@ -12,6 +12,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
 #include "dp4a_gemm.hpp"
+#include "mma_gemm.hpp"
 #include "device_target.hpp"
 
 #include <sycl/sycl.hpp>
@@ -242,10 +243,14 @@ bool use_xmx(XmxType t) {
     static const bool f16 = grf && device_has_xmx(dev, mx::matrix_type::fp16);
     static const bool bf16 = grf && device_has_xmx(dev, mx::matrix_type::bf16);
     static const bool told = [] {
-        if (!f16 || !bf16)
+        if (!f16 || !bf16) {
+            const auto& q = core::Runtime::get().compute();
+            const bool mma = xe::mma_usable(q, /*bf16=*/f16);   // the type without XMX: FP16, else BF16
             std::fprintf(stderr, "strata: the GPU (or its SYCL runtime) reports no XMX for %s: the prompt path's matrix "
-                         "products run through DP4a (on the B70, 1.6 times slower than XMX)\n", !f16 && !bf16 ? "FP16 and BF16"
-                         : !f16 ? "FP16" : "BF16");
+                         "products run through %s\n", !f16 && !bf16 ? "FP16 and BF16" : !f16 ? "FP16" : "BF16",
+                         mma ? "the matrix engines it reports (joint_matrix, mma_gemm)"
+                             : "DP4a (on the B70, 1.6 times slower than XMX)");
+        }
         return true;
     }();
     (void) told;
@@ -271,6 +276,10 @@ void xmx_gemm(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t
     if (!xmx_gemm_ok(X, W, Y, N, K, ldy))
         throw core::DeviceError("xmx_gemm: shape " + std::to_string(N) + " x " + std::to_string(K) + " not supported");
     auto& q = core::Runtime::get().stream(stream);
+    if (const bool bf16 = t == XmxType::bf16; xe::mma_usable(q, bf16) && (xe::mma_forced() || !use_xmx(t))) {
+        finish(stream, xe::mma_gemm(q, bf16, X, W, Y, T, N, K, ldy, accumulate), "xmx_gemm");
+        return;
+    }
     if (!use_xmx(t)) {
         // the remainder products go to gemm_rows: an accumulating DP4a kernel beside the others moved the last bits
         // of the default products (icpx's fast floating-point model)
@@ -299,6 +308,11 @@ void xmx_gemm_grouped(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
         throw core::DeviceError("xmx_gemm_grouped: shape " + std::to_string(N) + " x " + std::to_string(K));
     // 128-row work-group tiles: the best of 32, 64 and 128 for 16 experts of 20-420 rows (56 and 55 TFLOP/s for the
     // gate/up and down shapes against oneMKL's 45 and 44, one call per expert)
+    if (auto& q = core::Runtime::get().stream(stream); xe::mma_usable(q, false) &&
+                                                        (xe::mma_forced() || !use_xmx(XmxType::f16))) {
+        finish(stream, xe::mma_gemm_grouped(q, X, W, w_stride, Y, bounds, G, max_rows, N, K), "xmx_gemm_grouped");
+        return;
+    }
     if (!use_xmx(XmxType::f16)) {
         finish(stream, xe::dp4a_gemm_grouped(core::Runtime::get().stream(stream), X, W, w_stride, Y, bounds, G,
                                              max_rows, N, K), "xmx_gemm_grouped");
