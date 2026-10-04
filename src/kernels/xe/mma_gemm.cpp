@@ -152,7 +152,9 @@ struct Kernel {
             (void) it;
         } else {
             const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);
-            const int64_t wm0 = r / tiles_n * WM, wn0 = r % tiles_n * WN;
+            // M first: the work-groups that read a tile of W run side by side and find it in L2 (N first, a 52 MB W
+            // was read from memory once a tile of 64 rows: RTX 4070, 512 x 10240 x 2560, 1735 -> 1015 us)
+            const int64_t wm0 = r % tiles_m * WM, wn0 = r / tiles_m * WN;
             const int64_t row0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - row0 : T;
             if (wm0 >= rows) return;   // the whole work-group: this group of rows is shorter than the launch
             const E* x = X + row0 * K;
