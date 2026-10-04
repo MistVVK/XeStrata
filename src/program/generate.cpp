@@ -360,6 +360,7 @@ struct Options {
     int conversation_save_checkpoints = 2;
     int64_t conversation_save_mib = 16384;
     int64_t conversation_save_hours = 48;
+    bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
@@ -473,6 +474,8 @@ void usage() {
                  "  --conversation-save-checkpoints N  --serve: checkpoints written per conversation (default 2)\n"
                  "  --conversation-save-mib N  --serve: at most N MiB of files in DIR, oldest deleted first (default 16384)\n"
                  "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
+                 "  --conversation-save-compress  --serve: compress the files' floating-point parts (c-blosc2 ZSTD;\n"
+                 "                       10-15% smaller; only in a build that found libblosc2)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
@@ -1115,6 +1118,7 @@ int main(int argc, char** argv) {
             else o.conversation_cache_slots = (int) parsed;
         }
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
+        else if (a == "--conversation-save-compress") o.conversation_save_compress = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
@@ -1206,6 +1210,11 @@ int main(int argc, char** argv) {
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
+    if (o.conversation_save_compress && !strata::core::conversation_disk_can_compress()) {
+        std::fprintf(stderr, "strata: --conversation-save-compress: this build has no c-blosc2 (install libblosc2-dev "
+                             "and build again)\n");
+        return 2;
+    }
     // the folder keeps what the RAM cache parks: without parking there is nothing to write
     if (!o.conversation_save.empty() &&
         (o.conversation_cache_mib == 0 || o.conversation_cache_slots == 0 || o.prompt_cache == 0)) {
@@ -3629,10 +3638,12 @@ int main(int argc, char** argv) {
             dopt.budget = (size_t) o.conversation_save_mib * 1024 * 1024;
             dopt.max_age = std::chrono::hours(o.conversation_save_hours);
             dopt.checkpoints = (size_t) o.conversation_save_checkpoints;
+            dopt.compress = o.conversation_save_compress;
             std::string de;
             if (disk.open(std::move(dopt), de))
                 std::fprintf(stderr, "strata serve: conversation save: %s holds %zu usable conversations (%zu MiB in "
-                                     "the folder)\n", o.conversation_save.c_str(), disk.size(), disk.folder_bytes() >> 20);
+                                     "the folder)%s\n", o.conversation_save.c_str(), disk.size(),
+                             disk.folder_bytes() >> 20, o.conversation_save_compress ? "; writing compressed" : "");
             else
                 std::fprintf(stderr, "strata serve: conversation save: off (%s)\n", de.c_str());
         }

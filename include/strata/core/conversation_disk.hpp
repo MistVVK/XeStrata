@@ -17,6 +17,9 @@
 
 namespace strata::core {
 
+// Whether this build has c-blosc2 (CMake found libblosc2): needed to write compressed files and to read them.
+bool conversation_disk_can_compress();
+
 // What a saved conversation's state depends on beyond the geometry: canonical path, size and modification time of
 // a file, or of every regular file directly in a folder.  "-" when the path is empty, "?" when it cannot be read.
 std::string conversation_file_identity(const std::string& path);
@@ -27,6 +30,7 @@ struct ConversationDiskOptions {
     size_t budget = 0;             // bytes of .xsc files the folder may hold
     std::chrono::seconds max_age{0};  // since the file was last written or restored
     size_t checkpoints = 2;        // checkpoints written per conversation: deepest, chain root, then newest use
+    bool compress = false;         // the floating-point parts through c-blosc2 (needs conversation_disk_can_compress)
 };
 
 class ConversationDisk {
@@ -66,7 +70,8 @@ public:
     // The file was used: its age starts again, and it becomes the most recent.
     void touch(size_t index);
     // Writes `image` (its checkpoints cut to the configured count), then deletes the files it supersedes and the
-    // oldest ones over the budget.  A conversation larger than the budget is not written.  `written`: file bytes.
+    // oldest ones over the budget.  A conversation whose uncompressed size exceeds the budget is not written.
+    // `written`: file bytes.
     bool save(const SavedConversation& image, size_t& written, std::string& error);
     // Deletes files older than max_age, then the oldest while the folder is over its budget.  Returns how many.
     size_t expire();

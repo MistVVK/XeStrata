@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/conversation_disk.hpp"
 #include "conversation_checked.hpp"
+#include "strata/kernels/kv_stream.hpp"
+
+#ifdef STRATA_HAVE_BLOSC2
+#include <blosc2.h>
+#endif
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -12,7 +19,9 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace strata::core {
@@ -23,7 +32,10 @@ using conversation_detail::product;
 
 constexpr char kMagic[4] = {'X', 'S', 'C', 'V'};
 constexpr uint32_t kVersion = 1;
-constexpr uint8_t kCodecNone = 0;
+constexpr uint8_t kCodecNone = 0, kCodecBlosc2 = 1;
+// A compressed part is a run of chunks of this many raw bytes (the last one shorter), each its compressed size and
+// one c-blosc2 chunk.  It is a ConversationBuffer segment, so a freshly sized buffer takes a chunk in one piece.
+constexpr size_t kChunk = ConversationBuffer::segment_bytes;
 constexpr const char* kExtension = ".xsc";
 // a header is the conversation's token IDs and a few hundred bytes more: anything far larger is a damaged file
 constexpr uint64_t kMaxHeader = uint64_t{1} << 30;
@@ -75,6 +87,50 @@ private:
     size_t pending_ = 0;
     uint64_t total_ = 0;
 };
+
+#ifdef STRATA_HAVE_BLOSC2
+// The CPUs the process may use, taken before main: the serve loop pins its own thread to one core
+// (SessionLoopScratch), and c-blosc2's threads, started from that thread, would all inherit that one core.
+struct StartAffinity {
+    cpu_set_t set;
+    bool ok;
+    StartAffinity() noexcept {
+        CPU_ZERO(&set);
+        ok = sched_getaffinity(0, sizeof set, &set) == 0 && CPU_COUNT(&set) > 0;
+    }
+};
+const StartAffinity g_start_affinity;
+
+// While c-blosc2 runs, the calling thread (and the threads it starts) may use those CPUs; then its pin comes back.
+class WideAffinity {
+public:
+    WideAffinity() {
+        restore_ = g_start_affinity.ok && pthread_getaffinity_np(pthread_self(), sizeof saved_, &saved_) == 0 &&
+                   pthread_setaffinity_np(pthread_self(), sizeof g_start_affinity.set, &g_start_affinity.set) == 0;
+    }
+    WideAffinity(const WideAffinity&) = delete;
+    WideAffinity& operator=(const WideAffinity&) = delete;
+    ~WideAffinity() { if (restore_) pthread_setaffinity_np(pthread_self(), sizeof saved_, &saved_); }
+
+private:
+    cpu_set_t saved_;
+    bool restore_ = false;
+};
+
+// Every CPU the process may use: the expert pool is idle while a conversation is written or read.
+int16_t blosc2_threads() {
+    const int n = g_start_affinity.ok ? CPU_COUNT(&g_start_affinity.set) : (int) std::thread::hardware_concurrency();
+    return (int16_t) std::clamp(n, 1, 256);
+}
+
+struct Blosc2Context {
+    blosc2_context* ctx = nullptr;
+    Blosc2Context() = default;
+    Blosc2Context(const Blosc2Context&) = delete;
+    Blosc2Context& operator=(const Blosc2Context&) = delete;
+    ~Blosc2Context() { if (ctx != nullptr) blosc2_free_ctx(ctx); }
+};
+#endif
 
 // ---- the header, built in memory (little-endian, as every machine this engine runs on)
 struct Header {
@@ -186,21 +242,81 @@ std::array<const std::vector<uint8_t>*, 5> state_parts(const ConversationCheckpo
 }
 
 // ---- the body: every running state (the live one first), then every K/V layer.  Each part is its size, its codec
-// and its bytes, so a part can later be stored compressed without changing the layout of the others.
+// and its bytes.  With --conversation-save-compress the floating-point parts that compress (the DeltaNet states,
+// the indexer rows, FP16 K/V) go through c-blosc2's ZSTD at level 1 after a byte shuffle; 1-byte K/V codes gain
+// 4-7% and the small parts nothing, so they stay as they are (bench/results/2026-10-04-conversation-save-compress).
 struct Writer {
     std::FILE* f = nullptr;
     Hash hash;
     bool ok = true;
+    bool compress = false;
+    std::vector<uint8_t> stage, packed;   // a chunk gathered from a buffer's segments, and its compressed form
+#ifdef STRATA_HAVE_BLOSC2
+    Blosc2Context cctx[5];                // by element size
+#endif
     void write(const void* p, size_t n) {
         if (!ok || n == 0) return;
         ok = std::fwrite(p, 1, n, f) == n;
         hash.update(p, n);
     }
     template<class T> void value(const T& v) { write(&v, sizeof v); }
-    void part(const void* p, size_t n) { value((uint64_t) n); value(kCodecNone); write(p, n); }
-    void part(const ConversationBuffer& b) {
-        value((uint64_t) b.size()); value(kCodecNone);
-        b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) { write(p, n); return ok; });
+    // typesize: the element size the shuffle groups bytes by (2 or 4), 0 for a part stored as it is
+    bool compressing(size_t n, int typesize) const { return compress && typesize > 0 && n > 0; }
+    void part(const void* p, size_t n, int typesize = 0) {
+        value((uint64_t) n);
+        if (!compressing(n, typesize)) {
+            value(kCodecNone);
+            write(p, n);
+            return;
+        }
+        value(kCodecBlosc2);
+        for (size_t at = 0; at < n && ok; at += kChunk)
+            chunk(static_cast<const uint8_t*>(p) + at, std::min(kChunk, n - at), typesize);
+    }
+    void part(const ConversationBuffer& b, int typesize = 0) {
+        value((uint64_t) b.size());
+        if (!compressing(b.size(), typesize)) {
+            value(kCodecNone);
+            b.visit(0, b.size(), [&](const uint8_t* p, size_t n, size_t) { write(p, n); return ok; });
+            return;
+        }
+        value(kCodecBlosc2);
+        for (size_t at = 0; at < b.size() && ok; at += kChunk) {
+            const size_t len = std::min(kChunk, b.size() - at);
+            const uint8_t* src = nullptr;
+            b.visit(at, len, [&](const uint8_t* p, size_t k, size_t) { if (k == len) src = p; return true; });
+            if (src == nullptr) {   // the chunk spans segments: gather it
+                stage.resize(len);
+                ok = b.read(stage.data(), at, len);
+                src = stage.data();
+            }
+            if (ok) chunk(src, len, typesize);
+        }
+    }
+    void chunk(const uint8_t* src, size_t len, int typesize) {
+#ifdef STRATA_HAVE_BLOSC2
+        Blosc2Context& c = cctx[typesize];
+        if (c.ctx == nullptr) {
+            blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;   // its one filter is the byte shuffle
+            cp.compcode = BLOSC_ZSTD;
+            cp.clevel = 1;
+            cp.typesize = typesize;
+            cp.nthreads = blosc2_threads();
+            c.ctx = blosc2_create_cctx(cp);
+        }
+        packed.resize(len + BLOSC2_MAX_OVERHEAD);
+        const int n = c.ctx == nullptr ? -1 : blosc2_compress_ctx(c.ctx, src, (int32_t) len, packed.data(),
+                                                                   (int32_t) packed.size());
+        if (n <= 0) {
+            ok = false;
+            return;
+        }
+        value((uint64_t) n);
+        write(packed.data(), (size_t) n);
+#else
+        (void) src; (void) len; (void) typesize;
+        ok = false;
+#endif
     }
 };
 
@@ -212,10 +328,17 @@ bool read_exact(std::FILE* f, void* p, size_t n) {
     return std::fread(p, 1, n, f) == n && !std::ferror(f) && !std::feof(f);
 }
 
+// The checksum covers the stored bytes, so a compressed chunk is decompressed before the file's checksum is known:
+// its sizes are checked first, and c-blosc2 checks the rest of a chunk itself.
 struct FileReader {
     std::FILE* f = nullptr;
     Hash hash;
-    uint64_t left = 0;   // payload bytes the header promised and the body has not used yet
+    uint64_t left = 0;            // payload bytes the header promised and the body has not used yet
+    const char* why = nullptr;    // a reason more useful than "damaged", when there is one
+    std::vector<uint8_t> stage, packed;
+#ifdef STRATA_HAVE_BLOSC2
+    Blosc2Context dctx;
+#endif
     bool read(void* p, size_t n) {
         if (n == 0) return true;
         if (!read_exact(f, p, n)) return false;
@@ -223,23 +346,69 @@ struct FileReader {
         return true;
     }
     template<class T> bool value(T& v) { return read(&v, sizeof v); }
-    bool size(uint64_t& n) {
-        uint8_t codec = 0;
-        if (!value(n) || !value(codec) || codec != kCodecNone || n > left) return false;
+    bool size(uint64_t& n, uint8_t& codec) {
+        if (!value(n) || !value(codec) || n > left) return false;
+        if (codec == kCodecBlosc2 && !conversation_disk_can_compress()) {
+            why = "compressed, and this build has no c-blosc2";
+            return false;
+        }
+        if (codec != kCodecNone && codec != kCodecBlosc2) return false;
         left -= n;
         return true;
     }
     bool part(std::vector<uint8_t>& v) {
         uint64_t n = 0;
-        if (!size(n)) return false;
+        uint8_t codec = 0;
+        if (!size(n, codec)) return false;
         v.resize((size_t) n);
-        return read(v.data(), v.size());
+        if (codec == kCodecNone) return read(v.data(), v.size());
+        for (size_t at = 0; at < v.size(); at += kChunk)
+            if (!chunk(v.data() + at, std::min(kChunk, v.size() - at))) return false;
+        return true;
     }
     bool part(ConversationBuffer& b) {
         uint64_t n = 0;
-        if (!size(n)) return false;
+        uint8_t codec = 0;
+        if (!size(n, codec)) return false;
         b.resize((size_t) n);
-        return b.visit(0, b.size(), [&](uint8_t* p, size_t k, size_t) { return read(p, k); });
+        if (codec == kCodecNone) return b.visit(0, b.size(), [&](uint8_t* p, size_t k, size_t) { return read(p, k); });
+        for (size_t at = 0; at < b.size(); at += kChunk) {
+            const size_t len = std::min(kChunk, b.size() - at);
+            uint8_t* dst = nullptr;
+            b.visit(at, len, [&](uint8_t* p, size_t k, size_t) { if (k == len) dst = p; return true; });
+            if (dst != nullptr) {
+                if (!chunk(dst, len)) return false;
+                continue;
+            }
+            stage.resize(len);   // the chunk spans segments: decompress, then scatter
+            if (!chunk(stage.data(), len)) return false;
+            b.visit(at, len, [&](uint8_t* p, size_t k, size_t from) {
+                std::memcpy(p, stage.data() + (from - at), k);
+                return true;
+            });
+        }
+        return true;
+    }
+    bool chunk(uint8_t* dst, size_t len) {
+#ifdef STRATA_HAVE_BLOSC2
+        uint64_t bytes = 0;
+        if (!value(bytes) || bytes < BLOSC_MIN_HEADER_LENGTH || bytes > len + BLOSC2_MAX_OVERHEAD) return false;
+        packed.resize((size_t) bytes);
+        if (!read(packed.data(), packed.size())) return false;
+        int32_t raw = 0, stored = 0, block = 0;
+        if (blosc2_cbuffer_sizes(packed.data(), &raw, &stored, &block) < 0 || (size_t) raw != len ||
+            (uint64_t) stored != bytes) return false;
+        if (dctx.ctx == nullptr) {
+            blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
+            dp.nthreads = blosc2_threads();
+            dctx.ctx = blosc2_create_dctx(dp);
+        }
+        return dctx.ctx != nullptr &&
+               blosc2_decompress_ctx(dctx.ctx, packed.data(), (int32_t) bytes, dst, (int32_t) len) == (int) len;
+#else
+        (void) dst; (void) len;
+        return false;
+#endif
     }
 };
 
@@ -295,6 +464,14 @@ ConversationCheckpoint prefix_of(const Header& h, const Header::Checkpoint& c) {
 }
 } // namespace
 
+bool conversation_disk_can_compress() {
+#ifdef STRATA_HAVE_BLOSC2
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::string conversation_file_identity(const std::string& path) {
     if (path.empty()) return "-";
     std::error_code ec;
@@ -345,6 +522,14 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
             std::error_code e;
             fs::remove(it->path(), e);
         }
+    }
+#ifdef STRATA_HAVE_BLOSC2
+    static const bool blosc2_ready = (blosc2_init(), true);   // once per process; the contexts do the rest
+    (void) blosc2_ready;
+#endif
+    if (options_.compress && !conversation_disk_can_compress()) {
+        error = "compression needs c-blosc2, which this build lacks";
+        return false;
     }
     enabled_ = true;
     expire();
@@ -419,7 +604,12 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
     struct Close { std::FILE* f; ~Close() { std::fclose(f); } } close{f};
     Header h;
     if (!read_header(f, h) || h.fingerprint != options_.fingerprint) return reject("unreadable header");
-    FileReader r{f, {}, h.payload};
+#ifdef STRATA_HAVE_BLOSC2
+    const WideAffinity wide;
+#endif
+    FileReader r;
+    r.f = f;
+    r.left = h.payload;
     SavedConversation out;
     out.geometry = h.geometry;
     out.cvec = h.cvec;
@@ -440,7 +630,7 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
              r.part(kv.k) && r.part(kv.v) && r.part(kv.k_scale) && r.part(kv.v_scale) && r.part(kv.pooled);
         if (!ok) break;
     }
-    if (!ok) return reject("short or damaged body");
+    if (!ok) return reject(r.why != nullptr ? r.why : "short or damaged body");
     char extra;
     if (r.left != 0 || std::fread(&extra, 1, 1, f) != 0) return reject("unexpected length");
     if (r.hash.digest() != h.body_hash) return reject("checksum differs");
@@ -458,7 +648,7 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     h.geometry = image.geometry;
     h.ids = image.live.ids;
     h.imgs = image.live.imgs;
-    // the payload: what a load allocates, and with the part and layer headers what the body holds
+    // the payload: what a load allocates, and with the part and layer headers what the body holds uncompressed
     size_t payload = 0, body = 0;
     auto count_state = [&](const ConversationCheckpoint& c) {
         for (const auto* p : state_parts(c))
@@ -519,11 +709,18 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
                std::fwrite(&header_hash, 8, 1, f) == 1;
     };
     // the body's checksum is in the header: write the header, the body, then the header again with it
+#ifdef STRATA_HAVE_BLOSC2
+    std::optional<WideAffinity> wide;
+    if (options_.compress) wide.emplace();
+#endif
     Writer w;
     w.f = f;
+    w.compress = options_.compress;
     w.ok = prefix();
     auto write_state = [&](const ConversationCheckpoint& c) {
-        for (const auto* p : state_parts(c)) w.part(p->data(), p->size());
+        w.part(c.gdn.data(), c.gdn.size(), sizeof(float));   // the DeltaNet states; the rest is about 1 MiB
+        for (const auto* p : state_parts(c))
+            if (p != &c.gdn) w.part(p->data(), p->size());
     };
     write_state(image.live);
     for (size_t i : kept) write_state(image.checkpoints[i]);
@@ -531,9 +728,13 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     for (const auto& kv : image.kv) {
         w.value(kv.format); w.value(kv.cells); w.value(kv.heads); w.value(kv.head_dim);
         w.value(kv.page_size); w.value(kv.pooled_rows); w.value(kv.idx_dim);
-        w.part(kv.k); w.part(kv.v); w.part(kv.k_scale); w.part(kv.v_scale); w.part(kv.pooled);
+        // the format carries +16 for a rotated K/V; FP16 K/V is 2-byte elements, the others 1-byte codes
+        const int kv_type = (kv.format & 15) == strata::kernels::kKvF16 ? 2 : 0;
+        w.part(kv.k, kv_type); w.part(kv.v, kv_type); w.part(kv.k_scale); w.part(kv.v_scale);
+        w.part(kv.pooled, sizeof(float));
     }
-    bool ok = w.ok;
+    const long end = std::ftell(f);   // the file's length: the body ends it
+    bool ok = w.ok && end > 0;
     if (ok) {
         h.body_hash = w.hash.digest();
         header = encode(h);
@@ -549,7 +750,7 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         error = "cannot write " + path.string();
         return false;
     }
-    written = total;
+    written = (size_t) end;
     // #342 as the RAM cache applies it: a file whose deepest checkpoint this conversation's chain holds is the same
     // chat a turn (or a restart) back
     for (size_t i = 0; i < entries_.size();) {
