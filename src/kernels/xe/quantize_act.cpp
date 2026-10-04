@@ -122,10 +122,13 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     require_multiple(n, QK_K, "quantize_q8_K");
+    // d is stored as one 4-byte word: with only byte alignment known, the NVPTX backend stores its low byte straight
+    // from the rcp.rn.f32 register (st.global.b8) and CUDA 12.4's ptxas writes 0 there (quantize_act_parity, RTX 4070)
+    if ((uintptr_t) blocks % 4 != 0) throw core::DeviceError("quantize_q8_K: blocks is not 4-byte aligned");
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n / QK_K)), [=](sycl::id<1> id) {
         const int64_t b = (int64_t) id[0];
         const float* xb = x + b * QK_K;
-        uint8_t* out = blocks + b * Q8K_BYTES;
+        uint8_t* out = static_cast<uint8_t*>(__builtin_assume_aligned(blocks + b * Q8K_BYTES, 4));
         int8_t* qs = (int8_t*) (out + 4);
         uint8_t* bsums = out + 4 + QK_K;
         float max = 0.0f, amax = 0.0f;
