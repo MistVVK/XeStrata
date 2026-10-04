@@ -999,7 +999,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
-                     f"-DSTRATA_NONFREE={'ON' if comp['nonfree'] else 'OFF'}", "-DSTRATA_ENABLE_XE=ON",
+                     f"-DSTRATA_LICENSE={'contrib-icpx' if comp['nonfree'] else 'free'}", "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
                      f"-DSTRATA_GGML_DIR={llama}"], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
@@ -1009,7 +1009,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
             say("  Compiling the image encoder for the GPU (SYCL; 10-20 minutes, once) ...")
             bdir = ROOT / "build-vision-sycl"
             cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",
-                        [llama_def, "-DSTRATA_NONFREE=ON", "-DSTRATA_VISION_SYCL=ON", "-DSTRATA_PORTABLE=ON",
+                        [llama_def, "-DSTRATA_LICENSE=contrib-icpx", "-DSTRATA_VISION_SYCL=ON", "-DSTRATA_PORTABLE=ON",
                          "-DCMAKE_C_COMPILER=icx", "-DCMAKE_CXX_COMPILER=icpx"], oneapi_env())
         elif v == "vulkan":
             say("  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...")

@@ -11,9 +11,9 @@
 #   cmake -S tools/vision -B build-vision-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release \
 #         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_VISION_VULKAN=ON
 #
-# On the Intel GPU through SYCL (ggml-sycl, which needs oneMKL: the nonfree build only), in oneAPI's environment:
+# On the Intel GPU through SYCL (ggml-sycl, which needs oneMKL: the contrib-icpx build only), in oneAPI's environment:
 #   cmake -S tools/vision -B build-vision-sycl -G Ninja -DCMAKE_BUILD_TYPE=Release \
-#         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_NONFREE=ON -DSTRATA_VISION_SYCL=ON \
+#         -DLLAMA_DIR=third_party/main/llama.cpp -DSTRATA_LICENSE=contrib-icpx -DSTRATA_VISION_SYCL=ON \
 #         -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
@@ -26,10 +26,10 @@ option(STRATA_VISION_VULKAN "run the vision encoder on the GPU through Vulkan (b
 option(STRATA_VISION_SYCL "run the vision encoder on the Intel GPU through SYCL (ggml-sycl; needs icpx and oneMKL)"
        OFF)
 # AGENTS.md: the free build (the default) uses free software only; ggml-sycl links oneMKL, which is not
-option(STRATA_NONFREE "allow non-free build tools and libraries (icpx, oneMKL)" OFF)
-if(STRATA_VISION_SYCL AND NOT STRATA_NONFREE)
+set(STRATA_LICENSE free CACHE STRING "build mode: free, contrib or contrib-icpx (icpx, oneMKL)")
+if(STRATA_VISION_SYCL AND NOT STRATA_LICENSE STREQUAL "contrib-icpx")
   message(FATAL_ERROR "STRATA_VISION_SYCL needs oneMKL, which is not free software: use STRATA_VISION_VULKAN, or allow "
-                      "it with -DSTRATA_NONFREE=ON")
+                      "it with -DSTRATA_LICENSE=contrib-icpx")
 endif()
 if(STRATA_VISION_SYCL AND STRATA_VISION_VULKAN)
   message(FATAL_ERROR "choose one of STRATA_VISION_SYCL and STRATA_VISION_VULKAN")

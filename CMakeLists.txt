@@ -15,10 +15,19 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
 # measured the two decode equally fast, and a native build can stop running when the CPU is changed (Strata's own
 # AVX-512 kernels are per-file and chosen at run time either way).
 option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
-# The free build (the default) uses free software only, free enough for Debian main (AGENTS.md): intel/llvm's DPC++
-# (clang++ with -fsycl; Debian and Ubuntu package it as dpclang++).  ON allows the non-free tools and libraries:
-# Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others).
-option(STRATA_NONFREE "allow non-free build tools and libraries (Intel oneAPI's icpx)" OFF)
+# The build's mode (AGENTS.md, "Free and non-free builds"), after the Debian archive's areas:
+# - free (the default): free software only, free enough for Debian main.  intel/llvm's DPC++ (clang++ with -fsycl;
+#   Debian and Ubuntu package it as dpclang++), for Intel GPUs.
+# - contrib: free software that needs non-free parts to build or run: intel/llvm with its CUDA target, for NVIDIA GPUs
+#   as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run.
+# - contrib-icpx: Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others), Intel GPUs only.
+set(STRATA_LICENSE free CACHE STRING "build mode: free, contrib or contrib-icpx")
+set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib contrib-icpx)
+if(NOT STRATA_LICENSE MATCHES "^(free|contrib|contrib-icpx)$")
+  message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: one of free, contrib, contrib-icpx")
+endif()
+# NVIDIA GPU architectures to build for (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
+set(STRATA_CUDA_ARCHS "" CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (STRATA_LICENSE=contrib)")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -127,14 +136,21 @@ add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
 # ---- Intel Xe foundation --------------------------------------------------
 if(STRATA_ENABLE_XE)
+  include(CheckCXXSourceCompiles)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
-    if(NOT STRATA_NONFREE)
+    if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "icpx is not free software: configure with intel/llvm's DPC++ "
                           "(-DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang), or allow it with "
-                          "-DSTRATA_NONFREE=ON")
+                          "-DSTRATA_LICENSE=contrib-icpx")
+    endif()
+    if(STRATA_CUDA_ARCHS)
+      message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
+                          "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
     endif()
   else()
-    include(CheckCXXSourceCompiles)
+    if(STRATA_LICENSE STREQUAL "contrib-icpx")
+      message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
+    endif()
     set(CMAKE_REQUIRED_FLAGS -fsycl)
     check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { return 0; }" STRATA_HAVE_SYCL)
     unset(CMAKE_REQUIRED_FLAGS)
@@ -143,14 +159,45 @@ if(STRATA_ENABLE_XE)
                           "(-DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang)")
     endif()
   endif()
+  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each
+  # NVIDIA architecture's code.  Without them no -fsycl-targets: the compiler's default, SPIR-V alone.
+  set(_strata_sycl_targets "")
+  if(STRATA_CUDA_ARCHS)
+    if(NOT STRATA_LICENSE STREQUAL "contrib")
+      message(FATAL_ERROR "STRATA_CUDA_ARCHS needs NVIDIA's CUDA toolkit, which is not free software: "
+                          "-DSTRATA_LICENSE=contrib")
+    endif()
+    set(_strata_sycl_targets spir64)
+    foreach(_arch IN LISTS STRATA_CUDA_ARCHS)
+      list(APPEND _strata_sycl_targets nvidia_gpu_${_arch})
+    endforeach()
+    list(JOIN _strata_sycl_targets "," _strata_sycl_targets)
+    set(CMAKE_REQUIRED_FLAGS "-fsycl -fsycl-targets=${_strata_sycl_targets}")
+    check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { sycl::queue q; q.single_task([] {}); }"
+                              STRATA_HAVE_SYCL_CUDA)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT STRATA_HAVE_SYCL_CUDA)
+      message(FATAL_ERROR "STRATA_CUDA_ARCHS=${STRATA_CUDA_ARCHS}: the SYCL compiler does not build for these NVIDIA "
+                          "targets (intel/llvm built with CUDA: tools/intel_llvm_build.py --contrib; NVIDIA's CUDA "
+                          "toolkit)")
+    endif()
+    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_targets}")
+  endif()
   add_library(strata_sycl INTERFACE)
   # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and
   # quantize_act_parity sees the one-ulp difference in Q8_K's 1/iscale.
-  target_compile_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt)
+  target_compile_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
+                         -foffload-fp32-prec-sqrt)
   # SPV_KHR_integer_dot_product carries CUDA's __dp4a (src/kernels/xe/cuda_intrinsics.hpp); device code becomes
   # SPIR-V when the executable links.
-  target_link_options(strata_sycl INTERFACE -fsycl -foffload-fp32-prec-div -foffload-fp32-prec-sqrt
-                      "SHELL:-Xspirv-translator --spirv-ext=+SPV_KHR_integer_dot_product")
+  # SPIR-V when the executable links (with several targets, the translator's option names the SPIR-V one).
+  set(_strata_spirv_translator -Xspirv-translator)
+  if(_strata_sycl_targets)
+    set(_strata_spirv_translator -Xspirv-translator=spir64)
+  endif()
+  target_link_options(strata_sycl INTERFACE -fsycl ${_strata_sycl_targets} -foffload-fp32-prec-div
+                      -foffload-fp32-prec-sqrt
+                      "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
 
   # Level Zero (libze-dev; free, MIT): the runtime asks it what the SYCL device does not report, such as whether a
   # GPU is the processor's own (src/core/device.cpp)
