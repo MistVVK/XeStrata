@@ -93,7 +93,7 @@ CMake のオプション `STRATA_NONFREE` で選びます。
 なければ、GPU が報告する別の形の行列エンジン（Arc A シリーズ（Xe-HPG）の 8 x 8 x 16）を `joint_matrix` の標準の API で使う経路（`src/kernels/xe/mma_gemm.cpp`）を選びます。
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。
 Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイムが XMX のカーネルの使う Intel の拡張（joint_matrix の prefetch と境界つきの読み込み・書き込み）を受け付けないためです。
-A380 では DP4a より 10〜30% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%、[記録](../bench/results/2026-10-04-dg2-dp4a/README.md)）。
+A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%、[記録](../bench/results/2026-10-04-dg2-dp4a/README.md)）。
 `STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。

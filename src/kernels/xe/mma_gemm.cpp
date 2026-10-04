@@ -11,8 +11,9 @@
 //
 // On the A380 (Xe-HPG; bench/results/2026-10-04-dg2-dp4a) a 4096 x 2560 x 2560 FP16 product took 52 ms with W read
 // from global memory by every sub-group; with W in local memory 116 (column-major), 33 (transposed), 23 (VNNI-packed),
-// 21 (neighbouring lanes storing side by side), 20 (two buffers) and 16 (4 x 4 tiles a sub-group in the large register
-// file; in the default 128 registers they spilled).  DP4a takes 20.
+// 21 (neighbouring lanes storing side by side), 20 (two buffers), 16 (4 x 4 tiles a sub-group in the large register
+// file; in the default 128 registers they spilled), 14.2 (a fragment's rows contiguous) and 13.6 (16-byte stores).
+// DP4a takes 20.  Loading the next step into registers while multiplying, to store it after, spilled (91-103 ms).
 #include "mma_gemm.hpp"
 #include "device_target.hpp"
 
@@ -36,9 +37,9 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 // runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp); the work-group's
 // layout for a product (dense) and for the experts' groups (grouped); packed: B in Intel's VNNI layout.  Xe-HPG's
 // layouts from the A380's timings (bench/results/2026-10-04-dg2-dp4a): a product 4 x 8 sub-groups of 4 x 4 tiles in the
-// large register file (16 ms for the product above; 2 x 2 tiles in 128 registers, 8 x 8 sub-groups: 19), the groups of
-// 160 rows 2 x 8 of 2 x 2 (7.0 ms for 16 experts of 1280 x 2560; none of the large-register ones was faster).  The
-// others untuned.
+// large register file (13.6 ms for the product above; 8 x 4: 14.4, 4 x 4: 15.4; 2 x 2 tiles in 128 registers, 8 x 8
+// sub-groups: 19 before the contiguous fragments), the groups of 160 rows 2 x 8 of 2 x 2 (6.8 ms for 16 experts of
+// 1280 x 2560; none of the large-register ones was faster).  The others untuned.
 // A work-group's layout: wgm x wgn sub-groups, each sgm x sgn tiles, with the large register file (grf) or not.
 struct Layout {
     int wgm, wgn, sgm, sgn;
@@ -72,7 +73,18 @@ constexpr bool built() {
 // start 64-byte aligned (xmx_gemm_ok) and K is a multiple of 32, so every load is aligned.  PACKED: as Intel's
 // VNNI-packed B (row k/2 holds the pairs of values k, k+1 of every row, R pairs), and neighbouring lanes take
 // neighbouring rows so that their stores land side by side; else row by row (row stride LD).
-template<typename E, int R, int LD, bool PACKED>
+template<typename T, typename U>
+inline auto local_as(sycl::multi_ptr<U, sycl::access::address_space::local_space, sycl::access::decorated::no> p) {
+    using V = sycl::multi_ptr<void, sycl::access::address_space::local_space, sycl::access::decorated::no>;
+    return static_cast<sycl::multi_ptr<T, sycl::access::address_space::local_space, sycl::access::decorated::no>>(V(p));
+}
+
+// TT > 0: in fragments, the K step's two halves of 16 one after the other: A as [k / 16][row][k % 16] (a fragment's
+// rows contiguous), B packed as [k / 16][row / TT][k % 16 / 2][row % TT][k & 1] (a fragment of TT columns contiguous);
+// on the A380 the matrix loads from local memory took the 32-byte rows of a fragment 64 bytes apart one at a time,
+// and contiguous fragments made a product 12% faster.  WIDE: those stores 16 bytes (A) and 4 bytes (a pair of B) at a
+// time.
+template<typename E, int R, int LD, bool PACKED, int TT = 0, bool WIDE = false>
 inline void stage(const E* A, int64_t row0, int64_t n, int64_t K, int64_t k0, const sycl::local_accessor<E, 1>& dst,
                   int off, int lid, int lanes) {
     using V = sycl::vec<uint16_t, VEC>;
@@ -81,9 +93,25 @@ inline void stage(const E* A, int64_t row0, int64_t n, int64_t K, int64_t k0, co
         const int c = (PACKED ? v / R : v % (KC / VEC)) * VEC;
         const int64_t row = row0 + r;
         const V val = row < n ? *reinterpret_cast<const V*>(A + row * K + k0 + c) : V(0);
+        if constexpr (TT > 0 && WIDE) {
+            const auto base = dst.template get_multi_ptr<sycl::access::decorated::no>() + off + (c / 16) * (R * 16);
+            if constexpr (PACKED) {
+                const auto d = local_as<uint32_t>(base + (r / TT) * (16 * TT) + (r % TT) * 2);
+                for (int j = 0; j < VEC; j += 2)
+                    d[(c % 16 + j) / 2 * TT] = (uint32_t) val[j] | (uint32_t) val[j + 1] << 16;
+            } else {
+                *local_as<V>(base + r * 16 + c % 16) = val;
+            }
+            continue;
+        }
         for (int j = 0; j < VEC; ++j) {
             const int k = c + j;
-            if constexpr (PACKED) dst[off + (k / 2) * (2 * R) + r * 2 + (k & 1)] = sycl::bit_cast<E>(val[j]);
+            if constexpr (TT > 0 && PACKED)   // B in fragments: [k / 16][r / TT][k % 16 / 2][r % TT][k & 1]
+                dst[off + (k / 16) * (R * 16) + (r / TT) * (16 * TT) + (k % 16 / 2) * (2 * TT) + (r % TT) * 2 +
+                    (k & 1)] = sycl::bit_cast<E>(val[j]);
+            else if constexpr (TT > 0)        // A in fragments: [k / 16][r][k % 16]
+                dst[off + (k / 16) * (R * 16) + r * 16 + k % 16] = sycl::bit_cast<E>(val[j]);
+            else if constexpr (PACKED) dst[off + (k / 2) * (2 * R) + r * 2 + (k & 1)] = sycl::bit_cast<E>(val[j]);
             else dst[off + r * LD + k] = sycl::bit_cast<E>(val[j]);
         }
     }
@@ -96,6 +124,9 @@ template<int S, typename E, bool ACC, bool GROUPED>
 struct Kernel {
     static constexpr int TM = kShapes[S].m, TN = kShapes[S].n, TK = kShapes[S].k, SG = kShapes[S].sg;
     static constexpr bool PACKED = kShapes[S].packed;
+    // A and B in local memory a fragment after another (Intel's shapes), stored 16 and 4 bytes at a time in a product's
+    // layout (in the groups' layout the 2-byte stores were faster on the A380: 6.8 ms against 7.1)
+    static constexpr bool FR = PACKED && TK == 16, WIDE = FR && !GROUPED;
     static constexpr Layout L = GROUPED ? kShapes[S].grouped : kShapes[S].dense;
     static constexpr int NSGM = L.wgm, NSGN = L.wgn, NSG = NSGM * NSGN;
     static constexpr int SGM = L.sgm, SGN = L.sgn;   // tiles a sub-group
@@ -133,14 +164,15 @@ struct Kernel {
             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> c[SGM][SGN];
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
-            stage<E, WM, LDA, false>(x, wm0, rows, K, 0, as, 0, lid, NSG * SG);
-            stage<E, WN, LDB, PACKED>(w, wn0, N, K, 0, bs, 0, lid, NSG * SG);
+            stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, 0, as, 0, lid, NSG * SG);
+            stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, 0, bs, 0, lid, NSG * SG);
             sycl::group_barrier(it.get_group());
             int buf = 0;
             for (int64_t k0 = 0; k0 < K; k0 += KC) {
                 if (k0 + KC < K) {
-                    stage<E, WM, LDA, false>(x, wm0, rows, K, k0 + KC, as, (buf ^ 1) * ASZ, lid, NSG * SG);
-                    stage<E, WN, LDB, PACKED>(w, wn0, N, K, k0 + KC, bs, (buf ^ 1) * BSZ, lid, NSG * SG);
+                    const int nb = buf ^ 1;
+                    stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, k0 + KC, as, nb * ASZ, lid, NSG * SG);
+                    stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, k0 + KC, bs, nb * BSZ, lid, NSG * SG);
                 }
                 const auto apb = ap + buf * ASZ;
                 const auto bpb = bp + buf * BSZ;
@@ -148,9 +180,18 @@ struct Kernel {
                     constexpr auto BLAYOUT = PACKED ? mx::layout::ext_intel_packed : mx::layout::col_major;
                     mx::joint_matrix<sycl::sub_group, E, mx::use::a, TM, TK, mx::layout::row_major> a[SGM];
                     mx::joint_matrix<sycl::sub_group, E, mx::use::b, TK, TN, BLAYOUT> b[SGN];
-                    for (int i = 0; i < SGM; ++i) mx::joint_matrix_load(sg, a[i], apb + (ms + i * TM) * LDA + kk, LDA);
+                    if constexpr (FR) {
+                        for (int i = 0; i < SGM; ++i)
+                            mx::joint_matrix_load(sg, a[i], apb + (kk / 16) * (WM * 16) + (ms + i * TM) * 16, 16);
+                    } else {
+                        for (int i = 0; i < SGM; ++i)
+                            mx::joint_matrix_load(sg, a[i], apb + (ms + i * TM) * LDA + kk, LDA);
+                    }
                     for (int j = 0; j < SGN; ++j) {
-                        if constexpr (PACKED)
+                        if constexpr (FR)
+                            mx::joint_matrix_load(sg, b[j],
+                                                  bpb + (kk / 16) * (WN * 16) + (ns + j * TN) / TN * (16 * TN), 2 * TN);
+                        else if constexpr (PACKED)
                             mx::joint_matrix_load(sg, b[j], bpb + (kk / 2) * (2 * WN) + (ns + j * TN) * 2, 2 * WN);
                         else mx::joint_matrix_load(sg, b[j], bpb + (ns + j * TN) * LDB + kk, LDB);
                     }
