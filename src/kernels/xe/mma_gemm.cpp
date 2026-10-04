@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 
 namespace strata::kernels::xe {
 namespace {
@@ -143,6 +144,7 @@ struct Kernel {
     int64_t ldy;
     const int32_t* bounds;
     int64_t T, N, K, tiles_m, tiles_n;
+    int64_t kslice;   // a product's K split: the values of K one slice takes (K: none), slice s writing Y + s * T * ldy
     sycl::local_accessor<E, 1> as;       // two buffers of the step's rows of X: WM x KC
     sycl::local_accessor<E, 1> bs;       // two buffers of the step's rows of W, as B: WN x KC
     sycl::local_accessor<float, 1> cs;   // a TM x TN tile of Y a sub-group, on its way out
@@ -157,9 +159,11 @@ struct Kernel {
             const int64_t wm0 = r % tiles_m * WM, wn0 = r / tiles_m * WN;
             const int64_t row0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - row0 : T;
             if (wm0 >= rows) return;   // the whole work-group: this group of rows is shorter than the launch
+            // without bounds, ex is the slice of K (run: a product split along K)
+            const int64_t kb = bounds ? 0 : ex * kslice, ke = bounds ? K : sycl::min(K, kb + kslice);
             const E* x = X + row0 * K;
-            const E* w = W + ex * w_stride;
-            float* y = Y + row0 * ldy;
+            const E* w = W + (bounds ? ex * w_stride : 0);
+            float* y = Y + (bounds ? row0 * ldy : ex * T * ldy);
             const auto sg = it.get_sub_group();
             const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
             const int lid = (int) it.get_local_id(0);
@@ -169,12 +173,12 @@ struct Kernel {
             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> c[SGM][SGN];
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
-            stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, 0, as, 0, lid, NSG * SG);
-            stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, 0, bs, 0, lid, NSG * SG);
+            stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, kb, as, 0, lid, NSG * SG);
+            stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
             sycl::group_barrier(it.get_group());
             int buf = 0;
-            for (int64_t k0 = 0; k0 < K; k0 += KC) {
-                if (k0 + KC < K) {
+            for (int64_t k0 = kb; k0 < ke; k0 += KC) {
+                if (k0 + KC < ke) {
                     const int nb = buf ^ 1;
                     stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, k0 + KC, as, nb * ASZ, lid, NSG * SG);
                     stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, k0 + KC, bs, nb * BSZ, lid, NSG * SG);
@@ -239,7 +243,7 @@ struct Kernel {
 
 template<int S, typename E, bool ACC, bool GROUPED>
 sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, float* Y, int64_t ldy,
-                   const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K) {
+                   const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, int64_t kslice) {
     using KT = Kernel<S, E, ACC, GROUPED>;
     const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
     return q.submit([&](sycl::handler& h) {
@@ -247,7 +251,7 @@ sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, flo
         sycl::local_accessor<float, 1> cs(sycl::range<1>(KT::NSG * KT::TM * KT::TN), h);
         const size_t wg = (size_t) KT::NSG * KT::SG;
         h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * tiles_n) * wg, wg),
-                       KT{X, W, w_stride, Y, ldy, bounds, T, N, K, tiles_m, tiles_n, as, bs, cs});
+                       KT{X, W, w_stride, Y, ldy, bounds, T, N, K, tiles_m, tiles_n, kslice, as, bs, cs});
     });
 }
 
@@ -314,27 +318,74 @@ bool groups_layout_fits(int s, const sycl::queue& q) {
     return layout_fits<2, true>(q);
 }
 
+// A product's slices along K: when its tiles fill less than twice the device's compute units (its report) and it has
+// the rows of a prompt, so many slices that they do, each at least 4 steps of K.  The slices' sums go to a scratch
+// buffer and one kernel adds them in slice order: the result has other last bits than one slice's, the same on every
+// run.  RTX 4070: 512 x 320 x 10240 (BF16, the hyper-connection read: 40 tiles) 305 -> 159 us (four times the compute
+// units: no faster).  Not in a decode window's few rows (a captured graph would keep the scratch buffer's address).
+int64_t k_slices(const sycl::queue& q, int64_t T, int64_t tiles, int64_t K) {
+    static const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
+    if (T < 64 || tiles >= 2 * cu) return 1;
+    return std::max<int64_t>(1, std::min((2 * cu + tiles - 1) / tiles, K / ((int64_t) 4 * KC)));
+}
+
+float* k_scratch(sycl::queue& q, size_t floats) {
+    static std::mutex mu;
+    static float* buf = nullptr;
+    static size_t cap = 0;
+    std::lock_guard<std::mutex> lock(mu);
+    if (floats > cap) {
+        q.wait();   // the products queued before may still read the old one
+        if (buf != nullptr) sycl::free(buf, q);
+        buf = sycl::malloc_device<float>(floats, q);
+        cap = buf != nullptr ? floats : 0;
+    }
+    return buf;
+}
+
+template<int S, typename E, bool GROUPED>
+sycl::event launch_split(sycl::queue& q, const E* x, const E* w, float* Y, int64_t ldy, int64_t T, int64_t N,
+                         int64_t K, int64_t* slices) {
+    using KT = Kernel<S, E, false, GROUPED>;
+    const int64_t tiles = ((T + KT::WM - 1) / KT::WM) * ((N + KT::WN - 1) / KT::WN);
+    int64_t ns = k_slices(q, T, tiles, K);
+    const int64_t kslice = (K / ns + KC - 1) / KC * KC;
+    ns = (K + kslice - 1) / kslice;
+    *slices = ns;
+    if (ns <= 1) return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K);
+    float* part = k_scratch(q, (size_t) (ns * T * N));
+    if (part == nullptr) { *slices = 1; return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K); }
+    launch<S, E, false, GROUPED>(q, x, w, 0, part, N, nullptr, (int) ns, T, N, K, kslice);
+    return q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
+        const int64_t t = (int64_t) i[0], n = (int64_t) i[1];
+        float v = part[t * N + n];
+        for (int64_t k = 1; k < ns; ++k) v += part[(k * T + t) * N + n];
+        Y[t * ldy + n] = v;
+    });
+}
+
 template<int S, typename E>
 sycl::event run(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, int64_t ldy,
                 const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, bool accumulate) {
     const auto* x = reinterpret_cast<const E*>(X);
     const auto* w = reinterpret_cast<const E*>(W);
-    if (bounds) return launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+    if (bounds) return launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K, K);
+    int64_t slices = 1;
     // a product's layout until it fails to launch (the large register file not built: the launch throws before anything
     // is queued), then the groups' layout
     static std::atomic<bool> dense = layout_fits<S, false>(q);
     if (dense.load(std::memory_order_relaxed)) {
         try {
-            return accumulate ? launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
-                              : launch<S, E, false, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+            return accumulate ? launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K, K)
+                              : launch_split<S, E, false>(q, x, w, Y, ldy, T, N, K, &slices);
         } catch (const sycl::exception& e) {
             if (dense.exchange(false))
                 std::fprintf(stderr, "strata: mma_gemm's layout for a product did not launch (%s): its products take "
                              "the experts' layout\n", e.what());
         }
     }
-    return accumulate ? launch<S, E, true, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
-                      : launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+    return accumulate ? launch<S, E, true, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K, K)
+                      : launch_split<S, E, true>(q, x, w, Y, ldy, T, N, K, &slices);
 }
 
 template<typename E>
