@@ -15,6 +15,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -486,6 +487,145 @@ struct GdnRecLane {
     }
 };
 
+// The key-head form (upstream's gdn_rec_kh_kernel): a work-group takes one key head's VPK value heads and CB of their
+// columns, so every q and k value it reads feeds VPK heads, and 64 work-groups walk the chunk instead of 192.  The
+// inputs come in blocks of GDN_TB tokens, read into registers while the block before computes and stored to local
+// memory after it (upstream's cp.async), and a token takes two barriers instead of four.  Per value head and column
+// the same arithmetic in the same order as the D-2 kernel: the same bits.
+constexpr int GDN_TB = 8, VPK = HV / HK;
+struct GdnRecKh {
+    static constexpr int NT = CB * RG, QK4 = GDN_TB * 2 * (S / 4), V4 = GDN_TB * VPK * (CB / 4), GB = 2 * GDN_TB * VPK;
+    static constexpr int NQK = (QK4 + NT - 1) / NT, NV = (V4 + NT - 1) / NT;
+    float* state;
+    const float* h;
+    const float* gate;
+    const float* beta;
+    float* y;
+    int64_t T;
+    sycl::local_accessor<float, 1> sq, sk, sv, sgb, rkv, ro;   // [2][TB][S] x2, [2][TB][VPK][CB], [2][2][TB][VPK], ...
+
+    void operator()(sycl::nd_item<1> it) const {
+        const int qh = (int) it.get_group(0) / NCB, cb = (int) it.get_group(0) % NCB;
+        const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
+        float s[VPK][RPG];
+        const size_t rs = (size_t) HV * S;
+#pragma unroll
+        for (int j = 0; j < VPK; ++j) {
+            const float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) s[j][r] = base[r * rs];
+        }
+        const int64_t nblk = (T + GDN_TB - 1) / GDN_TB;
+        sycl::float4 rqk[NQK], rv[NV];
+        float rgb = 0.0f;
+        auto load = [&](int64_t k) {   // tokens [k * TB, k * TB + TB) into registers
+            const int64_t t0 = k * GDN_TB;
+#pragma unroll
+            for (int n = 0; n < NQK; ++n) {
+                const int p = tid + n * NT;
+                if (p >= QK4) break;
+                const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
+                rqk[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C + (int64_t) ((isk ? HK * S : 0) + qh * S + jj))
+                                    : sycl::float4(0.0f);
+            }
+#pragma unroll
+            for (int n = 0; n < NV; ++n) {
+                const int p = tid + n * NT;
+                if (p >= V4) break;
+                const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
+                rv[n] = t0 + i < T ? *reinterpret_cast<const sycl::float4*>(h + (t0 + i) * C +
+                                                                             (int64_t) (2 * HK * S + (qh + j * HK) * S + cb * CB + jj))
+                                   : sycl::float4(0.0f);
+            }
+            if (tid < GB) {
+                const int isb = tid / (GDN_TB * VPK), w = tid % (GDN_TB * VPK), i = w / VPK, j = w % VPK;
+                rgb = t0 + i < T ? (isb ? beta : gate)[(t0 + i) * HV + (int64_t) (qh + j * HK)] : 0.0f;
+            }
+        };
+        auto store = [&](int bb) {     // the registers into buffer bb
+#pragma unroll
+            for (int n = 0; n < NQK; ++n) {
+                const int p = tid + n * NT;
+                if (p >= QK4) break;
+                const int i = p / (2 * (S / 4)), w = p % (2 * (S / 4)), isk = w / (S / 4), jj = (w % (S / 4)) * 4;
+                const auto& dst = isk ? sk : sq;
+                for (int e = 0; e < 4; ++e) dst[((size_t) bb * GDN_TB + i) * S + jj + e] = rqk[n][e];
+            }
+#pragma unroll
+            for (int n = 0; n < NV; ++n) {
+                const int p = tid + n * NT;
+                if (p >= V4) break;
+                const int i = p / (VPK * (CB / 4)), w = p % (VPK * (CB / 4)), j = w / (CB / 4), jj = (w % (CB / 4)) * 4;
+                for (int e = 0; e < 4; ++e) sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + jj + e] = rv[n][e];
+            }
+            if (tid < GB) sgb[(size_t) bb * GB + tid] = rgb;   // [bb][gate, beta][i][j]
+        };
+        if (nblk > 0) {
+            load(0);
+            store(0);
+        }
+        sycl::group_barrier(it.get_group());
+        for (int64_t k = 0; k < nblk; ++k) {
+            if (k + 1 < nblk) load(k + 1);
+            const int bb = (int) (k & 1);
+            const int n = (int) std::min<int64_t>(GDN_TB, T - k * GDN_TB);
+            for (int i = 0; i < n; ++i) {
+                const int64_t t = k * GDN_TB + i;
+                float kc[RPG];
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) kc[r] = sk[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
+                float g[VPK], kv[VPK], delta[VPK], o[VPK];
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) {
+                    g[j] = sycl::exp(sgb[(size_t) bb * GB + (size_t) (i * VPK + j)]);
+                    kv[j] = 0.0f;
+                    o[j] = 0.0f;
+                }
+#pragma unroll
+                for (int r = 0; r < RPG; ++r)
+#pragma unroll
+                    for (int j = 0; j < VPK; ++j) kv[j] = sycl::fma(s[j][r], kc[r], kv[j]);
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) rkv[(j * RG + rg) * CB + c] = kv[j];
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) {
+                    const float kv_col = rkv[(j * RG + 0) * CB + c] + rkv[(j * RG + 1) * CB + c] +
+                                         rkv[(j * RG + 2) * CB + c] + rkv[(j * RG + 3) * CB + c];
+                    delta[j] = (sv[(((size_t) bb * GDN_TB + i) * VPK + j) * CB + c] - g[j] * kv_col) *
+                               sgb[(size_t) bb * GB + (size_t) (GDN_TB * VPK + i * VPK + j)];
+                }
+#pragma unroll
+                for (int r = 0; r < RPG; ++r) {
+                    const float qr = sq[((size_t) bb * GDN_TB + i) * S + (size_t) (rg * RPG + r)];
+#pragma unroll
+                    for (int j = 0; j < VPK; ++j) {
+                        s[j][r] = sycl::fma(g[j], s[j][r], kc[r] * delta[j]);
+                        o[j] = sycl::fma(s[j][r], qr, o[j]);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < VPK; ++j) ro[(j * RG + rg) * CB + c] = o[j];
+                sycl::group_barrier(it.get_group());
+                if (rg < VPK)   // row group j writes head j's output
+                    y[t * HV * S + (int64_t) (qh + rg * HK) * S + col] =
+                        (ro[(rg * RG + 0) * CB + c] + ro[(rg * RG + 1) * CB + c] + ro[(rg * RG + 2) * CB + c] +
+                         ro[(rg * RG + 3) * CB + c]) * sycl::rsqrt((float) S);
+            }
+            // buffer (k + 1) & 1 was read by block k - 1, whose last token's second barrier every work-item passed
+            if (k + 1 < nblk) store((int) ((k + 1) & 1));
+            sycl::group_barrier(it.get_group());
+        }
+#pragma unroll
+        for (int j = 0; j < VPK; ++j) {
+            float* base = state + ((size_t) (rg * RPG) * HV + (size_t) (qh + j * HK)) * S + col;
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) base[r * rs] = s[j][r];
+        }
+    }
+};
+static_assert(HV % HK == 0 && VPK <= RG && GdnRecKh::GB <= GdnRecKh::NT, "the key-head form's layout");
+
 namespace {
 // Whether GdnRecLane<16> runs on this device: a GRF holds 16 floats only where the EU is 16 wide (Xe2; the 8-wide
 // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
@@ -559,9 +699,25 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     }();
     const bool pipe = pipe_on;   // the kernel takes a copy
     static_assert(CB * RG == S, "one q and one k value a work-item");
-    if (gdn_lane_ok(q))
-        q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
-    else q.submit([&](sycl::handler& hd) {
+    // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B)
+    static const bool kh_on = [] {
+        const char* v = std::getenv("STRATA_GDN_KEYHEAD");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    auto launch_kh = [&](float* st, float* yy) {
+        q.submit([&](sycl::handler& hd) {
+        using L = sycl::local_accessor<float, 1>;
+        hd.parallel_for(sycl::nd_range<1>((size_t) HK * NCB * GdnRecKh::NT, GdnRecKh::NT),
+                        GdnRecKh{st, h, gate, beta, yy, T, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                                 L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                                 L(sycl::range<1>((size_t) 2 * GDN_TB * VPK * CB), hd),
+                                 L(sycl::range<1>((size_t) 2 * GdnRecKh::GB), hd),
+                                 L(sycl::range<1>((size_t) VPK * RG * CB), hd),
+                                 L(sycl::range<1>((size_t) VPK * RG * CB), hd)});
+    });
+    };
+    auto launch_d2 = [&](float* st, float* yy) {
+        q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * CB), hd);
         hd.parallel_for(sycl::nd_range<1>((size_t) HV * NCB * CB * RG, CB * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -569,14 +725,14 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
             const int tid = (int) it.get_local_id(0), c = tid % CB, rg = tid / CB, col = cb * CB + c;
             const int qh = head % HK;
             float s[RPG];
-            float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+            float* base = st + ((size_t) (rg * RPG) * HV + head) * S + col;
             const size_t rs = (size_t) HV * S;
             for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
             if (!pipe) {
                 for (int64_t t = 0; t < T; ++t) {
                     const float oc = rec_step<CB>(it, s, h + t * C, gate, beta, t, head, qh, rg, c, col, tid, &sk[0],
                                                   &sq[0], &red[0]);
-                    if (rg == 0) y[t * HV * S + (int64_t) head * S + col] = oc;
+                    if (rg == 0) yy[t * HV * S + (int64_t) head * S + col] = oc;
                 }
                 for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
                 return;
@@ -614,12 +770,49 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                 red[rg * CB + c] = o;
                 sycl::group_barrier(it.get_group());
                 if (rg == 0)
-                    y[t * HV * S + (int64_t) head * S + col] =
+                    yy[t * HV * S + (int64_t) head * S + col] =
                         (red[c] + red[CB + c] + red[2 * CB + c] + red[3 * CB + c]) * sycl::rsqrt((float) S);
             }
             for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
         });
     });
+    };
+    // D-2 or the key-head form, whichever ran a chunk faster on this device: timed once, on copies of the state, at
+    // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
+    // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
+    static int pick = -1;   // 1: the key-head form
+    if (gdn_lane_ok(q))
+        q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
+    else {
+        if (pick < 0 && kh_on && T >= 64) {
+            const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
+            float* st = sycl::malloc_device<float>(ns, q);
+            float* yy = sycl::malloc_device<float>(ny, q);
+            if (st != nullptr && yy != nullptr) {
+                auto time = [&](auto&& launch) {   // the second run: the first may compile the kernel
+                    double us = 0;
+                    for (int r = 0; r < 2; ++r) {
+                        q.copy(state, st, ns).wait();
+                        const auto t0 = std::chrono::steady_clock::now();
+                        launch(st, yy);
+                        q.wait();
+                        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    }
+                    return us;
+                };
+                const double d2 = time(launch_d2), kh = time(launch_kh);
+                pick = kh < d2 ? 1 : 0;
+                std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
+                             "us: %s\n", (long long) T, d2, kh, pick ? "the key-head form" : "D-2");
+            } else {
+                pick = 0;
+            }
+            if (st != nullptr) sycl::free(st, q);
+            if (yy != nullptr) sycl::free(yy, q);
+        }
+        if (kh_on && pick == 1) launch_kh(state, y);
+        else launch_d2(state, y);
+    }
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
