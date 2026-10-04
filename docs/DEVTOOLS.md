@@ -73,6 +73,24 @@ On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes.
 The clone (2.8 GB) and `install/` (0.7 GB) stay; the build tree is deleted (its size was not measured).
 This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
+### The contrib build (CUDA and HIP)
+
+The contrib build ([XE.md](XE.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
+`--contrib` builds the same clone with the CUDA target and, where ROCm's HIP is installed, HIP (AMD GPUs), into `.tools/intel-llvm-contrib/`.
+The CUDA target needs NVIDIA's CUDA toolkit, which is not free software (Ubuntu: multiverse; Debian: non-free).
+
+```sh
+sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
+python3 tools/intel_llvm_build.py --contrib --keep-build
+```
+
+- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder).
+  Without it the build has no HIP.
+- v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
+- On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
+  It ran beside other builds, so its time alone was not measured.
+- Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
+
 ## Intel SDE (the AVX-512 paths)
 
 The development machine has no AVX-512.

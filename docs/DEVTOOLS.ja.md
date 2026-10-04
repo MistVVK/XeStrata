@@ -73,6 +73,24 @@ python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree
 clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォルダーは消します（その大きさは測っていません）。
 このランタイムは Arc Pro B70 に XMX（FP16 と BF16）を使わせます。6.2 のランタイムは使わせません。
 
+### contrib 用のビルド（CUDA と HIP）
+
+contrib のビルド（[XE.ja.md](XE.ja.md#ビルド)）は、CUDA のターゲット付きの intel/llvm で NVIDIA の GPU 向けのコードも作ります。
+`--contrib` は同じ clone を CUDA のターゲット付きで、ROCm の HIP が入っていれば HIP（AMD の GPU）も付けて、`.tools/intel-llvm-contrib/` にビルドします。
+CUDA のターゲットには NVIDIA の CUDA ツールキットが要ります。これは自由ソフトウェアではありません（Ubuntu では multiverse、Debian では non-free）。
+
+```sh
+sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
+python3 tools/intel_llvm_build.py --contrib --keep-build
+```
+
+- ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダー）を探します。
+  見つからなければ HIP なしでビルドします。
+- v7.1.1 の `configure.py` は AMD の libclc の対象名を `amdgcn--amdhsa` としていて、libclc が受け付けないので、スクリプトが `amdgcn-amd-amdhsa` で上書きします。
+- 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
+  ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
+- NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
+
 ## AVX-512 の経路を確かめる Intel SDE
 
 開発機には AVX-512 がありません。

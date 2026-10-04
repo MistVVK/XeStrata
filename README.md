@@ -208,11 +208,13 @@ what has been checked in [docs/XE.md](docs/XE.md).
 
 ## For developers
 
-- **Two build modes,** chosen by the CMake option `STRATA_NONFREE`:
+- **Three build modes,** chosen by the CMake option `STRATA_LICENSE`:
    - free (the default): free software only, with intel/llvm's DPC++ as the compiler;
-   - nonfree (`-DSTRATA_NONFREE=ON`): may also use Intel oneAPI's icpx and other non-free tools.
+   - contrib (`-DSTRATA_LICENSE=contrib`): intel/llvm with its CUDA target, making code for NVIDIA GPUs as well;
+     it needs NVIDIA's CUDA toolkit and driver, which are not free software. How it runs on an NVIDIA GPU is `unverified`;
+   - contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): may also use Intel oneAPI's icpx and other non-free tools, for Intel GPUs.
 
-  Both modes must build and pass the tests.
+  The free and contrib-icpx modes must build and pass the tests.
 - **How to build:** [docs/XE.md](docs/XE.md#build-and-run). The development tools (lints, Intel SDE, GPU profilers):
   [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU

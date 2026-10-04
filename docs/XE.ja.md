@@ -76,21 +76,29 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
 
 ## ビルド
 
-エンジンは 2 つの方式でビルドできます（AGENTS.md の「Free and non-free builds」）。
-CMake のオプション `STRATA_NONFREE` で選びます。
+エンジンは 3 つの方式でビルドできます（AGENTS.md の「Free and non-free builds」）。
+CMake のオプション `STRATA_LICENSE` で選びます。
+分け方は Debian のアーカイブの main・contrib・non-free に合わせています。
 
-- **free**（既定）: intel/llvm の DPC++ でビルドします。
+- **free**（既定、`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
   Ubuntu 26.04 の `dpclang++` 6.2.0（パッケージ `dpclang-6`）で確かめています。
   ただし、intel/llvm 7.0 より前の SYCL ランタイムは Arc Pro B70 に XMX がないと報告します。
   その場合、プロンプトの経路の行列積は int8 のブロックを DP4a で計算し、時間は約 1.6 倍かかり、結果もわずかに粗くなります
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
   新しい intel/llvm は `tools/intel_llvm_build.py` でソースからビルドできます（[setup](#setup) を参照）。
-- **nonfree**（`-DSTRATA_NONFREE=ON`）: 自由ソフトウェアでない Intel oneAPI の icpx も使えます（2026.1.1 で確かめています）。
-  ビルドの前に oneAPI の環境を読み込みます。
+- **contrib**（`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
+  `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
+  XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
+  ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
+  Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.1.1 で、sm_89 向けのビルドが通ることを確かめています。
+  NVIDIA の GPU の上での動作と速さは `unverified` です。
+- **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
+  ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
+  icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
 エンジンは起動時に、XMX のカーネルが必要とする行列の組み合わせ（FP16 と BF16 の 8 x 16 x 16）を GPU に問い合わせます。
-なければ、GPU が報告する別の形の行列エンジン（Arc A シリーズ（Xe-HPG）の 8 x 8 x 16）を `joint_matrix` の標準の API で使う経路（`src/kernels/xe/mma_gemm.cpp`）を選びます。
+なければ、GPU が報告する別の形の行列エンジン（Arc A シリーズ（Xe-HPG）の 8 x 8 x 16、NVIDIA の Tensor Core の 16 x 16 x 16）を `joint_matrix` の標準の API で使う経路（`src/kernels/xe/mma_gemm.cpp`）を選びます。
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。
 Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイムが XMX のカーネルの使う Intel の拡張（joint_matrix の prefetch と境界つきの読み込み・書き込み）を受け付けないためです。
 A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%、[記録](../bench/results/2026-10-04-dg2-dp4a/README.md)）。
@@ -114,12 +122,12 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
   platform_memory_test ple_reader_test -j4
 ```
 
-icpx（nonfree）では次のとおりです。
+icpx（contrib-icpx）では次のとおりです。
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake -S . -B build/xe \
-  -DCMAKE_CXX_COMPILER=icpx -DSTRATA_NONFREE=ON \
+  -DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
@@ -138,6 +146,11 @@ ctest --test-dir build/xe \
   CPU だけの道具は `STRATA_ENABLE_XE=OFF` で構成できます。
 - CPU の正準形のエキスパートのテストは、AVX-512 かモデルのファイルを必要とするので、上のコマンドには含みません。
 - `build/xe/BUILD.json` には、バックエンド、版、移植元、コンパイラ、ビルドの範囲が記録されます。
+- **free のビルドは、oneAPI の環境（`setvars.sh`）を読み込んでいないシェルで動かします。**
+  読み込んだシェルでは、ディストリビューションの SYCL ランタイム（dpclang 6.2 の `libsycl.so.8`）が、
+  `LD_LIBRARY_PATH` の先にある oneAPI 2026.1 のアダプター（`libur_adapter_level_zero` など）と `libumf` を読み込みます。
+  版が合わないので、GPU を使うテストが起動してすぐにセグメンテーション違反で止まりました（CTest の 52 件のうち 32 件）。
+  setup は free のインストールで oneAPI をライブラリのパスに入れないので、setup が動かすエンジンはこれに当たりません。
 
 ### エンジン本体
 
@@ -151,7 +164,20 @@ cmake -S . -B build/free -DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpcla
 cmake --build build/free --target strata -j6
 ```
 
-icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_CXX_COMPILER=icpx -DSTRATA_NONFREE=ON` に替えます。
+icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` に替えます。
+NVIDIA の GPU 向け（contrib）では、`tools/intel_llvm_build.py --contrib` でビルドした intel/llvm を使います。
+
+```bash
+C=$PWD/.tools/intel-llvm-contrib/install
+cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+  -DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=sm_89 \
+  -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+cmake --build build/contrib --target strata -j6
+LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
+```
+
+`STRATA_CUDA_ARCHS` には GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
+同じ実行ファイルが Intel の GPU でも動きます。
 
 - **ジョブ数**: SYCL の翻訳単位 1 つのコンパイルに数 GB のメモリを使います。
   確かめた機械（92 GiB）では、16 ジョブのビルドがメモリ不足で止められ、6 ジョブでは止められませんでした。
@@ -297,12 +323,14 @@ intel/llvm のビルドは通りますが、setup は GPU が見えないとし�
 
 - **BIOS**: 単体の GPU では、Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。
   そうしないと B70 の BAR が割り当てられず、xe ドライバーがつながりませんでした。
-- **GPU の選び方**: Level Zero で Intel の GPU を 1 枚使います。
-  デバイス ID では選ばず、報告される能力で選びます。
-  16 幅のサブグループ、FP16、デバイスとホストの USM が必要です。
+- **GPU の選び方**: GPU を 1 枚使います。Intel の GPU は Level Zero、NVIDIA の GPU は CUDA のバックエンドを通します（OpenCL は同じ Intel の GPU を重ねて見せるので使いません）。
+  メーカー名やデバイス ID では選ばず、報告される能力で選びます。
+  32 幅のサブグループ、FP16、デバイスとホストの USM が必要です。
+  実行ファイルがその GPU 向けのコードを持たないとき（`STRATA_CUDA_ARCHS` なしのビルドと NVIDIA の GPU など）も断ります。
   `STRATA_GPU_PCI`（setup が書きます）は GPU を PCI アドレスで指定します。
-  これがなければ、単体の GPU を CPU 内蔵のグラフィックス（Level Zero の integrated フラグ）より先に選び、その中では計算ユニットの多いものを選びます。
-  CPU や OpenCL への代替の経路はありません。
+  これがなければ、単体の GPU を CPU 内蔵のグラフィックス（Level Zero の integrated フラグ。他のバックエンドの GPU は単体とみなします）より先に選び、
+  その中ではメモリの多いもの、同じならば計算ユニットの多いものを選びます（計算ユニットの大きさはメーカーで違うためです）。
+  CPU への代替の経路はありません。
   必要なものがない GPU は、理由を示して断ります。
 - **キュー**: 1 つのコンテキストが、順序つきの計算キューと転送キューを 1 つずつ持ちます。
   `copy_async` はイベントを返し、`compute_after` がキューをまたぐ依存を入れます。

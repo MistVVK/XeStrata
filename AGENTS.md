@@ -4,6 +4,7 @@
 
 XeStrata runs on any Intel Arc GPU and any x86-64 CPU with AVX2, not on the development machine's B70 and i7-14700.
 A GPU with matrix engines (XMX) takes the XMX paths; one without (an older Arc, an integrated GPU) takes the DP4a or plain paths and still runs.
+The contrib build (below) runs on NVIDIA GPUs as well, through the same kernels: their tensor cores take the matrix path that reads its tile shape from the device (`mma_gemm`), not Intel's.
 
 - Choose code paths from what the hardware reports: the CPUID feature bits (as `cpu_avx512_ok` does); the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, a model number, a device ID or a product name.
 - Sizes and thresholds measured on one machine (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves) are derived from those reports at run time, or have a fallback that works on a smaller device. A constant tuned on the B70 says so in a comment, with what it depends on.
@@ -12,18 +13,19 @@ A GPU with matrix engines (XMX) takes the XMX paths; one without (an older Arc, 
 
 ## Free and non-free builds (Debian main)
 
-XeStrata builds in two modes, chosen by the CMake option `STRATA_NONFREE`:
+XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
 
-- free (the default, `STRATA_NONFREE=OFF`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ (`dpclang++` from the distribution, or one built from source); icpx is refused.
-- nonfree (`-DSTRATA_NONFREE=ON`): may also use non-free tools and libraries: Intel oneAPI's icpx and the runtime libraries it links, oneMKL for the SYCL image encoder (ggml-sycl). It allows them; it does not require them, and the free choice is taken when it serves as well (setup picks icpx only when no free compiler gives the GPU its matrix engines).
+- free (the default, `STRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ (`dpclang++` from the distribution, or one built from source); icpx is refused.
+- contrib (`-DSTRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target (`STRATA_CUDA_ARCHS`), for NVIDIA GPUs as well. It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, which are not free software: the program could go into Debian contrib.
+- contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): may also use non-free tools and libraries: Intel oneAPI's icpx and the runtime libraries it links, oneMKL for the SYCL image encoder (ggml-sycl), for Intel GPUs. It allows them; it does not require them, and the free choice is taken when it serves as well (setup picks icpx only when no free compiler gives the GPU its matrix engines).
 
 Rules:
 
-- XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the nonfree mode can build or run, or that could only go into Debian contrib.
-- A non-free dependency goes only on a path the nonfree mode switches on, off by default, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
-- Keep one code path where both modes can use it: the engine's matrix products are XeStrata's own kernels in both modes, not oneMKL in one of them.
-- Build and test a change to the SYCL code in both modes: a free build (`build/free`, `dpclang++`; or `build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a nonfree one (`build/xe`, icpx). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
-- `third_party/nonfree/` (below) stays optional in both modes.
+- XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib or contrib-icpx mode can build or run, other than the paths for the GPUs only those modes reach (NVIDIA's, in the contrib mode).
+- A non-free dependency goes only on a path the contrib or contrib-icpx mode switches on, off by default, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
+- Keep one code path where the modes can share it: the engine's matrix products are XeStrata's own kernels in every mode, not oneMKL or cuBLAS in one of them.
+- Build and test a change to the SYCL code in the free and contrib-icpx modes: a free build (`build/free`, `dpclang++`; or `build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-icpx one (`build/xe`, icpx). A change that NVIDIA's device compile sees is also built in the contrib mode (`build/contrib`, `STRATA_CUDA_ARCHS`), and run on an NVIDIA GPU where one is there (else `unverified`). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
+- `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
 

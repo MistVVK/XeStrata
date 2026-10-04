@@ -75,20 +75,26 @@ Real-model checks of every quantization format, shared arenas across processes a
 
 ## Build and run
 
-The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen by the CMake option `STRATA_NONFREE`.
+The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's main, contrib and non-free.
 
-- **free** (the default): built with intel/llvm's DPC++.
+- **free** (the default, `-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++.
   Free software only; no oneAPI environment is used.
   Validated with Ubuntu 26.04's `dpclang++` 6.2.0 (package `dpclang-6`).
   A SYCL runtime before intel/llvm 7.0, though, reports no XMX for the Arc Pro B70.
   The prompt path's products then run through DP4a on int8 blocks, take about 1.6 times as long and are slightly less exact
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
   `tools/intel_llvm_build.py` builds a newer intel/llvm from source (see [Setup](#setup)).
-- **nonfree** (`-DSTRATA_NONFREE=ON`): also allows Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
-  Source oneAPI's environment before building.
+- **contrib** (`-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
+  XeStrata's source is the free mode's and stays free software,
+  but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
+  Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
+  How it runs on an NVIDIA GPU, and how fast, is `unverified`.
+- **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
+  Source oneAPI's environment before building. Intel GPUs only:
+  Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
 At start the engine asks the GPU whether it has the matrix combinations its XMX kernels need (FP16 and BF16 8 x 16 x 16).
-Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
+Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16, NVIDIA's tensor cores' 16 x 16 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
 and without that the DP4a path, and says once which.
 The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
 On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%; [record](../bench/results/2026-10-04-dg2-dp4a/README.md)).
@@ -112,12 +118,12 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
   platform_memory_test ple_reader_test -j4
 ```
 
-With icpx (nonfree):
+With icpx (contrib-icpx):
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
 cmake -S . -B build/xe \
-  -DCMAKE_CXX_COMPILER=icpx -DSTRATA_NONFREE=ON \
+  -DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
@@ -136,6 +142,10 @@ ctest --test-dir build/xe \
   CPU-only tools can be configured with `STRATA_ENABLE_XE=OFF`.
 - The CPU canonical expert tests need AVX-512 or model files and are not in the commands above.
 - `build/xe/BUILD.json` records the backend, version, upstream reference, compiler and build scope.
+- **Run a free build in a shell without oneAPI's environment (`setvars.sh`).**
+  In one with it, the distribution's SYCL runtime (dpclang 6.2's `libsycl.so.8`) loads oneAPI 2026.1's adapters (`libur_adapter_level_zero` and others) and `libumf`, which come first on `LD_LIBRARY_PATH`.
+  They do not match its version, and the tests that use the GPU stopped with a segmentation fault as they started (32 of the 52 CTest cases).
+  setup puts no oneAPI on the library path of a free install, so the engine setup runs is not affected.
 
 ### The engine
 
@@ -149,7 +159,20 @@ cmake -S . -B build/free -DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpcla
 cmake --build build/free --target strata -j6
 ```
 
-With icpx: `source /opt/intel/oneapi/setvars.sh`, then `-DCMAKE_CXX_COMPILER=icpx -DSTRATA_NONFREE=ON` instead.
+With icpx: `source /opt/intel/oneapi/setvars.sh`, then `-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` instead.
+For NVIDIA GPUs (contrib), with intel/llvm built by `tools/intel_llvm_build.py --contrib`:
+
+```bash
+C=$PWD/.tools/intel-llvm-contrib/install
+cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
+  -DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=sm_89 \
+  -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+cmake --build build/contrib --target strata -j6
+LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
+```
+
+`STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
+The same executable runs on Intel GPUs too.
 
 - **Jobs**: one SYCL translation unit takes several GB to compile.
   On the validated machine (92 GiB) a build with 16 jobs was killed for lack of memory, one with 6 was not.
@@ -293,11 +316,13 @@ What the engine requires of the GPU and the host, and the rules it keeps.
 
 - **BIOS**: a discrete card needs Above 4G Decoding and Re-Size BAR enabled and CSM disabled.
   Otherwise the B70's BARs stayed unassigned and the xe driver did not bind.
-- **Choosing the GPU**: the runtime drives one Intel GPU through Level Zero, chosen by what it reports, never by its device ID.
-  It needs 16-wide sub-groups, FP16, and device and host USM.
+- **Choosing the GPU**: the runtime drives one GPU: an Intel GPU through Level Zero, an NVIDIA GPU through the CUDA backend (not OpenCL, which lists the same Intel GPUs again).
+  It is chosen by what it reports, never by its maker or device ID.
+  It needs 32-wide sub-groups, FP16, and device and host USM, and the executable must carry code for it (an NVIDIA GPU with a build without `STRATA_CUDA_ARCHS` is refused).
   `STRATA_GPU_PCI` (setup writes it) names the card by PCI address.
-  Without it, a discrete card is taken before the processor's own graphics (Level Zero's integrated flag), then the one with the most compute units.
-  There is no CPU or OpenCL fallback.
+  Without it, a discrete card is taken before the processor's own graphics (Level Zero's integrated flag; the other backends' GPUs count as discrete cards),
+  then the one with the most memory, then the most compute units (whose size differs between makers).
+  There is no CPU fallback.
   A GPU without what it needs is refused with the reason.
 - **Queues**: one context owns an in-order compute queue and an in-order transfer queue.
   `copy_async` returns an event; `compute_after` inserts the cross-queue dependency.
