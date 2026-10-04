@@ -539,7 +539,7 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 - Requests still run one at a time.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
 - The default is 0 (off); `--prompt-cache 0` turns it off too.
-  Parked conversations are not kept across restarts.
+  Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
 - Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (`MemAvailable`).
   If it does not, or the copy does not fit the budget, it skips parking and reads the prompt as before.
   The oldest parked conversation is dropped first.
@@ -550,6 +550,35 @@ Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) 
 Its answers and state match a run without parking byte for byte:
 with FP16, INT8 (also with KV streaming), Q4_0 and K8V4 KV, and with INT8 on the small configuration (8 GB, no XMX).
 With parking off, the engine gives the same tokens and state as the engine before the change.
+
+### Keeping parked conversations across restarts (opt-in)
+
+With `"conversation_save": "<folder>"` in the config, the engine also writes its parked conversations to that folder and puts them back from there after a restart.
+It needs the previous section's `--conversation-cache-mib` as well.
+A relative path is from the XeStrata folder.
+
+- A conversation is written when the RAM cache pushes it out, and at a normal exit (the parked ones and the one the engine holds).
+  If the engine crashes, a conversation not yet written is lost.
+- Each conversation is written with up to `"conversation_save_checkpoints"` (default 2) checkpoints:
+  the start of the last turn (what the next turn of the same chat resumes from), the end of the system prompt (where a new chat of the same client starts),
+  then the most recently used.
+  A conversation takes about 118 MB × (1 + the checkpoints), plus about 14 KB of KV per context token (INT8).
+- When the folder holds more than `"conversation_save_mib"` (default 16384), the files used longest ago are deleted first.
+  A file not used for `"conversation_save_hours"` (default 48) hours is deleted too, at start and every 10 minutes between requests.
+- Writing a conversation deletes the file of the same conversation a turn back.
+- A file is used only by an engine with the same model files, engine version and settings (KV precision, context length, MTP, control vectors, and so on).
+  Other files are left alone until their age or the budget removes them; the budget counts every file in the folder, so give each model a folder of its own.
+  A damaged file is deleted and the prompt is read as before.
+- Only the owner can read the files (folder 0700, files 0600).
+  They hold values computed from the conversations: keep them on this PC.
+- As engine arguments: `--conversation-save DIR`, `--conversation-save-checkpoints N`, `--conversation-save-mib N`, `--conversation-save-hours N`.
+  Running setup again rewrites the config, so add the keys again then.
+
+Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two checkpoints) took 471 MiB.
+After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).
+The answer matches a run without the restart, also on the small configuration (8 GB, no XMX).
+Writing a conversation of 300-360 MiB takes 0.10-0.16 s; when the RAM cache pushes one out, the next request waits that long.
+The files are not compressed: blosc2, zstd and lz4 all make a whole file only 10-15% smaller ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
 
 ### Current limits and sampling
 
