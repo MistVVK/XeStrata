@@ -178,13 +178,11 @@ bool run(int fmt) {
         // the map inverts itself
         strata::parity::copy_bytes_out(pt.data(), m.page_table, n_blocks * 4);
         strata::parity::copy_bytes_out(sb.data(), m.slot_block, n_slots * 4);
-        int64_t resident = 0;
         for (int64_t bk = 0; bk < n_blocks; ++bk) {
             if (pt[bk] < -1 || pt[bk] >= n_slots || (pt[bk] >= 0 && sb[pt[bk]] != bk)) {
                 if (bad++ < 5) std::fprintf(stderr, "  map broken at block %lld (table %d)\n", (long long) bk, pt[bk]);
                 break;
             }
-            resident += pt[bk] >= 0;
         }
         for (int64_t sl = 0; sl < n_slots; ++sl)
             if (sb[sl] >= 0 && pt[sb[sl]] != sl) { if (bad++ < 5) std::fprintf(stderr, "  slot %lld not in the table\n", (long long) sl); break; }

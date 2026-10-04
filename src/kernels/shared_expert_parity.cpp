@@ -44,9 +44,7 @@ namespace {
 // test and the kernel cannot disagree about the conversion itself.
 // using-declarations rather than renames at the call sites, so the body below is untouched by the swap.
 using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
 inline uint16_t f32_to_f16(float f) { return f16_from_f32(f); }
-inline float f16_to_f32(uint16_t h) { return f32_from_f16(h); }
 
 // The S2 decode used from the host: one code per element, group 64, bias -1.
 // Normalised L1 difference, used by the moe_combine checks.  (The shared-expert checks above report worst

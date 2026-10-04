@@ -236,12 +236,6 @@ int main(int argc, char** argv) {
                 for (int c = 0; c < C; ++c) d[(size_t) (c * (dc - 1) + i)] = r[(size_t) (i * C + c)];
             return d;
         };
-        auto to_ref_layout = [&](const std::vector<float>& d) {
-            std::vector<float> r(d.size());
-            for (int i = 0; i < dc - 1; ++i)
-                for (int c = 0; c < C; ++c) r[(size_t) (i * C + c)] = d[(size_t) (c * (dc - 1) + i)];
-            return r;
-        };
 
         std::vector<float> cs = to_dev_layout(cs_ref);
         std::vector<float> want;

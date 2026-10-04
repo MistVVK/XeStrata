@@ -87,8 +87,6 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     for (int t = 0; t < n_tokens; ++t) {
         double s = 0;
         for (int i = 0; i < k; ++i) s += (double) h_w[(size_t) t * k + i];
-        double raw = 0;
-        for (int i = 0; i < k; ++i) raw += (double) r_w[(size_t) t * k + i];
         // both sides divide by the same clamped scale, so the ratios agree; check the kernel's own sum
         worst_sum = std::max(worst_sum, std::fabs(s - 1.0));
     }
