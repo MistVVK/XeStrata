@@ -581,14 +581,18 @@ KV は FP16、INT8（KV のストリーミングありも）、Q4_0、K8V4 で�
   壊れたファイルは消して、これまでどおりプロンプトを読みます。
 - ファイルは所有者だけが読めます（フォルダー 0700、ファイル 0600）。
   会話の内容から計算した値なので、PC の外に出しません。
-- エンジンの引数では `--conversation-save DIR`、`--conversation-save-checkpoints N`、`--conversation-save-mib N`、`--conversation-save-hours N` です。
+- `"conversation_save_compress": true` で、ファイルの浮動小数点の部分（DeltaNet の状態、indexer の行、FP16 の KV）を c-blosc2 の ZSTD（レベル 1）で圧縮して書きます（既定はオフ）。
+  INT8 の KV で 1 割前後、FP16 の KV で 1.5 割ほど小さくなります。1 バイト単位の KV（INT8、Q4_0、K8V4）はほとんど縮まないので、そのまま書きます。
+  ビルドのときに libblosc2-dev（Debian / Ubuntu）が見つかった場合だけ使えます。ないビルドでこのキーを書くと、エンジンは起動を止めます。
+  圧縮したファイルは、このキーがなくても、libblosc2 を組み込んだエンジンなら読めます。組み込んでいないエンジンでは消して、プロンプトを読み直します。
+- エンジンの引数では `--conversation-save DIR`、`--conversation-save-checkpoints N`、`--conversation-save-mib N`、`--conversation-save-hours N`、`--conversation-save-compress` です。
   setup を実行し直すと設定は書き直されるので、そのときはキーを書き足します。
 
 B70 の IQ2_XS で測ると、9,183 トークンの会話（INT8 の KV、チェックポイント 2 個）は 471 MiB でした。
 再起動のあと、CPU 直結の NVMe から 0.28 秒で読んで戻し、新しい 7 トークンだけを読みました（ファイルがないと 9,167 トークンを 7.9 秒で読み直します）。
 答えは、再起動しなかった実行と同じです。小さい GPU の設定（8 GB、XMX なし）でも同じでした。
 書き込みは、300〜360 MiB の会話で 0.10〜0.16 秒です。追い出すときは、この分だけ次の要求が遅れます。
-圧縮は使いません。blosc2、zstd、lz4 のどれでも、ファイル全体で 1〜1.5 割しか小さくならないためです（[記録](../bench/results/2026-10-04-conversation-save-compress/README.md)）。
+圧縮すると、同じ会話は 421 MiB になり、読んで戻すのに 0.30 秒、書くのに 0.23 秒かかります（[記録](../bench/results/2026-10-04-conversation-save-compress/README.md)）。
 
 ### いまの限界とサンプリング
 

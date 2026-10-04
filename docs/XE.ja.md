@@ -250,6 +250,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 | CPU の画像エンコーダー | `build-essential` | 同じ |
 | GPU の画像エンコーダー（[画像](#画像)） | Vulkan: `libvulkan-dev` 1.4.341、`glslc` 2026.1、`spirv-headers` 1.6.1、`mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | SYCL の画像エンコーダーの oneDNN（任意。選んだときだけ） | — | `intel-oneapi-dnnl-devel` 2026.0.2 |
+| 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
 
 Ubuntu 26.04 の `dpclang-6` 6.2.0 では、B70 に XMX が使えません。
 XMX を使うには、`--intel-llvm-build` で intel/llvm をビルドするか、nonfree で icpx を使います。

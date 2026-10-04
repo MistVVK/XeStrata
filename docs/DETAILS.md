@@ -571,14 +571,18 @@ A relative path is from the XeStrata folder.
   A damaged file is deleted and the prompt is read as before.
 - Only the owner can read the files (folder 0700, files 0600).
   They hold values computed from the conversations: keep them on this PC.
-- As engine arguments: `--conversation-save DIR`, `--conversation-save-checkpoints N`, `--conversation-save-mib N`, `--conversation-save-hours N`.
+- With `"conversation_save_compress": true` the floating-point parts of a file (the DeltaNet states, the indexer rows, FP16 KV) are written compressed with c-blosc2's ZSTD at level 1 (off by default).
+  A file gets about 10% smaller with INT8 KV and about 15% with FP16 KV. KV of 1-byte codes (INT8, Q4_0, K8V4) hardly compresses and is written as it is.
+  It is available only when the build found libblosc2-dev (Debian / Ubuntu); with the key and a build without it, the engine does not start.
+  A compressed file is read by any engine built with libblosc2, with or without the key; an engine without it deletes the file and reads the prompt again.
+- As engine arguments: `--conversation-save DIR`, `--conversation-save-checkpoints N`, `--conversation-save-mib N`, `--conversation-save-hours N`, `--conversation-save-compress`.
   Running setup again rewrites the config, so add the keys again then.
 
 Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two checkpoints) took 471 MiB.
 After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).
 The answer matches a run without the restart, also on the small configuration (8 GB, no XMX).
 Writing a conversation of 300-360 MiB takes 0.10-0.16 s; when the RAM cache pushes one out, the next request waits that long.
-The files are not compressed: blosc2, zstd and lz4 all make a whole file only 10-15% smaller ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
+Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
 
 ### Current limits and sampling
 

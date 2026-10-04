@@ -246,6 +246,7 @@ in a container with only this column and `python3-venv`, setup ran from start to
 | The CPU image encoder | `build-essential` | the same |
 | The GPU image encoder (see [Images](#images)) | Vulkan: `libvulkan-dev` 1.4.341, `glslc` 2026.1, `spirv-headers` 1.6.1, `mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | oneDNN for the SYCL image encoder (optional; off unless chosen) | — | `intel-oneapi-dnnl-devel` 2026.0.2 |
+| Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
 
 Ubuntu 26.04's `dpclang-6` 6.2.0 gives the B70 no XMX.
 For XMX, build intel/llvm with `--intel-llvm-build`, or use icpx in the nonfree mode.
