@@ -448,11 +448,10 @@ Where the draft modes differ, there are two causes:
 ### Why outputs change from run to run
 
 Which experts run on the CPU follows the cache size, and that changes the output's last bits.
-`auto` sizes the cache from the free VRAM rounded down (64 slots, or 256 MiB when slots are sized per expert),
-so starts on the same machine get the same cache.
-Before the rounding, free VRAM moved it by a slot or two
+`auto` sizes the cache from the free VRAM, so free VRAM moving between starts moves it by a slot or two and can change the output
 ([record](../bench/results/2026-10-02-new-machine/README.md#outputs-that-change-from-run-to-run)).
-To compare outputs across machines or settings, fix it with `--expert-cache N`.
+Rounding it down to 64 slots gave every start on a machine the same cache, but it slowed the RTX 4070's decode by 3-4%, so it is not rounded.
+When the same output is needed (comparisons across machines or settings too), fix it with `--expert-cache N`.
 
 ### The output head's VRAM refusal
 

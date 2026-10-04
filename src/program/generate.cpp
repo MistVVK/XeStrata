@@ -2325,10 +2325,10 @@ int main(int argc, char** argv) {
                                      ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind;
         const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+        // Not rounded: free VRAM moves the cache by a slot or two between starts, and with it the last bits of the
+        // output (bench/results/2026-10-02-new-machine), but rounding to 64 slots cost the RTX 4070 3-4% of its decode.
+        // Runs that must give the same tokens fix the size with --expert-cache N.
         int64_t slots = ((int64_t) free_b - reserve) / blob;
-        // Free VRAM moves by a few MiB between starts. Unrounded, that moved the cache by a slot or two, so another
-        // expert ran on the CPU and the same command gave other tokens (bench/results/2026-10-02-new-machine).
-        slots = std::max<int64_t>(slots, 0) / 64 * 64;
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
@@ -2352,8 +2352,8 @@ int main(int argc, char** argv) {
             if (fit_mib >= kSmallReserveMib) {
                 const int r = (int) std::min<int64_t>(fit_mib, o.vram_reserve_mib);
                 int64_t s2 = ((int64_t) free_b - ((((int64_t) r + prefill_mib) << 20) + mtp_bind)) / blob;
-                // rounded as above, but not below the slots a working cache needs (s2 >= min_slots: r leaves them)
-                s2 = std::max<int64_t>(min_slots, s2 / 64 * 64);
+                // not below the slots a working cache needs (s2 >= min_slots: r leaves them)
+                s2 = std::max<int64_t>(min_slots, s2);
                 if (!profile.empty()) s2 = std::min<int64_t>(s2, (int64_t) profile.size());
                 std::fprintf(stderr, "strata generate: expert cache auto: the %d MiB reserve leaves too few slots on "
                                      "this card (a working cache needs %lld): a %d MiB reserve instead -> %lld slots\n",
@@ -2410,7 +2410,6 @@ int main(int argc, char** argv) {
         uint64_t used = 0;
         size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
         uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
-        if (auto_cache) cap = cap / (256ull << 20) * (256ull << 20);   // as above: the same slots on every start
         for (const auto& pr : profile) {
             const uint64_t b = (lay.blob_bytes(pr.first) + 255) / 256 * 256;
             if (used + b > cap) break;
