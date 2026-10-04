@@ -6,8 +6,9 @@
 // 32 values at a time: the work-group copies the step's rows of X and of W into local memory, 16 bytes a work-item,
 // zero past the last row (so any row count works, the experts' groups too), into one of two buffers while the
 // sub-groups multiply out of the other.  W goes in as B in the layout the matrix engines take: Intel's VNNI-packed one
-// (pairs of K values together) on Intel GPUs, column-major on NVIDIA's.  The accumulators go out through local memory,
-// row by row, so the rows past the last one are not written.
+// (pairs of K values together) on Intel GPUs, column-major on NVIDIA's.  A tile of accumulators within Y goes straight
+// there; one that crosses the last row or column goes out through local memory, row by row, so the rows and columns
+// past the last are not written (straight stores made the A380's products 0-4% faster than all through local memory).
 //
 // On the A380 (Xe-HPG; bench/results/2026-10-04-dg2-dp4a) a 4096 x 2560 x 2560 FP16 product took 52 ms with W read
 // from global memory by every sub-group; with W in local memory 116 (column-major), 33 (transposed), 23 (VNNI-packed),
@@ -206,7 +207,13 @@ struct Kernel {
             const auto cp = cs.template get_multi_ptr<sycl::access::decorated::no>() + (std::ptrdiff_t) sgid * TM * TN;
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) {
-                    const int64_t n = wn0 + ns + (int64_t) j * TN;
+                    const int64_t n = wn0 + ns + (int64_t) j * TN, m = wm0 + ms + (int64_t) i * TM;
+                    if (!ACC && m + TM <= rows && n + TN <= N) {   // a tile within Y: stored straight there
+                        const auto gy = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                                  sycl::access::decorated::no>(y + m * ldy + n);
+                        mx::joint_matrix_store(sg, c[i][j], gy, ldy, mx::layout::row_major);
+                        continue;
+                    }
                     mx::joint_matrix_store(sg, c[i][j], cp, TN, mx::layout::row_major);
                     sycl::group_barrier(sg);
                     for (int e = lane; e < TM * TN; e += SG) {

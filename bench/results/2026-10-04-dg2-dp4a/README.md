@@ -67,6 +67,7 @@ Each step below was measured on the 4096 x 2560 x 2560 product, the outputs the 
 | 4 x 4 tiles a sub-group in the large register file (4 x 8 sub-groups) | 16 ms |
 | A and B in local memory a fragment after another (a fragment's 32-byte rows contiguous) | 14.2 ms |
 | Those stores 16 bytes (A) and 4 bytes (a pair of B) at a time, in a product's layout | 13.6 ms |
+| A tile of accumulators within Y stored straight there, not through local memory | 13.1 ms |
 
 - K steps of 64 instead of 32 were no faster (23.0 ms against 23.2)
 - Tiles beyond 2 x 2 a sub-group spilled in the default 128 registers (832–1,696 bytes in IGC's assembly, 84–97 ms): an 8 x 8 FP32 accumulator takes 8 of Xe-HPG's 32-byte registers.
@@ -75,6 +76,9 @@ Each step below was measured on the 4096 x 2560 x 2560 product, the outputs the 
 - The wider stores made the experts' groups slower (7.1 ms against 6.8), so their layout keeps the 2-byte ones
 - Loading the next step into registers while multiplying, to store it after, spilled (91–103 ms)
 - With the contiguous fragments, the other work-groups for a product: 8 x 4 sub-groups 14.4 ms, 4 x 4 15.4
+- The straight stores, five alternating rounds each (averages, ms): 13.1 against 13.6, 54.0 against 55.6, 34.3 against 33.6, 1.80 against 1.88, and for the experts 6.80 against 6.79 and 3.01 against 3.15
+- K steps of 64 in the experts' layout made them slower (9.5 ms against 6.8)
+- A product whose kernel had not changed ran up to 3% slower or faster when other kernels of the same source changed (13.6 and 14.0 ms); a difference of that size is within this noise
 - The experts' groups of 160 rows take a shorter work-group tile (2 x 8 sub-groups of 2 x 2 tiles, 32 rows) than a product: 7.0 ms for 16 experts of 1280 x 2560, against 9.2 with 8 x 8 sub-groups; none of the large-register layouts was faster for them (7.2–15 ms)
 
 Against DP4a, two alternating rounds (ms):
@@ -100,7 +104,7 @@ A layout is taken only where it fits what the GPU reports, else the next one (a 
 - Local memory: a product's layout takes 56 KiB on the A380 (two buffers of X 8 KiB and of W 16 KiB, the accumulators' way out 8 KiB), the experts' 24 KiB; the device's `local_mem_size` (64 KiB on the A380)
 - Work-group size: in the large register file at most a quarter of the device's largest work-group (`max_work_group_size`, 1,024 on the A380).
   8 x 8 sub-groups of 8 lanes (512) in the large register file lost the A380 (`UR_RESULT_ERROR_DEVICE_LOST`) although the kernel reported taking 512 (`kernel_device_specific::work_group_size`); 4 x 8 (256) run
-- The checks read the device's reports without building the kernels: building them beforehand to ask the kernel (in the engine's context, or in one of its own) made the products 3% slower on the A380 (14.0 ms against 13.6, two builds each, three alternating rounds); why is not known
+- The checks read the device's reports without building the kernels: with the kernels built beforehand to ask them (in the engine's context, or in one of its own) the products ran 3% slower on the A380 (14.0 ms against 13.6, two builds each, three alternating rounds); a product also moved that much when only other kernels of the same source changed (below), so the cause may not be the check
 - Checked on the A380 by forcing each: a product's layout over its local memory took the experts' layout (the same outputs); both over it took DP4a; the 8 x 8 sub-groups were refused before launching
 
 ## Not checked
