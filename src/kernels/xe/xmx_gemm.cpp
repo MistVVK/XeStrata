@@ -265,6 +265,12 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 
 bool xmx_available(XmxType t) { return use_xmx(t); }
 
+const char* gemm_path(XmxType t) {
+    if (xe::mma_usable(core::Runtime::get().compute(), t == XmxType::bf16) && (xe::mma_forced() || !use_xmx(t)))
+        return "joint_matrix";
+    return use_xmx(t) ? "XMX" : "DP4a";
+}
+
 bool xmx_gemm_ok(const void* X, const void* W, const float* Y, int64_t N, int64_t K, int64_t ldy) noexcept {
     const auto al = [](const void* p) { return ((uintptr_t) p & 63) == 0; };
     return N >= 16 && N % 16 == 0 && K >= 32 && K % 32 == 0 && ldy >= N && ldy % 16 == 0 && al(X) && al(W) && al(Y);

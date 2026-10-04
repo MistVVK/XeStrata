@@ -16,6 +16,10 @@ enum class XmxType { f16, bf16 };
 /// through DP4a, and other kernels on the matrix engines (the prompt attention) take their own paths.
 bool xmx_available(XmxType t);
 
+/// The path xmx_gemm takes for inputs of type `t` on the compute device, for the startup report: "XMX", "joint_matrix"
+/// (mma_gemm, the matrix engines a GPU without the XMX kernels reports) or "DP4a".
+const char* gemm_path(XmxType t);
+
 /// Whether xmx_gemm takes the product: N a multiple of 16, K of 32, ldy of 16, and X, W, Y 64-byte aligned (the 2D
 /// block loads and stores).  The others go to gemm_rows.
 bool xmx_gemm_ok(const void* X, const void* W, const float* Y, int64_t N, int64_t K, int64_t ldy) noexcept;
