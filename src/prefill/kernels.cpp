@@ -67,8 +67,6 @@ inline float block_sum(const sycl::nd_item<1>& it, float v, float* sh) {
     return sh[0];
 }
 
-size_t groups_for(int64_t n, int t = 256) { return (size_t) ((n + t - 1) / t) * t; }
-
 constexpr int CONV_TILE = 64;
 constexpr int RG = 4, RPG = S / RG;
 constexpr int CB = 32, NCB = S / CB;
