@@ -313,8 +313,12 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison) : capacity_(b
     if (ordinal != 0 || !bytes || bytes > std::numeric_limits<size_t>::max())
         throw DeviceError("DeviceArena requires nonzero bytes and device ordinal 0");
     auto& runtime = Runtime::get();
-    base_ = sycl::aligned_alloc_device(4096, bytes, runtime.device(), runtime.context());
-    if (!base_) throw DeviceError("device USM allocation failed for " + std::to_string(bytes) + " bytes");
+    // 4 KB aligned by hand: the CUDA adapter refuses an alignment its driver does not promise (cuMemAlloc gives
+    // 256 bytes; UNSUPPORTED_ALIGNMENT whenever the pointer comes back unaligned).  Level Zero returns pages, so
+    // the offset is 0 there.
+    raw_ = sycl::malloc_device(bytes + 4095, runtime.device(), runtime.context());
+    if (!raw_) throw DeviceError("device USM allocation failed for " + std::to_string(bytes) + " bytes");
+    base_ = (void*) (((uintptr_t) raw_ + 4095) & ~(uintptr_t) 4095);
     try {
         // in 1 GiB pieces: a single memset past 4 GiB never completes on the B70 (see gpu.cpp)
         if (poison) {
@@ -323,10 +327,10 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison) : capacity_(b
                 e = runtime.compute().memset((uint8_t*) base_ + o, 0xff, std::min<uint64_t>(1ull << 30, bytes - o));
             runtime.wait(e, "arena poison fill");
         }
-    } catch (...) { runtime.free(base_); base_ = nullptr; throw; }
+    } catch (...) { runtime.free(raw_); raw_ = base_ = nullptr; throw; }
 }
 
-DeviceArena::~DeviceArena() { Runtime::get().free(base_); }
+DeviceArena::~DeviceArena() { Runtime::get().free(raw_); }
 
 void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     if (!align || (align & (align - 1))) throw DeviceError("alignment must be a power of two");

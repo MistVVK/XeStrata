@@ -68,6 +68,7 @@ public:
     void* base() const { return base_; }
 
 private:
+    void* raw_ = nullptr;    // the allocation; base_ is it rounded up to 4 KB
     void* base_ = nullptr;
     uint64_t capacity_ = 0, used_ = 0;
     int ordinal_ = 0;
