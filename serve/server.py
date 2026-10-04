@@ -892,7 +892,28 @@ def engine_args(cfg: dict) -> list[str]:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
-    return learned_profile_args(cfg, args)
+    return conversation_save_args(cfg, learned_profile_args(cfg, args))
+
+
+def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
+    """Opt-in: "conversation_save": "<folder>" in the config has the engine keep its parked conversations there
+    across restarts (it needs --conversation-cache-mib in "args"), with "conversation_save_checkpoints",
+    "conversation_save_mib" and "conversation_save_hours" (whole numbers >= 0) for the engine's defaults.  A relative
+    path is the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    folder = cfg.get("conversation_save")
+    if not isinstance(folder, str) or not folder.strip() or "--conversation-save" in args:
+        return args
+    args = args + ["--conversation-save", folder]
+    for key in ("conversation_save_checkpoints", "conversation_save_mib", "conversation_save_hours"):
+        v = cfg.get(key)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            raise ValueError(f'"{key}" must be a whole number >= 0, not {v!r}')
+        flag = "--" + key.replace("_", "-")
+        if flag not in args:
+            args += [flag, str(v)]
+    return args
 
 
 def profile_shape(path: str) -> tuple[int, int] | None:
