@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/dp4a_gemm.cpp - see dp4a_gemm.hpp.
 //
-// A work-group of 16 x 16 work-items computes a BM x BN tile of Y, PM x PN outputs each (rows and columns 16 apart, so
+// A work-group of 16 x 16 work-items (in sub-groups of 16, or of 32 on a GPU without 16: see narrow_sub_group) computes a BM x BN tile of Y, PM x PN outputs each (rows and columns 16 apart, so
 // neighbouring work-items read neighbouring words of local memory).  K advances one 32-value block at a time: the
 // work-items load the block's BM rows of X and BN rows of W, each row shared by a few neighbouring lanes that find its
 // largest magnitude together, and write the int8 values (4 a word) and the scale to local memory.  Quantizing while
@@ -12,6 +12,7 @@
 #include "cuda_intrinsics.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::kernels::xe {
 namespace {
@@ -50,8 +51,9 @@ inline void load_block(sycl::sub_group sg, int lid, const uint16_t* A, int64_t r
     if (part == 0) d[r] = m / 127.0f;
 }
 
-// G groups of rows (bounds[e] .. bounds[e + 1], or all `rows_max` rows when bounds is null), each by its W.
-template<bool BF16, int PM, int PN>
+// G groups of rows (bounds[e] .. bounds[e + 1], or all `rows_max` rows when bounds is null), each by its W.  A row's
+// P lanes are neighbours in a P-aligned block, so its reduction stays within a sub-group of 16 or 32.
+template<bool BF16, int PM, int PN, int SG>
 sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
                    int64_t ldy, const int32_t* bounds, int G, int64_t rows_max, int64_t N, int64_t K) {
     constexpr int BM = TS * PM, BN = TS * PN;
@@ -60,7 +62,7 @@ sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t
         sycl::local_accessor<int, 2> xs(sycl::range<2>(8, BM), h), ws(sycl::range<2>(8, BN), h);
         sycl::local_accessor<float, 1> xds(sycl::range<1>(BM), h), wds(sycl::range<1>(BN), h);
         h.parallel_for(sycl::nd_range<2>({(size_t) (G * tiles_m * TS), (size_t) (tiles_n * TS)}, {TS, TS}),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int64_t g = (int64_t) it.get_group(0), ex = g / tiles_m, m0 = g % tiles_m * BM;
             const int64_t n0 = (int64_t) it.get_group(1) * BN;
             const int64_t r0 = bounds ? bounds[ex] : 0, rows = bounds ? bounds[ex + 1] - r0 : rows_max;
@@ -100,7 +102,25 @@ sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t
     });
 }
 
+template<bool BF16, int PM, int PN>
+sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
+                   int64_t ldy, const int32_t* bounds, int G, int64_t rows_max, int64_t N, int64_t K) {
+    if (narrow_sub_group(q) == 16) return launch<BF16, PM, PN, 16>(q, X, W, w_stride, Y, ldy, bounds, G, rows_max, N, K);
+    return launch<BF16, PM, PN, 32>(q, X, W, w_stride, Y, ldy, bounds, G, rows_max, N, K);
+}
+
 }  // namespace
+
+int narrow_sub_group(const sycl::queue& q) {
+    static const int sg = [&q] {
+        // STRATA_SUB_GROUP_32=1 takes 32 where 16 is listed too, to compare the two on one GPU
+        if (const char* v = std::getenv("STRATA_SUB_GROUP_32"); v != nullptr && std::strtol(v, nullptr, 10) != 0)
+            return 32;
+        const auto s = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        return std::find(s.begin(), s.end(), size_t(16)) != s.end() ? 16 : 32;
+    }();
+    return sg;
+}
 
 int64_t fill_rows(const sycl::queue& q, int64_t b70_rows) {
     const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();

@@ -302,17 +302,18 @@ void xmx_gemm_grouped(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
     finish(stream, e, "xmx_gemm_grouped");
 }
 
-void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-               void* stream, bool accumulate) {
-    if (T <= 0 || N <= 0) return;
-    // a sub-group a row of X and up to 16 outputs, so X is read once (one output a sub-group read it N times: the
-    // hyper-connection's inject, N 4 K 10240, took 1.7 ms a chunk of 8192 tokens); 8 values a load when K allows
+namespace {
+// gemm_rows on sub-groups of SG lanes: a sub-group a row of X and up to 16 outputs, so X is read once (one output a
+// sub-group read it N times: the hyper-connection's inject, N 4 K 10240, took 1.7 ms a chunk of 8192 tokens); 8 values
+// a load when K allows
+template<int SG>
+sycl::event rows_kernel(sycl::queue& q, bool half, const uint16_t* X, const uint16_t* W, float* Y, int64_t T,
+                        int64_t N, int64_t K, int64_t ldy, bool accumulate) {
     constexpr int NB = 16;
-    const bool half = t == XmxType::f16;
     const bool vec = K % 8 == 0 && ((uintptr_t) X | (uintptr_t) W) % 16 == 0;
     const int64_t nb = (N + NB - 1) / NB;
-    const sycl::event e = core::Runtime::get().stream(stream).parallel_for(
-        sycl::nd_range<2>({(size_t) T, (size_t) nb * 16}, {1, 16}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+    return q.parallel_for(
+        sycl::nd_range<2>({(size_t) T, (size_t) nb * SG}, {1, SG}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG)]] {
             const auto sg = it.get_sub_group();
             const int64_t r = (int64_t) it.get_group(0), n0 = (int64_t) it.get_group(1) * NB;
             const int lane = (int) sg.get_local_linear_id();
@@ -323,7 +324,7 @@ void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_
             const uint16_t* x = X + r * K;
             if (vec) {
                 using V = sycl::vec<uint16_t, 8>;
-                for (int64_t k = (int64_t) lane * 8; k < K; k += 16 * 8ll) {
+                for (int64_t k = (int64_t) lane * 8; k < K; k += SG * 8ll) {
                     const V xv = *reinterpret_cast<const V*>(x + k);
                     for (int n = 0; n < NB; ++n) {
                         if (n0 + n >= N) break;
@@ -332,7 +333,7 @@ void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_
                     }
                 }
             } else {
-                for (int64_t k = lane; k < K; k += 16)
+                for (int64_t k = lane; k < K; k += SG)
                     for (int n = 0; n < NB; ++n) {
                         if (n0 + n >= N) break;
                         acc[n] = sycl::fma(val(x[k]), val(W[(n0 + n) * K + k]), acc[n]);
@@ -344,6 +345,16 @@ void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_
                 if (lane == 0) Y[r * ldy + n0 + n] = accumulate ? Y[r * ldy + n0 + n] + s : s;
             }
         });
+}
+}  // namespace
+
+void gemm_rows(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               void* stream, bool accumulate) {
+    if (T <= 0 || N <= 0) return;
+    auto& q = core::Runtime::get().stream(stream);
+    const bool half = t == XmxType::f16;
+    const sycl::event e = xe::narrow_sub_group(q) == 16 ? rows_kernel<16>(q, half, X, W, Y, T, N, K, ldy, accumulate)
+                                                        : rows_kernel<32>(q, half, X, W, Y, T, N, K, ldy, accumulate);
     finish(stream, e, "gemm_rows");
 }
 

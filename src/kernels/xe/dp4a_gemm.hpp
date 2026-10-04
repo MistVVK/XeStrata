@@ -15,6 +15,11 @@
 
 namespace strata::kernels::xe {
 
+/// The sub-group size of the kernels written for 16 lanes (this file's, xmx_gemm's gemm_rows): 16 where the device
+/// lists it (Intel GPUs), else 32 (the size every GPU the engine accepts has).  The engine drives one device, so the
+/// first call's answer holds.
+int narrow_sub_group(const sycl::queue& q);
+
 /// A row count measured on the B70 (256 compute units) as the point where a product has tiles enough to fill it,
 /// scaled to `q`'s device by its compute units: the tile choices of xmx_gemm and dp4a_gemm.
 int64_t fill_rows(const sycl::queue& q, int64_t b70_rows);
