@@ -2,21 +2,25 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/mma_gemm.cpp - see mma_gemm.hpp.
 //
-// A work-group of sub-groups computes a tile of Y, each sub-group 2 x 2 matrix tiles of it.  K advances 32 values at a
-// time: the work-group copies the step's rows of X and of W into local memory, 16 bytes a work-item, zero past the
-// last row (so any row count works, the experts' groups too), into one of two buffers while the sub-groups multiply
-// out of the other.  W goes in as B in the layout the matrix engines take: Intel's VNNI-packed one (pairs of K values
-// together) on Intel GPUs, column-major on NVIDIA's.  The accumulators go out through local memory, row by row, so
-// the rows past the last one are not written.
+// A work-group of sub-groups computes a tile of Y, each sub-group some matrix tiles of it (Layout below).  K advances
+// 32 values at a time: the work-group copies the step's rows of X and of W into local memory, 16 bytes a work-item,
+// zero past the last row (so any row count works, the experts' groups too), into one of two buffers while the
+// sub-groups multiply out of the other.  W goes in as B in the layout the matrix engines take: Intel's VNNI-packed one
+// (pairs of K values together) on Intel GPUs, column-major on NVIDIA's.  The accumulators go out through local memory,
+// row by row, so the rows past the last one are not written.
 //
-// On the A380 (Xe-HPG; bench/results/2026-10-04-dg2-dp4a) these steps took a 4096 x 2560 x 2560 FP16 product from
-// 116 ms (W read by every sub-group, column-major, from local memory) to 52 (from global memory, as before), 29 (VNNI-
-// packed in local memory), 21 (its neighbouring lanes storing side by side) and 20 (two buffers); DP4a takes 20.
+// On the A380 (Xe-HPG; bench/results/2026-10-04-dg2-dp4a) a 4096 x 2560 x 2560 FP16 product took 52 ms with W read
+// from global memory by every sub-group; with W in local memory 116 (column-major), 33 (transposed), 23 (VNNI-packed),
+// 21 (neighbouring lanes storing side by side), 20 (two buffers) and 16 (4 x 4 tiles a sub-group in the large register
+// file; in the default 128 registers they spilled).  DP4a takes 20.
 #include "mma_gemm.hpp"
 #include "device_target.hpp"
 
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <iterator>
 
@@ -29,18 +33,25 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 
 // A joint_matrix tile shape and the sub-group size it is built for: Intel Xe2's 8 x 16 x 16 on 16 lanes (to check this
 // code there; xmx_gemm.cpp's kernels are the fast ones on Xe2), Intel Xe-HPG's 8 x 8 x 16 on 8 (the Arc A series, whose
-// runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp).  The work-group:
-// wgm x wgn sub-groups for a product, wgm_g x wgn for the experts' groups (a group of 160 rows wastes less of a short
-// tile); packed: B in Intel's VNNI layout.  Xe-HPG's from the A380's timings (8 x 8: 20 ms for the product above,
-// 4 x 8: 20, 2 x 8: 23; for 16 experts of 160 rows, 1280 x 2560: 9.2, 7.5 and 6.9 ms), the others untuned.
+// runtime refuses xmx_gemm's prefetches and checked loads) and NVIDIA's 16 x 16 x 16 on 32 (a warp); the work-group's
+// layout for a product (dense) and for the experts' groups (grouped); packed: B in Intel's VNNI layout.  Xe-HPG's
+// layouts from the A380's timings (bench/results/2026-10-04-dg2-dp4a): a product 4 x 8 sub-groups of 4 x 4 tiles in the
+// large register file (16 ms for the product above; 2 x 2 tiles in 128 registers, 8 x 8 sub-groups: 19), the groups of
+// 160 rows 2 x 8 of 2 x 2 (7.0 ms for 16 experts of 1280 x 2560; none of the large-register ones was faster).  The
+// others untuned.
+// A work-group's layout: wgm x wgn sub-groups, each sgm x sgn tiles, with the large register file (grf) or not.
+struct Layout {
+    int wgm, wgn, sgm, sgn;
+    bool grf;
+};
 struct Shape {
-    int m, n, k, sg, wgm, wgm_g, wgn;
+    int m, n, k, sg;
+    Layout dense, grouped;
     bool packed;
 };
-constexpr Shape kShapes[] = {{8, 16, 16, 16, 2, 2, 2, true}, {8, 8, 16, 8, 8, 2, 8, true},
-                             {16, 16, 16, 32, 2, 2, 2, false}};
-
-constexpr int SGM = 2, SGN = 2;   // tiles a sub-group (4 x 4 spilled on the A380: 86 ms for the product above)
+constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, true},
+                             {8, 8, 16, 8, {4, 8, 4, 4, true}, {2, 8, 2, 2, false}, true},
+                             {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false}};
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 constexpr int PAD = 8;            // column-major B's row stride is KC + PAD (16-byte aligned rows)
 constexpr int VEC = 8;            // values a work-item copies at once (16 bytes)
@@ -85,8 +96,9 @@ template<int S, typename E, bool ACC, bool GROUPED>
 struct Kernel {
     static constexpr int TM = kShapes[S].m, TN = kShapes[S].n, TK = kShapes[S].k, SG = kShapes[S].sg;
     static constexpr bool PACKED = kShapes[S].packed;
-    static constexpr int NSGM = GROUPED ? kShapes[S].wgm_g : kShapes[S].wgm, NSGN = kShapes[S].wgn;
-    static constexpr int NSG = NSGM * NSGN;
+    static constexpr Layout L = GROUPED ? kShapes[S].grouped : kShapes[S].dense;
+    static constexpr int NSGM = L.wgm, NSGN = L.wgn, NSG = NSGM * NSGN;
+    static constexpr int SGM = L.sgm, SGN = L.sgn;   // tiles a sub-group
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr int LDA = KC, LDB = PACKED ? KC : KC + PAD;   // A's row stride; B's (column-major) row stride
     static constexpr int ASZ = WM * LDA, BSZ = WN * LDB;           // a buffer's elements
@@ -165,7 +177,12 @@ struct Kernel {
                 }
         }
     }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
+    auto get(syclex::properties_tag) const {
+        if constexpr (L.grf)
+            return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>,
+                                      sycl::ext::intel::experimental::grf_size<256>};
+        else return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+    }
 };
 
 template<int S, typename E, bool ACC, bool GROUPED>
@@ -214,14 +231,41 @@ int shape(const sycl::queue& q, bool bf16) {
     return bf16 ? b16 : f16;
 }
 
+// Whether the device builds shape S's dense layout: one with the large register file fails to build where the device
+// lacks the mode, so one such kernel is built here, once, before any is launched; without it a product takes the
+// groups' layout, which needs no large register file.
+template<int S>
+bool dense_layout_ok(const sycl::queue& q) {
+    if constexpr (!kShapes[S].dense.grf) {
+        return true;
+    } else {
+        static const bool ok = [&q] {
+            try {
+                (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
+                    q.get_context(), {q.get_device()}, {sycl::get_kernel_id<Kernel<S, sycl::half, false, false>>()});
+                return true;
+            } catch (const sycl::exception& e) {
+                std::fprintf(stderr, "strata: the GPU does not build mma_gemm's kernel with the large register file "
+                             "(%s): its products take the smaller layout\n", e.what());
+                return false;
+            }
+        }();
+        return ok;
+    }
+}
+
 template<int S, typename E>
 sycl::event run(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, int64_t ldy,
                 const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, bool accumulate) {
     const auto* x = reinterpret_cast<const E*>(X);
     const auto* w = reinterpret_cast<const E*>(W);
     if (bounds) return launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
-    if (accumulate) return launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
-    return launch<S, E, false, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+    const bool dense = dense_layout_ok<S>(q);
+    if (accumulate)
+        return dense ? launch<S, E, true, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
+                     : launch<S, E, true, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
+    return dense ? launch<S, E, false, false>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K)
+                 : launch<S, E, false, true>(q, x, w, w_stride, Y, ldy, bounds, G, T, N, K);
 }
 
 template<typename E>

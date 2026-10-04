@@ -64,22 +64,27 @@ Each step below was measured on the 4096 x 2560 x 2560 product, the outputs the 
 | W in Intel's VNNI-packed layout in local memory | 23 ms |
 | The packed stores of neighbouring lanes side by side | 21 ms |
 | Two buffers (the next step loaded while this one is multiplied) | 20 ms |
+| 4 x 4 tiles a sub-group in the large register file (4 x 8 sub-groups) | 16 ms |
 
-- K steps of 64 instead of 32 were no faster (23.0 ms against 23.2), 4 x 4 tiles a sub-group spilled again (86–90 ms)
-- The experts' groups of 160 rows take a shorter work-group tile (2 x 8 sub-groups, 32 rows) than a product (8 x 8, 128 rows): 7.0 ms against 9.2 for 16 experts of 1280 x 2560, 23 ms against 20 for the dense product
+- K steps of 64 instead of 32 were no faster (23.0 ms against 23.2)
+- Tiles beyond 2 x 2 a sub-group spilled in the default 128 registers (832–1,696 bytes in IGC's assembly, 84–97 ms): an 8 x 8 FP32 accumulator takes 8 of Xe-HPG's 32-byte registers.
+  In the large register file (`grf_size<256>`, which the A380 builds) 4 x 4 tiles fit: with 4 x 8 sub-groups 16.1 ms, 4 x 4 17.0, 8 x 4 16.7, 4 x 2 24.8, 2 x 4 23.4; 8 x 8 sub-groups do not launch with it
+- In the assembly of the 2 x 2 tiles, the four `dpas.8x8` a K step of 16 came with 32 loads from local memory of 32 bytes each; 4 x 4 tiles share each load among twice the products
+- The experts' groups of 160 rows take a shorter work-group tile (2 x 8 sub-groups of 2 x 2 tiles, 32 rows) than a product: 7.0 ms for 16 experts of 1280 x 2560, against 9.2 with 8 x 8 sub-groups; none of the large-register layouts was faster for them (7.2–15 ms)
 
 Against DP4a, two alternating rounds (ms):
 
 | Product | mma_gemm | DP4a |
 | --- | --- | --- |
-| 4096 x 2560 x 2560 | 19.6–19.7 | 20.7–20.8 |
-| 4096 x 10240 x 2560 | 80.9–81.5 | 87.4–92.0 |
-| 4096 x 2560 x 6144 | 49.5–49.6 | 55.7–56.1 |
-| 512 x 2560 x 2560 | 2.6–2.8 | 2.9 |
-| 16 experts of 160 rows, 1280 x 2560 | 7.1 | 8.1–8.8 |
-| 16 experts of 160 rows, 2560 x 640 | 3.5 | 3.8–3.9 |
+| 4096 x 2560 x 2560 | 16.0–16.3 | 20.0–20.1 |
+| 4096 x 10240 x 2560 | 66.2–68.6 | 88.9–89.5 |
+| 4096 x 2560 x 6144 | 37.6–37.7 | 53.7 |
+| 512 x 2560 x 2560 | 2.1 | 2.9 |
+| 16 experts of 160 rows, 1280 x 2560 | 7.0–7.1 | 8.0–8.3 |
+| 16 experts of 160 rows, 2560 x 640 | 3.5 | 3.9 |
 
-So the Arc A series takes `mma_gemm` again, 5–17% faster and exact to 0.0001%.
+So the Arc A series takes `mma_gemm` again: 20–30% faster than DP4a for a product, 10–15% for the experts, and exact to 0.0001%.
+A GPU that does not build the large register file takes the groups' layout for a product too (checked on the A380 by forcing it: the same outputs).
 The same code on the B70 with `STRATA_MMA=1` (Xe2's 8 x 16 x 16, untuned 2 x 2 sub-groups) ran 15–24 T/s against 9–15 before (XMX's own kernels 120–170, so the B70 keeps them),
 and on an RTX 4070 (16 x 16 x 16, untuned) 16–27 T/s with a relative error of 0.0004%.
 

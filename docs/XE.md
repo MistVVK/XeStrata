@@ -91,7 +91,7 @@ At start the engine asks the GPU whether it has the matrix combinations its XMX 
 Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
 and without that the DP4a path, and says once which.
 The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
-On the A380 it ran 5–17% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%; [record](../bench/results/2026-10-04-dg2-dp4a/README.md)).
+On the A380 it ran 10–30% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%; [record](../bench/results/2026-10-04-dg2-dp4a/README.md)).
 `STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
