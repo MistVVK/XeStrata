@@ -124,7 +124,14 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
    sudo sysctl dev.xe.observation_paranoid=0 dev.i915.perf_stream_paranoid=0
    ```
 
-   For every boot, put the same two lines (`dev.xe.observation_paranoid = 0` ...) in `/etc/sysctl.d/60-gpu-observation.conf`.
+   For every boot, put the same two lines (`dev.xe.observation_paranoid = 0` ...) in `/etc/sysctl.d/60-gpu-observation.conf` and add a udev rule that applies them again when a GPU device appears.
+   The boot-time sysctl pass runs before xe and i915 are ready, so the file alone finds no such keys and is ignored (on the development machine the drivers initialized a second after `systemd-sysctl` reported `No such file or directory`).
+
+   ```sh
+   printf 'dev.xe.observation_paranoid = 0\ndev.i915.perf_stream_paranoid = 0\n' | sudo tee /etc/sysctl.d/60-gpu-observation.conf
+   echo 'ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card*", RUN+="/usr/lib/systemd/systemd-sysctl --prefix=/dev/xe --prefix=/dev/i915"' | sudo tee /etc/udev/rules.d/60-gpu-observation.rules
+   ```
+
 1. Intel's Metrics Discovery library (MIT; Ubuntu does not package it), built into `.tools/`:
 
    ```sh
