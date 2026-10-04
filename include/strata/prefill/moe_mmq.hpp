@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/prefill/moe_mmq.hpp - prompt-speed plan step 2b: the prompt path's experts through llama.cpp's MMQ
-// kernels (ggml-cuda mmq.cuh, MIT): the weights stay quantized and the activations are rounded to q8_1, the
-// products run on int8 tensor cores.  The dequantize-to-FP16 + cuBLAS path wrote ~10 MB of FP16 per expert and
+// include/strata/prefill/moe_mmq.hpp - prompt-speed plan step 2b: the prompt path's experts multiplied in their
+// quantized blocks (iq_mmq.hpp: llama.cpp's MMQ, written anew on joint_matrix): the activations are rounded to int8,
+// the products run on the int8 matrix engines.  The dequantize-to-FP16 path wrote ~10 MB of FP16 per expert and
 // multiplied in FP16; this reads the ~1.4-2 MB expert once.  A group of experts is gathered into one buffer
-// (`gather_*`, one launch per expert as its blob arrives) and multiplied in one launch per product.
+// (`gather_native`, one per expert as its blob arrives) and multiplied in one launch per product.
 #pragma once
 
 #include <cstddef>
@@ -13,16 +13,16 @@
 
 namespace strata::prefill::mmq {
 
-/// This build has the MMQ path (the ggml sources were available to the build).
+/// The GPU runs these products (iq_mmq_usable).
 bool built();
-/// MMQ covers this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
+/// They cover this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
-/// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
+/// Bytes of `rows` activation rows of `cols` values quantized for MMQ.
 size_t q8_bytes(int64_t rows, int64_t cols);
 
-/// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
+/// int8 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
@@ -45,7 +45,7 @@ struct Product {
     int64_t ld_dst = 0;
 };
 
-/// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
+/// The launch context.  One per prompt path.
 class Context {
 public:
     Context();
@@ -59,10 +59,6 @@ public:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
-/// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
-/// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
-void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
-
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);

@@ -88,7 +88,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
   Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
-  How it runs on an NVIDIA GPU, and how fast, is `unverified`.
+  Validated to run on an RTX 4070 (sm_89).
 - **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
@@ -101,6 +101,13 @@ On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error
 `STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
+
+Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prompt path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
+The weights are read in their GGUF blocks and the activations rounded to int8, a scale for each 32 values.
+That reads and writes less than dequantizing to FP16 and multiplying, and the relative error against FP64 is about 0.4% (the activations' rounding).
+It covers the i-quants but IQ1_M, and Q2_0; a layer of another type keeps the FP16 path.
+Intel GPUs do not report that shape and keep the XMX FP16 path.
+`STRATA_PREFILL_MMQ=0` takes the FP16 path.
 
 ### The engine's parts and tests
 

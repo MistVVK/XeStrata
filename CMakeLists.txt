@@ -304,10 +304,12 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # plan v0.3 P5: batched prompt processing.  The GEMMs are XeStrata's XMX kernels (src/kernels/xe/xmx_gemm.cpp;
-  # cuBLAS in the CUDA build, oneMKL in the first Xe port); llama.cpp's MMQ expert kernels are not ported, so the
-  # prompt path's experts take the FP16 GEMM path (STRATA_PREFILL_MMQ undefined).  Upstream 0.1.38's quantized and
-  # fused expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
-  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp)
+  # cuBLAS in the CUDA build, oneMKL in the first Xe port).  The experts' quantized products (moe_mmq.cpp) run on the
+  # int8 matrix engines where the GPU reports the shape src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM
+  # path elsewhere.  Upstream 0.1.38's quantized and fused expert products on the decode kernels' DP4a dots ran at 0.34x
+  # and 0.25x of it on the B70 and were dropped.
+  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
+                                    src/prefill/moe_mmq.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
 

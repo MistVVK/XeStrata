@@ -92,7 +92,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
   Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.1.1 で、sm_89 向けのビルドが通ることを確かめています。
-  NVIDIA の GPU の上での動作と速さは `unverified` です。
+  RTX 4070（sm_89）で動くことを確かめています。
 - **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
@@ -105,6 +105,13 @@ A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくな
 `STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
+
+プロンプトの経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
+重みは GGUF のブロックのまま読み、活性は 32 値ごとに int8 に丸めます。
+FP16 に展開してから掛ける経路より読み書きが少なく、FP64 との相対誤差は約 0.4% です（活性を int8 に丸めた分）。
+対象は IQ1_M を除く i-quant と Q2_0 で、それ以外の型の層は FP16 の経路のままです。
+Intel の GPU はこの形を報告しないので、これまでどおり XMX の FP16 の経路を使います。
+`STRATA_PREFILL_MMQ=0` を付けると FP16 の経路に戻ります。
 
 ### エンジンの部品とテスト
 
