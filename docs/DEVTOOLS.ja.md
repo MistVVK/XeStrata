@@ -81,11 +81,16 @@ CUDA のターゲットには NVIDIA の CUDA ツールキットが要ります�
 
 ```sh
 sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
+sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # HIP, optional
 python3 tools/intel_llvm_build.py --contrib --keep-build
 ```
 
 - ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダー）を探します。
   見つからなければ HIP なしでビルドします。
+- Ubuntu では、ROCm のメタパッケージ（`rocm`、`rocm-dev`）と `nvidia-cuda-toolkit` を同時に入れられません。
+  `rocm-dev` が引く `librocthrust-dev` と、`nvidia-cuda-dev` が引く `libthrust-dev` が、どちらも `/usr/include/thrust` を持っていて衝突するためで、apt は片方を入れると、もう片方を消します。
+  HIP には上の 4 つだけで足ります（rocThrust は要りません）。
+  `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - v7.1.1 の `configure.py` は AMD の libclc の対象名を `amdgcn--amdhsa` としていて、libclc が受け付けないので、スクリプトが `amdgcn-amd-amdhsa` で上書きします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
@@ -173,3 +178,31 @@ GPU のハードウェアカウンター（カーネルごとのメモリの帯�
 Metrics Discovery は、xe ドライバー経由で B70 のカウンターを読めました（Linux 7.0、2026-10-02）。
 VTune の `xpu-offload` の収集と unitrace は、どちらもエンジンをプロンプトのところで数分止めてしまいました。
 この 2 つは小さなプログラムやプローブに使い、エンジンには使いません。
+
+### NVIDIA の GPU の測定（nsys と ncu）
+
+Nsight Systems（`nsys`、カーネルごとの時間）と Nsight Compute（`ncu`、カーネルの中のメモリの帯域やストールの理由）は、`nvidia-cuda-toolkit` と一緒に入ります（Ubuntu 26.04 では 2023.4 と 2024.1）。
+どちらも自由ソフトウェアではありません。
+
+- `ncu` は GPU のハードウェアカウンターを読むので、既定では root が要ります（`/proc/driver/nvidia/params` の `RmProfilingAdminOnly: 1`）。
+  一般ユーザーに開くには、ドライバーの設定を書いて initramfs を作り直し、再起動します。
+  Ubuntu は NVIDIA のモジュールを initramfs に入れて起動の早くに読み込むので、設定ファイルだけでは効きません。
+
+  ```sh
+  echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+  sudo update-initramfs -u
+  ```
+
+- Ubuntu の `nsys` 2023.4 は、SYCL のプログラムの記録を `.nsys-rep` に変換するところで失敗します。
+  `--cuda-graph-trace=node` で記録し、変換を手で走らせると読めます。
+  変換ツールは既にある `.nsys-rep` を上書きしないので、先に消します。
+
+  ```sh
+  nsys profile -t cuda --cuda-graph-trace=node -o out -f true <プログラム>
+  /usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i out.qdstrm
+  nsys stats -r cuda_gpu_kern_sum out.nsys-rep
+  ```
+
+- `ncu` の下では、エンジンは最初の検証の窓を取ったところで止まりました。
+  GPU がホストの合図を待つカーネル（`wait_flag_ge`）が、`ncu` がカーネルを 1 つずつ測る間に解けないためと見ています（未確認）。
+  `ncu` はパリティテストやプローブに使い、エンジンには使いません。

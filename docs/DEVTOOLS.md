@@ -81,11 +81,16 @@ The CUDA target needs NVIDIA's CUDA toolkit, which is not free software (Ubuntu:
 
 ```sh
 sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
+sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # HIP, optional
 python3 tools/intel_llvm_build.py --contrib --keep-build
 ```
 
 - ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder).
   Without it the build has no HIP.
+- On Ubuntu, ROCm's metapackages (`rocm`, `rocm-dev`) and `nvidia-cuda-toolkit` cannot be installed together.
+  `librocthrust-dev` (pulled in by `rocm-dev`) and `libthrust-dev` (pulled in by `nvidia-cuda-dev`) both carry `/usr/include/thrust` and conflict, so installing one makes apt remove the other.
+  HIP needs only the four packages above (not rocThrust).
+  Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.
@@ -173,3 +178,31 @@ Reading the GPU's hardware counters (memory bandwidth per kernel) needs three th
 Metrics Discovery read the B70's counters through the xe driver (Linux 7.0, 2026-10-02).
 VTune's `xpu-offload` collection and unitrace both left the engine stalled at its prompt for minutes.
 They are for small programs and probes, not the engine.
+
+### Measuring NVIDIA GPUs (nsys and ncu)
+
+Nsight Systems (`nsys`, time per kernel) and Nsight Compute (`ncu`, memory bandwidth and stall reasons inside a kernel) come with `nvidia-cuda-toolkit` (2023.4 and 2024.1 on Ubuntu 26.04).
+Neither is free software.
+
+- `ncu` reads the GPU's hardware counters, which need root by default (`RmProfilingAdminOnly: 1` in `/proc/driver/nvidia/params`).
+  To open them to users, set the driver option, rebuild the initramfs and reboot.
+  Ubuntu puts the NVIDIA modules in the initramfs and loads them early, so the option file alone has no effect.
+
+  ```sh
+  echo 'options nvidia NVreg_RestrictProfilingToAdminUsers=0' | sudo tee /etc/modprobe.d/nvidia-profiling.conf
+  sudo update-initramfs -u
+  ```
+
+- Ubuntu's `nsys` 2023.4 fails to convert a SYCL program's recording to `.nsys-rep`.
+  Recorded with `--cuda-graph-trace=node` and converted by hand, it reads.
+  The converter does not overwrite an existing `.nsys-rep`, so delete it first.
+
+  ```sh
+  nsys profile -t cuda --cuda-graph-trace=node -o out -f true <program>
+  /usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i out.qdstrm
+  nsys stats -r cuda_gpu_kern_sum out.nsys-rep
+  ```
+
+- Under `ncu` the engine stopped once it had captured its first verify window.
+  The kernel in which the GPU waits for the host (`wait_flag_ge`) presumably cannot finish while `ncu` measures one kernel at a time (unverified).
+  Use `ncu` on the parity tests and probes, not on the engine.
