@@ -1,0 +1,52 @@
+strata generate: GPU Intel(R) Graphics [0xe223], 256 compute units, 30.3 GiB, matrix engines (XMX) yes
+strata generate: PCIe probe: 36.9 GB/s host->device (best of 36.5 36.0 36.8 36.9) -> pcie_frac 0.55 (default 0.55)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: <data>/packs/iq2_xs experts (largest blob 1.51 MB), token embedding IQ4_XS in mapped host memory (322 MiB)
+strata generate: 1466 MiB of weights loaded from <data>/packs/iq2_xs (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 1474.85 MiB of weights
+strata generate: PLE table format IQ4_NL
+strata generate: the SSD is kept awake while rows are read: one page of the table after 100 ms without a read, until 60 s after the last request (STRATA_SSD_KEEPALIVE=0 turns it off)
+strata generate: PLE on, table 320001536 rows of <data>/models/IQ2_XS/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00002-of-00002.gguf
+strata mtp: draft layer loaded, 839 MiB of VRAM (experts 675, dense 111), files read in 0.24 s (3333 MiB/s)
+strata generate: expert arena: one mapping registered for device copies in 2 pieces (the GPU's largest allocation); transparent huge pages requested (madvise); no mlock
+strata generate: loaded 33.02 GiB at 5.04 GiB/s
+strata generate: profile <repo>/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: experimental native Q5_K head, 337715200 bytes
+strata generate: expert cache auto: 26.58 GiB free, 700 MiB reserved (+143 MiB for the draft head) -> 18304 slots
+strata generate: expert cache 18981 slots, 25.50 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 18981 of 18981 slots from the profile; slot 0 verified
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 19 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.0)
+strata generate: sampling greedy
+strata generate: token graph hit path: 18981 resident experts, decided on the device
+strata generate: prompt chunk auto: 31744 tokens
+strata generate: prompt path borrows 10060 cache slots (13.56 GiB)
+strata mtp: draft head over 106299 tokens (137.9 MiB)
+strata generate: 10060 lent slots refilled in 426.1 ms
+strata generate: prefill 31565 tokens in 1 chunks, 16935.2 ms (1863.9 tok/s); experts streamed 15655 (15655 by DMA, host 1071.2 ms), resident 8911; PLE 1116.1 ms
+strata verify: window up to 6 tokens, 56.6 MiB of device buffers
+strata verify: captured the 1-token window (sync ok)
+strata verify: captured the 4-token window (sync ok)
+strata verify: captured the 2-token window (sync ok)
+strata generate: position 31769, 204 tokens, 64 rounds
+strata verify: captured the 3-token window (sync ok)
+speculation              83 rounds of 6, drafts accepted 173 of 227 (0.762), 3.08 tokens per round
+window sizes             T1:5 T2:3 T3:1 T4:74 T5:0 T6:0  (min draft probability 0.50)
+suffix drafts            12 windows, drafts accepted 32 of 36
+accepted per round       0:18 1:7 2:8 3:50 4:0 5:0
+verify window            wait for rings 25.369  pool 2.459  host 0.185  commit 0.082 ms/round; CPU experts 0.80 distinct / 0.91 routed per layer
+host memory              77 major page faults while decoding; 0 MiB of this process in swap
+pool multi               gate/up 1.028  quantize 0.024  down 0.465 ms/round; 36.8 GB/s over the rows phases; CPU pool call 2.455 ms/round
+dispatch                 plan 0.075  activation quantize 0.623  jobs 0.235  run 1.519 ms/round
+adaptive tier            668 experts swapped into the VRAM tier (every 4 rounds, 0.057 ms/round)
+pcie experts             0.00 distinct experts per layer read over PCIe (share 141/256 of the misses)
+mtp                      7.233 ms/round drafting (82 rounds), MTP prompt 58.2 ms, 977 MiB of VRAM
+prompt  : (the ids of prompts.py's 32k.ids, 31566 tokens)
+output  : 40 3172 1151 539 23218 279 12182 5759 310 1423 279 829 7320 4181 14322 1752 13 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 976 1627 73299 1 976 18997 2212 220 17 17566 3464 18710 976 1627 73299 1 976 18997 2830 14 485 450 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 4577 471 49 2212 2830 220 17 17566 3464 18710 735 1901 471 16 15 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 24751 976 18997 471 4120 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248068 271 248069 271 248058 198 27 1628 28 20728 29 198 27 15704 28 5454 29 198 3772 641 471 2721 17038 220 18 471 1267 293 735 1901 471 20 15 198 510 15704 29 198 510 1628 29 198 248059 248046 198 248045 846 198 248068 248046 198 248045 846 198 248068 198 760 12182 4816 310 1132 6435 279 3425 9711 303 279 9640 318 965 14 485 450 5152 11 2830 14 485 450 53683 20123 553 6558 728 1716 1092 3425 2905 13 198 248069 271 248058 198 27 1628 28 20728 29
+decode                   256 tokens in 3131.4 ms  ->  81.75 tok/s
+prefill                  31565 tokens in 17361.3 ms  ->  1818.12 tok/s  (time to first token 17501.1 ms)
