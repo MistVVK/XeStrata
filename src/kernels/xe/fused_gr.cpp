@@ -10,9 +10,11 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
+#include "device_target.hpp"
 
 #include <cstdlib>
 #include <string>
+#include <utility>
 
 namespace strata::kernels {
 namespace {
@@ -101,6 +103,46 @@ struct GrMulti {
     int T;
 };
 
+// m.a[k] for a run-time k.  Outside Intel, one work-item copies m.a[0..7] into local memory at constant indices and
+// the group reads them there: indexed at run time, the by-value kernel argument was copied whole (912 bytes) into
+// every work-item's local memory before the kernel's first instruction (RTX 4070: these kernels 145 us -> 53 us),
+// and a choice among the eight values in registers was folded back into an indexed address of that copy.  Intel
+// indexes the argument directly (a choice in registers slowed the B70's decode by 4%); the table is allocated for
+// every target, as the host code that sizes it is the same.
+class TokArgs {
+public:
+    explicit TokArgs(sycl::handler& h) : tab_(sycl::range<1>(kFusedGrMaxT), h) {}
+    // every work-item of the group, before the first read
+    template <int D>
+    void stage(const GrMulti& m, const sycl::nd_item<D>& it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        if (it.get_local_linear_id() == 0) copy(m, std::make_integer_sequence<int, kFusedGrMaxT>{});
+        sycl::group_barrier(it.get_group());
+#else
+        (void) m; (void) it;
+#endif
+    }
+    const FusedGrArgs& operator()(const GrMulti& m, int k) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) m;
+        return tab_[k];
+#else
+        return m.a[k];
+#endif
+    }
+
+private:
+    template <int... I>
+    void copy(const GrMulti& m, std::integer_sequence<int, I...>) const { (copy_one(m.a[I], tab_[I]), ...); }
+    // field by field: a whole-struct copy went a byte at a time
+    static void copy_one(const FusedGrArgs& s, FusedGrArgs& d) {
+        d.R = s.R; d.R_out = s.R_out; d.apply = s.apply; d.bo_prev = s.bo_prev; d.inj_prev = s.inj_prev;
+        d.w_norm = s.w_norm; d.w_down = s.w_down; d.w_up = s.w_up; d.w_inject = s.w_inject; d.eps = s.eps;
+        d.lo = s.lo; d.rs = s.rs; d.inject_out = s.inject_out; d.mixed = s.mixed;
+    }
+    sycl::local_accessor<FusedGrArgs, 1> tab_;
+};
+
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
@@ -132,12 +174,14 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> part(sycl::range<1>(WARPS), h);
             sycl::local_accessor<float, 1> s_rs(sycl::range<1>(1), h);
+            const TokArgs tok(h);
             h.parallel_for(sycl::nd_range<1>((size_t) n_tok * HC * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                tok.stage(m, it);
                 const sycl::sub_group sg = it.get_sub_group();
                 const int k = (int) it.get_group(0) / HC, c = (int) it.get_group(0) % HC;
                 const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
                 const int warp = (int) sg.get_group_linear_id();
-                const FusedGrArgs& a = m.a[k];
+                const auto& a = tok(m, k);
                 float* xn = m.xn + (size_t) k * D;
                 const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
                 float ss = 0.0f;
@@ -172,9 +216,11 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) WARPS * HC), h);
             sycl::local_accessor<float, 1> s_rs(sycl::range<1>(HC), h);
+            const TokArgs tok(h);
             h.parallel_for(sycl::nd_range<1>((size_t) n_tok * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                tok.stage(m, it);
                 const size_t k = it.get_group(0);
-                const FusedGrArgs& ak = m.a[k];
+                const auto& ak = tok(m, (int) k);
                 norm_step(it, ak, m.xn + k * D, part, s_rs, 0, [&](int t, float v) { ak.rs[t] = v; });
             });
         });
@@ -186,9 +232,11 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // output is bitwise the single-token one; rows and tokens are independent, so splitting them gives the GPU
     // T times the sub-groups (one per row alone left most of it idle) and needs no local staging.
     q.submit([&](sycl::handler& h) {
+        const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (DOWN_BLOCKS + 1) * THREADS, (size_t) n_tok),
                                          sycl::range<2>(THREADS, 1)),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();
             const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
             const int k = (int) it.get_group(1);
@@ -209,10 +257,10 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
             const float sum = warp_sum(sg, acc);
             if (lane != 0) return;
             if (inject_block) {
-                m.a[k].inject_out[row] = sum;
+                tok(m, k).inject_out[row] = sum;
             } else {
                 const float v = sum / (float) HC;
-                m.a[k].lo[row] = v / (1.0f + sycl::exp(-v));
+                tok(m, k).lo[row] = v / (1.0f + sycl::exp(-v));
             }
         });
     });
@@ -220,15 +268,26 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 
     // The up projection for T tokens: each row of w_up read once, lane k runs token k's epilogue.
     const auto e = q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> lo(sycl::range<1>(kFusedGrMaxT * LR), h);
+        // float4: a lane reads its 8 values as two 16-byte loads; one float at a time, the lanes' 32-byte stride put 8 of
+        // them on each local-memory bank (RTX 4070: this kernel 53 us -> 40 us)
+        sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
         sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            tok.stage(m, it);
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
             const int T = m.T;
             const int d0 = (int) it.get_group(0) * UPM_COLS;
-            for (int i = t; i < T * LR; i += THREADS) lo[i] = m.a[i / LR].lo[i % LR];
+            for (int k = 0; k < T; ++k) {   // one choice of m.a[k] a token, not one an element (see tok)
+                const float* src = tok(m, k).lo;
+                for (int j = t; j < LR / 4; j += THREADS) {
+                    const float* p = src + (size_t) j * 4;
+                    lo[k * LR / 4 + j] = sycl::float4(p[0], p[1], p[2], p[3]);
+                }
+            }
             sycl::group_barrier(it.get_group());
+            const auto& my = tok(m, lane < T ? lane : 0);   // this lane's token, for its epilogue
             for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
                 const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
@@ -237,21 +296,22 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
                 bool apply = false;
                 if (lane < T) {
-                    const FusedGrArgs& a = m.a[lane];
-                    rv = a.R[i];
-                    wn = a.w_norm[i];
-                    rsc = a.rs[c];
-                    apply = a.apply;
-                    if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+                    rv = my.R[i];
+                    wn = my.w_norm[i];
+                    rsc = my.rs[c];
+                    apply = my.apply;
+                    if (apply) { bo = my.bo_prev[d0 + dd]; ip = my.inj_prev[c]; }
                 }
                 float mine = 0.0f;
+#pragma unroll
                 for (int k = 0; k < kFusedGrMaxT; ++k) {
                     if (k >= T) break;
-                    float xa[8], xb[8];
-                    for (int e2 = 0; e2 < 8; ++e2) xa[e2] = lo[k * LR + lane * 8 + e2];
+                    const sycl::float4 a0 = lo[k * LR / 4 + lane * 2], a1 = lo[k * LR / 4 + lane * 2 + 1];
+                    const float xa[8] = {a0.x(), a0.y(), a0.z(), a0.w(), a1.x(), a1.y(), a1.z(), a1.w()};
                     float acc = dot8(wa, xa);
                     if (lane < LR / 8 - 32) {
-                        for (int e2 = 0; e2 < 8; ++e2) xb[e2] = lo[k * LR + (32 + lane) * 8 + e2];
+                        const sycl::float4 b0 = lo[k * LR / 4 + (32 + lane) * 2], b1 = lo[k * LR / 4 + (32 + lane) * 2 + 1];
+                        const float xb[8] = {b0.x(), b0.y(), b0.z(), b0.w(), b1.x(), b1.y(), b1.z(), b1.w()};
                         acc += dot8(wb, xb);
                     }
                     acc = warp_sum(sg, acc);
@@ -260,7 +320,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 if (lane < T) {
                     if (apply) {
                         rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
-                        m.a[lane].R_out[i] = rv;
+                        my.R_out[i] = rv;
                     }
                     const float x = rv * wn * rsc;
                     g[(lane * HC + c) * UPM_COLS + dd] = x * sigmoidf_(mine);
@@ -271,7 +331,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 const int k = i / UPM_COLS, col = i - k * UPM_COLS;
                 float s = 0.0f;
                 for (int c = 0; c < HC; ++c) s += g[(k * HC + c) * UPM_COLS + col];
-                m.a[k].mixed[d0 + col] = s / (float) HC;
+                tok(m, k).mixed[d0 + col] = s / (float) HC;
             }
         });
     });
