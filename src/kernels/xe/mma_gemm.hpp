@@ -23,6 +23,10 @@ bool mma_usable(const sycl::queue& q, bool bf16);
 /// STRATA_MMA=1: take mma_gemm before xmx_gemm's own kernels.
 bool mma_forced();
 
+/// Whether mma_usable(q, false) with the FP16 tile shape m x n x k on sg lanes (a kernel written for that shape alone,
+/// such as the prompt attention's portable one, asks this).
+bool mma_shape_is(const sycl::queue& q, int m, int n, int k, int sg);
+
 /// Y[T, N] (row stride ldy) = X[T, K] . W[N, K]^T (`accumulate`: Y +=), N a multiple of 16, K of 32.
 sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                      int64_t K, int64_t ldy, bool accumulate);

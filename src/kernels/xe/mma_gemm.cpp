@@ -408,6 +408,12 @@ bool mma_usable(const sycl::queue& q, bool bf16) {
     return !off && shape(q, bf16) >= 0;
 }
 
+bool mma_shape_is(const sycl::queue& q, int m, int n, int k, int sg) {
+    if (!mma_usable(q, false)) return false;
+    const Shape& s = kShapes[shape(q, false)];
+    return s.m == m && s.n == n && s.k == k && s.sg == sg;
+}
+
 sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                      int64_t K, int64_t ldy, bool accumulate) {
     const int s = shape(q, bf16);
