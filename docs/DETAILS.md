@@ -27,6 +27,35 @@ and the model files on a CPU-attached Gen4 x4 NVMe.
 Other GPUs have not been measured.
 The RTX numbers in Strata's (CUDA) README do not apply to XeStrata.
 
+The tables below are commit `58dbbe5` with the settings setup writes (images off), one code-agent prompt per length and 256 generated tokens.
+MTP speculative decoding is on.
+"262K" is the model's full context window (a 259,942-token prompt).
+One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
+
+### Prompt processing (tokens/s)
+
+| Model | 1K | 4K | 32K | 64K | 128K | 262K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Q2_0** | 726 | 1,116 | 1,834 | 1,532 | 1,393 | 1,122 |
+| **IQ2_XS** | 685 | 1,063 | 1,818 | 1,524 | 1,388 | 1,095 |
+| **IQ3_XXS** | 577 | 862 | 1,759 | 1,488 | 1,356 | 1,099 |
+| **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
+| **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
+
+### Output (tokens/s)
+
+| Model | 1K | 4K | 32K | 64K | 128K | 262K |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Q2_0** | 78.5 | 84.2 | 72.0 | 67.4 | 63.1 | 56.6 |
+| **IQ2_XS** | 86.0 | 96.4 | 81.8 | 73.5 | 76.9 | 62.7 |
+| **IQ3_XXS** | 70.7 | 71.9 | 77.0 | 70.1 | 69.4 | 59.1 |
+| **IQ3_S** | 77.1 | 73.9 | 72.5 | 68.8 | 63.2 | 50.3 |
+| **Coder** | 72.8 | 73.8 | 71.0 | 69.3 | 69.7 | 59.1 |
+
+Output speed depends on the text as well.
+Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
+(IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
+
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),
@@ -35,7 +64,7 @@ IQ2_XS writes 17.6 tokens/s with MTP and reads the 26K-token prompt at 574 token
 On a GPU without XMX the prompt path's products run through DP4a, so reading a prompt takes about 1.6 times as long
 ([record](../bench/results/2026-10-02-dp4a/README.md)).
 
-A table of every model by context length (1K–262K), and the text speed with images on, have not been measured on the B70 yet.
+The text speed with images on has not been measured on the B70 yet.
 
 ### Where the KV cache lives, and its precision
 
