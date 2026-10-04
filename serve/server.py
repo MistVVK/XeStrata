@@ -898,12 +898,18 @@ def engine_args(cfg: dict) -> list[str]:
 def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
     """Opt-in: "conversation_save": "<folder>" in the config has the engine keep its parked conversations there
     across restarts (it needs --conversation-cache-mib in "args"), with "conversation_save_checkpoints",
-    "conversation_save_mib" and "conversation_save_hours" (whole numbers >= 0) for the engine's defaults.  A relative
+    "conversation_save_mib" and "conversation_save_hours" (whole numbers >= 0) for the engine's defaults, and
+    "conversation_save_compress" (true: an engine built with libblosc2 compresses the files).  A relative
     path is the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
     folder = cfg.get("conversation_save")
     if not isinstance(folder, str) or not folder.strip() or "--conversation-save" in args:
         return args
     args = args + ["--conversation-save", folder]
+    compress = cfg.get("conversation_save_compress")
+    if compress is not None and not isinstance(compress, bool):
+        raise ValueError(f'"conversation_save_compress" must be true or false, not {compress!r}')
+    if compress and "--conversation-save-compress" not in args:
+        args += ["--conversation-save-compress"]
     for key in ("conversation_save_checkpoints", "conversation_save_mib", "conversation_save_hours"):
         v = cfg.get(key)
         if v is None:
