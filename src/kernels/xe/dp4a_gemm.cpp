@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <limits>
 
 namespace strata::kernels::xe {
 namespace {
@@ -131,8 +132,15 @@ int64_t fill_rows(const sycl::queue& q, int64_t b70_rows) {
 sycl::event dp4a_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                       int64_t K, int64_t ldy) {
     // 128 x 64 tiles where there are rows enough to fill the GPU with them (20 TOPS against 17 for 64 x 64 on the
-    // wide products, on the B70), 64 x 64 for short prompts
-    const int64_t many = fill_rows(q, 1024);
+    // wide products, on the B70), 64 x 64 for short prompts.  The 128 x 64 tile's 64 accumulators a work-item fit the
+    // registers only where the EU is 16 wide (Xe2): on the 8-wide EUs of Xe-HPG (the A380) they spilled, and it ran at
+    // 0.026 TOPS against 2.5 for 64 x 64 (bench/results/2026-10-04-dg2-dp4a).
+    static const bool wide_eu = [&q] {
+        const sycl::device d = q.get_device();
+        return d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
+               d.get_info<sycl::ext::intel::info::device::gpu_eu_simd_width>() >= 16;
+    }();
+    const int64_t many = wide_eu ? fill_rows(q, 1024) : std::numeric_limits<int64_t>::max();
     if (bf16) {
         if (T >= many) return launch<true, 8, 4>(q, X, W, 0, Y, ldy, nullptr, 1, T, N, K);
         return launch<true, 4, 4>(q, X, W, 0, Y, ldy, nullptr, 1, T, N, K);
