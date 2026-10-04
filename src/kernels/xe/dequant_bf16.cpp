@@ -10,6 +10,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <string>
 
@@ -178,9 +179,32 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
     }
 }
 
+// A work-item's 32 values go out 16 bytes at a time when `out` is 16-byte aligned (its groups then are): stored one
+// value at a time, neighbouring work-items' stores were 64 bytes apart and the RTX 4070 took 300-940 us a matrix.
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+inline uint32_t word(uint16_t v) { return v; }
+inline uint32_t word(H16 v) { return v.v; }
+inline uint32_t word(float v) { return sycl::bit_cast<uint32_t>(v); }
 template <int TYPE, typename T>
 sycl::event dequant_kernel(sycl::queue& q, const uint8_t* blocks, int64_t row_bytes, int64_t row0, int64_t rows,
                            int64_t groups_per_row, T* out) {
+    if (reinterpret_cast<uintptr_t>(out) % 16 == 0) {
+        return q.parallel_for(sycl::range<1>((size_t) (rows * groups_per_row)), [=](sycl::id<1> id) {
+            const int64_t g = (int64_t) id[0];
+            const int64_t r = g / groups_per_row, gi = g % groups_per_row;
+            T v[32];
+            group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, (int) groups_per_row, v);
+            u32x4* o = reinterpret_cast<u32x4*>(out + r * groups_per_row * 32 + gi * 32);
+            if constexpr (sizeof(T) == 4) {
+                for (int i = 0; i < 8; ++i)
+                    o[i] = u32x4{word(v[4 * i]), word(v[4 * i + 1]), word(v[4 * i + 2]), word(v[4 * i + 3])};
+            } else {
+                for (int i = 0; i < 4; ++i)
+                    o[i] = u32x4{word(v[8 * i]) | word(v[8 * i + 1]) << 16, word(v[8 * i + 2]) | word(v[8 * i + 3]) << 16,
+                                 word(v[8 * i + 4]) | word(v[8 * i + 5]) << 16, word(v[8 * i + 6]) | word(v[8 * i + 7]) << 16};
+            }
+        });
+    }
     return q.parallel_for(sycl::range<1>((size_t) (rows * groups_per_row)), [=](sycl::id<1> id) {
         const int64_t g = (int64_t) id[0];
         const int64_t r = g / groups_per_row, gi = g % groups_per_row;
