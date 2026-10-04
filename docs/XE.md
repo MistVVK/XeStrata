@@ -88,8 +88,12 @@ The engine builds in two modes (AGENTS.md, "Free and non-free builds"), chosen b
   Source oneAPI's environment before building.
 
 At start the engine asks the GPU whether it has the matrix combinations its XMX kernels need (FP16 and BF16 8 x 16 x 16).
-Without them it takes the path without XMX and says so once.
-`STRATA_NO_XMX=1` takes that path even when the GPU has XMX.
+Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
+and without that the DP4a path, and says once which.
+The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
+On the A380 a 4096 x 2560 x 2560 FP16 product took 53 ms there against DP4a's 2,041 ms (relative error against FP64 0.0001% against 0.53%).
+`STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
+`STRATA_MMA=1` takes `mma_gemm` even where XMX is there (to check that path on an Intel GPU).
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
 
 ### The engine's parts and tests
