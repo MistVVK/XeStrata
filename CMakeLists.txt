@@ -221,14 +221,14 @@ if(STRATA_ENABLE_XE)
                           "-DSTRATA_LICENSE=contrib")
     endif()
     # intel/llvm 7.1.1's SYCL runtime hands every NVIDIA GPU the first NVIDIA image it finds, whatever its
-    # architecture; tools/intel_llvm_build.py's fix cuda-select-binary (recorded in the install's XESTRATA.json) makes
+    # architecture; tools/intel_llvm_build.py's fix cuda-select-binary-2 (recorded in the install's XESTRATA.json) makes
     # it take the highest one the GPU runs.  A lower architecture's code runs on a newer GPU (the driver compiles its
     # PTX), so without the fix "auto" builds one architecture, the oldest of this PC's NVIDIA GPUs.
     get_filename_component(_strata_sycl_root "${CMAKE_CXX_COMPILER}" DIRECTORY)
     set(_strata_select_binary OFF)
     if(EXISTS "${_strata_sycl_root}/../XESTRATA.json")
       file(READ "${_strata_sycl_root}/../XESTRATA.json" _strata_record)
-      if(_strata_record MATCHES "\"cuda-select-binary\"")
+      if(_strata_record MATCHES "\"cuda-select-binary-2\"")
         set(_strata_select_binary ON)
       endif()
     endif()
@@ -243,7 +243,7 @@ if(STRATA_ENABLE_XE)
       else()
         list(SUBLIST _strata_cuda_built 0 1 _strata_cuda_archs)
         message(STATUS "contrib: NVIDIA code for ${_strata_cuda_archs}, the oldest of this PC's NVIDIA GPUs (the SYCL "
-                       "runtime lacks tools/intel_llvm_build.py's fix cuda-select-binary)")
+                       "runtime lacks tools/intel_llvm_build.py's fix cuda-select-binary-2)")
       endif()
     else()
       strata_cuda_choose("${_strata_cuda_archs}" ON)

@@ -98,7 +98,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
-  Fixed, the runtime hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX with the highest `.target` the GPU runs and refuses those for a newer one (`cuda-select-binary` and others).
+  Fixed, the runtime hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX with the highest `.target` the GPU runs and refuses those for a newer one (`cuda-select-binary-2` and others; in a fatbin, whose PTX CUDA 13 compresses, it reads the entries' architecture field).
   Third, the CUDA adapter left host memory registration (`urUSMImportExp`, `urUSMReleaseExp`) out of its table, as functions doing nothing, so the loader refused it with `UR_RESULT_ERROR_UNINITIALIZED`.
   Fixed, it page-locks the memory with `cuMemHostRegister`, so copies from it are DMA transfers (`cuda-host-register` and another; about 4% faster decoding on an RTX 4070).
   Fourth, the SYCL runtime's table of NVIDIA architectures stops at sm_90, so a newer GPU (an RTX 50, compute capability 12.0) reported no matrix combinations and the engine took no tensor-core path.

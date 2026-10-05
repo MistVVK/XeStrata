@@ -50,8 +50,9 @@ SOURCE_FIXES = [
     # the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture: with code for
     # several architectures (STRATA_CUDA_ARCHS), a GPU older than that image failed and a newer one ran older code.
     # The runtime now hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX
-    # with the highest .target the device runs and refuses those for a newer one.
-    ("cuda-select-binary", "unified-runtime/source/adapters/cuda/device.cpp", """\
+    # with the highest .target the device runs and refuses those for a newer one; in a fatbin (CUDA 13 compresses the
+    # PTX in it) the entries' architecture field.
+    ("cuda-select-binary-2", "unified-runtime/source/adapters/cuda/device.cpp", """\
 UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
     ur_device_handle_t /*hDevice*/, const ur_device_binary_t *pBinaries,
     uint32_t NumBinaries, uint32_t *pSelectedBinary) {
@@ -66,10 +67,33 @@ UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
     }
   }
 """, """\
-// The architecture a PTX image is for, from its ".target sm_XY" line: XY
-// (sm_120: 120), with the suffix a or f in Suffix; -1 where the image is not
-// PTX text.
+// The architecture an image is for: in a fatbin (CUDA 13's fatbinary compresses the PTX in it) its entries'
+// header field, else its PTX text's ".target sm_XY" line: XY (sm_120: 120), with the suffix a or f in Suffix; -1
+// where neither is found.
 static int ptxTargetSm(const unsigned char *Data, size_t Size, char &Suffix) {
+  Suffix = 0;
+  uint32_t Magic = 0;
+  if (Size >= 16)
+    memcpy(&Magic, Data, 4);
+  if (Magic == 0xBA55ED50u) {   // fatbin: a 16-byte header, then entries
+    uint16_t HeaderSize = 0;
+    uint64_t FatSize = 0;
+    memcpy(&HeaderSize, Data + 6, 2);
+    memcpy(&FatSize, Data + 8, 8);
+    int Sm = -1;
+    for (uint64_t Off = HeaderSize; Off + 32 <= Size && Off < HeaderSize + FatSize;) {
+      uint32_t EntryHeader = 0, Arch = 0;
+      uint64_t EntrySize = 0;
+      memcpy(&EntryHeader, Data + Off + 4, 4);
+      memcpy(&EntrySize, Data + Off + 8, 8);
+      memcpy(&Arch, Data + Off + 28, 4);
+      if (EntryHeader == 0)
+        break;
+      Sm = Sm > (int)Arch ? Sm : (int)Arch;
+      Off += EntryHeader + EntrySize;
+    }
+    return Sm;
+  }
   static const char Key[] = ".target sm_";
   const size_t KeyLen = sizeof(Key) - 1, End = Size < 65536 ? Size : 65536;
   for (size_t i = 0; i + KeyLen < End; i++) {

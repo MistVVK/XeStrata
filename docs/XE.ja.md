@@ -102,7 +102,7 @@ Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
 Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
 NVIDIA の GPU があれば、nvidia-smi が報告する各 GPU のアーキテクチャ（`STRATA_CUDA_ARCHS`）のコードと cuBLAS の後端を作り、CUDA ツールキットが要ります。
 世代の違う GPU が混ざっていれば、それぞれが自分の走らせられる最も新しいコードを使います。
-これには `tools/intel_llvm_build.py --contrib` で作った intel/llvm（修正 `cuda-select-binary` 入り）が要り、ほかの intel/llvm では `auto` は最も古いアーキテクチャのコードだけを作ります。
+これには `tools/intel_llvm_build.py --contrib` で作った intel/llvm（修正 `cuda-select-binary-2` 入り）が要り、ほかの intel/llvm では `auto` は最も古いアーキテクチャのコードだけを作ります。
 CUDA ツールキットがいくつもある PC（ディストリビューションの `/usr/lib/cuda` と NVIDIA の `/usr/local/cuda-X.Y` など）では、clang は `/usr/local/cuda` を、CMake の FindCUDA は PATH の `nvcc` を先に取り、GPU のコードと cuBLAS が別の版になっていました。
 `STRATA_CUDA_PATH` の既定 `auto` は、見つかったツールキット（`CUDA_PATH`・`CUDA_HOME`・`CUDA_ROOT`、`/usr/local/cuda-*`、`/opt/cuda`、`/usr/lib/cuda`、PATH の `nvcc`）を1つずつ試し、この PC の NVIDIA の GPU のうち多くにコードを作れるもの、次にその GPU により新しいアーキテクチャのコードを作れるもの、次に cuBLAS を持つもの、次に新しい版を選びます（`cmake/StrataCuda.cmake`）。
 GPU のコードと oneMath の cuBLAS は、選んだ1つを使います。cuBLAS のないツールキットでは cuBLAS の後端を作らず、密な積は自前のカーネルになります。
