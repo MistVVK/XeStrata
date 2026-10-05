@@ -82,6 +82,7 @@ function showTab(name) {
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
+  if (tab === "about") loadConfig();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -396,6 +397,62 @@ function renderMcp() {
       `</div>`;
   }).join("");
 }
+
+// ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
+// A few documented keys of the run config (xestrata-<model>.json), for every client, from the next start on.  The
+// server lists them, checks every value and keeps every other key of the file as it is.
+let cfgKeys = [];
+async function loadConfig() {
+  let r;
+  try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
+  if (!r.ok) { $("cfg-card").hidden = true; return; }       // no run config, an older server, or no key yet
+  const c = await r.json();
+  cfgKeys = c.keys || [];
+  $("cfg-file").textContent = c.file || "";
+  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
+    const id = `cfg-${i}`, v = k.value;
+    let input;
+    if (k.kind === "bool" || k.kind === "enum") {
+      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+      const cur = v == null ? "" : String(v);
+      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
+        opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
+    } else {
+      const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
+      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
+        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
+    }
+    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+  }).join("");
+  $("cfg-card").hidden = false;
+}
+function configValue(k, el) {
+  const s = el.value.trim();
+  if (s === "") return null;
+  if (k.kind === "bool") return s === "true";
+  if (k.kind === "number") return Number(s);
+  return s;                                         // enum, or names (the server splits them at commas)
+}
+$("cfg-save").addEventListener("click", async () => {
+  const set = {};
+  cfgKeys.forEach((k, i) => {
+    const v = configValue(k, $(`cfg-${i}`));
+    const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
+    if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
+  });
+  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  try {
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
+    const b = await r.json();
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+    $("cfg-msg").textContent = b.changed.length
+      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
+    loadConfig();
+  } catch (e) {
+    $("cfg-msg").textContent = "";
+    toast("error", "Not saved", String(e.message || e), 6000);
+  }
+});
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {

@@ -488,6 +488,11 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   (each with its own `id`, and in the model's `aliases`), like llama-server's `--alias`.
   A request naming one is answered under that name.
   Any other name is still served.
+- **Model settings in the web page (upstream #564).** The About tab's Model settings card shows and changes a few keys of `xestrata-<model>.json`:
+  the `sampling` defaults (temperature, top_p, top_k, min_p), `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `--vram-reserve-mib`.
+  An empty field removes the key (its default).
+  Every other key of the file stays as it is, the earlier file is kept as `xestrata-<model>.json.bak`, and the model uses the change from its next start.
+  Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --setup --host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
@@ -525,7 +530,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Any other page, and `Origin: null`, gets **403**.
   Clients that send no `Origin` (curl, the OpenAI and Anthropic SDKs, other servers) are not affected.
   With an API key, the key decides.
-  `POST /unload` and `POST /load` take `Content-Type: application/json` from XeStrata's own page (or no `Origin`), like `/settings`.
+  `POST /unload`, `POST /load` and `POST /config` take `Content-Type: application/json` from XeStrata's own page (or no `Origin`), like `/settings`.
 - **One line per request.** `STRATA_REQUEST_LINES=1` in the server's environment prints each finished request's numbers from the engine's log
   (`request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y tok/s`),
   for a supervisor that only sees the server's output.

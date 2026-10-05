@@ -498,6 +498,11 @@ print(r.choices[0].message.content)
   それぞれが自分の `id` を持ち、モデルの `aliases` にも入ります（llama-server の `--alias` と同じ）。
   別名で呼ばれた要求には、その名前で答えます。
   ほかの名前でも、これまでどおり答えます。
+- **ウェブのページのモデルの設定（upstream #564）**: About のタブの Model settings のカードで、`xestrata-<model>.json` のいくつかのキーを見て変えられます。
+  `sampling` の既定（temperature、top_p、top_k、min_p）、`reasoning_budget_tokens`、`fit_max_tokens`、`anthropic_thinking`、`effort_position`、`aliases`、`idle_unload_s`、`lazy_load`、`engine_silence_s`、`api_monitor`、`open_browser`、`--vram-reserve-mib` です。
+  空の欄はそのキーを消します（既定に戻ります）。
+  ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
+  保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --setup --host 0.0.0.0 --api-key 長い秘密の文字列` で setup するか、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
@@ -535,7 +540,7 @@ print(r.choices[0].message.content)
   それ以外のページと `Origin: null` には **403** を返します。
   `Origin` を送らないクライアント（curl、OpenAI と Anthropic の SDK、ほかのサーバー）には関係ありません。
   API キーがあれば、キーで決まります。
-  `POST /unload` と `POST /load` は、`/settings` と同じく、XeStrata 自身のページ（または `Origin` なし）からの `Content-Type: application/json` を受け付けます。
+  `POST /unload`、`POST /load`、`POST /config` は、`/settings` と同じく、XeStrata 自身のページ（または `Origin` なし）からの `Content-Type: application/json` を受け付けます。
 - **要求ごとに 1 行**: server の環境に `STRATA_REQUEST_LINES=1` を設定すると、終わった要求ごとに、エンジンのログの数字を 1 行で出します
   （`request prompt P cached C output O prompt_read R ms total S ms prefill X tok/s decode Y tok/s`）。
   server の出力しか見ない監視のプログラム向けです。

@@ -166,6 +166,14 @@ SPDX-License-Identifier: LGPL-3.0-or-later
         <p class="muted small">Chats, settings and the key are kept in this browser only.
           <a href="https://github.com/MistVVK/XeStrata" target="_blank" rel="noopener noreferrer">XeStrata on GitHub</a></p>
       </div>
+      <div class="st-card cfg-card" id="cfg-card" hidden>
+        <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
+        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
+          take effect the next time the model starts (close Strata's window and start it again).</p>
+        <form class="cfg-form" id="cfg-form"></form>
+        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
+          <span class="muted small" id="cfg-msg" role="status"></span></div>
+      </div>
     </div>
   </section>
 </main>
