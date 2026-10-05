@@ -1764,6 +1764,8 @@ def settings_summary(cfg: dict, port=None) -> str:
     srv = [f"{cfg.get('host', '127.0.0.1')}:{port or cfg.get('port', 8095)}"]
     if cfg.get("api_key"):
         srv.append("api key set")
+    if cfg.get("open_browser") is False:               # #609
+        srv.append("no browser")
     for k in ("gpu", "draft_vocab", "fit_max_tokens", "reasoning_budget_tokens", "anthropic_thinking"):
         if cfg.get(k) is not None:
             v = cfg[k]
@@ -1773,8 +1775,9 @@ def settings_summary(cfg: dict, port=None) -> str:
 
 
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
-          layer_split=None, reserve: int | None = None) -> int:
-    """reserve: --vram-reserve-mib given on this start, kept in the model's args from now on (#493)."""
+          layer_split=None, reserve: int | None = None, browser: bool | None = None) -> int:
+    """reserve: --vram-reserve-mib given on this start, kept in the model's args from now on (#493).  browser:
+    --no-browser (False) or --browser (True) given on this start, kept in the config's "open_browser" (#609)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -1787,6 +1790,10 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args += ["--vram-reserve-mib", str(reserve)]
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+    if browser is not None and (cfg.get("open_browser") is not False) != browser:
+        cfg["open_browser"] = browser
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok("saved for this model: " + ("the browser opens" if browser else "no browser"))
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
@@ -1803,6 +1810,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     elif usable:
         g = next((x for x in usable if x["pci"] == cfg.get("gpu_pci")), usable[0])
         ok("GPU: " + gpu_name(g))
+    open_browser = open_browser and cfg.get("open_browser") is not False   # #609: "open_browser": false
     if open_browser:
         cmd.append("--open")
     gb = 0.0
@@ -1823,7 +1831,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
         say(f"  Starting {cfg.get('model_name', 'the model')}: it loads {size} into RAM and locks part of it for the "
             "GPU.")
     say("  While it does, YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES (longer the first time after a")
-    say("  restart). That is normal: please wait and don't close this window - the browser opens when it is ready.")
+    say("  restart). That is normal: please wait and don't close this window - " + (
+        "the browser opens when it is ready." if open_browser else "the server says when it is ready."))
     say("  Later, closing this window stops the model.")
     say("  " + "-" * 100)
     for n, line in enumerate(textwrap.wrap(f"Settings ({cfg_path.name}): {settings_summary(cfg, port)}", 100,
@@ -1899,7 +1908,7 @@ def warm_up(cfg_path: Path) -> None:
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
-# user's - a "sampling" or "mcp_servers" block, "cors_origins" - and is kept when setup runs again, as
+# user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
                         "draft_vocab", "vision"})
@@ -1972,9 +1981,10 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
             if dropped else ""))
 
 
-def write_run_script(model, cfg_path, port):
+def write_run_script(model, cfg_path, port, open_browser=True):
+    """run-<model>.sh: the server with this config; `open_browser` False (--no-browser) leaves --open out."""
     serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
-             "--port", str(port), "--open"]
+             "--port", str(port)] + (["--open"] if open_browser else [])
     script = ROOT / f"run-{model.lower()}.sh"
     script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
                       encoding="utf-8")
@@ -2052,6 +2062,11 @@ def main() -> int:
     ap.add_argument("--layer-split", help=argparse.SUPPRESS)
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
+    ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
+                    help="do not open the chat page in the browser when the model is ready (for a harness or an app "
+                         "that uses the API; remembered for this model, also in run-<model>.sh)")
+    ap.add_argument("--browser", dest="browser", action="store_true",
+                    help="open the chat page again when the model is ready (the default; undoes --no-browser)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
     ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this folder, "
                                        "remembered for every Strata folder on this PC")
@@ -2166,11 +2181,12 @@ def main() -> int:
             pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
         calibrate_config(pick_cfg)
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                                          reserve=a.vram_reserve_mib)
+                                          reserve=a.vram_reserve_mib, browser=a.browser)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
-            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split, reserve=a.vram_reserve_mib)
+            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split, reserve=a.vram_reserve_mib,
+                         browser=a.browser)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -2178,7 +2194,7 @@ def main() -> int:
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                         reserve=a.vram_reserve_mib)
+                         reserve=a.vram_reserve_mib, browser=a.browser)
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -2607,6 +2623,8 @@ def main() -> int:
         cfg["host"] = a.host
     if a.api_key:
         cfg["api_key"] = a.api_key
+    if a.browser is not None:                          # #609: only when given (else an earlier choice is carried over)
+        cfg["open_browser"] = a.browser
     if vision != "none":
         vt = vision_tokens(a.vision_tokens, vision, ROOT / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
@@ -2634,7 +2652,7 @@ def main() -> int:
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
-    script = write_run_script(tag, cfg_path, port)
+    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it

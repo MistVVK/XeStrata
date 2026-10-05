@@ -255,6 +255,7 @@ Engine options you added to `"args"` by hand are not carried over: setup names t
 ./setup.sh --port 8081                      another port
 ./setup.sh --gpu 1                          another GPU (numbered as --check lists them; the default has the most VRAM)
 ./setup.sh --vram-reserve-mib 2048          leave 2 GB of VRAM free for other programs (remembered)
+./setup.sh --no-browser                     do not open the chat page when the model is ready (remembered; --browser undoes it)
 ./setup.sh --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
 ./setup.sh --check                          only check this PC
 ```
