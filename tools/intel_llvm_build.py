@@ -46,6 +46,121 @@ SOURCE_FIXES = [
     (f"{a}-sync-points", f"unified-runtime/source/adapters/{a}/command_buffer.cpp",
      "  auto SyncPoints = CommandBuffer->SyncPoints;\n", "  const auto &SyncPoints = CommandBuffer->SyncPoints;\n")
     for a in ("cuda", "hip")
+] + [
+    # the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture: with code for
+    # several architectures (STRATA_CUDA_ARCHS), a GPU older than that image failed and a newer one ran older code.
+    # The runtime now hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX
+    # with the highest .target the device runs and refuses those for a newer one.
+    ("cuda-select-binary", "unified-runtime/source/adapters/cuda/device.cpp", """\
+UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
+    ur_device_handle_t /*hDevice*/, const ur_device_binary_t *pBinaries,
+    uint32_t NumBinaries, uint32_t *pSelectedBinary) {
+
+  // Look for an image for the NVPTX64 target, and return the first one that is
+  // found
+  for (uint32_t i = 0; i < NumBinaries; i++) {
+    if (strcmp(pBinaries[i].pDeviceTargetSpec,
+               UR_DEVICE_BINARY_TARGET_NVPTX64) == 0) {
+      *pSelectedBinary = i;
+      return UR_RESULT_SUCCESS;
+    }
+  }
+""", """\
+// The architecture a PTX image is for, from its ".target sm_XY" line: XY
+// (sm_120: 120), with the suffix a or f in Suffix; -1 where the image is not
+// PTX text.
+static int ptxTargetSm(const unsigned char *Data, size_t Size, char &Suffix) {
+  static const char Key[] = ".target sm_";
+  const size_t KeyLen = sizeof(Key) - 1, End = Size < 65536 ? Size : 65536;
+  for (size_t i = 0; i + KeyLen < End; i++) {
+    if (memcmp(Data + i, Key, KeyLen) != 0)
+      continue;
+    size_t j = i + KeyLen;
+    int Sm = -1;
+    for (; j < End && Data[j] >= '0' && Data[j] <= '9'; j++)
+      Sm = (Sm < 0 ? 0 : Sm * 10) + (Data[j] - '0');
+    Suffix = j < End && (Data[j] == 'a' || Data[j] == 'f') ? Data[j] : 0;
+    return Sm;
+  }
+  return -1;
+}
+
+UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
+    ur_device_handle_t hDevice, const ur_device_binary_t *pBinaries,
+    uint32_t NumBinaries, uint32_t *pSelectedBinary) {
+
+  // Look for an image for the NVPTX64 target.  Where the SYCL runtime passes
+  // the image itself (a {pointer, size} pair in pNext), take the PTX with the
+  // highest .target the device runs (sm_XYa: that architecture only, sm_XYf:
+  // its family) and refuse one for a newer architecture; otherwise the first
+  // image found.
+  int Major = 0, Minor = 0;
+  UR_CHECK_ERROR(cuDeviceGetAttribute(
+      &Major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, hDevice->get()));
+  UR_CHECK_ERROR(cuDeviceGetAttribute(
+      &Minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, hDevice->get()));
+  const int DeviceSm = Major * 10 + Minor;
+  int Best = -1, BestSm = -1, Unknown = -1;
+  for (uint32_t i = 0; i < NumBinaries; i++) {
+    if (strcmp(pBinaries[i].pDeviceTargetSpec,
+               UR_DEVICE_BINARY_TARGET_NVPTX64) != 0)
+      continue;
+    using BinaryBlobTy = std::pair<const unsigned char *, size_t>;
+    const auto *Blob = static_cast<const BinaryBlobTy *>(pBinaries[i].pNext);
+    char Suffix = 0;
+    const int Sm = Blob ? ptxTargetSm(Blob->first, Blob->second, Suffix) : -1;
+    if (Sm < 0) {
+      if (Unknown < 0)
+        Unknown = (int)i;
+      continue;
+    }
+    const bool Runs = Suffix == 'a'   ? Sm == DeviceSm
+                      : Suffix == 'f' ? Sm / 10 == Major && Sm <= DeviceSm
+                                      : Sm <= DeviceSm;
+    if (Runs && Sm > BestSm) {
+      Best = (int)i;
+      BestSm = Sm;
+    }
+  }
+  if (Best >= 0 || Unknown >= 0) {
+    *pSelectedBinary = (uint32_t)(Best >= 0 ? Best : Unknown);
+    return UR_RESULT_SUCCESS;
+  }
+"""),
+    ("cuda-binary-to-adapter", "sycl/source/detail/program_manager/program_manager.cpp", """\
+  ur_device_binary_t UrBinary{};
+  UrBinary.pDeviceTargetSpec = getUrDeviceTarget(DevBin.DeviceTargetSpec);
+""", """\
+  ur_device_binary_t UrBinary{};
+  UrBinary.pDeviceTargetSpec = getUrDeviceTarget(DevBin.DeviceTargetSpec);
+  // the CUDA adapter refuses PTX for a newer architecture than the device's
+  std::pair<const unsigned char *, size_t> Blob{
+      DevBin.BinaryStart, std::distance(DevBin.BinaryStart, DevBin.BinaryEnd)};
+  if (DeviceImpl.getBackend() == backend::ext_oneapi_cuda)
+    UrBinary.pNext = &Blob;
+"""),
+    ("cuda-binaries-to-adapter", "sycl/source/detail/program_manager/program_manager.cpp", """\
+  // Pass extra information to the HIP adapter to aid in binary selection. We
+  // pass it the raw binary as a {ptr, length} pair.
+  std::vector<std::pair<const unsigned char *, size_t>> UrBinariesStorage;
+  if (DeviceImpl.getBackend() == backend::ext_oneapi_hip)
+    UrBinariesStorage.reserve(NumImgs);
+""", """\
+  // Pass extra information to the HIP and CUDA adapters to aid in binary
+  // selection. We pass it the raw binary as a {ptr, length} pair.
+  std::vector<std::pair<const unsigned char *, size_t>> UrBinariesStorage;
+  const bool PassBinaries = DeviceImpl.getBackend() == backend::ext_oneapi_hip ||
+                            DeviceImpl.getBackend() == backend::ext_oneapi_cuda;
+  if (PassBinaries)
+    UrBinariesStorage.reserve(NumImgs);
+"""),
+    ("cuda-binaries-to-adapter-2", "sycl/source/detail/program_manager/program_manager.cpp", """\
+    if (DeviceImpl.getBackend() == backend::ext_oneapi_hip) {
+      UrBinariesStorage.emplace_back(
+""", """\
+    if (PassBinaries) {
+      UrBinariesStorage.emplace_back(
+"""),
 ]
 
 
@@ -237,7 +352,9 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            missing = [f[0] for f in SOURCE_FIXES if f[0] not in have.get("fixes", [])]
+            # the CUDA and HIP adapters' fixes do not ask the free toolchain, which has neither, to be built again
+            missing = [f[0] for f in SOURCE_FIXES if f[0] not in have.get("fixes", [])
+                       and (a.contrib or not f[0].startswith(("cuda-", "hip-")))]
             if not have.get("zstd"):
                 missing.append("zstd")
             if not missing:

@@ -94,8 +94,11 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
 - v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
 - The script applies fixes the release lacks (`SOURCE_FIXES`) to the sources before building, and records them in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There is one fix now: the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
-  intel/llvm's `sycl` branch does not have it fixed either (2026-10-05).
+  There are two fixes now, neither fixed in intel/llvm's `sycl` branch either (2026-10-05).
+  First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
+  Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
+  With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
+  Fixed, the runtime hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX with the highest `.target` the GPU runs and refuses those for a newer one (`cuda-select-binary` and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
