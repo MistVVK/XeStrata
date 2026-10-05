@@ -414,6 +414,11 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The wrap-up is part of the thinking the client sees and counts as output tokens.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
   Off by default; Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **Changing the effort without reading the prompt again (opt-in).** The effort's instruction is the first thing in the prompt, so a request that only changes the effort (an agent's "think harder" switch, `none` for a quick tool step) reads the whole conversation again.
+  `"effort_position": "end"` in `xestrata-<model>.json` renders every request's prompt start as the default effort's and puts a `low` / `medium` effort in a short system turn right before the answer (no thinking: the empty thinking block, as always).
+  The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
+  The default (`"start"`) prompt is unchanged.
+  The model sees a level that is not the default in another place than it was trained with; how well it follows it there is not measured yet.
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
