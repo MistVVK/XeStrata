@@ -124,6 +124,8 @@ Verifier::~Verifier() {
     if (cs_) strata::gpu::stream_sync(cs_);
     for (auto& e : exec_)
         if (e) strata::gpu::graph_destroy(e);
+    for (auto& e : exec_res_)
+        if (e) strata::gpu::graph_destroy(e);
     for (auto& v : segs_)
         for (auto* e : v) strata::gpu::graph_destroy(e);
     if (commit_exec_) strata::gpu::graph_destroy(commit_exec_);
@@ -320,13 +322,18 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
         device_plan_ = v != nullptr && std::atoi(v) != 0;
     }
-    if (device_plan_) {
+    {
+        const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
+        res_graph_ = hits.h_res != nullptr && hits.d_res != nullptr &&
+                     (v == nullptr || std::strtol(v, nullptr, 10) != 0);
+    }
+    if (device_plan_ || res_graph_) {
         bool ok2 = strata::gpu::alloc_device((void**) &skip_, 64) && strata::gpu::memset(skip_, 0, 64);
         if (ok2 && hits.slot_off != nullptr && hits.n_slots > 0) {
             ok2 = strata::gpu::alloc_device((void**) &slot_off_d_, (size_t) hits.n_slots * sizeof(unsigned long long)) &&
                   strata::gpu::copy(slot_off_d_, hits.slot_off, (size_t) hits.n_slots * sizeof(unsigned long long));
         }
-        if (!ok2) { device_plan_ = false; }
+        if (!ok2) { device_plan_ = false; res_graph_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
@@ -642,13 +649,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_)   // E-6: every routed expert resident: this group's plan without the host
+        if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                           (uint32_t) ((l - lb_) * G + grp + 1), cs);
-        doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
-                         m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+        if (!recording_res_)   // the resident graph asks the host nothing
+            doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                             m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
         stamp(l, 17, grp);
         {
             const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
@@ -686,7 +694,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-        if (segmented_) {     // the host launched this segment after the plan was published
+        if (recording_res_) {
+            // the plan resident_plan built in pre(l)
+        } else if (segmented_) {     // the host launched this segment after the plan was published
             if (device_plan_)
                 copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip_ + grp, ring,
                                             cs);
@@ -727,30 +737,35 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         };
         grouped(p_ptr, p_start, p_counts, cap);
         stamp(l, 20, grp);
-        if (segmented_) {}                                   // landed before the host launched this segment
-        else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-        else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-            const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
-        }
-        stamp(l, 21, grp);
-        grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
-        stamp(l, 22, grp);
-        if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
-            if (!segmented_) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+        if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
-            if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
-            stamp(l, 23, grp);
-            if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-                copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
-                                      p_dst, p_counts + 1, cs);
-            else
-                copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            if (segmented_) {}                                   // landed before the host launched this segment
+            else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            }
+            stamp(l, 21, grp);
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
+            stamp(l, 22, grp);
+            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+                if (!segmented_) wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
+                copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
+                                         skip_ + grp, ring, cs);
+            } else {
+                if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
+                stamp(l, 23, grp);
+                if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                    copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
+                                          p_dst, p_counts + 1, cs);
+                else
+                    copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+            }
         }
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
@@ -775,7 +790,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
 
     // segmented: a graph ends where the host must answer a ring (before each group's experts)
     auto cut = [&]() -> bool {
-        if (!segmented_) return true;
+        if (!segmented_ || recording_res_) return true;
         strata::gpu::Graph* e = nullptr;
         if (!strata::gpu::end_capture(cs, &e)) {
             err = std::string("verify: segment capture: ") + strata::gpu::last_error();
@@ -902,6 +917,43 @@ bool Verifier::capture(int T, std::string& err) {
     return true;
 }
 
+bool Verifier::all_resident() const {
+    const int64_t ne = g_->n_expert;
+    for (int64_t i = lb_ * ne; i < le_ * ne; ++i)
+        if (hits_.h_res[i] < 0) return false;
+    return true;
+}
+
+bool Verifier::capture_res(int T, std::string& err) {
+    if (exec_res_[T] != nullptr) return true;
+    if (!strata::gpu::begin_capture(cs_)) {
+        err = "verify: begin capture failed";
+        return false;
+    }
+    std::string rerr;
+    bool ok = false;
+    recording_res_ = true;
+    try {
+        ok = record_window(T, cs_, rerr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: window capture: ") + e.what();
+    }
+    recording_res_ = false;
+    if (!ok) {
+        strata::gpu::abandon_capture(cs_);
+        err = rerr;
+        return false;
+    }
+    if (!strata::gpu::end_capture(cs_, &exec_res_[T])) {
+        err = std::string("verify: end capture: ") + strata::gpu::last_error();
+        return false;
+    }
+    const bool synced = strata::gpu::stream_sync(cs_);
+    std::fprintf(stderr, "strata verify: captured the %d-token window with every expert resident (sync %s)\n", T,
+                 synced ? "ok" : strata::gpu::last_error());
+    return true;
+}
+
 bool Verifier::capture_commit(std::string& err) {
     if (commit_exec_ != nullptr) return true;
     using namespace strata::kernels;
@@ -972,7 +1024,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (!capture(T, err) || !capture_commit(err)) return false;
+    const bool res = res_graph_ && all_resident();
+    if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -1005,7 +1058,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
-    const bool le = strata::gpu::graph_launch(segmented_ ? segs_[T][0] : exec_[T], cs_);
+    const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : segmented_ ? segs_[T][0] : exec_[T], cs_);
     if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
     (void) strata::gpu::stream_idle(cs_);
     VDBG("launched\n");
@@ -1013,7 +1066,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    for (int64_t k = 0; k < (le_ - lb_) * G; ++k) {
+    for (int64_t k = 0; !res && k < (le_ - lb_) * G; ++k) {   // the resident graph rings nothing
         const int64_t l = lb_ + k / G;
         const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);

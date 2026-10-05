@@ -51,6 +51,8 @@ struct VerifyHits {
     const uint64_t* slot_off = nullptr;   ///< E-6: host per-slot offsets when slots differ in size (null: slot * blob)
     int64_t n_slots = 0;                  ///< E-6: how many (for the device copy)
     int64_t blob = 0;
+    const int32_t* h_res = nullptr;       ///< host [n_layers * n_expert] slot or -1: a window whose layers have every
+                                          ///< expert resident runs without the host (null: never)
 };
 
 class Verifier {
@@ -174,6 +176,14 @@ private:
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
+    // Every expert of the verifier's layers resident (hits.h_res): the window runs as one graph that plans each
+    // layer's experts on the device and never asks the host - no doorbell, flag waits, PCIe or CPU share (upstream
+    // cfd3b72's zero-doorbell graph).  STRATA_VERIFY_RESIDENT_GRAPH=0: off.
+    bool res_graph_ = false;
+    bool recording_res_ = false;
+    strata::gpu::Graph* exec_res_[9] = {};
+    bool all_resident() const;
+    bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;

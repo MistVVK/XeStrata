@@ -401,6 +401,9 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   The verifier checks that at start (`doorbell_visible`).
   Where it fails (the UHD 770), each window runs as segments the host launches one after another, with no waiting kernel: the same results, slower.
   `STRATA_VERIFY_SEGMENTED=1` / `0` forces either.
+  A window whose verifier layers have every expert in VRAM runs as another graph that plans the experts on the GPU and never waits for the host (upstream cfd3b72; no segments either).
+  On the B70 the Coder IQ1_M went from 28.0 to 28.5 tok/s with the same logits.
+  `STRATA_VERIFY_RESIDENT_GRAPH=0` turns it off.
 - **Lifetimes**: every source, destination and reader stays alive until its final consumer completes.
   A copy-complete event alone does not allow reuse while a kernel still reads the destination.
   Arena destruction drains every owned queue before freeing USM or releasing the registration.
