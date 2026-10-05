@@ -753,12 +753,12 @@ void dq_iq2_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* q2 = x[ibs].qs + 4 * ib;
     const uint8_t aux8 = (uint8_t) (q2[il / 2] >> (8 * (il % 2)));
-    const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + aux8);
+    const uint64_t grid = iq2xxs_grid[aux8];   // whole, and the signs computed: as dq_iq3_xxs
     const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
     const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
-    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -767,11 +767,11 @@ void dq_iq2_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int64_t il = tid % 4, ib = tid / 4;          // neighbours in one sub-block: contiguous writes
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* q2 = x[ibs].qs + 4 * ib;
-    const uint8_t* grid = (const uint8_t*) (iq2xs_grid + (q2[il] & 511));
+    const uint64_t grid = iq2xs_grid[q2[il] & 511];   // whole, and the signs computed: as dq_iq3_xxs
     const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
-    const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+    const uint32_t signs = ksigns_byte((uint8_t) (q2[il] >> 9));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -779,11 +779,11 @@ void dq_iq2_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_iq2_s* x = (const block_iq2_s*) vx;
     const int64_t il = tid % 4, ib = tid / 4;          // neighbours in one sub-block: contiguous writes
     const int y = (int) (32 * ib + 8 * il);
-    const uint8_t* grid = (const uint8_t*) (iq2s_grid + (x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)));
+    const uint64_t grid = iq2s_grid[x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)];   // whole
     const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
-    const uint8_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
+    const uint32_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -793,15 +793,17 @@ void dq_iq3_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint8_t* q3 = x[ibs].qs + 8 * ib;
     const uint16_t* gas = (const uint16_t*) (x[ibs].qs + QK_K / 4) + 2 * ib;
-    const uint8_t* grid1 = (const uint8_t*) (iq3xxs_grid + q3[2 * il + 0]);
-    const uint8_t* grid2 = (const uint8_t*) (iq3xxs_grid + q3[2 * il + 1]);
+    // the grid words whole and the signs computed (ksigns_byte is ksigns_iq2xs): a load a byte of the grid and the
+    // tables' lookups made the dequant wait on loads (Arc A380: IQ3_XXS 16 experts 2.69 ms)
+    const uint32_t grid1 = iq3xxs_grid[q3[2 * il + 0]];
+    const uint32_t grid2 = iq3xxs_grid[q3[2 * il + 1]];
     const uint32_t aux32 = gas[0] | ((uint32_t) gas[1] << 16);
     const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
-    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
+    const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
-        v[j + 4] = d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -811,14 +813,14 @@ void dq_iq3_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int64_t il = tid % 4, ib = tid / 4;          // neighbours in one sub-block: contiguous writes
     const int y = (int) (32 * ib + 8 * il);
     const uint8_t* qs = x[ibs].qs + 8 * ib;
-    const uint8_t* grid1 = (const uint8_t*) (iq3s_grid + (qs[2 * il + 0] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 256)));
-    const uint8_t* grid2 = (const uint8_t*) (iq3s_grid + (qs[2 * il + 1] | ((x[ibs].qh[ib] << (7 - 2 * il)) & 256)));
+    const uint32_t grid1 = iq3s_grid[qs[2 * il + 0] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 256)];   // whole words
+    const uint32_t grid2 = iq3s_grid[qs[2 * il + 1] | ((x[ibs].qh[ib] << (7 - 2 * il)) & 256)];
     const float d = (float) x[ibs].d * (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
-    const uint8_t signs = x[ibs].signs[4 * ib + il];
+    const uint32_t signs = x[ibs].signs[4 * ib + il];
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
-        v[j + 4] = d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -900,12 +902,9 @@ void dq_q2_0(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_q2_0* x = (const block_q2_0*) vx + ibs * 4;
     const int b = tid / 8, part = tid % 8;          // block 0..3, 8 values each
     const float d = (float) x[b].d;
+    const uint32_t codes = ((const uint16_t*) x[b].qs)[part];   // the 8 values' 2-bit codes, the lowest first
     float v[8];
-    for (int j = 0; j < 8; ++j) {
-        const int i = part * 8 + j;
-        const int code = (x[b].qs[i / 4] >> ((i % 4) * 2)) & 3;
-        v[j] = d * (float) (code - 1);
-    }
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) ((int) ((codes >> (2 * j)) & 3) - 1);
     o.template put<8>(b * 64 + part * 8, v);
 }
 
