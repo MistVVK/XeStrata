@@ -1957,6 +1957,58 @@ def warm_up(cfg_path: Path) -> None:
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
+PARALLEL_MAX = 8               # #465: the engine's batch window holds at most 8 requests
+PARALLEL_SHARE = 0.2           # #465: the slots' sessions may take this share of the VRAM the expert cache would hold
+PARALLEL_HELD = 0.5            # #465: ... and only where the cache still holds this share of the experts beside them
+PARALLEL_COST_NOTE = ("parallel N reduces waiting for several users but costs about 10-25% speed per request on this "
+                      "card")
+
+
+def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
+    """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
+    positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured (upstream): 0.56 GiB at
+    32K int8."""
+    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
+    return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
+
+
+def parallel_recommend(vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> int:
+    """#465: how many requests at once ("parallel") to recommend: 0 = none (one at a time).  Only where the experts
+    mostly fit in VRAM - the expert cache (the card's VRAM less ~5 GB) still holds PARALLEL_HELD of the model's experts
+    beside the slots' sessions, which take at most PARALLEL_SHARE of it, up to 4.  Where the experts mostly run on the
+    CPU a batch reads about as many experts as the requests one by one and every slot's VRAM is expert cache lost
+    (upstream measured a 12 GB card: a request alone 11-24% slower with 2-4 slots; docs/BATCHING.md)."""
+    cache_gb = max(0.0, vram_gb - 5)
+    slot = parallel_slot_gb(ctx, kv, streaming)
+    best = 0
+    for n in (2, 3, 4):
+        if n * slot <= PARALLEL_SHARE * cache_gb and (cache_gb - n * slot) >= PARALLEL_HELD * arena_gb:
+            best = n
+    return best
+
+
+def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, kv: str, streaming: bool) -> list[str]:
+    """#465: what setup says about "parallel": the recommendation (or, where it would cost speed, why it is left at
+    one), or how the asked count compares with it (kept as asked: recommend, never force)."""
+    rec = parallel_recommend(vram_gb, arena_gb, ctx, kv, streaming)
+    slot = parallel_slot_gb(ctx, kv, streaming)
+    if asked is None or asked <= 1:
+        if not rec:
+            return [f"Several requests at once: left at one at a time - {PARALLEL_COST_NOTE} (docs/BATCHING.md)."]
+        return [f"Several requests at once (opt-in): --parallel {rec} decodes up to {rec} together instead of one "
+                f"after the other (each takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md)."]
+    lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
+             f"{asked * slot:.1f} GB in all)"]
+    if asked > PARALLEL_MAX:
+        lines.append(f"the engine runs at most {PARALLEL_MAX} at once; it will use {PARALLEL_MAX}")
+    if not rec:
+        lines.append(f"recommended for this card: one at a time - {PARALLEL_COST_NOTE}; kept as you chose")
+    elif asked > rec:
+        lines.append(f"recommended for this card: {rec} - more slots leave fewer experts in VRAM, which can make every "
+                     "request slower; kept as you chose")
+    return lines
+
+
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
@@ -2147,6 +2199,9 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
+    ap.add_argument("--parallel", type=int, metavar="N",
+                    help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
+                         "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -2679,6 +2734,20 @@ def main() -> int:
         cfg["api_key"] = a.api_key
     if a.browser is not None:                          # #609: only when given (else an earlier choice is carried over)
         cfg["open_browser"] = a.browser
+    # #465: requests at once - written only when given (else an earlier "parallel" is carried over); a recommendation
+    streaming = "--kv-resident" in args
+    if a.parallel is not None:
+        if a.parallel >= 2:
+            cfg["parallel"] = a.parallel
+            for i, line in enumerate(parallel_note(a.parallel, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv,
+                                                   streaming)):
+                (ok if i == 0 else warn)(line)
+        else:
+            cfg["parallel"] = 1
+            ok("parallel requests: one at a time (--parallel 1)")
+    else:                                              # the opt-in, said once (nothing changes)
+        for line in parallel_note(None, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv, streaming):
+            say("  " + line)
     if vision != "none":
         vt = vision_tokens(a.vision_tokens, vision, ROOT / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
