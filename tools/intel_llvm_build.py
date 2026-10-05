@@ -154,6 +154,59 @@ UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
   if (PassBinaries)
     UrBinariesStorage.reserve(NumImgs);
 """),
+    # the CUDA adapter had urUSMImportExp and urUSMReleaseExp (sycl_ext_oneapi_copy_optimize) doing nothing and left
+    # them out of its table, so the loader refused them (UR_RESULT_ERROR_UNINITIALIZED); now they page-lock the memory
+    # with cuMemHostRegister, so copies from it are DMA transfers that overlap the GPU's work
+    ("cuda-host-register", "unified-runtime/source/adapters/cuda/usm.cpp", """\
+UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t, void *,
+                                                   size_t Size) {
+  UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
+  return UR_RESULT_SUCCESS;
+}
+
+UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
+                                                    void *) {
+  return UR_RESULT_SUCCESS;
+}
+""", """\
+UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t hContext,
+                                                   void *pMem, size_t Size) {
+  UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
+  // page-locked for every context, so copies from and to it are DMA transfers
+  try {
+    ScopedContext Active(hContext->getDevices()[0]);
+    const CUresult Result =
+        cuMemHostRegister(pMem, Size, CU_MEMHOSTREGISTER_PORTABLE);
+    if (Result != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED)
+      UR_CHECK_ERROR(Result);
+  } catch (ur_result_t Err) {
+    return Err;
+  }
+  return UR_RESULT_SUCCESS;
+}
+
+UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
+                                                    void *pMem) {
+  try {
+    ScopedContext Active(hContext->getDevices()[0]);
+    const CUresult Result = cuMemHostUnregister(pMem);
+    if (Result != CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED)
+      UR_CHECK_ERROR(Result);
+  } catch (ur_result_t Err) {
+    return Err;
+  }
+  return UR_RESULT_SUCCESS;
+}
+"""),
+    ("cuda-host-register-table", "unified-runtime/source/adapters/cuda/ur_interface_loader.cpp", """\
+  pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
+  return UR_RESULT_SUCCESS;
+""", """\
+  pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
+  pDdiTable->pfnImportExp = urUSMImportExp;
+  pDdiTable->pfnReleaseExp = urUSMReleaseExp;
+  return UR_RESULT_SUCCESS;
+"""),
     ("cuda-binaries-to-adapter-2", "sycl/source/detail/program_manager/program_manager.cpp", """\
     if (DeviceImpl.getBackend() == backend::ext_oneapi_hip) {
       UrBinariesStorage.emplace_back(
