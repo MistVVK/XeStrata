@@ -803,6 +803,11 @@ The two GPU encoder builds (free Vulkan, nonfree SYCL), how their results differ
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
+**More image tokens:** `--vision-tokens N` at setup (`./setup.sh --setup --vision cpu --vision-tokens 768`) sets the most tokens a picture becomes.
+It is `"max_tokens"` in the `"vision"` section of `xestrata-<model>.json`, which you can also edit by hand.
+More tokens keep more detail (small text, charts, screenshots) and take longer to encode, on the CPU most of all.
+A setup run again keeps the value for the same encoder place (GPU or CPU).
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
