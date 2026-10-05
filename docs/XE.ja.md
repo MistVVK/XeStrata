@@ -101,6 +101,9 @@ Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
 どの後端を作るかは、ビルドする機械の GPU で決めます（メーカーが複数あればすべて）。
 Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
 NVIDIA の GPU があれば、nvidia-smi が報告する各 GPU のアーキテクチャ（`STRATA_CUDA_ARCHS`）のコードと cuBLAS の後端を作り、CUDA ツールキットが要ります。
+世代の違う GPU が混ざっていれば、それぞれが自分の走らせられる最も新しいコードを使います。
+これには `tools/intel_llvm_build.py --contrib` で作った intel/llvm（修正 `cuda-select-binary` 入り）が要り、ほかの intel/llvm では `auto` は最も古いアーキテクチャのコードだけを作ります。
+コンパイラが知らない新しいアーキテクチャ（intel/llvm 7.1.1 と CUDA 12.4 では sm_90 より上）は、作れる最も新しいものとして扱います。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
 `third_party/main/oneMath` は oneMath v0.9 に XeStrata の変更（cuBLAS の BF16 の積）を加えたもので、変更は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。

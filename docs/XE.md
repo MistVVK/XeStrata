@@ -97,6 +97,9 @@ oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
 Which backends are built follows the GPUs of the machine it is built on (every maker it has).
 An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
 NVIDIA GPUs bring the code for each one's architecture as nvidia-smi reports it (`STRATA_CUDA_ARCHS`) and the cuBLAS backend, which need the CUDA toolkit.
+With GPUs of different generations, each runs the newest code it can.
+That needs intel/llvm built by `tools/intel_llvm_build.py --contrib` (with the fix `cuda-select-binary`); with another intel/llvm, `auto` builds the code for the oldest architecture only.
+An architecture newer than the compiler knows (above sm_90 for intel/llvm 7.1.1 with CUDA 12.4) counts as the newest it builds.
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
 `third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
