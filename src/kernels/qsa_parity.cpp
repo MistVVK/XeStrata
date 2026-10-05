@@ -57,6 +57,7 @@
 
 #include "parity_device.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <chrono>
@@ -591,13 +592,28 @@ int main(int argc, char** argv) try {
         const std::vector<double> want = ref_pooled(rc, w_kn, EPS, (int) S.n_rot, THETA, Alt{}, &terms);
         const std::vector<double> want_raw = ref_pooled_raw(rc);
 
+        // A GPU without FP64 normalizes in f32 (device_caps.hpp's has_fp64; the Arc A series): its sum of IDXD
+        // squares rounds, so its keys are held to the bound of an f32 sum of that many terms instead of the
+        // FP64 path's bit-exactness and 1e-6 (the A380: 64 of 128 spare words off by an ulp, 1.04e-6 pooled).
+        const bool fp64 = strata::core::Runtime::get().compute().get_device().has(sycl::aspect::fp64);
+        const double f32_bound = (double) (IDXD + R + 4) * std::ldexp(1.0, -24);
         // (a) the spare slot: BIT-EXACT, because rope at position 0 is the identity in both (cos = 1, sin = 0
         //     exactly), so the residual the pooled rows carry from the f32 rope cannot appear here.
         int dead_bad = 0;
-        for (int64_t d = 0; d < IDXD; ++d)
-            if (got_dead[(size_t) d] != (float) want[(size_t) n_bid * IDXD + d]) ++dead_bad;
-        require("the spare slot's key (rms_norm of cell 0) is BIT-EXACT", dead_bad == 0,
-                std::to_string(dead_bad) + " of " + std::to_string(IDXD) + " wrong");
+        double dead_worst = 0;
+        for (int64_t d = 0; d < IDXD; ++d) {
+            const double wv = want[(size_t) n_bid * IDXD + d];
+            if (got_dead[(size_t) d] != (float) wv) ++dead_bad;
+            dead_worst = std::max(dead_worst, std::fabs((double) got_dead[(size_t) d] - wv) / std::fabs(wv));
+        }
+        if (fp64)
+            require("the spare slot's key (rms_norm of cell 0) is BIT-EXACT", dead_bad == 0,
+                    std::to_string(dead_bad) + " of " + std::to_string(IDXD) + " wrong");
+        else {
+            char detail[96];
+            std::snprintf(detail, sizeof detail, "worst relative %.3e (bound %.3e)", dead_worst, f32_bound);
+            require("the spare slot's key (rms_norm of cell 0), f32", dead_worst <= f32_bound, detail);
+        }
         require("the spare slot is at row n_bid and nowhere else", n_bid == 2,
                 "10 cells / r=4 -> 2 complete blocks");
 
@@ -613,7 +629,8 @@ int main(int argc, char** argv) try {
                 worst = std::max(worst, rel_terms(wv, (double) got[(size_t) b * IDXD + d], tm));
             }
         report("pooled block keys vs the reference", worst, "rel/|rope terms|");
-        if (!(worst <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++g_bad; }
+        const double bar = fp64 ? 1e-6 : f32_bound;
+        if (!(worst <= bar)) { std::printf("    *** over %.2e ***\n", bar); ++g_bad; }
 
         // (c) THE INCOMPLETE TAIL IS NOT POOLED: the two tail cells take the SPARE slot's score, which is cell
         //     0's key - not their own mean.  A rival reading that pools them would still fill every row.
