@@ -207,6 +207,21 @@ UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext
   pDdiTable->pfnReleaseExp = urUSMReleaseExp;
   return UR_RESULT_SUCCESS;
 """),
+    # the SYCL runtime's table of NVIDIA architectures stops at sm_90 (its sycl branch too, 2026-10-05), so a newer
+    # GPU (an RTX 50, sm_120) reported no matrix combinations and the engine took no tensor-core path; such a GPU runs
+    # sm_90's shapes (the mma instructions of sm_80 on), so a compute capability of 9.0 or more the table lacks
+    # reports those
+    ("cuda-newer-matrix", "sycl/source/detail/device_impl.hpp", """\
+      float ComputeCapability = GetArchNum(DeviceArch);
+""", """\
+      float ComputeCapability = GetArchNum(DeviceArch);
+      if (ComputeCapability == 0.f) {   // newer than the table: sm_90's shapes
+        const std::string Version =
+            get_info_impl<UrInfoCode<sycl::info::device::version>::value>();
+        if (std::strtof(Version.c_str(), nullptr) >= 9.0f)
+          ComputeCapability = 9.0f;
+      }
+"""),
     ("cuda-binaries-to-adapter-2", "sycl/source/detail/program_manager/program_manager.cpp", """\
     if (DeviceImpl.getBackend() == backend::ext_oneapi_hip) {
       UrBinariesStorage.emplace_back(
