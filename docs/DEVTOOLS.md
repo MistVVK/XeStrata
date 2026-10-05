@@ -94,7 +94,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
 - v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are four fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-05).
+  There are five fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-05).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -103,6 +103,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fixed, it page-locks the memory with `cuMemHostRegister`, so copies from it are DMA transfers (`cuda-host-register` and another; about 4% faster decoding on an RTX 4070).
   Fourth, the SYCL runtime's table of NVIDIA architectures stops at sm_90, so a newer GPU (an RTX 50, compute capability 12.0) reported no matrix combinations and the engine took no tensor-core path.
   Fixed, a compute capability of 9.0 or more that the table lacks reports sm_90's combinations (the mma instructions of sm_80 on; `cuda-newer-matrix`, checked with an RTX 4070 made to report 12.0; on such a GPU itself `unverified`).
+  Fifth, every link with an NVIDIA target left the driver's split bitcode, PTX and cubins in TMPDIR (22 GB of a tmpfs `/tmp` in a day).
+  `sycl-post-link`'s table and `llvm-foreach`'s lists were not registered as the temporary-file types whose contents the driver removes; fixed, their registration takes those types (`cuda-temp-lists`; spir64 leaves nothing either way).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).

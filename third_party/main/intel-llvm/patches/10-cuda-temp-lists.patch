@@ -1,0 +1,43 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cuda-temp-lists: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The driver removes the files a temporary list or table names only when the list or table is registered
+with that type.  For NVIDIA targets sycl-post-link's table is registered as bitcode and llvm-foreach's
+lists as PTX and objects, so every link left each device image's split bitcode, PTX and cubin in TMPDIR
+(22 GB of a tmpfs /tmp in a day of builds).  spir64 registers them as lists and leaves nothing.
+---
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 7aeb681..b2eb487 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -11088,6 +11088,11 @@ void SYCLPostLink::ConstructJob(Compilation &C, const JobAction &JA,
+          "single input file expected");
+   addArgs(CmdArgs, TCArgs, {Inputs.front().getFilename()});
+   std::string OutputFileName(Output.getFilename());
++  // The output is a table of the split modules (whatever type the action
++  // gives it): registered as one, so that the driver removes them with it.
++  for (auto &File : C.getTempFiles())
++    if (OutputFileName == File.first && File.second != types::TY_Tempfilelist)
++      File.second = types::TY_Tempfiletable;
+ 
+   // All the inputs are encoded as commands.
+   C.addCommand(std::make_unique<Command>(
+diff --git a/clang/lib/Driver/ToolChains/SYCL.cpp b/clang/lib/Driver/ToolChains/SYCL.cpp
+index 9a234ee..bddf4bc 100644
+--- a/clang/lib/Driver/ToolChains/SYCL.cpp
++++ b/clang/lib/Driver/ToolChains/SYCL.cpp
+@@ -166,6 +166,11 @@ void SYCL::constructLLVMForeachCommand(Compilation &C, const JobAction &JA,
+   // llvm-foreach --in-file-list=a.list --in-replace='{}' -- echo '{}'
+   ArgStringList ForeachArgs;
+   std::string OutputFileName(T->getToolChain().getInputFilename(Output));
++  // The output is a list of the files the command makes: registered as one,
++  // so that the driver removes them with it.
++  for (auto &File : C.getTempFiles())
++    if (OutputFileName == File.first && File.second != types::TY_Tempfiletable)
++      File.second = types::TY_Tempfilelist;
+   ForeachArgs.push_back(C.getArgs().MakeArgString("--out-ext=" + Ext));
+   for (auto &I : InputFiles) {
+     std::string Filename(T->getToolChain().getInputFilename(I));
