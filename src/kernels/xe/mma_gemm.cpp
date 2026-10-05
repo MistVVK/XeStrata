@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <mutex>
+#include <type_traits>
 
 namespace strata::kernels::xe {
 namespace {
@@ -183,7 +184,9 @@ struct Kernel {
     }
 
     void operator()(sycl::nd_item<1> it) const {
-        if constexpr (!built<S>()) {
+        // BF16 on NVIDIA's tensor cores from sm_80 on, FP16 from sm_70 on (device_target.hpp)
+        constexpr bool arch_ok = STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= (std::is_same_v<E, bf16_t> ? 800 : 700);
+        if constexpr (!built<S>() || !arch_ok) {
             (void) it;
         } else {
             const int64_t g = (int64_t) it.get_group(0), ex = g / (tiles_m * tiles_n), r = g % (tiles_m * tiles_n);

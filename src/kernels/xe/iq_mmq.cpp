@@ -50,7 +50,7 @@ constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
     return false;
 #else
-    return true;
+    return STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= 720;   // int8 on NVIDIA's tensor cores from sm_72 on
 #endif
 }
 
@@ -405,19 +405,23 @@ struct LayoutCheck {
     sycl::local_accessor<float, 1> pf;
     int* out;
     void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int lid = (int) it.get_local_id(0);
-        for (int i = lid; i < TM * TN; i += SG) { pi[i] = i; pf[i] = (float) i; }
-        sycl::group_barrier(it.get_group());
-        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN> a;
-        mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> b;
-        mx::joint_matrix_load(sg, a, pi.template get_multi_ptr<sycl::access::decorated::no>(), TN, mx::layout::row_major);
-        mx::joint_matrix_load(sg, b, pf.template get_multi_ptr<sycl::access::decorated::no>(), TN, mx::layout::row_major);
-        int bad = 0, n = 0;
-        mx::joint_matrix_apply(sg, b, a, [&](float& f, int32_t& v) { bad |= (int) f != v; ++n; });
-        bad |= n != NE;
-        bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
-        if (lid == 0) *out = bad ? 0 : 1;
+        if constexpr (!built<0>()) {
+            (void) it;
+        } else {
+            const auto sg = it.get_sub_group();
+            const int lid = (int) it.get_local_id(0);
+            for (int i = lid; i < TM * TN; i += SG) { pi[i] = i; pf[i] = (float) i; }
+            sycl::group_barrier(it.get_group());
+            mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN> a;
+            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> b;
+            mx::joint_matrix_load(sg, a, pi.template get_multi_ptr<sycl::access::decorated::no>(), TN, mx::layout::row_major);
+            mx::joint_matrix_load(sg, b, pf.template get_multi_ptr<sycl::access::decorated::no>(), TN, mx::layout::row_major);
+            int bad = 0, n = 0;
+            mx::joint_matrix_apply(sg, b, a, [&](float& f, int32_t& v) { bad |= (int) f != v; ++n; });
+            bad |= n != NE;
+            bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
+            if (lid == 0) *out = bad ? 0 : 1;
+        }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
 };
