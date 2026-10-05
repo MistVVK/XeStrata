@@ -18,6 +18,7 @@
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
 
@@ -387,7 +388,7 @@ bool env_on(const char* name) {
 bool shape_reported(const sycl::device& d) {
     const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sgs.begin(), sgs.end(), (size_t) SG) == sgs.end()) return false;
-    for (const auto& c : d.get_info<syclex::info::device::matrix_combinations>()) {
+    for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == (size_t) TM || (c.msize == 0 && c.max_msize >= (size_t) TM);
         const bool n = c.nsize == (size_t) TN || (c.nsize == 0 && c.max_nsize >= (size_t) TN);
         const bool k = c.ksize == (size_t) TK || (c.ksize == 0 && c.max_ksize >= (size_t) TK);

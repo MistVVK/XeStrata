@@ -238,7 +238,8 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/dequant_bf16.cpp src/kernels/xe/ple.cpp
                                     src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
-                                    src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp)
+                                    src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp
+                                    src/kernels/xe/matrix_report.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)

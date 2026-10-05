@@ -16,6 +16,7 @@
 // file; in the default 128 registers they spilled), 14.2 (a fragment's rows contiguous) and 13.6 (16-byte stores).
 // DP4a takes 20.  Loading the next step into registers while multiplying, to store it after, spilled (91-103 ms).
 #include "mma_gemm.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -387,7 +388,7 @@ sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, flo
 bool reported(const sycl::device& d, mx::matrix_type in, const Shape& s) {
     const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sg.begin(), sg.end(), (size_t) s.sg) == sg.end()) return false;
-    for (const auto& c : d.get_info<syclex::info::device::matrix_combinations>()) {
+    for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == (size_t) s.m || (c.msize == 0 && c.max_msize >= (size_t) s.m);
         const bool n = c.nsize == (size_t) s.n || (c.nsize == 0 && c.max_nsize >= (size_t) s.n);
         const bool k = c.ksize == (size_t) s.k || (c.ksize == 0 && c.max_ksize >= (size_t) s.k);

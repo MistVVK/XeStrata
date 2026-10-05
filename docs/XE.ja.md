@@ -111,6 +111,12 @@ Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイム�
 A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%、[記録](../bench/results/2026-10-04-dg2-dp4a/README.md)）。
 `STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
+`STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
+行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
+`STRATA_NO_BF16_MMA=1` のときは、contrib のモードでも BF16 の積を oneMath に任せません。
+`STRATA_NO_BLAS=1` は、contrib のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
+oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
 
 プロンプトの経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。

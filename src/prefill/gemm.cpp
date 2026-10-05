@@ -12,9 +12,12 @@
 
 #if STRATA_ONEMATH
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
 #include <future>
+#include <memory>
 #include <string>
+#include <type_traits>
 #endif
 
 #include <algorithm>
@@ -27,10 +30,44 @@ using strata::kernels::XmxType;
 
 namespace {
 #if STRATA_ONEMATH
-bool g_blas = true;   // false once oneMath had no backend for the GPU
-// Gemm::prepare's product: empty when oneMath took it, else why not
-std::future<std::string> g_ready;
+bool env_on(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+}
 
+// Whether oneMath takes the products: not once it had no backend for the GPU, nor with STRATA_NO_BLAS=1 (XeStrata's
+// own kernels, to compare).  BF16 also not when the trial product failed (a GPU whose library has no BF16 product), or
+// with STRATA_NO_BF16_MMA=1, which imitates a GPU without BF16 matrix engines.
+bool& blas_on() {
+    static bool v = !env_on("STRATA_NO_BLAS");
+    return v;
+}
+bool& bf16_on() {
+    static bool v = !strata::kernels::no_bf16_mma();
+    return v;
+}
+
+struct Trial {
+    std::string why;   // empty when oneMath took the products
+    bool bf16 = true;
+};
+std::future<Trial> g_ready;   // Gemm::prepare's trial
+
+void settle() {
+    if (!g_ready.valid()) return;
+    const Trial t = g_ready.get();
+    if (!t.why.empty()) {
+        std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
+                     t.why.c_str());
+        blas_on() = false;
+    } else if (!t.bf16 && bf16_on()) {
+        std::fprintf(stderr, "strata: oneMath has no BF16 product on this GPU: those take XeStrata's own kernels\n");
+        bf16_on() = false;
+    }
+}
+
+// Y[T, N] row-major is Y^T[N, T] column-major (ld ldy) = W^T . X^T, with row-major W[N, K] read as the transpose of a
+// column-major K x N and X[T, K] as a column-major K x T.  beta 0 leaves Y unread.
 template <class E>
 void product(sycl::queue& q, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
              int64_t ldy, bool accumulate) {
@@ -40,27 +77,18 @@ void product(sycl::queue& q, const uint16_t* X, const uint16_t* W, float* Y, int
                                  accumulate ? 1.0f : 0.0f, Y, ldy);
 }
 
-// Y[T, N] row-major is Y^T[N, T] column-major (ld ldy) = W^T . X^T, with row-major W[N, K] read as the transpose of a
-// column-major K x N and X[T, K] as a column-major K x T.  beta 0 leaves Y unread.
 template <class E>
 bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
           bool accumulate, void* stream) {
-    if (g_ready.valid()) {
-        const std::string why = g_ready.get();
-        if (!why.empty()) {
-            std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
-                         why.c_str());
-            g_blas = false;
-        }
-    }
-    if (!g_blas) return false;
+    settle();
+    if (!blas_on() || (std::is_same_v<E, oneapi::math::bfloat16> && !bf16_on())) return false;
     try {
         product<E>(core::Runtime::get().stream(stream), X, W, Y, T, N, K, ldy, accumulate);
         return true;
     } catch (const oneapi::math::exception& e) {
         std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
                      e.what());
-        g_blas = false;
+        blas_on() = false;
         return false;
     }
 }
@@ -69,35 +97,45 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
 
 void Gemm::prepare() {
 #if STRATA_ONEMATH
+    if (!blas_on()) return;
     // A backend's first product loads its library and its kernels (cuBLAS: about 0.6 s on an RTX 4070, inside the
-    // first prompt): one small product of each type on a queue of its own, beside the model's loading.
+    // first prompt): one small product of each type on a queue of its own, beside the model's loading.  An error of the
+    // BF16 one (thrown, or reported by the queue afterwards) leaves the BF16 products to XeStrata's own kernels.
     sycl::queue& c = core::Runtime::get().compute();
-    g_ready = std::async(std::launch::async, [ctx = c.get_context(), dev = c.get_device()]() -> std::string {
+    g_ready = std::async(std::launch::async, [ctx = c.get_context(), dev = c.get_device()]() -> Trial {
         constexpr int64_t n = 16;
         constexpr size_t tile = (size_t) n * n;
-        sycl::queue q(ctx, dev, sycl::property::queue::in_order{});
+        auto failed = std::make_shared<bool>(false);
+        sycl::queue q(ctx, dev, [failed](const sycl::exception_list& l) { *failed = *failed || l.size() > 0; },
+                      sycl::property::queue::in_order{});
         auto* x = sycl::malloc_device<uint16_t>(2 * tile, q);
         auto* y = sycl::malloc_device<float>(tile, q);
-        std::string why;
+        Trial t;
         try {
             q.fill<uint16_t>(x, 0, 2 * tile);
             product<sycl::half>(q, x, x + tile, y, n, n, n, n, false);
-            product<oneapi::math::bfloat16>(q, x, x + tile, y, n, n, n, n, false);
             q.wait_and_throw();
+            try {
+                product<oneapi::math::bfloat16>(q, x, x + tile, y, n, n, n, n, false);
+                q.wait_and_throw();
+            } catch (const std::exception&) {
+                t.bf16 = false;
+            }
+            t.bf16 = t.bf16 && !*failed;
         } catch (const oneapi::math::exception& e) {
-            why = e.what();
+            t.why = e.what();
         }
         q.wait();
         sycl::free(x, q);
         sycl::free(y, q);
-        return why;
+        return t;
     });
 #endif
 }
 
 const char* Gemm::path() {
 #if STRATA_ONEMATH
-    if (g_blas) return "oneMath";
+    if (blas_on()) return "oneMath";
 #endif
     return strata::kernels::gemm_path(XmxType::f16);
 }

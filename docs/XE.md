@@ -107,6 +107,12 @@ The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel ext
 On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%; [record](../bench/results/2026-10-04-dg2-dp4a/README.md)).
 `STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
+`STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
+to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
+With `STRATA_NO_BF16_MMA=1` the contrib modes do not hand the BF16 products to oneMath either.
+`STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib modes too (to compare).
+On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
+Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
 
 Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prompt path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).

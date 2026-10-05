@@ -13,6 +13,7 @@
 #include "strata/core/runtime.hpp"
 #include "dp4a_gemm.hpp"
 #include "mma_gemm.hpp"
+#include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 
 #include <sycl/sycl.hpp>
@@ -209,7 +210,7 @@ bool device_has_xmx(const sycl::device& d, mx::matrix_type in) {
     if (const char* v = std::getenv("STRATA_NO_XMX"); v != nullptr && std::strtol(v, nullptr, 10) != 0) return false;
     const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sg.begin(), sg.end(), size_t(16)) == sg.end()) return false;
-    for (const auto& c : d.get_info<syclex::info::device::matrix_combinations>()) {
+    for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == TM || (c.msize == 0 && c.max_msize >= TM);
         const bool n = c.nsize == TN || (c.nsize == 0 && c.max_nsize >= TN);
         const bool k = c.ksize == TK || (c.ksize == 0 && c.max_ksize >= TK);
