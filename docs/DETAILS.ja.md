@@ -421,6 +421,9 @@ print(r.choices[0].message.content)
   `xestrata-<model>.json` に `"reasoning_budget_tokens": N` を書くと、すべての要求に効きます。
   要求自身の値が優先し、`0` は上限なしです。
   既定はオフで、Anthropic の `"thinking": {"budget_tokens": N}` は、上のとおり深さを選ぶだけです。
+- **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
+  ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。
+  `xestrata-<model>.json` の `"repeat_stop_tokens": N` で回数を決め、`0` で止めません（本当に同じトークンを何度も求める要求のため）。
 - **思考を求めない Anthropic の要求（任意）**: 既定では、`"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、モデルのテンプレートどおりに考えます。
   `xestrata-<model>.json` に `"anthropic_thinking": "on_request"` を書くと、そうした要求を思考なしで処理します。
   Anthropic 自身の規則で、Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。

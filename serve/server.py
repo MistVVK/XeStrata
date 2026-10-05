@@ -61,6 +61,10 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
+# #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
+# broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
+# sets it; 0 turns it off.
+REPEAT_STOP_TOKENS = 256
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -1081,6 +1085,7 @@ class Service:
         self.min_free_vram_mib = 0
         self.before_load = None
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+        self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
@@ -1522,6 +1527,7 @@ class Service:
             sampling = {**defaults, **req_values}
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
@@ -1571,6 +1577,11 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
+                                run_len = run_len + 1 if t == run_tok else 1
+                                run_tok = t
+                                if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                                    repeated = True     # #606: a degenerate output, not an answer: end it here
+                                    break
                                 evs = parser.feed(detok.push(t))
                                 self._note(n, evs)
                                 last_print = self._progress(last_print)
@@ -1625,6 +1636,11 @@ class Service:
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif repeated:
+                        print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                              f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
+                              "xestrata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
+                              "same, restart the server and report it (#606)", flush=True)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -3060,6 +3076,10 @@ def main() -> int:
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
+    rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
+    if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
+        raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+    svc.repeat_stop_tokens = rs
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]

@@ -413,6 +413,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The wrap-up is part of the thinking the client sees and counts as output tokens.
   `"reasoning_budget_tokens": N` in `xestrata-<model>.json` sets it for every request; a request's own value wins, and `0` means no budget.
   Off by default; Anthropic's `"thinking": {"budget_tokens": N}` still only chooses the level, as above.
+- **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
+  a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
+  `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
 - **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
   `"anthropic_thinking": "on_request"` in `xestrata-<model>.json` renders such a request without thinking.
   That is Anthropic's own rule, and what Claude Code's short helper calls (a session title in a few dozen tokens) need.

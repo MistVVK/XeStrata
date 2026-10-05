@@ -29,7 +29,8 @@ from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
-ANSWER = "x" * 2000                              # longer than the old 1024 fallback: one token per byte
+ANSWER = "xy" * 1000                             # longer than the old 1024 fallback: one token per byte (#606: not
+#                                                one token repeated, which the server ends at 256)
 
 
 class RecordingEngine(MockEngine):
