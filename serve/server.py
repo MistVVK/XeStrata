@@ -368,6 +368,7 @@ class StrataEngine:
                 pass
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
                                start_failure_hint(log, log_start) + start_log_tail(log, log_start))
+        self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):
@@ -427,15 +428,37 @@ class StrataEngine:
         self.close()
         self.unloaded = True
 
-    def restart(self):
-        """Start the engine again (the same command) after it died; the new process has its own line queue."""
+    RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
+
+    def restart(self, tries: int = 3):
+        """Start the engine again (the same command) after it died; the new process has its own line queue.
+        close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
+        exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
+        (PR #637)."""
         self.close()
         info = dict(self.info)
-        # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says READY, and a
-        # request that saw alive() in that window skipped load() and failed with "context (0)".  __init__ clears
-        # `ended` itself once READY (before its pump thread can set it again).
-        self.ended = True
-        self.__init__(*self.spawn)
+        self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
+        try:
+            for i in range(tries):
+                # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
+                # READY, and a request that saw alive() in that window skipped load() and failed with "context
+                # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
+                self.ended = True
+                try:
+                    self.__init__(*self.spawn)
+                    break
+                except RuntimeError:
+                    try:
+                        self.proc.wait(timeout=60)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                    if i == tries - 1:
+                        raise
+                    print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
+                          f"{self.RESTART_RETRY_S:g} s", flush=True)
+                    time.sleep(self.RESTART_RETRY_S)
+        finally:
+            self.starting = False
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -1465,18 +1488,25 @@ class Service:
                 for path, _ in encoded:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
-        if self.engine.max_context <= 0:                # #344: (re)starting, not a prompt that is too long
-            raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-        room = self.engine.max_context - CTX_SLACK - len(ids)
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            # a failed restart leaves max_context 0: check against the last known context, so the request reaches
+            # run() - which starts the engine again - instead of failing with "exceeds the context (0)" forever
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
                 raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({self.engine.max_context}); requests are never truncated")
+                                 f"({ctx}); requests are never truncated")
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({self.engine.max_context}); requests are never truncated. Send a smaller "
+                                 f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's xestrata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
