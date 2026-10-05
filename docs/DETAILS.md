@@ -177,6 +177,12 @@ of an unlocked 40 GiB copy, 3–4.6 GiB went to swap and decoding ran at half sp
 That needs a memlock limit (`ulimit -l`) as large as the copy; setup warns when the limit is small.
 Raise it with `memlock` in `/etc/security/limits.conf` or `DefaultLimitMEMLOCK` in systemd's `user.conf`, then log in again.
 
+With a native pack whose experts the GPU mostly holds, `STRATA_ARENA_MMAP=1` in the engine's environment (opt-in, upstream #640) maps the experts read-only from the pack's `experts.bin`, not locked.
+The first start writes the arena to `experts.bin` (only when the drive has its size and 2 GiB more free); later starts map it.
+The pages of the experts in VRAM are handed back to the OS (`STRATA_ARENA_RELEASE=0` keeps them) and the rest are read ahead.
+The GPU does not read the mapping directly: run with `--pcie-frac 0`.
+With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and read the prompt a little slower (54 to 48 tok/s).
+
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
 setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB) and has not been checked on an Arc card (`unverified`).
 

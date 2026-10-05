@@ -3296,6 +3296,24 @@ int main(int argc, char** argv) {
         }
         thits.d_res = d_res;
         thits.n_expert = g.n_expert;
+        // a file-backed arena (STRATA_ARENA_MMAP): the experts a GPU holds are handed back first
+        // (STRATA_ARENA_RELEASE=0 keeps them): the fill read the whole arena, and left mapped and referenced it crowds
+        // every other allocation into swap.  The ones no GPU holds are those the CPU pool and the prompt path will
+        // read: start reading them now instead of faulting them in 4 KB at a time mid-request
+        {
+            static const bool keep = std::getenv("STRATA_ARENA_RELEASE") && std::getenv("STRATA_ARENA_RELEASE")[0] == '0';
+            uint64_t released = 0;
+            if (!keep)
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] != strata::core::kNotResident)
+                        released += srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+            if (released > 0)
+                std::fprintf(stderr, "strata generate: expert arena: %.2f GiB of VRAM-held experts handed back to the OS\n",
+                             (double) released / (1024.0 * 1024.0 * 1024.0));
+            for (size_t i = 0; i < host_res.size(); ++i)
+                if (host_res[i] == strata::core::kNotResident)
+                    srcp->prefetch((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);
+        }
         for (auto& st : stages) {   // layer split across GPUs: the same table on every device
             const strata::core::OnDevice on(st->dev);
             if (!strata::gpu::alloc_device((void**) &st->d_res, host_res.size() * sizeof(int32_t)) ||
@@ -3917,7 +3935,10 @@ int main(int argc, char** argv) {
                     else if (!strata::gpu::event_query(st->adapt_ev)) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
-            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
+            }
             src.commit_exchanges();
             pending.clear();
             res_upload();
@@ -3969,6 +3990,7 @@ int main(int argc, char** argv) {
                 if (gs) gs->adapt_live = true;
                 else main_live = true;
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) strata::gpu::event_record(adapt_ev, adapt_stream);
@@ -5518,7 +5540,10 @@ int main(int argc, char** argv) {
             }
             if (trace_adapt)
                 std::fprintf(stderr, "strata: PENDING landed, %zu experts become resident\n", pending.size());
-            for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+            for (const auto& [i, slot] : pending) {
+                host_res[(size_t) i] = slot;
+                srcp->release((int64_t) i / g.n_expert, (int64_t) i % g.n_expert);   // in VRAM now: RAM not needed
+            }
             src.commit_exchanges();
             pending.clear();
             if (d_res != nullptr)
@@ -5577,6 +5602,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 host_res[out] = strata::core::kNotResident;   // evicted now: the CPU computes it meanwhile
+                srcp->prefetch(s.layer, s.out);   // a file-backed arena released its pages: read them back ahead
                 pending.emplace_back((int32_t) in, slot);      // resident once the copy has landed
             }
             if (!swaps.empty()) strata::gpu::event_record(adapt_ev, adapt_stream);

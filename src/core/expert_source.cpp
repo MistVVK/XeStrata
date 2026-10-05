@@ -2011,7 +2011,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::ifstream f(path, std::ios::binary | std::ios::ate);
         if (!f) { err = "ArenaExpertSource: cannot open " + path; return false; }
         const uint64_t got = (uint64_t) f.tellg();
-        if (got != want) {
+        if (got != want && got != want + (uint64_t) blob) {   // + one blob: STRATA_ARENA_MMAP's padded file
             char buf[400];
             std::snprintf(buf, sizeof buf,
                           "ArenaExpertSource: %s is %llu B but %lld layers x %lld experts (blobs up to %lld B) "
@@ -2023,6 +2023,44 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         }
     }
 
+    // STRATA_ARENA_MMAP=1 (a small-RAM machine whose GPUs hold most experts): the arena is the pack's experts.bin
+    // mapped READ-ONLY - not locked, not pinned.  The page cache keeps what the CPU pool and the prompt path
+    // actually read (the experts no VRAM cache holds) and gives back the rest under memory pressure; a page
+    // dropped is re-read from the file, so a result never depends on what is resident.  The GPUs then get no
+    // mapped alias: run with --pcie-frac 0.  The first start writes experts.bin (arena layout, padded by one blob
+    // so a whole-slot copy may start at any expert), later ones map it.
+#if defined(_WIN32)
+    static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
+#else
+    static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+    if (arena_mmap) {
+        const uint64_t file_bytes = want + (uint64_t) blob;
+        uint64_t have = 0;
+        {
+            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            if (f) have = (uint64_t) f.tellg();
+        }
+        if (have == file_bytes) {
+            const int fd = ::open(path.c_str(), O_RDONLY);
+            void* v = fd >= 0 ? mmap(nullptr, (size_t) file_bytes, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
+            if (fd >= 0) ::close(fd);
+            if (v == MAP_FAILED) { err = "ArenaExpertSource: mmap of " + path + " failed"; return false; }
+            map_ = v;
+            map_bytes_ = file_bytes;
+            base_ = (const uint8_t*) v;
+            pinned_bytes_ = 0;
+            dev_slice_.clear();
+            slice_bytes_ = 0;
+            blobs_ = n_layers * n_expert;
+            n_expert_ = n_expert;
+            reads_ = 0;
+            note_ = "mapped read-only from " + path + " (STRATA_ARENA_MMAP: not locked, not pinned)";
+            gib_per_s_ = 0.0;
+            load_seconds_ = load_read_s_ = load_copy_s_ = 0.0;
+            return true;
+        }
+    }
+#endif
     // #633: THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host
     // has; its pages are committed as the load writes them, so a container whose memory limit is below the arena was
     // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is
@@ -2117,6 +2155,30 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
+    // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
+    // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
+    std::error_code space_ec;
+    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
+        std::filesystem::path(path).parent_path(), space_ec).available : 0;
+    const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
+    if (arena_mmap && from_gguf && !room)
+        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
+                             "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
+                     (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
+    if (arena_mmap && from_gguf && room) {
+        const std::string tmp = path + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
+        if (ok) {
+            std::vector<uint8_t> pad((size_t) blob, 0);
+            ok = std::fwrite(pad.data(), 1, pad.size(), f) == pad.size();
+        }
+        if (f) ok = std::fclose(f) == 0 && ok;
+        if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+        if (!ok) std::remove(tmp.c_str());
+        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
+                     ok ? "wrote" : "could NOT write", path.c_str());
+    }
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
@@ -2146,6 +2208,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 }
 
 void ArenaExpertSource::close() {
+#if !defined(_WIN32)
+    if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
+#endif
+    map_ = nullptr;
+    map_bytes_ = 0;
     if (arena_ != nullptr) {
         delete (PinnedArena*) arena_;
         arena_ = nullptr;
@@ -2153,6 +2220,39 @@ void ArenaExpertSource::close() {
     base_ = nullptr;
     blobs_ = 0;
     n_expert_ = 0;
+}
+
+void ArenaExpertSource::prefetch(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;
+#else
+    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t off = lay.blob_offset(layer, expert) & ~(uint64_t) 4095;
+    const uint64_t end = lay.blob_offset(layer, expert) + lay.blob_bytes(layer);
+    madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_WILLNEED);
+#endif
+}
+
+// Only the pages wholly inside the blob: a page shared with a neighbour the CPU may still read stays.  MADV_DONTNEED
+// unmaps them from this process; they stay in the page cache as clean, unmapped pages - the first the kernel takes
+// back under pressure, and a minor fault away when the CPU needs the expert again (an adaptive swap evicts it).
+// Dropping them from the cache too (POSIX_FADV_DONTNEED) made every eviction a re-read from the disk: ~200 major
+// faults a second in decode, +8 ms a window.  The memory the arena used to hold was never the cache itself but
+// ROCclr's pin-in-place locks on it (see main) - locked pages are the ones the kernel cannot take back.
+uint64_t ArenaExpertSource::release(int64_t layer, int64_t expert) {
+#if defined(_WIN32)
+    (void) layer; (void) expert;
+    return 0;
+#else
+    if (map_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return 0;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t off = (lay.blob_offset(layer, expert) + 4095) & ~(uint64_t) 4095;
+    const uint64_t end = (lay.blob_offset(layer, expert) + lay.blob_bytes(layer)) & ~(uint64_t) 4095;
+    if (end <= off) return 0;
+    if (madvise((uint8_t*) map_ + off, (size_t) (end - off), MADV_DONTNEED) != 0) return 0;
+    return end - off;
+#endif
 }
 
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
@@ -2178,7 +2278,8 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     ++reads_;
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
-    return ((const PinnedArena*) arena_)->at(strata::kernels::cpu::expert_layout().blob_offset(layer, expert));
+    const uint64_t off = strata::kernels::cpu::expert_layout().blob_offset(layer, expert);
+    return arena_ != nullptr ? ((const PinnedArena*) arena_)->at(off) : base_ + off;   // else STRATA_ARENA_MMAP's map
 }
 
 }  // namespace strata::core

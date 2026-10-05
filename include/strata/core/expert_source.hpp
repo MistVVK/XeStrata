@@ -139,6 +139,11 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
+    virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
+    /// A file-backed source: this expert lives in VRAM, so its pages need not stay in RAM - hand them back to the
+    /// kernel (a later read re-reads the file; no result depends on it).  Returns the bytes released; 0 elsewhere.
+    virtual uint64_t release(int64_t layer, int64_t expert) { (void) layer; (void) expert; return 0; }
     /// Whether the verify window may give the GPU a PCIe share of this layer's misses at all (each expert is still
     /// checked with `pinned`).  The arena answers per layer through its expert 0; the resident RAM mode's compact
     /// copy has no expert 0 when the GPU cache holds it, so it answers for the whole copy.
@@ -595,6 +600,8 @@ public:
     int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    void prefetch(int64_t layer, int64_t expert) override;
+    uint64_t release(int64_t layer, int64_t expert) override;
 
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
@@ -611,6 +618,8 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
+    void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
+    uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
     uint64_t slice_bytes_ = 0;
     const uint8_t* base_ = nullptr;

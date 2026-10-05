@@ -180,6 +180,12 @@ UD-Q4_K_XL 以外のモデルは、すべてのエキスパートを RAM に置�
 上限が小さいと setup が警告します。
 `/etc/security/limits.conf` の `memlock` か、systemd の `user.conf` の `DefaultLimitMEMLOCK` で上げ、ログインし直してください。
 
+ネイティブの pack で GPU がエキスパートの大半を持つなら、エンジンの環境の `STRATA_ARENA_MMAP=1`（任意、upstream #640）で、エキスパートを pack の `experts.bin` からファイルとして読み取り専用でマップし、固定しません。
+最初の起動がアリーナを `experts.bin` に書き（ドライブにその大きさと 2 GiB の空きがあるときだけ）、次の起動からマップします。
+VRAM に載ったエキスパートのページは OS に返し（`STRATA_ARENA_RELEASE=0` で返さない）、残りを先読みします。
+GPU はマップを直接読まないので、`--pcie-frac 0` で動かします。
+B70 の Coder（アリーナ 23.4 GiB、すべて VRAM）では、23.38 GiB を OS に返し、出力は同じで、デコードも同じ速さ（28.3 tok/s）、プロンプトは少し遅く（54 から 48 tok/s）なりました。
+
 CPU 内蔵のグラフィックスは RAM を共有するので、省 RAM モードにはなりません。
 GPU がモデルのどれだけを持てるかの setup の見積もりは upstream のもの（VRAM から約 5 GB を引く）で、Arc では確かめていません（`unverified`）。
 
