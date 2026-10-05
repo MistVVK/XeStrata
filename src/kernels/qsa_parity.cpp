@@ -1405,21 +1405,24 @@ int main(int argc, char** argv) try {
             sc.ext_factor = var.ext;
             const size_t prows = (size_t) (MC / R + 1) * IDXD, trows = (size_t) (R - 1) * IDXD;
             Dev<float> pooledA(prows), deadA(IDXD), tailA(trows), pooledB(prows), deadB(IDXD), tailB(trows);
-            Dev<int32_t> bposA(1), bposB(1), dpos(1);
+            Dev<int32_t> bposA(1), bposB(1), dpos((size_t) NB);
             for (Dev<float>* dp : {&pooledA, &deadA, &tailA, &pooledB, &deadB, &tailB})
                 check(strata::gpu::memset(dp->p, 0, dp == &pooledA || dp == &pooledB ? prows * 4
                                 : dp == &deadA || dp == &deadB ? IDXD * 4 : trows * 4), "zero");
             check(strata::gpu::memset(bposA.p, 0, 4), "zero"); check(strata::gpu::memset(bposB.p, 0, 4), "zero");
-            Dev<float> draw((size_t) IDXD), drawAll;
+            Dev<float> drawAll;
             drawAll.put(raws);
+            std::vector<int32_t> tps((size_t) NB);
+            for (int64_t t = 0; t < NB; ++t) tps[(size_t) t] = (int32_t) t;
+            dpos.put(tps);
             strata::kernels::QsaIndexerBuffers bufsA{tailA.p, deadA.p, pooledA.p, bposA.p};
             strata::kernels::QsaIndexerBuffers bufsB{tailB.p, deadB.p, pooledB.p, bposB.p};
-            for (int64_t t = 0; t < NB; ++t) {         // the sequential side: one cell, its device position
-                check(strata::gpu::copy(draw.p, &raws[(size_t) t * IDXD], (size_t) IDXD * 4), "raw");
-                const int32_t tp = (int32_t) t;
-                check(strata::gpu::copy(dpos.p, &tp, 4), "pos");
-                strata::kernels::native_qsa_indexer_append(draw.p, dpos.p, BASE, dw_kn.p, EPS, bufsA, S, MC, sc, cs);
-            }
+            // the sequential side: one cell, its device position.  Each append reads its own row and position:
+            // one buffer rewritten by a synchronous copy (on another queue) before each append raced with the
+            // appends still queued on cs, and whole rows came out of the wrong token (always on the A380)
+            for (int64_t t = 0; t < NB; ++t)
+                strata::kernels::native_qsa_indexer_append(drawAll.p + t * IDXD, dpos.p + t, BASE, dw_kn.p, EPS, bufsA, S,
+                                                           MC, sc, cs);
             strata::kernels::native_qsa_indexer_append_batch(drawAll.p, NB, 0, BASE, dw_kn.p, EPS, bufsB, S, MC, sc, cs);
             check(strata::gpu::stream_sync(cs), "sync");
             const std::vector<float> pa = pooledA.get(prows), pb = pooledB.get(prows);
