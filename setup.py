@@ -848,7 +848,8 @@ def cublas_found() -> bool:
 
 def cuda_archs() -> list:
     """The NVIDIA architectures of this PC's NVIDIA GPUs (sm_89 for compute capability 8.9), as nvidia-smi reports
-    them: the contrib build makes their code."""
+    them: the contrib build makes their code (CMake's STRATA_CUDA_ARCHS=auto reads them again and maps one the
+    compiler does not know to the newest it builds)."""
     return sorted({"sm_" + g["cc"].replace(".", "") for g in nvidia_smi().values()
                    if re.fullmatch(r"\d+\.\d+", g["cc"])})
 
@@ -1104,7 +1105,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
-                     f"-DSTRATA_LICENSE={comp['license']}", f"-DSTRATA_CUDA_ARCHS={';'.join(comp['cuda_archs'])}",
+                     f"-DSTRATA_LICENSE={comp['license']}",
+                     f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
                      f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
                      *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
