@@ -103,7 +103,9 @@ On a PC with several CUDA toolkits (a distribution's `/usr/lib/cuda` and NVIDIA'
 `STRATA_CUDA_PATH`'s default, `auto`, tries each toolkit found (`CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT`, `/usr/local/cuda-*`, `/opt/cuda`, `/usr/lib/cuda`, the `nvcc` on PATH) and takes the one that builds code for the most of this PC's NVIDIA GPUs, then the newest architectures for them, then has cuBLAS, then is the newest (`cmake/StrataCuda.cmake`).
 The GPU code and oneMath's cuBLAS both use it; a toolkit without cuBLAS gets no cuBLAS backend, and the dense products run on XeStrata's own kernels.
 Each GPU gets code for its architecture, or the newest older one the toolkit builds, and the driver compiles that PTX for the GPU.
-intel/llvm 7.1.1's SYCL has no name above sm_90, so an RTX 50 gets sm_90 code.
+intel/llvm 7.1.1's SYCL has no name above sm_90, so an architecture without one (an RTX 50's sm_120) is built through the generic NVIDIA target (`nvptx64-nvidia-cuda` with `--cuda-gpu-arch`); an executable takes it once, for the oldest GPU that needs it. A toolkit before CUDA 12.8 cannot build it, and the GPU gets sm_90 code.
+oneMath's cuBLAS backend takes one architecture, the oldest (the products themselves run inside cuBLAS).
+An executable built with CUDA 13.1 for sm_89 and the generic sm_120 took the sm_89 image on the 4070 and passed its 52 CTest tests (on an RTX 50 `unverified`).
 An old GPU a toolkit dropped (Volta in CUDA 13, for one) makes it take a toolkit that has it, if there is one; otherwise it gets a warning and no code.
 On this PC (CUDA 12.4 and 13.1) it took 13.1 for the RTX 4070 alone and 12.4 (code for all three) with a Volta, an Ada and an RTX 50 imitated; the 13.1 build passed its 52 CTest tests on the 4070.
 The NVIDIA code is PTX of the toolkit's version by default (PTX 8.4 for CUDA 12.4).

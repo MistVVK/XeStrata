@@ -107,7 +107,9 @@ CUDA ツールキットがいくつもある PC（ディストリビューショ
 `STRATA_CUDA_PATH` の既定 `auto` は、見つかったツールキット（`CUDA_PATH`・`CUDA_HOME`・`CUDA_ROOT`、`/usr/local/cuda-*`、`/opt/cuda`、`/usr/lib/cuda`、PATH の `nvcc`）を1つずつ試し、この PC の NVIDIA の GPU のうち多くにコードを作れるもの、次にその GPU により新しいアーキテクチャのコードを作れるもの、次に cuBLAS を持つもの、次に新しい版を選びます（`cmake/StrataCuda.cmake`）。
 GPU のコードと oneMath の cuBLAS は、選んだ1つを使います。cuBLAS のないツールキットでは cuBLAS の後端を作らず、密な積は自前のカーネルになります。
 各 GPU には、その GPU のアーキテクチャか、作れるうちでそれより古い最も新しいものを作り、ドライバーがその PTX を GPU に合わせてコンパイルします。
-intel/llvm 7.1.1 の SYCL は sm_90 より上の名前を持たないので、RTX 50 には sm_90 のコードになります。
+intel/llvm 7.1.1 の SYCL は sm_90 より上の名前を持たないので、名前のないアーキテクチャ（RTX 50 の sm_120）は汎用の NVIDIA のターゲット（`nvptx64-nvidia-cuda` に `--cuda-gpu-arch`）で作ります。実行ファイルに1つしか入らないので、それが要る GPU のうち最も古いもののアーキテクチャです。CUDA 12.8 より前のツールキットでは作れず、sm_90 のコードになります。
+oneMath の cuBLAS の後端は、1つのアーキテクチャしか受けないので、最も古いもので作ります（積そのものは cuBLAS の中で走ります）。
+CUDA 13.1 で sm_89 と汎用の sm_120 を作った実行ファイルは、4070 で sm_89 の像を選び、CTest 52 件が通りました（RTX 50 での動作は `unverified`）。
 ツールキットが外した古い GPU（CUDA 13 の Volta など）は、それを扱うツールキットがあればそれを選び、なければ警告を出してその GPU のコードを作りません。
 この PC（CUDA 12.4 と 13.1）では、RTX 4070 だけなら 13.1 を選び、Volta・Ada・RTX 50 を装うと 12.4（3つすべてにコードを作れる）を選びました。13.1 で作ったものは 4070 で CTest 52 件が通りました。
 NVIDIA のコードの PTX は、既定ではツールキットの版です（CUDA 12.4 なら PTX 8.4）。
