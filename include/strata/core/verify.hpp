@@ -124,6 +124,10 @@ public:
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
+    /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,
+    /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
+    bool copy_logits(int t, float* host) const;
+    int64_t vocab() const { return n_vocab_; }
     /// Measurement hook (STRATA_LOGPOS, upstream 06b82fe / 5e14c19): after run(), one line per row t of the last
     /// window's head - "pos target logprob top top_logprob hit extra_logprob target_logprob_without_extra", and with
     /// STRATA_LOGPOS_TOPK=K the K most likely tokens as `id:logprob` - where row t is the distribution at pos0 + t,

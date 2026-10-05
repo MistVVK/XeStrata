@@ -391,7 +391,17 @@ class StrataEngine:
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
+        lp = self.__dict__.setdefault("lp_lines", collections.deque())   # (token id, LP line): logprobs
+        last_t = None
         for line in proc.stdout:
+            if line.startswith("LP "):                  # beside the token before it, not in the queue
+                lp.append((last_t, line))
+                continue
+            if line.startswith("T "):
+                try:
+                    last_t = int(line[2:])
+                except ValueError:
+                    last_t = None
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
@@ -531,6 +541,9 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+        k = top_logprobs(sampling)
+        if k is not None:
+            keys += f" logprobs={k}"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -546,6 +559,7 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
         self.prefill_tok_s_mean = None
+        self.__dict__.setdefault("lp_lines", collections.deque()).clear()   # this request's LP lines only
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -1960,7 +1974,62 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
+def top_logprobs(req: dict):
+    """The K of the engine's logprobs=K, or None when the request did not ask (OpenAI: logprobs=true, top_logprobs
+    0..20; the legacy completions form, logprobs=N, is taken as N)."""
+    lp = req.get("logprobs")
+    if lp is True:
+        k = req.get("top_logprobs")
+        return max(0, min(20, k)) if isinstance(k, int) and not isinstance(k, bool) else 0
+    if isinstance(lp, int) and not isinstance(lp, bool) and lp >= 0:
+        return min(20, lp)
+    return None
+
+
+def logprob_entry(tok, t, line: str):
+    """OpenAI's logprobs entry of an engine's "LP logprob id:logprob ..." line for token `t`, or None ("LP nan")."""
+    f = line.split()
+    if len(f) < 2 or f[1] == "nan":
+        return None
+
+    def item(i, lp):
+        b = tok.token_bytes(i) if hasattr(tok, "token_bytes") else tok.decode([i]).encode()
+        return {"token": b.decode("utf-8", "replace"), "logprob": lp, "bytes": list(b)}
+    e = item(t, float(f[1])) if t is not None else {"token": "", "logprob": float(f[1]), "bytes": []}
+    e["top_logprobs"] = [item(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
+    return e
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+    """With `logprobs` asked (upstream's Intel port 4ba35fd), each chunk carries the log-probabilities of the tokens
+    the engine wrote since the last one (the model's, before sampling, temperature and penalties; the stop token is
+    not listed), under `content` or, while it thinks, `reasoning_content`."""
+    chunks = _openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run)
+    lp = getattr(svc.engine, "lp_lines", None)
+    if top_logprobs(req) is None or lp is None:
+        yield from chunks
+        return
+    try:
+        for c in chunks:
+            if c and c.get("choices") and lp:
+                got = []
+                while lp:
+                    t, line = lp.popleft()
+                    if t in svc.stop_ids:           # the stop token ends the reply; OpenAI does not list it
+                        continue
+                    e = logprob_entry(svc.tok, t, line)
+                    if e is not None:
+                        got.append(e)
+                if got:
+                    d = c["choices"][0].get("delta") or {}
+                    key = "reasoning_content" if d.get("reasoning_content") and not d.get("content") else "content"
+                    c["choices"][0]["logprobs"] = {key: got}
+            yield c
+    finally:
+        chunks.close()                              # a client that went: the run stops now, as without logprobs
+
+
+def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
@@ -2027,9 +2096,12 @@ def _is_json(text: str) -> bool:
 
 def openai_collect(chunks) -> dict:
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    lps: dict[str, list] = {"content": [], "reasoning_content": []}
     for c in chunks:
         if c is None:                              # a heartbeat
             continue
+        for k, v in (c["choices"][0].get("logprobs") or {}).items():
+            lps[k].extend(v)
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
         d = c["choices"][0]["delta"]
@@ -2059,6 +2131,10 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if lps["content"] or lps["reasoning_content"]:
+        out["choices"][0]["logprobs"] = {"content": lps["content"],
+                                         **({"reasoning_content": lps["reasoning_content"]}
+                                            if lps["reasoning_content"] else {})}
     return out
 
 

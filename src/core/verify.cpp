@@ -1220,6 +1220,12 @@ bool Verifier::wait_commit(std::string& err) {
     return next_ == nullptr || next_->wait_commit(err);
 }
 
+bool Verifier::copy_logits(int t, float* host) const {
+    if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
+    if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    return strata::gpu::copy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float));
+}
+
 bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                                std::string& err) {
     if (next_ != nullptr) return next_->window_logprobs(targets, T, pos0, extra_id, out, err);

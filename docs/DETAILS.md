@@ -628,6 +628,10 @@ Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s 
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+- **logprobs:** `"logprobs": true` with `"top_logprobs": K` (0–20) on `/v1/chat/completions` returns each token's log-probability and the K most likely candidates in `choices[].logprobs` (streamed too; from upstream's Intel port, 4ba35fd).
+  The values are the model's own, before sampling, temperature and penalties.
+  Tokens written while it thinks are listed under `reasoning_content`; the stop token is not listed.
+  On the B70 with IQ2_XS the answer was the same with and without it.
 
 ### JSON response formats
 
