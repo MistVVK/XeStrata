@@ -63,6 +63,20 @@ bool memset(void* dst, int value, size_t bytes);
 bool memset_async(void* dst, int value, size_t bytes, Stream s);
 
 bool mem_info(size_t* free_bytes, size_t* total_bytes);
+
+/// Virtual memory (sycl_ext_oneapi_virtual_mem; the Level Zero and CUDA adapters, not HIP in intel/llvm 7.1.1): one
+/// address range reserved once and backed by physical segments that can be given back to the driver and taken again,
+/// every address staying the same (#533).  vmem_supported is the device's report; the sizes are multiples of
+/// vmem_granularity().
+struct VmemSegment;
+bool vmem_supported();
+size_t vmem_granularity();
+void* vmem_reserve(size_t bytes);
+void vmem_free(void* va, size_t bytes);
+/// A new physical segment of `bytes` mapped read-write at `va`; null when the device has no memory for it.
+VmemSegment* vmem_map(void* va, size_t bytes);
+/// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
+void vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
 /// The device's compute units and maximum clock in kHz (cudaDevAttrMultiProcessorCount / ClockRate); device 0 only.
 bool device_speed(int device, int* units, int* khz);
 

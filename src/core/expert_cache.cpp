@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <numeric>
 #include <utility>
 #include <cstring>
 
@@ -145,6 +146,120 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 
 ExpertCache::~ExpertCache() { close(); }
 
+// ---- #533: the segmented arena (--vram-elastic): one address range for the whole arena, backed by physical
+// segments, the tail's segments unmapped and mapped again later.  Nothing here runs unless a segment size was set.
+bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
+    if (!strata::gpu::vmem_supported()) {
+        err = "ExpertCache: --vram-elastic needs virtual memory (sycl_ext_oneapi_virtual_mem), which this GPU's "
+              "runtime does not offer";
+        return false;
+    }
+    const uint64_t gran = (uint64_t) strata::gpu::vmem_granularity();
+    if (gran == 0) {
+        err = std::string("ExpertCache: cannot read the allocation granularity: ") + strata::gpu::last_error();
+        return false;
+    }
+    // a whole number of 2 MiB pages as well: Level Zero reports 64 KiB but refused a 0.49 GiB segment of 64 KiB
+    // pages (UR_RESULT_ERROR_INVALID_VALUE, the B70), and CUDA's granularity is 2 MiB
+    const uint64_t g = std::lcm(gran, (uint64_t) 2 << 20);
+    const uint64_t total = (want + g - 1) / g * g;
+    seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
+    void* va = strata::gpu::vmem_reserve((size_t) total);
+    if (va == nullptr) {
+        err = std::string("ExpertCache: cannot reserve the segmented cache's address range: ") + strata::gpu::last_error();
+        return false;
+    }
+    base_ = static_cast<uint8_t*>(va);
+    reserved_ = total;
+    for (uint64_t at = 0; at < total; at += (uint64_t) seg_) {
+        segs_.push_back(nullptr);
+        seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
+    }
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        segs_[i] = strata::gpu::vmem_map(base_ + (size_t) i * (size_t) seg_, (size_t) seg_size_[i]);
+        if (segs_[i] == nullptr) {
+            char buf[240];
+            std::snprintf(buf, sizeof buf, "ExpertCache: device allocation failed: segment %zu of %zu (%.2f GiB) of "
+                          "the segmented cache could not be backed: %s", i + 1, segs_.size(),
+                          (double) seg_size_[i] / 1073741824.0, strata::gpu::last_error());
+            err = buf;
+            release_segmented();
+            return false;
+        }
+        mapped_segs_ = (int64_t) i + 1;
+    }
+    return true;
+}
+
+void ExpertCache::release_segmented() {
+    if (base_ != nullptr) strata::gpu::device_sync();
+    for (size_t i = 0; i < segs_.size(); ++i)
+        if (segs_[i] != nullptr) strata::gpu::vmem_unmap(base_ + (size_t) i * (size_t) seg_, (size_t) seg_size_[i], segs_[i]);
+    if (base_ != nullptr && reserved_ > 0) strata::gpu::vmem_free(base_, (size_t) reserved_);
+    segs_.clear();
+    seg_size_.clear();
+    mapped_segs_ = 0;
+    reserved_ = 0;
+    base_ = nullptr;
+}
+
+int64_t ExpertCache::mapped_bytes() const {
+    if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
+    int64_t b = 0;
+    for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
+    return b;
+}
+
+int64_t ExpertCache::slots_within(int64_t bytes) const {
+    if (bytes >= full_bytes()) return slots_;
+    if (bytes <= 0) return 0;
+    if (off_.empty()) return blob_ > 0 ? bytes / blob_ : 0;
+    // off_[i + 1] is slot i's end: count the slots whose end is at most `bytes`
+    return (int64_t) (std::upper_bound(off_.begin() + 1, off_.end(), (uint64_t) bytes) - (off_.begin() + 1));
+}
+
+bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
+    if (segs_.empty()) {
+        err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
+    while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
+    if (keep >= mapped_segs_) return true;
+    if (!strata::gpu::device_sync()) {
+        err = std::string("the device failed before the cache shrank: ") + strata::gpu::last_error();
+        return false;
+    }
+    for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
+        strata::gpu::vmem_unmap(base_ + (size_t) i * (size_t) seg_, (size_t) seg_size_[(size_t) i], segs_[(size_t) i]);
+        segs_[(size_t) i] = nullptr;
+        mapped_segs_ = i;
+    }
+    live_slots_ = slots_within(mapped_bytes());
+    return true;
+}
+
+bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
+    if (segs_.empty()) {
+        err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    int64_t at = mapped_bytes();
+    while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
+        const size_t i = (size_t) mapped_segs_;
+        segs_[i] = strata::gpu::vmem_map(base_ + i * (size_t) seg_, (size_t) seg_size_[i]);
+        if (segs_[i] == nullptr) {
+            err = std::string("the device has no memory for another expert-cache segment: ") + strata::gpu::last_error();
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
+        at += seg_size_[i];
+        ++mapped_segs_;
+    }
+    live_slots_ = slots_within(mapped_bytes());
+    return true;
+}
+
 
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
@@ -181,7 +296,9 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (!strata::gpu::alloc_device((void**) &base_, (size_t) want)) {
+    if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
+        if (!open_segmented(want, err)) return false;
+    } else if (!strata::gpu::alloc_device((void**) &base_, (size_t) want)) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: device allocation of %.2f GiB failed: %s",
@@ -199,6 +316,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     residency_.assign((size_t) (n_layers * n_expert), kNotResident);
     slots_ = n_slots;
+    live_slots_ = n_slots;
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
@@ -229,6 +347,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     // one allocation of the summed size, through the uniform path's checks: n "slots" of 1 byte
     if (!open((int64_t) off.back(), n_layers, n_expert, 1, err)) return false;
     slots_ = (int64_t) slot_bytes.size();
+    live_slots_ = slots_;
     blob_ = mx;
     off_ = std::move(off);
     // #369: each layer's cursor at the bottom of its own range, as open() seeds it - open() above ran on byte-sized
@@ -244,12 +363,15 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 
 void ExpertCache::close() {
     off_.clear();
-    if (base_ != nullptr) {
+    if (!segs_.empty()) {
+        release_segmented();
+    } else if (base_ != nullptr) {
         strata::gpu::free(base_);
         base_ = nullptr;
     }
     residency_.clear();
     slots_ = 0;
+    live_slots_ = 0;
     n_layers_ = 0;
     n_expert_ = 0;
     blob_ = 0;
@@ -290,7 +412,7 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= live_slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }

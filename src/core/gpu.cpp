@@ -7,6 +7,8 @@
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
+#include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
+#include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
 
 #include <algorithm>
 #include <map>
@@ -24,6 +26,10 @@ struct Event {
 struct Graph {
     sx::command_graph<sx::graph_state::executable> exec;
     size_t nodes;
+};
+
+struct VmemSegment {
+    sx::physical_mem mem;
 };
 
 namespace {
@@ -134,6 +140,45 @@ void free(const void* p) {
         }
     }
     rt().free(const_cast<void*>(p));
+}
+
+bool vmem_supported() {
+    try { return rt().device().has(sycl::aspect::ext_oneapi_virtual_mem); }
+    catch (const std::exception& e) { return fail("vmem_supported", e); }
+}
+
+size_t vmem_granularity() {
+    try { return sx::get_mem_granularity(rt().device(), rt().context(), sx::granularity_mode::recommended); }
+    catch (const std::exception& e) { fail("vmem_granularity", e); return 0; }
+}
+
+void* vmem_reserve(size_t bytes) {
+    try { return reinterpret_cast<void*>(sx::reserve_virtual_mem(bytes, rt().context())); }
+    catch (const std::exception& e) { fail("vmem_reserve", e); return nullptr; }
+}
+
+void vmem_free(void* va, size_t bytes) {
+    try { sx::free_virtual_mem(reinterpret_cast<uintptr_t>(va), bytes, rt().context()); }
+    catch (const std::exception& e) { fail("vmem_free", e); }
+}
+
+VmemSegment* vmem_map(void* va, size_t bytes) {
+    try {
+        auto* seg = new VmemSegment{sx::physical_mem(rt().device(), rt().context(), bytes)};
+        try {
+            seg->mem.map(reinterpret_cast<uintptr_t>(va), bytes, sx::address_access_mode::read_write);
+        } catch (...) {
+            delete seg;
+            throw;
+        }
+        return seg;
+    } catch (const std::exception& e) { fail("vmem_map", e); return nullptr; }
+}
+
+void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
+    try { sx::unmap(va, bytes, rt().context()); }
+    catch (const std::exception& e) { fail("vmem_unmap", e); }
+    delete seg;
 }
 
 bool is_host_usm(const void* p) {
