@@ -650,6 +650,25 @@ void mmvq_f32(const void* weights, const float* x, void* scratch_q8_1, float* y,
 using Q40Traits = SmallTraits<Q40Block, 4>;
 using Q50Traits = SmallTraits<Q50Block, 4>;
 using Q80Traits = SmallTraits<Q80Block, 8>;
+// kNativeQ8Rows: Q80Traits' dot with the qs from the row's split arrays, every 32-bit load aligned; the same values
+// reach the same dot in the same order, so the results are Q80Traits' bit for bit.
+struct Q80RowTraits {
+    using Block = Q80Block;
+    static constexpr int DIV = Q80Traits::DIV, T = Q80Traits::T, KBY = Q80Traits::KBY, BPI = Q80Traits::BPI;
+    static int kqs(int tid) { return Q80Traits::kqs(tid); }
+    struct W { const uint8_t* qs; float d; };
+    static W load_row(const uint8_t* weights, int row, int kbx, int bpr, int) {
+        const uint8_t* base = weights + std::size_t(row) * bpr * sizeof(Q80Block);
+        return W{base + std::size_t(kbx) * 32,
+                 (float) *reinterpret_cast<const half*>(base + std::size_t(bpr) * 32 + std::size_t(kbx) * 2)};
+    }
+    static float apply(const W& r, const Q81Block* x, int iqs) {
+        int sumi = 0;
+        for (int i = 0; i < 2; ++i) sumi = dp4a(load_int(r.qs, iqs + i), load_int(x->qs, iqs + i), sumi);
+        const float d1 = low(x->ds);
+        return r.d * d1 * float(sumi);
+    }
+};
 using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
 
 } // namespace
@@ -708,6 +727,32 @@ void native_iq4_nl_mmvq(const void* w, const void* x, float* y, int n_in, int n_
 void native_iq4_nl_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<IQ4NLTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 
 bool native_q6_k_rows_ok(int n_in) noexcept { return n_in > 0 && n_in % 512 == 0; }
+bool native_q8_0_rows_ok(int n_in) noexcept { return n_in > 0 && n_in % 64 == 0; }
+
+void native_q8_0_to_rows(void* weights, int n_in, int n_out, void* stream) {
+    if (!native_q8_0_rows_ok(n_in)) throw std::invalid_argument("Q8_0 rows need an even number of blocks per row");
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    auto& q = validate_stream(stream);
+    const int bpr = n_in / 32;
+    const std::size_t row_bytes = std::size_t(bpr) * sizeof(Q80Block);
+    auto* w = static_cast<uint8_t*>(weights);
+    constexpr int WG = 256;
+    // as native_q6_k_to_rows: one work-group a row, through local memory, in place
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> row(sycl::range<1>(row_bytes), h);
+        h.parallel_for(sycl::nd_range<1>(std::size_t(n_out) * WG, WG), [=](sycl::nd_item<1> it) {
+            uint8_t* r = w + it.get_group(0) * row_bytes;
+            const int t = (int) it.get_local_id(0);
+            for (std::size_t i = t; i < row_bytes; i += WG) row[i] = r[i];
+            sycl::group_barrier(it.get_group());
+            for (std::size_t i = t; i < row_bytes; i += WG) {
+                const std::size_t b = i / sizeof(Q80Block), o = i % sizeof(Q80Block);
+                r[o < 2 ? std::size_t(bpr) * 32 + b * 2 + o : b * 32 + (o - 2)] = row[i];
+            }
+        });
+    });
+}
 
 void native_q6_k_to_rows(void* weights, int n_in, int n_out, void* stream) {
     if (!native_q6_k_rows_ok(n_in)) throw std::invalid_argument("Q6_K rows need an even number of blocks per row");
@@ -741,7 +786,7 @@ void native_q6_k_to_rows(void* weights, int n_in, int n_out, void* stream) {
 }
 
 bool native_mmvq_supported(int ggml_type) noexcept {
-    return ggml_type == kNativeQ6KRows || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 ||
+    return ggml_type == kNativeQ6KRows || ggml_type == kNativeQ8Rows || ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 ||
            ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
@@ -761,6 +806,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 13: block_elems = 256; block_bytes = 176; break;
     case 14: block_elems = 256; block_bytes = 210; break;
     case kNativeQ6KRows: block_elems = 512; block_bytes = 420; break;   // whole rows of an even block count
+    case kNativeQ8Rows: block_elems = 64; block_bytes = 68; break;
     case 23: block_elems = 256; block_bytes = 136; break;
     case 42: block_elems = 64; block_bytes = 18; break;
     case 16: case 17: case 18: case 21: case 22: case 29:
@@ -790,6 +836,10 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case kNativeQ6KRows:
         if (!native_q6_k_rows_ok(n_in)) throw std::invalid_argument("Q6_K rows need an even number of blocks per row");
         mmvq<Q6KRowTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+        break;
+    case kNativeQ8Rows:
+        if (!native_q8_0_rows_ok(n_in)) throw std::invalid_argument("Q8_0 rows need an even number of blocks per row");
+        mmvq<Q80RowTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
         break;
     case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;

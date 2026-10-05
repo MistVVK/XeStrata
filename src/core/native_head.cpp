@@ -65,6 +65,11 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
             strata::kernels::native_q6_k_to_rows(weights, (int) n_in, (int) n_out, &q);
             q.wait();
             type = strata::kernels::kNativeQ6KRows;
+        } else if (type == 8 && strata::kernels::native_q8_0_rows_ok((int) n_in)) {
+            sycl::queue& q = strata::core::Runtime::get().compute();
+            strata::kernels::native_q8_0_to_rows(weights, (int) n_in, (int) n_out, &q);
+            q.wait();
+            type = strata::kernels::kNativeQ8Rows;
         }
         weights_ = weights;
         scratch_ = scratch;

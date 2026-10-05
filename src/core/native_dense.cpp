@@ -175,6 +175,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (type == 14 && strata::kernels::native_q6_k_rows_ok((int) ref.ne0)) {   // aligned loads
                     strata::kernels::native_q6_k_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
                     type = strata::kernels::kNativeQ6KRows;
+                } else if (type == 8 && strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
+                    strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                    type = strata::kernels::kNativeQ8Rows;
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;

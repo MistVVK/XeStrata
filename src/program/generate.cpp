@@ -34,6 +34,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/ngram.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -1949,9 +1950,11 @@ int main(int argc, char** argv) {
             ss.ple.w.key_scales = (const float*) ((const uint8_t*) wk->data + wk->codes_bytes);
         }
         if (o.native_ple_key && wk->quantized()) {
-            // the types kernels::ple takes: Q2_0 (42), IQ3_XXS (18), IQ4_XS (23), Q8_0 (8: Unsloth's UD-IQ4_XS)
+            // the types kernels::ple takes: Q2_0 (42), IQ3_XXS (18), IQ4_XS (23), Q8_0 (8: Unsloth's UD-IQ4_XS; its
+            // aligned row layout once loaded)
             if (!wk->native_data || (wk->native_type != 42 && wk->native_type != 18 && wk->native_type != 23 &&
-                                     wk->native_type != 8) || !wk->native_q8_1) {
+                                     wk->native_type != 8 && wk->native_type != strata::kernels::kNativeQ8Rows) ||
+                !wk->native_q8_1) {
                 std::fprintf(stderr, "strata generate: native PLE key is absent or incompatible\n");
                 return 1;
             }

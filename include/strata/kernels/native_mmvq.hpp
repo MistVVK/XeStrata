@@ -125,5 +125,15 @@ constexpr int kNativeQ6KRows = kXeTypeBase + 1;
 // kNativeQ6KRows layout.  Throws on an odd block count; the caller then keeps GGUF order.
 bool native_q6_k_rows_ok(int n_in) noexcept;
 void native_q6_k_to_rows(void* weights, int n_in, int n_out, void* stream);
+// Q8_0 with each row's blocks split into two arrays: the row's qs (32 bytes a block), then its d (2).  A Q8_0 block is
+// 34 bytes, so in GGUF order its qs sit on two-byte boundaries and the kernel loads them 16 bits at a time; split,
+// every load is aligned (the B70 read the 2560 x 248320 output head at 150 GB/s in GGUF order).  The same lanes do
+// the same arithmetic in the same order, so the results are bitwise those of GGUF-order Q8_0.  The engine's own ID,
+// as kNativeQ6KRows; never written to a file.
+constexpr int kNativeQ8Rows = kXeTypeBase + 2;
+// Rewrites Q8_0 rows (n_in / 32 blocks each, an even count so every row starts 4-byte aligned) in place into the
+// kNativeQ8Rows layout.  Throws on an odd block count; the caller then keeps GGUF order.
+bool native_q8_0_rows_ok(int n_in) noexcept;
+void native_q8_0_to_rows(void* weights, int n_in, int n_out, void* stream);
 
 } // namespace strata::kernels

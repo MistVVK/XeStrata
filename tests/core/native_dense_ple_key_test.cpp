@@ -18,6 +18,7 @@
 
 #include "strata/core/runtime.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -37,6 +38,9 @@ void check(bool ok, const std::string& what) {
     std::printf("  %-84s %s\n", what.c_str(), ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
+
+// Q8_0 matrices are served in GGUF order or rewritten to the engine's row layout.
+bool q8_0_native(int type) { return type == 8 || type == strata::kernels::kNativeQ8Rows; }
 
 struct TempDir {
     fs::path path;
@@ -133,7 +137,7 @@ int main() try {
             check(same, "the arena holds the pack's BF16 bytes");
         }
         const auto* q = l.wt.find(QKV);
-        check(q && q->native_data && q->native_type == 8, "qkv still served natively (Q8_0)");
+        check(q && q->native_data && q8_0_native(q->native_type), "qkv still served natively (Q8_0)");
         check(l.dense.tensor_count() == 1, "one native matrix");
     }
 
@@ -148,7 +152,7 @@ int main() try {
         check(l.ok, "the pack loads " + l.err);
         check(l.skip.count(PLE_TENSOR) == 1, "the key stays skipped");
         const auto* k = l.wt.find(PLE_TENSOR);
-        check(k && !k->resident && k->native_data && k->native_type == 8, "the key is served natively");
+        check(k && !k->resident && k->native_data && q8_0_native(k->native_type), "the key is served natively");
         check(l.dense.tensor_count() == 2, "two native matrices");
     }
 
