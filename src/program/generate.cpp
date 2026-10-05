@@ -329,6 +329,10 @@ struct Options {
     /// spec-1 drafts); 0 = plain decode.  `spec_oracle` drafts from a token file (the expected continuation, for
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
+    /// --serve runs up to this many sequences at once, one token each per batch window (0 = off; upstream PR #559,
+    /// #465).  A request sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual
+    /// path, then continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
+    int batch = 0;
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
@@ -550,6 +554,8 @@ void usage() {
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
+                 "  --batch N, --slots N --serve: up to N conversations decoded together, one token each per batch\n"
+                 "                       window (2..8; a count that cannot run is a warning and fewer slots or none)\n"
                  "  --vram-elastic       --serve (#533, opt-in): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -1108,6 +1114,7 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-experts") o.prefill_experts = (int) std::strtol(next("--prefill-experts"), nullptr, 10);
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
+        else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -2083,6 +2090,55 @@ int main(int argc, char** argv) {
                      st.dev, last ? " and head" : "", (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
+
+    // --batch (upstream PR #559, #465): o.batch more sessions carved like the main one, one per slot of the batch
+    // windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.  A count the engine
+    // cannot run is a warning and fewer slots or none, never a refusal.
+    std::vector<std::unique_ptr<strata::core::SessionState>> bslot_ss;
+    std::vector<void*> bslot_buf;
+    if (o.batch != 0) {
+        const char* why = !o.serve ? "it needs --serve"
+                        : o.batch < 2 ? "it needs at least 2 slots"
+                        : multi_gpu || split_same ? "a layer split is not supported here"
+                        : nullptr;
+        if (o.batch > strata::kernels::kVerifyMaxT) {
+            std::fprintf(stderr, "strata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
+                         strata::kernels::kVerifyMaxT, strata::kernels::kVerifyMaxT);
+            o.batch = strata::kernels::kVerifyMaxT;
+        }
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --batch is off: %s\n", why);
+            o.batch = 0;
+        }
+        const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K);
+        for (int b = 0; b < o.batch; ++b) {
+            auto u = std::make_unique<strata::core::SessionState>();
+            void* buf = nullptr;
+            if (!strata::gpu::alloc_device(&buf, bytes) || strata::core::session_init(g, o.max_context, K, buf, *u) == 0) {
+                if (buf) strata::gpu::free(buf);
+                std::fprintf(stderr, "strata generate: --batch: slot %d's session does not fit (%.2f GiB each)\n", b,
+                             (double) bytes / 1073741824.0);
+                break;
+            }
+            strata::core::session_zero(*u, g, nullptr, main_cs);
+            bslot_ss.push_back(std::move(u));
+            bslot_buf.push_back(buf);
+        }
+        if (o.batch > 0 && bslot_ss.size() < 2) {
+            std::fprintf(stderr, "strata generate: --batch is off: not two slot sessions fit\n");
+            for (void* b : bslot_buf) strata::gpu::free(b);
+            bslot_ss.clear();
+            bslot_buf.clear();
+        }
+        o.batch = (int) bslot_ss.size();
+        if (o.batch > 0) {
+            strata::gpu::stream_sync(main_cs);
+            size_t fb = 0, tb = 0;
+            strata::gpu::mem_info(&fb, &tb);
+            std::fprintf(stderr, "strata generate: --batch: %d slot sessions (%.2f GiB each); %.2f GiB free\n", o.batch,
+                         (double) bytes / 1073741824.0, (double) fb / 1073741824.0);
+        }
+    }
 
     // Allocate the MTP weights before registering the large host arena with both CUDA contexts.
     strata::core::MtpDrafter mtp;
@@ -3653,10 +3709,20 @@ int main(int argc, char** argv) {
                           " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
             std::fprintf(stderr, "strata serve: layer split: layers %s, one hand-off per window\n", plan_s.c_str());
         }
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
+        if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max(o.spec, o.batch), err) ||
             !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
+        }
+        if (o.batch > 0) {   // the verifier gets the slot sessions; one that cannot take them runs without slots
+            std::vector<strata::core::SessionState*> ptrs;
+            ptrs.reserve(bslot_ss.size());
+            for (auto& u : bslot_ss) ptrs.push_back(u.get());
+            if (!ver.init_slots(ptrs, err)) {
+                std::fprintf(stderr, "strata serve: --batch is off: %s\n", err.c_str());
+                err.clear();
+                o.batch = 0;
+            }
         }
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
@@ -4155,7 +4221,8 @@ int main(int argc, char** argv) {
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d engine=" STRATA_VERSION "\n",
+                        "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d batch_slots=%d slot_cache=%d "
+                        "engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
                                          ? ss.qsa_states[0].n_slots * 4 : 0),
@@ -4164,7 +4231,7 @@ int main(int argc, char** argv) {
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.tail_role_token,
-                        xcache.segmented() ? 1 : 0);
+                        xcache.segmented() ? 1 : 0, o.batch, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -4313,7 +4380,195 @@ int main(int argc, char** argv) {
                         (long long) (free_b >> 20), (long long) o.prefill_chunk);
             return true;
         };
-        while (next_line(line)) {
+        // ---- --batch (upstream PR #559, #465): the slots of the batch windows
+        struct BSlot {
+            bool active = false, stop = false;
+            int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
+            int64_t p = 0;                 ///< its position
+            int64_t produced = 0, max_new = 0;
+            Clock::time_point t0;
+            // the slot's own conversation cache (#465): the tokens its session holds (the prompt, then every token a
+            // window fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from
+            // it instead of reading its history again (see `slot_source` in the request path).
+            std::vector<int32_t> ids;
+            bool cached = false;           ///< idle, and its session still holds `ids`
+            bool cvec = true;              ///< the control vector setting `ids` were read with
+            bool img = false;              ///< the conversation has pictures (never reused from the slot)
+            // the checkpoint its prompt read took at the last turn boundary (the history before the new turn's
+            // header): a client's next turn renders the history again WITHOUT this reply's thinking, so it matches
+            // the slot's tokens only up to there - the slot's K/V up to it plus this state continue from it
+            std::vector<ConvCheckpoint> checks;
+            // a prompt read that gave way to a waiting request (BYIELD): `ids` is the part read so far, and the same
+            // request continues from it (the read goes on with the same chunks; `from0`: it had started at token 0)
+            bool partial = false, partial_from0 = false;
+        };
+        std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // timing of the batch windows since the slots were last all idle (one stderr line then)
+        double bt_run = 0, bt_commit = 0, bt_emit = 0, bt_wait0 = 0, bt_pool0 = 0;
+        int64_t bt_windows = 0, bt_rows = 0;
+        Clock::time_point bt_start = Clock::now();
+        int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
+        long long admit_max_new = 0;
+        auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        auto try_next_line = [&](std::string& out) -> bool {
+            std::lock_guard<std::mutex> lk(in_mu);
+            if (in_lines.empty()) return false;
+            out = std::move(in_lines.front());
+            in_lines.pop_front();
+            return true;
+        };
+        // the session a request just left behind (its prompt and first token) -> slot b's session
+        auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+            const int64_t upto = (int64_t) ids.size();
+            strata::core::SessionState& to = *bslot_ss[(size_t) b];
+            if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+            strata::core::ConversationCheckpoint ck;
+            ck.ids = ids;
+            if (!strata::core::conversation_checkpoint_save(ck, ss, g, e) ||
+                !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                return false;
+            for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
+                strata::core::ConversationKv img;
+                if (!strata::core::conversation_kv_save(img, ss.qsa_states[j], g, upto, true, e)) return false;
+                if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+                if (!strata::core::conversation_kv_restore(img, to.qsa_states[j], g, upto, true, e)) return false;
+            }
+            if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+            return true;
+        };
+        // slot b's session -> the main one (the reverse of copy_to_slot): a request that continues the conversation an
+        // idle slot holds reads on from there.  `at`: one of the slot's checkpoints - only the K/V up to it is copied
+        // and its state restored instead
+        auto copy_from_slot = [&](int b, const ConvCheckpoint* at, std::string& e) -> bool {
+            const int64_t upto = at != nullptr ? (int64_t) at->ids.size() : (int64_t) bs[(size_t) b].ids.size();
+            strata::core::SessionState& from = *bslot_ss[(size_t) b];
+            if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
+            if (at != nullptr) {
+                if (!strata::core::conversation_checkpoint_restore(*at, ss, g, e)) return false;
+            } else {
+                strata::core::ConversationCheckpoint ck;
+                ck.ids = bs[(size_t) b].ids;
+                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    !strata::core::conversation_checkpoint_restore(ck, ss, g, e))
+                    return false;
+            }
+            for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                strata::core::ConversationKv img;
+                if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
+                if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
+                if (!strata::core::conversation_kv_restore(img, ss.qsa_states[j], g, upto, true, e)) return false;
+            }
+            if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
+            return true;
+        };
+        // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
+        // so it keeps the conversation it holds (#465)
+        auto batch_step = [&]() -> bool {
+            int S = 0;
+            int rows[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
+            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            for (int b = 0; b < (int) bs.size() && S < strata::kernels::kVerifyMaxT; ++b)
+                if (bs[(size_t) b].active) {
+                    rows[S] = b;
+                    tok[S] = bs[(size_t) b].x;
+                    pos[S] = bs[(size_t) b].p;
+                    ++S;
+                }
+            if (S == 0) return true;
+            const bool was_busy = strata::core::progress().busy.load();
+            strata::core::progress().busy.store(true);
+            drive.d.failed = false;
+            apply_pending(false);
+            if (bt_windows == 0) {
+                bt_start = Clock::now();
+                bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
+            }
+            const Clock::time_point w0 = Clock::now();
+            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+                std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                return false;
+            }
+            const Clock::time_point w1 = Clock::now();
+            if (!ver.commit_slots(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
+            const Clock::time_point w2 = Clock::now();
+            auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
+            bt_run += msd(w0, w1);
+            bt_commit += msd(w1, w2);
+            ++bt_windows;
+            bt_rows += S;
+            for (int t = 0; t < S; ++t) {
+                const int b = rows[t];
+                BSlot& sl = bs[(size_t) b];
+                const int32_t y = outb[t];
+                sl.ids.push_back(sl.x);    // the window fed it: the slot's session holds it now
+                std::printf("BT %d %d\n", b, (int) y);
+                ++sl.produced;
+                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                : sl.p + 2 > o.max_context ? "length" : nullptr;
+                if (fin != nullptr) {
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                    std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                    sl.active = false;
+                    sl.cached = o.prompt_cache > 0 && !sl.img;   // its session holds sl.ids for the next turn
+                } else {
+                    sl.x = y;
+                    sl.p += 1;
+                }
+            }
+            std::fflush(stdout);
+            bt_emit += msd(w2, Clock::now());
+            strata::core::progress().busy.store(was_busy);
+            if (!batch_on() && bt_windows > 0) {
+                const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
+                std::fprintf(stderr, "strata batch: %lld windows, avg %.2f rows, %.2f ms/window = run %.2f (GPU-reach wait "
+                                     "%.2f + CPU experts %.2f) + commit %.2f + emit %.2f; %.1f rows/s over %.0f ms of wall "
+                                     "time (admissions included)\n",
+                             (long long) bt_windows, (double) bt_rows / w, (bt_run + bt_commit + bt_emit) / w, bt_run / w,
+                             (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
+                             1000.0 * (double) bt_rows / std::max(wall, 1e-9), wall);
+                bt_run = bt_commit = bt_emit = 0;
+                bt_windows = bt_rows = 0;
+            }
+            return true;
+        };
+        for (;;) {
+            if (batch_on()) {   // the slots decode while no line waits
+                if (!try_next_line(line)) {
+                    if (!batch_step()) return 1;
+                    continue;
+                }
+            } else if (!next_line(line)) {
+                break;
+            }
+            // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
+            // request's prompt and first token as a GEN 1, then continues it in that slot
+            if (line.rfind("BSTOP ", 0) == 0) {
+                const int b = (int) std::strtol(line.c_str() + 6, nullptr, 10);
+                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                continue;
+            }
+            if (line.rfind("BYIELD", 0) == 0) continue;   // for a prompt read that has ended meanwhile
+            admit_slot = -1;
+            if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
+                const bool bimg = line.rfind("BGENI ", 0) == 0;
+                char* e1 = nullptr;
+                const long b = std::strtol(line.c_str() + (bimg ? 6 : 5), &e1, 10);
+                char* e2 = nullptr;
+                const long long mn = std::strtoll(e1, &e2, 10);
+                if (bs.empty() || b < 0 || b >= (long) bs.size() || bs[(size_t) b].active || mn < 1 || e2 == e1) {
+                    std::printf("ERR BGEN: no such free slot (--batch %d) or a bad max_new\n", o.batch);
+                    std::fflush(stdout);
+                    continue;
+                }
+                admit_slot = (int) b;
+                admit_max_new = mn;
+                line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
+            }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
             if (!heat.empty() && line != "QUIT" && o.expert_profile_save_min > 0 &&
                 Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
@@ -4327,7 +4582,9 @@ int main(int argc, char** argv) {
             if (line == "QUIT") break;
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
-                if (!vram_command(line, verr)) std::printf("ERR %s\n", verr.c_str());
+                if (batch_on()) verr = "VRAM: not while batch slots are decoding";
+                else vram_command(line, verr);
+                if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
                 std::fflush(stdout);
                 continue;
             }
@@ -4540,6 +4797,28 @@ int main(int argc, char** argv) {
                         from_live = false;
                     }
             }
+            // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a source
+            // too - its session is copied back below, so only the new part is read (#465)
+            int slot_source = -1;
+            int64_t slot_tokens = 0;
+            bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
+            const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
+            if (o.prompt_cache > 0 && req_imgs.empty())
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    const BSlot& sl = bs[(size_t) b];
+                    if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
+                    if ((int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
+                        slot_source = b;
+                        slot_tokens = (int64_t) sl.ids.size();
+                        slot_ck = nullptr;
+                    }
+                    for (const ConvCheckpoint& c : sl.checks)
+                        if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                            slot_source = b;
+                            slot_tokens = (int64_t) c.ids.size();
+                            slot_ck = &c;
+                        }
+                }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             int64_t in_tokens = 0;
@@ -4548,7 +4827,7 @@ int main(int argc, char** argv) {
             // --conversation-save: a file goes further than the live session and every parked conversation
             const auto saved = disk.enabled() ? disk.best(ids, req_imgs, want_cvec)
                                               : strata::core::ConversationDisk::Match{};
-            if (saved.tokens > resume && saved.tokens > parked.tokens) {
+            if (saved.tokens > std::max(resume, slot_tokens) && saved.tokens > parked.tokens) {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                 const size_t need = disk.load_bytes(saved.index);
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), need,
@@ -4577,7 +4856,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!incoming && parked.tokens > resume) {
+            if (!incoming && parked.tokens > std::max(resume, slot_tokens)) {
                 incoming.emplace(conversations.take(parked.index));
                 in_tokens = parked.tokens;
                 in_live = parked.live;
@@ -4592,9 +4871,47 @@ int main(int argc, char** argv) {
             }
             // the outgoing conversation is parked before a checkpoint rewind, a reset or the incoming restore
             // overwrites the positional state it needs
-            if ((!from_live || incoming) && !park_current(incoming ? incoming->bytes() : 0)) {
+            if (incoming) slot_source = -1;
+            if ((!from_live || incoming || slot_source >= 0) && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (slot_source >= 0) {
+                const auto t0 = Clock::now();
+                if (!copy_from_slot(slot_source, slot_ck, err)) {
+                    // the main session may be half written: read this prompt from the start
+                    std::fprintf(stderr, "strata batch: restoring slot %d failed (%s); reading the prompt\n",
+                                 slot_source, err.c_str());
+                    err.clear();
+                    live.clear();
+                    live_imgs.clear();
+                    checks.clear();
+                    resume = 0;
+                    from_live = false;
+                } else {
+                    checks.clear();   // the main session's checkpoints were of the conversation it held before
+                    // a read that gave way, the same request again (into its own slot): on with it - its parts and
+                    // checkpoints as if it had not stopped
+                    if (slot_ck == nullptr && bs[(size_t) slot_source].partial && admit_slot == slot_source) {
+                        resumed_from0 = bs[(size_t) slot_source].partial_from0;
+                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
+                        bs[(size_t) slot_source].partial = false;
+                    }
+                    if (slot_ck != nullptr) {
+                        live = slot_ck->ids;
+                        checks.push_back(*slot_ck);   // the main session's chain has it now
+                        checks.back().used = ++check_clock;
+                    } else {
+                        live = bs[(size_t) slot_source].ids;
+                    }
+                    live_imgs.clear();
+                    resume = slot_tokens;
+                    from_live = true;
+                    std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
+                                 "%.1f ms\n", slot_source, (long long) slot_tokens,
+                                 slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
             }
             if (incoming) {
                 const auto t0 = Clock::now();
@@ -4818,6 +5135,98 @@ int main(int argc, char** argv) {
                 lent_chunk = want;
                 return true;
             };
+            // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
+            // run: each run starts where the last ended, at a multiple of the chunk), and between two chunks the slots
+            // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
+            // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
+            // borrowed (marked missing: those experts run on the CPU), never a prompt buffer (#465).
+            static const double decode_share = [] {
+                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
+                return v != nullptr ? std::max(0.0, std::strtod(v, nullptr)) : 0.5;
+            }();
+            bool batch_fatal = false;
+            int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
+            double il_ms = 0;
+            int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
+            int yielded_slot = -1;
+            // `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
+            // far is copied into <slot> (this admission's own, or a free one the server reserved for a solo request),
+            // the request ends with `YIELDED <slot> <tokens>` + DONE cancel, and the server sends it again later: it
+            // continues from the slot with the same chunks (upstream #656's cooperative preemption, a slot as the park)
+            auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                if (o.batch <= 0) return sp.run(ids.data() + a0, b0 - a0, a0, e);
+                const int64_t C = std::max<int64_t>(sp.chunk(), 1);
+                for (int64_t q = a0; q < b0;) {
+                    const int64_t r = std::min(b0, q + C);
+                    const auto tq = Clock::now();
+                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    q = r;
+                    if (q >= b0) continue;
+                    int ys = -1;
+                    {   // a BSTOP that came meanwhile ends its slot at its next window; a BYIELD is for this read
+                        std::lock_guard<std::mutex> lk(in_mu);
+                        for (auto it = in_lines.begin(); it != in_lines.end();) {
+                            if (it->rfind("BSTOP ", 0) == 0) {
+                                const int b = (int) std::strtol(it->c_str() + 6, nullptr, 10);
+                                if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                                it = in_lines.erase(it);
+                            } else if (it->rfind("BYIELD ", 0) == 0) {
+                                ys = (int) std::strtol(it->c_str() + 7, nullptr, 10);
+                                it = in_lines.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    if (ys >= 0) {
+                        // only where the rest is read the same way after it (more than a chunk and more than a short
+                        // read left), text only, and into a slot that is not decoding
+                        const bool can = ys < (int) bs.size() && !bs[(size_t) ys].active &&
+                                         (admit_slot < 0 || ys == admit_slot) && req_imgs.empty() && o.prompt_cache > 0 &&
+                                         b0 - q > std::max<int64_t>(C, o.short_read);
+                        std::string ye;
+                        const auto ty = Clock::now();
+                        std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
+                        if (can && copy_to_slot(ys, pre, ye)) {
+                            BSlot& sl = bs[(size_t) ys];
+                            sl = BSlot{};
+                            sl.ids = std::move(pre);
+                            sl.cached = true;
+                            sl.partial = true;
+                            sl.partial_from0 = read_from == 0 || resumed_from0;
+                            sl.cvec = cvec_cached;
+                            for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
+                                if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
+                                        [](int32_t xa, int64_t yb) { return (int64_t) xa == yb; }))
+                                    sl.checks.push_back(c);
+                            yielded_at = q;
+                            yielded_slot = ys;
+                            std::fprintf(stderr, "strata batch: the prompt read gives way at %lld of %lld tokens; slot %d "
+                                                 "holds it (copied in %.1f ms)\n", (long long) q, (long long) n, ys,
+                                         std::chrono::duration<double, std::milli>(Clock::now() - ty).count());
+                            e = "yield";
+                            return false;
+                        }
+                        if (can) bs[(size_t) ys].cached = false;   // half written
+                        std::fprintf(stderr, "strata batch: BYIELD %d not taken at %lld of %lld%s%s\n", ys, (long long) q,
+                                     (long long) n, ye.empty() ? "" : ": ", ye.c_str());
+                    }
+                    if (decode_share <= 0.0 || !batch_on()) continue;
+                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    const auto td = Clock::now();
+                    do {
+                        if (!batch_step()) { batch_fatal = true; e = "a batch window failed"; return false; }
+                    } while (batch_on() && std::chrono::duration<double, std::milli>(Clock::now() - td).count() < budget);
+                    ++il_parts;
+                    il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                    if (trace) {
+                        std::fprintf(stderr, "strata trace: prompt chunk to %lld, then the slots decoded %.0f ms\n",
+                                     (long long) q, std::chrono::duration<double, std::milli>(Clock::now() - td).count());
+                        std::fflush(stderr);
+                    }
+                }
+                return true;
+            };
             apply_pending(true);
             // per-request sampling for the verify window's head (greedy when temperature is absent)
             strata::kernels::SamplerParams req_sp;
@@ -4867,7 +5276,7 @@ int main(int argc, char** argv) {
             // (PR #65, code-martin.)  Only for a system prompt of --prompt-cache-root tokens or more: a small one
             // is cheaper to read again than the extra part costs (~0.3 s).
             int64_t root_at = -1;
-            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && read_from == 0)
+            if (o.prompt_cache > 0 && o.turn_token >= 0 && o.prompt_cache_root > 0 && (read_from == 0 || resumed_from0))
                 for (int64_t i = 1; i < turn_at; ++i)
                     if (ids[(size_t) i] == o.turn_token) {
                         if (i >= o.prompt_cache_root) root_at = i;
@@ -4887,7 +5296,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 const auto tsp = Clock::now();
-                const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
+                const bool sp_ok = win ? read_windows(at, to, err) : read_part(at, to, err);
                 if (trace) {
                     std::fprintf(stderr, "strata trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -4895,7 +5304,7 @@ int main(int argc, char** argv) {
                     std::fflush(stderr);
                 }
                 if (!sp_ok) {
-                    if (!stop_req.load()) {
+                    if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
@@ -4914,6 +5323,9 @@ int main(int argc, char** argv) {
                 return 1;
             }
             tr("prompt done (slots refilled)");
+            if (il_parts > 0)
+                std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
+                                     "them\n", (long long) il_parts + 1, il_ms);
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
             std::printf("REUSED %lld\n", (long long) resume);   // the prompt is read; the first window comes next
             std::fflush(stdout);
@@ -5217,6 +5629,7 @@ int main(int argc, char** argv) {
             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
             //      [offloaded]   (#588: the decode's routed experts the GPU read over PCIe or another GPU computed;
             //                    not in [lookups])
+            if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
@@ -5225,6 +5638,42 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload);
             std::fflush(stdout);
+            if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
+                bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
+                            (int64_t) live.size() == p;
+                const auto tc0 = Clock::now();
+                if (cont && !copy_to_slot(admit_slot, live, err)) {
+                    std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
+                    err.clear();
+                    bs[(size_t) admit_slot].cached = false;   // its session may be half written
+                    cont = false;
+                }
+                if (cont) {
+                    ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                    BSlot& sl = bs[(size_t) admit_slot];
+                    sl = BSlot{};
+                    sl.active = true;
+                    sl.x = x;
+                    sl.p = p;
+                    sl.produced = 1;
+                    sl.max_new = admit_max_new;
+                    sl.t0 = Clock::now();
+                    sl.ids = live;
+                    sl.cvec = cvec_cached;
+                    sl.img = !live_imgs.empty();   // pictures: not matched again by tokens alone, so not cached
+                    const ConvCheckpoint* best = nullptr;
+                    for (const ConvCheckpoint& c : checks)
+                        if (c.ids.size() < live.size() && (best == nullptr || c.ids.size() > best->ids.size()) &&
+                            std::equal(c.ids.begin(), c.ids.end(), live.begin()))
+                            best = &c;
+                    if (best != nullptr && !sl.img) sl.checks.push_back(*best);
+                    std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
+                                 (long long) live.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
+                }
+                std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
+                std::fflush(stdout);
+            }
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
             char read_txt[64];
