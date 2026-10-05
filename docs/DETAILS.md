@@ -296,6 +296,14 @@ For a game, a 3D program or another model beside it, leave more (upstream #493).
 
 The expert cache is then that much smaller, so answers can be a little slower.
 
+The amount can also change while it runs (upstream #533).
+With `"vram_elastic": true` in the config, the expert cache is held in pieces of 512 MiB (`"vram_segment_mib"` changes it).
+Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's last pieces back to the GPU until that much is free, and `{"reserve_mib": null}` goes back to the amount the start left.
+A running request finishes first.
+The experts of the pieces given back are computed on the CPU: the same answers, slower.
+`GET /v1/status` shows the current size under `"vram"`.
+Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.1.1 does not).
+
 ### Model files downloaded by hand, or from a mirror
 
 setup's step 5 prints the folder it expects them in (`XeStrata-data/models/<SIZE>/`; upstream #495).
