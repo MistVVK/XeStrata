@@ -34,6 +34,7 @@
 // the multi-column kernel with NCOLS = 1 and the ncols = 1 layout (4 warps, 1 row, or 4 rows for small K) is the
 // single-column path, so both share one set of dot-product traits.  A warp is a sub-group of 32.
 #include "strata/kernels/native_mmvq.hpp"
+#include "q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
@@ -678,10 +679,10 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
         const float xi = x[i];
         const float amax = warp_max(sg, sycl::fabs(xi));
         const float sum = warp_sum(sg, xi);
-        const float d = amax / 127.0f;
-        const int8_t qv = amax == 0.0f ? 0 : (int8_t) sycl::round(xi / d);
+        const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
+        const int8_t qv = xe::q8_1_quant(xi, d, amax);
         y[i / Q8K].qs[i % Q8K] = qv;
-        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(sum));
+        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
     });
 }
 

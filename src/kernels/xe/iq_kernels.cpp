@@ -36,6 +36,7 @@
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
+#include "q8_1_finite.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -717,11 +718,11 @@ sycl::event launch_quantize_q8_1(sycl::queue& q, const float* x, block_q8_1* y, 
         const float xi = x[i];
         const float amax = warp_max(sg, sycl::fabs(xi));
         const float sum = warp_sum(sg, xi);
-        const float d = amax / 127.0f;
-        const int8_t qv = amax == 0.0f ? 0 : (int8_t) sycl::round(xi / d);
+        const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
+        const int8_t qv = xe::q8_1_quant(xi, d, amax);
         const long long ib = i / 32, iqs = i % 32;
         y[ib].qs[iqs] = qv;
-        if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(sum));
+        if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
     });
 }
 
@@ -1463,11 +1464,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             const float xi = (g / (1.0f + sycl::exp(-g))) * up[i];
             const float amax = warp_max(sg, sycl::fabs(xi));
             const float sum = warp_sum(sg, xi);
-            const float d = amax / 127.0f;
-            const int8_t qv = amax == 0.0f ? 0 : (int8_t) sycl::round(xi / d);
+            const float d = xe::q8_1_finite(amax / 127.0f);   // #606, as launch_quantize_q8_1
+            const int8_t qv = xe::q8_1_quant(xi, d, amax);
             const long long ib = i / 32, iqs = i % 32;
             hq[ib].qs[iqs] = qv;
-            if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(sum));
+            if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
         });
     }
     sycl::event e;
