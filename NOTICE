@@ -12,6 +12,14 @@ details.
 The GNU Lesser General Public License is in COPYING.LESSER; it supplements the GNU General Public License, which is in
 COPYING.
 
+Additional permission under GNU GPL version 3 section 7
+
+If you modify XeStrata, or any covered work, by linking or combining it with a math or compute library that the maker of
+a GPU or CPU publishes for its processors, or with the runtime libraries such a library or its compiler needs (for
+example Intel oneMKL and the runtime libraries of Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and
+driver), or with a modified version of such a library, containing parts covered by the terms of that library's license,
+the licensors of XeStrata grant you additional permission to convey the resulting work.
+
 Copyright notices
 =================
 

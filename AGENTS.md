@@ -33,6 +33,7 @@ Rules:
 
 XeStrata is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and MIT notices are in `NOTICE`.
 Keep the MIT notice of the parts that come from Strata.
+`NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime) may be conveyed.
 Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
 
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.

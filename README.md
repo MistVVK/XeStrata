@@ -243,6 +243,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
 XeStrata is free software under the [GNU Lesser General Public License, version 3 or later](COPYING.LESSER)
 (`COPYING.LESSER`, with `COPYING`).
 
+- **Linking with the vendors' math libraries:** what is linked with a math or compute library a GPU or CPU maker
+  publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime libraries of Intel's
+  oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
+  permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
 - **The parts that come from Strata:** Strata's MIT License stays with them (copyright and MIT notices are in [NOTICE](NOTICE)).
 - **Material from other projects:** in `third_party/`, one folder per project with its license.
    - `third_party/main/`: free software. ggml's `ggml-common.h` (MIT) and the app's font Outfit (SIL Open Font
