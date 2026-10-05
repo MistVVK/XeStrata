@@ -483,6 +483,8 @@ class StrataEngine:
             self.last.update(ram_blobs=int(f[11]), file_blobs=int(f[12]), file_mb=float(f[13]))
         if len(f) >= 15:                                  # #471 (engine 0.1.36+): the prompt tokens actually read
             self.last.update(prompt_read=int(f[14]))
+        if len(f) >= 16:                                  # #588 (engine 0.1.39+): routed experts read over PCIe
+            self.last.update(offloaded=int(f[15]))
 
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
@@ -1760,6 +1762,11 @@ class Service:
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                            # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
+                            # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
+                            routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
+                            pcie_share = round(last["offloaded"] / routed, 3) \
+                                if last.get("offloaded") is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
@@ -1772,7 +1779,7 @@ class Service:
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
-                                "hit_rate": hit_rate, "ram_blobs": last.get("ram_blobs"),
+                                "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
@@ -1796,6 +1803,8 @@ class Service:
                             ft = self.status.get("first_token")
                             rate = n / max(1e-6, now - ft) if ft else 0.0
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
+                            if hit_msg and pcie_share:
+                                hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state == "reasoning":   # #530

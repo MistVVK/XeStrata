@@ -4774,6 +4774,7 @@ int main(int argc, char** argv) {
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+            const int64_t offload0 = drive.d.offload_entries;   // #588
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -5001,6 +5002,7 @@ int main(int argc, char** argv) {
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;
+            const int64_t req_offload = drive.d.offload_entries - offload0;
             // #471: the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;
@@ -5008,11 +5010,15 @@ int main(int argc, char** argv) {
             // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
             //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
             //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld\n", (long long) produced_n,
+            //      [offloaded]   (#588: the decode's routed experts the GPU read over PCIe or another GPU computed;
+            //                    not in [lookups])
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n",
+                        (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
-                        (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n);
+                        (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
+                        (long long) req_offload);
             std::fflush(stdout);
             if (drive.routing != nullptr) std::fflush(drive.routing);   // the routing trace survives a crash and is watchable mid-session
             // "12288 of 98179" when cancelled mid-read (#471), the rate from what was read
@@ -5028,11 +5034,18 @@ int main(int argc, char** argv) {
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             // the VRAM share of the experts the pool looked up while decoding; experts it sent over PCIe for the GPU
-            // to read (--pcie-frac) are in neither count
+            // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
+            // raises the hit rate while the PCIe reads may make the decode slower)
             if (req_look > 0) {
-                std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)\n",
+                char off[160] = "";
+                if (req_offload > 0)
+                    std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
+                                  "all %lld routed)", (long long) req_offload,
+                                  100.0 * (double) req_offload / (double) (req_look + req_offload),
+                                  (long long) (req_look + req_offload));
+                std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
                              100.0 * (double) req_hits / (double) req_look,
-                             (long long) req_hits, (long long) req_look);
+                             (long long) req_hits, (long long) req_look, off);
             }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)

@@ -658,6 +658,8 @@ Treat the history as sensitive when the server is reachable from a network: set 
 
 `GET /metrics` also lists each recent request's speculative drafts, `drafts_offered` and `drafts_accepted` (`null` when the engine did not report them),
 and their sums since the server started in `totals`.
+Its `hit_rate` is the VRAM share of the experts looked up while answering: experts the GPU reads over PCIe (`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower.
+`pcie_share` is their share of all routed experts; the server log and the Monitor tab show it beside the hit rate (upstream #588).
 
 ---
 

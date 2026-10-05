@@ -122,7 +122,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num">Tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM (experts copied over PCIe are not counted)">Hit rate</th><th class="num">Duration</th></tr></thead>
+                <th class="num">Tok/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
               <tbody id="req-body"><tr><td colspan="8" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>

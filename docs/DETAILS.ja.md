@@ -670,6 +670,8 @@ server がネットワークから届くなら、この履歴は機密として�
 
 `GET /metrics` は、最近の要求ごとの推測の候補の数 `drafts_offered` と当たった数 `drafts_accepted`（エンジンが報告しなければ `null`）と、
 server の起動からの合計（`totals`）も示します。
+`hit_rate` は、答えを書く間に引いたエキスパートのうち VRAM にあったものの割合です。GPU が PCIe 越しに読むエキスパート（`--pcie-frac`）は入らないので、`--pcie-frac` を上げると、デコードが遅くなっても上がります。
+`pcie_share` は、それらが割り振られたエキスパート全体に占める割合で、server のログと Monitor のタブがヒット率の横に示します（upstream #588）。
 
 ---
 
