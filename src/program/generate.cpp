@@ -17,6 +17,7 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
@@ -1548,6 +1549,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[0], free_gib);
     }
+    strata::core::Runtime::get().preload_kernels();   // beside the model's loading
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);

@@ -164,7 +164,27 @@ sycl::queue& Runtime::stream(void* stream) {
     return *q;
 }
 
+void Runtime::preload_kernels() {
+    if (preload_.joinable()) return;
+    preload_ = std::thread([this] {
+        int built = 0, skipped = 0;
+        for (const sycl::kernel_id& id : sycl::get_kernel_ids()) {
+            if (preload_stop_.load(std::memory_order_relaxed)) return;
+            try {
+                (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(context_, {device_}, {id});
+                ++built;
+            } catch (const std::exception&) {   // none for this device, or a shape it does not run
+                ++skipped;
+            }
+        }
+        if (std::getenv("STRATA_TRACE"))
+            std::fprintf(stderr, "strata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
+    });
+}
+
 Runtime::~Runtime() {
+    preload_stop_.store(true, std::memory_order_relaxed);
+    if (preload_.joinable()) preload_.join();
     try { finish(); }
     catch (const std::exception& e) { fatal(e.what()); }
     {

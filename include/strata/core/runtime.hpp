@@ -4,6 +4,7 @@
 
 #include "strata/core/device.hpp"
 #include <sycl/sycl.hpp>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -39,6 +40,11 @@ public:
     void finish();
     // Exceptional teardown cannot unwind past memory still in use by the GPU.
     void free(void* pointer) noexcept;
+    // Builds every kernel the binary carries for the device, on a thread of its own (the program: strata generate),
+    // so that their modules are loaded while the model is: SYCL builds a kernel's on its first launch, and the first
+    // verify window took 22 module loads, 30 ms of its first token, on the RTX 4070.  A kernel the device cannot run
+    // (another GPU's matrix shape) is skipped.  Once.
+    void preload_kernels();
 
 private:
     struct Waiter {
@@ -63,6 +69,8 @@ private:
     std::list<Waiter> waiters_;
     bool stop_ = false;
     std::thread watchdog_;
+    std::atomic<bool> preload_stop_{false};
+    std::thread preload_;
 };
 
 }  // namespace strata::core
