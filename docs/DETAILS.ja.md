@@ -317,7 +317,7 @@ setup はインストールのあとにこの PC での測定を勧め、`./setu
 | 設定 | 設定ファイルのキー | 働き |
 | --- | --- | --- |
 | `--idle-unload 600` | `"idle_unload_s": 600` | 要求が 600 秒なければモデルを下ろし、次の要求でまた読み込む |
-| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | 下ろしたモデルを、その GPU にそれだけ VRAM が空いているときだけ読み込む（Level Zero の sysman で読み、返されつつあるメモリを最大 15 秒待つ）。空いていなければ **503**「the GPU is in use by another program」を返す |
+| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | 下ろしたモデルを、その GPU にそれだけ VRAM が空いているときだけ読み込む（Intel の GPU は Level Zero の sysman、NVIDIA の GPU は NVML で読み、返されつつあるメモリを最大 15 秒待つ）。空いていなければ **503**「the GPU is in use by another program」を返す |
 | `--before-load "cmd"` | `"before_load": "cmd"` または `["cmd", "arg"]` | モデルを読み込み直す前に実行するコマンド。たとえば、別のサーバーのモデルを下ろすもの |
 
 - **下ろす、読み込む**: `POST /unload` はすぐに下ろし（要求の処理中は `409`）、`POST /load` は要求の前に読み込みます。

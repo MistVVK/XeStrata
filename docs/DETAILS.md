@@ -310,7 +310,7 @@ All are off by default, and each is also a key in `xestrata-<model>.json`.
 | Option | Config key | What it does |
 | --- | --- | --- |
 | `--idle-unload 600` | `"idle_unload_s": 600` | unload the model after 600 s without requests; the next request loads it again |
-| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | load an unloaded model only when that much VRAM is free on its GPU (read through Level Zero's sysman; it waits up to 15 s for memory being given back), else answer **503** "the GPU is in use by another program" |
+| `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | load an unloaded model only when that much VRAM is free on its GPU (read through Level Zero's sysman on an Intel GPU, NVML on an NVIDIA one; it waits up to 15 s for memory being given back), else answer **503** "the GPU is in use by another program" |
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | a command run before the model is loaded again, e.g. one that unloads another server's model |
 
 - **Unloading and loading**: `POST /unload` unloads it now (`409` while a request is running) and `POST /load` loads it ahead of a request.

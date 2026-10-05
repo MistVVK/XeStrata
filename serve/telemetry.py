@@ -6,7 +6,8 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: the Intel GPU on the xe driver, from Linux (temperature and power from hwmon, the PCIe link, the load of this
   user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip package is
-  needed.
+  needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, installed with the driver)
+  through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   Linux /proc and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -205,10 +206,105 @@ class _XeGpu:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ an NVIDIA GPU
+class _NvGpu:
+    """An NVIDIA GPU through NVML, with _XeGpu's interface.  `pci` is the card's address as the config gives it
+    (setup's gpu_pci); without one, NVML's first card."""
+
+    class Util(ctypes.Structure):
+        _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+    class Mem(ctypes.Structure):
+        _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+    def __init__(self, pci=None):
+        self.lib = self.dev = None
+        self.pci = pci
+        for n in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+            try:
+                self.lib = ctypes.CDLL(n)
+                break
+            except OSError:
+                continue
+        if self.lib is None:
+            return
+        try:
+            if self.lib.nvmlInit_v2() != 0:
+                self.lib = None
+                return
+            h = ctypes.c_void_p()
+            r = self.lib.nvmlDeviceGetHandleByPciBusId_v2(pci.encode(), ctypes.byref(h)) if pci else \
+                self.lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(0), ctypes.byref(h))
+            if r != 0:
+                self.lib = None
+                return
+            self.dev = h
+        except (AttributeError, OSError):
+            self.lib = None
+
+    def ok(self):
+        return self.lib is not None and self.dev is not None
+
+    def _uint(self, fn, *args):
+        v = ctypes.c_uint()
+        try:
+            return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
+        except (AttributeError, OSError):
+            return None
+
+    def name(self):
+        if not self.ok():
+            return None
+        buf = ctypes.create_string_buffer(96)
+        try:
+            if self.lib.nvmlDeviceGetName(self.dev, buf, ctypes.c_uint(96)) == 0:
+                return buf.value.decode(errors="replace") + (f" at {self.pci}" if self.pci else "")
+        except (AttributeError, OSError):
+            pass
+        return None
+
+    def read(self):
+        out = {}
+        u = self.Util()
+        try:
+            if self.lib.nvmlDeviceGetUtilizationRates(self.dev, ctypes.byref(u)) == 0:
+                out["util"] = u.gpu
+        except (AttributeError, OSError):
+            pass
+        m = self.Mem()
+        try:
+            if self.lib.nvmlDeviceGetMemoryInfo(self.dev, ctypes.byref(m)) == 0:
+                out["mem_used"], out["mem_total"] = m.used, m.total
+        except (AttributeError, OSError):
+            pass
+        out["temp"] = self._uint("nvmlDeviceGetTemperature", ctypes.c_uint(0))          # NVML_TEMPERATURE_GPU
+        mw = self._uint("nvmlDeviceGetPowerUsage")
+        out["power"] = mw / 1000.0 if mw is not None else None
+        lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
+        out["power_limit"] = lim / 1000.0 if lim is not None else None
+        out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle (power saving)
+        out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
+        out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
+        rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
+        tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
+        out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
+        out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        return out
+
+
+def _gpu(pci=None):
+    """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the NVIDIA one."""
+    g = _XeGpu(pci)
+    if g.ok():
+        return g
+    n = _NvGpu(pci)
+    return n if n.ok() else g
+
+
 def free_vram_mib(gpu_pci=None):
-    """Free VRAM of the card (by PCI address, None: the first on the xe driver) in MiB, or None when it cannot be
-    read."""
-    g = _XeGpu(gpu_pci)
+    """Free VRAM of the card (by PCI address, None: the first on the xe driver, else NVML's first) in MiB, or None
+    when it cannot be read."""
+    g = _gpu(gpu_pci)
     if not g.ok():
         return None
     r = g.read()
@@ -261,12 +357,13 @@ class _CpuRamFallback:
 class Telemetry:
     def __init__(self, extra=None, gpu_pci=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_pci`: the PCI address
-        of the card the engine runs on (setup's gpu_pci), or None for the first card on the xe driver."""
+        of the card the engine runs on (setup's gpu_pci), or None for the first card on the xe driver (else NVML's
+        first)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpus = [(0, _XeGpu(gpu_pci))]
+        self.gpus = [(0, _gpu(gpu_pci))]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         try:
