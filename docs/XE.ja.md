@@ -652,7 +652,7 @@ XeStrata はそのまま使っていて、Xe での調整は一部しか済ん�
 | --- | --- | --- |
 | `src/program/generate.cpp` | ネイティブの pack で、キャッシュにないエキスパートを PCIe で運ぶ割合 0.55（正準形は 0.2）。リンクの速さ（256 MiB の転送 4 回の最良）/ 20 GB/s で縮める | 新しい開発機で測ると、0.15 で 2〜4% 速く、それより大きい割合はどれも遅かった。0.55 はこの測定に支持されない（[記録](../bench/results/2026-10-02-new-machine/README.md#the-expert-arena-and-the-pcie-share)） |
 | `tools/calibrate.py` | 基準は Ryzen 5 7600 と RTX 5070。PCIe の割合の候補 0、0.2、0.35、0.55、0.75、推測の下限 0.3、0.5、0.7、ワーカー数の候補。交互の確認で 3% を超えて速いときだけ採用 | 候補と基準は upstream のまま |
-| `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた（[記録](../bench/results/2026-10-03-prompt-upstream/README.md)）。ほかは upstream のまま |
+| `setup.py` | `--spec 4`、`--spec-min-p 0.5`、`--expert-cache auto`、`--prefill auto` | `--prefill auto` は 32768 トークンの塊まで選ぶように変えた（[記録](../bench/results/2026-10-03-prompt-upstream/README.md)）。既定のリングで収まらない塊は、リングを 96 スロットにして選ぶ（upstream #583。B70 を 8 GB に絞った IQ3_S で、8K と 32K のプロンプトが 1.5〜2 倍）。ほかは upstream のまま |
 | `src/program/generate.cpp` | VRAM の予約 700 MiB（小さい GPU では 300 まで）、プロンプトの経路のスロットの借り方と塊の選び方、4 ラウンドごとのキャッシュの入れ替え（最大 96 個） | upstream のまま |
 | `src/program/generate.cpp` と CPU のプール | 物理コア数に基づくワーカー数とホストのワーカー、キャッシュのヒットの通知、グラフとドアベルの段取り | ワーカー数は新しい開発機で測り、7〜19 で速さが変わらなかったので既定のまま（[記録](../bench/results/2026-10-02-new-machine/README.md#cpu-worker-threads)） |
 | `src/kernels/cpu/iq_avx512.cpp` | ソフトウェアのプリフェッチの距離と、AVX-512 向けの調整 | 開発機は AVX-512 を持たないので測っていない |

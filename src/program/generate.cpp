@@ -3414,6 +3414,28 @@ int main(int argc, char** argv) {
                                      : (uint64_t) (xcache.slots() - first) *
                                            (uint64_t) strata::kernels::cpu::expert_layout().max_blob;
     };
+    // --prefill auto: the slots a chunk of c tokens borrows, 0 when it does not fit.  At 8192-token chunks nearly
+    // every expert streams anyway, so a lent slot costs little: 90% when the copies are DMA from pinned RAM (Q2_0
+    // 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the limit (lending more only streams more
+    // through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).  A chunk that does not fit with the streamed ring
+    // of the pinned-share rule takes a 96-slot ring instead (upstream #583): fewer chunks stream far fewer experts,
+    // and the bigger ring does not buy that back - on the B70 at STRATA_VRAM_LIMIT_MIB=8192, IQ3_S, interleaved:
+    // 8K prompt 6144/default ring 532-817 tok/s, 8192/96 717-1161 (6 pairs); 32K 4096/default 565-617, 8192/96
+    // 1046-1293 (3 pairs); 4K 405-653, 283-712 (3 pairs).  STRATA_PREFILL_RING still wins.
+    auto auto_slots = [&](int64_t c) -> int64_t {
+        const int64_t pct = [] {
+            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+            return v ? (int64_t) std::strtol(v, nullptr, 10)
+                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
+        }();
+        auto fits = [&](int64_t k) { return k + 128 <= xcache.slots() && k * 100 <= pct * xcache.slots(); };
+        strata::prefill::Prefill::set_ring_override(0);
+        if (const int64_t k = lend_slots(c); fits(k)) return k;
+        strata::prefill::Prefill::set_ring_override(96);
+        if (const int64_t k = lend_slots(c); fits(k)) return k;
+        strata::prefill::Prefill::set_ring_override(0);
+        return (int64_t) 0;
+    };
     // The prompt path's chunk and the slots it borrows for its buffers: the requested chunk halved until it fits,
     // or with --prefill auto the largest of kAutoChunks whose buffers take at most kAutoLendPct % of the slots (a
     // lent slot's expert is streamed during the prompt and refilled after it; measured on a 12 GB card, 32K Q2_0
@@ -3430,25 +3452,15 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
             return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
         }();
-        // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
-        // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
-        // limit (lending more only streams more through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).
-        const int64_t kAutoLendPct = [] {
-            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
-            return v ? (int64_t) std::atoi(v)
-                     : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
-        }();
-        auto slots_for = lend_slots;
         if (o.prefill_auto) {
             for (const int64_t c : kAutoChunks) {
                 if (c > auto_max || (c > 8192 && c > o.max_context)) continue;
-                const int64_t k = slots_for(c);
-                if (k + 128 <= xcache.slots() && k * 100 <= kAutoLendPct * xcache.slots()) { chunk = c; return k; }
+                if (const int64_t k = auto_slots(c); k > 0) { chunk = c; return k; }
             }
             return 0;
         }
         for (int64_t c = chunk; c >= 256; c /= 2) {
-            const int64_t k = slots_for(c);
+            const int64_t k = lend_slots(c);
             if (k + 128 <= xcache.slots()) { chunk = c; return k; }
         }
         return 0;
@@ -5192,7 +5204,7 @@ int main(int argc, char** argv) {
             int64_t k = plan_lend(chunk);             // auto: the largest chunk that fits; fixed: halved to fit
             if (k > 0 && chunk > (n_prompt - 1 + 255) / 256 * 256) {   // no bigger than the prompt needs
                 chunk = std::max<int64_t>(256, (n_prompt - 1 + 255) / 256 * 256);
-                k = lend_slots(chunk);
+                k = o.prefill_auto ? auto_slots(chunk) : lend_slots(chunk);
                 if (!o.prefill_auto) o.prefill_chunk = chunk;
             }
             if (o.prefill_auto) {
