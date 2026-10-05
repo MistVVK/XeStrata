@@ -225,11 +225,18 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
 - **モデル**:
    - Qwen チームの [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)。
-   - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版。
+   - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版と、
+     [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)。
    - UkisAI による [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
+   - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS と UD-Q4_K_XL。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
-- **使っている部品**: [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
+- **使っている部品**:
+   - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
+   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0、XeStrata の変更つき）: contrib と contrib-icpx の密な行列積。
+   - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラ。
+     setup がビルドし、XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当てます。
+   - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、
   [HyperQwen](https://github.com/syv-ai/HyperQwen)。
 - 詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
@@ -245,7 +252,7 @@ XeStrata は自由ソフトウェアで、[GNU Lesser General Public License の
 - **Strata 由来の部分**: Strata の MIT License が引き続き適用されます（著作権と MIT の告知は [NOTICE](NOTICE) にあります）。
 - **ほかのプロジェクトの素材**: `third_party/` に、プロジェクトごとのフォルダーとライセンスの文書と一緒に置いています。
    - `third_party/main/`: 自由ソフトウェア。ggml の `ggml-common.h`（MIT）、画面のフォント Outfit
-     （SIL Open Font License 1.1）、oneMath（Apache-2.0、XeStrata の変更つき）です。ggml から書き写したカーネルは `src/` にあり、ggml の表示を残したうえで LGPL です。
+     （SIL Open Font License 1.1）、oneMath（Apache-2.0、XeStrata の変更つき）、intel/llvm への XeStrata の修正のパッチ（Apache-2.0 WITH LLVM-exception）です。ggml から書き写したカーネルは `src/` にあり、ggml の表示を残したうえで LGPL です。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。

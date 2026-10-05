@@ -990,10 +990,16 @@ The model files are not part of it; their licenses apply to them (below).
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
+  UD-IQ4_XS and UD-Q4_K_XL: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
+- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the contrib and contrib-icpx modes' dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA).
+  v0.9 is in `third_party/main/oneMath/`, with XeStrata's changes (cuBLAS's BF16 product) marked in each file's header. See `third_party/main/oneMath/LICENSE`.
+- **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib modes' compiler and SYCL runtime.
+  It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
+  with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
 - **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and [HyperQwen](https://github.com/syv-ai/HyperQwen);
   references in the paper.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;

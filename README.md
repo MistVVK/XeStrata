@@ -232,11 +232,20 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **The original software:** [Strata](https://github.com/Niko1221/Strata), by Niko1221 and the Strata contributors.
 - **The models:**
    - [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), by the Qwen team;
-   - compressed versions by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-   - [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), by UkisAI.
+   - compressed versions and the [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) by
+     [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
+   - [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), by UkisAI;
+   - UD-IQ4_XS and UD-Q4_K_XL, by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF).
 
   Each model's own license applies to its files.
-- **Parts it uses:** parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT).
+- **Parts it uses:**
+   - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0, with XeStrata's changes): the contrib and
+     contrib-icpx modes' dense matrix products;
+   - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib
+     modes' compiler, which setup builds with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same
+     license);
+   - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
 - **Ideas from:** [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen).
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
@@ -253,7 +262,8 @@ XeStrata is free software under the [GNU Lesser General Public License, version 
 - **The parts that come from Strata:** Strata's MIT License stays with them (copyright and MIT notices are in [NOTICE](NOTICE)).
 - **Material from other projects:** in `third_party/`, one folder per project with its license.
    - `third_party/main/`: free software. ggml's `ggml-common.h` (MIT), the app's font Outfit (SIL Open Font
-     License 1.1), and oneMath (Apache-2.0, with XeStrata's changes). The kernels transcribed from ggml are in `src/`, under the LGPL with ggml's notice kept.
+     License 1.1), oneMath (Apache-2.0, with XeStrata's changes), and XeStrata's patches to intel/llvm (Apache-2.0 WITH
+     LLVM-exception). The kernels transcribed from ggml are in `src/`, under the LGPL with ggml's notice kept.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs.

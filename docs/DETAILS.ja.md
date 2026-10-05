@@ -996,10 +996,16 @@ Strata 由来の部分には Strata の MIT License も適用され、著作権�
   Coder は [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
+  UD-IQ4_XS と UD-Q4_K_XL は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
+- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: contrib と contrib-icpx の密な行列積を、oneMKL（Intel）と cuBLAS（NVIDIA）に渡す層。
+  v0.9 を `third_party/main/oneMath/` に置き、XeStrata の変更（cuBLAS の BF16 の積）は各ファイルの見出しに記しています。`third_party/main/oneMath/LICENSE` を参照。
+- **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラと SYCL のランタイム。
+  リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
+  そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)。
   文献は論文にあります。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
