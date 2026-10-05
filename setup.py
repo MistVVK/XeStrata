@@ -37,6 +37,7 @@ explicit flag (--model, --context) is the consent to a risk setup would otherwis
 from __future__ import annotations
 
 import argparse
+import ctypes.util
 import hashlib
 import json
 import math
@@ -797,7 +798,7 @@ def free_compiler(install: Path, license: str = "free") -> dict:
     lib = install / "lib"
     env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join([str(lib), os.environ.get("LD_LIBRARY_PATH", "")]))
     return {"kind": "intel-llvm", "cxx": str(install / "bin" / "clang++"), "cc": str(install / "bin" / "clang"),
-            "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": []}
+            "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": [], "onemkl": False}
 
 
 def new_enough(comp: dict) -> bool:
@@ -823,7 +824,7 @@ def os_compiler() -> dict | None:
         return None
     cc = shutil.which(Path(cxx).name.replace("dpclang++", "dpclang")) or cxx
     return {"kind": "os", "cxx": cxx, "cc": cc, "env": dict(os.environ), "lib_dirs": [], "license": "free",
-            "cuda_archs": []}
+            "cuda_archs": [], "onemkl": False}
 
 
 def icpx_compiler() -> dict | None:
@@ -832,7 +833,17 @@ def icpx_compiler() -> dict | None:
         return None
     return {"kind": "icpx", "cxx": shutil.which("icpx", path=env.get("PATH")),
             "cc": shutil.which("icx", path=env.get("PATH")) or "icx", "env": env, "lib_dirs": oneapi_lib_dirs(),
-            "license": "contrib-icpx", "cuda_archs": []}
+            "license": "contrib-icpx", "cuda_archs": [], "onemkl": True}
+
+
+def intel_gpu_present() -> bool:
+    """Whether this PC has an Intel GPU Strata can use: the contrib build then gets the oneMKL backend."""
+    return any(g.get("vendor") == "intel" for g in gpus())
+
+
+def cublas_found() -> bool:
+    """Whether cuBLAS (NVIDIA's CUDA toolkit) is installed: oneMath's cuBLAS backend links it."""
+    return ctypes.util.find_library("cublas") is not None
 
 
 def cuda_archs() -> list:
@@ -891,10 +902,12 @@ def contrib_compiler(a, st: dict) -> tuple:
     if not any((d / "lib").glob("libur_adapter_cuda.so*")):
         fail(f"{d}: this intel/llvm has no CUDA target", "build one: python3 tools/intel_llvm_build.py --contrib")
     comp = free_compiler(d, "contrib")
+    # every maker's GPUs on this PC: the NVIDIA ones' code and cuBLAS, the Intel ones' oneMKL
     comp["cuda_archs"] = cuda_archs()
-    if comp["cuda_archs"] and shutil.which("nvcc") is None:
-        fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it)",
-             "install it: sudo apt install nvidia-cuda-toolkit")
+    comp["onemkl"] = intel_gpu_present()
+    if comp["cuda_archs"] and (shutil.which("nvcc") is None or not cublas_found()):
+        fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it, and their "
+             "dense products go to its cuBLAS)", "install it: sudo apt install nvidia-cuda-toolkit")
     return comp, d
 
 
@@ -938,8 +951,8 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp = free_compiler(build_intel_llvm(a))
             llvm_dir = str(INTEL_LLVM_DEFAULT)
         kept = {"intel_llvm": llvm_dir} if llvm_dir else {}
-    if mode != "free" and mkl_root() is None:
-        fail(f"--license {mode} hands the dense matrix products to oneMKL, which is not installed", MKL_HOW)
+    if comp["onemkl"] and mkl_root() is None:
+        fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed", MKL_HOW)
     if gpu.get("vendor") == "nvidia":
         # the tensor cores through cuBLAS and joint_matrix: the XMX question is Intel's
         xmx = False
@@ -1071,7 +1084,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
     xe = engine_is_xe(meta)
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
-            "license": comp["license"], "cuda_archs": comp["cuda_archs"]}
+            "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"]}
     engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
@@ -1092,7 +1105,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
         cmake_build(ROOT, bdir, "strata",
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}", f"-DSTRATA_CUDA_ARCHS={';'.join(comp['cuda_archs'])}",
-                     *([f"-DMKL_ROOT={mkl_root()}"] if comp["license"] != "free" else []), "-DSTRATA_ENABLE_XE=ON",
+                     f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
+                     *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
                      f"-DSTRATA_GGML_DIR={llama}"], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
@@ -1136,6 +1150,7 @@ def recorded_compiler(meta: dict) -> dict:
         comp = free_compiler(Path(rec["cxx"]).parent.parent, rec.get("license", "free"))
         if comp["license"] == "contrib":
             comp["cuda_archs"] = cuda_archs()
+            comp["onemkl"] = intel_gpu_present()
     elif rec["kind"] == "os":
         comp = os_compiler()
         if comp is not None and not new_enough(comp):

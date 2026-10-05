@@ -98,7 +98,10 @@ CMake のオプション `STRATA_LICENSE` で選びます。
 
 contrib と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（`third_party/main/oneMath`、Apache-2.0）経由で、
 Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
-ビルドには oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
+どの後端を作るかは、ビルドする機械の GPU で決めます（メーカーが複数あればすべて）。
+Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
+NVIDIA の GPU があれば、nvidia-smi が報告する各 GPU のアーキテクチャ（`STRATA_CUDA_ARCHS`）のコードと cuBLAS の後端を作り、CUDA ツールキットが要ります。
+どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
 `third_party/main/oneMath` は oneMath v0.9 に XeStrata の変更（cuBLAS の BF16 の積）を加えたもので、変更は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
 coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1350 ms、RTX 4070 では同じ（3845 ms）でした。
@@ -190,13 +193,13 @@ NVIDIA の GPU 向け（contrib）では、`tools/intel_llvm_build.py --contrib`
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
 cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
-  -DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=sm_89 \
+  -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib --target strata -j6
 LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
 ```
 
-`STRATA_CUDA_ARCHS` には GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
+別の機械向けには、`STRATA_CUDA_ARCHS` に GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
 同じ実行ファイルが Intel の GPU でも動きます。
 
 - **ジョブ数**: SYCL の翻訳単位 1 つのコンパイルに数 GB のメモリを使います。
@@ -244,7 +247,8 @@ setup は、`--license` で選んだモード（[上](#ビルド)）でビルド
   NVIDIA の GPU のアーキテクチャは nvidia-smi の報告（compute capability）から決め、そのときは NVIDIA の CUDA ツールキット（`nvcc`）が要ります。
 - **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。
 
-contrib と contrib-icpx は oneMKL（`MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）がないと止まります。
+contrib は、この機械に Intel の GPU があれば oneMKL（`MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）、NVIDIA の GPU があれば CUDA ツールキット（`nvcc` と cuBLAS）がないと止まります。両方あれば両方を求めます。
+contrib-icpx は oneMKL がないと止まります。
 NVIDIA の GPU は contrib でだけ使えます。
 モード、`--intel-llvm DIR`、XMX なしのビルドを受け入れたことは、設定に記録して次回以降も使います。
 以前の設定の `nonfree`（icpx を許す）は contrib-icpx として読みます。

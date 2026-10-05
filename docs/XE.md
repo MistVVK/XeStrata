@@ -94,7 +94,10 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
 
 The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (`third_party/main/oneMath`, Apache-2.0):
 oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
-The build needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
+Which backends are built follows the GPUs of the machine it is built on (every maker it has).
+An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
+NVIDIA GPUs bring the code for each one's architecture as nvidia-smi reports it (`STRATA_CUDA_ARCHS`) and the cuBLAS backend, which need the CUDA toolkit.
+Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
 `third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
 coder-iq1_m's prefill of 997 tokens went from 1421 to 1350 ms on the B70 and stayed the same on the RTX 4070 (3845 ms).
@@ -186,13 +189,13 @@ For NVIDIA GPUs (contrib), with intel/llvm built by `tools/intel_llvm_build.py -
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
 cmake -S . -B build/contrib -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_COMPILER=$C/bin/clang \
-  -DSTRATA_LICENSE=contrib -DSTRATA_CUDA_ARCHS=sm_89 \
+  -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib --target strata -j6
 LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
 ```
 
-`STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
+For another machine, `STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
 The same executable runs on Intel GPUs too.
 
 - **Jobs**: one SYCL translation unit takes several GB to compile.
@@ -239,7 +242,8 @@ setup builds in the mode `--license` names ([above](#build-and-run)), free unles
   The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
 - **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
 
-contrib and contrib-icpx stop without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
+contrib stops without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`) when the machine has an Intel GPU, and without the CUDA toolkit (`nvcc` and cuBLAS) when it has NVIDIA GPUs; with both, it wants both.
+contrib-icpx stops without oneMKL.
 NVIDIA GPUs can be used in the contrib mode only.
 The mode, a `--intel-llvm DIR` and an accepted build without XMX are kept in the settings for later runs.
 An older settings file's `nonfree` (icpx allowed) is read as contrib-icpx.

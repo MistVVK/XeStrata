@@ -28,8 +28,50 @@ set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib contrib-icpx)
 if(NOT STRATA_LICENSE MATCHES "^(free|contrib|contrib-icpx)$")
   message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: one of free, contrib, contrib-icpx")
 endif()
-# NVIDIA GPU architectures to build for (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
-set(STRATA_CUDA_ARCHS "" CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (STRATA_LICENSE=contrib)")
+# The GPUs a contrib build makes code and links libraries for; "auto" (the default) takes this PC's cards, of every
+# maker it has: an Intel card (on the PCI bus, from sysfs) wants the oneMKL backend, each NVIDIA card's compute
+# capability (from nvidia-smi) its architecture and the cuBLAS backend.
+# - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
+# - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
+set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (contrib); auto: this PC's")
+set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
+set(_strata_cuda_archs "${STRATA_CUDA_ARCHS}")
+if(STRATA_CUDA_ARCHS STREQUAL "auto")
+  set(_strata_cuda_archs "")
+  find_program(STRATA_NVIDIA_SMI nvidia-smi)
+  if(STRATA_LICENSE STREQUAL "contrib" AND STRATA_NVIDIA_SMI)
+    execute_process(COMMAND ${STRATA_NVIDIA_SMI} --query-gpu=compute_cap --format=csv,noheader
+                    OUTPUT_VARIABLE _strata_ccs RESULT_VARIABLE _strata_r ERROR_QUIET)
+    if(_strata_r EQUAL 0)
+      string(REGEX MATCHALL "[0-9]+\\.[0-9]+" _strata_ccs "${_strata_ccs}")
+      foreach(cc IN LISTS _strata_ccs)
+        string(REPLACE "." "" cc "${cc}")
+        list(APPEND _strata_cuda_archs "sm_${cc}")
+      endforeach()
+      list(REMOVE_DUPLICATES _strata_cuda_archs)
+    endif()
+  endif()
+endif()
+set(_strata_onemkl "${STRATA_ONEMKL}")
+if(STRATA_ONEMKL STREQUAL "auto")
+  set(_strata_onemkl OFF)
+  file(GLOB _strata_vendors /sys/class/drm/card*/device/vendor)
+  foreach(vendor_file IN LISTS _strata_vendors)
+    file(READ "${vendor_file}" _v)
+    if(_v MATCHES "0x8086")
+      set(_strata_onemkl ON)
+    endif()
+  endforeach()
+endif()
+if(STRATA_LICENSE STREQUAL "contrib-icpx")
+  if(NOT _strata_onemkl)
+    message(STATUS "STRATA_LICENSE=contrib-icpx always builds the oneMKL backend (its GPUs are Intel's)")
+  endif()
+  set(_strata_onemkl ON)
+endif()
+if(STRATA_LICENSE STREQUAL "contrib")
+  message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -145,7 +187,7 @@ if(STRATA_ENABLE_XE)
                           "(tools/intel_llvm_build.py; -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++), "
                           "or allow it with -DSTRATA_LICENSE=contrib-icpx")
     endif()
-    if(STRATA_CUDA_ARCHS)
+    if(_strata_cuda_archs)
       message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
                           "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
     endif()
@@ -157,8 +199,8 @@ if(STRATA_ENABLE_XE)
     # Arc Pro B70 no XMX): one compiler line for every build with intel/llvm
     set(CMAKE_REQUIRED_FLAGS -fsycl)
     check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { return 0; }" STRATA_HAVE_SYCL)
-    check_cxx_source_compiles("#include <sycl/sycl.hpp>\n#if __LIBSYCL_MAJOR_VERSION < 9\n#error old\n#endif\nint main() {}"
-                              STRATA_HAVE_SYCL9)
+    check_cxx_source_compiles(
+      "#include <sycl/sycl.hpp>\n#if __LIBSYCL_MAJOR_VERSION < 9\n#error old\n#endif\nint main() {}" STRATA_HAVE_SYCL9)
     unset(CMAKE_REQUIRED_FLAGS)
     if(NOT STRATA_HAVE_SYCL OR NOT STRATA_HAVE_SYCL9)
       message(FATAL_ERROR "The Xe backend needs intel/llvm's DPC++ 7 or later (libsycl 9): build it with "
@@ -169,13 +211,13 @@ if(STRATA_ENABLE_XE)
   # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each
   # NVIDIA architecture's code.  Without them no -fsycl-targets: the compiler's default, SPIR-V alone.
   set(_strata_sycl_targets "")
-  if(STRATA_CUDA_ARCHS)
+  if(_strata_cuda_archs)
     if(NOT STRATA_LICENSE STREQUAL "contrib")
       message(FATAL_ERROR "STRATA_CUDA_ARCHS needs NVIDIA's CUDA toolkit, which is not free software: "
                           "-DSTRATA_LICENSE=contrib")
     endif()
     set(_strata_sycl_targets spir64)
-    foreach(_arch IN LISTS STRATA_CUDA_ARCHS)
+    foreach(_arch IN LISTS _strata_cuda_archs)
       list(APPEND _strata_sycl_targets nvidia_gpu_${_arch})
     endforeach()
     list(JOIN _strata_sycl_targets "," _strata_sycl_targets)
@@ -184,7 +226,7 @@ if(STRATA_ENABLE_XE)
                               STRATA_HAVE_SYCL_CUDA)
     unset(CMAKE_REQUIRED_FLAGS)
     if(NOT STRATA_HAVE_SYCL_CUDA)
-      message(FATAL_ERROR "STRATA_CUDA_ARCHS=${STRATA_CUDA_ARCHS}: the SYCL compiler does not build for these NVIDIA "
+      message(FATAL_ERROR "STRATA_CUDA_ARCHS=${_strata_cuda_archs}: the SYCL compiler does not build for these NVIDIA "
                           "targets (intel/llvm built with CUDA: tools/intel_llvm_build.py --contrib; NVIDIA's CUDA "
                           "toolkit)")
     endif()
@@ -312,9 +354,10 @@ if(STRATA_ENABLE_XE)
   endif()
 
   # The contrib modes' dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath) with its
-  # oneMKL backend for Intel GPUs and, with STRATA_CUDA_ARCHS, its cuBLAS backend for NVIDIA GPUs.  oneMath opens the
-  # backends at run time, so the engine starts without the CUDA driver.
-  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS); a GPU
+  # without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time, so the engine starts
+  # without the library of a GPU it does not use.
+  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
     if(NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
@@ -327,8 +370,8 @@ if(STRATA_ENABLE_XE)
     set(BUILD_SHARED_LIBS ON)
     set(TARGET_DOMAINS blas)
     set(ENABLE_MKLCPU_BACKEND OFF)
-    set(ENABLE_MKLGPU_BACKEND ON)
-    if(STRATA_CUDA_ARCHS)
+    set(ENABLE_MKLGPU_BACKEND ${_strata_onemkl})
+    if(_strata_cuda_archs)
       set(ENABLE_CUBLAS_BACKEND ON)
     endif()
     set(BUILD_FUNCTIONAL_TESTS OFF)
