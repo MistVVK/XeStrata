@@ -251,8 +251,8 @@ XeStrata is free software under the [GNU Lesser General Public License, version 
   permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
 - **The parts that come from Strata:** Strata's MIT License stays with them (copyright and MIT notices are in [NOTICE](NOTICE)).
 - **Material from other projects:** in `third_party/`, one folder per project with its license.
-   - `third_party/main/`: free software. ggml's `ggml-common.h` (MIT) and the app's font Outfit (SIL Open Font
-     License 1.1). The kernels transcribed from ggml are in `src/`, under the LGPL with ggml's notice kept.
+   - `third_party/main/`: free software. ggml's `ggml-common.h` (MIT), the app's font Outfit (SIL Open Font
+     License 1.1), and oneMath (Apache-2.0, with XeStrata's changes). The kernels transcribed from ggml are in `src/`, under the LGPL with ggml's notice kept.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs.

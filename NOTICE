@@ -36,11 +36,23 @@ Every copyright holder whose work is in this repository, its license and where t
   with its own LICENSE
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
+- Copyright 2020-2025 Intel Corporation, Codeplay Software Limited, SiPearl, Heidelberg University (EMCL and URZ),
+  The Regents of the University of California, and the oneMath contributors; changes Copyright 2026 MistVVK and the
+  XeStrata contributors
+  Apache-2.0 - oneMath (https://github.com/uxlfoundation/oneMath) v0.9 in third_party/main/oneMath/, with XeStrata's
+  changes (each marked in its file's header): the contrib and contrib-icpx modes' dense matrix products. Its notices
+  are in its files' headers and in third_party/main/oneMath/third-party-programs/ - third_party/main/oneMath/LICENSE,
+  LICENSES/Apache-2.0.txt
+- Copyright 2008 Google Inc.
+  BSD-3-Clause - Googletest in third_party/main/oneMath/deps/googletest/, for oneMath's own tests (XeStrata does not
+  build them) - third_party/main/oneMath/deps/googletest/LICENSE, LICENSES/BSD-3-Clause.txt
 - Copyright (c) 2026 Qwen
   Qwen Community License 1.0 - third_party/nonfree/: material made from or copied from the Qwen3.8-Flash-Next model.
   Not free software and not covered by the LGPL; XeStrata builds and runs without it - third_party/nonfree/*/LICENSE
 
 The models are not part of this repository; each model's own license applies to its files.
+Neither are the vendors' libraries the contrib and contrib-icpx modes link (Intel oneMKL and the runtime libraries of
+Intel's oneAPI compilers, NVIDIA cuBLAS and the CUDA runtime and driver); each one's own license applies to it.
 
 
 Strata (MIT License)

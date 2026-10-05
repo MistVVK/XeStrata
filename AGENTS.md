@@ -39,6 +39,7 @@ Material from other projects goes into `third_party/`, one folder per project wi
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
 - Code transcribed from such a project into XeStrata's own sources (the kernels in `src/` that follow ggml, for example) is part of XeStrata under the LGPL, with the original notice kept in a comment.
 - `third_party/nonfree/<project>/`: anything that is not free software.
+- XeStrata's changes to `third_party/main/oneMath/` stay under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them: a changed file keeps its Apache-2.0 header, gains a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`), and gets no LGPL SPDX line. The changes are listed in `third_party/main/README.md`.
 
 XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
 
