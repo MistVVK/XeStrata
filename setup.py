@@ -108,13 +108,20 @@ MODELS: dict[str, dict[str, Any]] = {
     # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
+    # upstream #621: Unsloth's UD-IQ4_XS - IQ3_S gate/up experts with IQ4_NL (43 layers) or Q8_0 (5) downs, the dense
+    # side as UD-Q4_K_XL's; three shards.  Its 59.5 GB of experts: a RAM budget of them, like UD-Q4_K_XL, but far
+    # fewer read from the SSD on a 64 GB PC and none from ~80 GB of RAM.  Images: the same base model and encoder
+    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
+                           "less than ~80 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
+                  "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
     # EXPERIMENTAL (upstream's UD-Q4_K_XL support, 3889344 / 872af82): Unsloth's 4-bit file; its 77 GB of experts do not
     # fit a 64 GB PC, so the engine keeps a RAM budget of them (--resident-budget-gib, chosen below) and reads the rest
     # from the GGUF files in place
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
                             "experts come from the SSD while it answers, so it is slower than the 2-3-bit "
                             "models", "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",),
-                   "budget": True},
+                   "budget": True, "experimental": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -127,6 +134,15 @@ UNSLOTH_SHARDS = {
         (49376141504, "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf":
         (12087983520, "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"),
+}
+# UD-IQ4_XS's three shards at the same revision (sizes and SHA-256: the Hub's LFS pointers; upstream #621)
+UNSLOTH_IQ4_XS_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf":
+        (10946624, "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf":
+        (49835229856, "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
+        (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
 }
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
@@ -157,14 +173,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF"),
               "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-coder",
               "profile": "expert-profile-coder.bin"},
-    # EXPERIMENTAL: Unsloth's UD-Q4_K_XL of the original model: four shards, no images yet
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's 4-bit quantization (EXPERIMENTAL)",
-                "about": "4-bit, 111 GB download, part of the experts read from the SSD: slower",
+    # Unsloth's UD-IQ4_XS (three shards, upstream #621) and the EXPERIMENTAL UD-Q4_K_XL (four) of the original model;
+    # "experimental" and "vision" are per model (MODELS)
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's ~4-bit quantizations",
+                "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB of RAM part of its experts are read from "
+                         "the SSD (UD-Q4_K_XL, 111 GB: experimental)",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
-                "experimental": True, "vision": False, "pack_args": ["--compat-bf16"], "sha256": UNSLOTH_SHARDS},
+                "vision": False, "pack_args": ["--compat-bf16"],
+                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS}},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -1294,18 +1313,28 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
     return ram - 6 + max(0.0, vram_gb - 5) >= MODELS[model]["arena_gb"]
 
 
+def model_file(fam: dict, model: str, i: int) -> str:
+    """Shard i's file name: the family's pattern, or the model's own (UD-IQ4_XS has three shards, not four)."""
+    return MODELS.get(model, {}).get("file", fam["file"]).format(q=model, i=i)
+
+
+def model_shards(fam: dict, model: str) -> int:
+    return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+
+
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
-    """UD-Q4_K_XL: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB, ram_gb()) less 24
-    for the OS, the engine and the file cache the other experts are read through, less a KV cache streamed to RAM;
-    at most all of them, at least 8.  A 64 GB PC (~62 GiB): 38, 36 with a 128K context
+    """UD-Q4_K_XL, UD-IQ4_XS: the GiB of experts the engine keeps in RAM (--resident-budget-gib): the RAM (GB,
+    ram_gb()) less 24 for the OS, the engine and the file cache the other experts are read through, less a KV cache
+    streamed to RAM; at most all of them, at least 8.  A 64 GB PC (~62 GiB): 38, 36 with a 128K context
     (bench/results/2026-10-03-ud-low-ram)."""
     gib = round(ram) - UNSLOTH_RAM_LEFT_GB - math.ceil(kv_ram_gb)
     return max(8, min(gib, int(MODELS[model]["arena_gb"] / 1.073741824)))
 
 
 def budget_choice(model, ram, asked) -> float:
-    """UD-Q4_K_XL's RAM budget: --resident-budget-gib N as given, else the recommendation (resident_budget_gib).  More
-    than the recommendation is kept, with what it risks (setup recommends, it never forces)."""
+    """UD-Q4_K_XL's or UD-IQ4_XS's RAM budget: --resident-budget-gib N as given, else the recommendation
+    (resident_budget_gib).  More than the recommendation is kept, with what it risks (setup recommends, it never
+    forces)."""
     rec = resident_budget_gib(model, ram)
     if asked is None:
         return rec
@@ -1490,7 +1519,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("xestrata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
-    model = tag.split("-")[-1].upper()
+    model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -2099,8 +2128,8 @@ def main() -> int:
                          "experts the GPU does not hold are copied into RAM once when they fit (resident), else read "
                          "through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL: the GiB of its experts kept in RAM (default: the RAM less 24 GB, ~38 on "
-                         "64 GB; more is kept as you choose, with a note)")
+                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
+                         "~38 on 64 GB; more is kept as you choose, with a note)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
@@ -2252,8 +2281,9 @@ def main() -> int:
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             vram = gpu_expert_vram(gpu)
             if d.get("budget"):
-                verdict = (f"EXPERIMENTAL, fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest "
-                           "read from the SSD" if ram >= d["ram_gb"] else "does not fit")
+                fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
+                verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
+                    else "does not fit"
             elif low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}% of its "
                            "experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, vram)
@@ -2278,7 +2308,9 @@ def main() -> int:
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
-    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
+    # an experimental size sorts last (UD-IQ4_XS before UD-Q4_K_XL); --model takes the names as they are
+    names = sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),
+                   key=lambda m: bool(MODELS[m].get("experimental")))
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram = gpu_expert_vram(gpu)
@@ -2297,10 +2329,11 @@ def main() -> int:
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget = None
     if MODELS[model].get("budget"):
-        # Unsloth's UD-Q4_K_XL: a RAM budget of its experts, the rest read from the GGUF files in place (not the
-        # low-RAM mode's choice: the budget is set by the RAM, whatever the GPU holds)
-        warn(f"{model} is EXPERIMENTAL: part of its experts are read from the SSD while it answers, so it is slower "
-             "than the 2-3-bit models")
+        # Unsloth's UD-Q4_K_XL and UD-IQ4_XS: a RAM budget of their experts, the rest read from the GGUF files in place
+        # (not the low-RAM mode's choice: the budget is set by the RAM, whatever the GPU holds)
+        if MODELS[model].get("experimental"):
+            warn(f"{model} is EXPERIMENTAL: part of its experts are read from the SSD while it answers, so it is "
+                 "slower than the 2-3-bit models")
         if ram < MODELS[model]["ram_gb"]:
             confirm_risk(f"{model} needs {MODELS[model]['ram_gb']} GB of RAM or more; this PC has {ram:.0f} GB: "
                          f"its RAM budget would be {resident_budget_gib(model, ram)} GiB, so nearly every expert is "
@@ -2314,7 +2347,8 @@ def main() -> int:
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
-        warn(f"--resident-budget-gib is for UD-Q4_K_XL: {model} keeps all of its experts in RAM or in the low-RAM mode")
+        warn(f"--resident-budget-gib is for UD-Q4_K_XL and UD-IQ4_XS: {model} keeps all of its experts in RAM or in "
+             "the low-RAM mode")
     low_ram = budget is None and (a.low_ram in ("on", "resident", "mmap") or
                                   (a.low_ram == "auto" and low_ram_needed(model, ram) and
                                    low_ram_fits(model, ram, vram)))
@@ -2388,7 +2422,7 @@ def main() -> int:
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values"}[kv])
-    if fam.get("vision") is False:
+    if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
         vision = "none"
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {model} yet: off")
@@ -2452,7 +2486,7 @@ def main() -> int:
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off"
              if family == "swift" else f"the experimental speed projection is not tested with {model}: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
-    shards = [models_dir / fam["file"].format(q=model, i=i) for i in range(1, fam.get("shards", 2) + 1)]
+    shards = [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
     if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]

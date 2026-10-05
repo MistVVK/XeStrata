@@ -76,6 +76,9 @@ lot of VRAM, it runs in the **low-RAM mode**: the experts are read from the mode
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF):** UkisAI's fine-tune. It
   thinks for a shorter time before it answers, so the answer comes sooner, at about the same quality. There is no
   IQ3_S. Its own license applies.
+- **[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF):** a ~4-bit i-quant of the
+  original, between IQ3_S and UD-Q4_K_XL in quality, a 94 GB download. Its experts take 59.5 GB; on a PC with less
+  than about 80 GB of RAM, those that do not fit are read from the SSD ([details](docs/DETAILS.md#or-unsloths-ud-iq4_xs)).
 - **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (experimental): a 4-bit file
   of the original, a 111 GB download. Its experts take 77 GB; those that do not fit the RAM are read from the SSD
   while it answers, so it is slower than the 2-3-bit sizes ([details](docs/DETAILS.md#or-unsloths-ud-q4_k_xl-experimental)).

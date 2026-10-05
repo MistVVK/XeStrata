@@ -62,6 +62,14 @@ FALLBACK_MODELS = {
               "families": ("qwen",)},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
+    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
+                           "less than ~80 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth",), "budget": True,
+                  "vision": True},
+    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
+                            "experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
+                   "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
+                   "experimental": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -69,6 +77,10 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB "
+                                                                  "of RAM part of its experts are read from the SSD "
+                                                                  "(UD-Q4_K_XL, 111 GB: experimental)",
+                "tag": "unsloth-", "vision": False},
 }
 FALLBACK_CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
 BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper who finds a message in a bottle. "
@@ -600,7 +612,10 @@ class Strata:
 
     def model_table(self, hw: dict | None) -> list:
         models, families, _ctx, _src = self.tables()
+        S = self.setup_module()
         ram = (hw or {}).get("ram_gb")
+        usable = [g for g in (hw or {}).get("gpus", []) if g.get("usable")]
+        vram = max((g["vram_gb"] for g in usable), default=0.0)
         have = {c.stem[len(CONFIG):] for c in self.configs()}
         out = []
         for f, fd in families.items():
@@ -611,11 +626,23 @@ class Strata:
                 verdict = None
                 if ram is not None:
                     verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
+                    try:
+                        if d.get("budget"):
+                            verdict = (("experimental: " if d.get("experimental") else "")
+                                       + "part of its experts in RAM, the rest read from the SSD"
+                                       if ram >= d["ram_gb"] else "does not fit")
+                        elif S and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
+                            verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
+                    except Exception:                   # noqa: BLE001
+                        pass
                 sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
+                              "experimental": bool(d.get("experimental")),
+                              "images": d.get("vision", fd.get("vision", True)) is not False,
                               "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"),
                               "on_this_pc": verdict, "installed": tag in have, "id": tag})
             out.append({"family": f, "title": fd["title"], "about": fd.get("about"),
-                        "experimental": bool(fd.get("experimental")), "images": fd.get("vision", True) is not False,
+                        "experimental": bool(fd.get("experimental")),
+                        "images": any(x["images"] for x in sizes) if sizes else fd.get("vision", True) is not False,
                         "sizes": sizes})
         return out
 
@@ -1053,8 +1080,8 @@ class Tools:
             usable = [g for g in hw.get("gpus", []) if g.get("usable")]
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 32768 if vram < 14 else 65536 if vram < 20 else 131072
-        if vision in ("yes", "gpu", "cpu") and families[family].get("vision") is False:
-            raise ToolError(f"images are not available with {families[family]['title']} yet: use vision=no")
+        if vision in ("yes", "gpu", "cpu") and models[model].get("vision", families[family].get("vision")) is False:
+            raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
         target = self.check_data_dir(data_dir) if data_dir else s.data_dir()
         tag = (families[family].get("tag", "") + model)
         have_dir = target / "models" / tag

@@ -75,6 +75,8 @@ Strata との主な違い:
   ダウンロード 58 GB、RAM 32 GB で動きます。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。
   答える前の思考が短く、答えが早く出ます。品質はほぼ同じで、IQ3_S はありません。このモデル自身のライセンスに従います。
+- **[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの約 4 ビットの i-quant で、品質は IQ3_S と UD-Q4_K_XL の間です。
+  ダウンロードは 94 GB です。エキスパートが 59.5 GB あり、RAM が約 80 GB より少ない PC では、入りきらない分を SSD から読みます（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-iq4_xs)）。
 - **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（実験的）: 元のモデルの 4 ビット版です。
   ダウンロードは 111 GB です。エキスパートが 77 GB あり、RAM に入りきらない分は答えている間に SSD から読むので、
   2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。

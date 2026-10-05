@@ -130,6 +130,21 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
+### Unsloth の UD-IQ4_XS
+
+**[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** は、元のモデルの約 4 ビットの i-quant で、3 つのシャード（94 GB）です（upstream #621）。
+エキスパートの gate・up は IQ3_S（1 層は IQ4_XS）、down は IQ4_NL（5 層は Q8_0）で、59.5 GB あります。
+密な部分と、RAM の予算の扱いは、下の UD-Q4_K_XL と同じです（`--resident-budget-gib N`、setup は RAM から 24 GB を引いた値を選びます）。
+RAM が約 80 GB あれば、すべてのエキスパートが RAM に入ります。
+setup は画像を尋ね（既定はオフ）、画像のエンコーダーは元のモデルのものです（画像の経路は確かめていません、`unverified`）。
+
+```sh
+./setup.sh --setup --family unsloth --model UD-IQ4_XS
+```
+
+Arc Pro B70（32 GB）と i7-14700、RAM 96 GB（RAM の予算 55 GiB）で、短い会話で 96 トークンを書かせると、デコードは 32.5 / 32.8 トークン/秒で、答えは意味の通る文でした。
+Arc での llama.cpp と比べた品質は、測っていません（`unverified`）。
+
 ### Unsloth の UD-Q4_K_XL（実験的）
 
 **[Unsloth の UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** は、元のモデルの 4 ビット版で、4 つのシャード（111 GB）です。
@@ -161,7 +176,7 @@ Arc での llama.cpp と比べた品質は、測っていません（`unverified
 
 ### RAM がモデルより少ないとき（省 RAM モード）
 
-UD-Q4_K_XL 以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。
+Unsloth の 2 つ以外のモデルは、すべてのエキスパートを RAM に置き、GPU はよく使うもののコピーを持ちます。
 エキスパートが RAM に入らない（ほかのために約 10 GB を残す）けれど、GPU が十分な数を持てるときは、setup は省 RAM モードを選びます
 （`--low-ram auto`、既定）。
 このときエンジンは、エキスパートを RAM にすべてコピーせずに、モデルのファイルから読みます。
@@ -224,7 +239,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
 
 **初回**は、いくつか質問をして、あとは自分で進めます。
 
-1. **どのモデルか**: Qwen3.8-Flash-Next（元のモデル）、Swift 1.5、Coder、Unsloth の UD-Q4_K_XL（実験的）。
+1. **どのモデルか**: Qwen3.8-Flash-Next（元のモデル）、Swift 1.5、Coder、Unsloth の UD-IQ4_XS か UD-Q4_K_XL（実験的）。
 1. **どの大きさか**: RAM に合ったものを勧めます。
 1. **文脈の長さ**: 8K〜256K トークン。GPU に合った長さを勧めます。
    384K と 512K も選べますが、学習した長さ（262,144）を超えるので、RoPE の拡張を足す実験的なものです。

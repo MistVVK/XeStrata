@@ -130,6 +130,21 @@ Its license is the Swift Open License 1.0: read it on the model page.
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
+### Or: Unsloth's UD-IQ4_XS
+
+**[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** is a ~4-bit i-quant of the original model in three shards (94 GB; upstream #621).
+Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
+The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
+With about 80 GB of RAM every expert fits it.
+setup asks about images (off by default); the image encoder is the original model's (the image path has not been checked: `unverified`).
+
+```sh
+./setup.sh --setup --family unsloth --model UD-IQ4_XS
+```
+
+On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget), 96 tokens of a short chat decoded at 32.5 / 32.8 tokens/s, and the answer read correctly.
+The quality has not been measured on Arc against llama.cpp (`unverified`).
+
 ### Or: Unsloth's UD-Q4_K_XL (EXPERIMENTAL)
 
 **[Unsloth's UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** is a 4-bit file of the original model in four shards (111 GB).
@@ -161,7 +176,7 @@ The quality has not been measured on Arc against llama.cpp (`unverified`).
 
 ### Less RAM than the model: the low-RAM mode
 
-Every model but UD-Q4_K_XL keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.
+Every model but Unsloth's two keeps all of its experts in RAM, and the GPU holds a copy of the most-used ones.
 When the experts do not fit the RAM (with about 10 GB left for the rest) but the GPU can hold enough of them,
 setup chooses the low-RAM mode (`--low-ram auto`, the default).
 The engine then reads the experts from the model files instead of copying them all into RAM:
@@ -220,7 +235,7 @@ setup finds the files there and writes the configs again.
 
 **The first time** it asks a few questions and does the rest:
 
-1. **Which model?** Qwen3.8-Flash-Next (the original), Swift 1.5, the Coder, or Unsloth's UD-Q4_K_XL (experimental).
+1. **Which model?** Qwen3.8-Flash-Next (the original), Swift 1.5, the Coder, or Unsloth's UD-IQ4_XS or UD-Q4_K_XL (experimental).
 1. **Which size?** It recommends one for your RAM.
 1. **How much context?** 8K to 256K tokens; it recommends one for your GPU.
    384K and 512K are offered too, as experiments: past the trained length (262,144) setup adds RoPE scaling.

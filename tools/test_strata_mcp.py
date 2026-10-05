@@ -298,7 +298,8 @@ class Validation(FakeRoot):
         self.assertRejected("strata_install", {"backend": "hip"}, "unknown argument")
         self.assertRejected("strata_install", {"command": "setup.py --build"}, "unknown argument")
         self.assertRejected("strata_install", {"family": "swift", "model": "IQ3_S"}, "has no IQ3_S")
-        self.assertRejected("strata_install", {"family": "unsloth"}, "family must be one of")
+        self.assertRejected("strata_install", {"family": "unsloth", "model": "UD-Q4_K_XL", "vision": "yes"},
+                            "images are not available")
         self.assertRejected("strata_install", {"vision": "yes\nrm"}, "control characters")
 
     def test_data_dir_paths(self):
@@ -549,6 +550,22 @@ class Helpers(unittest.TestCase):
         for f, d in S.FAMILIES.items():
             self.assertEqual(d["tag"], M.FALLBACK_FAMILIES[f]["tag"])
         self.assertEqual(list(S.CONTEXTS), M.FALLBACK_CONTEXTS)
+
+    def test_unsloth_sizes(self):
+        """UD-IQ4_XS is a regular size, listed first (the family's default); UD-Q4_K_XL stays experimental."""
+        s = M.Strata(HERE.parent)
+        for models in (s.tables()[0], M.FALLBACK_MODELS):
+            self.assertEqual(s.sizes_of(models, "unsloth"), ["UD-IQ4_XS", "UD-Q4_K_XL"])
+            self.assertFalse(models["UD-IQ4_XS"].get("experimental"))
+            self.assertTrue(models["UD-Q4_K_XL"].get("experimental"))
+        fam = next(f for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] == "unsloth")
+        self.assertFalse(fam["experimental"])
+        self.assertTrue(fam["images"])
+        by = {x["model"]: x for x in fam["sizes"]}
+        self.assertEqual((by["UD-IQ4_XS"]["experimental"], by["UD-IQ4_XS"]["images"]), (False, True))
+        self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, False))
+        self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
+        self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
