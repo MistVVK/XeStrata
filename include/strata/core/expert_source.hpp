@@ -66,6 +66,22 @@ struct CgroupMemoryStat {
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
+/// #633: the RAM this process can get.  `available`: MemAvailable, lowered
+/// to the room under the tightest cgroup limit; `cgroup_limit`: that tightest limit itself (v2 memory.max of the group
+/// and its ancestors, or v1 memory.limit_in_bytes), ~0 when there is none - what a container can never exceed.
+struct HostMemory {
+    uint64_t available = 0;
+    uint64_t cgroup_limit = ~uint64_t{0};
+};
+
+/// Linux reads `meminfo`, `self_cgroup` and the cgroup tree under `cgroup_root` (the parameters are for tests; the
+/// defaults are the real files).  cgroup v2 as before (an unreadable limit of a group that has one fails); cgroup v1's
+/// memory controller (`<root>/memory/<path>`: memory.limit_in_bytes - memory.usage_in_bytes); no cgroup line at all is
+/// MemAvailable alone.  False when the RAM cannot be determined.
+bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/meminfo",
+                           const std::string& self_cgroup = "/proc/self/cgroup",
+                           const std::string& cgroup_root = "/sys/fs/cgroup");
+
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(
@@ -580,6 +596,8 @@ public:
     /// What backing was obtained and why, for the startup print.  "The engine adapts to the machine it is on" is
     /// only true if the engine says what it got.
     const std::string& note() const { return note_; }
+    /// #633: set by `open` when the RAM available is less than the arena needs (a recommendation; it still loads)
+    const std::string& ram_warning() const { return ram_warning_; }
     double load_gib_per_second() const { return gib_per_s_; }
     // Loader fix: the load, split.  `load_seconds()` is the wall clock of the load loop; the other two are
     // sums over the reader threads (see LoadStats), so on their own they say how much of that wall was spent
@@ -597,6 +615,7 @@ private:
     int64_t n_expert_ = 0;
     int64_t reads_ = 0;
     std::string note_;
+    std::string ram_warning_;
     double gib_per_s_ = 0.0;
     double load_seconds_ = 0.0;
     double load_read_s_ = 0.0;

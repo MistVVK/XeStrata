@@ -207,11 +207,17 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
 }
 #endif
 
-bool available_memory_bytes(uint64_t& bytes) {
+}  // namespace
+
+namespace detail {
+
+bool host_available_memory(HostMemory& m, const std::string& meminfo, const std::string& self_cgroup,
+                           const std::string& cgroup_root) {
+    m = HostMemory{};
     // MemAvailable includes reclaimable page cache, unlike _SC_AVPHYS_PAGES.
-    std::ifstream info("/proc/meminfo");
+    std::ifstream info(meminfo);
     std::string line;
-    bytes = 0;
+    uint64_t bytes = 0;
     while (std::getline(info, line)) {
         std::istringstream fields(line);
         std::string key, unit;
@@ -220,17 +226,26 @@ bool available_memory_bytes(uint64_t& bytes) {
             value <= std::numeric_limits<uint64_t>::max() / 1024) bytes = value * 1024;
     }
     if (bytes == 0) return false;
-    // Account for the tightest cgroup-v2 ancestor limit when its normal mount is visible.
+    // Account for the tightest cgroup ancestor limit when its normal mount is visible.
     // This is a point-in-time guard, not a reservation against concurrent allocations.
-    std::ifstream groups("/proc/self/cgroup");
+    std::ifstream groups(self_cgroup);
     if (!groups) return false;
-    bool resolved_v2 = false;
+    const std::filesystem::path root(cgroup_root);
+    bool v2 = false;
+    std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
     while (std::getline(groups, line)) {
-        if (line.rfind("0::/", 0) != 0) continue;
-        const std::filesystem::path root("/sys/fs/cgroup");
+        if (line.rfind("0::/", 0) != 0) {
+            // v1: "N:controller[,controller]:/path"
+            const size_t c1 = line.find(':'), c2 = c1 == std::string::npos ? c1 : line.find(':', c1 + 1);
+            if (c2 == std::string::npos) continue;
+            std::istringstream ctl(line.substr(c1 + 1, c2 - c1 - 1));
+            for (std::string c; std::getline(ctl, c, ',');)
+                if (c == "memory") v1_path = line.substr(c2 + 1);
+            continue;
+        }
         auto path = (root / line.substr(4)).lexically_normal();
         if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
-        resolved_v2 = true;
+        v2 = true;
         while (path.string().rfind(root.string(), 0) == 0) {
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
             std::string limit;
@@ -244,18 +259,48 @@ bool available_memory_bytes(uint64_t& bytes) {
                     size_t consumed = 0;
                     const uint64_t cap = std::stoull(limit, &consumed);
                     if (consumed != limit.size()) return false;
-                    detail::CgroupMemoryStat stat;
+                    CgroupMemoryStat stat;
                     if (!read_cgroup_memory_stat(path, current, stat)) return false;
                     uint64_t cgroup_available = 0;
-                    if (!detail::cgroup_available_bytes(cap, stat, cgroup_available)) return false;
+                    if (!cgroup_available_bytes(cap, stat, cgroup_available)) return false;
                     bytes = std::min(bytes, cgroup_available);
+                    m.cgroup_limit = std::min(m.cgroup_limit, cap);
                 } catch (...) { return false; }
             }
             if (path == root) break;
             path = path.parent_path();
         }
     }
-    return resolved_v2;
+    if (!v2 && !v1_path.empty()) {
+        // #633: cgroup v1 (older Docker hosts, RHEL 7/8): the memory controller's group and its ancestors.  An
+        // unlimited group says a number near 2^63 (rounded to its page size); a group whose files are not
+        // visible (no mount in this namespace) is skipped - MemAvailable alone, as with no cgroup at all.
+        const std::filesystem::path mroot = root / "memory";
+        auto path = (mroot / v1_path.substr(v1_path.rfind('/', 0) == 0 ? 1 : 0)).lexically_normal();
+        while (path.string().rfind(mroot.string(), 0) == 0) {
+            std::ifstream limit_file(path / "memory.limit_in_bytes"), usage_file(path / "memory.usage_in_bytes");
+            uint64_t cap = 0, usage = 0;
+            if (limit_file >> cap && usage_file >> usage && cap < (1ull << 62)) {
+                bytes = std::min(bytes, usage < cap ? cap - usage : 0);
+                m.cgroup_limit = std::min(m.cgroup_limit, cap);
+            }
+            if (path == mroot) break;
+            path = path.parent_path();
+        }
+    }
+    m.available = bytes;
+    return true;
+}
+
+}  // namespace detail
+
+namespace {
+
+bool available_memory_bytes(uint64_t& bytes) {
+    detail::HostMemory m;
+    if (!detail::host_available_memory(m)) return false;
+    bytes = m.available;
+    return bytes > 0;
 }
 
 }  // namespace
@@ -1974,6 +2019,37 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                           (long long) blob, (unsigned long long) want);
             err = buf;
             return false;
+        }
+    }
+
+    // #633: THE RAM BEFORE THE ALLOCATION.  On Linux the arena is an anonymous mapping that succeeds whatever the host
+    // has; its pages are committed as the load writes them, so a container whose memory limit is below the arena was
+    // killed by the OOM killer part-way through the load, without a message.  A hard cgroup limit below it is
+    // certain to end that way: refused, with the numbers.  Less RAM available than the arena (another program, an
+    // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
+    ram_warning_.clear();
+    // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
+    if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
+        const uint64_t need = want + (uint64_t) blob;
+        const double gib = 1073741824.0;
+        char buf[512];
+        if (hm.cgroup_limit < need) {
+            std::snprintf(buf, sizeof buf,
+                          "ArenaExpertSource: the expert arena needs %.2f GiB of RAM but this process's memory limit "
+                          "(cgroup memory.max / memory.limit_in_bytes) is %.2f GiB: it would be killed while loading. "
+                          "Raise the container's limit, or run with less RAM: --mmap-experts with "
+                          "--resident-budget-gib N keeps only the hottest experts in RAM",
+                          (double) need / gib, (double) hm.cgroup_limit / gib);
+            err = buf;
+            return false;
+        }
+        if (hm.available < need) {
+            std::snprintf(buf, sizeof buf,
+                          "the expert arena needs %.2f GiB of RAM but %.2f GiB is available (%.2f GiB short): the load "
+                          "may swap or be stopped by the OS. Close other programs (or wait for an engine that is "
+                          "still exiting), or run with less RAM: --mmap-experts with --resident-budget-gib N",
+                          (double) need / gib, (double) hm.available / gib, (double) (need - hm.available) / gib);
+            ram_warning_ = buf;
         }
     }
 

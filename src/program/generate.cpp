@@ -2169,6 +2169,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (!arena_src.ram_warning().empty())   // #633: said before the load's numbers, which it explains
+            std::fprintf(stderr, "strata generate: WARNING: %s\n", arena_src.ram_warning().c_str());
         std::fprintf(stderr, "strata generate: expert arena: %s\n", arena_src.note().c_str());
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
