@@ -1,0 +1,22 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cuda-host-register-table: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The CUDA adapter left urUSMImportExp and urUSMReleaseExp out of its table, so the loader refused them
+(UR_RESULT_ERROR_UNINITIALIZED); with cuda-host-register.
+---
+diff --git a/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp b/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
+index 50c588d..836bc02 100644
+--- a/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
++++ b/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
+@@ -444,6 +444,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
+   pDdiTable->pfnPoolGetDevicePoolExp = urUSMPoolGetDevicePoolExp;
+   pDdiTable->pfnPoolTrimToExp = urUSMPoolTrimToExp;
+   pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
++  pDdiTable->pfnImportExp = urUSMImportExp;
++  pDdiTable->pfnReleaseExp = urUSMReleaseExp;
+   return UR_RESULT_SUCCESS;
+ }
+ 

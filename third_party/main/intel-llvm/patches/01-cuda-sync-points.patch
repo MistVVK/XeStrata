@@ -1,0 +1,22 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cuda-sync-points: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The CUDA adapter copied the command-buffer's map of sync points for every node it added, so finalizing
+a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms).
+---
+diff --git a/unified-runtime/source/adapters/cuda/command_buffer.cpp b/unified-runtime/source/adapters/cuda/command_buffer.cpp
+index c33719b..62831b8 100644
+--- a/unified-runtime/source/adapters/cuda/command_buffer.cpp
++++ b/unified-runtime/source/adapters/cuda/command_buffer.cpp
+@@ -158,7 +158,7 @@ static ur_result_t getNodesFromSyncPoints(
+     std::vector<CUgraphNode> &CuNodesList) {
+   // Map of ur_exp_command_buffer_sync_point_t to ur_event_handle_t defining
+   // the event associated with each sync-point
+-  auto SyncPoints = CommandBuffer->SyncPoints;
++  const auto &SyncPoints = CommandBuffer->SyncPoints;
+ 
+   // If command-buffer is in-order use last node in ordered map, and return
+   // early as other user passed sync-points will be redundant for scheduling.

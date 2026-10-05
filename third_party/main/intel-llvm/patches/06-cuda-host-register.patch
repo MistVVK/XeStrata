@@ -1,0 +1,51 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cuda-host-register: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The CUDA adapter had urUSMImportExp and urUSMReleaseExp (sycl_ext_oneapi_copy_optimize) doing nothing;
+now they page-lock the memory with cuMemHostRegister, so copies from it are DMA transfers that overlap the
+GPU's work.
+---
+diff --git a/unified-runtime/source/adapters/cuda/usm.cpp b/unified-runtime/source/adapters/cuda/usm.cpp
+index c805c10..1d021d3 100644
+--- a/unified-runtime/source/adapters/cuda/usm.cpp
++++ b/unified-runtime/source/adapters/cuda/usm.cpp
+@@ -203,14 +203,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
+   return Result;
+ }
+ 
+-UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t, void *,
+-                                                   size_t Size) {
++UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t hContext,
++                                                   void *pMem, size_t Size) {
+   UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
++  // page-locked for every context, so copies from and to it are DMA transfers
++  try {
++    ScopedContext Active(hContext->getDevices()[0]);
++    const CUresult Result =
++        cuMemHostRegister(pMem, Size, CU_MEMHOSTREGISTER_PORTABLE);
++    if (Result != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED)
++      UR_CHECK_ERROR(Result);
++  } catch (ur_result_t Err) {
++    return Err;
++  }
+   return UR_RESULT_SUCCESS;
+ }
+ 
+-UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
+-                                                    void *) {
++UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
++                                                    void *pMem) {
++  try {
++    ScopedContext Active(hContext->getDevices()[0]);
++    const CUresult Result = cuMemHostUnregister(pMem);
++    if (Result != CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED)
++      UR_CHECK_ERROR(Result);
++  } catch (ur_result_t Err) {
++    return Err;
++  }
+   return UR_RESULT_SUCCESS;
+ }
+ 

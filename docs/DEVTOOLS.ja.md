@@ -92,7 +92,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   HIP には上の 4 つだけで足ります（rocThrust は要りません）。
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - v7.1.1 の `configure.py` は AMD の libclc の対象名を `amdgcn--amdhsa` としていて、libclc が受け付けないので、スクリプトが `amdgcn-amd-amdhsa` で上書きします。
-- スクリプトは、リリースにない修正（`SOURCE_FIXES`）をソースに当ててからビルドし、当てた修正を `install/XESTRATA.json` に残します。
+- スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
   今の修正は 4 つで、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-05）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。

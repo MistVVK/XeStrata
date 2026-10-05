@@ -38,222 +38,24 @@ REPO = "https://github.com/intel/llvm.git"
 # a change to this line, not by following the newest release, so a run does not start a build by itself.
 TAG = "v7.1.1"
 
-# Fixes the release lacks (its sycl branch too, on 2026-10-05), applied to the clone before the configuration: an id,
-# the file, the text it replaces and the replacement.  A finished install records the ids it was built with.
-SOURCE_FIXES = [
-    # the CUDA and HIP adapters copied the command-buffer's map of sync points for every node they added, so finalizing
-    # a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms)
-    (f"{a}-sync-points", f"unified-runtime/source/adapters/{a}/command_buffer.cpp",
-     "  auto SyncPoints = CommandBuffer->SyncPoints;\n", "  const auto &SyncPoints = CommandBuffer->SyncPoints;\n")
-    for a in ("cuda", "hip")
-] + [
-    # the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture: with code for
-    # several architectures (STRATA_CUDA_ARCHS), a GPU older than that image failed and a newer one ran older code.
-    # The runtime now hands the CUDA adapter the image itself, as it does the HIP one, and the adapter takes the PTX
-    # with the highest .target the device runs and refuses those for a newer one; in a fatbin (CUDA 13 compresses the
-    # PTX in it) the entries' architecture field.
-    ("cuda-select-binary-2", "unified-runtime/source/adapters/cuda/device.cpp", """\
-UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
-    ur_device_handle_t /*hDevice*/, const ur_device_binary_t *pBinaries,
-    uint32_t NumBinaries, uint32_t *pSelectedBinary) {
+# Fixes the release lacks (its sycl branch too, on 2026-10-05): third_party/main/intel-llvm/patches/NN-<id>.patch,
+# applied in order to the clone before the configuration (under intel/llvm's license, Apache-2.0 with LLVM
+# exceptions).  A finished install records the ids it was built with.
+PATCHES = sorted((ROOT / "third_party" / "main" / "intel-llvm" / "patches").glob("[0-9][0-9]-*.patch"))
 
-  // Look for an image for the NVPTX64 target, and return the first one that is
-  // found
-  for (uint32_t i = 0; i < NumBinaries; i++) {
-    if (strcmp(pBinaries[i].pDeviceTargetSpec,
-               UR_DEVICE_BINARY_TARGET_NVPTX64) == 0) {
-      *pSelectedBinary = i;
-      return UR_RESULT_SUCCESS;
-    }
-  }
-""", """\
-// The architecture an image is for: in a fatbin (CUDA 13's fatbinary compresses the PTX in it) its entries'
-// header field, else its PTX text's ".target sm_XY" line: XY (sm_120: 120), with the suffix a or f in Suffix; -1
-// where neither is found.
-static int ptxTargetSm(const unsigned char *Data, size_t Size, char &Suffix) {
-  Suffix = 0;
-  uint32_t Magic = 0;
-  if (Size >= 16)
-    memcpy(&Magic, Data, 4);
-  if (Magic == 0xBA55ED50u) {   // fatbin: a 16-byte header, then entries
-    uint16_t HeaderSize = 0;
-    uint64_t FatSize = 0;
-    memcpy(&HeaderSize, Data + 6, 2);
-    memcpy(&FatSize, Data + 8, 8);
-    int Sm = -1;
-    for (uint64_t Off = HeaderSize; Off + 32 <= Size && Off < HeaderSize + FatSize;) {
-      uint32_t EntryHeader = 0, Arch = 0;
-      uint64_t EntrySize = 0;
-      memcpy(&EntryHeader, Data + Off + 4, 4);
-      memcpy(&EntrySize, Data + Off + 8, 8);
-      memcpy(&Arch, Data + Off + 28, 4);
-      if (EntryHeader == 0)
-        break;
-      Sm = Sm > (int)Arch ? Sm : (int)Arch;
-      Off += EntryHeader + EntrySize;
-    }
-    return Sm;
-  }
-  static const char Key[] = ".target sm_";
-  const size_t KeyLen = sizeof(Key) - 1, End = Size < 65536 ? Size : 65536;
-  for (size_t i = 0; i + KeyLen < End; i++) {
-    if (memcmp(Data + i, Key, KeyLen) != 0)
-      continue;
-    size_t j = i + KeyLen;
-    int Sm = -1;
-    for (; j < End && Data[j] >= '0' && Data[j] <= '9'; j++)
-      Sm = (Sm < 0 ? 0 : Sm * 10) + (Data[j] - '0');
-    Suffix = j < End && (Data[j] == 'a' || Data[j] == 'f') ? Data[j] : 0;
-    return Sm;
-  }
-  return -1;
-}
 
-UR_APIEXPORT ur_result_t UR_APICALL urDeviceSelectBinary(
-    ur_device_handle_t hDevice, const ur_device_binary_t *pBinaries,
-    uint32_t NumBinaries, uint32_t *pSelectedBinary) {
+def patch_id(patch: Path) -> str:
+    return patch.stem.split("-", 1)[1]
 
-  // Look for an image for the NVPTX64 target.  Where the SYCL runtime passes
-  // the image itself (a {pointer, size} pair in pNext), take the PTX with the
-  // highest .target the device runs (sm_XYa: that architecture only, sm_XYf:
-  // its family) and refuse one for a newer architecture; otherwise the first
-  // image found.
-  int Major = 0, Minor = 0;
-  UR_CHECK_ERROR(cuDeviceGetAttribute(
-      &Major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, hDevice->get()));
-  UR_CHECK_ERROR(cuDeviceGetAttribute(
-      &Minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, hDevice->get()));
-  const int DeviceSm = Major * 10 + Minor;
-  int Best = -1, BestSm = -1, Unknown = -1;
-  for (uint32_t i = 0; i < NumBinaries; i++) {
-    if (strcmp(pBinaries[i].pDeviceTargetSpec,
-               UR_DEVICE_BINARY_TARGET_NVPTX64) != 0)
-      continue;
-    using BinaryBlobTy = std::pair<const unsigned char *, size_t>;
-    const auto *Blob = static_cast<const BinaryBlobTy *>(pBinaries[i].pNext);
-    char Suffix = 0;
-    const int Sm = Blob ? ptxTargetSm(Blob->first, Blob->second, Suffix) : -1;
-    if (Sm < 0) {
-      if (Unknown < 0)
-        Unknown = (int)i;
-      continue;
-    }
-    const bool Runs = Suffix == 'a'   ? Sm == DeviceSm
-                      : Suffix == 'f' ? Sm / 10 == Major && Sm <= DeviceSm
-                                      : Sm <= DeviceSm;
-    if (Runs && Sm > BestSm) {
-      Best = (int)i;
-      BestSm = Sm;
-    }
-  }
-  if (Best >= 0 || Unknown >= 0) {
-    *pSelectedBinary = (uint32_t)(Best >= 0 ? Best : Unknown);
-    return UR_RESULT_SUCCESS;
-  }
-"""),
-    ("cuda-binary-to-adapter", "sycl/source/detail/program_manager/program_manager.cpp", """\
-  ur_device_binary_t UrBinary{};
-  UrBinary.pDeviceTargetSpec = getUrDeviceTarget(DevBin.DeviceTargetSpec);
-""", """\
-  ur_device_binary_t UrBinary{};
-  UrBinary.pDeviceTargetSpec = getUrDeviceTarget(DevBin.DeviceTargetSpec);
-  // the CUDA adapter refuses PTX for a newer architecture than the device's
-  std::pair<const unsigned char *, size_t> Blob{
-      DevBin.BinaryStart, std::distance(DevBin.BinaryStart, DevBin.BinaryEnd)};
-  if (DeviceImpl.getBackend() == backend::ext_oneapi_cuda)
-    UrBinary.pNext = &Blob;
-"""),
-    ("cuda-binaries-to-adapter", "sycl/source/detail/program_manager/program_manager.cpp", """\
-  // Pass extra information to the HIP adapter to aid in binary selection. We
-  // pass it the raw binary as a {ptr, length} pair.
-  std::vector<std::pair<const unsigned char *, size_t>> UrBinariesStorage;
-  if (DeviceImpl.getBackend() == backend::ext_oneapi_hip)
-    UrBinariesStorage.reserve(NumImgs);
-""", """\
-  // Pass extra information to the HIP and CUDA adapters to aid in binary
-  // selection. We pass it the raw binary as a {ptr, length} pair.
-  std::vector<std::pair<const unsigned char *, size_t>> UrBinariesStorage;
-  const bool PassBinaries = DeviceImpl.getBackend() == backend::ext_oneapi_hip ||
-                            DeviceImpl.getBackend() == backend::ext_oneapi_cuda;
-  if (PassBinaries)
-    UrBinariesStorage.reserve(NumImgs);
-"""),
-    # the CUDA adapter had urUSMImportExp and urUSMReleaseExp (sycl_ext_oneapi_copy_optimize) doing nothing and left
-    # them out of its table, so the loader refused them (UR_RESULT_ERROR_UNINITIALIZED); now they page-lock the memory
-    # with cuMemHostRegister, so copies from it are DMA transfers that overlap the GPU's work
-    ("cuda-host-register", "unified-runtime/source/adapters/cuda/usm.cpp", """\
-UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t, void *,
-                                                   size_t Size) {
-  UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
-  return UR_RESULT_SUCCESS;
-}
 
-UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
-                                                    void *) {
-  return UR_RESULT_SUCCESS;
-}
-""", """\
-UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t hContext,
-                                                   void *pMem, size_t Size) {
-  UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
-  // page-locked for every context, so copies from and to it are DMA transfers
-  try {
-    ScopedContext Active(hContext->getDevices()[0]);
-    const CUresult Result =
-        cuMemHostRegister(pMem, Size, CU_MEMHOSTREGISTER_PORTABLE);
-    if (Result != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED)
-      UR_CHECK_ERROR(Result);
-  } catch (ur_result_t Err) {
-    return Err;
-  }
-  return UR_RESULT_SUCCESS;
-}
-
-UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
-                                                    void *pMem) {
-  try {
-    ScopedContext Active(hContext->getDevices()[0]);
-    const CUresult Result = cuMemHostUnregister(pMem);
-    if (Result != CUDA_ERROR_HOST_MEMORY_NOT_REGISTERED)
-      UR_CHECK_ERROR(Result);
-  } catch (ur_result_t Err) {
-    return Err;
-  }
-  return UR_RESULT_SUCCESS;
-}
-"""),
-    ("cuda-host-register-table", "unified-runtime/source/adapters/cuda/ur_interface_loader.cpp", """\
-  pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
-  return UR_RESULT_SUCCESS;
-""", """\
-  pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
-  pDdiTable->pfnImportExp = urUSMImportExp;
-  pDdiTable->pfnReleaseExp = urUSMReleaseExp;
-  return UR_RESULT_SUCCESS;
-"""),
-    # the SYCL runtime's table of NVIDIA architectures stops at sm_90 (its sycl branch too, 2026-10-05), so a newer
-    # GPU (an RTX 50, sm_120) reported no matrix combinations and the engine took no tensor-core path; such a GPU runs
-    # sm_90's shapes (the mma instructions of sm_80 on), so a compute capability of 9.0 or more the table lacks
-    # reports those
-    ("cuda-newer-matrix", "sycl/source/detail/device_impl.hpp", """\
-      float ComputeCapability = GetArchNum(DeviceArch);
-""", """\
-      float ComputeCapability = GetArchNum(DeviceArch);
-      if (ComputeCapability == 0.f) {   // newer than the table: sm_90's shapes
-        const std::string Version =
-            get_info_impl<UrInfoCode<sycl::info::device::version>::value>();
-        if (std::strtof(Version.c_str(), nullptr) >= 9.0f)
-          ComputeCapability = 9.0f;
-      }
-"""),
-    ("cuda-binaries-to-adapter-2", "sycl/source/detail/program_manager/program_manager.cpp", """\
-    if (DeviceImpl.getBackend() == backend::ext_oneapi_hip) {
-      UrBinariesStorage.emplace_back(
-""", """\
-    if (PassBinaries) {
-      UrBinariesStorage.emplace_back(
-"""),
-]
+def patched_files() -> list:
+    """The files the patches change, as paths in the clone."""
+    files = set()
+    for patch in PATCHES:
+        for line in patch.read_text().splitlines():
+            if line.startswith("diff --git a/"):
+                files.add(line.split()[2][2:])
+    return sorted(files)
 
 
 def set_out(out: Path) -> None:
@@ -361,16 +163,14 @@ def contrib_options() -> list:
 
 
 def fix_sources() -> None:
-    for _, rel, old, new in SOURCE_FIXES:
-        path = SRC / rel
-        text = path.read_text()
-        if new in text:
-            continue
-        if old not in text:
-            fail(f"{rel}: the text a fix replaces is not there",
-                 "a newer intel/llvm may have it fixed: check SOURCE_FIXES")
-        path.write_text(text.replace(old, new, 1))
-        say(f"fixed {rel}")
+    # the patched files back to the release, then every patch in order
+    run(["git", "-C", SRC, "checkout", "--", *patched_files()])
+    for patch in PATCHES:
+        r = subprocess.run(["git", "-C", str(SRC), "apply", str(patch)], capture_output=True, text=True)
+        if r.returncode != 0:
+            fail(f"{patch.name} does not apply: {r.stderr.strip()}",
+                 "a newer intel/llvm may have it fixed: check third_party/main/intel-llvm/patches")
+        say(f"applied {patch.name}")
 
 
 def build(tag: str, keep_build: bool, contrib: bool) -> None:
@@ -384,8 +184,8 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
                               text=True).stdout.strip()
         if have != tag:
             run(["git", "-C", SRC, "fetch", "--depth", "1", "origin", "tag", tag])
-            # the fixed files back to the release first
-            run(["git", "-C", SRC, "checkout", "--", *sorted({rel for _, rel, _, _ in SOURCE_FIXES})])
+            # the patched files back to the release first
+            run(["git", "-C", SRC, "checkout", "--", *patched_files()])
             run(["git", "-C", SRC, "checkout", "--detach", tag])
     else:
         run(["git", "clone", "--depth", "1", "--branch", tag, REPO, SRC])
@@ -407,7 +207,7 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
-    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [f[0] for f in SOURCE_FIXES], "zstd": True,
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES], "zstd": True,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
                                   "gpus": gpus}, indent=1))
@@ -445,8 +245,8 @@ def main() -> None:
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
             # the CUDA and HIP adapters' fixes do not ask the free toolchain, which has neither, to be built again
-            missing = [f[0] for f in SOURCE_FIXES if f[0] not in have.get("fixes", [])
-                       and (a.contrib or not f[0].startswith(("cuda-", "hip-")))]
+            missing = [patch_id(p) for p in PATCHES if patch_id(p) not in have.get("fixes", [])
+                       and (a.contrib or not patch_id(p).startswith(("cuda-", "hip-")))]
             if not have.get("zstd"):
                 missing.append("zstd")
             if not missing:

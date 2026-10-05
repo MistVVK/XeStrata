@@ -92,7 +92,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   HIP needs only the four packages above (not rocThrust).
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
-- The script applies fixes the release lacks (`SOURCE_FIXES`) to the sources before building, and records them in `install/XESTRATA.json`.
+- The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
   There are four fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-05).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).

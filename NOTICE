@@ -43,6 +43,11 @@ Every copyright holder whose work is in this repository, its license and where t
   changes (each marked in its file's header): the contrib and contrib-icpx modes' dense matrix products. Its notices
   are in its files' headers and in third_party/main/oneMath/third-party-programs/ - third_party/main/oneMath/LICENSE,
   LICENSES/Apache-2.0.txt
+- Copyright the LLVM project contributors; changes Copyright 2026 MistVVK and the XeStrata contributors
+  Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), in
+  third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
+  itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
+  LICENSES/LLVM-exception.txt
 - Copyright 2008 Google Inc.
   BSD-3-Clause - Googletest in third_party/main/oneMath/deps/googletest/, for oneMath's own tests (XeStrata does not
   build them) - third_party/main/oneMath/deps/googletest/LICENSE, LICENSES/BSD-3-Clause.txt

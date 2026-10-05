@@ -1,0 +1,27 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+cuda-newer-matrix: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The SYCL runtime's table of NVIDIA architectures stops at sm_90, so a newer GPU (an RTX 50, sm_120)
+reported no matrix combinations; such a GPU runs sm_90's shapes (the mma instructions of sm_80 on), so a
+compute capability of 9.0 or more the table lacks reports those.
+---
+diff --git a/sycl/source/detail/device_impl.hpp b/sycl/source/detail/device_impl.hpp
+index bf3d38a..0cd2a33 100644
+--- a/sycl/source/detail/device_impl.hpp
++++ b/sycl/source/detail/device_impl.hpp
+@@ -2219,6 +2219,12 @@ public:
+         return 0.f;
+       };
+       float ComputeCapability = GetArchNum(DeviceArch);
++      if (ComputeCapability == 0.f) {   // newer than the table: sm_90's shapes
++        const std::string Version =
++            get_info_impl<UrInfoCode<sycl::info::device::version>::value>();
++        if (std::strtof(Version.c_str(), nullptr) >= 9.0f)
++          ComputeCapability = 9.0f;
++      }
+       std::vector<combination> sm_70_combinations = {
+           {0, 0, 0, 16, 16, 16, matrix_type::fp16, matrix_type::fp16,
+            matrix_type::fp32, matrix_type::fp32},
