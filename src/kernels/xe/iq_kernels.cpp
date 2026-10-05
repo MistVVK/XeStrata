@@ -628,9 +628,13 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
 
 // ---------------------------------------------------------------- grouped native experts
 // Lanes a row in the experts' projections, measured on the B70 (bench/results/2026-10-02-xe-decode-gpu): 16 for the
-// 2560-wide gate/up rows, 8 for the 640-wide down rows (32 lanes left most of a 180-360 byte row's lanes idle).
+// 2560-wide gate/up rows, 8 for the 640-wide down rows (32 lanes left most of a 180-360 byte row's lanes idle).  A
+// down row of under 12 bytes per 32 values (Q2_0's 180) takes 4: a verify window's grouped experts 3-6% faster on the
+// B70 and on an RTX 4070 (scratch lpr_probe), where IQ4_NL's 360-byte rows were 11% slower with 4 (8 and 16 for gate
+// and up were slower on one or both).
 constexpr int GU_LPR = 16;
 constexpr int DOWN_LPR = 8;
+template<int TG> constexpr int down_lpr() { return Fmt<TG>::bsz * 32 / Fmt<TG>::qk < 12 ? 4 : DOWN_LPR; }
 constexpr int GU_ROWS = 8;     // rows per work-group (one sub-group each)
 // entries (a window's tokens routed to one expert) a pass over the row; the verify window of --spec 4 fits in one
 constexpr int kEntriesPass = 4;
@@ -1473,12 +1477,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     sycl::event e;
     switch (L.d_type) {
-        case 20: e = launch_native_down<20, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 23: e = launch_native_down<23, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 42: e = launch_native_down<42, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 7: e = launch_native_down<7, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 8: e = launch_native_down<8, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
-        case 6: e = launch_native_down<6, DOWN_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 20: e = launch_native_down<20, down_lpr<20>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 23: e = launch_native_down<23, down_lpr<23>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 42: e = launch_native_down<42, down_lpr<42>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 7: e = launch_native_down<7, down_lpr<7>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 8: e = launch_native_down<8, down_lpr<8>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 6: e = launch_native_down<6, down_lpr<6>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");
