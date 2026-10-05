@@ -18,6 +18,8 @@ if [ $# -gt 0 ]; then
 else
   mapfile -t files < <( { git diff --name-only --diff-filter=d HEAD; git ls-files --others --exclude-standard; } | sort -u)
 fi
+# oneMath is another project's code, kept as it was released (AGENTS.md, "Lints")
+mapfile -t files < <(printf '%s\n' "${files[@]}" | grep -v '^third_party/main/oneMath/')
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
 
 status=0

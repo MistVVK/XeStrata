@@ -211,8 +211,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
 - **Three build modes,** chosen by the CMake option `STRATA_LICENSE`:
    - free (the default): free software only, with intel/llvm's DPC++ as the compiler;
    - contrib (`-DSTRATA_LICENSE=contrib`): intel/llvm with its CUDA target, making code for NVIDIA GPUs as well;
-     it needs NVIDIA's CUDA toolkit and driver, which are not free software. How it runs on an NVIDIA GPU is `unverified`;
+     it needs NVIDIA's CUDA toolkit and driver and oneMKL, none of them free software;
    - contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): may also use Intel oneAPI's icpx and other non-free tools, for Intel GPUs.
+
+  The contrib and contrib-icpx modes hand the dense matrix products to oneMKL (Intel) or cuBLAS (NVIDIA) through oneMath.
 
   The free and contrib-icpx modes must build and pass the tests.
 - **How to build:** [docs/XE.md](docs/XE.md#build-and-run). The development tools (lints, Intel SDE, GPU profilers):

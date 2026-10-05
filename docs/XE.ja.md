@@ -97,6 +97,13 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
+contrib と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（`third_party/main/oneMath`、Apache-2.0）経由で、
+Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
+ビルドには oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
+`third_party/main/oneMath` は oneMath v0.9 に XeStrata の変更（cuBLAS の BF16 の積）を加えたもので、変更は [third_party/main/README.md](../third_party/main/README.md) にあります。
+oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
+coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1350 ms、RTX 4070 では同じ（3845 ms）でした。
+
 エンジンは起動時に、XMX のカーネルが必要とする行列の組み合わせ（FP16 と BF16 の 8 x 16 x 16）を GPU に問い合わせます。
 なければ、GPU が報告する別の形の行列エンジン（Arc A シリーズ（Xe-HPG）の 8 x 8 x 16、NVIDIA の Tensor Core の 16 x 16 x 16）を `joint_matrix` の標準の API で使う経路（`src/kernels/xe/mma_gemm.cpp`）を選びます。
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。

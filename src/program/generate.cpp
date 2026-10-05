@@ -59,7 +59,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
-#include "strata/kernels/xmx_gemm.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -1550,12 +1550,13 @@ int main(int argc, char** argv) {
                      remote_dev[0], free_gib);
     }
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
+    strata::prefill::Gemm::prepare();
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
         std::fprintf(stderr, "strata generate: GPU %s, %u compute units, %.1f GiB, prompt matrix products on %s\n",
                      gi.name.c_str(), gi.compute_units, (double) gi.total_bytes / (1024.0 * 1024 * 1024),
-                     strata::kernels::gemm_path(strata::kernels::XmxType::f16));
+                     strata::prefill::Gemm::path());
     }
     // plan v0.3 P6: the PCIe share of the missed experts, measured per kind of pack (the paper, finding on PCIe).
     // PR #44: a x8 link carries half of what the native default assumes - the GPU's SMs read that share over the

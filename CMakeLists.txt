@@ -19,8 +19,10 @@ option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
 # - free (the default): free software only, free enough for Debian main.  intel/llvm's DPC++ (clang++ with -fsycl;
 #   Debian and Ubuntu package it as dpclang++), for Intel GPUs.
 # - contrib: free software that needs non-free parts to build or run: intel/llvm with its CUDA target, for NVIDIA GPUs
-#   as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run.
-# - contrib-icpx: Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others), Intel GPUs only.
+#   as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run, and oneMKL and
+#   cuBLAS for the dense products (through oneMath).
+# - contrib-icpx: the same with Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others)
+#   and oneMKL, Intel GPUs only.
 set(STRATA_LICENSE free CACHE STRING "build mode: free, contrib or contrib-icpx")
 set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib contrib-icpx)
 if(NOT STRATA_LICENSE MATCHES "^(free|contrib|contrib-icpx)$")
@@ -303,15 +305,49 @@ if(STRATA_ENABLE_XE)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   endif()
 
-  # plan v0.3 P5: batched prompt processing.  The GEMMs are XeStrata's XMX kernels (src/kernels/xe/xmx_gemm.cpp;
-  # cuBLAS in the CUDA build, oneMKL in the first Xe port).  The experts' quantized products (moe_mmq.cpp) run on the
-  # int8 matrix engines where the GPU reports the shape src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM
-  # path elsewhere.  Upstream 0.1.38's quantized and fused expert products on the decode kernels' DP4a dots ran at 0.34x
-  # and 0.25x of it on the B70 and were dropped.
+  # The contrib modes' dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath) with its
+  # oneMKL backend for Intel GPUs and, with STRATA_CUDA_ARCHS, its cuBLAS backend for NVIDIA GPUs.  oneMath opens the
+  # backends at run time, so the engine starts without the CUDA driver.
+  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+    if(NOT MKL_ROOT)
+      if(DEFINED ENV{MKLROOT})
+        set(MKL_ROOT $ENV{MKLROOT})
+      elseif(EXISTS /opt/intel/oneapi/mkl/latest)
+        set(MKL_ROOT /opt/intel/oneapi/mkl/latest)
+      endif()
+    endif()
+    # oneMath's options as plain variables (its policy CMP0077 takes them); shared libraries for this folder only, as
+    # ggml is static
+    set(BUILD_SHARED_LIBS ON)
+    set(TARGET_DOMAINS blas)
+    set(ENABLE_MKLCPU_BACKEND OFF)
+    set(ENABLE_MKLGPU_BACKEND ON)
+    if(STRATA_CUDA_ARCHS)
+      set(ENABLE_CUBLAS_BACKEND ON)
+    endif()
+    set(BUILD_FUNCTIONAL_TESTS OFF)
+    set(BUILD_EXAMPLES OFF)
+    add_subdirectory(third_party/main/oneMath ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
+    unset(BUILD_SHARED_LIBS)
+  endif()
+
+  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes (above) and XeStrata's own
+  # kernels in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in the first Xe port).
+  # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
+  # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
+  # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
   add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
                                     src/prefill/moe_mmq.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
+  if(TARGET onemath)
+    # the library and its headers without its usage requirements: oneMath's cuBLAS backend puts
+    # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets
+    add_dependencies(strata_prefill onemath)
+    target_include_directories(strata_prefill SYSTEM PRIVATE $<TARGET_PROPERTY:onemath,INTERFACE_INCLUDE_DIRECTORIES>)
+    target_link_libraries(strata_prefill PRIVATE $<TARGET_FILE:onemath>)
+    target_compile_definitions(strata_prefill PRIVATE STRATA_ONEMATH=1)
+  endif()
 
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp)

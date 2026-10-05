@@ -93,6 +93,13 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
+The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (`third_party/main/oneMath`, Apache-2.0):
+oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
+The build needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
+`third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
+Where oneMath has no backend for the GPU the own kernels take the products.
+coder-iq1_m's prefill of 997 tokens went from 1421 to 1350 ms on the B70 and stayed the same on the RTX 4070 (3845 ms).
+
 At start the engine asks the GPU whether it has the matrix combinations its XMX kernels need (FP16 and BF16 8 x 16 x 16).
 Without them it takes the path that uses another shape the GPU reports (the Arc A series' (Xe-HPG) 8 x 8 x 16, NVIDIA's tensor cores' 16 x 16 x 16) through joint_matrix's portable API (`src/kernels/xe/mma_gemm.cpp`),
 and without that the DP4a path, and says once which.

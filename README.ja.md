@@ -207,8 +207,9 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 - **ビルドの 3 つの方式**: CMake のオプション `STRATA_LICENSE` で選びます。
    - free（既定）: 自由ソフトウェアだけでビルドします。コンパイラは intel/llvm の DPC++ です。
    - contrib（`-DSTRATA_LICENSE=contrib`）: CUDA のターゲット付きの intel/llvm で、NVIDIA の GPU 向けのコードも作ります。
-     NVIDIA の CUDA ツールキットとドライバー（自由ソフトウェアではありません）が要ります。NVIDIA の GPU の上での動作は `unverified` です。
+     NVIDIA の CUDA ツールキットとドライバー、oneMKL（どれも自由ソフトウェアではありません）が要ります。
    - contrib-icpx（`-DSTRATA_LICENSE=contrib-icpx`）: Intel oneAPI の icpx なども使えます。Intel の GPU だけを扱います。
+   - contrib と contrib-icpx では、密な行列積を oneMath 経由で oneMKL（Intel）や cuBLAS（NVIDIA）に任せます。
    - free と contrib-icpx の方式でビルドでき、テストが通る状態を保ちます。
 - **手順**: ビルドの手順は [docs/XE.ja.md](docs/XE.ja.md#ビルド)、開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は
   [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。

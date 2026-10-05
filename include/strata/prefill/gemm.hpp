@@ -6,7 +6,8 @@
 // Every projection of a chunk of T tokens is Y[T, N] = X[T, K] . W[N, K]^T with W row-major (the GGUF / pack layout)
 // and FP32 outputs.  Weights are either BF16 on the device already (the pack's BF16 tensors) or dequantized from their
 // native GGUF blocks to FP16 into a reusable scratch right before the product; the activations are in the same type.
-// The products run on the XMX engines (strata/kernels/xmx_gemm.hpp).
+// The products run through oneMath in the contrib modes, otherwise on XeStrata's own kernels
+// (strata/kernels/xmx_gemm.hpp).
 #pragma once
 
 #include <cstddef>
@@ -37,6 +38,12 @@ public:
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0);
+
+    /// Loads the products' library ahead of the first prompt (oneMath's backend), on a thread of its own: call once at
+    /// startup.
+    static void prepare();
+    /// The path the products take, for the startup report: "oneMath", or the own kernels' (kernels::gemm_path).
+    static const char* path();
 
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems);
