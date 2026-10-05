@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 namespace strata::kernels {
@@ -258,42 +259,71 @@ bool doorbell_visible(void* stream) {
 void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
                    const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
                    uint32_t ring, void* stream) {
-    // one work-item: at most kVerifyMaxT * 10 entries, the host's exact loop
-    const auto e = Q(stream).single_task([=] {
-        for (int i = 0; i < n; ++i) {
-            const int32_t ex = ids[i];
-            if (ex < 0 || ex >= n_expert || res[ex] < 0) { *skip = 0; return; }
-        }
-        int32_t* counts = pl;
-        int32_t* start = pl + 4;
-        int32_t* dst = start + capx + 1;
-        int32_t* tok = dst + capx;
-        const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-        unsigned long long* ptr = (unsigned long long*) (pl + ptr_off);
-        int32_t* start2 = pl + ptr_off + 4 * capx;
-        int groups = 0, entries = 0;
-        for (int i0 = 0; i0 < n; ++i0) {
-            bool first = true;
-            for (int j = 0; j < i0; ++j) if (ids[j] == ids[i0]) { first = false; break; }
-            if (!first) continue;
-            const int32_t slot = res[ids[i0]];
-            ptr[groups] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
-            start[groups] = entries;
-            for (int i = i0; i < n; ++i)
-                if (ids[i] == ids[i0]) {   // an entry belongs to i0's group when its expert id is i0's
-                    dst[entries] = i;
-                    tok[entries] = i / k;
-                    ++entries;
+    // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
+    // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
+    // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
+    // starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
+    constexpr int WG = 128;
+    if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
+    const auto e = Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_lead(sycl::range<1>(WG), h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const auto grp = it.get_group();
+            const int t = (int) it.get_local_id(0);
+            bool bad = false;
+            if (t < n) {
+                const int32_t ex = ids[t];
+                s_ids[t] = ex;
+                bad = ex < 0 || ex >= n_expert || res[ex] < 0;
+            }
+            if (sycl::any_of_group(grp, bad)) {
+                if (t == 0) *skip = 0;
+                return;
+            }
+            if (t < n) {
+                int L = t;
+                for (int j = 0; j < t; ++j)
+                    if (s_ids[j] == s_ids[t]) { L = j; break; }
+                s_lead[t] = L;
+            }
+            sycl::group_barrier(grp);
+            int32_t* counts = pl;
+            int32_t* start = pl + 4;
+            int32_t* dst = start + capx + 1;
+            int32_t* tok = dst + capx;
+            const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+            unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
+            int32_t* start2 = pl + ptr_off + 4 * capx;
+            if (t < n) {
+                const int L = s_lead[t];
+                int g = 0, gstart = 0, pos = 0;
+                for (int j = 0; j < n; ++j) {
+                    const int Lj = s_lead[j];
+                    if (j < L && Lj == j) ++g;
+                    if (Lj < L) ++gstart;
+                    if (j < t && Lj == L) ++pos;
                 }
-            ++groups;
-        }
-        start[groups] = entries;
-        start2[0] = entries;
-        counts[0] = groups;
-        counts[1] = entries;
-        counts[2] = 0;
-        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-        *skip = ring;
+                dst[gstart + pos] = t;
+                tok[gstart + pos] = t / k;
+                if (L == t) {
+                    const int32_t slot = res[s_ids[t]];
+                    ptr[g] = (unsigned long long) (cache_base + (slot_off ? (size_t) slot_off[slot] : (size_t) slot * (size_t) blob));
+                    start[g] = gstart;
+                }
+            }
+            sycl::group_barrier(grp);
+            if (t != 0) return;
+            int groups = 0;
+            for (int i = 0; i < n; ++i) groups += s_lead[i] == i;
+            start[groups] = n;
+            start2[0] = n;
+            counts[0] = groups;
+            counts[1] = n;
+            counts[2] = 0;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+            *skip = ring;
+        });
     });
     done(stream, e, "resident_plan");
 }
