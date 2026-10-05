@@ -275,7 +275,7 @@ in a container with only this column and `python3-venv`, setup ran from start to
 | For | Free | Nonfree (`--nonfree on`) |
 | --- | --- | --- |
 | Building the engine | `dpclang-6` 6.2.0, `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3 |
-| XMX on the B70 (`--intel-llvm-build`) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev` | (not needed: icpx gives XMX) |
+| XMX on the B70 (`--intel-llvm-build`) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx gives XMX) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
 | The GPU image encoder (see [Images](#images)) | Vulkan: `libvulkan-dev` 1.4.341, `glslc` 2026.1, `spirv-headers` 1.6.1, `mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
@@ -296,7 +296,7 @@ intel/llvm v7.1.1 built in 14 minutes, the B70 got XMX, and the model it started
 | For | Packages (versions checked) |
 | --- | --- |
 | Python | `python3` 3.14.7 (setup.sh can also install it through `dnf`) |
-| Building intel/llvm | `git`, `cmake` 4.3.0, `ninja-build`, `gcc-c++` 16.2.1, `hwloc-devel` |
+| Building intel/llvm | `git`, `cmake` 4.3.0, `ninja-build`, `gcc-c++` 16.2.1, `hwloc-devel`, `libzstd-devel` |
 | Building the engine | `oneapi-level-zero-devel` 1.33.1 |
 | Running it | `oneapi-level-zero` 1.33.1, `intel-level-zero` 26.35.39758.11 (the Level Zero driver for Intel GPUs) |
 

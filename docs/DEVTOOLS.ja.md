@@ -56,10 +56,10 @@ free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルし
 setup は `--intel-llvm-build` でこれを動かします。
 済んだビルドをどう使い回すかは [XE.ja.md](XE.ja.md#sycl-のコンパイラ) にあります。
 intel/llvm は自由ソフトウェア（Apache-2.0 with LLVM exceptions）で、自由ソフトウェアだけでビルドできます。
-要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ hwloc-devel python3`）。
+要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel python3`）。
 
 ```sh
-sudo apt install git cmake ninja-build g++ python3 libhwloc-dev
+sudo apt install git cmake ninja-build g++ python3 libhwloc-dev libzstd-dev
 python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update
 ```
 

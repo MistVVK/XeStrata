@@ -91,6 +91,10 @@ def missing_prerequisites() -> list:
             need.append(pkg)
     if not Path("/usr/include/hwloc.h").exists():
         need.append("libhwloc-dev")
+    # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without
+    # the headers the configuration leaves zstd out silently
+    if not Path("/usr/include/zstd.h").exists():
+        need.append("libzstd-dev")
     return need
 
 
@@ -184,9 +188,11 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
     # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed)
     cache = BUILD / "CMakeCache.txt"
     if not (BUILD / "build.ninja").exists() or not cache.exists() or \
-            "SYCL_UR_FORCE_FETCH_LEVEL_ZERO:BOOL=ON" not in cache.read_text(errors="replace"):
+            "SYCL_UR_FORCE_FETCH_LEVEL_ZERO:BOOL=ON" not in cache.read_text(errors="replace") or \
+            "LLVM_ENABLE_ZSTD:STRING=FORCE_ON" not in cache.read_text(errors="replace"):
         run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release",
-             f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON"]
+             f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
+             "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON"]
             + (contrib_options() if contrib else []))
     jobs = max(2, min(os.cpu_count() or 4, int(ram_gb() // 3)))
     started = time.time()
@@ -194,7 +200,7 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     gpus = probe(INSTALL)
     backends = sorted(p.name.split("_adapter_")[1].split(".")[0] for p in (INSTALL / "lib").glob("libur_adapter_*.so"))
-    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [f[0] for f in SOURCE_FIXES],
+    RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [f[0] for f in SOURCE_FIXES], "zstd": True,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60), "backends": backends,
                                   "gpus": gpus}, indent=1))
@@ -232,6 +238,8 @@ def main() -> None:
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
             missing = [f[0] for f in SOURCE_FIXES if f[0] not in have.get("fixes", [])]
+            if not have.get("zstd"):
+                missing.append("zstd")
             if not missing:
                 say(f"intel/llvm {a.tag} is already built in {INSTALL}")
             elif ask(f"intel/llvm {a.tag} is built without the fixes {', '.join(missing)}; build it again with them? "

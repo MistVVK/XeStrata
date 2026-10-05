@@ -282,7 +282,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 | 用途 | free | nonfree（`--nonfree on`） |
 | --- | --- | --- |
 | エンジンのビルド | `dpclang-6` 6.2.0、`libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3 |
-| B70 で XMX を使うとき（`--intel-llvm-build`） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev` | （icpx が XMX を使うので不要） |
+| B70 で XMX を使うとき（`--intel-llvm-build`） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx が XMX を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |
 | GPU の画像エンコーダー（[画像](#画像)） | Vulkan: `libvulkan-dev` 1.4.341、`glslc` 2026.1、`spirv-headers` 1.6.1、`mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
@@ -303,7 +303,7 @@ intel/llvm v7.1.1 のビルドに 14 分かかり、B70 に XMX が使えて、�
 | 用途 | パッケージ（確かめた版） |
 | --- | --- |
 | Python | `python3` 3.14.7（setup.sh が `dnf` で入れることもできます） |
-| intel/llvm のビルド | `git`、`cmake` 4.3.0、`ninja-build`、`gcc-c++` 16.2.1、`hwloc-devel` |
+| intel/llvm のビルド | `git`、`cmake` 4.3.0、`ninja-build`、`gcc-c++` 16.2.1、`hwloc-devel`、`libzstd-devel` |
 | エンジンのビルド | `oneapi-level-zero-devel` 1.33.1 |
 | エンジンの実行 | `oneapi-level-zero` 1.33.1、`intel-level-zero` 26.35.39758.11（Intel の GPU の Level Zero のドライバー） |
 
