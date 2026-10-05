@@ -19,6 +19,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,6 +139,81 @@ def images_of(messages: list[dict]) -> list[str]:
             for item in m["content"] if item.get("type") == "image"]
 
 
+# #537: a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
+# tokenizer matches those two strings as their special tokens everywhere (GGUF token type 4, as llama.cpp does), so
+# a user quoting "</think>" used to hand the model a real end-of-reasoning token.  Before the template is rendered
+# they are swapped for these private-use characters, and the server encodes the spans they mark as ordinary text.
+THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
+THINK_MARKS = {v: k for k, v in THINK_TAGS.items()}
+
+
+def _mark(text: str) -> str:
+    for tag, mark in THINK_TAGS.items():
+        text = text.replace(tag, mark)
+    return text
+
+
+def _mark_deep(v):
+    if isinstance(v, str):
+        return _mark(v)
+    if isinstance(v, dict):
+        return {k: _mark_deep(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_mark_deep(x) for x in v]
+    return v
+
+
+def _has_tag(v) -> bool:
+    if isinstance(v, str):
+        return "<think>" in v or "</think>" in v
+    if isinstance(v, dict):
+        return any(_has_tag(x) for x in v.values())
+    if isinstance(v, list):
+        return any(_has_tag(x) for x in v)
+    return False
+
+
+def mark_think_literals(messages: list[dict], tools: list[dict] | None):
+    """#537: (messages, tools) with every literal <think> / </think> in their text swapped for THINK_TAGS' marks, and
+    whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
+    An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
+    inline) keeps that one block as the model's markers, as before."""
+    if not _has_tag(messages) and not _has_tag(tools):
+        return messages, tools, False
+    out = []
+    for m in messages:
+        m = dict(m)
+        content = m.get("content")
+        for k, v in m.items():
+            if k != "role":
+                m[k] = _mark_deep(v)
+        if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
+                and "</think>" in content:
+            i, j = content.index("<think>") + len("<think>"), content.index("</think>")
+            m["content"] = content[:i] + _mark(content[i:j]) + "</think>" + _mark(content[j + len("</think>"):])
+        out.append(m)
+    return out, _mark_deep(tools), True
+
+
+_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
+
+
+def unmark_think_literals(prompt: str) -> tuple[str, list[tuple[int, int]]]:
+    """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
+    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
+    out, spans, pos, n = [], [], 0, 0
+    for m in _THINK_MARK_RE.finditer(prompt):
+        out.append(prompt[pos:m.start()])
+        n += m.start() - pos
+        tag = THINK_MARKS[m.group(0)]
+        out.append(tag)
+        spans.append((n, n + len(tag)))
+        n += len(tag)
+        pos = m.end()
+    out.append(prompt[pos:])
+    return "".join(out), spans
+
+
 def _late_system_to_user(messages: list[dict]) -> list[dict]:
     """The chat template takes a system message only at the start ("System message must be at the beginning").
     Clients also send them mid-conversation - Claude Code's hook context as {"role": "system"} after the first user
@@ -163,6 +239,27 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
+def _tool_list(value, wrapper: str | None) -> list[dict]:
+    """#592: a request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
+    {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
+    in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not (a string such as "auto", a list of
+    names, an object without a name) is a ValueError - a 400 naming the field - where it used to take the request
+    thread down with no reply at all.  No value (or an empty one) is no tools, as always."""
+    if not value:
+        return []
+    shape = ('{"type": "function", "function": {"name": ..., "parameters": {...}}}' if wrapper else
+             '{"name": ..., "input_schema": {...}}')
+    try:
+        tools = _object_list(value, "tools")
+    except ValueError:
+        raise ValueError(f"tools must be a list of tool objects, each {shape}") from None
+    for i, t in enumerate(tools):
+        fn = t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+            raise ValueError(f"tools[{i}] has no name: each tool must be {shape}")
+    return tools
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -185,8 +282,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 calls.append({"function": {"name": fn.get("name"), "arguments": args or {}}})
             out["tool_calls"] = calls
         messages.append(out)
-    tools = [t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
-             for t in req.get("tools") or []] or None
+    tools = [t.get("function", t) if t.get("type") == "function" else t
+             for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
@@ -236,7 +333,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 out["tool_calls"] = calls
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
-             for t in req.get("tools") or []] or None
+             for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}

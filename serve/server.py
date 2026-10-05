@@ -54,7 +54,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, openai_to_messages)
+                            images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 
@@ -1009,11 +1009,14 @@ class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
 
-    def encode(self, text, parse_special=False):
+    ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
+
+    def encode(self, text, parse_special=False, plain=()):
         out, i = [], 0
         while i < len(text):
             for k, s in enumerate(self.SPECIALS):
-                if parse_special and text.startswith(s, i):
+                if (parse_special or s in self.ALWAYS) and text.startswith(s, i) and not any(
+                        a <= i < b for a, b in plain):
                     out.append(256 + k)
                     i += len(s)
                     break
@@ -1446,11 +1449,20 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def encode_prompt(self, messages, tools, kwargs) -> list[int]:
+        """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
+        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are)."""
+        marked, marked_tools, changed = mark_think_literals(messages, tools)
+        prompt = self.template.render(marked, tools=marked_tools, **kwargs)
+        if not changed:
+            return self.tok.encode(prompt, parse_special=True)
+        prompt, plain = unmark_think_literals(prompt)
+        return self.tok.encode(prompt, parse_special=True, plain=plain)
+
     def prepare(self, messages, tools, kwargs, max_new=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context."""
-        prompt = self.template.render(messages, tools=tools, **kwargs)
-        ids = self.tok.encode(prompt, parse_special=True)
+        ids = self.encode_prompt(messages, tools, kwargs)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -2362,6 +2374,8 @@ def make_handler(svc: Service):
             if path == "/settings":
                 self._settings()
                 return
+            if path in ("/unload", "/load") and not self._control_body():
+                return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
                 return
@@ -2472,6 +2486,28 @@ def make_handler(svc: Service):
                 props["build_info"] = "Strata " + str(version)
             self._json(200, props)
 
+        def _control_body(self) -> bool:
+            """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json(400, {"error": {"message": "invalid Content-Length"}})
+                return False
+            if not 0 <= length <= 65536:
+                self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
+                return False
+            timeout = self.connection.gettimeout()
+            try:
+                self.connection.settimeout(2.0)
+                complete = len(self.rfile.read(length)) == length
+            except OSError:
+                complete = False
+            finally:
+                self.connection.settimeout(timeout)
+            if not complete:
+                self._json(400, {"error": {"message": "incomplete control request body"}})
+            return complete
+
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
             server never grants) and no foreign Origin: a web page elsewhere must not change settings or run tools."""
@@ -2556,7 +2592,7 @@ def make_handler(svc: Service):
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
-            own = {t.get("name") for t in tools or []}
+            own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
             if use_mcp:
                 if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
                     return
@@ -2609,8 +2645,7 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            prompt = svc.template.render(messages, tools=tools, **kw)
-            self._json(200, {"input_tokens": len(svc.tok.encode(prompt, parse_special=True))})
+            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
