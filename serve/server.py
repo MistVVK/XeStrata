@@ -57,6 +57,8 @@ from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_mess
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve import responses as responses_api  # noqa: E402
+from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -1434,7 +1436,7 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": 1, "requested": 1},       # one request at a time; more wait their turn
-            "dialects": ["/v1/chat/completions", "/v1/messages"],
+            "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images or vision_error is not None, "available": images, "error": vision_error,
                        "encoder": getattr(self.vision, "label", None) if self.vision is not None else None,
                        "fallback": self.vision_fallback},
@@ -1570,6 +1572,7 @@ class Service:
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
@@ -1619,6 +1622,7 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
+                                thinking_n += parser.state == "reasoning"
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
@@ -1671,6 +1675,7 @@ class Service:
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
+                            thinking_n += parser.state == "reasoning"
                             evs = parser.feed(detok.push(t))
                             self._note(n, evs)
                             for ev in evs:
@@ -1752,7 +1757,7 @@ class Service:
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings}
+                       "timings": timings, "reasoning_tokens": thinking_n}
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -2398,6 +2403,10 @@ def make_handler(svc: Service):
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
+                    self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
+                                                         "whole conversation to POST /v1/responses", code="not_found"))
+                    return
                 if path in ("/v1/load", "/v1/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
@@ -2422,9 +2431,11 @@ def make_handler(svc: Service):
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
-                if path == "/v1/chat/completions":
+                if path == "/v1/responses":
+                    self._responses(req)
+                elif path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
@@ -2433,7 +2444,10 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
-                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                if path == "/v1/responses":
+                    self._json(400, responses_error_body(str(e)))
+                else:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:
                 self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:
@@ -2564,6 +2578,11 @@ def make_handler(svc: Service):
                             delta = item["choices"][0]["delta"]
                             content, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                             usage, timings = item.get("usage"), item.get("timings")
+                        elif api == "responses":
+                            kind = item["type"]
+                            content = item["delta"] if kind == "response.output_text.delta" else ""
+                            reasoning = item["delta"] if kind == "response.reasoning_text.delta" else ""
+                            usage, timings = (item.get("response") or {}).get("usage"), None
                         else:
                             _, event = item
                             delta = event.get("delta", {})
@@ -2639,6 +2658,127 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+
+        def _responses(self, req):
+            """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
+            Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            try:
+                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
+            except ModelBusy as e:
+                return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
+            except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+            cancel = threading.Event()
+            self._watch_client(cancel)                       # #430 #431
+
+            def check(text, finish):
+                return validated_json(text, validator, finish)
+
+            def events():
+                yield from asm.start()
+                done = None
+                for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+                    if kind == "ping":
+                        yield None
+                    elif kind == "event":
+                        yield from asm.feed(x)
+                    elif kind == "done":
+                        done = x
+                if done is not None and done["finish"] != "cancel" and not cancel.is_set():
+                    yield from asm.finish(done, check)
+            items = self._capture(events(), "responses")
+            if not req.get("stream"):
+                try:
+                    result = responses_api.collect(items)
+                except StructuredOutputError as e:
+                    return self._json(502, responses_error_body(str(e), "server_error",
+                                                                code="structured_output_failed"))
+                except EngineDied as e:
+                    return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                                                                code="server_error"))
+                except ValueError as e:                      # the engine's ERR line
+                    return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                return self._json(200, result)
+            self._sse()
+            last = time.monotonic()
+
+            def send(e):
+                self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
+                                 json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+
+            try:
+                for e in items:
+                    if e is None:
+                        # Codex's idle timeout (5 minutes by default) counts events, not SSE comments: while a long
+                        # prompt is read, a response.in_progress every 15 s tells it the server is still working
+                        if time.monotonic() - last >= 15:
+                            send(asm.in_progress())
+                            last = time.monotonic()
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        send(e)
+                        last = time.monotonic()
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()                                 # client went away: stop the engine
+                items.close()
+            except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
+                self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except StructuredOutputError as e:
+                self._responses_failed(asm, str(e), "structured_output_failed", send)
+            except ValueError as e:                          # the engine's ERR after the stream started
+                self._responses_failed(asm, str(e), "server_error", send)
+
+        def _responses_failed(self, asm, message, code, send):
+            e = asm.failed(message, code)
+            self._note(error=e["response"]["error"])
+            try:
+                send(e)
+                self.wfile.flush()
+            except OSError:
+                pass
+
+        def _responses_prepare(self, req):
+            responses_api.check_request(req)
+            messages = responses_api.input_messages(req)
+            tools, names, skipped = responses_api.request_tools(req)
+            kw = responses_api.template_kwargs(req, svc.shared)
+            try:
+                messages, validator = prepare_format(responses_api.text_format(req), messages)
+            except ValueError as e:
+                raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
+            if validator is not None and tools:
+                raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
+                                     "unsupported_parameter")
+            noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
+            if set(skipped) - noted:
+                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                      f"(this server cannot run them)", flush=True)
+                noted.update(skipped)
+            if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
+                req = {**req, "max_output_tokens": svc.shared["max_tokens"]}
+            try:
+                svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
+            except ValueError as e:
+                raise ResponsesError(str(e), "reasoning_budget_tokens") from None
+            svc.load()
+            try:
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
+            except ResponsesError:
+                raise
+            except ValueError as e:                          # too long for the context, an image without vision
+                raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
+                    from None
+            _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
+            include = req.get("include") if isinstance(req.get("include"), list) else []
+            asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
+                                          "reasoning.encrypted_content" in include, validator is not None)
+            # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
+            return ids, thinking, tools, max_new, asm, validator, req
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would

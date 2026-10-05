@@ -370,6 +370,7 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | --- | --- |
 | OpenAI の Chat Completions（ストリーミングとそうでないもの、ツール） | `POST /v1/chat/completions` |
 | Anthropic の Messages（ストリーミングとそうでないもの、ツール） | `POST /v1/messages` |
+| OpenAI の Responses（ストリーミングとそうでないもの、ツール。状態を持たない、[下](#responses-api-と-codex-cli)） | `POST /v1/responses` |
 | モデルの一覧、状態 | `GET /v1/models`、`GET /models`、`GET /health` |
 | モデルの属性 | `GET /props`（`?model=<読み込んだモデルの id>` も受け付ける） |
 | モデルがいま何をしているか | `GET /status`、`GET /slots`（スロットは 1 つで、busy か idle） |
@@ -476,6 +477,7 @@ print(r.choices[0].message.content)
 - **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` を設定し、`ANTHROPIC_MODEL` には Claude Code が知っている Claude のモデル名を入れます。
   知らない名前は Claude Code が断ります。XeStrata は名前を無視します。
   `ANTHROPIC_AUTH_TOKEN` は何でも構いません（`api_key` を設定していればそれ）。
+- **Codex CLI**: [下の Responses API](#responses-api-と-codex-cli) を参照してください。
 - **文脈**: setup で選びます（8K〜262K）。
   それより長い要求は断り、黙って切り詰めることはしません。
   `max_tokens` が文脈を超える要求も断ります（400）。
@@ -655,6 +657,54 @@ server がネットワークから届くなら、この履歴は機密として�
 server の起動からの合計（`totals`）も示します。
 
 ---
+
+### Responses API と Codex CLI
+
+`POST /v1/responses` は、OpenAI の新しい Responses API を話します。Codex CLI はこれを使います（Chat Completions はもう話しません）。
+`/v1/chat/completions` と同じ経路で動くので、思考の深さ、思考の上限、会話のキャッシュ、API キー・Host・Origin の確認は同じです。
+
+**状態を持ちません**: 何も保存しないので、クライアントは毎回 `input` に会話全体を送ります（Codex は `store: false` でそうします）。
+`previous_response_id`、`conversation`、`background` と、取得・削除・取り消しのエンドポイントは、そう説明するエラーで断ります。
+
+| 要求 | XeStrata の扱い |
+| --- | --- |
+| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)` |
+| `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
+| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
+| `tool_choice` | `"none"` はツールを隠します。ほかはモデルが選びます（強制はできません） |
+| `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければモデルの既定（high） |
+| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります |
+| `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
+| `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
+
+モデルの思考は、`reasoning_text` を中身に持つ `reasoning` の出力項目で返ります（`response.reasoning_text.delta` で流れます）。
+このモデルは別の要約を書かないので、`summary` は空です。
+`"include": ["reasoning.encrypted_content"]` を付けると、項目に `encrypted_content` も付きます。不透明な文字列（base64 で、暗号化はしていません。クライアントは文字をすでに持っています）です。
+Codex と同じく、reasoning の項目も会話の残りと一緒に送り返してください。思考がプロンプトに戻るので、モデルが書いたものと一致し、会話のキャッシュが使い直されます。
+
+`"stream": true` では、公式のイベントを順に出します。`response.created`、`response.in_progress`、続いて出力の項目ごとに `response.output_item.added`、その差分（`response.reasoning_text.delta`、`response.output_text.delta`、`response.function_call_arguments.delta`）、その `...done` のイベントと `response.output_item.done`、最後に `response.completed`、`response.incomplete`、`response.failed` のどれかです。
+長いプロンプトを読む間は 15 秒ごとに `response.in_progress` を出します。Codex はこれを動いている印と数えます。
+答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `response.failed` で届きます。
+
+**Codex CLI**: `~/.codex/config.toml` に次を書きます。
+
+```toml
+model = "xestrata"                      # 名前は何でもよい。XeStrata は自分のモデルで答えます
+model_provider = "xestrata"
+model_context_window = 32768            # setup で選んだ文脈。Codex はそこに達する前に要約します
+show_raw_agent_reasoning = true         # モデルの思考を見せる（要約は書きません）
+# model_reasoning_effort = "medium"     # none、low、medium、high。既定はモデルのもの（high）
+
+[model_providers.xestrata]
+name = "XeStrata (local)"
+base_url = "http://127.0.0.1:8095/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 600000         # 最初の長いプロンプトは読むのに数分かかることがあります
+# env_key = "XESTRATA_API_KEY"          # server に api_key があるときだけ。それを持つ環境変数
+```
+
+あとは、いつもどおり `codex`（または `codex exec "..."`）を動かします。
+ローカルのモデルの名前には Codex が `Model metadata for ... not found` と警告しますが、想定どおりです。
 
 ## MCP サーバーのツールを使う
 

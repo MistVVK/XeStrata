@@ -362,6 +362,7 @@ The server listens on `http://127.0.0.1:8095` (change it with `--port` in setup,
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
+| OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
 | Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (a single slot, busy or idle) |
@@ -466,6 +467,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **Claude Code**: set `ANTHROPIC_BASE_URL=http://127.0.0.1:8095` and `ANTHROPIC_MODEL` to a Claude model name it knows.
   Claude Code refuses names it doesn't know; XeStrata ignores the name.
   Add any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
+- **Codex CLI**: see [the Responses API](#the-responses-api-and-codex-cli) below.
 - **Context.** Chosen in setup (8K–262K).
   Requests longer than that are refused, never silently cut.
   A request whose `max_tokens` would run past the context is refused too (400).
@@ -643,6 +645,62 @@ Treat the history as sensitive when the server is reachable from a network: set 
 and their sums since the server started in `totals`.
 
 ---
+
+### The Responses API and Codex CLI
+
+`POST /v1/responses` speaks OpenAI's newer Responses API, which Codex CLI uses (it no longer
+speaks Chat Completions). It runs on the same path as `/v1/chat/completions`, so the thinking levels, the thinking
+budget, the conversation cache and the same API key, Host and Origin checks apply.
+
+It is **stateless**: nothing is stored, so the client sends the whole conversation in `input` every time (Codex does,
+with `store: false`). `previous_response_id`, `conversation`, `background` and the retrieve/delete/cancel endpoints
+are refused with an error that says so.
+
+| Request | What XeStrata does |
+| --- | --- |
+| `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
+| `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
+| `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
+| `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
+| `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the model's default (high) |
+| `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`) |
+| `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
+| `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
+
+The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
+`response.reasoning_text.delta`). This model writes no separate summaries, so `summary` is empty. With
+`"include": ["reasoning.encrypted_content"]` the item also carries `encrypted_content`: an opaque string (base64, not
+encrypted; the client already holds the text). Send the reasoning items back with the rest of the conversation, as
+Codex does: their thinking goes back into the prompt, so it matches what the model wrote and the conversation cache
+is reused.
+
+With `"stream": true` the events are the official ones, in order: `response.created`, `response.in_progress`, then
+for each output item `response.output_item.added`, its deltas (`response.reasoning_text.delta`,
+`response.output_text.delta`, `response.function_call_arguments.delta`), its `...done` events and
+`response.output_item.done`, and at the end `response.completed`, `response.incomplete` or `response.failed`.
+While a long prompt is read, a `response.in_progress` event goes out every 15 s, which Codex counts as activity.
+Errors before the answer starts have the Responses form (`{"error": {"message", "type", "param", "code"}}`); after
+it started they arrive as `response.failed`.
+
+**Codex CLI.** In `~/.codex/config.toml`:
+
+```toml
+model = "xestrata"                      # any name; XeStrata answers with its model
+model_provider = "xestrata"
+model_context_window = 32768            # the context you chose in setup: Codex compacts before it gets there
+show_raw_agent_reasoning = true         # show the model's thinking (it writes no summaries)
+# model_reasoning_effort = "medium"     # none, low, medium or high; default: the model's (high)
+
+[model_providers.xestrata]
+name = "XeStrata (local)"
+base_url = "http://127.0.0.1:8095/v1"
+wire_api = "responses"
+stream_idle_timeout_ms = 600000         # a first, long prompt can take minutes to read
+# env_key = "XESTRATA_API_KEY"          # only if the server has an api_key: the variable holding it
+```
+
+Then run `codex` (or `codex exec "..."`) as usual. Codex warns `Model metadata for ... not found` for a local model
+name; that is expected.
 
 ## Tools from MCP servers
 
