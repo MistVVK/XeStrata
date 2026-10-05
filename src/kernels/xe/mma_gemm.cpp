@@ -107,6 +107,10 @@ inline void stage(const E* A, int64_t row0, int64_t n, int64_t K, int64_t k0, co
             }
             continue;
         }
+        if constexpr (TT == 0 && !PACKED && LD * sizeof(E) % 16 == 0) {   // row by row, 16 bytes at a time
+            *local_as<V>(dst.template get_multi_ptr<sycl::access::decorated::no>() + off + r * LD + c) = val;
+            continue;
+        }
         for (int j = 0; j < VEC; ++j) {
             const int k = c + j;
             if constexpr (TT > 0 && PACKED)   // B in fragments: [k / 16][r / TT][k % 16 / 2][r % TT][k & 1]
@@ -134,9 +138,11 @@ struct Kernel {
     static constexpr int NSGM = L.wgm, NSGN = L.wgn, NSG = NSGM * NSGN;
     static constexpr int SGM = L.sgm, SGN = L.sgn;   // tiles a sub-group
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
-    static constexpr int LDA = KC, LDB = PACKED ? KC : KC + PAD;   // A's row stride; B's (column-major) row stride
+    static constexpr int LDA = PACKED ? KC : KC + PAD, LDB = PACKED ? KC : KC + PAD;   // A's and B's row strides
     static constexpr int ASZ = WM * LDA, BSZ = WN * LDB;           // a buffer's elements
-    static constexpr size_t LOCAL = (2 * ASZ + 2 * BSZ) * sizeof(uint16_t) + (size_t) NSG * TM * TN * sizeof(float);
+    // NVIDIA's shape reads ahead into registers (PREFETCH below) and needs one buffer of each; Intel's packed shapes two
+    static constexpr int NBUF = PACKED ? 2 : 1;
+    static constexpr size_t LOCAL = (NBUF * ASZ + NBUF * BSZ) * sizeof(uint16_t) + (size_t) NSG * TM * TN * sizeof(float);
     const E* X;
     const E* W;
     int64_t w_stride;
@@ -148,6 +154,33 @@ struct Kernel {
     sycl::local_accessor<E, 1> as;       // two buffers of the step's rows of X: WM x KC
     sycl::local_accessor<E, 1> bs;       // two buffers of the step's rows of W, as B: WN x KC
     sycl::local_accessor<float, 1> cs;   // a TM x TN tile of Y a sub-group, on its way out
+
+    // NVIDIA's shape (B column-major): the next step's rows are read into registers before this step's products and
+    // stored to local memory after them.  stage() stores what it has just read, so each step waited on its loads
+    // before multiplying (RTX 4070: long-scoreboard stalls, 33% occupancy by local memory).  Intel's packed shapes keep
+    // stage(): on the A380 the registers spilled (see the file's note).
+    static constexpr bool PREFETCH = !PACKED;
+    static constexpr int LANES = NSG * SG, NVA = (WM * (KC / VEC) + LANES - 1) / LANES,
+                         NVB = (WN * (KC / VEC) + LANES - 1) / LANES;
+    using V8 = sycl::vec<uint16_t, VEC>;
+    template<int R, int NV>
+    static void fetch(const E* A, int64_t row0, int64_t n, int64_t K, int64_t k0, int lid, V8 (&v)[NV]) {
+#pragma unroll
+        for (int i = 0; i < NV; ++i) {
+            const int q = lid + i * LANES, r = q / (KC / VEC), c = q % (KC / VEC) * VEC;
+            const int64_t row = row0 + r;
+            v[i] = q < R * (KC / VEC) && row < n ? *reinterpret_cast<const V8*>(A + row * K + k0 + c) : V8(0);
+        }
+    }
+    template<int R, int LD, int NV>
+    static void put(const sycl::local_accessor<E, 1>& dst, int off, int lid, const V8 (&v)[NV]) {
+        const auto base = dst.template get_multi_ptr<sycl::access::decorated::no>() + off;
+#pragma unroll
+        for (int i = 0; i < NV; ++i) {
+            const int q = lid + i * LANES, r = q / (KC / VEC), c = q % (KC / VEC) * VEC;
+            if (q < R * (KC / VEC)) *local_as<V8>(base + r * LD + c) = v[i];
+        }
+    }
 
     void operator()(sycl::nd_item<1> it) const {
         if constexpr (!built<S>()) {
@@ -177,8 +210,15 @@ struct Kernel {
             stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
             sycl::group_barrier(it.get_group());
             int buf = 0;
+            V8 va[PREFETCH ? NVA : 1], vb[PREFETCH ? NVB : 1];
             for (int64_t k0 = kb; k0 < ke; k0 += KC) {
-                if (k0 + KC < ke) {
+                const bool more = k0 + KC < ke;
+                if constexpr (PREFETCH) {
+                    if (more) {
+                        fetch<WM, NVA>(x, wm0, rows, K, k0 + KC, lid, va);
+                        fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
+                    }
+                } else if (more) {
                     const int nb = buf ^ 1;
                     stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, k0 + KC, as, nb * ASZ, lid, NSG * SG);
                     stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, k0 + KC, bs, nb * BSZ, lid, NSG * SG);
@@ -207,8 +247,15 @@ struct Kernel {
                     for (int i = 0; i < SGM; ++i)
                         for (int j = 0; j < SGN; ++j) mx::joint_matrix_mad(sg, c[i][j], a[i], b[j], c[i][j]);
                 }
+                if constexpr (PREFETCH) {
+                    if (more) {   // into the one buffer, once every sub-group's products have read it
+                        sycl::group_barrier(it.get_group());
+                        put<WM, LDA, NVA>(as, 0, lid, va);
+                        put<WN, LDB, NVB>(bs, 0, lid, vb);
+                    }
+                }
                 sycl::group_barrier(it.get_group());
-                buf ^= 1;
+                buf = (buf + 1) % NBUF;
             }
             const auto cp = cs.template get_multi_ptr<sycl::access::decorated::no>() + (std::ptrdiff_t) sgid * TM * TN;
             for (int i = 0; i < SGM; ++i)
@@ -247,7 +294,7 @@ sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, flo
     using KT = Kernel<S, E, ACC, GROUPED>;
     const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
     return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<E, 1> as(sycl::range<1>(2 * KT::ASZ), h), bs(sycl::range<1>(2 * KT::BSZ), h);
+        sycl::local_accessor<E, 1> as(sycl::range<1>(KT::NBUF * KT::ASZ), h), bs(sycl::range<1>(KT::NBUF * KT::BSZ), h);
         sycl::local_accessor<float, 1> cs(sycl::range<1>(KT::NSG * KT::TM * KT::TN), h);
         const size_t wg = (size_t) KT::NSG * KT::SG;
         h.parallel_for(sycl::nd_range<1>((size_t) (G * tiles_m * tiles_n) * wg, wg),
