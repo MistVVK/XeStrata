@@ -40,6 +40,58 @@ inline float warp_max(const sycl::sub_group& sg, float v) {
 }
 inline float h2f(uint16_t bits) { return (float) sycl::bit_cast<sycl::half>(bits); }
 
+// The 12 heads' lane sums (`part[12..15]` zero), reduce-scattered with warp_sum's pairing order (xor 16, 8, 4, 2, 1):
+// every output adds the same two operands at every level, so each sum is bit for bit warp_sum's (float add commutes),
+// for 16 shuffles instead of 12 x 5 (upstream fd95405).  Lane l ends holding head head_of_lane(l); lanes l and l^1
+// agree.
+inline float reduce12(const sycl::sub_group& sg, const float (&part)[16], int lane) {
+    float r8[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const bool hi = (lane & 16) != 0;
+        r8[i] = (hi ? part[i + 8] : part[i]) + sycl::permute_group_by_xor(sg, hi ? part[i] : part[i + 8], 16);
+    }
+    float r4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const bool hi = (lane & 8) != 0;
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + sycl::permute_group_by_xor(sg, hi ? r8[i] : r8[i + 4], 8);
+    }
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const bool hi = (lane & 4) != 0;
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + sycl::permute_group_by_xor(sg, hi ? r4[i] : r4[i + 2], 4);
+    }
+    const bool hi2 = (lane & 2) != 0;
+    const float r1 = (hi2 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi2 ? r2[0] : r2[1], 2);
+    return r1 + sycl::permute_group_by_xor(sg, r1, 1);
+}
+inline int head_of_lane(int lane) {
+    return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
+}
+
+// One V element of pool row `row`, dimension `d` (the value loop's own work-item), per KV format.
+template <int KV_MODE>
+inline float load_v1(const QsaAttnPools& p, long long row, int d) {
+    if constexpr (KV_MODE == 0) {
+        return h2f(p.v_pool[row * HD + d]);
+    } else if constexpr (KV_MODE == 1) {
+        const float sc = h2f(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]);
+        return (float) p.v_q[row * HD + d] * sc;
+    } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+        constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+        const int b = d / QK4_0;
+        const int rem = d % QK4_0;
+        const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+        const float dd = h2f(blk->d);
+        const int j = rem < 16 ? rem : (rem - 16);
+        const uint8_t byte = blk->qs[j];
+        const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+        return (float) nibble * dd;
+    }
+}
+
 // 8 consecutive values of one cell's key or value row, dimensions [d0, d0+8).  KV_MODE 0: FP16, 1: INT8, 2: rotated
 // Q4_0, 3: the hybrid K8V4 (K as INT8, V as rotated Q4_0; upstream 2aa8f72).
 template <int KV_MODE>
@@ -77,7 +129,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                          long long scratch_stride) {
     return queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sq(sycl::range<1>(G * HD), hd);          // this KV head's query heads
-        sycl::local_accessor<float, 1> sp(sycl::range<1>(G * CHUNK), hd);       // scores, then probabilities
+        sycl::local_accessor<float, 1> sp(sycl::range<1>((size_t) G * CHUNK), hd);       // scores
+        sycl::local_accessor<sycl::float4, 1> spt(sycl::range<1>(CHUNK * G / 4), hd);   // probabilities, cell-major
         sycl::local_accessor<long long, 1> srow(sycl::range<1>(CHUNK), hd);     // pool row of each cell
         hd.parallel_for(sycl::nd_range<3>({n_q, (size_t) n_kv_heads, (size_t) n_chunks * THREADS}, {1, 1, THREADS}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -115,20 +168,55 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 srow[t] = r;
             }
             sycl::group_barrier(grp);
-            // scores: each sub-group takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
-            for (int c = warp; c < CHUNK; c += WARPS) {
-                if (c >= n_here || srow[c] < 0) {
-                    if (lane < G) sp[lane * CHUNK + c] = -FLT_MAX;
-                    continue;
+            // scores: each sub-group takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.  NC cells
+            // per step (warp + 8 * (i + j)): a lane's q slice comes out of local memory once for all of them (upstream
+            // fd95405); every dot product is the same expression as for a single cell, so the scores are unchanged.
+            constexpr int NC = 2;
+            const int hd_lane = head_of_lane(lane);
+            for (int i = 0; i < CHUNK / WARPS; i += NC) {
+                int cc[NC];
+                bool all_ok = true;
+                for (int j = 0; j < NC; ++j) {
+                    cc[j] = warp + WARPS * (i + j);
+                    all_ok = all_ok && cc[j] < n_here && srow[cc[j]] >= 0;
                 }
-                float k8[8];
-                load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
-                for (int h = 0; h < G; ++h) {
-                    const float* qa = &sq[h * HD + lane * 8];
-                    float s = k8[0] * qa[0] + k8[1] * qa[1] + k8[2] * qa[2] + k8[3] * qa[3] +
-                              k8[4] * qa[4] + k8[5] * qa[5] + k8[6] * qa[6] + k8[7] * qa[7];
-                    s = warp_sum(sg, s);
-                    if (lane == 0) sp[h * CHUNK + c] = s * scale;
+                if (all_ok) {
+                    float kk[NC][8];
+                    for (int j = 0; j < NC; ++j) load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j]);
+                    float pp[NC][16];
+#pragma unroll
+                    for (int h = 0; h < G; ++h) {
+                        const float* qa = &sq[h * HD + lane * 8];
+#pragma unroll
+                        for (int j = 0; j < NC; ++j)
+                            pp[j][h] = kk[j][0] * qa[0] + kk[j][1] * qa[1] + kk[j][2] * qa[2] + kk[j][3] * qa[3] +
+                                       kk[j][4] * qa[4] + kk[j][5] * qa[5] + kk[j][6] * qa[6] + kk[j][7] * qa[7];
+                    }
+#pragma unroll
+                    for (int j = 0; j < NC; ++j) {
+                        for (int h = G; h < 16; ++h) pp[j][h] = 0.0f;
+                        const float sj = reduce12(sg, pp[j], lane);
+                        if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + cc[j]] = sj * scale;
+                    }
+                } else {
+                    for (int j = 0; j < NC; ++j) {   // a masked or out-of-range cell in the step: one cell at a time
+                        const int c = cc[j];
+                        if (c >= n_here || srow[c] < 0) {
+                            if (lane < G) sp[lane * CHUNK + c] = -FLT_MAX;
+                            continue;
+                        }
+                        float k8[8];
+                        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+                        float part[16];
+                        for (int h = 0; h < G; ++h) {
+                            const float* qa = &sq[h * HD + lane * 8];
+                            part[h] = k8[0] * qa[0] + k8[1] * qa[1] + k8[2] * qa[2] + k8[3] * qa[3] +
+                                      k8[4] * qa[4] + k8[5] * qa[5] + k8[6] * qa[6] + k8[7] * qa[7];
+                        }
+                        for (int h = G; h < 16; ++h) part[h] = 0.0f;
+                        const float sc = reduce12(sg, part, lane);
+                        if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + c] = sc * scale;
+                    }
                 }
             }
             sycl::group_barrier(grp);
@@ -138,8 +226,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 const float m = warp_max(sg, sycl::fmax(a, b));
                 const float ea = (lane < n_here && srow[lane] >= 0) ? sycl::exp(a - m) : 0.0f;
                 const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? sycl::exp(b - m) : 0.0f;
-                sp[h * CHUNK + lane] = ea;
-                sp[h * CHUNK + lane + 32] = eb;
+                float* pt = reinterpret_cast<float*>(&spt[0]);
+                pt[lane * G + h] = ea;
+                pt[(lane + 32) * G + h] = eb;
                 const float l = warp_sum(sg, ea + eb);
                 if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
             }
@@ -147,26 +236,33 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             // values: work-item t owns dimension t for all 12 heads.
             float acc[G];
             for (int h = 0; h < G; ++h) acc[h] = 0.0f;
-            for (int c = 0; c < n_here; ++c) {
+            // one cell's 12 weights (three float4 loads from local memory) into the 12 accumulators; the cells are
+            // folded in ascending order, so the sums are the plain loop's, bit for bit (upstream fd95405)
+            const auto fold = [&](int c, float v) {
+                const sycl::float4 w0 = spt[(size_t) c * 3], w1 = spt[(size_t) c * 3 + 1], w2 = spt[(size_t) c * 3 + 2];
+                acc[0] = sycl::fma(w0.x(), v, acc[0]);  acc[1] = sycl::fma(w0.y(), v, acc[1]);
+                acc[2] = sycl::fma(w0.z(), v, acc[2]);  acc[3] = sycl::fma(w0.w(), v, acc[3]);
+                acc[4] = sycl::fma(w1.x(), v, acc[4]);  acc[5] = sycl::fma(w1.y(), v, acc[5]);
+                acc[6] = sycl::fma(w1.z(), v, acc[6]);  acc[7] = sycl::fma(w1.w(), v, acc[7]);
+                acc[8] = sycl::fma(w2.x(), v, acc[8]);  acc[9] = sycl::fma(w2.y(), v, acc[9]);
+                acc[10] = sycl::fma(w2.z(), v, acc[10]); acc[11] = sycl::fma(w2.w(), v, acc[11]);
+            };
+            int c = 0;
+            // four cells at a time with their V loads issued together; a group holding a masked cell (page -1,
+            // rare) leaves this loop and the one below finishes the chunk
+            for (; c + 4 <= n_here; c += 4) {
+                const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
+                if ((r0 | r1 | r2 | r3) < 0) break;
+                const float v0 = load_v1<KV_MODE>(p, r0, t), v1 = load_v1<KV_MODE>(p, r1, t);
+                const float v2 = load_v1<KV_MODE>(p, r2, t), v3 = load_v1<KV_MODE>(p, r3, t);
+                fold(c, v0);
+                fold(c + 1, v1);
+                fold(c + 2, v2);
+                fold(c + 3, v3);
+            }
+            for (; c < n_here; ++c) {
                 if (srow[c] < 0) continue;   // masked above, weight 0
-                float v;
-                if constexpr (KV_MODE == 0) {
-                    v = h2f(p.v_pool[srow[c] * HD + t]);
-                } else if constexpr (KV_MODE == 1) {
-                    const float sc = h2f(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]);
-                    v = (float) p.v_q[srow[c] * HD + t] * sc;
-                } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
-                    constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
-                    const int b = t / QK4_0;
-                    const int rem = t % QK4_0;
-                    const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + srow[c] * bytes_per_head) + b;
-                    const float d = h2f(blk->d);
-                    const int j = rem < 16 ? rem : (rem - 16);
-                    const uint8_t byte = blk->qs[j];
-                    const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
-                    v = (float) nibble * d;
-                }
-                for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h * CHUNK + c], v, acc[h]);
+                fold(c, load_v1<KV_MODE>(p, srow[c], t));
             }
             for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
         });
