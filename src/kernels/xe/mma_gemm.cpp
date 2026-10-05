@@ -58,6 +58,38 @@ constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, f
                              {8, 8, 16, 8, {4, 8, 4, 4, true}, {2, 8, 2, 2, false}, true},
                              {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false}};
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
+
+// NVIDIA's shape from sm_80 on: the tiles read from local memory with ldmatrix and multiplied with mma.sync
+// m16n8k16, in PTX.  joint_matrix's CUDA loads read a 16 x 16 tile as 32-bit generic loads (four a lane, four times
+// the instructions of ldmatrix's), and the products of a 512 x 10240 x 2560 FP16 product ran at 46 TFLOP/s on the
+// RTX 4070 against cuBLAS's 60.  The sums are the same HMMA instructions in the same order.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
+#define STRATA_MMA_PTX 1
+inline uint32_t smem_addr(const void* p) {
+    uint32_t a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+template<bool BF>
+inline void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    if constexpr (BF)
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+                     "{%8, %9}, {%0, %1, %2, %3};"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    else
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
+                     "{%8, %9}, {%0, %1, %2, %3};"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+#else
+#define STRATA_MMA_PTX 0
+#endif
 constexpr int PAD = 8;            // column-major B's row stride is KC + PAD (16-byte aligned rows)
 constexpr int VEC = 8;            // values a work-item copies at once (16 bytes)
 
@@ -161,6 +193,7 @@ struct Kernel {
     // before multiplying (RTX 4070: long-scoreboard stalls, 33% occupancy by local memory).  Intel's packed shapes keep
     // stage(): on the A380 the registers spilled (see the file's note).
     static constexpr bool PREFETCH = !PACKED;
+    static constexpr bool PTX = STRATA_MMA_PTX && !PACKED && TM == 16 && TN == 16 && TK == 16;
     static constexpr int LANES = NSG * SG, NVA = (WM * (KC / VEC) + LANES - 1) / LANES,
                          NVB = (WN * (KC / VEC) + LANES - 1) / LANES;
     using V8 = sycl::vec<uint16_t, VEC>;
@@ -207,8 +240,10 @@ struct Kernel {
             const auto ap = as.template get_multi_ptr<sycl::access::decorated::no>();
             const auto bp = bs.template get_multi_ptr<sycl::access::decorated::no>();
             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> c[SGM][SGN];
-            for (int i = 0; i < SGM; ++i)
-                for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
+            float pacc[PTX ? SGM : 1][PTX ? 2 * SGN : 1][4] = {};   // PTX: (16 rows, 8 columns) tiles, mma.sync's
+            if constexpr (!PTX)
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, c[i][j], 0.0f);
             stage<E, WM, LDA, false, FR, WIDE>(x, wm0, rows, K, kb, as, 0, lid, NSG * SG);
             stage<E, WN, LDB, PACKED, FR ? TN : 0, WIDE>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
             sycl::group_barrier(it.get_group());
@@ -228,7 +263,32 @@ struct Kernel {
                 }
                 const auto apb = ap + buf * ASZ;
                 const auto bpb = bp + buf * BSZ;
-                for (int kk = 0; kk < KC; kk += TK) {
+#if STRATA_MMA_PTX
+                if constexpr (PTX) {
+                    constexpr bool BF = std::is_same_v<E, bf16_t>;
+                    const E* al = apb.get();
+                    const E* bl = bpb.get();
+#pragma unroll
+                    for (int kk = 0; kk < KC; kk += 16) {
+                        uint32_t af[SGM][4], bf[SGN][4];
+#pragma unroll
+                        for (int i = 0; i < SGM; ++i)   // rows lane % 16, columns kk + 8 (lane / 16)
+                            ldsm4(af[i], smem_addr(al + (ms + i * 16 + lane % 16) * LDA + kk + lane / 16 * 8));
+#pragma unroll
+                        for (int j = 0; j < SGN; ++j)   // outputs 8 (lane / 16) + lane % 8, columns kk + 8 (lane / 8 % 2)
+                            ldsm4(bf[j], smem_addr(bl + (ns + j * 16 + lane / 16 * 8 + lane % 8) * LDB + kk +
+                                                   lane / 8 % 2 * 8));
+#pragma unroll
+                        for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                            for (int j = 0; j < SGN; ++j) {
+                                mma16816<BF>(pacc[i][2 * j], af[i], bf[j][0], bf[j][1]);
+                                mma16816<BF>(pacc[i][2 * j + 1], af[i], bf[j][2], bf[j][3]);
+                            }
+                    }
+                }
+#endif
+                for (int kk = 0; kk < (PTX ? 0 : KC); kk += TK) {
                     constexpr auto BLAYOUT = PACKED ? mx::layout::ext_intel_packed : mx::layout::col_major;
                     mx::joint_matrix<sycl::sub_group, E, mx::use::a, TM, TK, mx::layout::row_major> a[SGM];
                     mx::joint_matrix<sycl::sub_group, E, mx::use::b, TK, TN, BLAYOUT> b[SGN];
@@ -259,6 +319,25 @@ struct Kernel {
                 }
                 sycl::group_barrier(it.get_group());
                 buf = (buf + 1) % NBUF;
+            }
+            if constexpr (PTX) {   // mma.sync's tile: d0, d1 at row lane / 4, columns 2 (lane % 4) and +1; d2, d3 8 rows on
+                const int gr = lane / 4, gc = lane % 4 * 2;
+#pragma unroll
+                for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                    for (int jn = 0; jn < 2 * SGN; ++jn) {
+                        const int64_t n = wn0 + ns + (int64_t) jn * 8 + gc;
+                        if (n >= N) continue;
+#pragma unroll
+                        for (int h = 0; h < 2; ++h) {
+                            const int64_t row = wm0 + ms + (int64_t) i * 16 + gr + (int64_t) h * 8;
+                            if (row >= rows) continue;
+                            float* o = y + row * ldy + n;
+                            o[0] = ACC ? o[0] + pacc[i][jn][2 * h] : pacc[i][jn][2 * h];
+                            o[1] = ACC ? o[1] + pacc[i][jn][2 * h + 1] : pacc[i][jn][2 * h + 1];
+                        }
+                    }
+                return;
             }
             const auto cp = cs.template get_multi_ptr<sycl::access::decorated::no>() + (std::ptrdiff_t) sgid * TM * TN;
             for (int i = 0; i < SGM; ++i)
