@@ -1073,12 +1073,21 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
         }
         if (hand_in_ == nullptr) gr_broadcast(m.emb, m.R, T, m.cs);
-        // ---- the PLE rows of the whole chunk, one batched SSD request (read ahead on a thread, see ple_gather)
-        if (ple_on) {
+        // ---- the PLE rows of the whole chunk, one batched SSD request on a thread (see ple_gather).  A later chunk's
+        // were read ahead during the previous chunk; the first chunk's are read beside layer 0 - they are needed from
+        // layer 1 on, and gathering them here first left the GPU idle for the whole read (upstream; RTX 4070, 997
+        // tokens: 42 ms)
+        if (ple_on && !ple_next.valid())
+            ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {
+                return ple_gather(c0, b, ple_next_err);
+            });
+        bool ple_pending = ple_on;
+        // the chunk's rows onto the device just before layer 1 reads them, and the next chunk's gather started
+        auto ple_land = [&]() -> bool {
+            if (!ple_pending) return true;
+            ple_pending = false;
             const auto tp = Clock::now();
-            if (!ple_next.valid()) {
-                if (!ple_gather(c0, ple_buf, err)) return false;
-            } else if (!ple_next.get()) {
+            if (!ple_next.get()) {
                 err = ple_next_err;
                 return false;
             }
@@ -1092,7 +1101,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             }
             ple_buf ^= 1;
             stats_.ms_ple += ms_since(tp);
-        }
+            return true;
+        };
         for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
         // ---- the QSA step records of every position in the chunk
         for (int64_t t = 0; t < T; ++t) strata::kernels::qsa_step_fill(m.steps_host.data() + t * strata::kernels::kStepCount, p0 + t, s);
@@ -1222,6 +1232,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
+            if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -1876,6 +1887,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
+        if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
             issuer.join();
             stats_.ms_experts_host += iss_ms;
