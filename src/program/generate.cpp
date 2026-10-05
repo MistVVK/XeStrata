@@ -94,6 +94,16 @@
 #include <vector>
 
 namespace {
+// #620 #486: " (N MiB of M MiB VRAM free on this GPU)" for an allocation's failure message
+std::string vram_free_note() {
+    size_t free_b = 0, total_b = 0;
+    if (!strata::gpu::mem_info(&free_b, &total_b)) return {};
+    char buf[96];
+    std::snprintf(buf, sizeof buf, " (%llu MiB of %llu MiB VRAM free on this GPU)", (unsigned long long) (free_b >> 20),
+                  (unsigned long long) (total_b >> 20));
+    return buf;
+}
+
 // perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
 bool refill_blocking() {
     static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
@@ -2016,8 +2026,9 @@ int main(int argc, char** argv) {
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_gguf, g.n_embd, wo_s->ne1, err))) {
-            std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s\n", st.dev,
-                         wo_s == nullptr ? "output.weight is missing" : err.c_str());
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
+                         wo_s == nullptr ? "output.weight is missing" : err.c_str(),
+                         wo_s == nullptr ? "" : vram_free_note().c_str());
             return 1;
         }
         // a control vector (the speed projection): its tables on this device too - the stage's layers apply it here
@@ -2064,7 +2075,31 @@ int main(int argc, char** argv) {
         static const strata::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+    }
+    // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
+    // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
+    // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
+    // good at its first verify window.  Loaded first, the cache is sized around it.  #620: and before the expert
+    // arena registers tens of GiB of host pages, like the drafter above (on Windows the driver then refused the
+    // head's allocation with GiBs free).
+    const strata::core::WeightRef* wo = wt.find("output.weight");
+    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
+    const int64_t n_vocab = wo->ne1;
+    strata::core::NativeHead native_head;
+    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+        if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
+            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes\n",
+                     (unsigned long long) native_head.weight_bytes());
+    }
+    std::vector<float> logits((size_t) n_vocab);
+    float* d_logits = nullptr;
+    if (!strata::gpu::alloc_device(&d_logits, (size_t) n_vocab * 4)) {
+        std::fprintf(stderr, "strata generate: the logits buffer failed%s\n", vram_free_note().c_str());
+        return 1;
     }
     // Create the additional contexts after MTP has secured CUDA0 memory, but
     // before the host arena maps its expert pages into their address spaces.
@@ -2291,28 +2326,7 @@ int main(int argc, char** argv) {
             stages[i]->le = i + 1 < stages.size() ? split_at[i + 1] : g.n_layers;
         }
     }
-    // THE HEAD BEFORE THE CACHE.  The expert cache takes what is free minus the reserve, so everything allocated
-    // after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after it and ate most of
-    // the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for good at its first
-    // verify window.  Loaded first, the cache is sized around it.
-    const strata::core::WeightRef* wo = wt.find("output.weight");
-    if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
-    const int64_t n_vocab = wo->ne1;
-    strata::core::NativeHead native_head;
-    if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
-        if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
-        }
-        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes\n",
-                     (unsigned long long) native_head.weight_bytes());
-    }
-    std::vector<float> logits((size_t) n_vocab);
-    float* d_logits = nullptr;
-    if (!strata::gpu::alloc_device(&d_logits, (size_t) n_vocab * 4)) {
-        std::fprintf(stderr, "strata generate: the logits buffer failed\n");
-        return 1;
-    }
+    // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     if (o.expert_cache < 0) {

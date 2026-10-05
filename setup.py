@@ -2442,6 +2442,9 @@ def main() -> int:
         if budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
             budget = resident_budget_gib(model, ram, kv_ram_gb)
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
+    elif kv != "k8v4" and ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
+        ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
+           f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts)")
     if budget is not None:     # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N GiB kept in RAM
         args += ["--resident-budget-gib", f"{budget:g}"]
     if vision != "none":
