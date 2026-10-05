@@ -1901,9 +1901,15 @@ def warm_up(cfg_path: Path) -> None:
         finally:
             try:
                 os.killpg(proc.pid, 15)
+            except ProcessLookupError:                 # the server and its engine have ended already
+                pass
+            try:
                 proc.wait(timeout=60)
-            except (OSError, subprocess.TimeoutExpired):
-                os.killpg(proc.pid, 9)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, 9)
+                except ProcessLookupError:
+                    pass
                 proc.wait()
 
 
