@@ -230,33 +230,41 @@ icpx なら oneAPI のもの、ここで作った intel/llvm ならそのもの�
 
 ### SYCL のコンパイラ
 
-setup は、指定がなければ free でビルドします。
-`--nonfree on` で icpx も候補にし、`--nonfree off` で元に戻します。
-この選択、`--intel-llvm DIR`、XMX なしのビルドを受け入れたことは、設定に記録して次回以降も使います。
+setup は、`--license` で選んだモード（[上](#ビルド)）でビルドします。指定がなければ free です。
 
-コンパイラは次の順に選びます。
+- **free**: 自由ソフトウェアのコンパイラで、Intel の GPU 向けに作ります（下の順で選びます）。
+- **contrib**: CUDA のターゲット付きの intel/llvm（`.tools/intel-llvm-contrib`、なければ尋ねてからここでビルドします）で、
+  Intel と NVIDIA の GPU 向けに作ります。
+  NVIDIA の GPU のアーキテクチャは nvidia-smi の報告（compute capability）から決め、そのときは NVIDIA の CUDA ツールキット（`nvcc`）が要ります。
+- **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。
+
+contrib と contrib-icpx は oneMKL（`MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）がないと止まります。
+NVIDIA の GPU は contrib でだけ使えます。
+モード、`--intel-llvm DIR`、XMX なしのビルドを受け入れたことは、設定に記録して次回以降も使います。
+以前の設定の `nonfree`（icpx を許す）は contrib-icpx として読みます。
+
+free のコンパイラは次の順に選びます。
 
 1. `--intel-llvm DIR` の指定があれば、DIR にインストールされた intel/llvm。
 1. なければ、ディストリビューションの intel/llvm（`dpclang++`、なければいちばん新しい `dpclang++-N`）。
 1. `--intel-llvm-build` の指定があり、上のどちらもないか、GPU に XMX がないと報告するなら、ここでソースからビルドした intel/llvm。
 1. どれもなければ止まり、手に入れる方法を表示します。
-   ディストリビューションのパッケージ、`--intel-llvm-build`、`--nonfree on` なら icpx（Intel の apt リポジトリのコマンド）です。
+   ディストリビューションのパッケージと `--intel-llvm-build` です。
 
-選んだコンパイラで `tools/xmx_probe.cpp` をビルドし、選んだ GPU で動かします。
+Intel の GPU では、選んだコンパイラで `tools/xmx_probe.cpp` をビルドし、選んだ GPU で動かします。
 結果によって、次のように進みます。
 
 - **GPU がまったく列挙されない**: 止まります。
   GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）が入っていないか、この GPU には古すぎる、と案内します。
   openSUSE Leap 16 の compute-runtime 25.18 は、Arc Pro B70 を列挙しませんでした。
-- **GPU は列挙されるが XMX がない**: `--nonfree on` で icpx が入っていて、そちらが XMX を報告するなら icpx を使います。
-  そうでなければ、XMX なしでビルドする、intel/llvm 7 以降をここでビルドする、止める、から選ばせます。
-  使っているのがすでにここで作った intel/llvm なら、ビルドの選択肢は出しません。
-  `--nonfree on` で icpx がないときは、icpx を入れる選択肢も出します。
+- **GPU は列挙されるが XMX がない**: XMX なしでビルドする、intel/llvm 7 以降をここでビルドする、止める、から選ばせます。
+  使っているのがすでにここで作った intel/llvm のとき、または contrib と contrib-icpx では、ビルドの選択肢は出しません。
+  止めるときは、`--license contrib-icpx`（icpx）も案内します。
   端末がないときや `--yes` のときは止まります。
   `--allow-no-xmx` を付ければ、遅い経路を受け入れて進みます。
 
 更新のあとでエンジンをコンパイルし直すときは、`BUILD.json` に記録したコンパイラを使い、何も尋ねません。
-free のビルドができる前のエンジン（記録がないもの）は icpx で作ったものなので、`--nonfree on` としてそのまま icpx を使います。
+free のビルドができる前のエンジン（記録がないもの）は icpx で作ったものなので、`--license contrib-icpx` としてそのまま icpx を使います。
 
 `tools/intel_llvm_build.py` は、`--intel-llvm-build` から、または手で動かします。
 スクリプトに書いた intel/llvm のリリースのタグを `.tools/intel-llvm/src` に clone してビルドし、`.tools/intel-llvm/install` にインストールします。
@@ -286,9 +294,9 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 （[記録](../bench/results/2026-10-03-clean-setup/README.md)）。
 `intel-opencl-icd` は、エンジンを動かすだけなら要りません。
 
-| 用途 | free | nonfree（`--nonfree on`） |
+| 用途 | free | contrib-icpx（`--license contrib-icpx`） |
 | --- | --- | --- |
-| エンジンのビルド | `dpclang-6` 6.2.0、`libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3 |
+| エンジンのビルド | `dpclang-6` 6.2.0、`libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | B70 で XMX を使うとき（`--intel-llvm-build`） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx が XMX を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |
@@ -297,7 +305,10 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 | 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
 
 Ubuntu 26.04 の `dpclang-6` 6.2.0 では、B70 に XMX が使えません。
-XMX を使うには、`--intel-llvm-build` で intel/llvm をビルドするか、nonfree で icpx を使います。
+XMX を使うには、`--intel-llvm-build` で intel/llvm をビルドするか、contrib-icpx で icpx を使います。
+
+contrib（`--license contrib`）では、free の列のうち intel/llvm をビルドするためのものと、
+`intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
 `dpclang-6` のまま進めるなら `--allow-no-xmx` を付けます。
 
 #### Fedora 44
@@ -541,7 +552,7 @@ Vulkan では、最初の GPU が CPU 内蔵のグラフィックスやほかの
   CPU のエンコーダー（8 スレッド）より 7〜9 倍速く、SYCL のものの約半分の速さです。
   埋め込みは CPU のエンコーダーと 2.4〜3.1%（相対 L2）違い、SYCL のものより差が小さく、毎回ビット単位で同じになります
   （[記録](../bench/results/2026-10-02-vision-vulkan/README.md)）。
-- **SYCL**（ggml-sycl、`-DSTRATA_VISION_SYCL=ON`）: `--nonfree on` で、icpx と oneMKL が入っているときに使います。
+- **SYCL**（ggml-sycl、`-DSTRATA_VISION_SYCL=ON`）: contrib-icpx（`--license contrib-icpx`）で、oneMKL が入っているときに使います。
   ggml-sycl は、自由ソフトウェアでない oneMKL をリンクします。
   すべてのノードが GPU で動き、CPU のエンコーダーより 13〜20 倍速く、答えは同じか、僅差のところで言い回しが変わる程度です。
   埋め込みは CPU のエンコーダーと 3〜6%（相対 L2）違い、その差に許容範囲を決めずに採用しました

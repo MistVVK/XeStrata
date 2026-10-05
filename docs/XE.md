@@ -224,33 +224,41 @@ Only one GPU is used; `--gpus` is refused.
 
 ### The SYCL compiler
 
-setup builds free unless told otherwise.
-`--nonfree on` also allows icpx; `--nonfree off` goes back.
-That choice, a `--intel-llvm DIR` and an accepted build without XMX are kept in the settings for later runs.
+setup builds in the mode `--license` names ([above](#build-and-run)), free unless told otherwise.
 
-The compiler is chosen in this order:
+- **free**: a free compiler, for Intel GPUs (chosen in the order below).
+- **contrib**: intel/llvm with its CUDA target (`.tools/intel-llvm-contrib`; without one, setup asks and builds it here),
+  for Intel and NVIDIA GPUs.
+  The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
+- **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
+
+contrib and contrib-icpx stop without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
+NVIDIA GPUs can be used in the contrib mode only.
+The mode, a `--intel-llvm DIR` and an accepted build without XMX are kept in the settings for later runs.
+An older settings file's `nonfree` (icpx allowed) is read as contrib-icpx.
+
+The free compiler is chosen in this order:
 
 1. With `--intel-llvm DIR`: the intel/llvm installed in DIR.
 1. Otherwise the distribution's intel/llvm (`dpclang++`, or the newest `dpclang++-N`).
 1. With `--intel-llvm-build`, when neither exists or the GPU reports no XMX to it: intel/llvm built here from source.
 1. Otherwise setup stops and says how to get one:
-   the distribution's package, `--intel-llvm-build`, and with `--nonfree on` icpx (the commands for Intel's apt repository).
+   the distribution's package and `--intel-llvm-build`.
 
-The chosen compiler builds `tools/xmx_probe.cpp` and runs it on the chosen GPU.
+On an Intel GPU the chosen compiler builds `tools/xmx_probe.cpp` and runs it on the chosen GPU.
 What happens next depends on the result:
 
 - **The GPU is not listed at all**: setup stops.
   It names the GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) as missing or too old for the GPU.
   openSUSE Leap 16's compute-runtime 25.18 lists no Arc Pro B70.
-- **The GPU is listed without XMX**: with `--nonfree on`, an installed icpx that reports XMX is taken.
-  Otherwise setup asks: build without XMX, build intel/llvm 7 or later here, or stop.
-  Building intel/llvm is not offered when the compiler already is the one built here.
-  With `--nonfree on` and no icpx, it also offers to install icpx.
+- **The GPU is listed without XMX**: setup asks: build without XMX, build intel/llvm 7 or later here, or stop.
+  Building intel/llvm is not offered when the compiler already is the one built here, or in the contrib and contrib-icpx modes.
+  Stopping also names `--license contrib-icpx` (icpx).
   Without a terminal, or with `--yes`, it stops;
   `--allow-no-xmx` accepts the slower path.
 
 When the engine is compiled again after an update, setup uses the compiler recorded in `BUILD.json` and asks nothing.
-An engine from before the free build (no record) was built with icpx and stays so, as `--nonfree on`.
+An engine from before the free build (no record) was built with icpx and stays so, as `--license contrib-icpx`.
 
 `tools/intel_llvm_build.py` is run by `--intel-llvm-build` or by hand.
 It clones the intel/llvm release tag the script names into `.tools/intel-llvm/src`, builds it, and installs it into `.tools/intel-llvm/install`.
@@ -279,9 +287,9 @@ The free column is also what a clean Ubuntu 26.04 needs:
 in a container with only this column and `python3-venv`, setup ran from start to end ([record](../bench/results/2026-10-03-clean-setup/README.md)).
 `intel-opencl-icd` is not needed to run the engine.
 
-| For | Free | Nonfree (`--nonfree on`) |
+| For | Free | contrib-icpx (`--license contrib-icpx`) |
 | --- | --- | --- |
-| Building the engine | `dpclang-6` 6.2.0, `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3 |
+| Building the engine | `dpclang-6` 6.2.0, `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | XMX on the B70 (`--intel-llvm-build`) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx gives XMX) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
@@ -290,7 +298,10 @@ in a container with only this column and `python3-venv`, setup ran from start to
 | Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
 
 Ubuntu 26.04's `dpclang-6` 6.2.0 gives the B70 no XMX.
-For XMX, build intel/llvm with `--intel-llvm-build`, or use icpx in the nonfree mode.
+For XMX, build intel/llvm with `--intel-llvm-build`, or use icpx in the contrib-icpx mode.
+
+The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
+`intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 To go on with `dpclang-6`, pass `--allow-no-xmx`.
 
 #### Fedora 44
@@ -528,7 +539,7 @@ with Vulkan the first GPU can be the processor's graphics or another card.
   It encodes 7–9× faster than the CPU encoder (8 threads) and about half as fast as the SYCL one.
   Its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2), less than the SYCL encoder's, and repeat bit for bit
   ([record](../bench/results/2026-10-02-vision-vulkan/README.md)).
-- **SYCL** (ggml-sycl, `-DSTRATA_VISION_SYCL=ON`): with `--nonfree on`, when icpx and oneMKL are installed.
+- **SYCL** (ggml-sycl, `-DSTRATA_VISION_SYCL=ON`): in the contrib-icpx mode (`--license contrib-icpx`), when oneMKL is installed.
   ggml-sycl links oneMKL, which is not free software.
   Every node runs on the GPU; it encodes 13–20× faster than the CPU encoder, with the same answers or a rewording at a near-tie.
   Its embeddings differ from the CPU encoder's by 3–6% (relative L2); it was adopted without a tolerance for that

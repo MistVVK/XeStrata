@@ -13,11 +13,11 @@ is already downloaded, installed or prepared is done again.
 
 What the first run does (each step is skipped when it is already done):
 
-  1. checks your PC: the Intel GPU and its driver, RAM, CPU, free disk space
+  1. checks your PC: the GPU (Intel; NVIDIA with --license contrib) and its driver, RAM, CPU, free disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
   4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md), and the image encoder when
-     images are wanted (on the CPU; on the GPU through Vulkan, or SYCL with oneMKL in the nonfree mode)
+     images are wanted (on the CPU; on the GPU through Vulkan, or SYCL with oneMKL in the contrib-icpx mode)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
@@ -176,7 +176,7 @@ VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "strata"
 # the image encoder, one binary per place it runs: the configs of different models may use different ones
-# the image encoders: on the CPU, on the GPU through Vulkan (free), on the GPU through SYCL (oneMKL: --nonfree)
+# the image encoders: on the CPU, on the GPU through Vulkan (free), on the GPU through SYCL (oneMKL: contrib-icpx)
 VEXE = {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan", "gpu": "strata-vision-sycl"}
 
 
@@ -278,6 +278,7 @@ def cpu_info():
 
 
 GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+ARGS = None                                             # the command line (--license decides which cards can be used)
 
 
 def _drm_iowr(nr: int, size: int) -> int:
@@ -368,22 +369,57 @@ def host_link(dev: Path):
         return None
 
 
+def nvidia_smi() -> dict:
+    """What NVIDIA's driver reports of each NVIDIA GPU, by PCI address ("0000:09:00.0"): its name, memory (MiB) and
+    compute capability ("8.9").  Empty without nvidia-smi."""
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        return {}
+    try:
+        r = subprocess.run([exe, "--query-gpu=pci.bus_id,name,memory.total,compute_cap",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    found = {}
+    for line in r.stdout.splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) == 4:
+            mib = float(f[2]) if re.fullmatch(r"[\d.]+", f[2]) else 0.0
+            found[f[0].lower()[-12:]] = {"name": f[1], "mib": mib, "cc": f[3]}   # "00000000:09:00.0" -> "0000:09:00.0"
+    return found
+
+
 def gpus():
-    """Every Intel GPU on the xe or i915 driver, in PCI order (the order Level Zero numbers them), from sysfs and the
-    driver's memory query: no tool is needed before the engine is built.  Nothing is decided from the device ID: the
-    engine checks at start what the card reports (AGENTS.md)."""
-    found = []
+    """Every Intel GPU on the xe or i915 driver in PCI order (the order Level Zero numbers them), then every NVIDIA GPU
+    on NVIDIA's driver (after them, so that the Intel cards keep the numbers saved configs know them by), from sysfs,
+    the Intel driver's memory query and nvidia-smi: no tool of Strata's is needed before the engine is built.  Nothing
+    is decided from the device ID: the engine checks at start what the card reports (AGENTS.md)."""
+    found, nvidia = [], []
+    smi = None
     cards = [c for c in Path("/sys/class/drm").glob("card*") if re.fullmatch(r"card\d+", c.name)]
     for card in sorted(cards, key=lambda c: (c / "device").resolve().name):
         dev = card / "device"
         try:
             driver = (dev / "driver").resolve().name
-            if (dev / "vendor").read_text().strip() != "0x8086" or driver not in ("xe", "i915"):
+            vendor = (dev / "vendor").read_text().strip()
+            if (vendor, driver) not in (("0x8086", "xe"), ("0x8086", "i915"), ("0x10de", "nvidia")):
                 continue
             did = int((dev / "device").read_text().strip(), 16)
-            bar = (dev / "resource").read_text().splitlines()[2].split()
+            # the BAR the CPU sees the memory through: BAR 2 on Intel's cards, BAR 1 on NVIDIA's
+            bar = (dev / "resource").read_text().splitlines()[2 if vendor == "0x8086" else 1].split()
             bar_gb = (int(bar[1], 16) - int(bar[0], 16) + 1) / 2 ** 30 if int(bar[1], 16) else 0.0
         except (OSError, ValueError, IndexError):
+            continue
+        pci = dev.resolve().name
+        if vendor == "0x10de":
+            smi = nvidia_smi() if smi is None else smi
+            info = smi.get(pci, {})
+            vram = info.get("mib", 0.0) / 1024 or bar_gb
+            node = "/dev/nvidiactl" if Path("/dev/nvidiactl").exists() else None
+            nvidia.append({"name": info.get("name") or f"NVIDIA GPU 0x{did:04x}", "vram_gb": vram,
+                           "device_id": did, "driver": driver, "integrated": False, "supported": True, "pci": pci,
+                           "bar_gb": bar_gb, "link": host_link(dev), "render": node, "vendor": "nvidia",
+                           "cc": info.get("cc")})
             continue
         render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
         node = f"/dev/dri/{render.name}" if render else None
@@ -392,9 +428,9 @@ def gpus():
         vram = mem[0] / 2 ** 30 if mem else bar_gb             # the BAR when the driver cannot be asked
         visible = mem[1] / 2 ** 30 if mem else bar_gb
         found.append({"index": len(found), "name": pci_name(0x8086, did), "vram_gb": vram, "device_id": did,
-                      "driver": driver, "integrated": integrated, "supported": True, "pci": dev.resolve().name,
-                      "bar_gb": visible, "link": host_link(dev), "render": node})
-    return found
+                      "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
+                      "bar_gb": visible, "link": host_link(dev), "render": node, "vendor": "intel"})
+    return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia)]
 
 
 def gpu_problem(g, together=False):
@@ -402,6 +438,8 @@ def gpu_problem(g, together=False):
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
+        return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
     return None
 
 
@@ -411,7 +449,7 @@ def gpu_name(g) -> str:
 
 
 def gpu_table(found) -> None:
-    say("  Your Intel GPUs:")
+    say("  Your GPUs:")
     for g in found:
         p = gpu_problem(g)
         mem = "no VRAM of its own" if g.get("integrated") else f"{g['vram_gb']:.0f} GB VRAM"
@@ -437,7 +475,7 @@ def check_gpus(sel, found, what="") -> None:
         gpu_table(found)
         single = [x for x in found if gpu_problem(x) is None]
         hint = ("use " + " or ".join(f"--gpu {x['index']}" for x in single)) if single else \
-            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver"
+            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver, or with --license contrib an NVIDIA GPU"
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
 
@@ -452,7 +490,8 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata", "it needs an Intel GPU on the xe or i915 driver")
+        fail("none of your GPUs can run Strata",
+             "it needs an Intel GPU on the xe or i915 driver, or with --license contrib an NVIDIA GPU")
     return [single[0]["index"]]
 
 
@@ -705,13 +744,17 @@ def oneapi_lib_dirs() -> list:
 
 
 # ------------------------------------------------------------------------------------------------ the SYCL compiler
-# AGENTS.md: the free build (the default) uses free software only: intel/llvm's DPC++, the distribution's (dpclang++)
-# or one built from source (tools/intel_llvm_build.py, --intel-llvm-build).  --nonfree also allows Intel oneAPI's icpx,
-# taken only when no free compiler gives the GPU its matrix engines (XMX).  Whether one does is asked of the GPU itself
+# AGENTS.md, "Free and non-free builds": three build modes (--license).  free (the default) uses free software only:
+# intel/llvm's DPC++, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
+# --intel-llvm-build), for Intel GPUs.  contrib: intel/llvm built with its CUDA target (.tools/intel-llvm-contrib), for
+# Intel and NVIDIA GPUs, with oneMKL and cuBLAS for the dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL,
+# Intel GPUs only.  Whether the Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself
 # (tools/xmx_probe.cpp), not read from a version number.  Without XMX the engine still runs, its prompt path about 1.6
 # times slower (bench/results/2026-10-02-dp4a); setup asks before building it so.
+LICENSES = ("free", "contrib", "contrib-icpx")
 INTEL_LLVM_BUILD = ROOT / "tools" / "intel_llvm_build.py"
 INTEL_LLVM_DEFAULT = ROOT / ".tools" / "intel-llvm" / "install"
+INTEL_LLVM_CONTRIB = ROOT / ".tools" / "intel-llvm-contrib" / "install"
 ICPX_HOW = ("Intel oneAPI's compiler (not free software; Intel's apt repository):\n"
             "         wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \\\n"
             "           | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null\n"
@@ -721,6 +764,24 @@ ICPX_HOW = ("Intel oneAPI's compiler (not free software; Intel's apt repository)
 FREE_HOW = ("intel/llvm's DPC++ (free software): the distribution's package (Ubuntu: sudo apt install dpclang-6; it "
             "gives the Arc Pro B70 no XMX before version 7), or build it here: ./setup.sh --intel-llvm-build "
             "(13 minutes on 28 threads, 3.5 GB)")
+MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/XE.md#packages): "
+           "sudo apt install intel-oneapi-mkl-sycl-devel")
+
+
+def license_mode(a=None) -> str:
+    """The build mode: --license, else the one kept in the settings.  Settings from before the three modes kept
+    "nonfree": true for icpx, which is contrib-icpx now."""
+    if a is not None and getattr(a, "license", None):
+        return a.license
+    st = load_settings()
+    return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "free")
+
+
+def mkl_root() -> str | None:
+    """Where oneMKL is (the contrib modes' dense products, the SYCL image encoder): oneAPI's MKLROOT, else oneAPI's
+    default folder."""
+    root = (oneapi_env() or {}).get("MKLROOT") or "/opt/intel/oneapi/mkl/latest"
+    return root if Path(root, "lib").is_dir() else None
 
 
 def compiler_version(cxx, env) -> str:
@@ -730,12 +791,13 @@ def compiler_version(cxx, env) -> str:
     return f"{lines[0]} {lines[1]}" if lines[0].endswith(":") and len(lines) > 1 else lines[0]
 
 
-def free_compiler(install: Path) -> dict:
-    """intel/llvm built from source (`install` holds bin/clang++ and lib/libsycl.so)."""
+def free_compiler(install: Path, license: str = "free") -> dict:
+    """intel/llvm built from source (`install` holds bin/clang++ and lib/libsycl.so); "contrib": one with its CUDA
+    target."""
     lib = install / "lib"
     env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join([str(lib), os.environ.get("LD_LIBRARY_PATH", "")]))
     return {"kind": "intel-llvm", "cxx": str(install / "bin" / "clang++"), "cc": str(install / "bin" / "clang"),
-            "env": env, "lib_dirs": [str(lib)], "nonfree": False}
+            "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": []}
 
 
 def os_compiler() -> dict | None:
@@ -751,7 +813,8 @@ def os_compiler() -> dict | None:
     if cxx is None:
         return None
     cc = shutil.which(Path(cxx).name.replace("dpclang++", "dpclang")) or cxx
-    return {"kind": "os", "cxx": cxx, "cc": cc, "env": dict(os.environ), "lib_dirs": [], "nonfree": False}
+    return {"kind": "os", "cxx": cxx, "cc": cc, "env": dict(os.environ), "lib_dirs": [], "license": "free",
+            "cuda_archs": []}
 
 
 def icpx_compiler() -> dict | None:
@@ -760,11 +823,18 @@ def icpx_compiler() -> dict | None:
         return None
     return {"kind": "icpx", "cxx": shutil.which("icpx", path=env.get("PATH")),
             "cc": shutil.which("icx", path=env.get("PATH")) or "icx", "env": env, "lib_dirs": oneapi_lib_dirs(),
-            "nonfree": True}
+            "license": "contrib-icpx", "cuda_archs": []}
+
+
+def cuda_archs() -> list:
+    """The NVIDIA architectures of this PC's NVIDIA GPUs (sm_89 for compute capability 8.9), as nvidia-smi reports
+    them: the contrib build makes their code."""
+    return sorted({"sm_" + g["cc"].replace(".", "") for g in nvidia_smi().values()
+                   if re.fullmatch(r"\d+\.\d+", g["cc"])})
 
 
 def probe_gpu(comp: dict, pci: str | None) -> dict | None:
-    """What the GPU at `pci` reports to this compiler's SYCL runtime (tools/xmx_probe.cpp): its fields ("fp16",
+    """What the Intel GPU at `pci` reports to this compiler's SYCL runtime (tools/xmx_probe.cpp): its fields ("fp16",
     "bf16": "1" for the matrix engines), {} when the runtime lists no such GPU, None when the probe did not build."""
     with tempfile.TemporaryDirectory() as d:
         exe = Path(d) / "xmx_probe"
@@ -793,98 +863,128 @@ def probe_xmx(comp: dict, pci: str | None) -> bool:
     return has_xmx(probe_gpu(comp, pci))
 
 
-def build_intel_llvm(a) -> Path:
-    """tools/intel_llvm_build.py: a finished build is used as it is, an interrupted one continued."""
-    flags = [f for f, on in (("--rebuild", a.intel_llvm_rebuild), ("--keep-build", a.intel_llvm_keep_build),
-                             ("--yes", a.yes)) if on]
+def build_intel_llvm(a, contrib: bool = False) -> Path:
+    """tools/intel_llvm_build.py (--contrib: with the CUDA target): a finished build is used as it is, an interrupted
+    one continued."""
+    flags = [f for f, on in (("--contrib", contrib), ("--rebuild", a.intel_llvm_rebuild),
+                             ("--keep-build", a.intel_llvm_keep_build), ("--yes", a.yes)) if on]
     run([sys.executable, INTEL_LLVM_BUILD, *flags])
-    return INTEL_LLVM_DEFAULT
+    return INTEL_LLVM_CONTRIB if contrib else INTEL_LLVM_DEFAULT
 
 
-def choose_compiler(a, pci: str | None) -> dict:
-    """The SYCL compiler the engine is built with (the order in docs/XE.md, "The SYCL compiler").  Its choice is kept in
-    the settings: --nonfree, --intel-llvm DIR and an accepted build without XMX hold for the next runs."""
-    st = load_settings()
-    nonfree = (a.nonfree == "on") if a.nonfree else bool(st.get("nonfree"))
-    llvm_dir = a.intel_llvm or st.get("intel_llvm")
-    allow_no_xmx = a.allow_no_xmx or bool(st.get("allow_no_xmx"))
-    comp = None
-    if llvm_dir:
-        d = Path(llvm_dir).expanduser().resolve()
-        if not (d / "bin" / "clang++").exists():
+def contrib_compiler(a, st: dict) -> tuple:
+    """intel/llvm with its CUDA target: --intel-llvm DIR, the one kept in the settings, or the one built here (built
+    now when there is none).  Returns it and its folder."""
+    d = Path(a.intel_llvm or st.get("intel_llvm_contrib") or INTEL_LLVM_CONTRIB).expanduser().resolve()
+    if not (d / "bin" / "clang++").exists():
+        if a.intel_llvm:
             fail(f"--intel-llvm {d}: no bin/clang++ there", "give the folder intel/llvm was installed to")
-        comp = free_compiler(d)
-    elif (c := os_compiler()) is not None:
-        comp = c
-    elif a.intel_llvm_build:
-        comp = free_compiler(build_intel_llvm(a))
-        llvm_dir = str(INTEL_LLVM_DEFAULT)
-    if comp is not None and comp["kind"] == "os" and a.intel_llvm_build and not probe_xmx(comp, pci):
-        say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using intel/llvm built here (--intel-llvm-build)")
-        comp = free_compiler(build_intel_llvm(a))
-        llvm_dir = str(INTEL_LLVM_DEFAULT)
-    icpx = icpx_compiler() if nonfree else None
-    if comp is None:
-        if icpx is None:
-            fail("no SYCL compiler for the engine",
-                 FREE_HOW + (f"\n       or {ICPX_HOW}" if nonfree else "\n       (--nonfree also allows Intel's icpx)"))
-        comp = icpx
-    probed = probe_gpu(comp, pci)
-    icpx_probed = probe_gpu(icpx, pci) if icpx is not None and icpx is not comp and not has_xmx(probed) else None
-    if has_xmx(probed):
-        xmx = True
-    elif icpx is not None and has_xmx(icpx_probed):
-        say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using icpx (--nonfree)")
-        comp, probed, xmx = icpx, icpx_probed, True
+        say("  The contrib build needs intel/llvm with its CUDA target (NVIDIA's CUDA toolkit, not free software); "
+            "it is built here from source (about 25 minutes on 28 threads, 4 GB).")
+        if ask("Build it now?", ["y", "n"], "y", a.yes) != "y":
+            fail("stopped: no intel/llvm with the CUDA target", "python3 tools/intel_llvm_build.py --contrib")
+        d = build_intel_llvm(a, contrib=True)
+    if not any((d / "lib").glob("libur_adapter_cuda.so*")):
+        fail(f"{d}: this intel/llvm has no CUDA target", "build one: python3 tools/intel_llvm_build.py --contrib")
+    comp = free_compiler(d, "contrib")
+    comp["cuda_archs"] = cuda_archs()
+    if comp["cuda_archs"] and shutil.which("nvcc") is None:
+        fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it)",
+             "install it: sudo apt install nvidia-cuda-toolkit")
+    return comp, d
+
+
+def choose_compiler(a, gpu: dict) -> dict:
+    """The SYCL compiler the engine is built with, for the build mode (--license; the order in docs/XE.md, "The SYCL
+    compiler").  The mode, --intel-llvm DIR and an accepted build without XMX are kept in the settings for the next
+    runs."""
+    st = load_settings()
+    mode = license_mode(a)
+    pci = gpu["pci"]
+    allow_no_xmx = a.allow_no_xmx or bool(st.get("allow_no_xmx"))
+    kept = {}                                          # the intel/llvm folder to keep in the settings
+    if mode == "contrib-icpx":
+        comp = icpx_compiler()
+        if comp is None:
+            fail("--license contrib-icpx builds with Intel's icpx, which is not installed", ICPX_HOW)
+    elif mode == "contrib":
+        comp, d = contrib_compiler(a, st)
+        kept = {"intel_llvm_contrib": str(d)}
     else:
-        xmx = False
-    if probed == {}:
-        # an XMX question would not help here: no compiler makes the engine run on a GPU its driver does not list
-        # (seen on openSUSE Leap 16, whose compute-runtime 25.18 lists no Arc Pro B70)
-        fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
-             f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
-             "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for this "
-             "GPU: install a newer one (docs/XE.md#packages) and run setup again")
-    built_here = Path(comp["cxx"]).parent.parent == INTEL_LLVM_DEFAULT
-    if not xmx and not allow_no_xmx:
-        say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX (its "
-            "matrix engines): the engine would run, but its prompt processing about 1.6 times slower.")
-        choices = {"1": "build without XMX", "2": "build intel/llvm 7 or later here and use it (13 minutes on 28 "
-                   "threads, 3.5 GB)", "3": "stop"}
-        if built_here:                                 # it is already the intel/llvm built here
-            del choices["2"]
-        if nonfree and icpx is None:
-            choices = {"0": "install Intel's icpx (not free software) and run setup again", **choices}
-        for k, v in choices.items():
-            say(f"  {k}) {v}")
-        pick = ask("Which?", list(choices), "3", a.yes)
-        if pick == "0":
-            fail("install icpx, then run setup again", ICPX_HOW)
-        if pick == "3":
-            fail("stopped: no XMX for this GPU",
-                 ("" if built_here else "build intel/llvm here (--intel-llvm-build), or ") +
-                 "accept the slower prompt path (--allow-no-xmx)" + (f"; or {ICPX_HOW}" if nonfree else ""))
-        if pick == "2":
+        llvm_dir = a.intel_llvm or st.get("intel_llvm")
+        comp = None
+        if llvm_dir:
+            d = Path(llvm_dir).expanduser().resolve()
+            if not (d / "bin" / "clang++").exists():
+                fail(f"--intel-llvm {d}: no bin/clang++ there", "give the folder intel/llvm was installed to")
+            comp = free_compiler(d)
+        elif (c := os_compiler()) is not None:
+            comp = c
+        elif a.intel_llvm_build:
             comp = free_compiler(build_intel_llvm(a))
             llvm_dir = str(INTEL_LLVM_DEFAULT)
-            if not probe_xmx(comp, pci):
-                fail("the intel/llvm built here gives this GPU no XMX either",
-                     "accept the slower prompt path with --allow-no-xmx" + (f", or {ICPX_HOW}" if nonfree else ""))
-            xmx = True
-        else:
-            allow_no_xmx = True
-    save_settings({**load_settings(), "nonfree": nonfree, "allow_no_xmx": allow_no_xmx,
-                   **({"intel_llvm": llvm_dir} if llvm_dir else {})})
+        if comp is not None and comp["kind"] == "os" and a.intel_llvm_build and not probe_xmx(comp, pci):
+            say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using intel/llvm built here (--intel-llvm-build)")
+            comp = free_compiler(build_intel_llvm(a))
+            llvm_dir = str(INTEL_LLVM_DEFAULT)
+        if comp is None:
+            fail("no SYCL compiler for the engine", FREE_HOW + "\n       (--license contrib-icpx builds with Intel's "
+                 "icpx, which is not free software)")
+        kept = {"intel_llvm": llvm_dir} if llvm_dir else {}
+    if mode != "free" and mkl_root() is None:
+        fail(f"--license {mode} hands the dense matrix products to oneMKL, which is not installed", MKL_HOW)
+    if gpu.get("vendor") == "nvidia":
+        # the tensor cores through cuBLAS and joint_matrix: the XMX question is Intel's
+        xmx = False
+    else:
+        probed = probe_gpu(comp, pci)
+        if probed == {}:
+            # no compiler makes the engine run on a GPU its driver does not list (seen on openSUSE Leap 16, whose
+            # compute-runtime 25.18 lists no Arc Pro B70)
+            fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
+                 f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
+                 "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for "
+                 "this GPU: install a newer one (docs/XE.md#packages) and run setup again")
+        xmx = has_xmx(probed)
+        built_here = Path(comp["cxx"]).parent.parent in (INTEL_LLVM_DEFAULT, INTEL_LLVM_CONTRIB)
+        if not xmx and not allow_no_xmx:
+            say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX "
+                "(its matrix engines): the engine would run, but its prompt processing about 1.6 times slower.")
+            choices = {"1": "build without XMX", "2": "build intel/llvm 7 or later here and use it (13 minutes on 28 "
+                       "threads, 3.5 GB)", "3": "stop"}
+            if built_here or mode != "free":           # the contrib modes' compilers are not replaced here
+                del choices["2"]
+            for k, v in choices.items():
+                say(f"  {k}) {v}")
+            pick = ask("Which?", list(choices), "3", a.yes)
+            if pick == "3":
+                fail("stopped: no XMX for this GPU",
+                     ("" if built_here or mode != "free" else "build intel/llvm here (--intel-llvm-build), or ") +
+                     "accept the slower prompt path (--allow-no-xmx)" +
+                     ("; or --license contrib-icpx (Intel's icpx)" if mode != "contrib-icpx" else ""))
+            if pick == "2":
+                comp = free_compiler(build_intel_llvm(a))
+                kept = {"intel_llvm": str(INTEL_LLVM_DEFAULT)}
+                if not probe_xmx(comp, pci):
+                    fail("the intel/llvm built here gives this GPU no XMX either",
+                         "accept the slower prompt path with --allow-no-xmx, or --license contrib-icpx (Intel's icpx)")
+                xmx = True
+            else:
+                allow_no_xmx = True
+    st = {k: v for k, v in load_settings().items() if k != "nonfree"}
+    save_settings({**st, "license": mode, "allow_no_xmx": allow_no_xmx, **kept})
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
     comp["xmx"] = xmx
-    ok(f"SYCL compiler: {comp['version']} ({'free' if not comp['nonfree'] else 'not free: --nonfree'}; "
-       f"{'XMX' if xmx else 'no XMX: the slower prompt path'})")
+    what = ("NVIDIA's tensor cores" if gpu.get("vendor") == "nvidia" else
+            "XMX" if xmx else "no XMX: the slower prompt path")
+    ok(f"SYCL compiler: {comp['version']} ({mode}; {what}" +
+       (f"; NVIDIA code for {', '.join(comp['cuda_archs'])}" if comp["cuda_archs"] else "") + ")")
     return comp
 
 
 def check_build_tools(comp: dict, sycl_vision: bool) -> None:
     """What the build needs besides the SYCL compiler: the Level Zero headers for the engine, g++ for the CPU image
-    encoder, glslc and the Vulkan headers for the Vulkan one, and oneMKL for the SYCL one (ggml-sycl, --nonfree).
+    encoder, glslc and the Vulkan headers for the Vulkan one, and oneMKL for the SYCL one (ggml-sycl, contrib-icpx).
     Setup does not install them (no apt or sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
@@ -960,11 +1060,10 @@ def engine_is_xe(meta: dict) -> bool:
 
 
 def gpu_encoder(comp: dict) -> str:
-    """The GPU image encoder this build makes: ggml-sycl ("gpu") when --nonfree has icpx and oneMKL, else Vulkan."""
+    """The GPU image encoder this build makes: ggml-sycl ("gpu") in the contrib-icpx mode with oneMKL, else Vulkan."""
     env = oneapi_env() or {}
-    if comp.get("nonfree") or load_settings().get("nonfree"):
-        if icpx_compiler() is not None and Path(env.get("MKLROOT", "")).is_dir():
-            return "gpu"
+    if comp.get("license") == "contrib-icpx" and Path(env.get("MKLROOT", "")).is_dir():
+        return "gpu"
     return "vulkan"
 
 
@@ -979,7 +1078,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     xe = engine_is_xe(meta)
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
-    used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"]}
+    used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
+            "license": comp["license"], "cuda_archs": comp["cuda_archs"]}
     engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
@@ -999,7 +1099,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
             and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
         cmake_build(ROOT, bdir, "strata",
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
-                     f"-DSTRATA_LICENSE={'contrib-icpx' if comp['nonfree'] else 'free'}", "-DSTRATA_ENABLE_XE=ON",
+                     f"-DSTRATA_LICENSE={comp['license']}", f"-DSTRATA_CUDA_ARCHS={';'.join(comp['cuda_archs'])}",
+                     *([f"-DMKL_ROOT={mkl_root()}"] if comp["license"] != "free" else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
                      f"-DSTRATA_GGML_DIR={llama}"], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
@@ -1037,18 +1138,20 @@ def sycl_encoder_onednn() -> bool:
 
 def recorded_compiler(meta: dict) -> dict:
     """The compiler an installed engine was built with, for building it again after a `git pull` without asking.  An
-    engine from before the free build (no record) was built with icpx: it stays so, as --nonfree."""
+    engine from before the free build (no record) was built with icpx: it stays so, as --license contrib-icpx."""
     rec = meta.get("compiler") or {"kind": "icpx", "xmx": True}
     if rec["kind"] == "intel-llvm":
-        comp = free_compiler(Path(rec["cxx"]).parent.parent)
+        comp = free_compiler(Path(rec["cxx"]).parent.parent, rec.get("license", "free"))
+        if comp["license"] == "contrib":
+            comp["cuda_archs"] = cuda_archs()
     elif rec["kind"] == "os":
         comp = os_compiler()
     else:
         comp = icpx_compiler()
         if comp is not None and "compiler" not in meta:
-            save_settings({**load_settings(), "nonfree": True})
-            say("  the installed engine was built with icpx (not free software): building it so again (--nonfree); "
-                "./setup.sh --setup --nonfree off chooses a free compiler")
+            save_settings({**{k: v for k, v in load_settings().items() if k != "nonfree"}, "license": "contrib-icpx"})
+            say("  the installed engine was built with icpx (not free software): building it so again "
+                "(--license contrib-icpx); ./setup.sh --setup --license free chooses a free compiler")
     if comp is None or not Path(comp["cxx"]).exists():
         fail("the compiler the engine was built with is gone", "run ./setup.sh --setup to choose one")
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
@@ -1837,10 +1940,11 @@ def main() -> int:
                                        "remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
-    ap.add_argument("--nonfree", choices=["on", "off"],
-                    help="on: also allow non-free tools (Intel oneAPI's icpx when no free compiler gives the GPU XMX, "
-                         "oneMKL for the SYCL image encoder); off (the default): free software only. Kept for "
-                         "later runs")
+    ap.add_argument("--license", choices=LICENSES,
+                    help="the build mode: free (the default) builds with free software only, for Intel GPUs; contrib "
+                         "builds with intel/llvm's CUDA target for Intel and NVIDIA GPUs, and hands the dense matrix "
+                         "products to oneMKL and cuBLAS; contrib-icpx builds with Intel oneAPI's icpx and oneMKL, for "
+                         "Intel GPUs, with the SYCL image encoder. Kept for later runs")
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
     ap.add_argument("--intel-llvm-build", action="store_true",
@@ -1880,6 +1984,8 @@ def main() -> int:
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    global ARGS
+    ARGS = a
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
@@ -1956,9 +2062,9 @@ def main() -> int:
     step(1, "checking your PC")
     found = gpus()
     if not found:
-        fail("no Intel GPU on the xe or i915 driver found",
+        fail("no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found",
              "Strata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 kernel "
-             "driver (lspci -k shows the driver)")
+             "driver, or with --license contrib an NVIDIA GPU on NVIDIA's driver (lspci -k shows the driver)")
     if len(found) > 1 or gpu_problem(found[0]) is not None:
         gpu_table(found)
     gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
@@ -1971,6 +2077,7 @@ def main() -> int:
     ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
     if gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
+             "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
     if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
         warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the CPU. "
@@ -2224,7 +2331,7 @@ def main() -> int:
     step(4, "the Strata engine")
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    comp = choose_compiler(a, gpu["pci"])
+    comp = choose_compiler(a, gpu)
     enc = gpu_encoder(comp)
     eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
     # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when this

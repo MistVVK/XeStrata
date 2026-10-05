@@ -17,7 +17,7 @@ XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, aft
 
 - free (the default, `STRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ (`dpclang++` from the distribution, or one built from source); icpx is refused.
 - contrib (`-DSTRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target (`STRATA_CUDA_ARCHS`), for NVIDIA GPUs as well. Its dense matrix products go through oneMath (`third_party/main/oneMath`, Apache-2.0): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones. It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
-- contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): may also use non-free tools and libraries: Intel oneAPI's icpx and the runtime libraries it links, oneMKL for the dense matrix products (through oneMath) and the SYCL image encoder (ggml-sycl), for Intel GPUs. It allows them; it does not require them, and the free choice is taken when it serves as well (setup picks icpx only when no free compiler gives the GPU its matrix engines).
+- contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): the same free source built with Intel oneAPI's icpx and the runtime libraries it links, with oneMKL for the dense matrix products (through oneMath) and the SYCL image encoder (ggml-sycl), for Intel GPUs. setup builds in this mode only when asked (`--license contrib-icpx`).
 
 Rules:
 

@@ -108,7 +108,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
    - 新しい intel/llvm をこの場でビルドする（`--intel-llvm-build`）。
    - 止める。
 
-  `--nonfree on` を付けると、Intel oneAPI の icpx も候補にします。
+  `--license contrib-icpx` で Intel oneAPI の icpx、`--license contrib` で NVIDIA の GPU も使えるビルドにします（どちらも自由ソフトウェアでない部品を使います）。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
   GPU のコードは初めて使うときにドライバーがコンパイルするので、setup は最後にモデルを一度動かしてそれを済ませます。
 - **起動中は PC が重くなります**: モデルを起動すると、RAM に 23〜50 GB を読み込みます。初回はとくに時間がかかり、

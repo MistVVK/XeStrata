@@ -108,7 +108,7 @@ it. Your browser opens `http://127.0.0.1:8095`.
    - build a newer intel/llvm here (`--intel-llvm-build`);
    - stop.
 
-  With `--nonfree on` it also considers Intel oneAPI's icpx.
+  `--license contrib-icpx` builds with Intel oneAPI's icpx, `--license contrib` for NVIDIA GPUs as well (both use parts that are not free software).
 - **Time:** the first time, the download (60-110 GB) and the build take a while. If you stop it, the next run
   continues where it stopped. The driver compiles the GPU code the first time it is used, so setup ends by running
   the model once to get that done.
