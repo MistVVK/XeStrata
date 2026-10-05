@@ -179,3 +179,10 @@ main { flex: 1; min-height: 0; display: flex; }
   .facts { grid-template-columns: 1fr; gap: 2px; }
   .facts dd { margin-bottom: var(--st-s-2); }
 }
+/* the model menu (a host that swaps models: config model_switcher) */
+.model-switch{display:flex;align-items:center;gap:var(--st-s-2);font-size:var(--st-fs-sm);color:var(--st-ink-muted)}
+.model-switch[hidden]{display:none}
+.model-switch select{font:inherit;color:var(--st-ink);background:var(--st-surface-2);border:1px solid var(--st-line);
+  border-radius:var(--st-r-md);padding:4px 8px;max-width:340px}
+.model-switch select:focus{outline:2px solid var(--st-focus);outline-offset:1px}
+@media (max-width:640px){.model-switch__k{display:none}.model-switch select{max-width:150px}}

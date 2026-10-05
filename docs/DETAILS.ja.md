@@ -504,6 +504,9 @@ print(r.choices[0].message.content)
   それぞれが自分の `id` を持ち、モデルの `aliases` にも入ります（llama-server の `--alias` と同じ）。
   別名で呼ばれた要求には、その名前で答えます。
   ほかの名前でも、これまでどおり答えます。
+- **モデルを入れ替えるホストのメニュー（upstream 717e7e8）**: 1 枚の GPU で一度に 1 つのモデルだけを動かし、入れ替えるホストでは、`xestrata-<model>.json` の `"model_switcher"` にその入れ替えの RPC（`{"mode": m}` を受け取る URL）を書くと、ウェブのページの見出しに、このポートで出すモデルのメニューが出ます。
+  選ぶと server が RPC に入れ替えを頼み、ページは `/health` が新しいモデルの名前を返すまで待って読み直します。
+  入れ替えを頼めるのは、`/settings` と同じく XeStrata 自身のページの JSON だけです。
 - **ウェブのページのモデルの設定（upstream #564）**: About のタブの Model settings のカードで、`xestrata-<model>.json` のいくつかのキーを見て変えられます。
   `sampling` の既定（temperature、top_p、top_k、min_p）、`reasoning_budget_tokens`、`fit_max_tokens`、`anthropic_thinking`、`effort_position`、`aliases`、`idle_unload_s`、`lazy_load`、`engine_silence_s`、`api_monitor`、`open_browser`、`--vram-reserve-mib` です。
   空の欄はそのキーを消します（既定に戻ります）。

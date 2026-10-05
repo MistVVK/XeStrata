@@ -111,6 +111,55 @@ async function loadHealth() {
   }
 }
 
+// ------------------------------------------------------------------ the model menu
+// A host that swaps models on one GPU (config model_switcher): this page offers the ones served here. Switching
+// stops THIS server and starts the other on the same port, so the page waits for /health to name the new model.
+let switching = null;
+async function loadSwitcher() {
+  let sw;
+  try { sw = await (await fetch("switcher", {headers: headers()})).json(); } catch (e) { return; }
+  const keys = Object.keys(sw.choices || {});
+  if (!sw.enabled || sw.error || keys.length < 2) { $("model-switch").hidden = true; return; }
+  const sel = $("model-select");
+  sel.replaceChildren(...keys.map((k) => {
+    const o = document.createElement("option");
+    o.value = k;
+    o.textContent = sw.choices[k].replace(/ \(Strata SYCL engine\)$/, "");
+    o.selected = k === (sw.starting || sw.mode);
+    return o;
+  }));
+  sel.disabled = !!sw.starting || !!switching;
+  $("model-switch").hidden = false;
+  if (sw.starting && !switching) setPill("reading", `Loading ${sw.choices[sw.starting] || sw.starting}…`);
+}
+$("model-select").onchange = async () => {
+  const mode = $("model-select").value, name = $("model-select").selectedOptions[0].textContent;
+  if (!confirm(`Load ${name}? The current model is unloaded first; it takes about 2 minutes and stops any answer in progress.`)) {
+    loadSwitcher();
+    return;
+  }
+  switching = {mode, from: health.model, t0: Date.now()};
+  $("model-select").disabled = true;
+  setPill("reading", `Switching to ${name}… (about 2 minutes)`, true);
+  try {
+    await fetch("switcher", {method: "POST", headers: headers(true), body: JSON.stringify({mode})});
+  } catch (e) { /* this server may already be going down */ }
+  const wait = async () => {
+    try {
+      const h = await (await fetch("health", {cache: "no-store"})).json();
+      if (h.model && h.model !== switching.from) { location.reload(); return; }
+    } catch (e) { /* down while the models swap */ }
+    if (Date.now() - switching.t0 > 6 * 60 * 1000) {
+      setPill("error", `${name} did not come up in 6 minutes`, true);
+      switching = null;
+      return;
+    }
+    setPill("reading", `Switching to ${name}… ${Math.round((Date.now() - switching.t0) / 1000)} s`, true);
+    setTimeout(wait, 3000);
+  };
+  setTimeout(wait, 5000);
+};
+
 // ------------------------------------------------------------------ Monitor
 const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
@@ -175,7 +224,8 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
-function setPill(state, text) {
+function setPill(state, text, force = false) {
+  if (switching && !force) return;   // while the models swap, the menu owns the pill
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
 }
@@ -1037,6 +1087,7 @@ setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+loadHealth().then(loadSwitcher).then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
+setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

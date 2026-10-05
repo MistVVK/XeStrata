@@ -494,6 +494,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   (each with its own `id`, and in the model's `aliases`), like llama-server's `--alias`.
   A request naming one is answered under that name.
   Any other name is still served.
+- **A model menu for a host that swaps models (upstream 717e7e8).** On a host that runs one model at a time on a GPU and swaps them, `"model_switcher"` in `xestrata-<model>.json` names the RPC that does the swap (a URL taking `{"mode": m}`); the web page's header then has a menu of the models served on this port.
+  Choosing one makes the server ask the RPC for the swap, and the page waits for `/health` to name the new model, then reloads.
+  Only XeStrata's own page can ask for a swap (JSON, as for `/settings`).
 - **Model settings in the web page (upstream #564).** The About tab's Model settings card shows and changes a few keys of `xestrata-<model>.json`:
   the `sampling` defaults (temperature, top_p, top_k, min_p), `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `--vram-reserve-mib`.
   An empty field removes the key (its default).

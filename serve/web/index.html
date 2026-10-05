@@ -24,6 +24,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 <body>
 <header class="st-header">
   <span class="st-header__brand">XeStrata</span>
+  <!-- the model on the GPU, when the host swaps models (config model_switcher); hidden otherwise -->
+  <label class="model-switch" id="model-switch" hidden title="Which model is loaded. Only one fits on the GPU at a time: switching unloads this one and loads the other (about 2 minutes).">
+    <span class="model-switch__k">Model</span>
+    <select id="model-select" aria-label="Model on the GPU"></select>
+  </label>
   <nav class="st-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>

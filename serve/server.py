@@ -1112,6 +1112,28 @@ class Detokenizer:
         return delta
 
 
+def model_switcher(svc, mode: str = "") -> dict:
+    """The host's model swapper (config `model_switcher`, an RPC taking {"mode": m}): the models it serves on THIS
+    port, which one holds the card, whether one is loading. With `mode`, asks for that one first; this server is
+    then usually the one stopped, so the web app waits for /health to name the new model."""
+    url = getattr(svc, "switcher", None)
+    if not url:
+        return {"enabled": False}
+    try:
+        body = json.dumps({"mode": mode} if mode else {}).encode()
+        req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            res = json.load(r)
+        st = res.get("result", res)
+    except (OSError, ValueError) as e:
+        return {"enabled": True, "error": f"the model switcher did not answer ({e})"}
+    port = f":{getattr(svc, 'port', '')}"
+    urls = st.get("urls") or {}
+    mine = {k: v for k, v in (st.get("choices") or {}).items() if not urls or str(urls.get(k, "")).endswith(port)}
+    return {"enabled": True, "mode": st.get("mode"), "up": st.get("up"), "starting": st.get("starting"),
+            "choices": mine, "model": svc.model}
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -1132,6 +1154,8 @@ class Service:
         self.effort_end = False
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
+        self.switcher: str | None = None                # the host's model swapper RPC (config model_switcher)
+        self.port = 0                                   # the port this server listens on (the switcher's models)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
         # matters); empty = no CORS headers at all, as before
         self.cors_origins: list[str] = []
@@ -2455,6 +2479,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._config_get()
                 return
+            if path == "/switcher":
+                if self._authorized():
+                    self._json(200, model_switcher(svc))
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -2523,6 +2551,17 @@ def make_handler(svc: Service):
                 return
             if path == "/settings":
                 self._settings()
+                return
+            if path == "/switcher":                     # the web app's model menu: ask the host to swap models
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                if not self._own_page("the model can be switched"):   # as /settings: a page elsewhere must not
+                    return
+                try:
+                    req = json.loads(body or b"{}")
+                except ValueError:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": "send a JSON object"}})
+                    return
+                self._json(200, model_switcher(svc, str(req.get("mode") or "") if isinstance(req, dict) else ""))
                 return
             if path == "/config":
                 self._config_post()
@@ -3490,6 +3529,10 @@ def main() -> int:
     svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
+    # the swap: the web app then offers the models served on this port. {"mode": m} switches, {} only reports.
+    svc.switcher = cfg.get("model_switcher") or None
+    svc.port = a.port
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
