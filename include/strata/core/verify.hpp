@@ -34,6 +34,7 @@
 #include "strata/core/gpu.hpp"
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -126,6 +127,33 @@ public:
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
+    // ================================ SEVERAL SEQUENCES IN ONE WINDOW (upstream PR #559) ================================
+    //
+    // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
+    // reading and writing slot s's own state (GDN recurrence and conv history, QSA K/V and indexer, PLE history),
+    // which lives in `slots[s]` - a session carved like this verifier's own (same max_cells).  Everything that is per
+    // row already (hyper-connections, dense projections, router, shared expert, the routed experts on the GPU and the
+    // CPU, the head) runs once over the S rows, so the weights are read once per window for all the sequences.  Row
+    // s's arithmetic is the single-token window's, so a slot's greedy tokens are its solo greedy tokens (modulo the
+    // multi-token CPU kernel choice: STRATA_IQ_MT_MIN=1).  No drafts (MTP) in a batch window.  `init_slots` once
+    // after `init` (S <= max_t); a GPU that runs windows as segments (doorbell_visible false) takes none.
+    bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    int n_slots() const { return (int) slots_.size(); }
+    /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the pick after it.
+    bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
+                   std::string& err);
+    /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not listed
+    /// are not touched, so an idle slot keeps its state (a finished conversation it may continue later; #465).
+    bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
+                       int32_t* out, std::string& err);
+    /// Keep every row of the last batch window: each slot's state advances by its one token.
+    bool commit_slots(std::string& err);
+    /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
+    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.
+    void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
+        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+    }
+
     /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,
     /// temperature and penalties) into `host` (vocab() floats); false when there is none.  OpenAI's logprobs.
     bool copy_logits(int t, float* host) const;
@@ -179,6 +207,27 @@ private:
     // Every expert of the verifier's layers resident (hits.h_res): the window runs as one graph that plans each
     // layer's experts on the device and never asks the host - no doorbell, flag waits, PCIe or CPU share (upstream
     // cfd3b72's zero-doorbell graph).  STRATA_VERIFY_RESIDENT_GRAPH=0: off.
+    // batch windows (see init_slots)
+    std::vector<SessionState*> slots_;
+    bool batch_rec_ = false;               ///< record_window is capturing a batch window
+    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    std::map<uint64_t, strata::gpu::Graph*> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S)
+    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    static uint64_t batch_key(const int* rows, int S) {
+        uint64_t k = (uint64_t) S << 32;
+        for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
+        return k;
+    }
+    std::vector<strata::kernels::SamplerParams> slot_sp_;
+    int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
+    int32_t* commitb_ = nullptr;
+    float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
+    void* arena_b_ = nullptr;
+    int64_t last_pos_b_[8] = {};
+    bool capture_batch(const int* rows, int S, std::string& err);
+    bool capture_commit_batch(const int* rows, int S, std::string& err);
+    bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
     strata::gpu::Graph* exec_res_[9] = {};

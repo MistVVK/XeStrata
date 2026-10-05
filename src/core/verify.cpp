@@ -129,6 +129,12 @@ Verifier::~Verifier() {
     for (auto& v : segs_)
         for (auto* e : v) strata::gpu::graph_destroy(e);
     if (commit_exec_) strata::gpu::graph_destroy(commit_exec_);
+    for (auto& kv : exec_bm_)
+        if (kv.second) strata::gpu::graph_destroy(kv.second);
+    for (auto& kv : commit_bm_)
+        if (kv.second) strata::gpu::graph_destroy(kv.second);
+    if (arena_b_) strata::gpu::free(arena_b_);
+    if (h_commitb_) strata::gpu::free(h_commitb_);
     if (cs_) strata::gpu::stream_destroy(cs_);
     if (copy_) { strata::gpu::stream_sync(copy_); strata::gpu::stream_destroy(copy_); }
     if (commit_done_) strata::gpu::event_destroy(commit_done_);
@@ -368,11 +374,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2) ? 2 : 1;
+    const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
-    groups_[T] = G;
+    if (!batch_rec_) groups_[T] = G;
+    const int64_t nQall = g.n_qsa_layers();
+    // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
+    auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -445,14 +454,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 PleOut po;
                 po.normalized = normalized;
                 po.result = Rt(t);
+                float* hist = batch_rec_ ? slot_ss(t).ple_hist : ss.ple.hist;   // the row's own history
                 try {
-                    ple_block(ple_ + t * N, Rt(t), ss.ple.hist, ss.ple.w, po, ss.ple.scratch, cs);
-                    ple_history_advance(ss.ple.hist, normalized, cs);
+                    ple_block(ple_ + t * N, Rt(t), hist, ss.ple.w, po, ss.ple.scratch, cs);
+                    ple_history_advance(hist, normalized, cs);
                 } catch (const std::exception& e) {
                     err = std::string("verify PLE: ") + e.what();
                     return false;
                 }
-                copy_from_mapped(hist_snap_ + (size_t) t * HS, ss.ple.hist, HS, cs);
+                copy_from_mapped(hist_snap_ + (size_t) t * HS, hist, HS, cs);
             }
             pending = false;
         }
@@ -495,6 +505,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
+                if (batch_rec_) {   // each row from its own slot's conv history, one row each
+                    for (int t = tb; t < te; ++t) {
+                        const float* cx = slot_ss(t).gdn_state + (size_t) gi * gdn_floats +
+                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        gdn_conv_l2_multi(cx, qkv + (size_t) t * C, (const float*) wc->data, hb + (size_t) t * C, (int) C,
+                                          (int) (2 * HK), EPS, 1, cs, 0);
+                    }
+                } else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
                 stamp(l, 3, grp);
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -504,6 +522,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
+                if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
+                    for (int t = tb; t < te; ++t) {
+                        float* stx = slot_ss(t).gdn_state + (size_t) gi * gdn_floats;
+                        gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
+                                            z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
+                                            (int) HK, (int) HV, 1, nullptr, cs, 0);
+                    }
+                } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, nullptr, cs, tb);
                 stamp(l, 6, grp);
@@ -548,8 +574,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
+                if (batch_rec_) {   // every slot's indexer tail, restored by its commit
+                    for (int t = tb; t < te; ++t)
+                        copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                         slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
+                } else
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
                 for (int t = tb; t < te; ++t) {
+                    const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
                     const int32_t* step_t = step_ + t * kStepCount;
                     if (st.kv_hybrid) {   // K8V4: the used pool for both halves (layer.cpp)
                         kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
@@ -566,11 +598,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
-                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                for (int t = tb; t < te; ++t)
+                for (int t = tb; t < te; ++t) {
+                    const QsaState& sx = slot_ss(t).qsa_states[qi];
+                    const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
                     native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                              (const float*) wikn->data, EPS, ib, s, sx.max_cells,
                                               rope_scaling(), cs);
+                }
                 stamp(l, 9, grp);
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
@@ -601,6 +635,21 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 }
                 }
                 stamp(l, 10, grp);
+                if (batch_rec_) {   // each row selects and attends over its own slot's K/V
+                    for (int t = tb; t < te; ++t) {
+                        const QsaState& sx = slot_ss(t).qsa_states[qi];
+                        const int32_t* step_t = step_ + (size_t) t * kStepCount;
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + (size_t) t * IQ * ID, step_t, 1,
+                                         max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
+                        qsa_block_topk(scores_ + (size_t) t * max_blocks_, step_t, 1, max_blocks_, cap_, s,
+                                       sel_ + (size_t) t * cap_, cs);
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) t * cap_, step_t, 1, cap_, cs);
+                        const QsaAttnPools px = qsa_attn_pools(sx);
+                        qsa_decode_attn_batch(qcur_ + (size_t) t * NH * HD, px, sel_ + (size_t) t * cap_, step_t,
+                                              cap_, s, attn_scratch_ + (size_t) t * attn_scratch_floats_,
+                                              attn_ + t * NH * HD, 1, cs);
+                    }
+                } else {
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
@@ -612,6 +661,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
+                }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
@@ -1020,6 +1070,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                    std::string& err) {
     using namespace strata::kernels;
     const OnDevice on_device(device_);
+    last_batch_ = false;
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -1218,7 +1269,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int G = groups_[last_t_] > 0 ? groups_[last_t_] : 1;
+    const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
@@ -1271,6 +1322,299 @@ bool Verifier::wait_commit(std::string& err) {
         }
     }
     return next_ == nullptr || next_->wait_commit(err);
+}
+
+// ================================ BATCH WINDOWS (see init_slots; upstream PR #559) ================================
+
+bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& err) {
+    const OnDevice on_device(device_);
+    if (g_ == nullptr || ss_ == nullptr) { err = "verify: init_slots before init"; return false; }
+    if (segmented_) { err = "verify: batch windows need a GPU whose running kernels see the host's writes"; return false; }
+    if (slots.empty() || (int) slots.size() > max_t_) {
+        err = "verify: init_slots needs 1.." + std::to_string(max_t_) + " sessions";
+        return false;
+    }
+    for (SessionState* x : slots)
+        if (x == nullptr || x->max_cells != ss_->max_cells) {
+            err = "verify: a slot's session is not carved like the verifier's own (context)";
+            return false;
+        }
+    const strata::kernels::QsaShapes s = shapes_of(*g_);
+    const int64_t S = (int64_t) slots.size(), CB = 2 + max_t_;
+    const int64_t TS = (s.idx_block - 1) * g_->idx_key_dim, nQ = g_->n_qsa_layers();
+    if (!mapped((size_t) (S * CB * 4 + 16), (void**) &h_commitb_, (void**) &m_commitb_)) {
+        err = "verify: the batch commit staging failed";
+        return false;
+    }
+    const uint64_t a = ((uint64_t) S * CB * 4 + 255) & ~255ull;
+    if (!strata::gpu::alloc_device(&arena_b_, a + (uint64_t) S * std::max<int64_t>(nQ, 1) * TS * 4)) {
+        err = "verify: the batch buffers do not fit";
+        return false;
+    }
+    commitb_ = (int32_t*) arena_b_;
+    tail_snap_b_ = reinterpret_cast<float*>(static_cast<uint8_t*>(arena_b_) + a);
+    slots_ = slots;
+    slot_sp_.assign(slots.size(), sampling_);   // greedy until set_slot_sampling
+    std::fprintf(stderr, "strata verify: batch windows of up to %lld sequences\n", (long long) S);
+    return true;
+}
+
+bool Verifier::capture_batch(const int* rows, int S, std::string& err) {
+    strata::gpu::Graph*& ex = exec_bm_[batch_key(rows, S)];
+    if (ex != nullptr) return true;
+    if (!strata::gpu::begin_capture(cs_)) { err = "verify: begin batch capture failed"; return false; }
+    batch_rec_ = true;
+    for (int t = 0; t < S; ++t) brow_[t] = rows[t];
+    std::string rerr;
+    bool ok = false;
+    try {
+        ok = record_window(S, cs_, rerr);
+    } catch (const std::exception& e) {
+        rerr = std::string("verify: batch capture: ") + e.what();
+    }
+    batch_rec_ = false;
+    if (!ok) {
+        strata::gpu::abandon_capture(cs_);
+        err = rerr;
+        return false;
+    }
+    if (!strata::gpu::end_capture(cs_, &ex)) {
+        err = std::string("verify: end batch capture: ") + strata::gpu::last_error();
+        return false;
+    }
+    const bool synced = strata::gpu::stream_sync(cs_);
+    std::string list;
+    for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
+    std::fprintf(stderr, "strata verify: captured the batch window over slots %s (sync %s)\n", list.c_str(),
+                 synced ? "ok" : strata::gpu::last_error());
+    return true;
+}
+
+bool Verifier::capture_commit_batch(const int* rows, int S, std::string& err) {
+    strata::gpu::Graph*& cex = commit_bm_[batch_key(rows, S)];
+    if (cex != nullptr) return true;
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim, ID = g.idx_key_dim, MT = max_t_;
+    const int64_t CB = 2 + MT, nQ = g.n_qsa_layers();
+    const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+    const int64_t TS = (s.idx_block - 1) * ID;
+    const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
+    if (!strata::gpu::begin_capture(cs_)) { err = "verify: begin batch commit capture failed"; return false; }
+    bool ok = true;
+    try {
+        for (int t = 0; t < S; ++t)
+            copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
+        int64_t qsa_index = 0, gdn_index = 0;
+        for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+        for (int64_t l = lb_; l < le_ && ok; ++l) {
+            const LayerView v(*wt_, l);
+            if (!is_qsa_layer(g, l)) {
+                const WeightRef* wnm = need(v, "ssm_norm.weight", err);
+                if (!wnm) { ok = false; break; }
+                for (int t = 0; t < S; ++t) {
+                    SessionState& sx = *slots_[(size_t) rows[t]];
+                    const int32_t* keep = commitb_ + (size_t) rows[t] * CB;
+                    float* state = sx.gdn_state + (size_t) gdn_index * gdn_floats;
+                    float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C, keep, cs_);
+                    gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C,
+                                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV,
+                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) t * HV, z_ + (size_t) t * ZV,
+                                        (const float*) wnm->data, EPS, y_dummy_ + (size_t) t * ZV, (int) g.ssm_k_heads,
+                                        (int) HV, 1, keep, cs_);
+                }
+                ++gdn_index;
+            } else {
+                const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);
+                if (!wikn) { ok = false; break; }
+                for (int t = 0; t < S; ++t) {
+                    const QsaState& st = slots_[(size_t) rows[t]]->qsa_states[qsa_index];
+                    copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[t] * nQ + qsa_index) * TS, TS, cs_);
+                    const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
+                                              0, (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
+                }
+                ++qsa_index;
+            }
+        }
+        if (ok && ss_->ple.ready() && ple_stage())
+            for (int t = 0; t < S; ++t)
+                copy_indexed(slots_[(size_t) rows[t]]->ple_hist, hist_snap_ + (size_t) t * HS, HS,
+                             commitb_ + (size_t) rows[t] * CB + 1, HS, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify batch commit: ") + e.what();
+        ok = false;
+    }
+    if (!ok) {
+        strata::gpu::abandon_capture(cs_);
+        return false;
+    }
+    if (!strata::gpu::end_capture(cs_, &cex)) {
+        err = std::string("verify: batch commit capture: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
+                         std::string& err) {
+    int rows[8] = {};
+    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
+    return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
+}
+
+bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
+                             void* user, int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    if (S < 1 || S > max_t_ || S > (int) slots_.size()) { err = "verify: batch rows out of range (init_slots)"; return false; }
+    const ModelGeometry& g = *g_;
+    for (int t = 0; t < S; ++t) {
+        bool dup = false;
+        for (int u = 0; u < t; ++u) dup = dup || rows[u] == rows[t];
+        if (rows[t] < 0 || rows[t] >= (int) slots_.size() || dup) {
+            err = "verify: a batch row's slot is out of range or twice";
+            return false;
+        }
+        if (pos[t] < 0 || pos[t] + 1 > slots_[(size_t) rows[t]]->max_cells) {
+            err = "verify: slot " + std::to_string(rows[t]) + " runs past its context";
+            return false;
+        }
+    }
+    if (!capture_batch(rows, S, err) || !capture_commit_batch(rows, S, err)) return false;
+    const Clock::time_point t0 = Clock::now();
+    const QsaShapes s = shapes_of(g);
+    for (int t = 0; t < S; ++t) {
+        h_tok_[t] = tokens[t];
+        qsa_step_fill(h_step_ + (size_t) t * kStepCount, pos[t], s);
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
+        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
+        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
+    }
+    if (ss_->ple.ready() && ple_stage()) {
+        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+        for (int t = 0; t < S; ++t) {
+            const SessionState& sx = *slots_[(size_t) rows[t]];
+            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
+        }
+        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+    }
+    // the commit's rows (a batch window keeps every row): [1, 0, position, -1 ..] per slot
+    const int64_t CB = 2 + max_t_;
+    for (int t = 0; t < S; ++t) {
+        int32_t* c = h_commitb_ + (size_t) rows[t] * CB;
+        c[0] = 1;
+        c[1] = 0;
+        c[2] = (int32_t) pos[t];
+        for (int64_t j = 3; j < CB; ++j) c[j] = -1;
+    }
+    *(volatile uint32_t*) h_seq_ = 0;
+    *(volatile uint32_t*) h_flag_ = 0;
+    *(volatile uint32_t*) h_flagA_ = 0;
+    *(volatile uint32_t*) h_flagB_ = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    last_t_ = S;
+    last_batch_ = true;
+    for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; last_rows_[t] = rows[t]; }
+    ms_host += ms_since(t0);
+    if (!strata::gpu::graph_launch(exec_bm_[batch_key(rows, S)], cs_)) {
+        err = std::string("verify: batch launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    (void) strata::gpu::stream_idle(cs_);
+    volatile uint32_t* const seq = h_seq_;
+    volatile uint32_t* const flag = h_flag_;
+    for (int64_t k = 0; k < le_ - lb_; ++k) {
+        const int64_t l = lb_ + k;
+        const uint32_t want = (uint32_t) (k + 1);
+        const Clock::time_point a = Clock::now();
+        auto last_flush = a;
+        uint32_t spins = 0;
+        progress_at("verify batch: waiting for the GPU to reach layer", l);
+        while (*seq < want) {
+            _mm_pause();
+            if ((++spins & 1023u) != 0) continue;
+            const auto now = Clock::now();
+            if (now - last_flush > std::chrono::microseconds(2000)) {
+                last_flush = now;
+                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                    err = "verify batch: layer " + std::to_string(l) + " never rang (graph finished)";
+                    return false;
+                }
+            }
+            if (now - a > std::chrono::seconds(20)) { err = "verify batch: timed out at layer " + std::to_string(l); return false; }
+        }
+        const Clock::time_point b = Clock::now();
+        cur_layer_ = want - 1;
+        set_plan_slot(0);
+        progress_at("verify batch: the CPU experts of layer", l);
+        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        *flag = want;
+        ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
+        ms_pool += ms_since(b);
+    }
+    if (!strata::gpu::stream_sync(cs_)) { err = std::string("verify batch: ") + strata::gpu::last_error(); return false; }
+    strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
+    ++windows;
+    if (!sample_rows(S, err)) return false;
+    for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    progress_at("decode");
+    progress_beat();
+    return true;
+}
+
+bool Verifier::commit_slots(std::string& err) {
+    const OnDevice on_device(device_);
+    if (!last_batch_ || last_t_ < 1) { err = "verify: commit_slots without a batch window"; return false; }
+    const int S = last_t_;
+    const Clock::time_point t0 = Clock::now();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!strata::gpu::graph_launch(commit_bm_[batch_key(last_rows_, S)], cs_) || !strata::gpu::stream_sync(cs_)) {
+        err = std::string("verify: batch commit: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (ple_stage())
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) last_rows_[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = last_tokens_[t];
+        }
+    ms_commit += ms_since(t0);
+    return true;
+}
+
+bool Verifier::sample_rows(int S, std::string& err) {
+    bool any = false;
+    for (int t = 0; t < S; ++t) {
+        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
+        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
+        sp.penalty_last_n = 0;
+        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
+                                       m_out_ + t, cs_);
+        any = true;
+    }
+    if (any && !strata::gpu::stream_sync(cs_)) { err = "verify batch: the row sampling failed"; return false; }
+    return true;
 }
 
 bool Verifier::copy_logits(int t, float* host) const {
