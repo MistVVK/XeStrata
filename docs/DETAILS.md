@@ -346,7 +346,8 @@ setup rewrites the config when run again: add the key again then.
 
 ### When the draft head does not fit
 
-The MTP draft layer's head covers a token subset (`./setup.sh --draft-vocab cjk|cyrillic|en`; upstream #474).
+The MTP draft layer's head covers a token subset (`./setup.sh --draft-vocab cjk|cyrillic|fr|en`; upstream #474).
+`fr` is the English/code subset plus the tokens of French text, so French answers draft more (a head of about 151 MiB; upstream #597).
 The default includes Chinese, Japanese and Korean and takes up to about 348 MiB of VRAM.
 When the start stops with "the draft head does not fit", the engine says how much the head needs, how much VRAM is free and which smaller subset fits,
 and the server's start error repeats it.

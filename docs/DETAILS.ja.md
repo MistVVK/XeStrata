@@ -354,7 +354,8 @@ setup を実行し直すと設定は書き直されるので、そのときは�
 
 ### 推測のヘッドが入らないとき
 
-MTP の推測の層のヘッドは、トークンの一部だけを扱います（`./setup.sh --draft-vocab cjk|cyrillic|en`、upstream #474）。
+MTP の推測の層のヘッドは、トークンの一部だけを扱います（`./setup.sh --draft-vocab cjk|cyrillic|fr|en`、upstream #474）。
+`fr` は英語・コードの組にフランス語の文章のトークンを足したもので、フランス語の答えを推測しやすくなります（ヘッドは約 151 MiB、upstream #597）。
 既定は中国語、日本語、韓国語を含み、VRAM を最大約 348 MiB 使います。
 起動が「the draft head does not fit」で止まったときは、エンジンが、ヘッドに要る量、空いている VRAM、入る小さい組を示し、server の起動のエラーも同じことを繰り返します。
 VRAM が 14 GB 未満の GPU では、setup が `--draft-vocab en` を勧めます。

@@ -1639,7 +1639,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
 # The draft layer's token subsets (data/, written by tools/draft_vocab.py; upstream 6e153c9, 0fc1a1e, cbd0522): cjk
 # = with Chinese, Japanese and Korean (the default), en = English and code only (the subset before it), cyrillic =
 # English, code and the Cyrillic script.  The ones setup copied before are replaced; a subset made by hand is kept.
-DRAFT_VOCABS = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin"}
+DRAFT_VOCABS = {"cjk": "draft_vocab.bin", "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin",
+                "fr": "draft_vocab_fr.bin"}
 
 
 def vision_tokens(asked: int | None, vision: str, earlier: Path) -> int:
@@ -1677,7 +1678,8 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     return v if v in DRAFT_VOCABS else None
 
 
-DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "en": 133}   # the draft head's VRAM per subset (IQ3_S: the largest)
+# the draft head's VRAM per subset (IQ3_S: the largest)
+DRAFT_VOCAB_MIB = {"cjk": 348, "cyrillic": 193, "fr": 151, "en": 133}
 SMALL_DRAFT_VRAM_GB = 14   # #474: below this the default subset's head can be what does not fit
 
 
@@ -1717,7 +1719,7 @@ def refresh_draft_vocab(rt: Path, choice: str = "cjk") -> None:
                    for f in DRAFT_VOCABS.values() if (ROOT / "data" / f).exists()}
         if old not in shipped or old == hashlib.sha256(new.read_bytes()).hexdigest():
             return
-        what = {"cjk": "with Chinese, Japanese and Korean", "cyrillic": "with the Cyrillic script"}
+        what = {"cjk": "with Chinese, Japanese and Korean", "cyrillic": "with the Cyrillic script", "fr": "for French"}
         ok("draft layer: the token subset " + what.get(choice, "for English and code"))
     shutil.copyfile(new, dst)
 
@@ -2020,7 +2022,8 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
-                         "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script")
+                         "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
+                         "English, code and French (French answers draft more)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
