@@ -1,5 +1,7 @@
 /***************************************************************************
 *  Copyright (C) Codeplay Software Limited
+*  Modified 2026 by MistVVK and the XeStrata contributors: GEMM with BF16 inputs
+*  through cublasGemmEx.
 *  Licensed under the Apache License, Version 2.0 (the "License");
 *  you may not use this file except in compliance with the License.
 *  You may obtain a copy of the License at
@@ -126,7 +128,8 @@ GEMM_EX_LAUNCHER(sycl::half, sycl::half, sycl::half, CUDA_R_16F, CUDA_R_16F, CUD
 void gemm(sycl::queue& queue, transpose transa, transpose transb, int64_t m, int64_t n, int64_t k,
           float alpha, sycl::buffer<bfloat16, 1>& a, int64_t lda, sycl::buffer<bfloat16, 1>& b,
           int64_t ldb, float beta, sycl::buffer<float, 1>& c, int64_t ldc) {
-    throw unimplemented("blas", "gemm", "for column_major layout");
+    gemm_ex(CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, queue, transa, transb, m, n, k, alpha, a, lda, b,
+            ldb, beta, c, ldc);
 }
 
 template <typename Func, typename T>
@@ -534,7 +537,8 @@ sycl::event gemm(sycl::queue& queue, transpose transa, transpose transb, int64_t
                  int64_t k, float alpha, const bfloat16* a, int64_t lda, const bfloat16* b,
                  int64_t ldb, float beta, float* c, int64_t ldc,
                  const std::vector<sycl::event>& dependencies) {
-    throw unimplemented("blas", "gemm", "for column_major layout");
+    return gemm_ex_usm(CUDA_R_16BF, CUDA_R_16BF, CUDA_R_32F, queue, transa, transb, m, n, k, alpha,
+                       a, lda, b, ldb, beta, c, ldc, dependencies);
 }
 
 template <typename Func, typename T>

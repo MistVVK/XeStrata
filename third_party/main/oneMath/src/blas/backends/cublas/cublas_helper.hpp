@@ -1,5 +1,7 @@
 /***************************************************************************
 *  Copyright (C) Codeplay Software Limited
+*  Modified 2026 by MistVVK and the XeStrata contributors: GEMM with BF16 inputs
+*  through cublasGemmEx.
 *  Licensed under the Apache License, Version 2.0 (the "License");
 *  you may not use this file except in compliance with the License.
 *  You may obtain a copy of the License at
@@ -31,6 +33,7 @@
 #include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <complex>
 
 #include "oneapi/math/types.hpp"
@@ -317,6 +320,10 @@ struct CudaEquivalentType {
 template <>
 struct CudaEquivalentType<sycl::half> {
     using Type = __half;
+};
+template <>
+struct CudaEquivalentType<oneapi::math::bfloat16> {
+    using Type = __nv_bfloat16;
 };
 template <>
 struct CudaEquivalentType<std::complex<float>> {
