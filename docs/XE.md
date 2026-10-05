@@ -99,7 +99,18 @@ An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (on
 NVIDIA GPUs bring the code for each one's architecture as nvidia-smi reports it (`STRATA_CUDA_ARCHS`) and the cuBLAS backend, which need the CUDA toolkit.
 With GPUs of different generations, each runs the newest code it can.
 That needs intel/llvm built by `tools/intel_llvm_build.py --contrib` (with the fix `cuda-select-binary`); with another intel/llvm, `auto` builds the code for the oldest architecture only.
-An architecture newer than the compiler knows (above sm_90 for intel/llvm 7.1.1 with CUDA 12.4) counts as the newest it builds.
+On a PC with several CUDA toolkits (a distribution's `/usr/lib/cuda` and NVIDIA's `/usr/local/cuda-X.Y`, say), clang takes `/usr/local/cuda` first and CMake's FindCUDA the `nvcc` on PATH, and the GPU code and cuBLAS came from different versions.
+`STRATA_CUDA_PATH`'s default, `auto`, tries each toolkit found (`CUDA_PATH`, `CUDA_HOME`, `CUDA_ROOT`, `/usr/local/cuda-*`, `/opt/cuda`, `/usr/lib/cuda`, the `nvcc` on PATH) and takes the one that builds code for the most of this PC's NVIDIA GPUs, then the newest architectures for them, then has cuBLAS, then is the newest (`cmake/StrataCuda.cmake`).
+The GPU code and oneMath's cuBLAS both use it; a toolkit without cuBLAS gets no cuBLAS backend, and the dense products run on XeStrata's own kernels.
+Each GPU gets code for its architecture, or the newest older one the toolkit builds, and the driver compiles that PTX for the GPU.
+intel/llvm 7.1.1's SYCL has no name above sm_90, so an RTX 50 gets sm_90 code.
+An old GPU a toolkit dropped (Volta in CUDA 13, for one) makes it take a toolkit that has it, if there is one; otherwise it gets a warning and no code.
+On this PC (CUDA 12.4 and 13.1) it took 13.1 for the RTX 4070 alone and 12.4 (code for all three) with a Volta, an Ada and an RTX 50 imitated; the 13.1 build passed its 52 CTest tests on the 4070.
+The NVIDIA code is PTX of the toolkit's version by default (PTX 8.4 for CUDA 12.4).
+A driver older than the toolkit cannot load it, so `STRATA_CUDA_PTX`'s default, `auto`, lowers it to the driver's version (libcuda's `cuDriverGetVersion`); a number sets it (`78`: CUDA 11.8's PTX 7.8).
+A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
+The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
+A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
 `third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.

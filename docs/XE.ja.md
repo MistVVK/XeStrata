@@ -103,7 +103,18 @@ Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneM
 NVIDIA の GPU があれば、nvidia-smi が報告する各 GPU のアーキテクチャ（`STRATA_CUDA_ARCHS`）のコードと cuBLAS の後端を作り、CUDA ツールキットが要ります。
 世代の違う GPU が混ざっていれば、それぞれが自分の走らせられる最も新しいコードを使います。
 これには `tools/intel_llvm_build.py --contrib` で作った intel/llvm（修正 `cuda-select-binary` 入り）が要り、ほかの intel/llvm では `auto` は最も古いアーキテクチャのコードだけを作ります。
-コンパイラが知らない新しいアーキテクチャ（intel/llvm 7.1.1 と CUDA 12.4 では sm_90 より上）は、作れる最も新しいものとして扱います。
+CUDA ツールキットがいくつもある PC（ディストリビューションの `/usr/lib/cuda` と NVIDIA の `/usr/local/cuda-X.Y` など）では、clang は `/usr/local/cuda` を、CMake の FindCUDA は PATH の `nvcc` を先に取り、GPU のコードと cuBLAS が別の版になっていました。
+`STRATA_CUDA_PATH` の既定 `auto` は、見つかったツールキット（`CUDA_PATH`・`CUDA_HOME`・`CUDA_ROOT`、`/usr/local/cuda-*`、`/opt/cuda`、`/usr/lib/cuda`、PATH の `nvcc`）を1つずつ試し、この PC の NVIDIA の GPU のうち多くにコードを作れるもの、次にその GPU により新しいアーキテクチャのコードを作れるもの、次に cuBLAS を持つもの、次に新しい版を選びます（`cmake/StrataCuda.cmake`）。
+GPU のコードと oneMath の cuBLAS は、選んだ1つを使います。cuBLAS のないツールキットでは cuBLAS の後端を作らず、密な積は自前のカーネルになります。
+各 GPU には、その GPU のアーキテクチャか、作れるうちでそれより古い最も新しいものを作り、ドライバーがその PTX を GPU に合わせてコンパイルします。
+intel/llvm 7.1.1 の SYCL は sm_90 より上の名前を持たないので、RTX 50 には sm_90 のコードになります。
+ツールキットが外した古い GPU（CUDA 13 の Volta など）は、それを扱うツールキットがあればそれを選び、なければ警告を出してその GPU のコードを作りません。
+この PC（CUDA 12.4 と 13.1）では、RTX 4070 だけなら 13.1 を選び、Volta・Ada・RTX 50 を装うと 12.4（3つすべてにコードを作れる）を選びました。13.1 で作ったものは 4070 で CTest 52 件が通りました。
+NVIDIA のコードの PTX は、既定ではツールキットの版です（CUDA 12.4 なら PTX 8.4）。
+ドライバーがツールキットより古いとその PTX を読めないので、`STRATA_CUDA_PTX` の既定 `auto` はドライバーの版（libcuda の `cuDriverGetVersion`）に下げます（数で指定もできます。例 `78` は CUDA 11.8 の PTX 7.8）。
+PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
+ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
+CUDA 12.0〜12.3 のドライバーで CUDA 12.4 のツールキットを使う組み合わせは確かめていません（`unverified`）。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
 `third_party/main/oneMath` は oneMath v0.9 に XeStrata の変更（cuBLAS の BF16 の積）を加えたもので、変更は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。

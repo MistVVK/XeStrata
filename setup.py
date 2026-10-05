@@ -37,7 +37,6 @@ explicit flag (--model, --context) is the consent to a risk setup would otherwis
 from __future__ import annotations
 
 import argparse
-import ctypes.util
 import hashlib
 import json
 import math
@@ -860,9 +859,24 @@ def intel_gpu_present() -> bool:
     return any(g.get("vendor") == "intel" for g in gpus())
 
 
-def cublas_found() -> bool:
-    """Whether cuBLAS (NVIDIA's CUDA toolkit) is installed: oneMath's cuBLAS backend links it."""
-    return ctypes.util.find_library("cublas") is not None
+def cuda_toolkits() -> list:
+    """The CUDA toolkits on this PC, as cmake/StrataCuda.cmake looks for them (which chooses the one the contrib build
+    uses): CUDA_PATH / CUDA_HOME / CUDA_ROOT, /usr/local/cuda-X.Y, /opt/cuda, Debian's /usr/lib/cuda and the nvcc on
+    PATH; a folder counts when it has the libdevice clang needs."""
+    import glob
+    dirs = [os.environ.get(v, "") for v in ("CUDA_PATH", "CUDA_HOME", "CUDA_ROOT")]
+    dirs += sorted(glob.glob("/usr/local/cuda-*")) + sorted(glob.glob("/opt/cuda-*"))
+    dirs += ["/usr/local/cuda", "/opt/cuda", "/usr/lib/cuda"]
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        dirs.append(str(Path(nvcc).resolve().parent.parent))
+    found = []
+    for d in dirs:
+        if d and Path(d).is_dir() and glob.glob(str(Path(d) / "nvvm" / "libdevice" / "libdevice*.bc")):
+            r = str(Path(d).resolve())
+            if r not in found:
+                found.append(r)
+    return found
 
 
 def cuda_archs() -> list:
@@ -925,7 +939,7 @@ def contrib_compiler(a, st: dict) -> tuple:
     # every maker's GPUs on this PC: the NVIDIA ones' code and cuBLAS, the Intel ones' oneMKL
     comp["cuda_archs"] = cuda_archs()
     comp["onemkl"] = intel_gpu_present()
-    if comp["cuda_archs"] and (shutil.which("nvcc") is None or not cublas_found()):
+    if comp["cuda_archs"] and not cuda_toolkits():
         fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it, and their "
              "dense products go to its cuBLAS)", "install it: sudo apt install nvidia-cuda-toolkit")
     return comp, d
