@@ -16,8 +16,8 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
 # AVX-512 kernels are per-file and chosen at run time either way).
 option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
 # The build's mode (AGENTS.md, "Free and non-free builds"), after the Debian archive's areas:
-# - free (the default): free software only, free enough for Debian main.  intel/llvm's DPC++ (clang++ with -fsycl;
-#   Debian and Ubuntu package it as dpclang++), for Intel GPUs.
+# - free (the default): free software only, free enough for Debian main.  intel/llvm's DPC++ 7 or later (clang++ with
+#   -fsycl; tools/intel_llvm_build.py builds it, or a distribution's package as new), for Intel GPUs.
 # - contrib: free software that needs non-free parts to build or run: intel/llvm with its CUDA target, for NVIDIA GPUs
 #   as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run, and oneMKL and
 #   cuBLAS for the dense products (through oneMath).
@@ -141,9 +141,9 @@ if(STRATA_ENABLE_XE)
   include(CheckCXXSourceCompiles)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
     if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
-      message(FATAL_ERROR "icpx is not free software: configure with intel/llvm's DPC++ "
-                          "(-DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang), or allow it with "
-                          "-DSTRATA_LICENSE=contrib-icpx")
+      message(FATAL_ERROR "icpx is not free software: configure with intel/llvm's DPC++ 7 or later "
+                          "(tools/intel_llvm_build.py; -DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++), "
+                          "or allow it with -DSTRATA_LICENSE=contrib-icpx")
     endif()
     if(STRATA_CUDA_ARCHS)
       message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
@@ -153,12 +153,17 @@ if(STRATA_ENABLE_XE)
     if(STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
     endif()
+    # intel/llvm 7 or later, whose SYCL runtime is libsycl 9 (Ubuntu 26.04's dpclang++ 6.2 has libsycl 8 and gives the
+    # Arc Pro B70 no XMX): one compiler line for every build with intel/llvm
     set(CMAKE_REQUIRED_FLAGS -fsycl)
     check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { return 0; }" STRATA_HAVE_SYCL)
+    check_cxx_source_compiles("#include <sycl/sycl.hpp>\n#if __LIBSYCL_MAJOR_VERSION < 9\n#error old\n#endif\nint main() {}"
+                              STRATA_HAVE_SYCL9)
     unset(CMAKE_REQUIRED_FLAGS)
-    if(NOT STRATA_HAVE_SYCL)
-      message(FATAL_ERROR "The Xe backend needs a SYCL compiler: intel/llvm's DPC++ "
-                          "(-DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang)")
+    if(NOT STRATA_HAVE_SYCL OR NOT STRATA_HAVE_SYCL9)
+      message(FATAL_ERROR "The Xe backend needs intel/llvm's DPC++ 7 or later (libsycl 9): build it with "
+                          "tools/intel_llvm_build.py and configure with "
+                          "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++")
     endif()
   endif()
   # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each

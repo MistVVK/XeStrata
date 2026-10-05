@@ -80,13 +80,12 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
 CMake のオプション `STRATA_LICENSE` で選びます。
 分け方は Debian のアーカイブの main・contrib・non-free に合わせています。
 
-- **free**（既定、`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ でビルドします。
+- **free**（既定、`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
-  Ubuntu 26.04 の `dpclang++` 6.2.0（パッケージ `dpclang-6`）で確かめています。
-  ただし、intel/llvm 7.0 より前の SYCL ランタイムは Arc Pro B70 に XMX がないと報告します。
-  その場合、プロンプトの経路の行列積は int8 のブロックを DP4a で計算し、時間は約 1.6 倍かかり、結果もわずかに粗くなります
+  `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
+  ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
+  6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、プロンプトの経路が約 1.6 倍遅くなっていました
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
-  新しい intel/llvm は `tools/intel_llvm_build.py` でソースからビルドできます（[setup](#setup) を参照）。
 - **contrib**（`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
@@ -129,15 +128,16 @@ Intel の GPU はこの形を報告しないので、これまでどおり XMX �
 ### エンジンの部品とテスト
 
 モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
-free の方式では次のとおりです。
+free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/install`）。
 
 ```bash
-cmake -S . -B build/free \
-  -DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang \
+L=$PWD/.tools/intel-llvm/install
+cmake -S . -B build/llvm7 \
+  -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/free --target strata-device strata-load elementwise_parity \
+cmake --build build/llvm7 --target strata-device strata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -166,10 +166,9 @@ ctest --test-dir build/xe \
   CPU だけの道具は `STRATA_ENABLE_XE=OFF` で構成できます。
 - CPU の正準形のエキスパートのテストは、AVX-512 かモデルのファイルを必要とするので、上のコマンドには含みません。
 - `build/xe/BUILD.json` には、バックエンド、版、移植元、コンパイラ、ビルドの範囲が記録されます。
-- **free のビルドは、oneAPI の環境（`setvars.sh`）を読み込んでいないシェルで動かします。**
-  読み込んだシェルでは、ディストリビューションの SYCL ランタイム（dpclang 6.2 の `libsycl.so.8`）が、
-  `LD_LIBRARY_PATH` の先にある oneAPI 2026.1 のアダプター（`libur_adapter_level_zero` など）と `libumf` を読み込みます。
-  版が合わないので、GPU を使うテストが起動してすぐにセグメンテーション違反で止まりました（CTest の 52 件のうち 32 件）。
+- **free のビルドは、oneAPI の環境（`setvars.sh`）を読み込んでいないシェルで、`LD_LIBRARY_PATH` に intel/llvm の `lib` を置いて動かします。**
+  oneAPI の環境では、`LD_LIBRARY_PATH` の先にある oneAPI のアダプター（`libur_adapter_level_zero` など）と `libumf` が読み込まれます。
+  版の合わない組み合わせ（dpclang 6.2 の `libsycl.so.8`）では、GPU を使うテストが起動してすぐにセグメンテーション違反で止まりました。
   setup は free のインストールで oneAPI をライブラリのパスに入れないので、setup が動かすエンジンはこれに当たりません。
 
 ### エンジン本体
@@ -179,9 +178,10 @@ llama.cpp は固定したコミット（`3cf03257f219afbe7334045ff7c6a06ac68c627
 setup.py が取ってきます。画像のエンコーダーは、その `tools/mtmd` も使います。
 
 ```bash
-cmake -S . -B build/free -DCMAKE_CXX_COMPILER=dpclang++ -DCMAKE_C_COMPILER=dpclang -DSTRATA_ENABLE_XE=ON \
+L=$PWD/.tools/intel-llvm/install
+cmake -S . -B build/llvm7 -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
-cmake --build build/free --target strata -j6
+cmake --build build/llvm7 --target strata -j6
 ```
 
 icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` に替えます。
@@ -251,11 +251,12 @@ NVIDIA の GPU は contrib でだけ使えます。
 
 free のコンパイラは次の順に選びます。
 
-1. `--intel-llvm DIR` の指定があれば、DIR にインストールされた intel/llvm。
-1. なければ、ディストリビューションの intel/llvm（`dpclang++`、なければいちばん新しい `dpclang++-N`）。
-1. `--intel-llvm-build` の指定があり、上のどちらもないか、GPU に XMX がないと報告するなら、ここでソースからビルドした intel/llvm。
-1. どれもなければ止まり、手に入れる方法を表示します。
-   ディストリビューションのパッケージと `--intel-llvm-build` です。
+1. `--intel-llvm DIR` の指定があれば、DIR にインストールされた intel/llvm（7 より古ければ止まります）。
+1. `--intel-llvm-build` の指定があれば、ここでソースからビルドした intel/llvm。
+1. なければ、ディストリビューションの intel/llvm（`dpclang++`、なければいちばん新しい `dpclang++-N`）。7 以降のときだけ使います。
+1. どれもなければ、ここで intel/llvm をビルドするかを尋ねます。ビルドしないときは止まり、手に入れる方法を表示します。
+
+intel/llvm 7 以降かどうかは、コンパイラの SYCL ランタイムの版（`__LIBSYCL_MAJOR_VERSION` が 9 以上）で見ます。
 
 Intel の GPU では、選んだコンパイラで `tools/xmx_probe.cpp` をビルドし、選んだ GPU で動かします。
 結果によって、次のように進みます。
@@ -263,8 +264,7 @@ Intel の GPU では、選んだコンパイラで `tools/xmx_probe.cpp` をビ�
 - **GPU がまったく列挙されない**: 止まります。
   GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）が入っていないか、この GPU には古すぎる、と案内します。
   openSUSE Leap 16 の compute-runtime 25.18 は、Arc Pro B70 を列挙しませんでした。
-- **GPU は列挙されるが XMX がない**: XMX なしでビルドする、intel/llvm 7 以降をここでビルドする、止める、から選ばせます。
-  使っているのがすでにここで作った intel/llvm のとき、または contrib と contrib-icpx では、ビルドの選択肢は出しません。
+- **GPU は列挙されるが XMX がない**: XMX なしでビルドするか、止めるかを選ばせます。
   止めるときは、`--license contrib-icpx`（icpx）も案内します。
   端末がないときや `--yes` のときは止まります。
   `--allow-no-xmx` を付ければ、遅い経路を受け入れて進みます。
@@ -296,26 +296,22 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 
 開発機（Ubuntu 26.04.1）で使っているパッケージです。
 free の列は、まっさらな Ubuntu 26.04 で必要なものでもあります。
-コンテナで、この列と `python3-venv` だけを入れて、setup を最初から最後まで通しました
-（[記録](../bench/results/2026-10-03-clean-setup/README.md)）。
+コンテナで、この列と `python3-venv` だけを入れて、setup を最初から最後まで通しました（[記録](../bench/results/2026-10-03-clean-setup/README.md)。
+そのときは intel/llvm の代わりに `dpclang-6` でした。intel/llvm をビルドする今の手順でまっさらな Ubuntu から通すことは `unverified` です）。
 `intel-opencl-icd` は、エンジンを動かすだけなら要りません。
 
 | 用途 | free | contrib-icpx（`--license contrib-icpx`） |
 | --- | --- | --- |
-| エンジンのビルド | `dpclang-6` 6.2.0、`libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
-| B70 で XMX を使うとき（`--intel-llvm-build`） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx が XMX を使うので不要） |
+| エンジンのビルド | `libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
+| intel/llvm 7 以降のビルド（setup がここで作ります） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |
 | GPU の画像エンコーダー（[画像](#画像)） | Vulkan: `libvulkan-dev` 1.4.341、`glslc` 2026.1、`spirv-headers` 1.6.1、`mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | SYCL の画像エンコーダーの oneDNN（任意。選んだときだけ） | — | `intel-oneapi-dnnl-devel` 2026.0.2 |
 | 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
 
-Ubuntu 26.04 の `dpclang-6` 6.2.0 では、B70 に XMX が使えません。
-XMX を使うには、`--intel-llvm-build` で intel/llvm をビルドするか、contrib-icpx で icpx を使います。
-
 contrib（`--license contrib`）では、free の列のうち intel/llvm をビルドするためのものと、
 `intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
-`dpclang-6` のまま進めるなら `--allow-no-xmx` を付けます。
 
 #### Fedora 44
 

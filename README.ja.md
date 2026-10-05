@@ -101,12 +101,10 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んでエンジンをビルドし、モデルをダウンロードして起動します。
 ブラウザで `http://127.0.0.1:8095` が開きます。
 
-- **コンパイラ**: 自由ソフトウェアのコンパイラ（intel/llvm の DPC++、ディストリビューションの `dpclang++`）を使います。
-  そのコンパイラでは GPU の XMX が使えないとき、setup は次のどれにするかを尋ねます
-  （[詳細](docs/XE.ja.md#sycl-のコンパイラ)）。
-   - XMX なしでビルドする。
-   - 新しい intel/llvm をこの場でビルドする（`--intel-llvm-build`）。
-   - 止める。
+- **コンパイラ**: 自由ソフトウェアのコンパイラ（intel/llvm の DPC++ 7 以降）を使います。
+  ディストリビューションの `dpclang++` が 7 より古ければ、setup はこの場で intel/llvm をビルドするかを尋ねます（13 分ほど、
+  [詳細](docs/XE.ja.md#sycl-のコンパイラ)）。
+  GPU の XMX が使えないときは、XMX なしでビルドするか止めるかを尋ねます。
 
   `--license contrib-icpx` で Intel oneAPI の icpx、`--license contrib` で NVIDIA の GPU も使えるビルドにします（どちらも自由ソフトウェアでない部品を使います）。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。

@@ -102,11 +102,9 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 setup checks the GPU, the RAM and the CPU, chooses a SYCL compiler, builds the engine, downloads the model and starts
 it. Your browser opens `http://127.0.0.1:8095`.
 
-- **The compiler:** setup uses a free compiler (intel/llvm's DPC++, the distribution's `dpclang++`). When that
-  compiler cannot use the GPU's XMX, setup asks which of these to do ([details](docs/XE.md#the-sycl-compiler)):
-   - build without XMX;
-   - build a newer intel/llvm here (`--intel-llvm-build`);
-   - stop.
+- **The compiler:** setup uses a free compiler, intel/llvm's DPC++ 7 or later. When the distribution's `dpclang++`
+  is older, setup asks whether to build intel/llvm here (about 13 minutes; [details](docs/XE.md#the-sycl-compiler)).
+  When the GPU's XMX cannot be used, it asks whether to build without XMX or stop.
 
   `--license contrib-icpx` builds with Intel oneAPI's icpx, `--license contrib` for NVIDIA GPUs as well (both use parts that are not free software).
 - **Time:** the first time, the download (60-110 GB) and the build take a while. If you stop it, the next run

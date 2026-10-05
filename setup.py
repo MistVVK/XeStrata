@@ -745,9 +745,10 @@ def oneapi_lib_dirs() -> list:
 
 # ------------------------------------------------------------------------------------------------ the SYCL compiler
 # AGENTS.md, "Free and non-free builds": three build modes (--license).  free (the default) uses free software only:
-# intel/llvm's DPC++, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
-# --intel-llvm-build), for Intel GPUs.  contrib: intel/llvm built with its CUDA target (.tools/intel-llvm-contrib), for
-# Intel and NVIDIA GPUs, with oneMKL and cuBLAS for the dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL,
+# intel/llvm's DPC++ 7 or later, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
+# --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib: intel/llvm
+# built with its CUDA target (.tools/intel-llvm-contrib), for Intel and NVIDIA GPUs, with oneMKL and cuBLAS for the
+# dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL,
 # Intel GPUs only.  Whether the Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself
 # (tools/xmx_probe.cpp), not read from a version number.  Without XMX the engine still runs, its prompt path about 1.6
 # times slower (bench/results/2026-10-02-dp4a); setup asks before building it so.
@@ -761,9 +762,8 @@ ICPX_HOW = ("Intel oneAPI's compiler (not free software; Intel's apt repository)
             "         echo \"deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] "
             "https://apt.repos.intel.com/oneapi all main\" | sudo tee /etc/apt/sources.list.d/oneAPI.list\n"
             "         sudo apt update && sudo apt install intel-oneapi-compiler-dpcpp-cpp")
-FREE_HOW = ("intel/llvm's DPC++ (free software): the distribution's package (Ubuntu: sudo apt install dpclang-6; it "
-            "gives the Arc Pro B70 no XMX before version 7), or build it here: ./setup.sh --intel-llvm-build "
-            "(13 minutes on 28 threads, 3.5 GB)")
+FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./setup.sh --intel-llvm-build (13 minutes "
+            "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
 MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/XE.md#packages): "
            "sudo apt install intel-oneapi-mkl-sycl-devel")
 
@@ -798,6 +798,15 @@ def free_compiler(install: Path, license: str = "free") -> dict:
     env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join([str(lib), os.environ.get("LD_LIBRARY_PATH", "")]))
     return {"kind": "intel-llvm", "cxx": str(install / "bin" / "clang++"), "cc": str(install / "bin" / "clang"),
             "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": []}
+
+
+def new_enough(comp: dict) -> bool:
+    """Whether the compiler is intel/llvm 7 or later: its SYCL runtime is libsycl 9 (the distribution's dpclang++ 6.2
+    has libsycl 8, and gives the Arc Pro B70 no XMX)."""
+    r = subprocess.run([comp["cxx"], "-fsycl", "-dM", "-E", "-x", "c++", "-"], input="#include <sycl/sycl.hpp>\n",
+                       capture_output=True, text=True, env=comp["env"])
+    m = re.search(r"#define __LIBSYCL_MAJOR_VERSION (\d+)", r.stdout)
+    return m is not None and int(m.group(1)) >= 9
 
 
 def os_compiler() -> dict | None:
@@ -858,11 +867,6 @@ def has_xmx(probed: dict | None) -> bool:
     return probed is not None and probed.get("fp16") == "1" and probed.get("bf16") == "1"
 
 
-def probe_xmx(comp: dict, pci: str | None) -> bool:
-    """Whether the GPU at `pci` reports the matrix engines to this compiler's SYCL runtime."""
-    return has_xmx(probe_gpu(comp, pci))
-
-
 def build_intel_llvm(a, contrib: bool = False) -> Path:
     """tools/intel_llvm_build.py (--contrib: with the CUDA target): a finished build is used as it is, an interrupted
     one continued."""
@@ -918,18 +922,21 @@ def choose_compiler(a, gpu: dict) -> dict:
             if not (d / "bin" / "clang++").exists():
                 fail(f"--intel-llvm {d}: no bin/clang++ there", "give the folder intel/llvm was installed to")
             comp = free_compiler(d)
-        elif (c := os_compiler()) is not None:
-            comp = c
-        elif a.intel_llvm_build:
-            comp = free_compiler(build_intel_llvm(a))
-            llvm_dir = str(INTEL_LLVM_DEFAULT)
-        if comp is not None and comp["kind"] == "os" and a.intel_llvm_build and not probe_xmx(comp, pci):
-            say(f"  {Path(comp['cxx']).name} gives this GPU no XMX: using intel/llvm built here (--intel-llvm-build)")
-            comp = free_compiler(build_intel_llvm(a))
-            llvm_dir = str(INTEL_LLVM_DEFAULT)
+            if not new_enough(comp):
+                fail(f"--intel-llvm {d}: older than intel/llvm 7", FREE_HOW)
+        elif not a.intel_llvm_build and (c := os_compiler()) is not None:
+            if new_enough(c):
+                comp = c
+            else:
+                say(f"  {Path(c['cxx']).name} ({compiler_version(c['cxx'], c['env'])}) is older than intel/llvm 7, "
+                    "which the engine needs")
         if comp is None:
-            fail("no SYCL compiler for the engine", FREE_HOW + "\n       (--license contrib-icpx builds with Intel's "
-                 "icpx, which is not free software)")
+            if not a.intel_llvm_build and ask("Build intel/llvm here now (13 minutes on 28 threads, 3.5 GB)?",
+                                              ["y", "n"], "y", a.yes) != "y":
+                fail("no SYCL compiler for the engine", FREE_HOW + "\n       (--license contrib-icpx builds with "
+                     "Intel's icpx, which is not free software)")
+            comp = free_compiler(build_intel_llvm(a))
+            llvm_dir = str(INTEL_LLVM_DEFAULT)
         kept = {"intel_llvm": llvm_dir} if llvm_dir else {}
     if mode != "free" and mkl_root() is None:
         fail(f"--license {mode} hands the dense matrix products to oneMKL, which is not installed", MKL_HOW)
@@ -946,31 +953,16 @@ def choose_compiler(a, gpu: dict) -> dict:
                  "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for "
                  "this GPU: install a newer one (docs/XE.md#packages) and run setup again")
         xmx = has_xmx(probed)
-        built_here = Path(comp["cxx"]).parent.parent in (INTEL_LLVM_DEFAULT, INTEL_LLVM_CONTRIB)
         if not xmx and not allow_no_xmx:
             say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX "
                 "(its matrix engines): the engine would run, but its prompt processing about 1.6 times slower.")
-            choices = {"1": "build without XMX", "2": "build intel/llvm 7 or later here and use it (13 minutes on 28 "
-                       "threads, 3.5 GB)", "3": "stop"}
-            if built_here or mode != "free":           # the contrib modes' compilers are not replaced here
-                del choices["2"]
+            choices = {"1": "build without XMX", "2": "stop"}
             for k, v in choices.items():
                 say(f"  {k}) {v}")
-            pick = ask("Which?", list(choices), "3", a.yes)
-            if pick == "3":
-                fail("stopped: no XMX for this GPU",
-                     ("" if built_here or mode != "free" else "build intel/llvm here (--intel-llvm-build), or ") +
-                     "accept the slower prompt path (--allow-no-xmx)" +
+            if ask("Which?", list(choices), "2", a.yes) == "2":
+                fail("stopped: no XMX for this GPU", "accept the slower prompt path (--allow-no-xmx)" +
                      ("; or --license contrib-icpx (Intel's icpx)" if mode != "contrib-icpx" else ""))
-            if pick == "2":
-                comp = free_compiler(build_intel_llvm(a))
-                kept = {"intel_llvm": str(INTEL_LLVM_DEFAULT)}
-                if not probe_xmx(comp, pci):
-                    fail("the intel/llvm built here gives this GPU no XMX either",
-                         "accept the slower prompt path with --allow-no-xmx, or --license contrib-icpx (Intel's icpx)")
-                xmx = True
-            else:
-                allow_no_xmx = True
+            allow_no_xmx = True
     st = {k: v for k, v in load_settings().items() if k != "nonfree"}
     save_settings({**st, "license": mode, "allow_no_xmx": allow_no_xmx, **kept})
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
@@ -1146,6 +1138,9 @@ def recorded_compiler(meta: dict) -> dict:
             comp["cuda_archs"] = cuda_archs()
     elif rec["kind"] == "os":
         comp = os_compiler()
+        if comp is not None and not new_enough(comp):
+            fail(f"the engine was built with {Path(comp['cxx']).name}, older than intel/llvm 7 (which it now needs)",
+                 "run ./setup.sh --setup to build it with intel/llvm 7 or later")
     else:
         comp = icpx_compiler()
         if comp is not None and "compiler" not in meta:
@@ -1948,8 +1943,8 @@ def main() -> int:
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
     ap.add_argument("--intel-llvm-build", action="store_true",
-                    help="no intel/llvm on this PC: build it from source into .tools/intel-llvm (13 minutes on 28 "
-                         "threads, 3.5 GB); a finished build is used again, an interrupted one continued")
+                    help="build intel/llvm from source into .tools/intel-llvm and use it (13 minutes on 28 threads, "
+                         "3.5 GB); a finished build is used again, an interrupted one continued")
     ap.add_argument("--intel-llvm-rebuild", action="store_true", help="with --intel-llvm-build: build it again")
     ap.add_argument("--intel-llvm-keep-build", action="store_true",
                     help="with --intel-llvm-build: keep its build tree so the next update is quicker")
