@@ -249,6 +249,9 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 ウィンドウを閉じるとモデルが止まります。
 複数のモデルを入れていれば、どれを起動するかを尋ねます。
 `run-<model>.sh` は、そのモデルを直接起動します。
+同じモデルに setup をやり直すと（別の文脈の長さなど）、setup が書くキー（`exe`、`args`、`port`、`gpu_pci`、`vision` など）を書き直し、あなたが足したキー（`sampling`、`mcp_servers`、`cors_origins` など）と、指定しなかった `host`・`api_key` は残します。
+前のファイルは `xestrata-<model>.json.bak` に残します。
+`"args"` に手で足したエンジンのオプションは引き継がず、setup がその名前を示すので、足し直します（upstream #629）。
 
 ```text
 ./setup.sh --setup                          別のモデルを入れる、文脈や画像の設定を変える

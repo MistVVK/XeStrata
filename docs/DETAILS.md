@@ -243,6 +243,9 @@ The API for your apps is at `http://127.0.0.1:8095/v1`.
 Loading 23–50 GB into RAM takes a while; nothing is downloaded again.
 Closing the window stops the model.
 With more than one model installed, it asks which one to start; `run-<model>.sh` starts a model directly.
+Running setup again for the same model (another context, say) rewrites the keys setup writes (`exe`, `args`, `port`, `gpu_pci`, `vision`, ...) and keeps the ones you added (`sampling`, `mcp_servers`, `cors_origins`, ...) and a `host` and `api_key` this run does not give.
+The earlier file is kept as `xestrata-<model>.json.bak`.
+Engine options you added to `"args"` by hand are not carried over: setup names them, and you add them again (upstream #629).
 
 ```text
 ./setup.sh --setup                          install another model, or change context / images

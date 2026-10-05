@@ -1898,6 +1898,80 @@ def warm_up(cfg_path: Path) -> None:
                 proc.wait()
 
 
+# upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
+# user's - a "sampling" or "mcp_servers" block, "cors_origins" - and is kept when setup runs again, as
+# are "host" and "api_key" when this run does not give them
+SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
+                        "draft_vocab", "vision"})
+SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
+
+
+def carry_over(old: dict, cfg: dict) -> list[str]:
+    """Setup run again for an installed model keeps what the user added to its run config: every key setup does not
+    write (`SETUP_KEYS`), and in "vision" the keys setup does not write plus an mmproj of their own that still exists.
+    `cfg` (the new config) is updated in place; the names of what was kept are returned.  Engine options added by
+    hand to "args" are not merged (setup chooses those): `args_dropped` names them."""
+    kept = []
+    for k, v in old.items():
+        if k not in SETUP_KEYS and k not in cfg:
+            cfg[k] = v
+            kept.append(k)
+    ov, nv = old.get("vision"), cfg.get("vision")
+    if isinstance(ov, dict) and isinstance(nv, dict):
+        for k, v in ov.items():
+            if k not in SETUP_VISION and k not in nv:
+                nv[k] = v
+                kept.append(f"vision {k}")
+        mm = ov.get("mmproj")                          # a file of the user's own: not the one setup downloads
+        if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
+            nv["mmproj"] = mm
+            kept.append("vision mmproj")
+    return kept
+
+
+def args_dropped(old: dict, cfg: dict) -> list[str]:
+    """The engine options of the earlier run config that the new one has no more (by flag name): options added by
+    hand, which a setup run does not carry over - the start of the line that names them."""
+    def flags(c):
+        a = c.get("args") if isinstance(c.get("args"), list) else []
+        return [str(x) for x in a if str(x).startswith("--")]
+    new = set(flags(cfg))
+    return list(dict.fromkeys(f for f in flags(old) if f not in new))
+
+
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) -> None:
+    """Setup's run config, written over an earlier one for the same model without losing what the user added to it:
+    the keys setup does not write are carried over (carry_over), and the earlier file is kept as
+    xestrata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
+    this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not."""
+    old_path = cfg_path if cfg_path.is_file() else source
+    old = None
+    if old_path is not None and old_path.is_file():
+        try:
+            old = json.loads(old_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            pass
+        if not isinstance(old, dict):
+            old = None
+    kept = carry_over(old, cfg) if old is not None else []
+    bak = None
+    if cfg_path.is_file() and old != cfg:
+        bak = cfg_path.with_name(cfg_path.name + ".bak")
+        try:
+            shutil.copyfile(cfg_path, bak)
+        except OSError as e:
+            warn(f"could not keep a copy of the earlier {cfg_path.name} ({e.strerror or e})")
+            bak = None
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    if kept and old_path is not None:
+        ok(f"kept from your earlier {old_path.name}: " + ", ".join(kept))
+    if bak is not None:
+        dropped = args_dropped(old, cfg) if old is not None else []
+        say(f"  the earlier run config is kept as {bak.name}" + (
+            f"; engine options it had that this one has not (setup chooses those): {' '.join(dropped)}"
+            if dropped else ""))
+
+
 def write_run_script(model, cfg_path, port):
     serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
              "--port", str(port), "--open"]
@@ -2052,6 +2126,7 @@ def main() -> int:
     if a.update:                                       # #475: update.sh - never starts the model
         return update_install(have)
     explicit = a.setup or a.model or a.family or a.check or a.no_start
+    adopted = None                                     # the earlier install this copy is set up like
     if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
         if prev is not None:
@@ -2060,6 +2135,7 @@ def main() -> int:
                 say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
                     "copy the same way - the model files are reused, nothing big is downloaded.")
                 a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
+                adopted = prev
                 a.kv = a.kv or ch["kv"]
                 a.vision = a.vision or ch["vision"]
                 a.vision_onednn = a.vision_onednn or ch["vision_onednn"]
@@ -2557,7 +2633,7 @@ def main() -> int:
         import calibrate as CAL
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
-    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port)
     if not a.no_warmup:
         warm_up(cfg_path)
