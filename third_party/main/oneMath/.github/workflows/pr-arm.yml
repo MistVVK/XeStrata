@@ -1,0 +1,103 @@
+name: "PR Tests (aarch64)"
+permissions: read-all
+
+# Trigger for PR and merge to develop branch
+on:
+  push:
+    branches: develop
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CTEST_OUTPUT_ON_FAILURE: 1
+  LAPACK_VERSION: 3.12.0
+  DPCPP_VERSION: 6.1.0
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04-arm
+    # One runner for each domain
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - config: ArmPL BLAS
+          domain: blas
+          build_options: -DREF_BLAS_ROOT=${PWD}/lapack/install
+        - config: ArmPL LAPACK
+          domain: lapack
+          build_options: -DREF_LAPACK_ROOT=${PWD}/lapack/install
+        - config: ArmPL RNG
+          domain: rng
+          test_options: -E 'Device|DEVICE'
+        - config: ArmPL DFT
+          domain: dft
+    name: unit tests ${{ matrix.config }} CPU
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - name: Check if the changes affect this domain
+      id: domain_check
+      uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+      with:
+        script: |
+         const domainCheck = require('.github/scripts/domain-check.js')
+         return domainCheck({github, context, domain: "${{ matrix.domain }}"})
+    - name: Restore netlib from cache
+      id: cache-lapack
+      uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+      with:
+        path: lapack/install
+        key: lapack-${{ env.LAPACK_VERSION }}-arm
+    - name: Install netlib
+      if: steps.domain_check.outputs.result == 'true' && steps.cache-lapack.outputs.cache-hit != 'true'
+      run: |
+        curl -sL https://github.com/Reference-LAPACK/lapack/archive/refs/tags/v${LAPACK_VERSION}.tar.gz | tar zx
+        SHARED_OPT="lapack-${LAPACK_VERSION} -DBUILD_SHARED_LIBS=on -DCBLAS=on -DLAPACKE=on -DCMAKE_INSTALL_PREFIX=${PWD}/lapack/install -G Ninja"
+        # 32 bit int
+        cmake ${SHARED_OPT} -B lapack/build32
+        cmake --build lapack/build32 --target install
+        # 64 bit int
+        cmake ${SHARED_OPT} -DBUILD_INDEX64=on -B lapack/build64
+        cmake --build lapack/build64 --target install
+    - name: Restore DPC++ from cache
+      id: cache-dpcpp
+      uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
+      with:
+        path: dpcpp/install
+        key: dpcpp-${{ env.DPCPP_VERSION }}-arm
+    - name: Build DPC++
+      if: steps.domain_check.outputs.result == 'true' && steps.cache-dpcpp.outputs.cache-hit != 'true'
+      run: |
+        wget --progress=dot:giga -P dpcpp https://github.com/intel/llvm/archive/refs/tags/v${{ env.DPCPP_VERSION }}.tar.gz
+        cd dpcpp
+        tar -xzf v${{ env.DPCPP_VERSION }}.tar.gz
+        python llvm-${{ env.DPCPP_VERSION }}/buildbot/configure.py -o build -t Release --cmake-gen Ninja --native_cpu --cmake-opt="-DSYCL_ENABLE_BACKENDS=native_cpu" --cmake-opt="-DCMAKE_INSTALL_PREFIX=$PWD/install" --llvm-external-projects=openmp
+        cd build
+        ninja deploy-sycl-toolchain omp install
+    - name: Install ArmPL
+      if: steps.domain_check.outputs.result == 'true'
+      run: |
+        . /etc/os-release
+        curl "https://developer.arm.com/packages/arm-toolchains:${NAME,,}-${VERSION_ID/%.*/}/${VERSION_CODENAME}/Release.key" | sudo tee /etc/apt/trusted.gpg.d/developer-arm-com.asc
+        echo "deb https://developer.arm.com/packages/arm-toolchains:${NAME,,}-${VERSION_ID/%.*/}/${VERSION_CODENAME}/ ./" | sudo tee /etc/apt/sources.list.d/developer-arm-com.list
+        sudo apt update
+        sudo apt install -y arm-performance-libraries
+    - name: Configure/Build for a domain
+      if: steps.domain_check.outputs.result == 'true'
+      run: |
+        export PATH=/opt/arm/arm-performance-libraries/bin:${PWD}/dpcpp/install/bin:${PATH}
+        export CPATH=/opt/arm/arm-performance-libraries/include:${PWD}/dpcpp/install/include:${CPATH}
+        export LIBRARY_PATH=/opt/arm/arm-performance-libraries/lib:${PWD}/dpcpp/install/lib:${PWD}/dpcpp/install/lib/aarch64-unknown-linux-gnu:${LIBRARY_PATH}
+        export LD_LIBRARY_PATH=/opt/arm/arm-performance-libraries/lib:${PWD}/dpcpp/install/lib:${PWD}/dpcpp/install/lib/aarch64-unknown-linux-gnu:${LD_LIBRARY_PATH}
+        sycl-ls
+        cmake -DTARGET_DOMAINS=${{ matrix.domain }} -DENABLE_MKLCPU_BACKEND=off -DENABLE_MKLGPU_BACKEND=off -DENABLE_ARMPL_BACKEND=on -DARMPL_ROOT=/opt/arm/arm-performance-libraries -DCMAKE_CXX_FLAGS='-fopenmp' -DCMAKE_VERBOSE_MAKEFILE=on ${{ matrix.build_options }} -B build -G Ninja
+        cmake --build build
+    - name: Run tests
+      if: steps.domain_check.outputs.result == 'true'
+      run: |
+        export PATH=/opt/arm/arm-performance-libraries/bin:${PWD}/dpcpp/install/bin:${PATH}
+        export CPATH=/opt/arm/arm-performance-libraries/include:${PWD}/dpcpp/install/include:${CPATH}
+        export LIBRARY_PATH=/opt/arm/arm-performance-libraries/lib:${PWD}/dpcpp/install/lib:${PWD}/dpcpp/install/lib/aarch64-unknown-linux-gnu:${LIBRARY_PATH}
+        export LD_LIBRARY_PATH=/opt/arm/arm-performance-libraries/lib:${PWD}/dpcpp/install/lib:${PWD}/dpcpp/install/lib/aarch64-unknown-linux-gnu:${LD_LIBRARY_PATH}
+        sycl-ls
+        ctest --test-dir build ${{ matrix.test_options }}
