@@ -116,9 +116,11 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
         float acc[kVerifyMaxT];
+        #pragma unroll
         for (int t = 0; t < kVerifyMaxT; ++t) acc[t] = 0.0f;
         for (int j = lane; j < n / 8; j += 32) {
             const uint32_t w0 = w[j * 4], w1 = w[j * 4 + 1], w2 = w[j * 4 + 2], w3 = w[j * 4 + 3];
+            #pragma unroll
             for (int t = 0; t < kVerifyMaxT; ++t) {
                 if (t >= T) break;
                 const float* xa = x + (size_t) t * n + j * 8;
@@ -130,6 +132,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
                 acc[t] = a;
             }
         }
+        #pragma unroll
         for (int t = 0; t < kVerifyMaxT; ++t) {
             if (t >= T) break;
             const float a = warp_sum(sg, acc[t]);
@@ -167,6 +170,7 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
             float s[RPG];
             float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
             const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
             for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
             for (int t = 0; t < n; ++t) {
                 const float* ht = hbuf + (size_t) t * C;
@@ -175,12 +179,14 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
                 sycl::group_barrier(it.get_group());
                 const float g = sycl::exp(gate[(size_t) t * h_v + head]);
                 float kv = 0.0f;
+                #pragma unroll
                 for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
                 red[rg * S + col] = kv;
                 sycl::group_barrier(it.get_group());
                 const float kv_col = red[col] + red[S + col] + red[2 * S + col] + red[3 * S + col];
                 const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
                 float o = 0.0f;
+                #pragma unroll
                 for (int r = 0; r < RPG; ++r) {
                     s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
                     o = sycl::fma(s[r], sq[rg * RPG + r], o);
@@ -205,6 +211,7 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
                 }
             }
             if (n_keep != nullptr && n > 0)
+                #pragma unroll
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
         });
     });

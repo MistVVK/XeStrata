@@ -495,6 +495,7 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
             for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += BPI) {
                 const int kby = kbx * F::KBY;
                 const int kqs = F::kqs(tid);
+                #pragma unroll
                 for (int i = 0; i < ROWS; ++i) {
                     // The source assumes allocator padding for partial row groups. This
                     // guard preserves every valid row's math without an out-of-bounds read.
@@ -504,6 +505,7 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
                             wv = F::load_row(static_cast<const uint8_t*>(weights), row0 + i, kbx, blocks_per_row, kqs);
                         else
                             wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                        #pragma unroll
                         for (int j = 0; j < NCOLS; ++j)
                             tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
                     }
@@ -512,12 +514,17 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
             auto at = [&](int l, int j, int i, int lane) -> float& {
                 return partial[((l * NCOLS + j) * ROWS + i) * WARP + lane];
             };
-            if (ty > 0)
+            if (ty > 0) {
+                #pragma unroll
                 for (int j = 0; j < NCOLS; ++j)
+                    #pragma unroll
                     for (int i = 0; i < ROWS; ++i) at(ty - 1, j, i, tx) = tmp[j][i];
+            }
             sycl::group_barrier(it.get_group());
             if (ty > 0) return;
+            #pragma unroll
             for (int j = 0; j < NCOLS; ++j) {
+                #pragma unroll
                 for (int i = 0; i < ROWS; ++i) {
                     for (int l = 0; l < NW - 1; ++l) tmp[j][i] += at(l, j, i, tx);
                     tmp[j][i] = warp_sum(sg, tmp[j][i]);
