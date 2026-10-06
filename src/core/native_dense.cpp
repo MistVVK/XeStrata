@@ -66,6 +66,31 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
 
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 
+bool NativeDense::layer_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                              std::vector<uint64_t>& per_layer, uint64_t& shared, std::string& err) {
+    per_layer.assign((size_t) std::max<int64_t>(n_layers, 0), 0);
+    shared = 0;
+    try {
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported((int) tensor.type) ||
+                    tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX || tensor.shape[1] > INT_MAX)
+                    continue;
+                const uint64_t b = strata::kernels::native_mmvq_weight_bytes((int) tensor.type, (int) tensor.shape[0],
+                                                                             (int) tensor.shape[1]);
+                const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
+                if (tensor.name.find("ple") != std::string::npos || l < 0 || l >= n_layers) shared += b;
+                else per_layer[(size_t) l] += b;
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string ple_tensor = "blk.1.ple_key.weight";

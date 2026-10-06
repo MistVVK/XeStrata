@@ -31,6 +31,10 @@ public:
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
+    /// The bytes `load` would upload for each layer (`per_layer[l]`), and for the tensors every stage loads (the PLE
+    /// ones: `shared`), from the GGUF headers only - so a layer split can price a placement before loading anything.
+    static bool layer_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                            std::vector<uint64_t>& per_layer, uint64_t& shared, std::string& err);
     /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
