@@ -715,6 +715,7 @@ struct GpuStage {
     strata::gpu::Stream stream = nullptr;
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
+    int64_t held = 0;                                    ///< the first `held` pairs of `profile` fill its cache
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     strata::core::Verifier ver;
     strata::prefill::Prefill sp;
@@ -2337,6 +2338,7 @@ int main(int argc, char** argv) {
     // #477: the whole ranking as loaded, the prior of --expert-profile-save's order (a layer split keeps only
     // CUDA0's pairs in `profile` below).  Empty without --expert-profile-save.
     std::vector<std::pair<int32_t, int32_t>> profile_loaded;
+    std::vector<std::pair<int32_t, int32_t>> profile_all;   // a layer split: the whole ranking
     if (!o.expert_profile_save.empty()) profile_loaded = profile;
     // ---- layer split across GPUs: "auto" places the split points by a cost model of one decode window, measured on
     // the 5080 + 3090 rig (bench/results/2026-09-29-layer-split):
@@ -2464,6 +2466,7 @@ int main(int argc, char** argv) {
             const int st = stage_of(pr.first);
             (st == 0 ? mine : stages[(size_t) st - 1]->profile).push_back(pr);
         }
+        profile_all = profile;   // the RAM tier ranks every stage's layers (pin_cache_complement)
         profile.swap(mine);
         for (size_t i = 0; i < stages.size(); ++i) {
             stages[i]->lb = split_at[i];
@@ -2752,6 +2755,7 @@ int main(int argc, char** argv) {
             }
             ++filled;
         }
+        st.held = filled;
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                  blob_to_copy(srcp, st.profile[0].first, st.profile[0].second, fill_tmp), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {
@@ -3613,7 +3617,14 @@ int main(int argc, char** argv) {
             const int64_t slots = plan_lend(chunk);
             if (slots > 0) lend_from = xcache.slots() - slots;
         }
-        if (!src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, 8ull << 30, budget, &profile) ||
+        // with a layer split the RAM tier serves every stage's layers: ranked by the whole profile, without the experts
+        // the later stages' caches hold (CUDA0's `profile` is its own layers' only; B70 + 4070, UD-Q4_K_XL: 26 GiB
+        // of the 66 GiB budget were filled, and the later stage's misses were read from the SSD)
+        std::vector<std::pair<int32_t, int32_t>> other_gpus;
+        for (const auto& st : stages)
+            other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
+        if (!src.pin_cache_complement(xcache, err, o.resident_pin, other_gpus, lend_from, 8ull << 30, budget,
+                                      stages.empty() ? &profile : &profile_all) ||
             (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
         }
