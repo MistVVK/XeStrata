@@ -976,7 +976,8 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   The cache adapts to the conversation while you chat.
 - **RAM:** all 24,576 experts, in one large mapping registered for device copies.
   The CPU computes the experts that are not on the GPU **in place**, at the same time as the GPU works on the cached ones
-  (AVX-512 / AVX2 kernels, ggml's for the i-quants).
+  (AVX-512 / AVX2 kernels, ggml's for the i-quants; on a CPU with AVX-VNNI the Q2_0 and IQ4_NL dots use it,
+  `STRATA_NO_AVXVNNI=1` goes back to AVX2).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them.
   On the B70 a check advances 2.1–3.4 tokens on average ([record](../bench/results/2026-10-03-mtp-accept/README.md)).

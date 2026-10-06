@@ -176,6 +176,10 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                float* const* out, int r0, int r1);
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
+/// The Q2_0 rows with AVX-VNNI (src/kernels/cpu/q2_avxvnni.cpp, built when the compiler has -mavxvnni), bitwise the
+/// same as the AVX2 ones; called only when cpu_avxvnni_ok().
+void q2_0_gguf_rows_multi_avxvnni(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                  float* const* out, int r0, int r1);
 
 void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
 

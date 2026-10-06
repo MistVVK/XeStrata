@@ -625,6 +625,16 @@ target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+# AVX-VNNI (Intel Core 12th gen and later, AMD Zen 5): the Q2_0 and IQ4_NL rows' integer dot as vpdpbusd, chosen at run
+# time (cpu_avxvnni_ok); without the compiler flag the AVX2 kernels serve every CPU.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mavxvnni STRATA_CXX_AVXVNNI)
+if(STRATA_CXX_AVXVNNI)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/q2_avxvnni.cpp)
+  set_source_files_properties(src/kernels/cpu/q2_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
+                              "-mavx2;-mavxvnni;-mfma;-mf16c")
+  target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_HAVE_AVXVNNI=1)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -673,6 +683,11 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  if(STRATA_CXX_AVXVNNI)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avxvnni.cpp)
+    set_source_files_properties(src/kernels/cpu/iq_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx2;-mavxvnni;-mfma;-mf16c")
+  endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
