@@ -36,7 +36,9 @@ The engine's own options:
 It needs:
 
 - `--serve` (the server passes it) and `--expert-profile`.
-- No conversation parking (`--conversation-cache-mib`): where it is set, set it to 0.
+
+Conversation parking (`--conversation-cache-mib`, `--conversation-save`) copies every GPU's session out and back.
+A saved file is read only by an engine with the same split points; `--layer-split auto` can choose others from what it measures, and then the earlier files are not read.
 
 ## GPU numbers
 
@@ -113,5 +115,3 @@ Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, 
 ## Limits
 
 - One PC only: no GPUs over the network.
-- No conversation parking (`--conversation-cache-mib`).
-- No `--expert-cache-remote` (a helper GPU's expert cache).

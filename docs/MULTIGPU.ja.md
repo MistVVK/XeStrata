@@ -36,7 +36,9 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 必要なもの:
 
 - `--serve`（サーバーから起動するときは付いています）と `--expert-profile`。
-- 会話の退避（`--conversation-cache-mib`）は使えません。付けているときは `--conversation-cache-mib 0` にします。
+
+会話の退避（`--conversation-cache-mib`、`--conversation-save`）は、各 GPU のセッションを写して戻します。
+保存したファイルは同じ分割点のエンジンだけが読みます。`--layer-split auto` は測った値で分割点が変わることがあり、そのときは前のファイルを読みません。
 
 ## GPU の番号
 
@@ -113,5 +115,3 @@ IQ2_XS では、手で K=38 にすると auto より約 3% 速くなりました
 ## いまの限界
 
 - 1 台の PC の中だけです。ネットワークの先の GPU は使えません。
-- 会話の退避（`--conversation-cache-mib`）は使えません。
-- `--expert-cache-remote`（補助の GPU のエキスパートのキャッシュ）は使えません。
