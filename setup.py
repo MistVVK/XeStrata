@@ -7,13 +7,14 @@
     ./setup.sh installs Python if needed and runs this file
 
 The first time it asks four questions - which model (the original Qwen3.8-Flash-Next or the Swift 1.5 fine-tune),
-which size, how much context, and whether the model should also read images - then installs everything and starts the model on http://127.0.0.1:8095 (OpenAI- and Anthropic-compatible
-API; a small page there shows that it runs). Every later start skips straight to running the model: nothing that
-is already downloaded, installed or prepared is done again.
+which size, how much context, and whether the model should also read images - then installs everything and starts
+the model on http://127.0.0.1:8095 (OpenAI- and Anthropic-compatible API; a small page there shows that it runs).
+Every later start skips straight to running the model: nothing that is already downloaded, installed or prepared is
+done again.
 
 What the first run does (each step is skipped when it is already done):
 
-  1. checks your PC: the GPU (Intel; NVIDIA with --license contrib) and its driver, RAM, CPU, free disk space
+  1. checks your PC: the GPU (Intel; NVIDIA in the contrib build, the default) and its driver, RAM, CPU, free disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
   4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md), and the image encoder when
@@ -162,11 +163,13 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "file": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-{q}-0000{i}-of-00002.gguf", "tag": "swift-",
               "mmproj_hf": hf("ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
               "mmproj": "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf", "name": "swift-1.5",
-              "license": "Swift Open License 1.0: https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"},
+              "license": "Swift Open License 1.0: "
+                         "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"},
     # ISTA-DASLab's expert-pruned release: half of each layer's experts removed, chosen for code, agentic tool use and
     # vision; its shard 2 (the n-gram table) and vision encoder are the original's files, shared with it
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "by": "ISTA-DASLab's coding version",
-              "about": "half the experts (code, tools, images kept): needs ~32 GB of RAM, faster; weaker outside coding",
+              "about": "half the experts (code, tools, images kept): needs ~32 GB of RAM, faster; weaker outside "
+                       "coding",
               "hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF") + "{q}/",
               "file": "Qwen3.8-Flash-Next-GSQ-RCO-{q}-0000{i}-of-00002.gguf", "tag": "coder-",
               "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF"),
@@ -617,7 +620,8 @@ def download(url, dst: Path, what=None):
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
     if total and part.stat().st_size != total:
-        fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, the server says {total:,}",
+        fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, "
+             f"the server says {total:,}",
              "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
     mark(dst)
@@ -765,11 +769,11 @@ def oneapi_lib_dirs() -> list:
 # ------------------------------------------------------------------------------------------------ the SYCL compiler
 # AGENTS.md, "Free and non-free builds": three build modes (--license).  free uses free software only:
 # intel/llvm's DPC++ 7 or later, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
-# --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib (the default): intel/llvm
-# built with its CUDA target (.tools/intel-llvm-contrib), for Intel and NVIDIA GPUs, with oneMKL and cuBLAS for the
-# dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL,
-# Intel GPUs only.  Whether the Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself
-# (tools/xmx_probe.cpp), not read from a version number.  Without XMX the engine still runs, its prompt path about 1.6
+# --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib (the
+# default): intel/llvm built with its CUDA target (.tools/intel-llvm-contrib), for Intel and NVIDIA GPUs, with oneMKL
+# and cuBLAS for the dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL, Intel GPUs only.  Whether the
+# Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself (tools/xmx_probe.cpp), not read from
+# a version number.  Without XMX the engine still runs, its prompt path about 1.6
 # times slower (bench/results/2026-10-02-dp4a); setup asks before building it so.
 LICENSES = ("free", "contrib", "contrib-icpx")
 INTEL_LLVM_BUILD = ROOT / "tools" / "intel_llvm_build.py"
@@ -1549,7 +1553,8 @@ def choices_from_config(cfg_path: Path) -> dict:
             "context": int(ctx) if (ctx := val("--max-context")) else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
-            "vision_onednn": ("on" if vis.get("onednn") else "off") if isinstance(vis, dict) and vis.get("gpu") else None,
+            "vision_onednn": (("on" if vis.get("onednn") else "off") if isinstance(vis, dict) and vis.get("gpu")
+                              else None),
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
             "layer_split": cfg.get("layer_split"),
@@ -1642,7 +1647,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg["args"] = CAL.apply(cfg["args"], res["settings"])
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     st = load_settings()
-    st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
+    st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"],
+                                                           "tok_s": res["report"].get("tok_s"),
                                                            "date": time.strftime("%Y-%m-%d")}
     save_settings(st)
     if res["settings"]:
@@ -1664,7 +1670,7 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     itself (`--prefill auto`: up to 32768, as the free VRAM allows - about 2x faster on long prompts)."""
     try:
         if engine_is_xe(json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text())):
-            return cfg                                 # the Xe engine numbers its versions from 0.1.0 and reads --prefill auto
+            return cfg             # the Xe engine numbers its versions from 0.1.0 and reads --prefill auto
     except (OSError, ValueError):
         pass
     a = cfg.get("args", [])
@@ -1677,7 +1683,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     elif "--prefill" in a and a[a.index("--prefill") + 1] == "auto" and (0, 0, 0) < ver < (0, 1, 13):
         a[a.index("--prefill") + 1] = "2048"           # an older engine kept after a failed update (issue #49)
         changed = True
-        warn(f"the installed engine is {'.'.join(map(str, ver))}: prompts are read in 2048-token chunks until it is updated")
+        warn(f"the installed engine is {'.'.join(map(str, ver))}: prompts are read in 2048-token chunks until it is "
+             "updated")
     if changed:
         cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     return cfg
@@ -1939,7 +1946,8 @@ def warm_up(cfg_path: Path) -> None:
                 asks.append([{"role": "user", "content": [{"type": "text", "text": "What colours are in this picture?"},
                                                           {"type": "image_url", "image_url": {"url": url}}]}])
             for messages in asks:
-                req = urllib.request.Request(base + "/v1/chat/completions", headers={"Content-Type": "application/json"},
+                req = urllib.request.Request(base + "/v1/chat/completions",
+                                             headers={"Content-Type": "application/json"},
                                              data=json.dumps({"messages": messages, "max_tokens": 32,
                                                               "temperature": 0}).encode())
                 json.loads(urllib.request.urlopen(req, timeout=900).read())
@@ -2160,7 +2168,8 @@ def main() -> int:
                     help="EXPERIMENTAL, off by default: the control vector in "
                          "third_party/nonfree/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
-    ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8095 for a new one)")
+    ap.add_argument("--port", type=int,
+                    help="the server's port (default: the one the install was set up with, 8095 for a new one)")
     ap.add_argument("--gpu", help="the GPU, numbered in PCI order as --check lists them (default: the one with "
                                   "the most VRAM); the engine takes it by PCI address")
     # upstream's layer split across several GPUs: refused with an explanation, the Xe engine runs on one GPU
@@ -2174,8 +2183,8 @@ def main() -> int:
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
-    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this folder, "
-                                       "remembered for every Strata folder on this PC")
+    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
+                                       "folder, remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
     ap.add_argument("--license", choices=LICENSES,
@@ -2327,7 +2336,8 @@ def main() -> int:
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
     if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
-        warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the CPU. "
+        warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the "
+             "CPU. "
              "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
     if gpu.get("integrated"):
         warn("the processor's own graphics: Strata will run, but slowly - its memory is the system RAM, and it has "
@@ -2544,11 +2554,13 @@ def main() -> int:
             say()
             say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")
             say("  It changes how the model answers: its package describes it as a refusal-direction projection (the")
-            say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it off")
-            say("  per chat. Details: third_party/nonfree/experimental-speed-projection/README.md")
-            esp_choice = "on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y" else "off"
+            say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it")
+            say("  off per chat. Details: third_party/nonfree/experimental-speed-projection/README.md")
+            esp_choice = ("on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y"
+                          else "off")
         if esp_choice.lower() not in ("off", "no", "n", "0"):
-            esp = ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1") else Path(esp_choice).expanduser().resolve()
+            esp = (ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1")
+                   else Path(esp_choice).expanduser().resolve())
             if not esp.is_file() and esp == ESP_VECTOR:   # third_party/nonfree removed: the rest works without it
                 warn(f"the experimental speed projection's vector is not here ({esp}): left off. Put the vector "
                      "there, or pass --experimental-speed-projection <its GGUF>")
@@ -2606,7 +2618,8 @@ def main() -> int:
                 ok(f"{s.name} already downloaded")
                 continue
             # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
-            other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf") if done(p)]
+            other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf")
+                     if done(p)]
             if family in ("qwen", "coder") and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
                 try:
                     os.link(other[0], s)
