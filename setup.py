@@ -479,15 +479,21 @@ def gpu_table(found) -> None:
 
 
 def parse_gpus(text, found) -> list:
-    """--gpus: a layer split across several cards, which the Xe engine does not do."""
-    fail(f"--gpus {text}: the Xe engine runs on one GPU",
-         "use --gpu N (or leave it out for the card with the most VRAM)")
+    """--gpus 0,2: a layer split across these cards (numbered as --check lists them), the first one running the early
+    layers (docs/MULTIGPU.md).  Two or more distinct cards that can be used."""
+    try:
+        sel = [int(x) for x in str(text).split(",") if x.strip() != ""]
+    except ValueError:
+        sel = []
+    if len(sel) < 2 or len(set(sel)) != len(sel):
+        fail(f"--gpus {text}: two or more different GPU numbers, as --check lists them, e.g. --gpus 0,1",
+             "use --gpu N for one card")
+    check_gpus(sel, found)
+    return sel
 
 
 def check_gpus(sel, found, what="") -> None:
     """Stops with a plain message when a chosen card is missing or cannot be used, and says what can."""
-    if len(sel) > 1:
-        parse_gpus(",".join(str(i) for i in sel), found)
     for i in sel:
         g = next((x for x in found if x["index"] == i), None)
         p = "not found on this PC" if g is None else gpu_problem(g)
@@ -502,10 +508,10 @@ def check_gpus(sel, found, what="") -> None:
 
 
 def choose_gpus(a, found) -> list:
-    """Which card this install uses: --gpu, else the supported card with the most VRAM.  Returns its number in a
-    list (the Xe engine runs on one GPU)."""
+    """Which cards this install uses: --gpus (a layer split, the first card first), else --gpu, else the supported
+    card with the most VRAM.  Returns their numbers."""
     if a.gpus:
-        parse_gpus(a.gpus, found)
+        return parse_gpus(a.gpus, found)
     if a.gpu is not None:
         check_gpus([a.gpu], found)
         return [a.gpu]
@@ -1557,6 +1563,7 @@ def choices_from_config(cfg_path: Path) -> dict:
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
             "layer_split": cfg.get("layer_split"),
+            "split_pci": [cfg.get("gpu_pci"), *cfg["split_pci"]] if cfg.get("split_pci") else None,
             # #493: --vram-reserve-mib given at setup (images write the default 700 themselves)
             "vram_reserve_mib": reserve if reserve is not None and (
                 vis is None or reserve != VISION["gpu"]["reserve_mib"]) else None}
@@ -1622,6 +1629,8 @@ def hardware_key(cfg: dict) -> str:
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
     sel = cfg.get("gpu")
     gl = [gpu_info(i) or {} for i in sel] if isinstance(sel, list) else [gpu_info(sel) or {}]
+    if cfg.get("split_pci"):                             # a layer split (setup --gpus): its other cards
+        gl += [next((x for x in gpus() if x["pci"] == pci), {}) for pci in cfg["split_pci"]]
     g = {"name": " + ".join(x.get("name", "?") for x in gl), "vram_gb": sum(x.get("vram_gb", 0) for x in gl)}
     a = cfg.get("args", [])
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
@@ -1855,11 +1864,29 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     found = gpus()
     env = None
     usable = [x for x in found if gpu_problem(x) is None]
-    if gpu is not None:                                # --gpu N: this start only, by the card's PCI address
+    if isinstance(gpu, list) and len(gpu) > 1:        # --gpus: a layer split, saved for this model
+        check_gpus(gpu, found)
+        cards = [next(x for x in found if x["index"] == i) for i in gpu]
+        cfg["gpu_pci"], cfg["split_pci"] = cards[0]["pci"], [x["pci"] for x in cards[1:]]
+        if layer_split:
+            cfg["layer_split"] = str(layer_split)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok("saved for this model: the layers split across " + " + ".join(gpu_name(x) for x in cards) +
+           f" ({cfg.get('layer_split') or 'auto'})")
+    elif gpu is not None:                              # --gpu N: this start only, by the card's PCI address
         check_gpus(gpu if isinstance(gpu, list) else [gpu], found)
         g = next(x for x in found if x["index"] == (gpu[0] if isinstance(gpu, list) else gpu))
         env = dict(os.environ, STRATA_GPU_PCI=g["pci"])
+        if cfg.get("split_pci"):                       # one card for this start, the saved split kept
+            env["STRATA_LAYER_SPLIT"] = "off"
         ok("GPU: " + gpu_name(g) + " (this start)")
+    elif cfg.get("split_pci"):
+        cards = [next((x for x in found if x["pci"] == pci), None) for pci in [cfg.get("gpu_pci"), *cfg["split_pci"]]]
+        if None in cards:
+            fail("a GPU of this model's layer split is missing: " +
+                 ", ".join(pci for pci, x in zip([cfg.get("gpu_pci"), *cfg["split_pci"]], cards) if x is None),
+                 "start it with --gpus (the cards to use, as --check lists them) or --gpu N for one card")
+        ok("GPUs: " + " + ".join(gpu_name(x) for x in cards) + f" (layer split, {cfg.get('layer_split') or 'auto'})")
     elif usable:
         g = next((x for x in usable if x["pci"] == cfg.get("gpu_pci")), usable[0])
         ok("GPU: " + gpu_name(g))
@@ -2171,9 +2198,10 @@ def main() -> int:
                     help="the server's port (default: the one the install was set up with, 8095 for a new one)")
     ap.add_argument("--gpu", help="the GPU, numbered in PCI order as --check lists them (default: the one with "
                                   "the most VRAM); the engine takes it by PCI address")
-    # upstream's layer split across several GPUs: refused with an explanation, the Xe engine runs on one GPU
-    ap.add_argument("--gpus", help=argparse.SUPPRESS)
-    ap.add_argument("--layer-split", help=argparse.SUPPRESS)
+    ap.add_argument("--gpus", help="a layer split across these GPUs, e.g. 0,1 (numbered as --check lists them; the "
+                                   "first runs the early layers; docs/MULTIGPU.md); saved for the model")
+    ap.add_argument("--layer-split", help="with --gpus: the first layer of each later GPU's share (e.g. 36), or auto "
+                                          "(the default: measured on this PC)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
@@ -2276,8 +2304,10 @@ def main() -> int:
                 a.port = a.port or ch["port"]
                 if a.vram_reserve_mib is None:          # #493: an explicit reserve set up before
                     a.vram_reserve_mib = ch.get("vram_reserve_mib")
-                if isinstance(ch.get("gpu"), list):     # a layer split: set up across the same cards again
-                    a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
+                by_pci = {x["pci"]: x["index"] for x in gpus()}
+                if ch.get("split_pci") and all(pci in by_pci for pci in ch["split_pci"]):
+                    # a layer split: set up across the same cards again
+                    a.gpus = a.gpus or ",".join(str(by_pci[pci]) for pci in ch["split_pci"])
                     a.layer_split = a.layer_split or ch.get("layer_split")
                 else:
                     a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
@@ -2330,6 +2360,10 @@ def main() -> int:
     chosen = [gpu]
     mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else f"{gpu['vram_gb']:.0f} GB VRAM"
     ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
+    for i in sel[1:]:                                  # --gpus: the later layers' cards
+        x = gpu_info(i)
+        ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
+           f"{a.layer_split or 'auto'})")
     if gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
@@ -2744,6 +2778,11 @@ def main() -> int:
                            "log": str(ROOT / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+    if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
+        cfg["gpu_pci"] = gpu["pci"]
+        cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
+        if a.layer_split:
+            cfg["layer_split"] = str(a.layer_split)
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
     if a.host:

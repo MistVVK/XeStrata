@@ -1473,6 +1473,10 @@ def engine_args(cfg: dict) -> list[str]:
     args = list(cfg["args"])
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
+    # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; STRATA_LAYER_SPLIT=off (setup --gpu N
+    # for one start) runs on the first card alone
+    if cfg.get("split_pci") and "--layer-split" not in args and os.environ.get("STRATA_LAYER_SPLIT") != "off":
+        args += ["--layer-split", str(cfg.get("layer_split") or "auto"), "--split-device", ",".join(cfg["split_pci"])]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
