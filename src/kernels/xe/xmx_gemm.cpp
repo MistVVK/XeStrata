@@ -11,6 +11,7 @@
 // the wide products), while the dequantizers write row-major twice as fast as packed (bench/results/2026-10-02-xmx-gemm).
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/per_device.hpp"
 #include "dp4a_gemm.hpp"
 #include "mma_gemm.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -237,25 +238,29 @@ bool large_grf_ok(const sycl::device& d) {
     }
 }
 
+// the current device's XMX, worked out and reported once for each GPU
+struct XmxUse {
+    bool f16, bf16;
+};
 bool use_xmx(XmxType t) {
-    static const sycl::device dev = core::Runtime::get().compute().get_device();
-    static const bool grf = (device_has_xmx(dev, mx::matrix_type::fp16) || device_has_xmx(dev, mx::matrix_type::bf16))
-                            && large_grf_ok(dev);
-    static const bool f16 = grf && device_has_xmx(dev, mx::matrix_type::fp16);
-    static const bool bf16 = grf && device_has_xmx(dev, mx::matrix_type::bf16);
-    static const bool told = [] {
-        if (!f16 || !bf16) {
-            const auto& q = core::Runtime::get().compute();
-            const bool mma = xe::mma_usable(q, /*bf16=*/f16);   // the type without XMX: FP16, else BF16
+    static core::PerDevice<XmxUse> per_device;
+    auto& q = core::Runtime::get().compute();
+    const XmxUse& u = per_device.get(q.get_device(), [&q] {
+        const sycl::device dev = q.get_device();
+        const bool grf = (device_has_xmx(dev, mx::matrix_type::fp16) || device_has_xmx(dev, mx::matrix_type::bf16))
+                         && large_grf_ok(dev);
+        const XmxUse use{grf && device_has_xmx(dev, mx::matrix_type::fp16),
+                         grf && device_has_xmx(dev, mx::matrix_type::bf16)};
+        if (!use.f16 || !use.bf16) {
+            const bool mma = xe::mma_usable(q, /*bf16=*/use.f16);   // the type without XMX: FP16, else BF16
             std::fprintf(stderr, "strata: the GPU (or its SYCL runtime) reports no XMX for %s: the prompt path's matrix "
-                         "products run through %s\n", !f16 && !bf16 ? "FP16 and BF16" : !f16 ? "FP16" : "BF16",
+                         "products run through %s\n", !use.f16 && !use.bf16 ? "FP16 and BF16" : !use.f16 ? "FP16" : "BF16",
                          mma ? "the matrix engines it reports (joint_matrix, mma_gemm)"
                              : "DP4a (on the B70, 1.6 times slower than XMX)");
         }
-        return true;
-    }();
-    (void) told;
-    return t == XmxType::f16 ? f16 : bf16;
+        return use;
+    });
+    return t == XmxType::f16 ? u.f16 : u.bf16;
 }
 
 void finish(void* stream, const sycl::event& e, const char* what) {

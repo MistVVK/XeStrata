@@ -13,6 +13,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 
@@ -66,15 +67,15 @@ inline uint32_t order_key(float s) {
 
 inline size_t grid_for(long long n, int threads) { return (size_t) ((n + threads - 1) / threads) * threads; }
 
-// ---- the step state, uploaded (see the CUDA file): one process-wide device buffer written on the compute queue.
+// ---- the step state, uploaded (see the CUDA file): a device buffer for each GPU, written on its compute queue.
 int32_t* step_scratch() {
-    static int32_t* d_step = [] {
-        auto& rt = core::Runtime::get();
+    static core::PerDevice<int32_t*> per_device;
+    auto& rt = core::Runtime::get();
+    return per_device.get(rt.device(), [&rt] {
         auto* p = static_cast<int32_t*>(sycl::malloc_device(qsa_step_bytes(), rt.device(), rt.context()));
         if (!p) fail("step upload: device allocation failed");
         return p;
-    }();
-    return d_step;
+    });
 }
 
 // CUDA copied with a synchronous cudaMemcpy on the legacy stream; the compute queue plays that part.  The copy starts

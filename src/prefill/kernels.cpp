@@ -11,6 +11,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/per_device.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -631,7 +632,8 @@ namespace {
 // EUs of Xe-LP and Xe-HPG would spill the 128 state rows), and the device must build the large register file.
 // STRATA_GDN_REC_LANE=0: the D-2 kernel (A/B).
 bool gdn_lane_ok(sycl::queue& q) {
-    static const bool ok = [&] {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&] {
         const char* v = std::getenv("STRATA_GDN_REC_LANE");
         if (v != nullptr && v[0] == '0') return false;
         const sycl::device d = q.get_device();
@@ -647,8 +649,7 @@ bool gdn_lane_ok(sycl::queue& q) {
                          "(%s): the prompt path keeps the work-group kernel\n", e.what());
             return false;
         }
-    }();
-    return ok;
+    });
 }
 }  // namespace
 

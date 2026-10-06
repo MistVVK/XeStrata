@@ -11,6 +11,7 @@
 #include "dp4a_gemm.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
+#include "strata/core/per_device.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -114,14 +115,14 @@ sycl::event launch(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t
 }  // namespace
 
 int narrow_sub_group(const sycl::queue& q) {
-    static const int sg = [&q] {
+    static core::PerDevice<int> per_device;
+    return per_device.get(q.get_device(), [&q] {
         // STRATA_SUB_GROUP_32=1 takes 32 where 16 is listed too, to compare the two on one GPU
         if (const char* v = std::getenv("STRATA_SUB_GROUP_32"); v != nullptr && std::strtol(v, nullptr, 10) != 0)
             return 32;
         const auto s = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
         return std::find(s.begin(), s.end(), size_t(16)) != s.end() ? 16 : 32;
-    }();
-    return sg;
+    });
 }
 
 int64_t fill_rows(const sycl::queue& q, int64_t b70_rows) {
@@ -135,11 +136,12 @@ sycl::event dp4a_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16
     // wide products, on the B70), 64 x 64 for short prompts.  The 128 x 64 tile's 64 accumulators a work-item fit the
     // registers only where the EU is 16 wide (Xe2): on the 8-wide EUs of Xe-HPG (the A380) they spilled, and it ran at
     // 0.026 TOPS against 2.5 for 64 x 64 (bench/results/2026-10-04-dg2-dp4a).
-    static const bool wide_eu = [&q] {
+    static core::PerDevice<bool> per_device;
+    const bool wide_eu = per_device.get(q.get_device(), [&q] {
         const sycl::device d = q.get_device();
         return d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) &&
                d.get_info<sycl::ext::intel::info::device::gpu_eu_simd_width>() >= 16;
-    }();
+    });
     const int64_t many = wide_eu ? fill_rows(q, 1024) : std::numeric_limits<int64_t>::max();
     if (bf16) {
         if (T >= many) return launch<true, 8, 4>(q, X, W, 0, Y, ldy, nullptr, 1, T, N, K);

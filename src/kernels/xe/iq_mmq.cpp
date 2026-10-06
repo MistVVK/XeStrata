@@ -20,6 +20,7 @@
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
+#include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
 
 #define GGML_COMMON_DECL_SYCL
@@ -430,7 +431,8 @@ struct LayoutCheck {
 }  // namespace
 
 bool iq_mmq_usable(sycl::queue& q) {
-    static const bool ok = [&q] {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
         if (env_on("STRATA_NO_XMX")) return false;
         const sycl::device d = q.get_device();
         if (!shape_reported(d)) return false;
@@ -456,8 +458,7 @@ bool iq_mmq_usable(sycl::queue& q) {
         if (!res) std::fprintf(stderr, "strata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
                                "prompt products stay in FP16\n");
         return res == 1;
-    }();
-    return ok;
+    });
 }
 
 bool iq_mmq_type_ok(int t) {

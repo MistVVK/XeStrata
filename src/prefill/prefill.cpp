@@ -7,6 +7,8 @@
 #include "strata/core/progress.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/per_device.hpp"
+#include "strata/core/runtime.hpp"
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
@@ -73,7 +75,10 @@ inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
     int r = v ? (int) std::strtol(v, nullptr, 10) : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? 384 : 96);
     if (!v) {
-        static const uint64_t mem = strata::core::device_info(0).total_bytes;
+        static strata::core::PerDevice<uint64_t> per_device;   // the current device's memory, read once for each GPU
+        const int dev = strata::core::current_device();
+        const uint64_t mem = per_device.get(strata::core::Runtime::at(dev).device(),
+                                            [dev] { return strata::core::device_info(dev).total_bytes; });
         const uint64_t blob = (uint64_t) std::max<int64_t>(MAXBLOB(), 1);
         r = (int) std::min<uint64_t>((uint64_t) r, mem / 8 / blob);
     }

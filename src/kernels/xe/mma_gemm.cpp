@@ -18,6 +18,7 @@
 #include "mma_gemm.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
+#include "strata/core/per_device.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -29,6 +30,7 @@
 #include <iterator>
 #include <mutex>
 #include <type_traits>
+#include <unordered_map>
 
 namespace strata::kernels::xe {
 namespace {
@@ -407,16 +409,21 @@ bool env_on(const char* name) {
 bool groups_layout_fits(int s, const sycl::queue& q);
 
 // The first shape the device reports for the input type whose layout for the experts' groups (the smaller one) it
-// runs, or -1.  The engine drives one device, so the first call's answer holds.
+// runs, or -1; worked out once for each GPU.
 int shape(const sycl::queue& q, bool bf16) {
-    static const auto pick = [](const sycl::queue& qq, mx::matrix_type in) {
-        for (int s = 0; s < (int) std::size(kShapes); ++s)
-            if (reported(qq.get_device(), in, kShapes[s])) return groups_layout_fits(s, qq) ? s : -1;
-        return -1;
+    struct Shapes {
+        int f16, b16;
     };
-    static const int f16 = pick(q, mx::matrix_type::fp16);
-    static const int b16 = pick(q, mx::matrix_type::bf16);
-    return bf16 ? b16 : f16;
+    static core::PerDevice<Shapes> per_device;
+    const Shapes& s = per_device.get(q.get_device(), [&q] {
+        const auto pick = [&q](mx::matrix_type in) {
+            for (int i = 0; i < (int) std::size(kShapes); ++i)
+                if (reported(q.get_device(), in, kShapes[i])) return groups_layout_fits(i, q) ? i : -1;
+            return -1;
+        };
+        return Shapes{pick(mx::matrix_type::fp16), pick(mx::matrix_type::bf16)};
+    });
+    return bf16 ? s.b16 : s.f16;
 }
 
 // Whether shape S's layout for a product (GROUPED false) or for the experts' groups fits the device: its local memory
@@ -428,7 +435,8 @@ int shape(const sycl::queue& q, bool bf16) {
 template<int S, bool GROUPED>
 bool layout_fits(const sycl::queue& q) {
     using KT = Kernel<S, sycl::half, false, GROUPED>;
-    static const bool ok = [&q] {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
         const sycl::device d = q.get_device();
         const char* what = GROUPED ? "the experts' groups" : "a product";
         const size_t local = d.get_info<sycl::info::device::local_mem_size>();
@@ -438,8 +446,7 @@ bool layout_fits(const sycl::queue& q) {
                      "the GPU has %zu and %zu%s\n", what, KT::LOCAL, KT::NSG * KT::SG, local, wg,
                      KT::L.grf ? " (a quarter of its largest, with the large register file)" : "");
         return false;
-    }();
-    return ok;
+    });
 }
 
 bool groups_layout_fits(int s, const sycl::queue& q) {
@@ -454,23 +461,28 @@ bool groups_layout_fits(int s, const sycl::queue& q) {
 // run.  RTX 4070: 512 x 320 x 10240 (BF16, the hyper-connection read: 40 tiles) 305 -> 159 us (four times the compute
 // units: no faster).  Not in a decode window's few rows (a captured graph would keep the scratch buffer's address).
 int64_t k_slices(const sycl::queue& q, int64_t T, int64_t tiles, int64_t K) {
-    static const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
     if (T < 64 || tiles >= 2 * cu) return 1;
     return std::max<int64_t>(1, std::min((2 * cu + tiles - 1) / tiles, K / ((int64_t) 4 * KC)));
 }
 
+// one buffer for each GPU, on its device
 float* k_scratch(sycl::queue& q, size_t floats) {
+    struct Scratch {
+        float* buf = nullptr;
+        size_t cap = 0;
+    };
     static std::mutex mu;
-    static float* buf = nullptr;
-    static size_t cap = 0;
+    static std::unordered_map<sycl::device, Scratch> per_device;
     std::lock_guard<std::mutex> lock(mu);
-    if (floats > cap) {
+    Scratch& s = per_device[q.get_device()];
+    if (floats > s.cap) {
         q.wait();   // the products queued before may still read the old one
-        if (buf != nullptr) sycl::free(buf, q);
-        buf = sycl::malloc_device<float>(floats, q);
-        cap = buf != nullptr ? floats : 0;
+        if (s.buf != nullptr) sycl::free(s.buf, q);
+        s.buf = sycl::malloc_device<float>(floats, q);
+        s.cap = s.buf != nullptr ? floats : 0;
     }
-    return buf;
+    return s.buf;
 }
 
 template<int S, typename E, bool GROUPED>

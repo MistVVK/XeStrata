@@ -23,6 +23,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/per_device.hpp"
 #include "device_target.hpp"
 #include "mma_gemm.hpp"
 
@@ -639,13 +640,16 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (n_q <= 0) return true;
     // the matrix engines and the work-group's local memory (26 KiB, 34 KiB with Q4_0 K and V); without them the
     // caller keeps the FP32 kernel
-    static const size_t slm = core::Runtime::get().compute().get_device().get_info<sycl::info::device::local_mem_size>();
+    auto& queue = core::Runtime::get().stream(stream);
+    const size_t slm = queue.get_device().get_info<sycl::info::device::local_mem_size>();
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     if (!xmx_available(XmxType::f16)) {
         // the portable kernel: FP16 pools (the others keep the FP32 kernel)
-        auto& queue = core::Runtime::get().stream(stream);
-        static const bool mma = xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes();
+        static core::PerDevice<bool> per_device;
+        const bool mma = per_device.get(queue.get_device(), [&queue, slm] {
+            return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes();
+        });
         if (!mma || pools.k_q4 != nullptr || pools.k_q != nullptr || !pools.k_pool || !pools.v_pool) return false;
         const sycl::event e = launch_mma(queue, q, pools, ids, steps, cap, s.n_head_kv, s.page_size, attn, n_q);
         if (!stream) core::Runtime::get().wait(e, "qsa_prompt_attn_batch");
@@ -656,7 +660,6 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
         return v == nullptr || v[0] != '0';
     }();
-    auto& queue = core::Runtime::get().stream(stream);
     const int64_t nkv = s.n_head_kv, ps = s.page_size;
     sycl::event e;
     if (pools.k_q4 != nullptr) {   // --kv q4_0
