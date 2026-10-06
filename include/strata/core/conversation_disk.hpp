@@ -31,6 +31,8 @@ struct ConversationDiskOptions {
     std::chrono::seconds max_age{0};  // since the file was last written or restored
     size_t checkpoints = 2;        // checkpoints written per conversation: deepest, chain root, then newest use
     bool compress = false;         // the floating-point parts through c-blosc2 (needs conversation_disk_can_compress)
+    size_t stage_parts = 0;        // a layer split's later GPUs: each state is followed by theirs (the fingerprint
+                                   // names the split, so a file is read only by an engine split the same way)
 };
 
 class ConversationDisk {

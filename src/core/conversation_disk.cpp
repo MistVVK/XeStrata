@@ -616,8 +616,18 @@ bool ConversationDisk::load(size_t index, SavedConversation& image, std::string&
     out.live.ids = h.ids;
     out.live.imgs = h.imgs;
     for (const auto& c : h.checkpoints) out.checkpoints.push_back(prefix_of(h, c));
-    auto state = [&](ConversationCheckpoint& c) {
+    auto one = [&](ConversationCheckpoint& c) {
         return r.part(c.gdn) && r.part(c.ple) && r.part(c.tails) && r.part(c.dead) && r.part(c.block_pos);
+    };
+    auto state = [&](ConversationCheckpoint& c) {   // its own, then the later GPUs' of a layer split
+        bool good = one(c);
+        c.stage_parts.resize(options_.stage_parts);
+        for (auto& part : c.stage_parts) {
+            part.ids = c.ids;
+            part.imgs = c.imgs;
+            good = good && one(part);
+        }
+        return good;
     };
     bool ok = state(out.live);
     for (auto& c : out.checkpoints) ok = ok && state(c);
@@ -650,11 +660,21 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     h.imgs = image.live.imgs;
     // the payload: what a load allocates, and with the part and layer headers what the body holds uncompressed
     size_t payload = 0, body = 0;
-    auto count_state = [&](const ConversationCheckpoint& c) {
+    auto count_one = [&](const ConversationCheckpoint& c) {
         for (const auto* p : state_parts(c))
             if (!add(payload, p->size()) || !add(body, kPartHeader)) return false;
         return true;
     };
+    auto count_state = [&](const ConversationCheckpoint& c) {
+        if (c.stage_parts.size() != options_.stage_parts) return false;
+        bool good = count_one(c);
+        for (const auto& part : c.stage_parts) good = good && count_one(part);
+        return good;
+    };
+    if (image.live.stage_parts.size() != options_.stage_parts) {
+        error = "the conversation's layer-split parts differ from the folder's";
+        return false;
+    }
     bool sized = count_state(image.live) && add(body, sizeof(uint64_t));
     for (size_t i : kept) {
         const auto& c = image.checkpoints[i];
@@ -717,10 +737,14 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
     w.f = f;
     w.compress = options_.compress;
     w.ok = prefix();
-    auto write_state = [&](const ConversationCheckpoint& c) {
+    auto write_one = [&](const ConversationCheckpoint& c) {
         w.part(c.gdn.data(), c.gdn.size(), sizeof(float));   // the DeltaNet states; the rest is about 1 MiB
         for (const auto* p : state_parts(c))
             if (p != &c.gdn) w.part(p->data(), p->size());
+    };
+    auto write_state = [&](const ConversationCheckpoint& c) {   // its own, then the later GPUs' (count_state)
+        write_one(c);
+        for (const auto& part : c.stage_parts) write_one(part);
     };
     write_state(image.live);
     for (size_t i : kept) write_state(image.checkpoints[i]);
