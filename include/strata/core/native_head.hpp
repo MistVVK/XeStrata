@@ -6,6 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
+#include <mutex>
 
 namespace strata::core {
 
@@ -39,7 +41,8 @@ private:
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
 /// is read over PCIe per token, so the table costs no VRAM.  `embed_row`, the verify window and the MTP drafter
-/// use it instead of the canonical table when it is set (`set_native_embed`).
+/// use it instead of the canonical table when it is set (`set_native_embed`).  Host USM belongs to one GPU's context,
+/// so a layer split's stage on another GPU (the drafter on the last one) reads a copy made in its own, once.
 class NativeEmbed {
 public:
     NativeEmbed() = default;
@@ -55,8 +58,12 @@ public:
     int type() const { return type_; }
 
 private:
+    /// The table as the GPU that runs `stream` reads it.
+    const void* table_for(void* stream) const;
     void* host_ = nullptr;
     const void* dev_ = nullptr;
+    mutable std::mutex copies_mutex_;
+    mutable std::vector<void*> copies_;   ///< by device ordinal: another GPU's copy (null: none yet, or host_'s own)
     uint64_t bytes_ = 0;
     size_t row_ = 0;
     int64_t n_embd_ = 0, n_vocab_ = 0;

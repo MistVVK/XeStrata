@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/native_head.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -11,6 +12,7 @@
 #include <climits>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 
 namespace strata::core {
 
@@ -112,7 +114,28 @@ void set_native_embed(const NativeEmbed* e) { g_embed = e; }
 const NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
+    for (void* c : copies_)
+        if (c) strata::gpu::free(c);
     if (host_) strata::gpu::free(host_);
+}
+
+const void* NativeEmbed::table_for(void* stream) const {
+    const Runtime* table_rt = Runtime::owner(host_);
+    const Runtime* run_rt = stream ? Runtime::owner_of_stream(stream) : &Runtime::get();
+    if (!table_rt || !run_rt || table_rt == run_rt) return dev_;
+    const int dev = run_rt->ordinal();
+    std::lock_guard<std::mutex> lock(copies_mutex_);
+    if (copies_.size() <= (size_t) dev) copies_.resize((size_t) dev + 1, nullptr);
+    if (!copies_[(size_t) dev]) {
+        const OnDevice on(dev);
+        void* c = nullptr;
+        if (!strata::gpu::alloc_host(&c, bytes_))
+            throw std::runtime_error("native embedding: cannot pin a copy of " + std::to_string(bytes_ >> 20) +
+                                     " MiB for GPU " + std::to_string(dev));
+        std::memcpy(c, host_, bytes_);
+        copies_[(size_t) dev] = c;
+    }
+    return copies_[(size_t) dev];
 }
 
 bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab, std::string& err) {
@@ -160,11 +183,12 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
 }
 
 void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream);
+    strata::kernels::iq_embed_rows(type_, table_for(stream), row_, tokens, n_tok, n_embd_, out, stream);
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) table_for(stream) + (size_t) token * row_, n_embd_, out,
+                                    stream);
 }
 
 }  // namespace strata::core
