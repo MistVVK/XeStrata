@@ -1272,9 +1272,8 @@ int main(int argc, char** argv) {
         }
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next discrete ones); "auto" chooses the K before anything is loaded (below).  Across GPUs, not yet: the
-    // helper caches (--expert-cache-remote) and conversation parking; not checked: KV streaming, images, control
-    // vectors.
+    // the next discrete ones); "auto" chooses the K before anything is loaded (below).  The helper caches
+    // (--expert-cache-remote) are not carried by the Xe engine at all (remote_experts.cpp).
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
