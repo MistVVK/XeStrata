@@ -4708,6 +4708,7 @@ int main(int argc, char** argv) {
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
         std::vector<int> stage_group((size_t) n_pipe, -1);
         int64_t pipe_tick = 0, rr = 0;
+        std::vector<double> pipe_pool0((size_t) n_pipe, 0.0);   // each stage's CPU-expert time at the run's start
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) gi * (size_t) GS + (size_t) t].active) return true;
@@ -4719,7 +4720,10 @@ int main(int argc, char** argv) {
         // one turn: serve every running stage, hand finished groups on, start what can start
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
-            if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
+            if (bt_windows == 0 && !pipe_inflight()) {
+                bt_start = Clock::now();
+                for (int k = 0; k < n_pipe; ++k) pipe_pool0[(size_t) k] = stage_ver(k).ms_pool;
+            }
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
@@ -4804,6 +4808,12 @@ int main(int argc, char** argv) {
                              "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = %.1f "
                              "rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
                              (long long) bt_rows, wall, 1000.0 * (double) bt_rows / std::max(wall, 1e-9));
+                // the host thread serves every stage's CPU experts in turn: how much of the wall time that took
+                std::string pools;
+                for (int k = 0; k < n_pipe; ++k)
+                    pools += " " + std::to_string((int) (stage_ver(k).ms_pool - pipe_pool0[(size_t) k])) + " ms";
+                std::fprintf(stderr, "strata batch (pipelined): CPU experts per stage:%s of %.0f ms\n", pools.c_str(),
+                             wall);
                 bt_windows = bt_rows = 0;
                 strata::core::progress().busy.store(false);
             }
