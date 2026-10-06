@@ -296,19 +296,10 @@ if(STRATA_ENABLE_XE)
                       -foffload-fp32-prec-sqrt
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
 
-  # Level Zero (libze-dev; free, MIT): the runtime asks it what the SYCL device does not report, such as whether a
-  # GPU is the processor's own (src/core/device.cpp)
-  find_path(STRATA_ZE_INCLUDE level_zero/ze_api.h)
-  find_library(STRATA_ZE_LOADER ze_loader)
-  if(NOT STRATA_ZE_INCLUDE OR NOT STRATA_ZE_LOADER)
-    message(FATAL_ERROR "The Xe backend needs the Level Zero headers and loader (Debian / Ubuntu: libze-dev)")
-  endif()
-
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC include)
-  target_include_directories(strata_core PRIVATE ${STRATA_ZE_INCLUDE})
-  target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform ${STRATA_ZE_LOADER})
+  target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)

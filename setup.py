@@ -1029,14 +1029,12 @@ def choose_compiler(a, gpu: dict) -> dict:
 
 
 def check_build_tools(comp: dict, sycl_vision: bool) -> None:
-    """What the build needs besides the SYCL compiler: the Level Zero headers for the engine, g++ for the CPU image
-    encoder, glslc and the Vulkan headers for the Vulkan one, and oneMKL for the SYCL one (ggml-sycl, contrib-icpx).
-    Setup does not install them (no apt or sudo from setup): it says what is missing."""
+    """What the build needs besides the SYCL compiler: g++ for the CPU image encoder, glslc and the Vulkan headers for
+    the Vulkan one, and oneMKL for the SYCL one (ggml-sycl, contrib-icpx).  Setup does not install them (no apt or
+    sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
         missing.append("build-essential")
-    if not Path("/usr/include/level_zero/ze_api.h").exists():
-        missing.append("libze-dev (the Level Zero headers the engine asks the GPU through)")
     if sycl_vision and not Path((oneapi_env() or {}).get("MKLROOT", "")).is_dir():
         missing.append("oneMKL for the SYCL image encoder (intel-oneapi-mkl-sycl-devel from Intel's apt repository)")
     if missing:

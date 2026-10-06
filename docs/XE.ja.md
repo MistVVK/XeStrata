@@ -94,6 +94,9 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
   Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.1.1 で、sm_89 向けのビルドが通ることを確かめています。
   RTX 4070（sm_89）で動くことを確かめています。
+  エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
+  そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
+  （開発機で、もう一方のライブラリを読めなくして確かめました。実際にそれだけの PC では `unverified`）。
 - **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
@@ -327,7 +330,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 
 | 用途 | free | contrib-icpx（`--license contrib-icpx`） |
 | --- | --- | --- |
-| エンジンのビルド | `libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`（oneMath に XeStrata の変更を当てる） |
+| エンジンのビルド | —（SYCL のコンパイラのほかに要るものはありません） | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`（oneMath に XeStrata の変更を当てる） |
 | intel/llvm 7 以降のビルド（setup がここで作ります） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |

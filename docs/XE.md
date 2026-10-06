@@ -90,6 +90,9 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
   Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
   Validated to run on an RTX 4070 (sm_89).
+  The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
+  So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
+  (checked on the development machine with the other maker's libraries made unreadable; on such a PC itself `unverified`).
 - **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
@@ -322,7 +325,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 
 | For | Free | contrib-icpx (`--license contrib-icpx`) |
 | --- | --- | --- |
-| Building the engine | `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch` (to apply XeStrata's changes to oneMath) |
+| Building the engine | — (nothing besides the SYCL compiler) | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch` (to apply XeStrata's changes to oneMath) |
 | Building intel/llvm 7 or later (setup builds it here) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx is used) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
