@@ -216,7 +216,7 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
   [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
-- **upstream の取り込み**: Strata 0.1.38 の単一 GPU 向けの機能を Xe に移しています。`--coupled-draft` は MTP の
+- **upstream の取り込み**: Strata 0.1.39 までの単一 GPU 向けの機能を Xe に移しています。`--coupled-draft` は MTP の
   下書きを対象モデルと同じサンプリングで引きます。速くするための経路は、Xe で測って速くなったものだけを移します
   （[docs/XE.ja.md](docs/XE.ja.md#strata-0138-の取り込み)）。
 - **README と docs**: 日本語版（README.ja.md、docs/*.ja.md）を先に書き、英語版（README.md、docs/*.md）はその訳です。

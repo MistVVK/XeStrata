@@ -1670,7 +1670,7 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     itself (`--prefill auto`: up to 32768, as the free VRAM allows - about 2x faster on long prompts)."""
     try:
         if engine_is_xe(json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text())):
-            return cfg             # the Xe engine numbers its versions from 0.1.0 and reads --prefill auto
+            return cfg             # the Xe engine (versions xe0.1.39 and on) reads --prefill auto
     except (OSError, ValueError):
         pass
     a = cfg.get("args", [])

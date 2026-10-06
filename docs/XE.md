@@ -10,8 +10,8 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata 0.1.0 runs Strata's engine on Intel GPUs through Level Zero and SYCL.
-It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.38
+XeStrata xe0.1.39 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated.
+It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.

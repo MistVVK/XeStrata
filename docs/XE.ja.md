@@ -10,8 +10,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 ビルドの方法、setup の振る舞い、要るパッケージ、エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md) にあります。
 
-XeStrata 0.1.0 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。
-移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.38 までの変更の一部を取り込んでいます
+XeStrata xe0.1.39 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。
+移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。

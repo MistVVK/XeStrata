@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 cmake_minimum_required(VERSION 3.24)
-project(XeStrata VERSION 0.1.0 LANGUAGES CXX)
+project(XeStrata VERSION 0.1.39 LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.38")
-set(STRATA_UPSTREAM_COMMIT "99f3dbd")
-add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
+set(STRATA_UPSTREAM_VERSION "0.1.39")
+set(STRATA_UPSTREAM_COMMIT "6f32ec0")
+# XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's
+set(STRATA_VERSION_NAME "xe${PROJECT_VERSION}")
+add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
 # ggml's CPU backend for any AVX2 CPU (the default), or OFF for this machine's (-march=native).  On the B70 machines
