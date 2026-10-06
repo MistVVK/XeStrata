@@ -4117,6 +4117,7 @@ int main(int argc, char** argv) {
             res_upload();
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
+        int64_t adapt_swaps_n = 0, adapt_sync_n = 0;   // STRATA_DECODE_TIMING: swaps issued, of them synchronous
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             struct Swap { float gain; int32_t layer, in, out; };
@@ -4156,6 +4157,8 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(gs ? gs->dev : -1);
                 uint8_t* sdst = gs ? gs->cache.device_slot(slot) : xcache.device_slot(slot);
                 const size_t sn = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer);
+                ++adapt_swaps_n;
+                if (tb) ++adapt_sync_n;
                 if (slot < 0 || b == nullptr ||
                     !(tb ? strata::gpu::copy(sdst, b, sn)
                          : strata::gpu::copy_async(sdst, b, sn, gs ? gs->adapt_stream : adapt_stream)))
@@ -5423,7 +5426,8 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
-            double dt_run = 0, dt_commit = 0, dt_draft = 0;
+            double dt_run = 0, dt_commit = 0, dt_draft = 0, dt_pre = 0, dt_join = 0, dt_adapt = 0;
+            const int64_t adapt_swaps0 = adapt_swaps_n, adapt_sync0 = adapt_sync_n;
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             // the expert tiers this request read from (DONE's RAM / file blobs and file MB)
@@ -5475,6 +5479,7 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
+                dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -5486,7 +5491,11 @@ int main(int argc, char** argv) {
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
                 bool adapt_ok = true;
                 if (!drive.d.usage.empty() && ((rounds + 1) % o.adapt_every) == 0)
-                    adapt_thr = std::thread([&] { adapt_ok = adapt(); });
+                    adapt_thr = std::thread([&] {
+                        const Clock::time_point ta = Clock::now();
+                        adapt_ok = adapt();
+                        dt_adapt += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
+                    });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -5542,7 +5551,9 @@ int main(int argc, char** argv) {
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
                     ++dec_windows; dec_T += T;
                 }
+                const Clock::time_point tj0 = Clock::now();
                 if (adapt_thr.joinable()) adapt_thr.join();
+                dt_join += std::chrono::duration<double, std::milli>(Clock::now() - tj0).count();
                 if (!adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -5571,12 +5582,15 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata decode timing: %lld windows, avg T %.2f, %.2f tokens/window, %.2f ms/window = "
                                      "verify %.2f (GPU-reach wait %.2f + per-layer host %.2f [plan %.2f actq %.2f jobs %.2f "
                                      "CPU %.2f] + stage %.2f) + commit/emit %.2f + draft %.2f; per layer-window: CPU experts "
-                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f\n",
+                                     "%.2f (%.2f entries), VRAM hits %.2f, PCIe %.2f; before the window %.2f, adapt join %.2f "
+                                     "(adapt %.2f, %lld swaps, %lld synchronous)\n",
                              (long long) dec_windows, dec_T / w, produced_n / w, decode_ms / w, dt_run / w,
                              (d1.wait - ds0.wait) / w, (d1.pool - ds0.pool) / w, (d1.plan - ds0.plan) / w,
                              (d1.actq - ds0.actq) / w, (d1.jobs - ds0.jobs) / w, (d1.run - ds0.run) / w,
                              (d1.host - ds0.host) / w, dt_commit / w, dt_draft / w, (d1.misses - ds0.misses) / (w * L),
-                             (d1.entries - ds0.entries) / (w * L), (d1.hits - ds0.hits) / (w * L), (d1.pcie - ds0.pcie) / (w * L));
+                             (double) (d1.entries - ds0.entries) / (w * L), (double) (d1.hits - ds0.hits) / (w * L),
+                             (double) (d1.pcie - ds0.pcie) / (w * L), dt_pre / w, dt_join / w, dt_adapt / w, (long long) (adapt_swaps_n - adapt_swaps0),
+                             (long long) (adapt_sync_n - adapt_sync0));
                 const std::string pr = ver.profile_report();
                 if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (millions of device-clock ticks per window):%s\n", pr.c_str());
             }
