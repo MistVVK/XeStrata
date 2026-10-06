@@ -271,6 +271,14 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 
 bool xmx_available(XmxType t) { return use_xmx(t); }
 
+bool f16_only_matrix_engines() {
+    static core::PerDevice<bool> per_device;
+    auto& q = core::Runtime::get().compute();
+    return per_device.get(q.get_device(), [&q] {
+        return (use_xmx(XmxType::f16) || xe::mma_usable(q, false)) && !use_xmx(XmxType::bf16) && !xe::mma_usable(q, true);
+    });
+}
+
 const char* gemm_path(XmxType t) {
     if (xe::mma_usable(core::Runtime::get().compute(), t == XmxType::bf16) && (xe::mma_forced() || !use_xmx(t)))
         return "joint_matrix";

@@ -54,10 +54,15 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    bool bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
     bool external_ = false;
+    uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
+    uint16_t* tc_x_ = nullptr;
+    int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
 };
 
 }  // namespace strata::prefill

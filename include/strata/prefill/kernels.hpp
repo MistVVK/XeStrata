@@ -86,6 +86,9 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo = nullptr);
+/// bf16 -> fp16 bits, n elements, finite values past FP16's range saturated at +-65504 (Inf and NaN stay): exact for
+/// every value in FP16's normal range (Gemm::bf16 through FP16)
+void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream);
 /// y = fp32(fp16(x)): what an FP16 store of x would read back (the FP16 indexer-key experiment)
 void round_f16(const float* x, float* y, int64_t n, void* stream);
 /// Expert blob -> FP16 (Q2_0 values are exact in FP16).

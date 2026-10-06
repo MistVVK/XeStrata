@@ -134,10 +134,15 @@ On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
 `STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
 to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
-With `STRATA_NO_BF16_MMA=1` the contrib modes do not hand the BF16 products to oneMath either.
+With `STRATA_NO_BF16_MMA=1` the contrib modes do not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
 `STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib modes too (to compare).
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
+On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prompt path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
+On such a GPU cuBLAS computes BF16 products without the tensor cores, and the own kernels fall to DP4a.
+The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
+With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%; on Volta and Turing themselves `unverified`).
+`STRATA_BF16_TC=0` turns it off.
 `tools/xmx_probe.cpp` asks every GPU the same without building the engine.
 
 Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prompt path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).

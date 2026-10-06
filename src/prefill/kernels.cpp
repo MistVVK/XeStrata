@@ -223,6 +223,13 @@ void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { y[i] = hf(x[i]); });
 }
+void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        const float f = sycl::bit_cast<float>((uint32_t) x[i] << 16);
+        y[i] = sycl::isinf(f) ? hf(f) : hf_sat(f);
+    });
+}
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { y[i] = kernels::f32_from_f16(hf(x[i])); });

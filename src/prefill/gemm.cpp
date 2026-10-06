@@ -6,6 +6,7 @@
 // cuBLAS on NVIDIA ones), the free mode through XeStrata's own kernels, which also take a GPU oneMath has no backend
 // for.
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/kernels.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
@@ -160,6 +161,8 @@ const char* Gemm::path() {
 
 Gemm::~Gemm() {
     if (!external_ && scratch_) strata::gpu::free(scratch_);
+    if (tc_w_) strata::gpu::free(tc_w_);
+    if (tc_x_) strata::gpu::free(tc_x_);
 }
 
 void Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems) {
@@ -184,10 +187,47 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
+// The BF16 products on a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, where cuBLAS runs BF16
+// inputs on an FP32 kernel without the tensor cores: a fifth of a 4K prompt on an RTX 2080 Ti, upstream f2fb7c1,
+// ff6f9f1): W, then X a slice at a time, converted to FP16 in this instance's own buffers and multiplied as FP16 (FP32
+// accumulation).  The conversion is exact for every value in FP16's normal range, where the weights and the normalized
+// activations are; the finite ones past it saturate.  An accumulating product (STRATA_PREFILL_BF16X2's remainder, deep
+// in FP16's subnormal range) and a single output row keep the BF16 path, as does a failed allocation.
+// STRATA_BF16_TC=0 turns it off.
+bool Gemm::bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                            int64_t ldy) {
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_BF16_TC");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (off || N <= 1 || K <= 0 || !strata::kernels::f16_only_matrix_engines()) return false;
+    constexpr int64_t kXSliceElems = 16ll << 20;   // 32 MiB of FP16 activations a slice (upstream's)
+    const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+    const auto grow = [this](uint16_t*& p, int64_t& have, int64_t want) {
+        if (have >= want) return true;
+        if (p) {
+            strata::gpu::stream_sync(stream_);   // the products queued on the old buffer
+            strata::gpu::free(p);
+        }
+        p = static_cast<uint16_t*>(strata::gpu::alloc_device((size_t) want * 2));
+        have = p ? want : 0;
+        return p != nullptr;
+    };
+    if (!grow(tc_w_, tc_w_elems_, N * K) || !grow(tc_x_, tc_x_elems_, x_rows * K)) return false;
+    bf16_to_f16(W, tc_w_, N * K, stream_);
+    for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+        const int64_t nt = std::min(x_rows, T - t0);
+        bf16_to_f16(X + t0 * K, tc_x_, nt * K, stream_);
+        f16(tc_x_, tc_w_, Y + t0 * ldy, nt, N, K, ldy);
+    }
+    return true;
+}
+
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 bool accumulate) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    if (!accumulate && bf16_through_f16(X, W, Y, T, N, K, ldy)) return;
 #if STRATA_ONEMATH
     if (blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
 #endif

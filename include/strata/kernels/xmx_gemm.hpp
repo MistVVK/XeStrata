@@ -16,6 +16,10 @@ enum class XmxType { f16, bf16 };
 /// through DP4a, and other kernels on the matrix engines (the prompt attention) take their own paths.
 bool xmx_available(XmxType t);
 
+/// Whether the compute device's matrix engines take FP16 inputs and not BF16 ones (NVIDIA's before sm_80): its BF16
+/// products are faster through FP16 (prefill::Gemm::bf16).
+bool f16_only_matrix_engines();
+
 /// The path xmx_gemm takes for inputs of type `t` on the compute device, for the startup report: "XMX", "joint_matrix"
 /// (mma_gemm, the matrix engines a GPU without the XMX kernels reports) or "DP4a".
 const char* gemm_path(XmxType t);

@@ -138,10 +138,15 @@ A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくな
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
 `STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
 行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
-`STRATA_NO_BF16_MMA=1` のときは、contrib のモードでも BF16 の積を oneMath に任せません。
+`STRATA_NO_BF16_MMA=1` のときは、contrib のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
 `STRATA_NO_BLAS=1` は、contrib のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
+行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、プロンプトの経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
+そのような GPU の BF16 の積を、cuBLAS は Tensor Core を使わずに計算し、自前のカーネルでは DP4a に落ちるためです。
+変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
+RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました（Volta と Turing の実機では `unverified`）。
+`STRATA_BF16_TC=0` で止まります。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
 
 プロンプトの経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
