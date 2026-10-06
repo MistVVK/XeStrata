@@ -4,11 +4,16 @@
 // src/kernels/xe/cvec.cpp - the Xe port of Strata's src/kernels/cuda/cvec.cu (see the header): the control vector, applied to the
 // residual streams after a layer's FFN write, optionally folding in that pending write first.
 //
-// One Xe device, so the per-device tables of the CUDA build are one set.  The gate is fused_gr's, with the precise exp.
+// The tables are per engine device, as the CUDA build's: a layer split's stages each read their own GPU's (one set for
+// all made the RTX 4070 read the B70's and time out at its first steered layer).  The gate is fused_gr's, with the
+// precise exp.
 #include "strata/kernels/cvec.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
+#include <array>
 #include <stdexcept>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -20,33 +25,49 @@ constexpr int WARP = 32;
 Cvec g_cvec;
 bool g_on_host = false;
 struct DevTables { float* dir = nullptr; float* s = nullptr; int* on = nullptr; };
-DevTables g_dev;
+constexpr int kMaxDevices = 16;
+std::array<DevTables, kMaxDevices> g_devs;
 std::vector<float> g_dir_host, g_s_host;
 
+// the current engine device's tables
+DevTables& here() {
+    const int d = core::current_device();
+    if (d < 0 || d >= kMaxDevices) throw std::runtime_error("control vector: engine device " + std::to_string(d));
+    return g_devs[(size_t) d];
+}
+
 void free_tables() {
-    auto& rt = core::Runtime::get();
-    rt.free(g_dev.dir);
-    rt.free(g_dev.s);
-    rt.free(g_dev.on);
-    g_dev = DevTables{};
+    for (int d = 0; d < kMaxDevices; ++d) {
+        DevTables& t = g_devs[(size_t) d];
+        if (t.dir == nullptr && t.s == nullptr && t.on == nullptr) continue;
+        auto& rt = core::Runtime::at(d);
+        rt.free(t.dir);
+        rt.free(t.s);
+        rt.free(t.on);
+        t = DevTables{};
+    }
 }
 
 bool upload_here(std::string& err) {
-    if (g_dev.dir != nullptr) return true;
+    DevTables& t = here();
+    if (t.dir != nullptr) return true;
     auto& rt = core::Runtime::get();
     const int flag = g_on_host ? 1 : 0;
-    g_dev.dir = sycl::malloc_device<float>(g_dir_host.size(), rt.device(), rt.context());
-    g_dev.s = sycl::malloc_device<float>(g_s_host.size(), rt.device(), rt.context());
-    g_dev.on = sycl::malloc_device<int>(1, rt.device(), rt.context());
-    if (!g_dev.dir || !g_dev.s || !g_dev.on) {
+    t.dir = sycl::malloc_device<float>(g_dir_host.size(), rt.device(), rt.context());
+    t.s = sycl::malloc_device<float>(g_s_host.size(), rt.device(), rt.context());
+    t.on = sycl::malloc_device<int>(1, rt.device(), rt.context());
+    if (!t.dir || !t.s || !t.on) {
         err = "control vector: device allocation failed";
-        free_tables();
+        rt.free(t.dir);
+        rt.free(t.s);
+        rt.free(t.on);
+        t = DevTables{};
         return false;
     }
     auto& q = rt.compute();
-    q.memcpy(g_dev.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float));
-    q.memcpy(g_dev.s, g_s_host.data(), g_s_host.size() * sizeof(float));
-    q.memcpy(g_dev.on, &flag, sizeof(int));
+    q.memcpy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float));
+    q.memcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float));
+    q.memcpy(t.on, &flag, sizeof(int));
     rt.finish(q);
     return true;
 }
@@ -62,14 +83,15 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
                  int64_t n_embd, int64_t hc, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
-    if (g_dev.dir != nullptr) free_tables();   // a new vector replaces the old one (free drains the queues first)
+    free_tables();   // a new vector replaces the old one (free drains the queues first)
     g_dir_host = dir;
     g_s_host = s;
     g_on_host = true;
     if (!upload_here(err)) return false;
-    g_cvec.dir = g_dev.dir;
-    g_cvec.s = g_dev.s;
-    g_cvec.on = g_dev.on;
+    const DevTables& t = here();
+    g_cvec.dir = t.dir;
+    g_cvec.s = t.s;
+    g_cvec.on = t.on;
     g_cvec.mode = mode;
     g_cvec.first = first;
     g_cvec.last = last;
@@ -84,10 +106,13 @@ bool cvec_replicate(std::string& err) { return !g_cvec.loaded() || upload_here(e
 
 void cvec_set_enabled(bool on) {
     if (!g_cvec.loaded() || on == g_on_host) return;
-    auto& rt = core::Runtime::get();
     const int v = on ? 1 : 0;
-    rt.finish();   // nothing in flight may still read the flag
-    rt.wait(rt.compute().memcpy(g_dev.on, &v, sizeof(int)), "cvec_set_enabled");
+    for (int d = 0; d < kMaxDevices; ++d) {   // every GPU that holds the tables
+        if (g_devs[(size_t) d].on == nullptr) continue;
+        auto& rt = core::Runtime::at(d);
+        rt.finish();   // nothing in flight may still read the flag
+        rt.wait(rt.compute().memcpy(g_devs[(size_t) d].on, &v, sizeof(int)), "cvec_set_enabled");
+    }
     g_on_host = on;
 }
 
@@ -96,11 +121,12 @@ bool cvec_enabled() { return g_cvec.loaded() && g_on_host; }
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream) {
     if (!g_cvec.loaded() || T < 1) return;
-    if (g_dev.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
+    const DevTables& t = here();
+    if (t.dir == nullptr) throw std::runtime_error("cvec_apply: the control vector is not on this device (cvec_replicate)");
     auto& q = core::Runtime::get().stream(stream);
-    const float* dir = g_dev.dir;
-    const float* s_l = g_dev.s;
-    const int* on = g_dev.on;
+    const float* dir = t.dir;
+    const float* s_l = t.s;
+    const int* on = t.on;
     const int mode = g_cvec.mode, n = (int) g_cvec.n_embd, hc = (int) g_cvec.hc, wr = write ? 1 : 0;
     const auto e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(THREADS / WARP), h);
