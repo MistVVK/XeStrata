@@ -336,6 +336,11 @@ struct Options {
     /// With a layer split: the --batch slots in this many groups pipelined through the stages (stage k runs one group
     /// while stage k+1 runs another; upstream PR #559).  1 = every slot in one window, stage after stage.
     int batch_groups = 1;
+    /// EXPERIMENTAL, off by default: with --batch-groups over two GPUs, the CPU expert workers in two pools on separate
+    /// cores (N0 for the first stage, N1 for the second), each stage's windows served by a host thread of its own, so
+    /// the stages' CPU experts run at once.  On the B70 + RTX 4070 PC (DDR, i7-14700) it was slower: the two stages
+    /// share the RAM bandwidth the CPU experts are bound by (69 -> 62 tok/s); kept for PCs with more of it.
+    int batch_cpu_split[2] = {0, 0};
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
@@ -562,6 +567,9 @@ void usage() {
                  "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
                  "                       (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
                  "                       after GPU)\n"
+                 "  --batch-cpu-split N0,N1  EXPERIMENTAL, with --batch-groups over two GPUs: the CPU expert workers\n"
+                 "                       in two pools (N0 + N1) so both stages' CPU experts run at once (slower where\n"
+                 "                       the RAM bandwidth is the limit, as on a DDR PC; for PCs with more of it)\n"
                  "  --vram-elastic       --serve (#533, opt-in): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -1125,6 +1133,16 @@ int main(int argc, char** argv) {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--batch-groups") o.batch_groups = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        else if (a == "--batch-cpu-split") {
+            const char* v = next(a.c_str());
+            char* e = nullptr;
+            o.batch_cpu_split[0] = (int) std::strtol(v, &e, 10);
+            o.batch_cpu_split[1] = e != v && *e == ',' ? (int) std::strtol(e + 1, nullptr, 10) : 0;
+            if (o.batch_cpu_split[0] < 1 || o.batch_cpu_split[1] < 1) {
+                std::fprintf(stderr, "strata generate: --batch-cpu-split takes N0,N1 (CPU workers for each stage)\n");
+                return 2;
+            }
+        }
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -2348,7 +2366,22 @@ int main(int argc, char** argv) {
                      arena_src.load_gib_per_second());
         srcp = &arena_src;
     }
-    strata::kernels::cpu::ExpertPool pool(o.pool_workers, /*pin=*/true, /*host_works=*/!o.no_host_worker);
+    // --batch-cpu-split (EXPERIMENTAL): the CPU workers in two pools on separate cores, N0 for stage 0 and N1 for
+    // stage 1 (a layer split over two GPUs with --batch-groups; anything else keeps the one pool)
+    const bool cpu_split = o.batch_cpu_split[0] > 0 && multi_gpu && split_devs.size() == 1 && o.batch_groups > 1 &&
+                           o.batch > 0;
+    if (o.batch_cpu_split[0] > 0 && !cpu_split)
+        std::fprintf(stderr, "strata generate: --batch-cpu-split is off: it needs --batch with --batch-groups over a "
+                             "layer split on two GPUs\n");
+    const int pipe_n0 = cpu_split ? o.batch_cpu_split[0] : 0, pipe_n1 = cpu_split ? o.batch_cpu_split[1] : 0;
+    strata::kernels::cpu::ExpertPool pool(pipe_n0 > 0 ? pipe_n0 : o.pool_workers, /*pin=*/true,
+                                          /*host_works=*/!o.no_host_worker);
+    std::unique_ptr<strata::kernels::cpu::ExpertPool> pool1;
+    if (pipe_n1 > 0) {
+        pool1 = std::make_unique<strata::kernels::cpu::ExpertPool>(pipe_n1, true, !o.no_host_worker, pipe_n0);
+        std::fprintf(stderr, "strata generate: --batch-cpu-split (experimental): CPU experts in two pools, %d + %d "
+                             "workers\n", pipe_n0, pipe_n1);
+    }
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
@@ -4698,6 +4731,52 @@ int main(int argc, char** argv) {
         }
         const bool piped = o.batch > 0 && o.batch_groups > 1;
         const int GS = piped ? o.batch / o.batch_groups : o.batch;
+        // --batch-cpu-split (experimental): stage 1's CPU experts through a Drive and a pool of their own, and each
+        // stage's windows served by a host thread of its own, so the two stages' CPU work runs at once
+        const bool pipe_threads = piped && pool1 != nullptr && n_pipe == 2;
+        Drive drive1 = drive;
+        drive1.d.pool = pool1.get();
+        SplitDrive split_drive1 = split_drive;
+        split_drive1.base = &drive1;
+        struct StagePoll {
+            std::thread th;
+            std::mutex mu;
+            std::condition_variable cv;
+            bool go = false, quit = false;
+            std::atomic<int> result{2};   // 0 running, 1 done, -1 failed, 2 idle
+            std::string err;
+        };
+        std::vector<std::unique_ptr<StagePoll>> spoll;
+        struct StagePollJoin {
+            std::vector<std::unique_ptr<StagePoll>>& v;
+            ~StagePollJoin() {
+                for (auto& sp : v) {
+                    { std::lock_guard<std::mutex> lk(sp->mu); sp->quit = true; }
+                    sp->cv.notify_all();
+                    if (sp->th.joinable()) sp->th.join();
+                }
+            }
+        } spoll_join{spoll};
+        if (pipe_threads)
+            for (int k = 0; k < n_pipe; ++k) {
+                spoll.push_back(std::make_unique<StagePoll>());
+                StagePoll* sp = spoll.back().get();
+                void* user = k == 0 ? (void*) &split_drive : (void*) &split_drive1;
+                sp->th = std::thread([&, sp, k, user] {
+                    for (;;) {
+                        {
+                            std::unique_lock<std::mutex> lk(sp->mu);
+                            sp->cv.wait(lk, [sp] { return sp->go || sp->quit; });
+                            if (sp->quit) return;
+                            sp->go = false;
+                        }
+                        int rr;
+                        while ((rr = stage_ver(k).batch_poll(win_pool_fn, user, sp->err)) == 0)
+                            std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        sp->result.store(rr);
+                    }
+                });
+            }
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
@@ -4727,7 +4806,14 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n_pipe; ++k) {
                 const int gi = stage_group[(size_t) k];
                 if (gi < 0) continue;
-                const int r = stage_ver(k).batch_poll(win_pool_fn, win_pool_user, err);
+                int r;
+                if (pipe_threads) {
+                    r = spoll[(size_t) k]->result.load();
+                    if (r < 0) err = spoll[(size_t) k]->err;
+                    if (r == 1) spoll[(size_t) k]->result.store(2);
+                } else {
+                    r = stage_ver(k).batch_poll(win_pool_fn, win_pool_user, err);
+                }
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 stage_group[(size_t) k] = -1;
@@ -4797,9 +4883,16 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
+                if (pipe_threads) {   // the stage's thread serves the window from here
+                    StagePoll& sp = *spoll[(size_t) k];
+                    sp.result.store(0);
+                    { std::lock_guard<std::mutex> lk(sp.mu); sp.go = true; }
+                    sp.cv.notify_one();
+                }
             }
-            if (drive.d.failed) {
-                std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed");
+            if (drive.d.failed || drive1.d.failed) {
+                const char* f = drive.d.failed ? drive.d.fail : drive1.d.fail;
+                std::printf("ERR %s\n", f ? f : "the expert pool failed");
                 return false;
             }
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: one timing line
@@ -4814,6 +4907,12 @@ int main(int argc, char** argv) {
                     pools += " " + std::to_string((int) (stage_ver(k).ms_pool - pipe_pool0[(size_t) k])) + " ms";
                 std::fprintf(stderr, "strata batch (pipelined): CPU experts per stage:%s of %.0f ms\n", pools.c_str(),
                              wall);
+                if (pipe_threads) {   // stage 1's routing counts go back to the one the adaptive tier reads
+                    for (size_t i = 0; i < drive.d.usage.size() && i < drive1.d.usage.size(); ++i) {
+                        drive.d.usage[i] += drive1.d.usage[i];
+                        drive1.d.usage[i] = 0.0f;
+                    }
+                }
                 bt_windows = bt_rows = 0;
                 strata::core::progress().busy.store(false);
             }
@@ -4828,6 +4927,8 @@ int main(int argc, char** argv) {
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
+                    // the stages' threads poll; spinning here slowed them 3x (it starved the runtime's threads)
+                    if (pipe_threads) std::this_thread::sleep_for(std::chrono::microseconds(20));
                     continue;
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first

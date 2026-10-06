@@ -104,7 +104,9 @@ public:
     /// With `host_works`, `run()` claims jobs itself instead of spinning on `done_`, and the pool is six
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true);
+    /// `first_core`: the workers take the physical cores from that one on (a second pool beside a first, which took
+    /// the cores below it: a layer split's stages each with workers of their own).
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0);
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();

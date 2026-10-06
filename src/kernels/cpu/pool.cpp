@@ -129,7 +129,7 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(host_works) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core) : host_works_(host_works) {
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     const std::vector<int> cores = physical_cores(true);
@@ -145,7 +145,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works) : host_works_(h
     split_multi_.resize((size_t) kMaxSplitMulti);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
+        const int c = first_core + i;
+        const int core = pin ? (c < (int) cores.size() ? cores[(size_t) c] : -1) : -1;
         threads_.emplace_back([this, i, core] {
             pin_this_thread(core);
             worker(i);
