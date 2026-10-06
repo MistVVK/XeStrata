@@ -1688,7 +1688,7 @@ int main(int argc, char** argv) {
     }
     // ---- --layer-split auto: the split points, chosen before anything is loaded - from what this PC measures and
     // the sizes the files and the geometry give - so the placement then loads as an explicit one: each GPU's sessions
-    // carved to its layers (and with STRATA_STAGE_TRIM=1 its dense weights).
+    // carved to its layers, and its dense weights too.
     //   The window time of a placement: per layer, the dense weights read at the GPU's own bandwidth, then the
     //   layer's routed experts - the cached share read by the GPU at its bandwidth while the CPU reads the rest at the
     //   RAM's (the two overlap: the larger counts) - and a hand-off per stage boundary.
@@ -1721,14 +1721,13 @@ int main(int argc, char** argv) {
         }
         auto dev_of_stage = [&](int i) { return i == 0 ? 0 : split_devs[(size_t) i - 1]; };
         // the weights a range holds: the canonical arena's and the native projections'
-        const bool trims = std::getenv("STRATA_STAGE_TRIM") && std::string(std::getenv("STRATA_STAGE_TRIM")) == "1";
         uint64_t canon_all = 0;
         if (!strata::core::WeightTable::pool_bytes(o.pack, canon_all, err, skip.empty() ? nullptr : &skip)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         std::vector<uint64_t> canon_layer((size_t) L, 0);
-        if (trims) {   // each layer's share: the arena without that layer's blk.N.* tensors (PLE ones excepted)
+        {   // each layer's share: the arena without that layer's blk.N.* tensors (PLE ones excepted)
             std::vector<std::vector<std::string>> names((size_t) L);
             if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
                 char line[1024], name[256];
@@ -1770,7 +1769,6 @@ int main(int argc, char** argv) {
             }
         }
         auto weights_of = [&](int64_t lo, int64_t hi) -> uint64_t {
-            if (!trims) return canon_all + nat_all;
             uint64_t b = canon_all + nat_shared;
             for (int64_t l = 0; l < L; ++l)
                 if (l < lo || l >= hi) b -= std::min(b, canon_layer[(size_t) l]);
@@ -1947,14 +1945,12 @@ int main(int argc, char** argv) {
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
                      (long long) best_held, prof.size(), 100.0 * best_mass);
     }
-    // Layer split with explicit split points (upstream e50f2663, 12c099b3, 13f70a34): with STRATA_STAGE_TRIM=1 every
-    // GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).  Without it each card keeps a
-    // full copy (~1.5 GB for IQ2_XS) that its stage never reads - VRAM the expert cache wants.  Opt-in until it is
-    // checked on more GPUs, as upstream's.  (Upstream efec5694 keeps CUDA0's routers for RouterLookahead, which the Xe
-    // engine does not have.)
+    // Layer split across GPUs (upstream e50f2663, 12c099b3, 13f70a34): every GPU holds only the dense weights of ITS
+    // layers (the PLE tensors stay everywhere).  A full copy on each card (~1.5 GB for IQ2_XS) is VRAM the expert cache
+    // wants: upstream's opt-in STRATA_STAGE_TRIM=1 is always on here (IQ2_XS, 8 GB cards: hits 22% -> 32%, 7% faster).
+    // (Upstream efec5694 keeps CUDA0's routers for RouterLookahead, which the Xe engine does not have.)
     const std::set<std::string> skip_base = skip;
-    const bool stage_trim = multi_gpu && !split_auto && !split_at.empty() && std::getenv("STRATA_STAGE_TRIM") &&
-                            std::string(std::getenv("STRATA_STAGE_TRIM")) == "1";
+    const bool stage_trim = multi_gpu && !split_auto && !split_at.empty();
     auto add_foreign = [&](int64_t lb, int64_t le, std::set<std::string>& out) {
         std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb");
         if (!f) return;
