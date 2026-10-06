@@ -31,7 +31,7 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 
 Of upstream Strata's changes up to 0.1.38 (`99f3dbd0b21d1401b3769e0c0d963913607f380b`), the single-GPU Linux ones are carried into Xe.
 The upstream history is kept as a merge.
-The CUDA, HIP, Windows and multi-GPU implementations are not carried.
+The CUDA, HIP and Windows implementations are not carried; of the multi-GPU ones, only the layer split is ([MULTIGPU](MULTIGPU.md)).
 
 Carried:
 
@@ -253,7 +253,7 @@ oneAPI's for icpx, the intel/llvm built here for that one.
 So the server starts the engine without any toolkit environment.
 
 There is no ready-made Xe engine to download.
-Only one GPU is used; `--gpus` is refused.
+setup's `--gpus` is refused; several GPUs are used through engine options in the config's `args` ([MULTIGPU](MULTIGPU.md)).
 
 ### The SYCL compiler
 
@@ -373,7 +373,7 @@ What the engine requires of the GPU and the host, and the rules it keeps.
 
 - **BIOS**: a discrete card needs Above 4G Decoding and Re-Size BAR enabled and CSM disabled.
   Otherwise the B70's BARs stayed unassigned and the xe driver did not bind.
-- **Choosing the GPU**: the runtime drives one GPU: an Intel GPU through Level Zero, an NVIDIA GPU through the CUDA backend (not OpenCL, which lists the same Intel GPUs again).
+- **Choosing the GPU**: the runtime drives one GPU (several with a layer split, [MULTIGPU](MULTIGPU.md#gpu-numbers)): an Intel GPU through Level Zero, an NVIDIA GPU through the CUDA backend (not OpenCL, which lists the same Intel GPUs again).
   It is chosen by what it reports, never by its maker or device ID.
   It needs 32-wide sub-groups, FP16, and device and host USM, and the executable must carry code for it (an NVIDIA GPU with a build without `STRATA_CUDA_ARCHS` is refused).
   `STRATA_GPU_PCI` (setup writes it) names the card by PCI address.

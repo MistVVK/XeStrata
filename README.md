@@ -28,7 +28,7 @@ The models, the install, the app and the API are much the same as Strata's.
 How it differs from Strata:
 
 - **For Intel Arc,** and it runs on NVIDIA GPUs too. AMD GPUs are not supported.
-- **One GPU only.** There is no sharing of the model across several GPUs.
+- **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
 - **Linux only.** Windows and WSL are not supported.
 - **Builds with free software only, too** (`--license free`, free enough for Debian main). The default contrib build
   uses Intel's oneMKL and, for an NVIDIA GPU, NVIDIA's CUDA toolkit, which are not free software

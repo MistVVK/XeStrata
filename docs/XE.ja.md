@@ -32,7 +32,7 @@ CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用�
 
 upstream の Strata 0.1.38（`99f3dbd0b21d1401b3769e0c0d963913607f380b`）までの変更のうち、単一の GPU と Linux に関わるものを Xe に移しています。
 upstream の履歴はマージとして残しています。
-CUDA、HIP、Windows、複数の GPU の実装は移していません。
+CUDA、HIP、Windows の実装は移していません。複数の GPU の実装は、層の分割だけを移しています（[MULTIGPU](MULTIGPU.ja.md)）。
 
 移したものは次のとおりです。
 
@@ -258,7 +258,7 @@ icpx なら oneAPI のもの、ここで作った intel/llvm ならそのもの�
 これで server は、ツールキットの環境を読み込まずにエンジンを起動できます。
 
 ダウンロードできる出来合いの Xe のエンジンはありません。
-使う GPU は 1 枚だけで、`--gpus` は受け付けません。
+setup の `--gpus` は受け付けません。複数の GPU は、設定ファイルの `args` にエンジンのオプションを書いて使います（[MULTIGPU](MULTIGPU.ja.md)）。
 
 ### SYCL のコンパイラ
 
@@ -378,7 +378,7 @@ intel/llvm のビルドは通りますが、setup は GPU が見えないとし�
 
 - **BIOS**: 単体の GPU では、Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。
   そうしないと B70 の BAR が割り当てられず、xe ドライバーがつながりませんでした。
-- **GPU の選び方**: GPU を 1 枚使います。Intel の GPU は Level Zero、NVIDIA の GPU は CUDA のバックエンドを通します（OpenCL は同じ Intel の GPU を重ねて見せるので使いません）。
+- **GPU の選び方**: GPU を 1 枚使います（層の分割では複数、[MULTIGPU](MULTIGPU.ja.md#gpu-の番号)）。Intel の GPU は Level Zero、NVIDIA の GPU は CUDA のバックエンドを通します（OpenCL は同じ Intel の GPU を重ねて見せるので使いません）。
   メーカー名やデバイス ID では選ばず、報告される能力で選びます。
   32 幅のサブグループ、FP16、デバイスとホストの USM が必要です。
   実行ファイルがその GPU 向けのコードを持たないとき（`STRATA_CUDA_ARCHS` なしのビルドと NVIDIA の GPU など）も断ります。

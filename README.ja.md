@@ -28,7 +28,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU
 Strata との主な違い:
 
 - **Intel Arc 向け**で、NVIDIA の GPU でも動きます。AMD の GPU には対応しません。
-- **GPU は 1 枚だけ**使います。複数の GPU でモデルを分け合う機能はありません。
+- **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **Linux だけ**です。Windows と WSL には対応しません。
 - **自由ソフトウェアだけでもビルドできます**（`--license free`、Debian main に入れられる程度に自由な構成）。
   既定の contrib のビルドは、自由ソフトウェアでない Intel の oneMKL と、NVIDIA の GPU には CUDA ツールキットを使います
