@@ -198,7 +198,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
-    const int64_t max_cells = ss.qsa_states[0].max_cells;
+    const int64_t max_cells = ss.qsa_states[ss.qsa_primary()].max_cells;
     // KV streaming: the drafter only reads its last `window` cells, so with streaming on its K/V is a ring of the
     // window (plus the cells a round writes ahead of its queries) over a host copy, refilled on a resume. The host copy
     // is pinned after the expert arena has pinned what it could: if it does not fit, the K/V stays whole in VRAM.
@@ -217,7 +217,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     } restore{kv_hybrid_was, kv_int8_was};
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (!strata::gpu::alloc_device(&state_arena_, sb)) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) {
+    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
         std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         strata::gpu::free(state_arena_);
@@ -225,7 +225,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         ring = -1;   // fully resident
         sb = qsa_state_bytes(g, max_cells, false, ring);
         if (!strata::gpu::alloc_device(&state_arena_, sb)) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[0], ring) == 0) { err = "mtp: state init failed"; return false; }
+        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+            err = "mtp: state init failed";
+            return false;
+        }
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);

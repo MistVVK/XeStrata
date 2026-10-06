@@ -34,10 +34,21 @@ struct SessionState {
     int64_t max_cells = 0;
 
     GdnBuffers gdn;                 ///< the 36 GDN layers share one set of scratch; their STATE is per layer
-    float* gdn_state = nullptr;     ///< (n_gdn_layers, gdn_state_floats)
+    float* gdn_state = nullptr;     ///< (gdn_alloc, gdn_state_floats): row 0 is GDN ordinal gdn_ord0
 
-    int64_t qsa_alloc = 0;            ///< allocated states, including a partially initialized one
-    QsaState* qsa_states = nullptr;      ///< one per QSA layer
+    // **THE LAYER-RANGE CARVE (multi-GPU, upstream #216).**  A layer split's stage runs a slice of the model, so its
+    // session owns [layer_lo, layer_hi) only: `qsa_states`/`gdn_state` keep GLOBAL ordinal indexing, the arrays
+    // simply hold fewer rows, so per-layer consumers subtract `gdn_ord0`, and every model-level `qsa_states[0]` use
+    // (the shared RoPE table, the prefill staging identity, the MTP rope borrow) reads `qsa_states[qsa_primary()]`.
+    // A range with no QSA layer still carves ONE primary state so those model-level uses stay valid.  The full range
+    // (the default) is the whole-model carve.
+    int64_t layer_lo = 0, layer_hi = 0;   ///< resolved by `session_init` (hi = n_layers for the full range)
+    int64_t qsa_ord0 = 0;                 ///< global QSA ordinal of the first allocated state
+    int64_t qsa_alloc = 0;                ///< allocated QSA states (>= 1 whenever the model has any)
+    int64_t gdn_ord0 = 0;                 ///< global GDN ordinal of `gdn_state` row 0
+    int64_t gdn_alloc = 0;                ///< allocated GDN rows
+    int qsa_primary() const { return (int) qsa_ord0; }
+    QsaState* qsa_states = nullptr;      ///< one per QSA layer of the model; those outside the range stay null
     void* qsa_state_arena = nullptr;
     QsaBuffers qsa_bufs;                 ///< scratch, shared across the 12 (they never run concurrently)
     void* qsa_buf_arena = nullptr;
@@ -80,9 +91,13 @@ struct SessionState {
 /// Bytes for a whole session at `max_cells` of context.  Every layer's state is sized at once, because P2.T10
 /// requires ZERO token-path allocations - a `cudaMalloc` that happened on the first token of a longer sequence
 /// would satisfy every test here and fail that one.
-uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k);
-/// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.
-uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s);
+/// [layer_lo, layer_hi) carves only that range's per-layer state (a layer split's stage); the default full range is
+/// the whole-model carve.  Pure arithmetic: safe to call for a candidate range before anything is allocated.
+uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
+                       int64_t layer_hi = -1);
+/// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
+uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
+                      int64_t layer_lo = 0, int64_t layer_hi = -1);
 /// Zeroes every layer's state - the residual to `R_init`, everything else to zero, so a fresh sequence starts
 /// from the reference's own `zeros()`.
 /// Unpublish this session's RoPE table before its arena is freed.

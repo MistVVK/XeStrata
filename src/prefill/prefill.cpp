@@ -351,7 +351,7 @@ namespace {
 bool stage_own() { static const bool v = std::getenv("STRATA_KV_STAGE_OWN") != nullptr; return v; }
 void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::kernels::QsaShapes& s,
                 strata::kernels::KvHostPools& st, bool& ok) {
-    const core::QsaState& q0 = ss.qsa_states[0];
+    const core::QsaState& q0 = ss.qsa_states[ss.qsa_primary()];
     if (q0.kv_mode != 1) return;
     if (stage_own() && o_borrowed.count_only) return;
     Alloc own;
@@ -554,8 +554,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
-    if (ss.qsa_states[0].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
-        const int64_t pages = ss.qsa_states[0].n_pages;
+    if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
+        const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) ident[(size_t) i] = (int32_t) i;
         if (!strata::gpu::alloc_device((void**) &m.ident_table, ident.size() * 4) ||
@@ -601,7 +601,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    m.max_blocks = ss.qsa_states[0].max_cells / s.idx_block + 2;
+    m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
@@ -867,7 +867,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    const int64_t max_blocks = ss.qsa_states[0].max_cells / s.idx_block + 2;
+    const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
                                        moe_set_bytes(T, g.n_expert)}), ok);
     o.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
@@ -1322,7 +1322,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                           *wsa = need(v, "ssm_a", err);
                     if (!wqkv || !wg || !wo || !wa || !wb || !wc || !wnm || !wdt || !wsa) return false;
                     pt.mark(kPfGdn, cs);
-                    float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
+                    float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
@@ -1998,7 +1998,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;
         char h[8];
-        for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
+        for (int64_t i = 0; i < ss.gdn_alloc; ++i) {   // the GDN layers this session owns
             strata::gpu::copy(b.data(), ss.gdn_state + (size_t) i * gdn_floats, b.size());
             uint64_t x = 1469598103934665603ull;
             for (uint8_t c : b) x = (x ^ c) * 1099511628211ull;

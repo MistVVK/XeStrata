@@ -1861,7 +1861,13 @@ int main(int argc, char** argv) {
     }
 
     void* sbuf = nullptr;
-    if (!strata::gpu::alloc_device(&sbuf, strata::core::session_bytes(g, o.max_context, K))) {
+    // a layer split with explicit split points (upstream #216, the carve): every GPU's sessions hold the state of its
+    // own layers only ([0, K) here, [lb, le) on a later stage); --layer-split auto and one GPU hold every layer
+    const bool carve = multi_gpu && !split_auto && !split_at.empty();
+    const int64_t hi0 = carve ? split_at[0] : -1;
+    auto stage_lo = [&](size_t i) { return split_at[i]; };
+    auto stage_hi = [&](size_t i) { return i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers; };
+    if (!strata::gpu::alloc_device(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0))) {
         std::fprintf(stderr, "strata generate: session state allocation failed\n");
         return 1;
     }
@@ -1878,7 +1884,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     void* const main_cs = (void*) main_stream;
-    if (strata::core::session_init(g, o.max_context, K, sbuf, ss) == 0) {
+    if (strata::core::session_init(g, o.max_context, K, sbuf, ss, 0, hi0) == 0) {
         std::fprintf(stderr, "strata generate: session_init failed\n");
         return 1;
     }
@@ -1890,9 +1896,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
         return 1;
     }
-    if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1)
+    if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1)
         std::fprintf(stderr, "strata generate: KV streaming: %lld of %lld cells per QSA layer in VRAM, the K/V in "
-                             "%.2f GiB of pinned RAM\n", (long long) (ss.qsa_states[0].n_slots * 4),
+                             "%.2f GiB of pinned RAM\n", (long long) ss.qsa_states[ss.qsa_primary()].n_slots * 4,
                      (long long) o.max_context, (double) strata::core::qsa_kv_host_bytes() / 1073741824.0);
 
     // ---- **THE HALF-LEVEL DUMP HAS TO BE ARMED BEFORE `session_capture`, AND THE LADDER MUST NOT BE.**  The
@@ -2096,8 +2102,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         void* sbuf_s = nullptr;
-        if (!strata::gpu::alloc_device(&sbuf_s, strata::core::session_bytes(g, o.max_context, K)) ||
-            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss) == 0 ||
+        const int64_t slo = carve ? stage_lo(i) : 0, shi = carve ? stage_hi(i) : -1;
+        if (!strata::gpu::alloc_device(&sbuf_s, strata::core::session_bytes(g, o.max_context, K, slo, shi)) ||
+            strata::core::session_init(g, o.max_context, K, sbuf_s, st.ss, slo, shi) == 0 ||
             !(st.stream = strata::gpu::stream_create()) ||
             !(st.adapt_stream = strata::gpu::stream_create()) ||
             !strata::gpu::event_create(&st.adapt_ev)) {
@@ -2161,11 +2168,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --batch is off: %s\n", why);
             o.batch = 0;
         }
-        const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K);
+        const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
         for (int b = 0; b < o.batch; ++b) {
             auto u = std::make_unique<strata::core::SessionState>();
             void* buf = nullptr;
-            if (!strata::gpu::alloc_device(&buf, bytes) || strata::core::session_init(g, o.max_context, K, buf, *u) == 0) {
+            if (!strata::gpu::alloc_device(&buf, bytes) ||
+                strata::core::session_init(g, o.max_context, K, buf, *u, 0, hi0) == 0) {
                 if (buf) strata::gpu::free(buf);
                 std::fprintf(stderr, "strata generate: --batch: slot %d's session does not fit (%.2f GiB each)\n", b,
                              (double) bytes / 1073741824.0);
@@ -2180,11 +2188,13 @@ int main(int argc, char** argv) {
         for (auto& stp : stages) {
             GpuStage& st = *stp;
             const strata::core::OnDevice on(st.dev);
+            // carved like the stage's own session (its layer range)
+            const uint64_t sbytes = strata::core::session_bytes(g, o.max_context, K, st.ss.layer_lo, st.ss.layer_hi);
             while (st.bslots.size() < bslot_ss.size()) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
-                if (!strata::gpu::alloc_device(&buf, bytes) ||
-                    strata::core::session_init(g, o.max_context, K, buf, *u) == 0) {
+                if (!strata::gpu::alloc_device(&buf, sbytes) ||
+                    strata::core::session_init(g, o.max_context, K, buf, *u, st.ss.layer_lo, st.ss.layer_hi) == 0) {
                     if (buf) strata::gpu::free(buf);
                     std::fprintf(stderr, "strata generate: --batch: CUDA%d holds %zu slot sessions\n", st.dev,
                                  st.bslots.size());
@@ -4358,8 +4368,8 @@ int main(int argc, char** argv) {
                         "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d batch_slots=%d slot_cache=%d "
                         "engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
-                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1
-                                         ? ss.qsa_states[0].n_slots * 4 : 0),
+                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                         ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
                         (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) (strata::kernels::cpu::expert_layout().total >> 20), pool.workers(), o.pcie_frac,
@@ -4563,7 +4573,7 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
                     !strata::core::conversation_checkpoint_restore(ck, to, g, e))
                     return false;
-                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {   // the owned layers
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
                     if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
@@ -4593,7 +4603,7 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_checkpoint_restore(ck, ss, g, e))
                     return false;
             }
-            for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+            for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {
                 strata::core::ConversationKv img;
                 if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
                 if (!strata::gpu::device_sync()) { e = "batch slot restore: device sync failed"; return false; }
@@ -5834,12 +5844,14 @@ int main(int argc, char** argv) {
                     return h;
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
-                uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr && g.n_gdn_layers() > 0) {   // which layer first
-                    const size_t per = z.gdn / (size_t) g.n_gdn_layers();
+                // the GDN rows this session owns (a layer split's carve holds its own layers only)
+                const size_t per_gdn = g.n_gdn_layers() > 0 ? z.gdn / (size_t) g.n_gdn_layers() : 0;
+                uint64_t h_gdn = hash_dev(ss.gdn_state, per_gdn * (size_t) ss.gdn_alloc, 1469598103934665603ull);
+                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr && ss.gdn_alloc > 0) {   // which layer first
+                    const size_t per = per_gdn;
                     std::string s;
                     char b[8];
-                    for (int64_t i = 0; i < g.n_gdn_layers(); ++i) {
+                    for (int64_t i = 0; i < ss.gdn_alloc; ++i) {
                         std::snprintf(b, sizeof(b), "%04llx ", (unsigned long long) (hash_dev((const uint8_t*) ss.gdn_state + i * per, per, 1469598103934665603ull) & 0xffff));
                         s += b;
                     }
@@ -5873,7 +5885,7 @@ int main(int argc, char** argv) {
                 };
                 const int64_t end_cell = std::min<int64_t>(((L + qs.page_size - 1) / qs.page_size) * qs.page_size,
                                                            ss.max_cells);
-                for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                for (int64_t i = ss.qsa_ord0; i < ss.qsa_ord0 + ss.qsa_alloc; ++i) {   // the owned QSA layers
                     const strata::core::QsaState& st = ss.qsa_states[i];
                     h_tail = hash_dev(st.idx_tail, z.tail, h_tail);
                     h_dead = hash_dev(st.idx_dead, z.dead, h_dead);
@@ -5993,11 +6005,11 @@ int main(int argc, char** argv) {
                                          "pool + plan %.3f ms, host staging %.3f ms, commit %.3f ms\n", st,
                                  (long long) v.windows, v.ms_wait / w, v.ms_pool / w, v.ms_host / w, v.ms_commit / w);
                 }
-            if (g.n_qsa_layers() > 0 && ss.qsa_states[0].kv_mode == 1) {
+            if (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {
                 // KV streaming, cumulative over the process: blocks the selections named vs blocks read from RAM
                 uint64_t miss = 0, look = 0;
                 bool over = false;
-                for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                for (int64_t i = ss.qsa_ord0; i < ss.qsa_ord0 + ss.qsa_alloc; ++i) {
                     const strata::kernels::KvStreamCounters c = strata::kernels::kv_stream_counters(ss.qsa_states[i].map);
                     miss += c.misses; look += c.lookups; over = over || c.overflow;
                 }
@@ -6328,7 +6340,7 @@ int main(int argc, char** argv) {
         // The sampled-token synchronization also completes every captured QSA
         // status readback. Retain one status per layer so a later layer cannot
         // hide an earlier failure; no extra synchronization or token allocation.
-        if (o.native_flash_attn_short) for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+        if (o.native_flash_attn_short) for (int64_t i = ss.qsa_ord0; i < ss.qsa_ord0 + ss.qsa_alloc; ++i) {
             const int32_t status = ss.qsa_states[i].host_step[strata::kernels::kStepCount];
             if (status != 0) {
                 std::fprintf(stderr, "strata generate: native attention status %d at QSA layer %lld, position %lld\n",

@@ -191,7 +191,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     const strata::kernels::QsaShapes s = shapes_of(g);
     cap_ = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
-    max_blocks_ = ss.qsa_states[0].max_cells / s.idx_block + 2;
+    max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
@@ -498,7 +498,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     !native_of(wout, v.name("ssm_out.weight"), err))
                     return false;
                 const int64_t gi = gdn_idx[(size_t) l];
-                float* state = ss.gdn_state + (size_t) gi * gdn_floats;
+                float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                 float* qkv = qkv_L_ + (size_t) gi * MT * C;
                 float* hb = h_L_ + (size_t) gi * MT * C;
@@ -509,7 +509,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // each row from its own slot's conv history, one row each
                     for (int t = tb; t < te; ++t) {
-                        const float* cx = slot_ss(t).gdn_state + (size_t) gi * gdn_floats +
+                        const float* cx = slot_ss(t).gdn_state + (size_t) (gi - slot_ss(t).gdn_ord0) * gdn_floats +
                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                         gdn_conv_l2_multi(cx, qkv + (size_t) t * C, (const float*) wc->data, hb + (size_t) t * C, (int) C,
                                           (int) (2 * HK), EPS, 1, cs, 0);
@@ -526,7 +526,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
                     for (int t = tb; t < te; ++t) {
-                        float* stx = slot_ss(t).gdn_state + (size_t) gi * gdn_floats;
+                        float* stx = slot_ss(t).gdn_state + (size_t) (gi - slot_ss(t).gdn_ord0) * gdn_floats;
                         gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
                                             z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
                                             (int) HK, (int) HV, 1, nullptr, cs, 0);
@@ -1032,7 +1032,7 @@ bool Verifier::capture_commit(std::string& err) {
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
-                float* state = ss.gdn_state + (size_t) gdn_index * gdn_floats;
+                float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                 const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
@@ -1077,7 +1077,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) {
+        err = "verify: the window runs past the context";
+        return false;
+    }
     const bool res = res_graph_ && all_resident();
     if (!(res ? capture_res(T, err) : capture(T, err)) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
@@ -1427,7 +1430,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 for (int t = 0; t < S; ++t) {
                     SessionState& sx = *slots_[(size_t) rows[t]];
                     const int32_t* keep = commitb_ + (size_t) rows[t] * CB;
-                    float* state = sx.gdn_state + (size_t) gdn_index * gdn_floats;
+                    float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C, keep, cs_);
                     gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) t * C, (int) C,

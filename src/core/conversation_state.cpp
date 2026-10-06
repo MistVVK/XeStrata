@@ -42,9 +42,16 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error) {
     return false;
 }
 
-// XeStrata's sessions hold every layer (upstream's per-stage layer carve, #216, is not ported): every QSA state.
-size_t owned_qsa(const ModelGeometry& g) { return (size_t) std::max<int64_t>(g.n_qsa_layers(), 0); }
-const QsaState& owned(const SessionState& ss, size_t j) { return ss.qsa_states[j]; }
+// The session's carve (upstream #216): `qsa_states` keeps global ordinals and holds the owned ones
+// [qsa_ord0, qsa_ord0 + qsa_alloc); `gdn_state` holds `gdn_alloc` rows. A whole-model session owns every layer,
+// and so does one session_init did not carve (layer_hi 0: a session put together by hand, as the tests do).
+bool carved(const SessionState& ss) { return ss.layer_hi > 0; }
+size_t owned_qsa(const SessionState& ss, const ModelGeometry& g) {
+    return (size_t) std::max<int64_t>(carved(ss) ? ss.qsa_alloc : g.n_qsa_layers(), 0);
+}
+const QsaState& owned(const SessionState& ss, size_t j) {
+    return ss.qsa_states[(size_t) (carved(ss) ? ss.qsa_ord0 : 0) + j];
+}
 
 bool image_keys(const std::vector<ConversationImageKey>& images, size_t tokens) {
     int64_t previous = -1;
@@ -57,10 +64,10 @@ bool image_keys(const std::vector<ConversationImageKey>& images, size_t tokens) 
 
 bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t tokens,
                         ConversationStateSizes& z, std::string& error) {
-    if (!conversation_state_sizes(g, z, error)) return false;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (ss.max_cells < 0 || tokens > static_cast<uint64_t>(ss.max_cells) || (z.gdn && !ss.gdn_state) ||
-        (owned_qsa(g) && !ss.qsa_states)) return fail(error, "invalid session running-state targets");
-    for (size_t j = 0; j < owned_qsa(g); ++j) {
+        (owned_qsa(ss, g) && !ss.qsa_states)) return fail(error, "invalid session running-state targets");
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j) {
         const auto& st = owned(ss, j);
         const auto block = strata::kernels::qsa_real_shapes().idx_block;
         size_t pooled_bytes = 0;
@@ -133,11 +140,24 @@ bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& z,
     return true;
 }
 
+bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, ConversationStateSizes& z,
+                                std::string& error) {
+    if (!conversation_state_sizes(g, z, error)) return false;
+    const int64_t n_gdn = g.n_gdn_layers(), n_qsa = g.n_qsa_layers();
+    if (!carved(ss)) return true;   // every layer
+    if (ss.gdn_alloc < 0 || ss.gdn_alloc > n_gdn || ss.qsa_ord0 < 0 || ss.qsa_alloc < 0 ||
+        ss.qsa_ord0 > n_qsa || ss.qsa_alloc > n_qsa - ss.qsa_ord0)
+        return fail(error, "invalid session layer carve");
+    // z.gdn is n_gdn whole rows; the session holds gdn_alloc of them (all of them for the default full range)
+    z.gdn = n_gdn > 0 ? z.gdn / (size_t) n_gdn * (size_t) ss.gdn_alloc : 0;
+    return true;
+}
+
 bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
-    const size_t layers = owned_qsa(g);
+    const size_t layers = owned_qsa(ss, g);
     if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
         c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
         c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
@@ -149,7 +169,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
                                   const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
-    const size_t layers = owned_qsa(g);
+    const size_t layers = owned_qsa(ss, g);
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
     if (!copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error) ||
@@ -167,10 +187,10 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
                                      const ModelGeometry& g, std::string& error) {
     if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
     ConversationStateSizes z;
-    if (!conversation_state_sizes(g, z, error)) return false;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!copy(ss.gdn_state, c.gdn.data(), c.gdn.size(), error) ||
         !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
-    for (size_t j = 0; j < owned_qsa(g); ++j) {
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j) {
         const auto& st = owned(ss, j);
         if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
             !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
@@ -191,9 +211,9 @@ bool conversation_snapshot_bytes(const ConversationView& view, const SessionStat
     bytes = 0;
     if (!view_validate(view, ss, g, error)) return false;
     ConversationStateSizes z;
-    if (!conversation_state_sizes(g, z, error)) return false;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
     size_t ids = 0, images = 0, checkpoints = 0, layers = 0, tails = 0, dead = 0, positions = 0;
-    const auto qsa = (uint64_t) owned_qsa(g);
+    const auto qsa = (uint64_t) owned_qsa(ss, g);
     if (!product(ids, {view.ids.size(), sizeof(int32_t)}) ||
         !product(images, {view.images.size(), sizeof(ConversationImageKey)}) ||
         !product(checkpoints, {view.checkpoints.size(), sizeof(ConversationCheckpoint)}) ||
@@ -218,7 +238,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          const QsaState& draft, size_t& bytes, std::string& error) {
     if (!conversation_snapshot_bytes(view, ss, g, draft, bytes, error)) return false;
     if (reuse.kv.empty()) return true;
-    const size_t layers = owned_qsa(g) + 1;
+    const size_t layers = owned_qsa(ss, g) + 1;
     if (reuse.kv.size() != layers || reuse.unchanged_tokens < 0 ||
         reuse.unchanged_tokens > reuse.captured_tokens || reuse.unchanged_tokens > int64_t(view.ids.size()))
         return fail(error, "invalid retained K/V prefix");
@@ -251,7 +271,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
-    const size_t layers = owned_qsa(g);
+    const size_t layers = owned_qsa(ss, g);
     captured.kv.resize(layers + 1);
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
@@ -272,7 +292,7 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
     if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
-    const size_t layers = owned_qsa(g);
+    const size_t layers = owned_qsa(ss, g);
     if (image.kv.size() != layers + 1) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
@@ -285,7 +305,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
-    for (size_t j = 0; j < owned_qsa(g); ++j)
+    for (size_t j = 0; j < owned_qsa(ss, g); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
             return ConversationRestore::transfer_failed;
     if (!conversation_kv_restore(image.kv.back(), draft, g, upto, false, error) ||

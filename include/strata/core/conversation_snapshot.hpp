@@ -38,6 +38,9 @@ struct ConversationStateSizes {
 };
 /// Whole-model sizes: `gdn` covers every GDN layer, the indexer sizes are per QSA layer.
 bool conversation_state_sizes(const ModelGeometry& g, ConversationStateSizes& sizes, std::string& error);
+/// The same for the layers `ss` owns (its carve, upstream #216): `gdn` holds its GDN rows only.
+bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, ConversationStateSizes& sizes,
+                                std::string& error);
 bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, const SessionState& session,
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
