@@ -149,7 +149,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
-    device_ = 0;   // one Xe device: a layer split across GPUs is not supported (OnDevice)
+    device_ = current_device();   // a layer split's stage on another GPU: init runs on it (OnDevice)
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;

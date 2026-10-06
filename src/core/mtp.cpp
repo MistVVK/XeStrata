@@ -137,7 +137,7 @@ const void* MtpDrafter::q8(const char* name) const {
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window) {
-    device_ = 0;   // one Xe device: a layer split across GPUs is not supported (OnDevice)
+    device_ = current_device();   // with a layer split, the last stage's GPU (OnDevice)
     g_ = &g;
     ss_ = &ss;
     max_t_ = max_t;

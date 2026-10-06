@@ -176,7 +176,7 @@ struct Stager {
             }
             if (!strata::gpu::event_create(&dma_done[i])) return false;
         }
-        device = 0;   // one Xe device
+        device = strata::core::current_device();
         for (int t = 0; t < nthreads; ++t) threads.emplace_back([this] { work(); });
         return true;
     }
@@ -191,7 +191,7 @@ struct Stager {
         }
     }
     void work() {
-        (void) device;   // one Xe device: nothing to select on the worker thread
+        const strata::core::OnDevice on_device(device);   // the stage's GPU, on this worker thread too
         uint32_t seen = 0;
         for (;;) {
             {
@@ -495,7 +495,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
-    m.device = 0;   // one Xe device
+    m.device = strata::core::current_device();
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
