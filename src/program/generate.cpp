@@ -566,7 +566,8 @@ void usage() {
                  "                       window (2..8; a count that cannot run is a warning and fewer slots or none)\n"
                  "  --layer-split K[,K2..]|auto  --serve: the next GPU runs layers from K on (docs/MULTIGPU.md);\n"
                  "                       auto chooses K from what this PC measures, before loading\n"
-                 "  --split-device D[,D2..]  the GPU for each split point (default: the other discrete GPUs)\n"
+                 "  --split-device D[,D2..]  the GPU for each split point, by engine number or PCI address\n"
+                 "                       (default: the other discrete GPUs)\n"
                  "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
                  "                       (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
                  "                       after GPU)\n"
@@ -1316,7 +1317,33 @@ int main(int argc, char** argv) {
         };
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
-        if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
+        // --split-device: engine numbers, or PCI addresses (setup writes those: its numbers are not the engine's)
+        auto devices = [n_dev](const std::string& str, std::vector<int>& out) -> bool {
+            size_t a = 0;
+            while (a < str.size()) {
+                size_t b = str.find(',', a);
+                if (b == std::string::npos) b = str.size();
+                std::string t = str.substr(a, b - a);
+                if (t.empty()) return false;
+                if (t.find_first_not_of("0123456789") == std::string::npos) {
+                    out.push_back((int) std::strtol(t.c_str(), nullptr, 10));
+                } else {
+                    for (auto& c : t) c = (char) std::tolower((unsigned char) c);
+                    int found = -1;
+                    for (int d = 0; d < n_dev && found < 0; ++d)
+                        if (strata::core::device_info(d).pci == t) found = d;
+                    if (found < 0) {
+                        std::fprintf(stderr, "strata generate: --split-device: no usable GPU at PCI address %s\n",
+                                     t.c_str());
+                        return false;
+                    }
+                    out.push_back(found);
+                }
+                a = b + 1;
+            }
+            return !out.empty();
+        };
+        if (ok && !o.split_device.empty()) ok = devices(o.split_device, split_devs);
         else if (ok)   // without --split-device: the other discrete GPUs (the processor's own graphics only by name)
             for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d)
                 if (!strata::core::device_info(d).integrated) split_devs.push_back(d);

@@ -23,6 +23,7 @@ struct DeviceInfo {
     int ordinal = -1;
     std::string name, driver_version, platform_version;
     std::string backend;            ///< "Level Zero", "CUDA" or "HIP"
+    std::string pci;                ///< its PCI address (domain:bus:device.function, lower case), "?" if not reported
     uint32_t vendor_id = 0, device_id = 0;   ///< device_id: Intel GPUs only (0 elsewhere)
     uint64_t total_bytes = 0, free_bytes = 0;
     bool free_bytes_known = false;

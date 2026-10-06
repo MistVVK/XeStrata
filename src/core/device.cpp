@@ -375,6 +375,7 @@ DeviceInfo device_info(int ordinal) {
     apply_vram_limit(free, out.total_bytes);
     if (out.free_bytes_known) out.free_bytes = free;
     out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
+    out.pci = pci_of(d);
     out.integrated = integrated(d);
     out.subgroup_sizes = d.get_info<sycl::info::device::sub_group_sizes>();
     out.fp64 = d.has(sycl::aspect::fp64);
