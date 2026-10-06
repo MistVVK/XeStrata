@@ -253,7 +253,7 @@ oneAPI's for icpx, the intel/llvm built here for that one.
 So the server starts the engine without any toolkit environment.
 
 There is no ready-made Xe engine to download.
-setup's `--gpus` is refused; several GPUs are used through engine options in the config's `args` ([MULTIGPU](MULTIGPU.md)).
+Several GPUs are chosen with setup's `--gpus` (a layer split, [MULTIGPU](MULTIGPU.md)).
 
 ### The SYCL compiler
 

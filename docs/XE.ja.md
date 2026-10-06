@@ -258,7 +258,7 @@ icpx なら oneAPI のもの、ここで作った intel/llvm ならそのもの�
 これで server は、ツールキットの環境を読み込まずにエンジンを起動できます。
 
 ダウンロードできる出来合いの Xe のエンジンはありません。
-setup の `--gpus` は受け付けません。複数の GPU は、設定ファイルの `args` にエンジンのオプションを書いて使います（[MULTIGPU](MULTIGPU.ja.md)）。
+複数の GPU は setup の `--gpus` で選びます（層の分割、[MULTIGPU](MULTIGPU.ja.md)）。
 
 ### SYCL のコンパイラ
 

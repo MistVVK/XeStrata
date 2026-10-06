@@ -282,6 +282,7 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 ./setup.sh --data-dir /data/XeStrata-data   モデルのファイルを別の場所に置く
 ./setup.sh --port 8081                      別のポート
 ./setup.sh --gpu 1                          別の GPU（--check が並べる番号。既定は VRAM がいちばん大きいもの）
+./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
 ./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（5〜10 分）

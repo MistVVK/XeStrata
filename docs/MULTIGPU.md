@@ -13,22 +13,25 @@ It is opt-in and changes nothing when the options are absent (a port of upstream
 
 ## Turning it on
 
-Add the engine options to the model's config (`xestrata-<model>.json`), in `"args"`.
-setup's `--gpus` is refused.
+List the GPUs in setup's `--gpus` (numbered as `--check` lists them; the first runs the early layers).
+
+```sh
+./setup.sh --gpus 1,2                    # at install or at a start (kept in the model's config)
+./setup.sh --gpus 1,2 --layer-split 36   # split points of your own (auto by default)
+./setup.sh --gpu 1                       # this start on one GPU (the saved split stays)
+```
+
+setup writes the first GPU's PCI address in `"gpu_pci"` and the others' in `"split_pci"`, and the server passes
+`--layer-split` and `--split-device` to the engine.
+The engine's own options:
 
 | Option | Meaning |
 | --- | --- |
 | `--layer-split auto` | The split points are chosen from what this PC measures ([below](#choosing-the-split-points)). With one GPU visible there is no split. |
 | `--layer-split K[,K2..]` | The next GPU takes over at layer K (K from 2, rising). One GPU per split point. |
-| `--split-device D[,D2..]` | The GPU for each split point (from 1, see [GPU numbers](#gpu-numbers)). Without it, the GPUs that are not the processor's own graphics, in their order. |
+| `--split-device D[,D2..]` | The GPU for each split point, by engine number (from 1, see [GPU numbers](#gpu-numbers)) or PCI address. Without it, the GPUs that are not the processor's own graphics, in their order. |
 | `--batch-groups G` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
 | `--batch-cpu-split N0,N1` | Experimental, off by default ([below](#the-cpu-experts-per-stage-experimental)). |
-
-For example (part of the config):
-
-```json
-"args": ["...", "--layer-split", "auto"]
-```
 
 It needs:
 
@@ -40,7 +43,7 @@ It needs:
 The engine numbers the GPUs it can drive from 0.
 0 is the GPU setup chose with `STRATA_GPU_PCI`.
 The rest follow in this order: GPUs that are not the processor's own graphics, then the most memory, then the most compute units.
-The processor's own graphics is used only when `--split-device` names its number.
+The processor's own graphics is used only when `--split-device` (setup: `--gpus`) names it.
 
 The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream's spelling; it says nothing about the maker).
 
