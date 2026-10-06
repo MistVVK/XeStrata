@@ -11,8 +11,10 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -28,8 +30,15 @@ sycl::queue& queue_for(void* stream) {
     return queue;
 }
 
-// One Xe device: the per-device table array of the CUDA build collapses to one pointer.
-std::atomic<const int32_t*> mrope_tab{nullptr};
+// The tables of each engine device, as the CUDA build's per-device array: a layer split's stages each read their own
+// GPU's (one pointer for all made the B70 read the RTX 4070's image positions and hang at the first rotary layer)
+constexpr int kMaxDevices = 16;
+std::array<std::atomic<const int32_t*>, kMaxDevices> mrope_tab{};
+int device_slot() {
+    const int d = core::current_device();
+    if (d < 0 || d >= kMaxDevices) throw std::runtime_error("rope tables: engine device " + std::to_string(d));
+    return d;
+}
 std::atomic<bool> native_enabled{false};
 
 bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
@@ -46,8 +55,8 @@ void rope_scaling_set(const RopeScaling& scaling) { g_rope_scaling = scaling; }
 const RopeScaling& rope_scaling() { return g_rope_scaling; }
 
 namespace {
-RopeTab g_rope_tab;
-RopeScaling g_rope_tab_scaling;
+std::array<RopeTab, kMaxDevices> g_rope_tab;   // per engine device (set at startup, before any graph)
+std::array<RopeScaling, kMaxDevices> g_rope_tab_scaling;
 bool same_scaling(const RopeScaling& a, const RopeScaling& b) {
     return a.type == b.type && a.freq_base == b.freq_base && a.factor == b.factor && a.freq_scale_in == b.freq_scale_in &&
            a.orig_ctx == b.orig_ctx && a.ext_factor == b.ext_factor && a.attn_factor == b.attn_factor &&
@@ -55,22 +64,28 @@ bool same_scaling(const RopeScaling& a, const RopeScaling& b) {
 }
 }  // namespace
 void rope_table_set(const float* cos_tab, const float* sin_tab, int max_pos, const RopeScaling& scaling) {
-    g_rope_tab = RopeTab{cos_tab, sin_tab, max_pos};
-    g_rope_tab_scaling = scaling;
+    const int d = device_slot();
+    g_rope_tab[(size_t) d] = RopeTab{cos_tab, sin_tab, max_pos};
+    g_rope_tab_scaling[(size_t) d] = scaling;
 }
 void rope_table_release(const float* cos_tab) {
-    if (g_rope_tab.cos == cos_tab) g_rope_tab = RopeTab{};
+    for (RopeTab& t : g_rope_tab)
+        if (t.cos == cos_tab) t = RopeTab{};
 }
 RopeTab rope_table_for(const RopeScaling& scaling) {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ROPE_TABLE");
         return v != nullptr && v[0] == '1';
     }();
-    return on && same_scaling(scaling, g_rope_tab_scaling) ? g_rope_tab : RopeTab{};
+    if (!on) return RopeTab{};
+    const int d = device_slot();
+    return same_scaling(scaling, g_rope_tab_scaling[(size_t) d]) ? g_rope_tab[(size_t) d] : RopeTab{};
 }
 
-void mrope_table_set(const int32_t* device_table) { mrope_tab.store(device_table, std::memory_order_relaxed); }
-const int32_t* mrope_table() { return mrope_tab.load(std::memory_order_relaxed); }
+void mrope_table_set(const int32_t* device_table) {
+    mrope_tab[(size_t) device_slot()].store(device_table, std::memory_order_relaxed);
+}
+const int32_t* mrope_table() { return mrope_tab[(size_t) device_slot()].load(std::memory_order_relaxed); }
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
