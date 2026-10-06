@@ -1184,6 +1184,7 @@ def recorded_compiler(meta: dict) -> dict:
     """The compiler an installed engine was built with, for building it again after a `git pull` without asking.  An
     engine from before the free build (no record) was built with icpx: it stays so, as --license contrib-icpx."""
     rec = meta.get("compiler") or {"kind": "icpx", "xmx": True}
+    comp: dict | None
     if rec["kind"] == "intel-llvm":
         comp = free_compiler(Path(rec["cxx"]).parent.parent, rec.get("license", "free"))
         if comp["license"] == "contrib":
@@ -1545,7 +1546,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     reserve = int(rv) if rv.isdigit() else None
     esp_path = esp.rsplit(":", 1)[0] if esp else None
     return {"family": family, "model": model if model in MODELS else None,
-            "context": int(val("--max-context")) if val("--max-context") else None,
+            "context": int(ctx) if (ctx := val("--max-context")) else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "vision_onednn": ("on" if vis.get("onednn") else "off") if isinstance(vis, dict) and vis.get("gpu") else None,
@@ -1931,7 +1932,8 @@ def warm_up(cfg_path: Path) -> None:
                     time.sleep(2)
             notes = " ".join(f"Note {i}: the {c} sensor read {i * 7 % 100} at step {i}."
                              for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
-            asks = [[{"role": "user", "content": "Summarize these notes in two sentences.\n" + notes}]]
+            asks: list[list[dict[str, Any]]] = [
+                [{"role": "user", "content": "Summarize these notes in two sentences.\n" + notes}]]
             if cfg.get("vision"):
                 url = "data:image/png;base64," + base64.b64encode(tiny_png()).decode()
                 asks.append([{"role": "user", "content": [{"type": "text", "text": "What colours are in this picture?"},
@@ -2724,9 +2726,10 @@ def main() -> int:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
-    cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
-           "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"xestrata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port}
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT),
+                           "tokenizer": str(pack / "tokenizer"),
+                           "model_name": f"{fam['name']}-{model.lower()}",
+                           "log": str(ROOT / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
     if draft_vocab:
