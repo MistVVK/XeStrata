@@ -405,6 +405,8 @@ if(STRATA_ENABLE_XE)
   # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS); a GPU
   # without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time, so the engine starts
   # without the library of a GPU it does not use.
+  set(STRATA_ONEMATH_SOURCE "" CACHE STRING
+      "oneMath v0.9's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
   if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
     if(NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
@@ -437,7 +439,43 @@ if(STRATA_ENABLE_XE)
       add_link_options(${_strata_cuda_base_opts})
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
-    add_subdirectory(third_party/main/oneMath ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
+    # oneMath is not in the repository: the pinned release, with XeStrata's changes to it
+    # (third_party/main/oneMath/patches/NN-<id>.patch) applied in order.  `patch`, not `git apply`: the source
+    # folder is inside this repository's work tree, where git apply takes the paths as this repository's.
+    find_program(STRATA_PATCH patch REQUIRED)
+    file(GLOB _strata_onemath_patches CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/[0-9][0-9]-*.patch)
+    list(SORT _strata_onemath_patches)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_onemath_patches})
+    if(STRATA_ONEMATH_SOURCE)
+      set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
+    else()
+      set(_strata_onemath_url
+        URL https://github.com/uxlfoundation/oneMath/archive/6ff3a43e555dbb20357017d48f0f6c6263259895.tar.gz
+        URL_HASH SHA256=4d431378064867e3b6b3bb3271cdfc6decfe7580a676f1c70bd5c338f8731a94)
+    endif()
+    set(_strata_onemath_patch)
+    set(_strata_onemath_key "${_strata_onemath_url}")
+    foreach(onemath_patch_file ${_strata_onemath_patches})
+      list(APPEND _strata_onemath_patch
+           COMMAND ${STRATA_PATCH} -p1 -N -s --no-backup-if-mismatch -i ${onemath_patch_file})
+      file(SHA256 ${onemath_patch_file} _h)
+      string(APPEND _strata_onemath_key ";${_h}")
+    endforeach()
+    list(POP_FRONT _strata_onemath_patch)
+    # a changed patch does not change what FetchContent fetches, so it would keep the tree patched before: start
+    # from the archive again
+    if(NOT _strata_onemath_key STREQUAL _STRATA_ONEMATH_KEY)
+      file(REMOVE_RECURSE ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
+                          ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
+    endif()
+    include(FetchContent)
+    FetchContent_Populate(strata_onemath QUIET ${_strata_onemath_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      PATCH_COMMAND ${_strata_onemath_patch}
+      SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
+    set(_STRATA_ONEMATH_KEY "${_strata_onemath_key}" CACHE INTERNAL "the archive and patches the oneMath tree has")
+    add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
     unset(BUILD_SHARED_LIBS)
   endif()
