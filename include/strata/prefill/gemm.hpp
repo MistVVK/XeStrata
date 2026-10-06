@@ -39,10 +39,11 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0);
 
-    /// Loads the products' library ahead of the first prompt (oneMath's backend), on a thread of its own: call once at
-    /// startup.
+    /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
+    /// its own: call once for each GPU at startup.
     static void prepare();
-    /// The path the products take, for the startup report: "oneMath", or the own kernels' (kernels::gemm_path).
+    /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
+    /// (kernels::gemm_path).
     static const char* path();
 
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).

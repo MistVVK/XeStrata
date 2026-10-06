@@ -16,8 +16,10 @@
 #include <oneapi/math/blas.hpp>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #endif
 
 #include <algorithm>
@@ -35,35 +37,47 @@ bool env_on(const char* name) {
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
-// Whether oneMath takes the products: not once it had no backend for the GPU, nor with STRATA_NO_BLAS=1 (XeStrata's
-// own kernels, to compare).  BF16 also not when the trial product failed (a GPU whose library has no BF16 product), or
-// with STRATA_NO_BF16_MMA=1, which imitates a GPU without BF16 matrix engines.
-bool& blas_on() {
-    static bool v = !env_on("STRATA_NO_BLAS");
-    return v;
-}
-bool& bf16_on() {
-    static bool v = !strata::kernels::no_bf16_mma();
-    return v;
-}
-
 struct Trial {
     std::string why;   // empty when oneMath took the products
     bool bf16 = true;
 };
-std::future<Trial> g_ready;   // Gemm::prepare's trial
+// Per GPU (a layer split drives GPUs of different makers, so oneMKL on one and cuBLAS on the next): whether oneMath
+// takes the products - not once it had no backend for the GPU, nor with STRATA_NO_BLAS=1 (XeStrata's own kernels, to
+// compare) - and BF16 ones too - not when the trial product failed (a GPU whose library has no BF16 product), nor with
+// STRATA_NO_BF16_MMA=1, which imitates a GPU without BF16 matrix engines.
+struct Backend {
+    bool blas = !env_on("STRATA_NO_BLAS");
+    bool bf16 = !strata::kernels::no_bf16_mma();
+    std::shared_future<Trial> ready;   // Gemm::prepare's trial, until it is settled
+};
+std::mutex g_mutex;
+std::unordered_map<sycl::device, Backend> g_backends;
 
-void settle() {
-    if (!g_ready.valid()) return;
-    const Trial t = g_ready.get();
-    if (!t.why.empty()) {
-        std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
-                     t.why.c_str());
-        blas_on() = false;
-    } else if (!t.bf16 && bf16_on()) {
-        std::fprintf(stderr, "strata: oneMath has no BF16 product on this GPU: those take XeStrata's own kernels\n");
-        bf16_on() = false;
+// The backend of `dev`, its trial's outcome taken in (waited for) the first time
+Backend backend(const sycl::device& dev) {
+    std::shared_future<Trial> ready;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        Backend& b = g_backends[dev];
+        if (!b.ready.valid()) return b;
+        ready = b.ready;
     }
+    const Trial t = ready.get();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Backend& b = g_backends[dev];
+    if (b.ready.valid()) {
+        b.ready = {};
+        if (!t.why.empty()) {
+            std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
+                         t.why.c_str());
+            b.blas = false;
+        } else if (!t.bf16 && b.bf16) {
+            std::fprintf(stderr, "strata: oneMath has no BF16 product on this GPU: those take XeStrata's own "
+                                 "kernels\n");
+            b.bf16 = false;
+        }
+    }
+    return b;
 }
 
 // Y[T, N] row-major is Y^T[N, T] column-major (ld ldy) = W^T . X^T, with row-major W[N, K] read as the transpose of a
@@ -80,15 +94,17 @@ void product(sycl::queue& q, const uint16_t* X, const uint16_t* W, float* Y, int
 template <class E>
 bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
           bool accumulate, void* stream) {
-    settle();
-    if (!blas_on() || (std::is_same_v<E, oneapi::math::bfloat16> && !bf16_on())) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const Backend b = backend(q.get_device());
+    if (!b.blas || (std::is_same_v<E, oneapi::math::bfloat16> && !b.bf16)) return false;
     try {
-        product<E>(core::Runtime::get().stream(stream), X, W, Y, T, N, K, ldy, accumulate);
+        product<E>(q, X, W, Y, T, N, K, ldy, accumulate);
         return true;
     } catch (const oneapi::math::exception& e) {
         std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
                      e.what());
-        blas_on() = false;
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_backends[q.get_device()].blas = false;
         return false;
     }
 }
@@ -97,12 +113,14 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
 
 void Gemm::prepare() {
 #if STRATA_ONEMATH
-    if (!blas_on()) return;
     // A backend's first product loads its library and its kernels (cuBLAS: about 0.6 s on an RTX 4070, inside the
     // first prompt): one small product of each type on a queue of its own, beside the model's loading.  An error of the
     // BF16 one (thrown, or reported by the queue afterwards) leaves the BF16 products to XeStrata's own kernels.
     sycl::queue& c = core::Runtime::get().compute();
-    g_ready = std::async(std::launch::async, [ctx = c.get_context(), dev = c.get_device()]() -> Trial {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    Backend& b = g_backends[c.get_device()];
+    if (!b.blas || b.ready.valid()) return;
+    b.ready = std::async(std::launch::async, [ctx = c.get_context(), dev = c.get_device()]() -> Trial {
         constexpr int64_t n = 16;
         constexpr size_t tile = (size_t) n * n;
         auto failed = std::make_shared<bool>(false);
@@ -129,13 +147,13 @@ void Gemm::prepare() {
         sycl::free(x, q);
         sycl::free(y, q);
         return t;
-    });
+    }).share();
 #endif
 }
 
 const char* Gemm::path() {
 #if STRATA_ONEMATH
-    if (blas_on()) return "oneMath";
+    if (backend(core::Runtime::get().device()).blas) return "oneMath";
 #endif
     return strata::kernels::gemm_path(XmxType::f16);
 }

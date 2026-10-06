@@ -1616,7 +1616,15 @@ int main(int argc, char** argv) {
                      remote_dev[0], free_gib);
     }
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading
+    // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
+    if (multi_gpu)
+        for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
     strata::prefill::Gemm::prepare();
+    if (multi_gpu)
+        for (const int d : split_devs) {
+            const strata::core::OnDevice on(d);
+            strata::prefill::Gemm::prepare();
+        }
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
