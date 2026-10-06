@@ -23,7 +23,6 @@ constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
 constexpr int SCORE_WARPS = 8;
 constexpr int TOPK_T = 256;
 constexpr int TK_T = 1024;
-constexpr int TK_PER = 33;
 constexpr int WARP = 32;
 
 inline uint32_t order_key(float s) {
@@ -124,10 +123,11 @@ sycl::event launch_topk_ref(sycl::queue& q, const float* scores, const int32_t* 
     });
 }
 
-// A query with more blocks than the register kernel holds (contexts past 4 * TK_T * TK_PER cells; upstream cce52db):
-// the register kernel's work-items, per-sub-group histograms and sub-group scans, with each key read from memory again
-// on every pass.  A histogram has no order, so on the four radix passes work-item t reads blocks t, t + TK_T, ...: a
-// sub-group reads WARP neighbours at a time.  The cells are emitted ascending in the order (sub-group, row, lane):
+// The top-k on TK_T work-items (upstream cce52db), per-sub-group histograms and sub-group scans, with each key read
+// from memory again on every pass.  A histogram has no order, so on the four radix passes work-item t reads blocks t,
+// t + TK_T, ...: a sub-group reads WARP neighbours at a time.  It replaced the kernel that kept each work-item's run of
+// contiguous blocks in registers, which upstream 1bb5c72 left for Turing above 90K cells: these coalesced reads were
+// faster at every context and batch measured, 4K-135K cells and 1-2,048 queries (B70 1.1-2.3x, RTX 4070 1.05-1.25x).  The cells are emitted ascending in the order (sub-group, row, lane):
 // sub-group w holds the `per` rows of WARP consecutive blocks from block w * WARP * per.  launch_topk_ref's selection
 // rule (radix threshold, ties to the lowest index): identical ids.
 sycl::event launch_topk_wide(sycl::queue& q, const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks,
@@ -287,111 +287,18 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
 }
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                    const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
-    // keys in registers when every query's blocks fit, else the same work-items reading them from memory; the same
-    // ids.  STRATA_TOPK_OLD=1: the kernel that reads them from memory on every pass, which a device that takes no
-    // TK_T-item work-group runs as well
+                    const QsaShapes& s, int32_t* ids, void* stream) {
+    // STRATA_TOPK_OLD=1: the kernel with one shared histogram, which a device that takes no TK_T-item work-group runs
+    // as well; the same ids
     static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
     if (nq <= 0) return;
-    const int64_t bound = active_blocks > 0 ? std::min(active_blocks, max_blocks) : max_blocks;
     if (old || xe::max_work_group(queue_for(stream)) < (size_t) TK_T) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);
         return;
     }
     if (s.idx_block != R || cap < qsa_selection_width(kTopkMaxCells, s))
         throw core::DeviceError("qsa_block_topk: unsupported geometry or cap");
-    if (bound > int64_t(TK_T) * TK_PER) {
-        finish(stream, launch_topk_wide(queue_for(stream), scores, steps, nq, max_blocks, cap, ids), "qsa_block_topk");
-        return;
-    }
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<int, 2> hist(sycl::range<2>(TK_T / WARP, 256), h);
-        sycl::local_accessor<int, 1> s_digit_above(sycl::range<1>(2), h);
-        h.parallel_for(sycl::nd_range<1>(size_t(nq) * TK_T, TK_T), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const auto grp = it.get_group();
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t qi = int64_t(it.get_group(0));
-            const int32_t* st = steps + qi * kStepCount;
-            const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
-            int32_t* out = ids + qi * cap;
-            const int t = int(it.get_local_id(0)), lane = t & 31, warp = t >> 5;
-            if (n_kv <= width) {
-                for (int64_t j = t; j < n_kv; j += TK_T) out[j] = int32_t(j);
-                return;
-            }
-            const float* sc = scores + qi * max_blocks;
-            const int64_t nb = n_bid + 1;
-            const int64_t per = (nb + TK_T - 1) / TK_T;   // <= TK_PER (checked above)
-            const int64_t b0 = int64_t(t) * per, b1 = (b0 + per < nb) ? b0 + per : nb;
-            uint32_t key[TK_PER];
-            for (int j = 0; j < TK_PER; ++j) key[j] = (b0 + j < b1) ? order_key(sc[b0 + j]) : 0u;
-            auto weight = [&](int64_t b) -> int { return b < n_bid ? R : int(n_kv - n_bid * R); };
-            uint32_t prefix = 0;
-            int above = 0;
-            for (int shift = 24; shift >= 0; shift -= 8) {
-                for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
-                sycl::group_barrier(sg);
-                const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
-                for (int j = 0; j < TK_PER; ++j) {
-                    const int64_t b = b0 + j;
-                    if (b >= b1) break;
-                    const int w = weight(b);
-                    if (w == 0) continue;
-                    if ((key[j] & hi_mask) == (prefix & hi_mask)) local_atomic(hist[warp][(key[j] >> shift) & 255]).fetch_add(w);
-                }
-                sycl::group_barrier(grp);
-                if (t < 256) {   // fold the sub-groups' histograms into sub-group 0's
-                    int sum = 0;
-                    for (int w2 = 0; w2 < TK_T / WARP; ++w2) sum += hist[w2][t];
-                    hist[0][t] = sum;
-                }
-                sycl::group_barrier(grp);
-                if (t == 0) {
-                    int cum = above, d = 255;
-                    for (; d > 0; --d) {
-                        if (cum + hist[0][d] >= width) break;
-                        cum += hist[0][d];
-                    }
-                    s_digit_above[0] = d;
-                    s_digit_above[1] = cum;
-                }
-                sycl::group_barrier(grp);
-                prefix |= uint32_t(s_digit_above[0]) << shift;
-                above = s_digit_above[1];
-                sycl::group_barrier(grp);
-            }
-            const uint32_t thr = prefix;
-            const int64_t eq_budget = width - above;
-            int gt = 0, eq = 0;
-            for (int j = 0; j < TK_PER; ++j) {
-                const int64_t b = b0 + j;
-                if (b >= b1) break;
-                const int w = weight(b);
-                if (w == 0) continue;
-                if (key[j] > thr) gt += w;
-                else if (key[j] == thr) eq += w;
-            }
-            const int eq_before = sycl::exclusive_scan_over_group(grp, eq, sycl::plus<int>());
-            int64_t my_eq = eq_budget - eq_before;
-            if (my_eq < 0) my_eq = 0;
-            if (my_eq > eq) my_eq = eq;
-            const int sel = gt + int(my_eq);
-            int64_t wpos = sycl::exclusive_scan_over_group(grp, sel, sycl::plus<int>());
-            int64_t eq_left = my_eq;
-            for (int j = 0; j < TK_PER; ++j) {
-                const int64_t b = b0 + j;
-                if (b >= b1) break;
-                const int w = weight(b);
-                if (w == 0) continue;
-                if (key[j] > thr) {
-                    for (int c = 0; c < w; ++c) out[wpos++] = int32_t(b * R + c);
-                } else if (key[j] == thr) {
-                    for (int c = 0; c < w && eq_left > 0; ++c, --eq_left) out[wpos++] = int32_t(b * R + c);
-                }
-            }
-        });
-    });
-    finish(stream, e, "qsa_block_topk");
+    finish(stream, launch_topk_wide(queue_for(stream), scores, steps, nq, max_blocks, cap, ids), "qsa_block_topk");
 }
 
 }  // namespace strata::kernels

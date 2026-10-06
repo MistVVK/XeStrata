@@ -37,9 +37,8 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks);
 
 /// ids [nq, cap] (cells, ascending); `cap` >= the largest selection width.
-/// active_blocks > 0 bounds every query's n_bid + 1; omit it for captured graphs with growing context.
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
-                    const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks = -1);
+                    const QsaShapes& s, int32_t* ids, void* stream);
 /// The original kernel (keys read from memory on every radix pass), for tests: the same ids.
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                         const QsaShapes& s, int32_t* ids, void* stream);
