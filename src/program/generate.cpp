@@ -333,6 +333,9 @@ struct Options {
     /// #465).  A request sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual
     /// path, then continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
+    /// With a layer split: the --batch slots in this many groups pipelined through the stages (stage k runs one group
+    /// while stage k+1 runs another; upstream PR #559).  1 = every slot in one window, stage after stage.
+    int batch_groups = 1;
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
@@ -556,6 +559,9 @@ void usage() {
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --batch N, --slots N --serve: up to N conversations decoded together, one token each per batch\n"
                  "                       window (2..8; a count that cannot run is a warning and fewer slots or none)\n"
+                 "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
+                 "                       (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
+                 "                       after GPU)\n"
                  "  --vram-elastic       --serve (#533, opt-in): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -1118,6 +1124,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        else if (a == "--batch-groups") o.batch_groups = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
@@ -4670,12 +4677,141 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        // ---- --batch-groups: the slot groups pipelined through the stages (upstream PR #559).  A group's window runs
+        // on one stage at a time, its commit right behind it; when it is done there it moves to the next stage, and the
+        // stage it left takes the next group.  Each stage on its own GPU, so the GPUs work on different groups at once.
+        const int n_pipe = n_stages;
+        if (o.batch > 0 && o.batch_groups > 1 && (n_pipe < 2 || split_same || o.batch % o.batch_groups != 0)) {
+            std::fprintf(stderr, "strata serve: --batch-groups %d is off: it needs a layer split over GPUs of their "
+                                 "own and to divide --batch %d\n", o.batch_groups, o.batch);
+            o.batch_groups = 1;
+        }
+        const bool piped = o.batch > 0 && o.batch_groups > 1;
+        const int GS = piped ? o.batch / o.batch_groups : o.batch;
+        struct PGroup {
+            bool inflight = false;
+            int stage = 0;                  ///< the stage it runs on or waits for
+            int32_t tok[strata::kernels::kVerifyMaxT] = {};
+            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int64_t since = 0;              ///< the turn it started waiting (the longest waiting goes first)
+        };
+        std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
+        std::vector<int> stage_group((size_t) n_pipe, -1);
+        int64_t pipe_tick = 0, rr = 0;
+        auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+        auto group_active = [&](int gi) {
+            for (int t = 0; t < GS; ++t) if (bs[(size_t) gi * (size_t) GS + (size_t) t].active) return true;
+            return false;
+        };
+        if (piped)
+            std::fprintf(stderr, "strata serve: --batch %d in %d groups of %d, pipelined through %d GPUs\n", o.batch,
+                         o.batch_groups, GS, n_pipe);
+        // one turn: serve every running stage, hand finished groups on, start what can start
+        auto pump = [&](bool may_start) -> bool {
+            ++pipe_tick;
+            if (bt_windows == 0 && !pipe_inflight()) bt_start = Clock::now();
+            for (int k = 0; k < n_pipe; ++k) {
+                const int gi = stage_group[(size_t) k];
+                if (gi < 0) continue;
+                const int r = stage_ver(k).batch_poll(win_pool_fn, win_pool_user, err);
+                if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
+                if (r == 0) continue;
+                stage_group[(size_t) k] = -1;
+                PGroup& G = pg[(size_t) gi];
+                if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
+                const int32_t* outb = stage_ver(k).batch_out();   // the last stage: the group's picks
+                for (int t = 0; t < GS; ++t) {
+                    const int b = gi * GS + t;
+                    BSlot& sl = bs[(size_t) b];
+                    if (!sl.active) continue;
+                    const int32_t y = outb[t];
+                    sl.ids.push_back(sl.x);    // the window fed it: the slot's session holds it now
+                    std::printf("BT %d %d\n", b, (int) y);
+                    ++sl.produced;
+                    ++bt_rows;
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : sl.p + 2 > o.max_context ? "length" : nullptr;
+                    if (fin != nullptr) {
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
+                        std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        sl.active = false;
+                        sl.cached = false;   // the group's pad rows write an idle slot's state: not reused as a cache
+                    } else {
+                        sl.x = y;
+                        sl.p += 1;
+                    }
+                }
+                std::fflush(stdout);
+                ++bt_windows;
+                G.inflight = false;
+            }
+            // start waiting groups on free stages, the longest waiting first; a new step on stage 0 round-robin
+            for (int k = n_pipe - 1; k >= 0; --k) {
+                if (stage_group[(size_t) k] >= 0) continue;
+                int pick = -1;
+                if (k > 0) {
+                    for (int gi = 0; gi < (int) pg.size(); ++gi)
+                        if (pg[(size_t) gi].inflight && pg[(size_t) gi].stage == k &&
+                            (pick < 0 || pg[(size_t) gi].since < pg[(size_t) pick].since))
+                            pick = gi;
+                    if (pick < 0) continue;
+                } else {
+                    if (!may_start) continue;
+                    for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
+                        const int gi = (int) ((rr + j) % (int64_t) pg.size());
+                        if (!pg[(size_t) gi].inflight && group_active(gi)) pick = gi;
+                    }
+                    if (pick < 0) continue;
+                    rr = pick + 1;
+                    PGroup& G = pg[(size_t) pick];
+                    for (int t = 0; t < GS; ++t) {
+                        BSlot& sl = bs[(size_t) pick * (size_t) GS + (size_t) t];
+                        G.tok[t] = sl.active ? sl.x : 0;
+                        G.pos[t] = sl.active ? sl.p : 0;
+                        if (!sl.active) sl.cached = false;   // its pad row writes its state
+                    }
+                    G.inflight = true;
+                    G.stage = 0;
+                    drive.d.failed = false;
+                    apply_pending(false);
+                }
+                PGroup& G = pg[(size_t) pick];
+                strata::core::progress().busy.store(true);
+                if (!stage_ver(k).batch_launch(pick * GS, GS, G.tok, G.pos, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                stage_group[(size_t) k] = pick;
+            }
+            if (drive.d.failed) {
+                std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed");
+                return false;
+            }
+            if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: one timing line
+                const double wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
+                std::fprintf(stderr,
+                             "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = %.1f "
+                             "rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
+                             (long long) bt_rows, wall, 1000.0 * (double) bt_rows / std::max(wall, 1e-9));
+                bt_windows = bt_rows = 0;
+                strata::core::progress().busy.store(false);
+            }
+            return true;
+        };
+        auto pipe_drain = [&]() -> bool {
+            while (pipe_inflight())
+                if (!pump(false)) return false;
+            return true;
+        };
         for (;;) {
-            if (batch_on()) {   // the slots decode while no line waits
+            if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!try_next_line(line)) {
-                    if (!batch_step()) return 1;
+                    if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
+                // a request reads its prompt through every stage: the groups in flight finish first
+                if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
             } else if (!next_line(line)) {
                 break;
             }

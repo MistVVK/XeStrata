@@ -34,6 +34,7 @@
 #include "strata/core/gpu.hpp"
 
 #include <cstdint>
+#include <chrono>
 #include <map>
 #include <string>
 #include <vector>
@@ -150,6 +151,20 @@ public:
                        int32_t* out, std::string& err);
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
+
+    // ---- The stages of a layer split as a PIPELINE (upstream PR #559, --batch-groups).  A batch window over the slot
+    // GROUP [base, base + S) is launched on ONE stage with its commit right behind it on the stage's queue (a batch
+    // window keeps every row, so the commit needs no host decision), and the host serves the rings of every stage
+    // that has a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while
+    // stage k+1 runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share one;
+    // a stage on another GPU gets its group's rows copied over when the window is done.
+    bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
+    /// -1 = an error (err).  Serves every layer that has rung so far.
+    int batch_poll(PoolMultiFn pool, void* user, std::string& err);
+    bool batch_busy() const { return b_running_; }
+    const int32_t* batch_out() const { return b_out_; }
+    bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
     /// the first stage of a layer split, it reaches the last (which draws).
@@ -216,21 +231,29 @@ private:
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<uint64_t, strata::gpu::Graph*> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S)
+    std::map<uint64_t, strata::gpu::Graph*> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hbase)
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    static uint64_t batch_key(const int* rows, int S) {
-        uint64_t k = (uint64_t) S << 32;
+    static uint64_t batch_key(const int* rows, int S, int hbase) {
+        uint64_t k = (uint64_t) S << 32 | (uint64_t) (hbase & 15) << 40;
         for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
         return k;
     }
+    int row_base_ = 0;                     ///< a batch window's first hand-off row (its slot group's base)
+    // batch_launch / batch_poll
+    bool b_running_ = false;
+    int64_t b_k_ = 0, b_steps_ = 0;
+    std::chrono::steady_clock::time_point b_last_;
+    int32_t b_out_[8] = {};
+    /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
+    bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
-    bool capture_batch(const int* rows, int S, std::string& err);
-    bool capture_commit_batch(const int* rows, int S, std::string& err);
+    bool capture_batch(const int* rows, int S, int hbase, std::string& err);
+    bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;

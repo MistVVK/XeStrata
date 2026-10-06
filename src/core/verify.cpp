@@ -395,11 +395,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
     const int64_t HB = Verifier::handoff_floats(g);
+    const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows (batch_launch)
     if (lb_ > 0) {
         for (int t = 0; t < T; ++t) {
-            copy_from_mapped(Rt(t), hand_in_ + (size_t) t * HB, HC * N, cs);
-            copy_from_mapped(bo_ + (size_t) t * N, hand_in_ + (size_t) t * HB + HC * N, N, cs);
-            copy_from_mapped(inj2_ + (size_t) t * HC, hand_in_ + (size_t) t * HB + HC * N + N, HC, cs);
+            const float* hin = hand_in_ + (size_t) (hrow0 + t) * HB;
+            copy_from_mapped(Rt(t), hin, HC * N, cs);
+            copy_from_mapped(bo_ + (size_t) t * N, hin + HC * N, N, cs);
+            copy_from_mapped(inj2_ + (size_t) t * HC, hin + HC * N + N, HC, cs);
         }
     } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
         ne->gather_dev(tok_, T, emb_, cs);
@@ -859,9 +861,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: hand the residual on, no head
         for (int t = 0; t < T; ++t) {
-            copy_from_mapped(hand_out_ + (size_t) t * HB, Rt(t), HC * N, cs);
-            copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N, bo_ + (size_t) t * N, N, cs);
-            copy_from_mapped(hand_out_ + (size_t) t * HB + HC * N + N, inj2_ + (size_t) t * HC, HC, cs);
+            float* hout = hand_out_ + (size_t) (hrow0 + t) * HB;
+            copy_from_mapped(hout, Rt(t), HC * N, cs);
+            copy_from_mapped(hout + HC * N, bo_ + (size_t) t * N, N, cs);
+            copy_from_mapped(hout + HC * N + N, inj2_ + (size_t) t * HC, HC, cs);
         }
         return true;
     }
@@ -1364,11 +1367,12 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
     return true;
 }
 
-bool Verifier::capture_batch(const int* rows, int S, std::string& err) {
-    strata::gpu::Graph*& ex = exec_bm_[batch_key(rows, S)];
+bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
+    strata::gpu::Graph*& ex = exec_bm_[batch_key(rows, S, hbase)];
     if (ex != nullptr) return true;
     if (!strata::gpu::begin_capture(cs_)) { err = "verify: begin batch capture failed"; return false; }
     batch_rec_ = true;
+    row_base_ = hbase;
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
     bool ok = false;
@@ -1378,6 +1382,7 @@ bool Verifier::capture_batch(const int* rows, int S, std::string& err) {
         rerr = std::string("verify: batch capture: ") + e.what();
     }
     batch_rec_ = false;
+    row_base_ = 0;
     if (!ok) {
         strata::gpu::abandon_capture(cs_);
         err = rerr;
@@ -1395,8 +1400,8 @@ bool Verifier::capture_batch(const int* rows, int S, std::string& err) {
     return true;
 }
 
-bool Verifier::capture_commit_batch(const int* rows, int S, std::string& err) {
-    strata::gpu::Graph*& cex = commit_bm_[batch_key(rows, S)];
+bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::string& err) {
+    strata::gpu::Graph*& cex = commit_bm_[batch_key(rows, S, hbase)];
     if (cex != nullptr) return true;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
@@ -1471,10 +1476,10 @@ bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolM
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
 }
 
-bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
-                             void* user, int32_t* out, std::string& err) {
+bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                           std::string& err) {
     using namespace strata::kernels;
-    const OnDevice on_device(device_);
+    if (hbase < 0 || hbase + S > (int) slots_.size()) { err = "verify: a batch group past the slots"; return false; }
     if (S < 1 || S > max_t_ || S > (int) slots_.size()) { err = "verify: batch rows out of range (init_slots)"; return false; }
     const ModelGeometry& g = *g_;
     for (int t = 0; t < S; ++t) {
@@ -1489,7 +1494,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             return false;
         }
     }
-    if (!capture_batch(rows, S, err) || !capture_commit_batch(rows, S, err)) return false;
+    if (!capture_batch(rows, S, hbase, err) || !capture_commit_batch(rows, S, hbase, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < S; ++t) {
@@ -1525,10 +1530,20 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = S;
+    row_base_ = hbase;   // commit_slots' graph key until the next stage_batch
     last_batch_ = true;
     for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; last_rows_[t] = rows[t]; }
     ms_host += ms_since(t0);
-    if (!strata::gpu::graph_launch(exec_bm_[batch_key(rows, S)], cs_)) {
+    return true;
+}
+
+bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool,
+                             void* user, int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (!strata::gpu::graph_launch(exec_bm_[batch_key(rows, S, 0)], cs_)) {
         err = std::string("verify: batch launch: ") + strata::gpu::last_error();
         return false;
     }
@@ -1600,7 +1615,8 @@ bool Verifier::commit_slots(std::string& err) {
     const int S = last_t_;
     const Clock::time_point t0 = Clock::now();
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (!strata::gpu::graph_launch(commit_bm_[batch_key(last_rows_, S)], cs_) || !strata::gpu::stream_sync(cs_)) {
+    if (!strata::gpu::graph_launch(commit_bm_[batch_key(last_rows_, S, row_base_)], cs_) ||
+        !strata::gpu::stream_sync(cs_)) {
         err = std::string("verify: batch commit: ") + strata::gpu::last_error();
         return false;
     }
@@ -1612,6 +1628,99 @@ bool Verifier::commit_slots(std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit_slots(err);
+}
+
+bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    int rows[8] = {};
+    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+    // the commit right behind the window: every row of a batch window is kept
+    if (!strata::gpu::graph_launch(exec_bm_[batch_key(rows, S, base)], cs_) ||
+        !strata::gpu::graph_launch(commit_bm_[batch_key(rows, S, base)], cs_)) {
+        err = std::string("verify: batch launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    (void) strata::gpu::stream_idle(cs_);
+    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) rows[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = tokens[t];
+        }
+    b_running_ = true;
+    b_k_ = 0;
+    b_steps_ = le_ - lb_;
+    b_last_ = Clock::now();
+    return true;
+}
+
+int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
+    if (!b_running_) return 1;
+    const OnDevice on_device(device_);
+    volatile uint32_t* const seq = h_seq_;
+    const int S = last_t_;
+    while (b_k_ < b_steps_) {
+        const uint32_t want = (uint32_t) (b_k_ + 1);
+        if (*seq < want) {
+            const auto now = Clock::now();
+            if (now - b_last_ > std::chrono::milliseconds(2)) {
+                if (strata::gpu::stream_idle(cs_) && *seq < want) {
+                    err = "verify batch: layer " + std::to_string(lb_ + b_k_) + " never rang (graph finished)";
+                    b_running_ = false;
+                    return -1;
+                }
+                if (now - b_last_ > std::chrono::seconds(20)) {
+                    err = "verify batch: timed out at layer " + std::to_string(lb_ + b_k_);
+                    b_running_ = false;
+                    return -1;
+                }
+            }
+            return 0;
+        }
+        const Clock::time_point b = Clock::now();
+        cur_layer_ = want - 1;
+        set_plan_slot(0);
+        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        *(volatile uint32_t*) h_flag_ = want;
+        ms_pool += ms_since(b);
+        b_last_ = Clock::now();
+        ++b_k_;
+    }
+    if (!strata::gpu::stream_idle(cs_) || !strata::gpu::stream_idle(copy_)) {   // (copy_: no host function of this
+        if (Clock::now() - b_last_ > std::chrono::seconds(20)) {                // window may raise flag B in the next)
+            err = "verify batch: the window's commit did not finish";
+            b_running_ = false;
+            return -1;
+        }
+        return 0;
+    }
+    if (last_stage()) {
+        if (!sample_rows(S, err)) { b_running_ = false; return -1; }
+        for (int t = 0; t < S; ++t) b_out_[t] = ((volatile int32_t*) h_out_)[t];
+    } else if (next_ != nullptr && next_->hand_in_ != hand_out_) {   // the next stage on another GPU: its rows
+        const size_t HB = (size_t) handoff_floats(*g_);
+        std::memcpy(const_cast<float*>(next_->hand_in_) + (size_t) row_base_ * HB, hand_out_ + (size_t) row_base_ * HB,
+                    (size_t) S * HB * sizeof(float));
+    }
+    ++windows;
+    b_running_ = false;
+    progress_beat();
+    return 1;
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
