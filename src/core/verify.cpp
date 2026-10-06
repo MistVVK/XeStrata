@@ -1221,7 +1221,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
-        return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+        if (next_ == nullptr) return true;
+        // the next stage on another GPU reads a hand-off of its own context (set_stage): the rows go across here
+        if (next_->hand_in_ != hand_out_)
+            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
+                        (size_t) T * (size_t) handoff_floats(g) * sizeof(float));
+        return next_->run(T, tokens, pos0, pool, next_user_, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     if (head_sampling_ && (sampled || hist_d_ != nullptr)) {

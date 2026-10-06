@@ -105,7 +105,9 @@ public:
     /// does not end at the last layer writes its residual to `handoff_out` and has no head.  The hand-off holds,
     /// per token, the residual R (hc x n_embd), the last layer's pending write bo (n_embd) and inject (hc): the next
     /// stage folds that write into its first read exactly as the unsplit window does, so the split is bit-exact.
-    /// Both pointers must be device-visible (mapped pinned memory, portable when the stages are on two devices).
+    /// Both pointers are host USM of this stage's GPU, which its kernels read and write.  Stages on one GPU share
+    /// the buffer between them; when the next stage is on another GPU, its `handoff_in` is a buffer of its own and
+    /// `run` copies the rows into it.
     /// Set before `init`.  Default: the whole model, no hand-off.
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;

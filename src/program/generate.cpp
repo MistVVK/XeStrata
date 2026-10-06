@@ -1269,8 +1269,7 @@ int main(int argc, char** argv) {
     std::vector<int> split_devs;
     bool split_auto = false, split_same = false;
     if (!o.layer_split.empty()) {
-        int n_dev = 1;
-        // one Xe device (docs/XE.md): a layer split has no second GPU to use
+        const int n_dev = strata::core::Runtime::count();
         auto ints = [](const std::string& str, auto& out) -> bool {
             using V = typename std::decay_t<decltype(out)>::value_type;
             size_t a = 0;
@@ -3647,7 +3646,8 @@ int main(int argc, char** argv) {
         vh.n_slots = xcache.slots();
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
-        // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
+        // last runs the head.  The hand-offs are host USM: one buffer between two stages on one GPU, and one on each
+        // side between stages on two (a context's host USM is not visible to another GPU; Verifier::run copies).
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
         SplitDrive split_drive;
@@ -3659,21 +3659,31 @@ int main(int argc, char** argv) {
         if (n_stages > 1) {
             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
-            for (float*& h : hand) {
+            auto dev_of = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
+            auto hand_alloc = [&](int dev) -> float* {
+                const strata::core::OnDevice on(dev);
                 float* hh = nullptr;
-                if (!strata::gpu::alloc_host((void**) &hh, hb) ||
-                    !strata::gpu::device_pointer((void**) &h, hh)) {
+                if (!strata::gpu::alloc_host((void**) &hh, hb)) return nullptr;
+                std::memset(hh, 0, hb);
+                return hh;
+            };
+            // hand_out[st]: what stage st writes; hand_in[st]: what stage st + 1 reads
+            std::vector<float*> hand_out((size_t) n_stages - 1, nullptr), hand_in((size_t) n_stages - 1, nullptr);
+            for (int st = 0; st + 1 < n_stages; ++st) {
+                hand_out[(size_t) st] = hand_alloc(dev_of(st));
+                hand_in[(size_t) st] =
+                    dev_of(st + 1) == dev_of(st) ? hand_out[(size_t) st] : hand_alloc(dev_of(st + 1));
+                if (!hand_out[(size_t) st] || !hand_in[(size_t) st]) {
                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
                     return 1;
                 }
-                std::memset(hh, 0, hb);
             }
             split_drive.base = &drive;
             split_drive.n = n_stages;
             for (int st = 0; st < n_stages; ++st) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                                        st == 0 ? nullptr : hand_in[(size_t) st - 1],
+                                        st + 1 < n_stages ? hand_out[(size_t) st] : nullptr);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
