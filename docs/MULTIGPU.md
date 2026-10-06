@@ -7,6 +7,7 @@ The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
 GPUs of different makers can be combined (Intel and NVIDIA, in the contrib build).
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
+The prompt path borrows its buffers from each GPU's expert cache, as on one GPU (with one chunk size on every GPU).
 
 It is opt-in and changes nothing when the options are absent (a port of upstream's layer split).
 
@@ -83,21 +84,28 @@ Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of 
 
 | Model | B70 alone | B70 + 4070 (`--layer-split auto`) |
 | --- | --- | --- |
-| IQ3_S | 62.4 tok/s | 67.5 tok/s (K=37) |
-| UD-Q4_K_XL | 20.8 tok/s | 32.2-33.0 tok/s (K=36) |
-| IQ2_XS | 73.5 tok/s | 86.4 tok/s (K=43) |
+| IQ3_S | 62.4 tok/s | 68.7-69.6 tok/s (K=36) |
+| UD-Q4_K_XL | 20.8 tok/s | 38.3-39.0 tok/s (K=35) |
+| IQ2_XS | 73.5 tok/s | 84.7 tok/s (K=45) |
 
-Around auto's choice by hand: for IQ3_S and UD-Q4_K_XL auto's choice was the fastest; for IQ2_XS, K=38 was about 3% faster.
+For IQ2_XS, K=38 by hand was about 3% faster than auto's choice.
 
-Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split 34`, speed from the first batch token):
+A prompt of about 5,000 tokens (the second prompt of the process):
+
+| Model | B70 alone | B70 + 4070 |
+| --- | --- | --- |
+| IQ3_S | 4,884 ms | 5,110 ms (K=36) |
+| IQ2_XS | 4,439 ms | 4,208 ms (K=45), 3,661 ms (K=42) |
+
+Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, speed from the first batch token):
 
 | Configuration | Speed |
 | --- | --- |
-| B70 alone | 55.9 tok/s |
-| split, one group | 65.4 tok/s |
-| split, `--batch-groups 2` | 71.6-74.3 tok/s |
-| split, `--batch-groups 4` | 63.5 tok/s |
-| split, `--batch-groups 2 --batch-cpu-split 10,9` | 62.1 tok/s (69 tok/s without it, same conditions) |
+| B70 alone | 55.2 tok/s |
+| split, one group | 73.1 tok/s |
+| split, `--batch-groups 2` | 77.1-79.0 tok/s |
+| split, `--batch-groups 4` | 64.9 tok/s |
+| split, `--batch-groups 2 --batch-cpu-split 10,9` | 71.8 tok/s |
 
 ## Limits
 
