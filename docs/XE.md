@@ -149,6 +149,11 @@ Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's te
 The weights are read in their GGUF blocks and the activations rounded to int8, a scale for each 32 values.
 That reads and writes less than dequantizing to FP16 and multiplying, and the relative error against FP64 is about 0.4% (the activations' rounding).
 It covers the i-quants but IQ1_M, and Q2_0; a layer of another type keeps the FP16 path.
+
+On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), the prompt attention runs a kernel written on joint_matrix's portable API (`src/kernels/xe/qsa_prompt_attn.cpp`).
+It takes FP16, INT8 and K8V4 KV; Q4_0 keeps the FP32 kernel (the range of upstream's Volta kernel 06a90a2).
+INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they are, with the scales applied in FP32.
+With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.
 Intel GPUs do not report that shape and keep the XMX FP16 path.
 `STRATA_PREFILL_MMQ=0` takes the FP16 path.
 
@@ -638,7 +643,7 @@ The GPU's q8_1 activation contract and the CPU's ggml `vec_dot_type` stay explic
 | `rope_parity`, `router_top10_parity`, `bf16_gemv_parity`, `quantize_act_parity`, `qsa_parity`, `kv_q8_parity`, `kv_q4_parity`, `kv_stream_parity`, `gdn_parity`, `gr_parity`, `cvec_parity` | Ported, registered in CTest, pass on the B70 |
 | `shared_expert_parity` | Ported, registered in CTest, passes on the B70, including the SYCL-graph replay of the native scalar gate |
 | `sampler_parity` | Ported, registered in CTest, passes on the B70 |
-| `qsa_prompt_attn_parity` | The existing FP64 reference and FP32 baseline, ported to SYCL (built, not a CTest case: it is also a benchmark). The XMX kernel passes it at int8 and FP16 KV ([record](../bench/results/2026-10-02-prompt-attn-xmx/README.md)); without the matrix engines the caller keeps `qsa_decode_attn_batch` |
+| `qsa_prompt_attn_parity` | The existing FP64 reference and FP32 baseline, ported to SYCL (built, not a CTest case: it is also a benchmark). The XMX kernel passes it at int8 and FP16 KV ([record](../bench/results/2026-10-02-prompt-attn-xmx/README.md)), the tensor-core one at INT8, FP16 and K8V4 (Q4_0 skipped); without the matrix engines the caller keeps `qsa_decode_attn_batch` |
 | `native_moe`, `native_gdn`, `native_gdn_preprocess`, `native_ple_postops`, `native_qsa`, `native_qsa_score`, `native_qsa_indexer`, `native_flash_attn`, `qsa_select`, `fused_gdn` (no in-tree parity) | [Probes against ggml-cpu at the pinned commit](../bench/results/2026-09-30-xe-native/README.md) pass on the B70; not registered in CTest |
 | `native_expert_parity`, `dequant_bf16_test` | Ported, built with `STRATA_NATIVE_EXPERTS`, not registered (they need the model shards). Pass on the B70 with the shards of every model under [Models](#models-on-the-b70) |
 | `iq_parity` | Ported and built, not registered. `tools/iq_fixture.py` writes `logs/iq_fixture` from ranged reads of the pinned model revision. All 10 formats pass. Q6_K/Q8_0 are not in its list |

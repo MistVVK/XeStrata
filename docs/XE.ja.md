@@ -153,6 +153,11 @@ RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと�
 重みは GGUF のブロックのまま読み、活性は 32 値ごとに int8 に丸めます。
 FP16 に展開してから掛ける経路より読み書きが少なく、FP64 との相対誤差は約 0.4% です（活性を int8 に丸めた分）。
 対象は IQ1_M を除く i-quant と Q2_0 で、それ以外の型の層は FP16 の経路のままです。
+
+プロンプトの注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/qsa_prompt_attn.cpp`）。
+KV は FP16・INT8・K8V4 で、Q4_0 は FP32 のカーネルのままです（upstream の Volta のカーネル 06a90a2 と同じ範囲）。
+INT8 と Q4_0 の符号は FP16 で正確に表せるのでそのまま行列エンジンに渡し、尺度は FP32 で掛けます。
+RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP64 との誤差は FP32 のカーネルの 3 倍以内で、2,048 クエリ・32K セルの塊が INT8 で 1.6 倍、FP16 と K8V4 で 1.5 倍速くなりました。
 Intel の GPU はこの形を報告しないので、これまでどおり XMX の FP16 の経路を使います。
 `STRATA_PREFILL_MMQ=0` を付けると FP16 の経路に戻ります。
 
@@ -649,7 +654,7 @@ GPU の q8_1 の活性化の約束と、CPU の ggml の `vec_dot_type` は、�
 | `rope_parity`、`router_top10_parity`、`bf16_gemv_parity`、`quantize_act_parity`、`qsa_parity`、`kv_q8_parity`、`kv_q4_parity`、`kv_stream_parity`、`gdn_parity`、`gr_parity`、`cvec_parity` | 移植済み。CTest に登録。B70 で通る |
 | `shared_expert_parity` | 移植済み。CTest に登録。B70 で通る（ネイティブのスカラーのゲートの SYCL graph での再生を含む） |
 | `sampler_parity` | 移植済み。CTest に登録。B70 で通る |
-| `qsa_prompt_attn_parity` | 既存の FP64 の参照と FP32 の基準を SYCL に移植（ベンチマークも兼ねるので、ビルドするが CTest には登録しない）。XMX のカーネルは int8 と FP16 の KV で通る（[記録](../bench/results/2026-10-02-prompt-attn-xmx/README.md)）。XMX がなければ、呼び出し側は `qsa_decode_attn_batch` を使い続ける |
+| `qsa_prompt_attn_parity` | 既存の FP64 の参照と FP32 の基準を SYCL に移植（ベンチマークも兼ねるので、ビルドするが CTest には登録しない）。XMX のカーネルは int8 と FP16 の KV で通る（[記録](../bench/results/2026-10-02-prompt-attn-xmx/README.md)）。Tensor Core の版は INT8・FP16・K8V4 で通り、Q4_0 は飛ばす。行列エンジンがなければ、呼び出し側は `qsa_decode_attn_batch` を使い続ける |
 | `native_moe`、`native_gdn`、`native_gdn_preprocess`、`native_ple_postops`、`native_qsa`、`native_qsa_score`、`native_qsa_indexer`、`native_flash_attn`、`qsa_select`、`fused_gdn`（ツリーに parity なし） | [固定したコミットの ggml-cpu に対するプローブ](../bench/results/2026-09-30-xe-native/README.md)が B70 で通る。CTest には登録しない |
 | `native_expert_parity`、`dequant_bf16_test` | 移植済み。`STRATA_NATIVE_EXPERTS` でビルド。モデルのシャードが要るので登録しない。[B70 で確かめたモデル](#b70-で確かめたモデル)のすべてのシャードで通る |
 | `iq_parity` | 移植済みでビルドする。登録しない。`tools/iq_fixture.py` が、固定したモデルのリビジョンの範囲読みから `logs/iq_fixture` を書く。10 の形式すべてが通る。Q6_K と Q8_0 は一覧にない |

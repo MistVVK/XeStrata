@@ -1516,8 +1516,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (qsa_prompt_attn.hpp). K8V4 KV, or STRATA_PROMPT_ATTN_OLD=1: the
-                    // decode kernel, 32 queries at a time
+                    // accuracy but not bitwise (qsa_prompt_attn.hpp). The pools it has no kernel for on this device,
+                    // or STRATA_PROMPT_ATTN_OLD=1: the decode kernel, 32 queries at a time
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))

@@ -20,8 +20,9 @@
 //   * q and p are split into FP16 hi + lo parts (two MMAs each), so they keep ~22 bits: the result differs from
 //     the FP32 kernel by summation order and the exp2 rounding, not by an FP16 cast.
 // Not bitwise equal to `qsa_decode_attn_batch`; `qsa_prompt_attn_parity` bounds the difference and the prompt
-// quality gate (needles, teacher-forced top-1) checks it end to end. K8V4 (INT8 K, Q4_0 V) is not handled (returns
-// false: it ran slower than the FP32 kernel), nor a device without the matrix engines.
+// quality gate (needles, teacher-forced top-1) checks it end to end. K8V4 (INT8 K, Q4_0 V) is handled by the portable
+// kernel only (NVIDIA's tensor cores; on Intel's XMX it ran slower than the FP32 kernel), Q4_0 KV by Intel's kernel
+// only, and nothing on a device without the matrix engines.
 #pragma once
 
 #include "strata/kernels/qsa_decode_attn.hpp"
@@ -31,7 +32,8 @@
 namespace strata::kernels {
 
 /// Same arguments and output as `qsa_decode_attn_batch` minus the scratch. Returns false (nothing launched) when the
-/// pools are K8V4 or the geometry is not 24 heads / 2 KV heads / 256: the caller then uses the old kernel.
+/// device has no kernel for the pools (above) or the geometry is not 24 heads / 2 KV heads / 256: the caller then uses
+/// the old kernel.
 bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 

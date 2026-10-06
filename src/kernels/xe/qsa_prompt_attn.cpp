@@ -420,20 +420,29 @@ sycl::event launch(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_
 }
 
 // The portable form, for a GPU without Intel's XMX kernels whose joint_matrix runs FP16 16 x 16 x 16 on 32 lanes
-// (NVIDIA's tensor cores; xe::mma_shape_is), FP16 pools.  The scheme above with the accumulators' layout unknown:
-// 4 sub-groups of 32, sub-group g owns dim group g for all 16 rows (one 16-row tile).  The output is not kept in the
-// accumulators: each chunk's p.v starts from zero and goes through local memory into FP32 registers (a lane 32 of
-// the sub-group's 16 x 64), scaled there by the softmax's correction.  Accumulated over the whole selection in the
-// tensor cores, which align and cut the addends instead of rounding them, the output was off FP64 by 14 times the
-// FP32 kernel's error (qsa_prompt_attn_parity, RTX 4070); per chunk, 2.8 times (Intel's kernel: 2.9), at 2.9 times the FP32
-// kernel's speed.
+// (NVIDIA's tensor cores, from sm_70 on; xe::mma_shape_is).  The scheme above with the accumulators' layout unknown:
+// 4 sub-groups of 32, sub-group g owns dim group g (int8 scale group g) for all 16 rows (one 16-row tile).  The output
+// is not kept in the accumulators: each chunk's p.v starts from zero and goes through local memory into FP32 registers
+// (a lane 32 of the sub-group's 16 x 64), where it is scaled by the chunk's unit (its largest V scale / PSCALE) and
+// added to the output scaled by the softmax's correction.  Accumulated over the whole selection in the tensor cores,
+// which align and cut the addends instead of rounding them, the output was off FP64 by 14 times the FP32 kernel's
+// error (qsa_prompt_attn_parity, RTX 4070); per chunk, 2.8 times (Intel's kernel: 2.9), at 2.9 times the FP32
+// kernel's speed.  K is FP16 or INT8, V FP16, INT8 or Q4_0 (--kv k8v4, as upstream's Volta kernel 06a90a2 takes
+// it); Q4_0's codes enter exactly and its two scales of a 64-dim group are folded into two p' (dequantized to FP16
+// at the gather, V was off FP64 by 360 times as much: qsa_prompt_attn_parity, RTX 4070 on sm_70 code).
 namespace pm {
 constexpr int SG = 32, NSG = NG, WG = NSG * SG, T16 = 16, CH = 16;
 }
+template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
+    static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
+    using Pa = PromptAttn<kF16, kF16, pm::CH>;   // the helpers that do not depend on the pools
+    static constexpr int VPG = VF == kQ4 ? 2 : 1;      // V scale groups a sub-group's 64 dims
+    static constexpr int VS = NG * VPG;                // V scales a cell
     static constexpr int KV_HALVES = 2 * pm::CH * KR;   // FP16 K and V rows; q (hi + lo) shares them at the start
     static_assert(KV_HALVES >= 2 * R * QS, "q's staging must fit in the K/V rows");
     static_assert(R == pm::T16, "the 16 rows are one tile");
+    static_assert(pm::CH * (HD / QK4_0) == pm::WG, "Q4_0 V: one work-item a block");
     const float* qv;
     QsaAttnPools p;
     const int32_t* ids;
@@ -443,8 +452,9 @@ struct PromptAttnMma {
     float* attn;
     sycl::local_accessor<half, 1> kvq;      // kh [CH][KR], vh [CH][KR]; at the start qh [R][QS], ql [R][QS]
     sycl::local_accessor<long long, 1> rows;
+    sycl::local_accessor<float, 1> ks, vs;  // [CH][NG], [CH][VS]: INT8 K's scales, V's
     sycl::local_accessor<float, 1> part;    // [NG][R][CH]: q.k per 64-dim group; part[0] then holds p
-    sycl::local_accessor<half, 1> pp;       // [2 NG][R][CH]: p' hi (2g) / lo (2g + 1) per dim group
+    sycl::local_accessor<half, 1> pp;       // [2 VS][R][CH]: p' hi (2v) / lo (2v + 1) per V scale group
     sycl::local_accessor<float, 1> st;      // [NG][R][64]: a sub-group's chunk of p.v on its way to the registers
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
@@ -476,7 +486,7 @@ struct PromptAttnMma {
         for (int i = t; i < R * HD; i += pm::WG) {
             const int r = i / HD, d = i % HD;
             half hi, lo;
-            PromptAttn<kF16, kF16, CH>::split(r < G ? qp[r * HD + d] * qup : 0.0f, hi, lo);
+            Pa::split(r < G ? qp[r * HD + d] * qup : 0.0f, hi, lo);
             kvq[QH + (size_t) r * QS + d] = hi;
             kvq[QL + (size_t) r * QS + d] = lo;
         }
@@ -492,8 +502,6 @@ struct PromptAttnMma {
         constexpr int OPL = R * 64 / pm::SG;   // output values a lane: element lane + SG * i of the sub-group's 16 x 64
         float o[OPL];
         for (int i = 0; i < OPL; ++i) o[i] = 0.0f;
-        // FP16 pools: every V scale is 1, so the unit is 1 / PSCALE from the first chunk on
-        const float unit = 1.0f / PSCALE, vup = PSCALE;
 
         for (int c0 = 0; c0 < n; c0 += CH) {
             const int nh = sycl::min(CH, n - c0);
@@ -507,18 +515,44 @@ struct PromptAttnMma {
                 rows[t] = r;
             }
             sycl::group_barrier(grp);   // rows ready; the previous chunk (and q's staging) is done with kvq, part, pp
+            // K and V as FP16: int8 codes are exact in FP16
             for (int i = t; i < CH * (HD / 8); i += pm::WG) {
                 const int c = i / (HD / 8), pc = i % (HD / 8);
                 const long long r = rows[c];
                 sycl::vec<half, 8> kx(half(0.0f)), vx(half(0.0f));
                 if (r >= 0) {
                     const int64_t off = r * HD + (int64_t) pc * 8;
-                    kx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.k_pool + off);
-                    vx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.v_pool + off);
+                    if constexpr (KF == kI8)
+                        kx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + off)->template convert<half>();
+                    else
+                        kx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.k_pool + off);
+                    if constexpr (VF == kI8)
+                        vx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.v_q + off)->template convert<half>();
+                    else if constexpr (VF == kF16)
+                        vx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.v_pool + off);
                 }
                 *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[KH + (size_t) c * KR + (size_t) pc * 8]) = kx;
-                *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
+                if constexpr (VF != kQ4)
+                    *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
             }
+            // Q4_0 V: one work-item a block, its codes and its scale
+            if constexpr (VF == kQ4) {
+                const int c = t / (HD / QK4_0), b = t % (HD / QK4_0);
+                const long long r = rows[c];
+                half* vd = &kvq[VH + (size_t) c * KR + (size_t) b * QK4_0];
+                float a = 0.0f;
+                if (r >= 0) a = Pa::q4_block(p.v_q4 + r * Pa::Q4ROW, b, vd);
+                else for (int j = 0; j < QK4_0; ++j) vd[j] = half(0.0f);
+                vs[t] = a;
+            }
+            if constexpr (KF == kI8 || VF == kI8)
+                if (t < CH * NG) {
+                    const int c = t / NG, gg = t % NG;
+                    const long long r = rows[c];
+                    const int64_t si = r * (HD / KV_Q8_GROUP) + gg;
+                    if constexpr (KF == kI8) ks[t] = r >= 0 ? f32_from_f16(p.k_scale[si]) : 0.0f;
+                    if constexpr (VF == kI8) vs[t] = r >= 0 ? f32_from_f16(p.v_scale[si]) : 0.0f;
+                }
             sycl::group_barrier(grp);
 
             // q.k of the 16 rows and this sub-group's 64 dims, hi and lo
@@ -535,15 +569,21 @@ struct PromptAttnMma {
             }
             sycl::group_barrier(grp);
 
-            // online softmax as in PromptAttn: row t / 8, CH / 8 cells each, 8 neighbouring lanes a row
+            // online softmax as in PromptAttn: row t / 8, CH / 8 cells each, 8 neighbouring lanes a row; the groups'
+            // partials in order, each times its K scale
             {
                 constexpr int PER = CH / 8;
                 const int r = t / 8, sub = t % 8;
                 float x[PER], mxv = NEG_INF;
                 for (int j = 0; j < PER; ++j) {
                     const int c = sub * PER + j;
-                    const float sc = ((part[(0 * R + r) * CH + c] + part[(1 * R + r) * CH + c]) +
-                                      part[(2 * R + r) * CH + c]) + part[(3 * R + r) * CH + c];
+                    const auto pt = [&](int gg) { return part[((size_t) gg * R + r) * CH + c]; };
+                    float sc;
+                    if constexpr (KF == kI8)
+                        sc = ((pt(0) * ks[c * NG + 0] + pt(1) * ks[c * NG + 1]) + pt(2) * ks[c * NG + 2]) +
+                             pt(3) * ks[c * NG + 3];
+                    else
+                        sc = ((pt(0) + pt(1)) + pt(2)) + pt(3);
                     x[j] = c < nh && rows[c] >= 0 ? sc * qdown : NEG_INF;
                     mxv = sycl::fmax(mxv, x[j]);
                 }
@@ -566,19 +606,37 @@ struct PromptAttnMma {
             }
             sycl::group_barrier(grp);
 
-            // p.v of the 16 rows and this sub-group's 64 dims: p' = p * PSCALE, hi + lo
+            // p.v of the 16 rows and this sub-group's 64 dims: p' = p * vscale / unit, hi + lo, one p' per V scale
+            // group (two of 32 dims for Q4_0, whose scales are signed), with the chunk's unit its largest |V scale|
+            // of the 64 dims / PSCALE (FP16 V: 1 / PSCALE, a power of two)
             {
-                for (int e = lane; e < R * CH; e += pm::SG) {
-                    half hi, lo;
-                    PromptAttn<kF16, kF16, CH>::split(part[e] * vup, hi, lo);
-                    pp[(size_t) (2 * g) * R * CH + e] = hi;
-                    pp[(size_t) (2 * g + 1) * R * CH + e] = lo;
+                float unit = 1.0f / PSCALE, vup = PSCALE;
+                if constexpr (VF != kF16) {
+                    float vm = 0.0f;
+                    if (lane < CH)
+                        for (int vp = 0; vp < VPG; ++vp) vm = sycl::fmax(vm, sycl::fabs(vs[lane * VS + g * VPG + vp]));
+                    vm = sycl::reduce_over_group(sg, vm, sycl::maximum<float>());
+                    unit = vm * (1.0f / PSCALE);
+                    vup = vm > 0.0f ? PSCALE / vm : 0.0f;
+                }
+                for (int vp = 0; vp < VPG; ++vp) {
+                    const int vg = g * VPG + vp;
+                    for (int e = lane; e < R * CH; e += pm::SG) {
+                        const float w = VF == kF16 ? vup : vs[(e % CH) * VS + vg] * vup;
+                        half hi, lo;
+                        Pa::split(part[e] * w, hi, lo);
+                        pp[(size_t) (2 * vg) * R * CH + e] = hi;
+                        pp[(size_t) (2 * vg + 1) * R * CH + e] = lo;
+                    }
                 }
                 sycl::group_barrier(sg);
                 mx::joint_matrix<sycl::sub_group, half, mx::use::a, T16, T16, mx::layout::row_major> ph, pl;
-                mx::joint_matrix_load(sg, ph, at(pp, (size_t) (2 * g) * R * CH), CH);
-                mx::joint_matrix_load(sg, pl, at(pp, (size_t) (2 * g + 1) * R * CH), CH);
                 for (int nt = 0; nt < 4; ++nt) {
+                    if (nt % (4 / VPG) == 0) {   // the V scale group of these 16 dims
+                        const int vg = g * VPG + nt / (4 / VPG);
+                        mx::joint_matrix_load(sg, ph, at(pp, (size_t) (2 * vg) * R * CH), CH);
+                        mx::joint_matrix_load(sg, pl, at(pp, (size_t) (2 * vg + 1) * R * CH), CH);
+                    }
                     mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, T16, T16> acc;
                     mx::joint_matrix_fill(sg, acc, 0.0f);
                     mx::joint_matrix<sycl::sub_group, half, mx::use::b, T16, T16, mx::layout::row_major> b;
@@ -590,7 +648,7 @@ struct PromptAttnMma {
                 sycl::group_barrier(sg);
                 for (int i = 0; i < OPL; ++i) {
                     const int e = lane + pm::SG * i;
-                    o[i] = sycl::fma(o[i], alpha[e / 64], st[SG0 + e]);
+                    o[i] = sycl::fma(o[i], alpha[e / 64], st[SG0 + e] * unit);
                 }
             }
         }
@@ -598,7 +656,7 @@ struct PromptAttnMma {
             const int e = lane + pm::SG * i, r = e / 64, col = e % 64;
             if (r < G) {
                 const float l = lsum[r];
-                out[r * HD + g * 64 + col] = l > 0.0f ? o[i] * unit / l : 0.0f;
+                out[r * HD + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
             }
         }
 #endif
@@ -606,21 +664,27 @@ struct PromptAttnMma {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(pm::SG)>}; }
 };
 
+// the work-group's local memory, as launch_mma allocates it (the most, Q4_0 V's)
 constexpr size_t mma_local_bytes() {
-    return (size_t) PromptAttnMma::KV_HALVES * 2 + (size_t) pm::CH * 8 + (size_t) NG * R * pm::CH * 4 +
-           (size_t) 2 * NG * R * pm::CH * 2 + (size_t) NG * R * 64 * 4 + (size_t) 3 * R * 4;
+    constexpr size_t VS = PromptAttnMma<kI8, kQ4>::VS;
+    return (size_t) PromptAttnMma<kF16, kF16>::KV_HALVES * 2 + (size_t) pm::CH * 8 + (size_t) pm::CH * (NG + VS) * 4 +
+           (size_t) NG * R * pm::CH * 4 + (size_t) 2 * VS * R * pm::CH * 2 + (size_t) NG * R * 64 * 4 +
+           (size_t) 3 * R * 4;
 }
 
+template<int KF, int VF>
 sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_t* ids, const int32_t* steps,
                        int64_t cap, int64_t n_kv, int64_t page_size, float* attn, int64_t n_q) {
     const float scale_log2 = 1.4426950408889634f / std::sqrt((float) HD);
     return q.submit([&](sycl::handler& h) {
-        using K = PromptAttnMma;
+        using K = PromptAttnMma<KF, VF>;
         K k{qv, p, ids, steps, cap, n_kv, page_size, scale_log2, attn,
             sycl::local_accessor<half, 1>(sycl::range<1>(K::KV_HALVES), h),
             sycl::local_accessor<long long, 1>(sycl::range<1>(pm::CH), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * NG), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * K::VS), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::CH), h),
-            sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 2 * NG * R * pm::CH), h),
+            sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 2 * K::VS * R * pm::CH), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * 64), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
@@ -645,13 +709,26 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     if (!xmx_available(XmxType::f16)) {
-        // the portable kernel: FP16 pools (the others keep the FP32 kernel)
+        // the portable kernel: FP16, INT8 and K8V4 pools (Q4_0 K keeps the FP32 kernel)
         static core::PerDevice<bool> per_device;
         const bool mma = per_device.get(queue.get_device(), [&queue, slm] {
             return xe::mma_shape_is(queue, 16, 16, 16, 32) && slm >= mma_local_bytes();
         });
-        if (!mma || pools.k_q4 != nullptr || pools.k_q != nullptr || !pools.k_pool || !pools.v_pool) return false;
-        const sycl::event e = launch_mma(queue, q, pools, ids, steps, cap, s.n_head_kv, s.page_size, attn, n_q);
+        if (!mma || pools.k_q4 != nullptr) return false;
+        const int64_t nkv = s.n_head_kv, ps = s.page_size;
+        sycl::event e;
+        if (pools.k_q != nullptr) {
+            if (!pools.k_scale) return false;
+            if (pools.v_q4 != nullptr)
+                e = launch_mma<kI8, kQ4>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+            else if (pools.v_q && pools.v_scale)
+                e = launch_mma<kI8, kI8>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+            else
+                return false;
+        } else {
+            if (!pools.k_pool || !pools.v_pool) return false;
+            e = launch_mma<kF16, kF16>(queue, q, pools, ids, steps, cap, nkv, ps, attn, n_q);
+        }
         if (!stream) core::Runtime::get().wait(e, "qsa_prompt_attn_batch");
         return true;
     }

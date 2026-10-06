@@ -145,10 +145,16 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     };
     auto new_run = [&]() {
         if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
-            std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (or the device has no XMX)\n");
+            std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (or the device has no matrix engines)\n");
             std::exit(2);
         }
     };
+    // Q4_0 KV runs on Intel's kernel only (the portable one leaves it to the FP32 kernel; upstream 06a90a2)
+    if (fmt == 2 && !k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+        std::printf("SKIP q4_0 ctx %lld: the prompt attention leaves Q4_0 KV to the FP32 kernel on this device\n",
+                    (long long) ctx);
+        return 0;
+    }
     old_run();
     new_run();
     par::sync();
