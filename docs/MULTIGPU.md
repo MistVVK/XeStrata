@@ -2,7 +2,7 @@
 
 The model's layers can be spread over two or more GPUs in one PC.
 The first GPU runs the early layers, the next GPU the layers after them.
-Each GPU holds its own layers' dense weights, their sessions (the GDN recurrent state, the QSA K/V) and an expert cache of its own.
+Each GPU holds its own layers' dense weights (the PLE tensors on every GPU), their sessions (the GDN recurrent state, the QSA K/V) and an expert cache of its own.
 The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
 GPUs of different makers can be combined (Intel and NVIDIA, in the contrib build).
 
@@ -22,13 +22,11 @@ setup's `--gpus` is refused.
 | `--split-device D[,D2..]` | The GPU for each split point (from 1, see [GPU numbers](#gpu-numbers)). Without it, the GPUs that are not the processor's own graphics, in their order. |
 | `--batch-groups G` | With `--batch N`: the slots in G groups, each GPU on another group at once ([below](#decoding-several-conversations)). |
 | `--batch-cpu-split N0,N1` | Experimental, off by default ([below](#the-cpu-experts-per-stage-experimental)). |
-| `STRATA_STAGE_TRIM=1` (environment) | Each GPU loads the dense weights of its own layers only; the VRAM saved goes to the expert cache. |
 
 For example (part of the config):
 
 ```json
-"args": ["...", "--layer-split", "auto"],
-"env": {"STRATA_STAGE_TRIM": "1"}
+"args": ["...", "--layer-split", "auto"]
 ```
 
 It needs:
@@ -51,7 +49,7 @@ The start-up log names the GPUs by these numbers, as `CUDA0`, `CUDA1` (upstream'
 
 - how fast each GPU reads its VRAM, and how much VRAM is free;
 - how fast the CPU reads the RAM (which sets the speed of the experts the CPU computes);
-- what each GPU holds: weights (its own layers only with `STRATA_STAGE_TRIM=1`), sessions (its own layers), the output head (the last GPU), and the room the prompt path keeps.
+- what each GPU holds: weights and sessions (both of its own layers only), the output head (the last GPU), and the room the prompt path keeps.
 
 From these it works out how many experts each GPU holds and, filling the caches in the order of `--expert-profile`,
 predicts the time of one window for every placement; the shortest wins.
@@ -81,7 +79,7 @@ Where the RAM bandwidth is the limit it is slower (below); it is an experiment f
 
 ## Measurements
 
-Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, `STRATA_STAGE_TRIM=1`, 128 tokens of decode:
+Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of decode:
 
 | Model | B70 alone | B70 + 4070 (`--layer-split auto`) |
 | --- | --- | --- |
