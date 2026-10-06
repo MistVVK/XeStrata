@@ -3027,7 +3027,10 @@ int main(int argc, char** argv) {
             !(native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                           : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
-                         sized.empty() ? "no room" : err.c_str());
+                         sized.empty() ? ("no room (" + std::to_string(room >> 20) + " MiB left after the reserve; on a "
+                                          "GPU without memory of its own the RAM the expert arena holds is gone)")
+                                             .c_str()
+                                       : err.c_str());
             return 1;
         }
         int64_t filled = 0;
