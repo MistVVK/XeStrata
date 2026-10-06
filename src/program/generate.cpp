@@ -1683,6 +1683,267 @@ int main(int argc, char** argv) {
         }
         if (native_pack) skip.insert("token_embd.weight");
     }
+    // ---- --layer-split auto: the split points, chosen before anything is loaded - from what this PC measures and
+    // the sizes the files and the geometry give - so the placement then loads as an explicit one: each GPU's sessions
+    // carved to its layers (and with STRATA_STAGE_TRIM=1 its dense weights).
+    //   The window time of a placement: per layer, the dense weights read at the GPU's own bandwidth, then the
+    //   layer's routed experts - the cached share read by the GPU at its bandwidth while the CPU reads the rest at the
+    //   RAM's (the two overlap: the larger counts) - and a hand-off per stage boundary.
+    //   Which experts a cache holds: its layers' profiled pairs, hottest first, until the VRAM its GPU has left is
+    //   used: free now, less the reserve, the weights, the sessions (--batch slots too), the prompt path and, on the
+    //   last GPU, the head; a later GPU keeps 1 GiB more (its windows and the drafter; and what KV streaming's staging
+    //   would take, which is not counted here).  A window routes about k x rows experts a layer (rows:
+    //   STRATA_SPLIT_ROWS, default 3, the average verify window with MTP drafts).
+    if (multi_gpu && split_auto) {
+        // the geometry, as set up below (the canonical one, the model file's MoE shape)
+        strata::core::ModelGeometry ga;
+        int64_t Ka = 10;
+        if (!o.native_preset.empty()) {
+            try {
+                strata::GgufFile model_gguf(o.native_preset);
+                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_count")) ga.n_expert = (int64_t) v->u;
+                if (const strata::MetaValue* v = model_gguf.get("qwen4exp.expert_used_count")) Ka = (int64_t) v->u;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: layer split auto: %s (sizes from the default geometry)\n", e.what());
+            }
+        }
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const int ns = (int) split_devs.size() + 1;
+        const int64_t L = ga.n_layers;
+        std::vector<std::pair<int32_t, int32_t>> prof;
+        int64_t pslots = 0;
+        if (!strata::core::read_expert_profile(o.expert_profile, ga.n_layers, ga.n_expert, prof, pslots, err)) {
+            std::fprintf(stderr, "strata generate: --layer-split auto: %s\n", err.c_str());
+            return 1;
+        }
+        auto dev_of_stage = [&](int i) { return i == 0 ? 0 : split_devs[(size_t) i - 1]; };
+        // the weights a range holds: the canonical arena's and the native projections'
+        const bool trims = std::getenv("STRATA_STAGE_TRIM") && std::string(std::getenv("STRATA_STAGE_TRIM")) == "1";
+        uint64_t canon_all = 0;
+        if (!strata::core::WeightTable::pool_bytes(o.pack, canon_all, err, skip.empty() ? nullptr : &skip)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<uint64_t> canon_layer((size_t) L, 0);
+        if (trims) {   // each layer's share: the arena without that layer's blk.N.* tensors (PLE ones excepted)
+            std::vector<std::vector<std::string>> names((size_t) L);
+            if (std::FILE* f = std::fopen((o.pack + "/index.txt").c_str(), "rb")) {
+                char line[1024], name[256];
+                while (std::fgets(line, sizeof line, f)) {
+                    if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
+                    const std::string nm = name;
+                    if (nm.rfind("blk.", 0) != 0 || nm.find("ple") != std::string::npos) continue;
+                    const long l = std::strtol(name + 4, nullptr, 10);
+                    if (l >= 0 && l < L) names[(size_t) l].push_back(nm);
+                }
+                std::fclose(f);
+            }
+            for (int64_t l = 0; l < L; ++l) {
+                std::set<std::string> without = skip;
+                without.insert(names[(size_t) l].begin(), names[(size_t) l].end());
+                uint64_t b = 0;
+                if (strata::core::WeightTable::pool_bytes(o.pack, b, err, &without) && b <= canon_all)
+                    canon_layer[(size_t) l] = canon_all - b;
+            }
+        }
+        std::vector<uint64_t> nat_layer;
+        uint64_t nat_shared = 0, nat_all = 0;
+        if (!o.native_dense_gguf.empty() &&
+            !strata::core::NativeDense::layer_bytes(o.native_dense_gguf, o.native_ple_key, L, nat_layer, nat_shared, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        nat_layer.resize((size_t) L, 0);
+        nat_all = nat_shared;
+        for (const uint64_t b : nat_layer) nat_all += b;
+        uint64_t head_bytes = 0;   // the native head, on the last GPU
+        if (!o.native_head_gguf.empty()) {
+            try {
+                const strata::GgufModel hm = strata::GgufModel::open(o.native_head_gguf);
+                size_t at = 0;
+                if (const strata::TensorInfo* t = hm.find("output.weight", &at)) head_bytes = strata::tensor_payload_bytes(*t);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: layer split auto: %s (the head left out of the sizes)\n", e.what());
+            }
+        }
+        auto weights_of = [&](int64_t lo, int64_t hi) -> uint64_t {
+            if (!trims) return canon_all + nat_all;
+            uint64_t b = canon_all + nat_shared;
+            for (int64_t l = 0; l < L; ++l)
+                if (l < lo || l >= hi) b -= std::min(b, canon_layer[(size_t) l]);
+            for (int64_t l = lo; l < hi; ++l) b += nat_layer[(size_t) l];
+            return b;
+        };
+        // what each GPU has, and what its prompt path takes (the chunk's buffers and the streamed ring, on that GPU)
+        std::vector<int64_t> free0((size_t) ns), prompt((size_t) ns);
+        strata::core::QsaState q_ctx{};
+        q_ctx.max_cells = o.max_context;
+        strata::core::SessionState s_ctx;
+        s_ctx.qsa_states = &q_ctx;
+        s_ctx.k = Ka;
+        for (int i = 0; i < ns; ++i) {
+            const strata::core::OnDevice on(dev_of_stage(i));
+            size_t fb = 0, tb = 0;
+            strata::gpu::mem_info(&fb, &tb);
+            free0[(size_t) i] = (int64_t) fb;
+            prompt[(size_t) i] = o.prefill_chunk > 0
+                                     ? (int64_t) strata::prefill::Prefill::bytes_needed(ga, s_ctx, o.prefill_chunk) : 0;
+        }
+        auto cap_of = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
+            const int64_t reserve = ((int64_t) o.vram_reserve_mib + (i > 0 ? 1024 : 0)) << 20;
+            const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
+                                 (1 + std::max(o.batch, 0));
+            const int64_t c = free0[(size_t) i] - reserve - (int64_t) weights_of(lo, hi) - sess - prompt[(size_t) i] -
+                              (last ? (int64_t) head_bytes : 0);
+            return std::max<int64_t>(c, 0);
+        };
+        // each GPU reading its own memory (bytes per ms; random bytes: a memset's run of one value is compressed on
+        // some GPUs, and the B70 then read it at over 1.7 TB/s)
+        std::vector<double> bw((size_t) ns);
+        auto gpu_bandwidth = [&](int dev) -> double {
+            const strata::core::OnDevice on(dev);
+            const size_t n = (size_t) 512 << 20;
+            std::vector<uint64_t> host(n / 8);
+            uint64_t x = 0x9e3779b97f4a7c15ull;
+            for (uint64_t& v : host) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v = x; }
+            void* a = nullptr;
+            void* b = nullptr;
+            std::vector<double> got;
+            if (strata::gpu::alloc_device(&a, n) && strata::gpu::alloc_device(&b, n) &&
+                strata::gpu::copy(a, host.data(), n) && strata::gpu::copy(b, a, n)) {
+                for (int rep = 0; rep < 5; ++rep) {
+                    const Clock::time_point t0 = Clock::now();
+                    if (!strata::gpu::copy(b, a, n)) break;
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                    got.push_back(2.0 * (double) n / std::max(ms, 1e-3));   // read + write
+                }
+            }
+            if (a) strata::gpu::free(a);
+            if (b) strata::gpu::free(b);
+            if (got.empty()) return 100e6;   // (100 GB/s when the copy could not run)
+            std::sort(got.begin(), got.end());
+            return got[got.size() / 2];
+        };
+        // the RAM as the CPU expert pool reads it (one reader per hardware thread; STRATA_SPLIT_CPU_GBPS overrides)
+        const double cpu_bw = [&] {
+            if (const char* v = std::getenv("STRATA_SPLIT_CPU_GBPS")) return std::strtod(v, nullptr) * 1e6;
+            const int nt = std::max(1, (int) std::thread::hardware_concurrency());
+            const size_t per = (size_t) 32 << 20;
+            std::vector<std::vector<uint64_t>> bufs((size_t) nt, std::vector<uint64_t>(per / 8, 1));
+            double best = 0;
+            for (int rep = 0; rep < 3; ++rep) {
+                std::atomic<uint64_t> sink{0};
+                std::vector<std::thread> th;
+                th.reserve((size_t) nt);
+                const Clock::time_point t0 = Clock::now();
+                for (int t = 0; t < nt; ++t)
+                    th.emplace_back([&, t] {
+                        uint64_t acc = 0;
+                        for (const uint64_t v : bufs[(size_t) t]) acc += v;
+                        sink += acc;
+                    });
+                for (auto& t : th) t.join();
+                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                best = std::max(best, (double) nt * (double) per / std::max(ms, 1e-3));
+            }
+            return best;
+        }();
+        for (int i = 0; i < ns; ++i) {
+            bw[(size_t) i] = gpu_bandwidth(dev_of_stage(i));
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d reads %.0f GB/s, %.2f GiB free\n",
+                         dev_of_stage(i), bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
+        }
+        std::fprintf(stderr, "strata generate: layer split auto: the CPU experts read RAM at %.0f GB/s\n", cpu_bw / 1e6);
+        const double rows = std::getenv("STRATA_SPLIT_ROWS") ? std::strtod(std::getenv("STRATA_SPLIT_ROWS"), nullptr) : 3.0;
+        const double dense_layer = (double) (canon_all + nat_all) / (double) L;
+        // the routed mass of rank r: (r+1)^-a.  a = 0.8 fits this model's measured hit rates on the B70 (IQ3_S: 58% of
+        // the pairs cached, 91% hits; UD-Q4_K_XL: 34%, 78%); upstream's 1.2 (the Coder, 256 experts) put both near 98%.
+        // A profile that held each pair's count would replace the fit.  STRATA_SPLIT_MASS_EXP overrides a.
+        const double mass_exp = std::getenv("STRATA_SPLIT_MASS_EXP") ? std::strtod(std::getenv("STRATA_SPLIT_MASS_EXP"), nullptr) : 0.8;
+        std::vector<double> mass(prof.size());
+        for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
+        std::vector<double> layer_mass((size_t) L, 0.0), layer_held((size_t) L, 0.0);
+        for (size_t r = 0; r < prof.size(); ++r) layer_mass[(size_t) prof[r].first] += mass[r];
+        auto cost = [&](int64_t l) -> int64_t {
+            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
+        };
+        const double hop_ms = 0.1;   // a hand-off between two GPUs (5 tokens: ~60 us measured, B70 -> RTX 4070)
+        // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
+        std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
+            const int nst = (int) at.size() + 1;
+            for (int i = 0; i < nst; ++i) {
+                const int64_t lo = i == 0 ? 0 : at[(size_t) i - 1], hi = i + 1 < nst ? at[(size_t) i] : L;
+                cap[(size_t) i] = cap_of(i, nst == 1 ? 0 : lo, nst == 1 ? -1 : hi, i + 1 == nst);
+            }
+            std::fill(used.begin(), used.end(), 0);
+            std::fill(layer_held.begin(), layer_held.end(), 0.0);
+            held = 0;
+            std::vector<bool> full((size_t) ns, false);
+            for (size_t r = 0; r < prof.size(); ++r) {
+                const int64_t l = prof[r].first;
+                int st = 0;
+                while (st + 1 < nst && l >= at[(size_t) st]) ++st;
+                if (full[(size_t) st]) continue;
+                if (used[(size_t) st] + cost(l) > cap[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
+                used[(size_t) st] += cost(l);
+                layer_held[(size_t) l] += mass[r];
+                ++held;
+            }
+            double ms = hop_ms * (double) (nst - 1), all = 0, kept = 0;
+            for (int64_t l = 0; l < L; ++l) {
+                int st = 0;
+                while (st + 1 < nst && l >= at[(size_t) st]) ++st;
+                const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
+                const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
+                ms += dense_layer / bw[(size_t) st] +
+                      std::max(experts * hit / bw[(size_t) st], experts * (1.0 - hit) / cpu_bw);
+                all += layer_mass[(size_t) l];
+                kept += layer_held[(size_t) l];
+            }
+            held_mass = all > 0 ? kept / all : 1.0;
+            return ms;
+        };
+        {
+            double hm = 0;
+            int64_t held = 0;
+            const double one = predict({}, hm, held);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA0 alone would take %.1f ms per window (~%.1f%% "
+                                 "of the routed mass cached)\n", one, 100.0 * hm);
+        }
+        std::vector<int64_t> best, at((size_t) ns - 1);
+        double best_ms = 1e30, best_mass = 0;
+        int64_t best_held = 0;
+        auto consider = [&]() {
+            double hm = 0;
+            int64_t held = 0;
+            const double ms = predict(at, hm, held);
+            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
+        };
+        if (ns == 2) {
+            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
+        } else if (ns == 3) {
+            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
+        } else {
+            double total = 0;
+            for (const double c : bw) total += c;
+            double acc = 0;
+            for (int i = 0; i + 1 < ns; ++i) {
+                acc += bw[(size_t) i];
+                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
+                                                    i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
+            }
+            consider();
+        }
+        split_at = best;
+        split_auto = false;   // from here on, as an explicit --layer-split
+        std::string ks;
+        for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
+        std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
+                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
+                     (long long) best_held, prof.size(), 100.0 * best_mass);
+    }
     // Layer split with explicit split points (upstream e50f2663, 12c099b3, 13f70a34): with STRATA_STAGE_TRIM=1 every
     // GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).  Without it each card keeps a
     // full copy (~1.5 GB for IQ2_XS) that its stage never reads - VRAM the expert cache wants.  Opt-in until it is
@@ -2451,86 +2712,6 @@ int main(int argc, char** argv) {
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + (later ? 1024 : 0)) << 20) + pf;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
-    if (multi_gpu && split_auto) {
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        const int ns = (int) stages.size() + 1;
-        std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
-        std::vector<double> layer_ms((size_t) ns);
-        for (int i = 0; i < ns; ++i) {
-            const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? ss : stages[(size_t) i - 1]->ss);
-            int sms = 0, khz = 0;
-            if (!strata::gpu::device_speed(dev, &sms, &khz) || khz <= 0) khz = 1800000;
-            const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
-            layer_ms[(size_t) i] = 0.33 * (84.0 * 2.617) / speed;
-            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d %d SMs at %.2f GHz -> %.2f ms per layer, "
-                                 "%.2f GiB for experts\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
-                         (double) cap[(size_t) i] / 1073741824.0);
-        }
-        const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
-        std::vector<double> mass(profile.size());
-        double total_mass = 0;
-        for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
-        auto cost = [&](int64_t l) -> int64_t {
-            return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
-        };
-        // the predicted window time (ms) of a placement, and the routed mass its caches hold
-        auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
-            std::fill(used.begin(), used.end(), 0);
-            held_mass = 0;
-            held = 0;
-            std::vector<bool> full((size_t) ns, false);
-            for (size_t r = 0; r < profile.size(); ++r) {
-                const int64_t l = profile[r].first;
-                int st = 0;
-                while (st + 1 < ns && l >= at[(size_t) st]) ++st;
-                if (full[(size_t) st]) continue;
-                if (used[(size_t) st] + cost(l) > cap[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
-                used[(size_t) st] += cost(l);
-                held_mass += mass[r];
-                ++held;
-            }
-            held_mass /= std::max(total_mass, 1e-9);
-            double ms = miss_ms * (1.0 - held_mass);
-            for (int i = 0; i < ns; ++i) {
-                const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                ms += (double) (le - lb) * layer_ms[(size_t) i];
-            }
-            return ms;
-        };
-        std::vector<int64_t> best, at((size_t) ns - 1);
-        double best_ms = 1e30, best_mass = 0;
-        int64_t best_held = 0;
-        auto consider = [&]() {
-            double hm = 0;
-            int64_t held = 0;
-            const double ms = predict(at, hm, held);
-            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
-        };
-        const int64_t L = g.n_layers;
-        if (ns == 2) {
-            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
-        } else if (ns == 3) {
-            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
-                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
-        } else {
-            double total = 0;
-            for (const double c : layer_ms) total += 1.0 / c;
-            double acc = 0;
-            for (int i = 0; i + 1 < ns; ++i) {
-                acc += 1.0 / layer_ms[(size_t) i];
-                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
-                                                    i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
-            }
-            consider();
-        }
-        split_at = best;
-        std::string ks;
-        for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
-        std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
-                             "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
-                     (long long) best_held, profile.size(), 100.0 * best_mass);
-    }
     for (size_t i = 0; i < split_at.size(); ++i)
         if (split_at[i] >= g.n_layers) {
             std::fprintf(stderr, "strata generate: --layer-split: layer %lld is past the last (%lld)\n",
