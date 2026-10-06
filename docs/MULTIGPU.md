@@ -115,4 +115,3 @@ Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, 
 - One PC only: no GPUs over the network.
 - No conversation parking (`--conversation-cache-mib`).
 - No `--expert-cache-remote` (a helper GPU's expert cache).
-- Images, KV streaming (`--kv-resident`) and the speed projections have not been checked with a layer split.
