@@ -13,13 +13,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 XeStrata xe0.1.39 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
-CUDA のビルドは廃止してソースも消しました。
+同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib のビルド、[ビルド](#ビルド)）。
+upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
 
 開発と測定は Intel Arc Pro B70（Xe2、32 GB）で行っています。
-記録にある速さは、どれもこの GPU のものです。
+記録にある速さは、断りがなければこの GPU のものです。NVIDIA は RTX 4070 と RTX 3070 で確かめています。
 エンジンは経路を GPU が報告する能力で選びます（AGENTS.md の最初の規則）。
-行列エンジン（XMX）のない GPU は、DP4a の経路を使います。
+プリフィルの行列積は、Xe2 の XMX には専用のカーネル（xmx_gemm）を、Arc A シリーズの XMX と NVIDIA の Tensor Core には
+報告されたタイルの形で動く joint_matrix の積（mma_gemm）を使い、行列エンジンのない GPU は DP4a の経路を使います。
 
 小さい GPU は、B70 を小さく見せて確かめます。
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、

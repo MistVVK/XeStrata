@@ -209,10 +209,11 @@ GPU がモデルのどれだけを持てるかの setup の見積もりは upstr
 GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なもの) にあります。
 ここでは、それを補うことだけを書きます。
 
-- **パッケージ**: Intel の GPU のランタイム（Level Zero）と、SYCL のコンパイラが要ります。
+- **パッケージ**: Intel の GPU にはそのランタイム（Level Zero）、NVIDIA の GPU にはドライバーと CUDA ツールキット、
+  既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、先に入れておきます。
   Ubuntu 26.04 と Fedora 44 で要るものは [XE.ja.md](XE.ja.md#パッケージ) にあります。
-- **GPU のデバイス**: 自分のユーザーで `/dev/dri/renderD*` を開けることが要ります（`render` グループ）。
+- **GPU のデバイス**: Intel の GPU は、自分のユーザーで `/dev/dri/renderD*` を開けることが要ります（`render` グループ）。
 - **ディスク**: モデルに約 60〜110 GB、MTP 層に約 6 GB（画像を使うならさらに 1 GB）。
   **AVX-512 の CPU で元のモデルの Q2_0** を選ぶと、速い CPU のカーネル用に、エキスパートのコピー（約 40 GB）を一度書きます。
   NVMe の SSD を強く勧めます。
@@ -845,14 +846,14 @@ setup はエンコーダーをダウンロードし、小さな補助のプロ�
 
 | エンコーダーの場所 | 速さ | 画像 1 枚のトークン |
 | --- | --- | --- |
-| **GPU**（勧める） | CPU のエンコーダーより、Vulkan で 7〜9 倍、SYCL（nonfree）で 13〜20 倍速い | 最大 1,024 |
+| **GPU**（勧める） | CPU のエンコーダーより、Vulkan で 7〜9 倍、SYCL（contrib-icpx）で 13〜20 倍速い | 最大 1,024 |
 | CPU | 遅い | 約 300 に縮める |
 
 画像を有効にすると、setup はエンジンに `--vram-reserve-mib 700` を渡します。
 文章だけのときの既定と同じ値ですが、小さい GPU で予約を自動で下げることはしなくなります（[XE.ja.md](XE.ja.md#小さい-gpu-での-vram-の予約)）。
 GPU のエンコーダーが VRAM を使うぶん、エキスパートのキャッシュが小さくなり、文章の速さが下がることがあります（B70 では測っていません）。
 
-GPU のエンコーダーの 2 つのビルド（free の Vulkan と nonfree の SYCL）、精度の違い、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
+GPU のエンコーダーの 2 つのビルド（Vulkan と contrib-icpx の SYCL）、精度の違い、GPU で動かないときに CPU へ切り替わる順は [XE.ja.md](XE.ja.md#画像) にあります。
 画像 1 枚は、文脈の最大 1,024 トークンになります（640x480 の写真なら 300）。
 チャットのアプリが毎回送り直す同じ画像は、一度だけエンコードします。
 
@@ -946,7 +947,10 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 
 | 症状 | すること |
 | --- | --- |
-| `no Intel GPU on the xe or i915 driver found` | Intel の GPU が xe か i915 のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
+| `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
+| `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
+| `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[XE.ja.md](XE.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[XE.ja.md](XE.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、プロンプトの読み込みに約 1.6 倍の時間がかかります（[XE.ja.md](XE.ja.md#sycl-のコンパイラ)）。 |
@@ -986,7 +990,8 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
   ただし、測った当たり方と費用から、得になるところでだけ使います。
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **プロンプト**は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
-  GPU に XMX があれば、行列積は XMX で計算します。
+  行列積は、Intel の GPU では XMX、NVIDIA の GPU では Tensor Core で計算し、
+  contrib と contrib-icpx のビルドでは密な行列積を oneMath 経由で oneMKL か cuBLAS に任せます。
 
 Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**（英語、CUDA での測定）にあります。
 

@@ -13,12 +13,14 @@ The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its transla
 XeStrata xe0.1.39 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated.
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
-The CUDA build is retired and its sources are removed.
+The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib build, [Build and run](#build-and-run)).
+Upstream's CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
 
-It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's.
+It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's unless they say otherwise.
+On NVIDIA it is checked on an RTX 4070 and an RTX 3070.
 The engine chooses its paths from what the GPU reports (AGENTS.md, the first rule).
-A GPU without the matrix engines (XMX) takes the DP4a paths.
+The prompt path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), and the DP4a paths on a GPU without matrix engines.
 
 A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and

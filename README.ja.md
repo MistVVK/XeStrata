@@ -7,12 +7,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](README.md) | 日本語
 
-1,250 億パラメーターの AI モデルを、Intel Arc の GPU 1 枚と普通の PC で動かします。
+1,250 億パラメーターの AI モデルを、Intel Arc か NVIDIA の GPU 1 枚と普通の PC で動かします。
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル
 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を、自分の PC で動かすためのソフトウェアです。
-GPU は Intel Arc を 1 枚、OS は Linux を使い、インストールはコマンド 1 つです。
-自由ソフトウェアで、自由ソフトウェアだけでビルドして動かせます。
+GPU は Intel Arc か NVIDIA を 1 枚、OS は Linux を使い、インストールはコマンド 1 つです。
+自由ソフトウェアで、Intel の GPU なら自由ソフトウェアだけでもビルドして動かせます。
 
 > **目次:** [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
@@ -22,34 +22,38 @@ GPU は Intel Arc を 1 枚、OS は Linux を使い、インストールはコ�
 
 [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）を、Intel の GPU に移したものです。
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU で動くようにしました。
+同じコードを、NVIDIA の GPU 向けにもコンパイルします（contrib のビルド）。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
 Strata との主な違い:
 
-- **Intel Arc 向け**です。NVIDIA と AMD の GPU には対応しません。
+- **Intel Arc 向け**で、NVIDIA の GPU でも動きます。AMD の GPU には対応しません。
 - **GPU は 1 枚だけ**使います。複数の GPU でモデルを分け合う機能はありません。
 - **Linux だけ**です。Windows と WSL には対応しません。
-- **自由ソフトウェアだけでビルドできます**（Debian main に入れられる構成）。Intel oneAPI のような自由でない道具は、
-  選んだときだけ使います（[開発する人へ](#開発する人へ)）。
+- **自由ソフトウェアだけでもビルドできます**（`--license free`、Debian main に入れられる程度に自由な構成）。
+  既定の contrib のビルドは、自由ソフトウェアでない Intel の oneMKL と、NVIDIA の GPU には CUDA ツールキットを使います
+  （[開発する人へ](#開発する人へ)）。
 
 ## 必要なもの
 
 | | |
 | --- | --- |
-| GPU | Intel Arc（A シリーズ、B シリーズ）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
+| GPU | Intel Arc（A シリーズ、B シリーズ）か、Tensor Core のある NVIDIA の GPU（Volta 以降）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（WSL は不可）。Ubuntu 26.04 で確かめ、Fedora 44 でもコンテナで setup と起動を確かめています。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
-- **行列エンジン（XMX）**: XMX のある GPU ではそれを使い、ない GPU では DP4a の命令で計算します。
-  どちらを使うかは、GPU が報告する能力で決めます。XMX がないとプロンプトの読み込みが遅くなりますが、動きます。
-- **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。ほかの Arc は確かめていません。
+- **行列エンジン**: Intel の XMX と NVIDIA の Tensor Core を使い、ない GPU では DP4a の命令で計算します。
+  どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないとプロンプトの読み込みが遅くなりますが、動きます。
+- **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070 で確かめています。
+  Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。ほかの GPU は確かめていません。
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
 - **CPU 内蔵のグラフィックス**: 起動とプロンプトの読み込みまでを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
-- **パッケージ**: Intel の GPU のランタイム（Level Zero）と、SYCL のコンパイラが要ります。
+- **パッケージ**: Intel の GPU にはそのランタイム（Level Zero）と oneMKL、NVIDIA の GPU にはドライバーと CUDA ツールキットが要ります。
+  SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、[docs/XE.ja.md](docs/XE.ja.md#パッケージ) の表にあるものを先に入れてください。
 
 ## モデルの選び方
@@ -154,7 +158,7 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
 **GPU が見つからない、使えないと言われた**
 次の 3 つを確かめてください。
 
-- Intel の GPU のランタイムが入っているか確かめてください（[docs/XE.ja.md](docs/XE.ja.md#パッケージ)）。
+- Intel の GPU のランタイム、NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください（[docs/XE.ja.md](docs/XE.ja.md#パッケージ)）。
 - 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`）を開けるか確かめてください（`render` グループ）。
 - 単体の GPU が OS から見えないときは、BIOS の Above 4G Decoding と Re-Size BAR を確かめてください。
 
@@ -197,9 +201,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 - **SSD** には大きな表を置き、1 語ごとにその数行だけを読みます。
 - **推測してから確かめる**: モデルに組み込まれた小さな助手が次の数語を推測し、大きなモデルがそれをまとめて確かめます。
   合っているものは残し、次の 1 語は自分で書きます。決めるのはいつも大きなモデルなので、答えの品質は変わりません。
-- **長い文章は大きな塊で読みます**（一度に最大 8,192 トークン）。
+- **長い文章は大きな塊で読みます**（一度に最大 32,768 トークン）。
 
-Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU は DP4a の命令で計算します。
+行列積は、Intel の GPU では XMX、NVIDIA の GPU では Tensor Core で計算し、行列エンジンのない GPU では DP4a の命令を使います。
 各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ)、Intel の GPU での実装と確かめたことは
 [docs/XE.ja.md](docs/XE.ja.md) にあります。
 
