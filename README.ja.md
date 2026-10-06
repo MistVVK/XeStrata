@@ -244,16 +244,19 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 
 ## ライセンス
 
-XeStrata は自由ソフトウェアで、[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)
-（`COPYING.LESSER` と `COPYING`）で配布します。
+XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
+[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。
 
 - **メーカーの計算ライブラリとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
   （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）とリンクしたものも配布できます。
   GPL 第 3 版の第 7 条による追加の許可で、文面は [NOTICE](NOTICE) にあります。
-- **Strata 由来の部分**: Strata の MIT License が引き続き適用されます（著作権と MIT の告知は [NOTICE](NOTICE) にあります）。
-- **ほかのプロジェクトの素材**: `third_party/` に、プロジェクトごとのフォルダーとライセンスの文書と一緒に置いています。
-   - `third_party/main/`: 自由ソフトウェア。ggml の `ggml-common.h`（MIT）、画面のフォント Outfit
-     （SIL Open Font License 1.1）、oneMath（Apache-2.0、XeStrata の変更つき）、intel/llvm への XeStrata の修正のパッチ（Apache-2.0 WITH LLVM-exception）です。ggml から書き写したカーネルは `src/` にあり、ggml の表示を残したうえで LGPL です。
+- **Strata と ggml から来たコード**: MIT ライセンスの Strata と ggml / llama.cpp から来たコード（`src/` に書き写したカーネルを含む）も、
+  XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
+- **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
+   - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
+   - oneMath と XeStrata の変更（`third_party/main/oneMath/`）: Apache-2.0（中の googletest は BSD-3-Clause）。
+   - ggml の `ggml-common.h`（`third_party/main/ggml/`、変えていない写し）: MIT。
+   - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。

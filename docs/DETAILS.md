@@ -988,8 +988,9 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 ## Credits and licenses
 
-XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
-The parts from Strata are also under Strata's MIT License; the copyright and MIT notices are in [NOTICE](../NOTICE).
+The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
+The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
+The exceptions stay under their own licenses: the patches to intel/llvm, oneMath with its changes, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.

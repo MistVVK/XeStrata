@@ -994,8 +994,9 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 ## クレジットとライセンス
 
-XeStrata は [LGPL-3.0-or-later](../COPYING.LESSER) です。
-Strata 由来の部分には Strata の MIT License も適用され、著作権と MIT の告知は [NOTICE](../NOTICE) にあります。
+XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
+Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
+例外は、元のライセンスのままの intel/llvm へのパッチ、oneMath とその変更、`ggml-common.h`、Outfit、`third_party/nonfree/` です（下）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。

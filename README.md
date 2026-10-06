@@ -253,18 +253,21 @@ what has been checked in [docs/XE.md](docs/XE.md).
 
 ## License
 
-XeStrata is free software under the [GNU Lesser General Public License, version 3 or later](COPYING.LESSER)
-(`COPYING.LESSER`, with `COPYING`).
+XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the whole of it is under the
+[GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`).
 
 - **Linking with the vendors' math libraries:** what is linked with a math or compute library a GPU or CPU maker
   publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime libraries of Intel's
   oneAPI compilers, cuBLAS and the CUDA runtime and driver, for example), may be distributed as well: an additional
   permission under section 7 of the GPL, version 3, worded in [NOTICE](NOTICE).
-- **The parts that come from Strata:** Strata's MIT License stays with them (copyright and MIT notices are in [NOTICE](NOTICE)).
-- **Material from other projects:** in `third_party/`, one folder per project with its license.
-   - `third_party/main/`: free software. ggml's `ggml-common.h` (MIT), the app's font Outfit (SIL Open Font
-     License 1.1), oneMath (Apache-2.0, with XeStrata's changes), and XeStrata's patches to intel/llvm (Apache-2.0 WITH
-     LLVM-exception). The kernels transcribed from ggml are in `src/`, under the LGPL with ggml's notice kept.
+- **Code from Strata and ggml:** the code that comes from Strata and from ggml / llama.cpp, both MIT (the kernels
+  transcribed into `src/` included), is part of XeStrata under the LGPL; as MIT asks, their copyright and permission
+  notices are kept in [NOTICE](NOTICE).
+- **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
+   - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
+   - oneMath with XeStrata's changes (`third_party/main/oneMath/`): Apache-2.0 (its googletest: BSD-3-Clause).
+   - ggml's `ggml-common.h` (`third_party/main/ggml/`, an unmodified copy): MIT.
+   - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs.
