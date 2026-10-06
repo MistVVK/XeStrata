@@ -2043,7 +2043,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
+    strata::core::Verifier::set_commit_async(true);   // see Verifier::set_commit_async
     // ---- layer split across GPUs: each later stage's own copy of the dense weights, its session and (the last) the
     // head, made on its device before the host arena is mapped
     std::vector<std::unique_ptr<GpuStage>> stages;

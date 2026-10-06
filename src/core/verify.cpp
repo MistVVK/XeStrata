@@ -1696,8 +1696,10 @@ bool Verifier::commit(int n_keep, std::string& err) {
     if (!le) { err = std::string("verify: commit launch: ") + strata::gpu::last_error(); return false; }
     // set_commit_async: no wait here - the next window runs on the same queue after it, and the drafter (its own
     // queue) reads only this window's final rows and its own K/V.  h_commit_ is next written after the next window's
-    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-    if (!g_commit_async || next_ != nullptr) {
+    // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit, which
+    // goes on into a layer split's later stages).  Each stage's commit graph writes its own layers' state on its own
+    // queue, so a layer split's stages commit without a wait as well (upstream kept the wait there).
+    if (!g_commit_async) {
         if (!strata::gpu::stream_sync(cs_)) { err = std::string("verify: commit: ") + strata::gpu::last_error(); return false; }
     } else {
         if (!strata::gpu::event_record(commit_done_, cs_)) {
