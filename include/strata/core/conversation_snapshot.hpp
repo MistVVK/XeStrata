@@ -77,4 +77,23 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);
 
+// A layer split (docs/MULTIGPU.md): each GPU's session (its carve) on its device, in layer order; the draft layer is
+// on the last one's.  The image is the one-GPU image's layout - the QSA layers' K/V in layer order, then the draft's -
+// with each later GPU's running state in `live.stage_parts` (and every checkpoint's).  Device calls run on the device
+// that holds the state; the caller does not synchronize.
+struct ConversationStage {
+    SessionState* session = nullptr;
+    int device = 0;
+};
+bool conversation_split_bytes(const ConversationView& view, const std::vector<ConversationStage>& stages,
+                              const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
+bool conversation_split_save(SavedConversation& image, const ConversationView& view,
+                             const std::vector<ConversationStage>& stages, const ModelGeometry& g,
+                             const QsaState& draft, std::string& error);
+bool conversation_split_validate(const SavedConversation& image, const std::vector<ConversationStage>& stages,
+                                 const ModelGeometry& g, const QsaState& draft, std::string& error);
+ConversationRestore conversation_split_restore(const SavedConversation& image,
+                                               const std::vector<ConversationStage>& stages, const ModelGeometry& g,
+                                               const QsaState& draft, std::string& error);
+
 } // namespace strata::core

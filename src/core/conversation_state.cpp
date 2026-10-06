@@ -4,12 +4,15 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <utility>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -82,26 +85,35 @@ bool checkpoint_targets(const SessionState& ss, const ModelGeometry& g, size_t t
     return true;
 }
 
+bool live_valid(const ConversationView& view, std::string& error) {
+    if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
+        std::any_of(view.ids.begin(), view.ids.end(), [](int32_t id) { return id < 0; }))
+        return fail(error, "invalid live token/image metadata");
+    return true;
+}
+
+// a checkpoint's tokens and pictures start the live ones
+bool checkpoint_prefix(const ConversationCheckpoint& c, const ConversationView& view, std::string& error) {
+    if (c.ids.empty() || c.ids.size() > view.ids.size() || !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
+        return fail(error, "checkpoint is not a live token prefix");
+    size_t image = 0;
+    for (const auto& key : view.images) {
+        if ((uint64_t) key.start >= c.ids.size()) break;
+        if (image >= c.imgs.size() || !(c.imgs[image] == key)) return fail(error, "checkpoint image identity differs");
+        ++image;
+    }
+    if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+    return true;
+}
+
 bool view_validate(const ConversationView& view, const SessionState& ss,
                    const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, view.ids.size(), z, error)) return false;
-    if (view.ids.empty() || !image_keys(view.images, view.ids.size()) ||
-        std::any_of(view.ids.begin(), view.ids.end(), [](int32_t id) { return id < 0; }))
-        return fail(error, "invalid live token/image metadata");
+    if (!live_valid(view, error)) return false;
     for (const auto& c : view.checkpoints) {
-        if (!c.stage_parts.empty() || c.ids.empty() || c.ids.size() > view.ids.size() ||
-            !std::equal(c.ids.begin(), c.ids.end(), view.ids.begin()))
-            return fail(error, "checkpoint is not a live token prefix");
-        if (!conversation_checkpoint_validate(c, ss, g, error)) return false;
-        size_t image = 0;
-        for (const auto& key : view.images) {
-            if ((uint64_t) key.start >= c.ids.size()) break;
-            if (image >= c.imgs.size() || !(c.imgs[image] == key))
-                return fail(error, "checkpoint image identity differs");
-            ++image;
-        }
-        if (image != c.imgs.size()) return fail(error, "checkpoint image prefix differs");
+        if (!c.stage_parts.empty()) return fail(error, "checkpoint is not a live token prefix");
+        if (!checkpoint_prefix(c, view, error) || !conversation_checkpoint_validate(c, ss, g, error)) return false;
     }
     return true;
 }
@@ -310,6 +322,166 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
             return ConversationRestore::transfer_failed;
     if (!conversation_kv_restore(image.kv.back(), draft, g, upto, false, error) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+// ---- a layer split: every GPU's session, each on its own device (conversation_snapshot.hpp)
+namespace {
+bool sync_on(int device, std::string& error) {
+    const OnDevice on(device);
+    return sync(error);
+}
+
+// the stages' QSA layers in layer order (the one-GPU image's), each with its stage
+std::vector<std::pair<const QsaState*, size_t>> split_layers(const std::vector<ConversationStage>& stages,
+                                                             const ModelGeometry& g) {
+    std::vector<std::pair<const QsaState*, size_t>> out;
+    for (size_t i = 0; i < stages.size(); ++i)
+        for (size_t j = 0; j < owned_qsa(*stages[i].session, g); ++j) out.emplace_back(&owned(*stages[i].session, j), i);
+    return out;
+}
+
+bool split_stages(const std::vector<ConversationStage>& stages, std::string& error) {
+    if (stages.size() < 2) return fail(error, "a layer split needs two or more stages");
+    for (const auto& st : stages)
+        if (st.session == nullptr) return fail(error, "a layer split stage has no session");
+    return true;
+}
+
+// the live state and every checkpoint of a split view: a part for each later stage, each valid for its session
+bool split_view_validate(const ConversationView& view, const ConversationCheckpoint* live,
+                         const std::vector<ConversationStage>& stages, const ModelGeometry& g, std::string& error) {
+    if (!split_stages(stages, error) || !live_valid(view, error)) return false;
+    ConversationStateSizes z;
+    for (const auto& st : stages)
+        if (!checkpoint_targets(*st.session, g, view.ids.size(), z, error)) return false;
+    auto parts_valid = [&](const ConversationCheckpoint& c) {
+        if (c.stage_parts.size() + 1 != stages.size()) return fail(error, "checkpoint parts differ from the split");
+        if (!conversation_checkpoint_validate(c, *stages[0].session, g, error)) return false;
+        for (size_t i = 0; i < c.stage_parts.size(); ++i)
+            if (c.stage_parts[i].ids.size() != c.ids.size() ||
+                !conversation_checkpoint_validate(c.stage_parts[i], *stages[i + 1].session, g, error))
+                return false;
+        return true;
+    };
+    for (const auto& c : view.checkpoints)
+        if (!checkpoint_prefix(c, view, error) || !parts_valid(c)) return false;
+    return live == nullptr || parts_valid(*live);
+}
+}  // namespace
+
+bool conversation_split_bytes(const ConversationView& view, const std::vector<ConversationStage>& stages,
+                              const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error) {
+    bytes = 0;
+    if (!split_view_validate(view, nullptr, stages, g, error)) return false;
+    size_t ids = 0, images = 0, checkpoints = 0, layers = 0;
+    const auto qsa = split_layers(stages, g);
+    if (!product(ids, {view.ids.size(), sizeof(int32_t)}) ||
+        !product(images, {view.images.size(), sizeof(ConversationImageKey)}) ||
+        !product(checkpoints, {view.checkpoints.size(), sizeof(ConversationCheckpoint)}) ||
+        !product(layers, {(uint64_t) qsa.size() + 1, sizeof(ConversationKv)}))
+        return fail(error, "snapshot metadata byte count overflow");
+    for (size_t n : {ids, images, checkpoints, layers})
+        if (!add(bytes, n)) return fail(error, "snapshot byte count overflow");
+    for (const auto& st : stages) {   // each stage's running state, and its tokens again (its part's)
+        ConversationStateSizes z;
+        if (!conversation_session_sizes(g, *st.session, z, error)) return false;
+        const uint64_t n = owned_qsa(*st.session, g);
+        size_t tails = 0, dead = 0, positions = 0;
+        if (!product(tails, {n, z.tail}) || !product(dead, {n, z.dead}) || !product(positions, {n, z.block_pos}))
+            return fail(error, "snapshot byte count overflow");
+        for (size_t k : {tails, dead, positions, z.gdn, st.session->ple_hist ? z.ple : 0, ids})
+            if (!add(bytes, k)) return fail(error, "snapshot byte count overflow");
+    }
+    for (const auto& c : view.checkpoints) {
+        if (!metadata_bytes(c, bytes)) return fail(error, "checkpoint byte count overflow");
+        for (const auto& part : c.stage_parts)
+            if (!metadata_bytes(part, bytes)) return fail(error, "checkpoint byte count overflow");
+    }
+    const int64_t upto = (int64_t) view.ids.size();
+    for (const auto& [st, stage] : qsa) {
+        const size_t n = conversation_kv_bytes(*st, g, upto, true);
+        if (!n || !add(bytes, n)) return fail(error, "invalid or overflowing K/V byte estimate");
+    }
+    const size_t n = conversation_kv_bytes(draft, g, upto, false);
+    if (!n || !add(bytes, n)) return fail(error, "invalid or overflowing K/V byte estimate");
+    return true;
+}
+
+bool conversation_split_save(SavedConversation& image, const ConversationView& view,
+                             const std::vector<ConversationStage>& stages, const ModelGeometry& g,
+                             const QsaState& draft, std::string& error) {
+    size_t estimate = 0;
+    if (!conversation_split_bytes(view, stages, g, draft, estimate, error)) return false;
+    for (const auto& st : stages)
+        if (!sync_on(st.device, error)) return false;
+    // Build into a new object so a failure cannot publish a partial snapshot.
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.live.ids = view.ids;
+    captured.live.imgs = view.images;
+    captured.cvec = view.cvec;
+    captured.checkpoints = view.checkpoints;
+    for (size_t i = 0; i < stages.size(); ++i) {
+        const OnDevice on(stages[i].device);
+        ConversationCheckpoint part;
+        part.ids = view.ids;
+        part.imgs = view.images;
+        ConversationCheckpoint& target = i == 0 ? captured.live : part;
+        if (!conversation_checkpoint_save(target, *stages[i].session, g, error)) return false;
+        if (i > 0) captured.live.stage_parts.push_back(std::move(part));
+    }
+    const int64_t upto = (int64_t) view.ids.size();
+    const auto qsa = split_layers(stages, g);
+    captured.kv.resize(qsa.size() + 1);
+    for (size_t j = 0; j < qsa.size(); ++j) {
+        const OnDevice on(stages[qsa[j].second].device);
+        if (!conversation_kv_save(captured.kv[j], *qsa[j].first, g, upto, true, error)) return false;
+    }
+    {
+        const OnDevice on(stages.back().device);
+        if (!conversation_kv_save(captured.kv.back(), draft, g, upto, false, error)) return false;
+    }
+    image = std::move(captured);
+    return true;
+}
+
+bool conversation_split_validate(const SavedConversation& image, const std::vector<ConversationStage>& stages,
+                                 const ModelGeometry& g, const QsaState& draft, std::string& error) {
+    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
+    if (!split_view_validate(view, &image.live, stages, g, error)) return false;
+    const auto qsa = split_layers(stages, g);
+    if (image.kv.size() != qsa.size() + 1) return fail(error, "invalid K/V layer count");
+    const int64_t upto = (int64_t) image.live.ids.size();
+    for (size_t j = 0; j < qsa.size(); ++j)
+        if (!conversation_kv_validate(image.kv[j], *qsa[j].first, g, upto, true, error)) return false;
+    return conversation_kv_validate(image.kv.back(), draft, g, upto, false, error);
+}
+
+ConversationRestore conversation_split_restore(const SavedConversation& image,
+                                               const std::vector<ConversationStage>& stages, const ModelGeometry& g,
+                                               const QsaState& draft, std::string& error) {
+    if (!conversation_split_validate(image, stages, g, draft, error)) return ConversationRestore::invalid;
+    for (const auto& st : stages)
+        if (!sync_on(st.device, error)) return ConversationRestore::transfer_failed;
+    const int64_t upto = (int64_t) image.live.ids.size();
+    const auto qsa = split_layers(stages, g);
+    for (size_t j = 0; j < qsa.size(); ++j) {
+        const OnDevice on(stages[qsa[j].second].device);
+        if (!conversation_kv_restore(image.kv[j], *qsa[j].first, g, upto, true, error))
+            return ConversationRestore::transfer_failed;
+    }
+    {
+        const OnDevice on(stages.back().device);
+        if (!conversation_kv_restore(image.kv.back(), draft, g, upto, false, error))
+            return ConversationRestore::transfer_failed;
+    }
+    for (size_t i = 0; i < stages.size(); ++i) {   // conversation_checkpoint_restore synchronizes its device
+        const OnDevice on(stages[i].device);
+        if (!conversation_checkpoint_restore(i == 0 ? image.live : image.live.stage_parts[i - 1], *stages[i].session,
+                                             g, error))
+            return ConversationRestore::transfer_failed;
+    }
     return ConversationRestore::restored;
 }
 } // namespace strata::core
