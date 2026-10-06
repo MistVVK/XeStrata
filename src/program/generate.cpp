@@ -564,6 +564,9 @@ void usage() {
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --batch N, --slots N --serve: up to N conversations decoded together, one token each per batch\n"
                  "                       window (2..8; a count that cannot run is a warning and fewer slots or none)\n"
+                 "  --layer-split K[,K2..]|auto  --serve: the next GPU runs layers from K on (docs/MULTIGPU.md);\n"
+                 "                       auto chooses K from what this PC measures, before loading\n"
+                 "  --split-device D[,D2..]  the GPU for each split point (default: the other discrete GPUs)\n"
                  "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
                  "                       (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
                  "                       after GPU)\n"
@@ -1268,9 +1271,9 @@ int main(int argc, char** argv) {
         }
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
-    // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  Across
-    // GPUs, not yet: KV streaming, images, control vectors, the helper caches (--expert-cache-remote), and lending
-    // cache slots to the prompt path (each stage's prompt path has its own buffers).
+    // the next discrete ones); "auto" chooses the K before anything is loaded (below).  Across GPUs, not yet: the
+    // helper caches (--expert-cache-remote), conversation parking, and lending cache slots to the prompt path (each
+    // stage's prompt path has its own buffers); not checked: KV streaming, images, control vectors.
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
                      o.prompt_cache == 0 ? "--prompt-cache 0" : "--conversation-cache-slots 0");
