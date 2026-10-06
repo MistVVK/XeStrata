@@ -4407,8 +4407,10 @@ int main(int argc, char** argv) {
                         if (it != part_at.end()) parts = std::move(it->second);
                         part_at.erase(part_at.begin(), part_at.upper_bound(done));
                     }
+                    // a part a stage saved has its tokens (its running state can be empty: a stage of QSA layers only,
+                    // as the RTX 4070's layer 47 with K=47 - which dropped every mid-prompt checkpoint of a split)
                     bool complete = parts.size() == stages.size() + 1;
-                    for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
+                    for (const ConvCheckpoint& k : parts) complete = complete && !k.ids.empty();
                     saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
                 } else {
                     saved = checkpoint_at(done);
