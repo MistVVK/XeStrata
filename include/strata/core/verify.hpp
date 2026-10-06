@@ -151,9 +151,11 @@ public:
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
-    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.
+    /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
+    /// the first stage of a layer split, it reaches the last (which draws).
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
         if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (next_) next_->set_slot_sampling(slot, sp);
     }
 
     /// Row `t` of the last window's head logits (the distribution token t of the window came from: before sampling,

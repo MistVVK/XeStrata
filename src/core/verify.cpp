@@ -1580,6 +1580,13 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("verify batch: ") + strata::gpu::last_error(); return false; }
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
     ++windows;
+    if (le_ < g.n_layers) {   // a layer split's earlier stage: the rows go on to the next stage, as in run()
+        if (next_ == nullptr) return true;
+        if (next_->hand_in_ != hand_out_)
+            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
+                        (size_t) S * (size_t) handoff_floats(g) * sizeof(float));
+        return next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
+    }
     if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     progress_at("decode");
@@ -1604,7 +1611,7 @@ bool Verifier::commit_slots(std::string& err) {
             sx.ple_prev[1] = last_tokens_[t];
         }
     ms_commit += ms_since(t0);
-    return true;
+    return next_ == nullptr || next_->commit_slots(err);
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {

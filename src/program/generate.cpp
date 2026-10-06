@@ -716,6 +716,8 @@ struct GpuStage {
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int64_t held = 0;                                    ///< the first `held` pairs of `profile` fill its cache
+    std::vector<std::unique_ptr<strata::core::SessionState>> bslots;   ///< --batch: the slots' sessions on its GPU
+    std::vector<void*> bslot_buf;
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     strata::core::Verifier ver;
     strata::prefill::Prefill sp;
@@ -2142,7 +2144,6 @@ int main(int argc, char** argv) {
     if (o.batch != 0) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
-                        : multi_gpu || split_same ? "a layer split is not supported here"
                         : nullptr;
         if (o.batch > strata::kernels::kVerifyMaxT) {
             std::fprintf(stderr, "strata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
@@ -2167,6 +2168,38 @@ int main(int argc, char** argv) {
             bslot_ss.push_back(std::move(u));
             bslot_buf.push_back(buf);
         }
+        // a layer split: every later GPU keeps the slots' state of its own layers in sessions of its own (one GPU in
+        // two stages shares them: --split-device 0); as many slots as every GPU holds
+        for (auto& stp : stages) {
+            GpuStage& st = *stp;
+            const strata::core::OnDevice on(st.dev);
+            while (st.bslots.size() < bslot_ss.size()) {
+                auto u = std::make_unique<strata::core::SessionState>();
+                void* buf = nullptr;
+                if (!strata::gpu::alloc_device(&buf, bytes) ||
+                    strata::core::session_init(g, o.max_context, K, buf, *u) == 0) {
+                    if (buf) strata::gpu::free(buf);
+                    std::fprintf(stderr, "strata generate: --batch: CUDA%d holds %zu slot sessions\n", st.dev,
+                                 st.bslots.size());
+                    break;
+                }
+                strata::core::session_zero(*u, g, nullptr, st.stream);
+                st.bslots.push_back(std::move(u));
+                st.bslot_buf.push_back(buf);
+            }
+            while (bslot_ss.size() > st.bslots.size()) {
+                strata::gpu::free(bslot_buf.back());
+                bslot_buf.pop_back();
+                bslot_ss.pop_back();
+            }
+        }
+        for (auto& stp : stages)
+            while (stp->bslots.size() > bslot_ss.size()) {
+                const strata::core::OnDevice on(stp->dev);
+                strata::gpu::free(stp->bslot_buf.back());
+                stp->bslot_buf.pop_back();
+                stp->bslots.pop_back();
+            }
         if (o.batch > 0 && bslot_ss.size() < 2) {
             std::fprintf(stderr, "strata generate: --batch is off: not two slot sessions fit\n");
             for (void* b : bslot_buf) strata::gpu::free(b);
@@ -3797,7 +3830,17 @@ int main(int argc, char** argv) {
             std::vector<strata::core::SessionState*> ptrs;
             ptrs.reserve(bslot_ss.size());
             for (auto& u : bslot_ss) ptrs.push_back(u.get());
-            if (!ver.init_slots(ptrs, err)) {
+            bool slots_ok = ver.init_slots(ptrs, err);
+            // a layer split: every later stage's verifier takes its own GPU's sessions (--split-device 0: the same)
+            for (int st = 1; slots_ok && st < n_stages; ++st) {
+                std::vector<strata::core::SessionState*> sp_ptrs = ptrs;
+                if (!split_same) {
+                    sp_ptrs.clear();
+                    for (auto& u : stages[(size_t) st - 1]->bslots) sp_ptrs.push_back(u.get());
+                }
+                slots_ok = stage_ver(st).init_slots(sp_ptrs, err);
+            }
+            if (!slots_ok) {
                 std::fprintf(stderr, "strata serve: --batch is off: %s\n", err.c_str());
                 err.clear();
                 o.batch = 0;
@@ -4500,22 +4543,29 @@ int main(int argc, char** argv) {
             return true;
         };
         // the session a request just left behind (its prompt and first token) -> slot b's session
+        // (a layer split: each GPU's session -> its own slot session, on that GPU)
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
-            strata::core::SessionState& to = *bslot_ss[(size_t) b];
-            if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
-            strata::core::ConversationCheckpoint ck;
-            ck.ids = ids;
-            if (!strata::core::conversation_checkpoint_save(ck, ss, g, e) ||
-                !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                return false;
-            for (int64_t j = 0; j < ss.qsa_alloc; ++j) {
-                strata::core::ConversationKv img;
-                if (!strata::core::conversation_kv_save(img, ss.qsa_states[j], g, upto, true, e)) return false;
+            auto one = [&](int dev, strata::core::SessionState& from, strata::core::SessionState& to) -> bool {
+                const strata::core::OnDevice on(dev);
                 if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
-                if (!strata::core::conversation_kv_restore(img, to.qsa_states[j], g, upto, true, e)) return false;
-            }
-            if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+                strata::core::ConversationCheckpoint ck;
+                ck.ids = ids;
+                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
+                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
+                    return false;
+                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    strata::core::ConversationKv img;
+                    if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
+                    if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[j], g, upto, true, e)) return false;
+                }
+                if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
+                return true;
+            };
+            if (!one(0, ss, *bslot_ss[(size_t) b])) return false;
+            for (auto& stp : stages)
+                if (!one(stp->dev, stp->ss, *stp->bslots[(size_t) b])) return false;
             return true;
         };
         // slot b's session -> the main one (the reverse of copy_to_slot): a request that continues the conversation an
@@ -4885,7 +4935,8 @@ int main(int argc, char** argv) {
             int64_t slot_tokens = 0;
             bool resumed_from0 = false;   // a prompt read parked in a slot (BYIELD) that had started at token 0
             const ConvCheckpoint* slot_ck = nullptr;   // the slot's checkpoint the prompt continues from (else its end)
-            if (o.prompt_cache > 0 && req_imgs.empty())
+            // (not with a layer split: a slot's state is spread over the GPUs, and copy_from_slot reads one session)
+            if (o.prompt_cache > 0 && req_imgs.empty() && !multi_gpu && !split_same)
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if (sl.active || !sl.cached || sl.cvec != want_cvec) continue;
