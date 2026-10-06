@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
 #include <level_zero/ze_api.h>
@@ -13,6 +14,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -66,7 +69,9 @@ std::string pci_of(const sycl::device& d) {
     return s;
 }
 
-sycl::device select_device() {
+// The GPUs the engine can drive, device 0 first: the GPU chosen below, then the others in the same order of
+// preference.  Read once.
+std::vector<sycl::device> find_devices() {
     std::vector<sycl::device> candidates;
     std::string refused;
     for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu)) {
@@ -88,19 +93,30 @@ sycl::device select_device() {
         if (match.size() != 1)
             throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
                               refused);
-        return match.front();
     }
-    // Without a choice, a discrete card before the processor's own graphics, then the most memory, then the most
-    // compute units (whose size differs between GPU makers, so they only break a tie).  The engine drives one GPU.
-    return *std::max_element(candidates.begin(), candidates.end(), [](const sycl::device& x, const sycl::device& y) {
+    // A discrete card before the processor's own graphics, then the most memory, then the most compute units (whose
+    // size differs between GPU makers, so they only break a tie); the GPU STRATA_GPU_PCI names goes first.
+    const char* want = std::getenv("STRATA_GPU_PCI");
+    std::string w = want ? want : "";
+    for (auto& c : w) c = (char) std::tolower((unsigned char) c);
+    std::stable_sort(candidates.begin(), candidates.end(), [&w](const sycl::device& x, const sycl::device& y) {
+        if (!w.empty() && (pci_of(x) == w) != (pci_of(y) == w)) return pci_of(x) == w;
         const bool ix = integrated(x), iy = integrated(y);
-        if (ix != iy) return ix;
+        if (ix != iy) return iy;
         const auto mx = x.get_info<sycl::info::device::global_mem_size>();
         const auto my = y.get_info<sycl::info::device::global_mem_size>();
-        if (mx != my) return mx < my;
-        return x.get_info<sycl::info::device::max_compute_units>() < y.get_info<sycl::info::device::max_compute_units>();
+        if (mx != my) return mx > my;
+        return x.get_info<sycl::info::device::max_compute_units>() > y.get_info<sycl::info::device::max_compute_units>();
     });
+    return candidates;
 }
+
+const std::vector<sycl::device>& engine_devices() {
+    static const std::vector<sycl::device> devices = find_devices();
+    return devices;
+}
+
+thread_local int t_current = 0;
 
 // Instantiates ProbeKernel for the device compilers; never run.
 [[maybe_unused]] void probe_kernel_instance(sycl::queue& q) {
@@ -119,9 +135,54 @@ sycl::device select_device() {
 constexpr auto kHangLimit = std::chrono::seconds(120);
 }  // namespace
 
-Runtime& Runtime::get() {
-    static Runtime runtime;
-    return runtime;
+int current_device() { return t_current; }
+
+void set_current_device(int device) {
+    if (device < 0 || device >= Runtime::count())
+        throw DeviceError("no engine device " + std::to_string(device) + " (" + std::to_string(Runtime::count()) +
+                          " usable)");
+    t_current = device;
+}
+
+void restore_current_device(int device) noexcept { t_current = device; }
+
+namespace {
+std::mutex g_runtimes_mutex;
+std::vector<std::unique_ptr<Runtime>>& runtimes() {
+    static std::vector<std::unique_ptr<Runtime>> all;
+    return all;
+}
+}  // namespace
+
+int Runtime::count() { return (int) engine_devices().size(); }
+
+Runtime& Runtime::get() { return at(t_current); }
+
+Runtime& Runtime::at(int ordinal) {
+    if (ordinal < 0 || ordinal >= count())
+        throw DeviceError("no engine device " + std::to_string(ordinal) + " (" + std::to_string(count()) +
+                          " usable)");
+    std::lock_guard<std::mutex> lock(g_runtimes_mutex);
+    auto& all = runtimes();
+    if (all.size() < (size_t) count()) all.resize((size_t) count());
+    auto& r = all[(size_t) ordinal];
+    if (!r) r.reset(new Runtime(ordinal, engine_devices()[(size_t) ordinal]));
+    return *r;
+}
+
+Runtime* Runtime::owner(const void* pointer) {
+    if (!pointer) return nullptr;
+    std::lock_guard<std::mutex> lock(g_runtimes_mutex);
+    for (auto& r : runtimes())
+        if (r && sycl::get_pointer_type(pointer, r->context_) != sycl::usm::alloc::unknown) return r.get();
+    return nullptr;
+}
+
+Runtime* Runtime::owner_of_stream(const void* stream) {
+    std::lock_guard<std::mutex> lock(g_runtimes_mutex);
+    for (auto& r : runtimes())
+        if (r && r->owns(static_cast<const sycl::queue*>(stream))) return r.get();
+    return nullptr;
 }
 
 sycl::async_handler Runtime::handler() {
@@ -131,7 +192,7 @@ sycl::async_handler Runtime::handler() {
     };
 }
 
-Runtime::Runtime() : device_(select_device()), context_(device_),
+Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
     transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {}
 
@@ -160,7 +221,8 @@ bool Runtime::owns(const sycl::queue* queue) {
 sycl::queue& Runtime::stream(void* stream) {
     if (!stream) return compute_;
     auto* q = static_cast<sycl::queue*>(stream);
-    if (!owns(q)) throw DeviceError("the stream is not a queue of the Xe runtime");
+    // a queue of another device's runtime is that device's: a kernel goes where its stream is, as with CUDA streams
+    if (!owns(q) && owner_of_stream(q) == nullptr) throw DeviceError("the stream is not a queue of the Xe runtime");
     return *q;
 }
 
@@ -297,8 +359,9 @@ uint64_t max_alloc_bytes() {
 }
 
 DeviceInfo device_info(int ordinal) {
-    if (ordinal != 0) throw DeviceError("only device ordinal 0 is supported");
-    const auto& d = Runtime::get().device();
+    if (ordinal < 0 || ordinal >= Runtime::count())
+        throw DeviceError("no engine device " + std::to_string(ordinal));
+    const auto& d = engine_devices()[(size_t) ordinal];
     DeviceInfo out;
     out.ordinal = ordinal;
     out.name = d.get_info<sycl::info::device::name>();
@@ -330,9 +393,10 @@ DeviceInfo device_info(int ordinal) {
 }
 
 DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison) : capacity_(bytes), ordinal_(ordinal) {
-    if (ordinal != 0 || !bytes || bytes > std::numeric_limits<size_t>::max())
-        throw DeviceError("DeviceArena requires nonzero bytes and device ordinal 0");
-    auto& runtime = Runtime::get();
+    if (!bytes || bytes > std::numeric_limits<size_t>::max())
+        throw DeviceError("DeviceArena requires nonzero bytes");
+    auto& runtime = Runtime::at(ordinal);
+    runtime_ = &runtime;
     // 4 KB aligned by hand: the CUDA adapter refuses an alignment its driver does not promise (cuMemAlloc gives
     // 256 bytes; UNSUPPORTED_ALIGNMENT whenever the pointer comes back unaligned).  Level Zero returns pages, so
     // the offset is 0 there.
@@ -350,7 +414,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison) : capacity_(b
     } catch (...) { runtime.free(raw_); raw_ = base_ = nullptr; throw; }
 }
 
-DeviceArena::~DeviceArena() { Runtime::get().free(raw_); }
+DeviceArena::~DeviceArena() { runtime_->free(raw_); }
 
 void* DeviceArena::alloc(uint64_t bytes, uint64_t align) {
     if (!align || (align & (align - 1))) throw DeviceError("alignment must be a power of two");

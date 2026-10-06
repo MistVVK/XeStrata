@@ -14,18 +14,31 @@
 
 namespace strata::core {
 
-// A single context owns both queues and every USM allocation. Cross-queue
-// consumers must depend on the producer event; in-order applies within a queue.
+// One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
+// consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices
+// puts first; 1.. the other usable GPUs (device.cpp).  A runtime is created when its device is first used, so a run on
+// one GPU never opens the others.
 class Runtime {
 public:
+    /// The runtime of this thread's current device (on_device.hpp).
     static Runtime& get();
+    static Runtime& at(int ordinal);
+    /// The number of GPUs the engine can drive.
+    static int count();
+    /// The runtime whose context holds `pointer` (device or host USM), or null.
+    static Runtime* owner(const void* pointer);
+    /// The runtime one of whose queues `stream` is, or null.
+    static Runtime* owner_of_stream(const void* stream);
+    int ordinal() const { return ordinal_; }
+    ~Runtime();
     sycl::queue& compute() { return compute_; }
     sycl::queue& transfer() { return transfer_; }
     const sycl::device& device() const { return device_; }
     const sycl::context& context() const { return context_; }
 
     // Engine streams: further in-order queues on this context, for the work CUDA put on its own streams.  A void*
-    // stream handed to a kernel is one of these, compute() or null (compute()); anything else is refused.
+    // stream handed to a kernel is one of these, compute() or null (compute()), or a queue of another device's
+    // runtime (the kernel then runs there); anything else is refused.
     sycl::queue* create_stream();
     void destroy_stream(sycl::queue* stream);
     sycl::queue& stream(void* stream);
@@ -51,12 +64,12 @@ private:
         std::chrono::steady_clock::time_point since;
         const char* what;
     };
-    Runtime();
-    ~Runtime();
+    Runtime(int ordinal, const sycl::device& device);
     void check_async();
     sycl::async_handler handler();
     bool owns(const sycl::queue* queue);
     void watch();
+    int ordinal_;
     std::mutex error_mutex_;
     std::exception_ptr error_;
     sycl::device device_;

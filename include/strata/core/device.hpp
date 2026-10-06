@@ -32,7 +32,7 @@ struct DeviceInfo {
     bool fp64 = false, host_usm = false, device_usm = false;
 };
 
-// Ordinal 0 is the GPU the runtime selected (src/core/device.cpp, select_device).
+// Ordinal 0 is the GPU the runtime selected, 1.. the other usable GPUs (src/core/device.cpp, find_devices).
 DeviceInfo device_info(int ordinal = 0);
 
 /// A smaller device, for checking the engine's choices on the B70 (AGENTS.md, the first rule):
@@ -44,6 +44,8 @@ uint64_t max_alloc_limit_bytes();
 void apply_vram_limit(uint64_t& free, uint64_t& total);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
 uint64_t max_alloc_bytes();
+
+class Runtime;
 
 class DeviceError : public std::runtime_error {
 public:
@@ -72,6 +74,7 @@ private:
     void* base_ = nullptr;
     uint64_t capacity_ = 0, used_ = 0;
     int ordinal_ = 0;
+    Runtime* runtime_ = nullptr;   // the runtime of `ordinal_`, which frees `raw_`
 };
 
 }  // namespace strata::core

@@ -3,6 +3,7 @@
 // src/core/gpu.cpp - see include/strata/core/gpu.hpp.
 #include "strata/core/gpu.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
@@ -74,7 +75,19 @@ sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes
     for (size_t o = 0; o < bytes; o += kPiece) e = queue.memset((uint8_t*) dst + o, value, std::min(kPiece, bytes - o));
     return e;
 }
-sycl::queue& q(Stream s) { return rt().stream(s); }
+// A stream is a queue of the device it was created on, whichever device is current (null: the current device's
+// compute queue).
+sycl::queue& q(Stream s) {
+    if (!s) return rt().compute();
+    core::Runtime* owner = core::Runtime::owner_of_stream(s);
+    if (!owner) throw core::DeviceError("the stream is not a queue of the Xe runtime");
+    return owner->stream(s);
+}
+core::Runtime& rt_of(Stream s) {
+    if (!s) return rt();
+    core::Runtime* owner = core::Runtime::owner_of_stream(s);
+    return owner ? *owner : rt();
+}
 
 // the recordings in progress, by queue
 std::mutex g_capture_mutex;
@@ -90,12 +103,12 @@ Stream stream_create() {
 }
 
 void stream_destroy(Stream s) {
-    try { rt().destroy_stream(static_cast<sycl::queue*>(s)); }
+    try { rt_of(s).destroy_stream(static_cast<sycl::queue*>(s)); }
     catch (const std::exception& e) { fail("stream_destroy", e); }
 }
 
 bool stream_sync(Stream s) {
-    try { rt().finish(q(s)); return true; }
+    try { rt_of(s).finish(q(s)); return true; }
     catch (const std::exception& e) { return fail("stream_sync", e); }
 }
 
@@ -139,7 +152,9 @@ void free(const void* p) {
             g_live.erase(it);
         }
     }
-    rt().free(const_cast<void*>(p));
+    // freed by the device that allocated it, whichever is current
+    core::Runtime* owner = core::Runtime::owner(p);
+    (owner ? *owner : rt()).free(const_cast<void*>(p));
 }
 
 bool vmem_supported() {
@@ -183,7 +198,10 @@ void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
 
 bool is_host_usm(const void* p) {
     if (!p) return false;
-    try { return sycl::get_pointer_type(p, rt().context()) == sycl::usm::alloc::host; }
+    try {
+        const core::Runtime* owner = core::Runtime::owner(p);
+        return owner && sycl::get_pointer_type(p, owner->context()) == sycl::usm::alloc::host;
+    }
     catch (const std::exception& e) { return fail("is_host_usm", e); }
 }
 
@@ -250,9 +268,8 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
 }
 
 bool device_speed(int device, int* units, int* khz) {
-    if (device != 0) { g_error = "device_speed: the Xe runtime drives device 0 only"; return false; }
     try {
-        const auto& d = rt().device();
+        const auto& d = core::Runtime::at(device < 0 ? core::current_device() : device).device();
         *units = (int) d.get_info<sycl::info::device::max_compute_units>();
         *khz = (int) d.get_info<sycl::info::device::max_clock_frequency>() * 1000;
         return true;
