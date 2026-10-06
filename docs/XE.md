@@ -94,7 +94,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
-The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (`third_party/main/oneMath`, Apache-2.0):
+The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
 oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
 Which backends are built follows the GPUs of the machine it is built on (every maker it has).
 An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
@@ -116,7 +116,9 @@ A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
-`third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
+CMake fetches oneMath v0.9 from GitHub when it configures (checking the archive's SHA-256) and applies XeStrata's changes (cuBLAS's BF16 product, `third_party/main/oneMath/patches/`).
+On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
+The patches are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
 coder-iq1_m's prefill of 997 tokens went from 1421 to 1350 ms on the B70 and stayed the same on the RTX 4070 (3845 ms).
 
@@ -320,7 +322,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 
 | For | Free | contrib-icpx (`--license contrib-icpx`) |
 | --- | --- | --- |
-| Building the engine | `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
+| Building the engine | `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch` (to apply XeStrata's changes to oneMath) |
 | Building intel/llvm 7 or later (setup builds it here) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx is used) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
@@ -329,7 +331,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 | Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
 
 The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
-`intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
+`intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch`, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 
 #### Fedora 44
 

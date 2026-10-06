@@ -995,7 +995,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
 The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm, oneMath with its changes, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
+The exceptions stay under their own licenses: the patches to intel/llvm and oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
@@ -1010,7 +1010,8 @@ The model files are not part of it; their licenses apply to them (below).
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
 - **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the contrib and contrib-icpx modes' dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA).
-  v0.9 is in `third_party/main/oneMath/`, with XeStrata's changes (cuBLAS's BF16 product) marked in each file's header. See `third_party/main/oneMath/LICENSE`.
+  It is not in the repository: CMake fetches v0.9,
+  with XeStrata's changes (cuBLAS's BF16 product) from `third_party/main/oneMath/patches/`, under oneMath's license. See `third_party/main/oneMath/LICENSE`.
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
