@@ -2719,6 +2719,11 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int64_t room = stage_room(st.dev, true, st.ss);
         const strata::core::OnDevice on(st.dev);
+        // the expert arena is registered for device copies with CUDA0's context only: this GPU's fills and adaptive
+        // swaps copied from it as pageable memory (B70 + 4070, iq3_s: the swaps took 4.5 ms a window against 0.1)
+        if (st.dev != 0 && !srcp->register_on(st.dev, err))
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s; its copies from the arena are slower\n",
+                         st.dev, err.c_str());
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {

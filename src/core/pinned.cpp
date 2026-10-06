@@ -41,7 +41,8 @@ constexpr uint64_t kHugePage = 2ull << 20;
 // UHD 770 (4 GiB) registered without an error and copied wrong bytes, the B70 (31 GB) did not.  `cuts` are the
 // offsets a piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
 namespace {
-void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg) {
+void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg,
+                     std::vector<std::pair<void*, size_t>>& pieces) {
     const uint64_t limit = max_alloc_bytes();
     // pieces end at the last cut that keeps them within the limit (or at the limit when no cut does)
     std::vector<uint64_t> ends, c;
@@ -62,6 +63,7 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
         sycl::ext::oneapi::experimental::prepare_for_device_copy(base + start, (size_t) (end - start),
                                                                  Runtime::get().context());
         reg.push_back(base + start);
+        pieces.emplace_back(base + start, (size_t) (end - start));
         start = end;
     }
 }
@@ -84,10 +86,11 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
     const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
     try {
-        register_pieces((uint8_t*) base, bytes, cuts, reg_);
+        register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_);
     } catch (const std::exception& e) {
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
         reg_.clear();
+        pieces_.clear();
         munmap(map_, map_bytes_);
         map_ = base = nullptr;
         throw DeviceError(std::string("registering the expert arena for device copies failed: ") + e.what());
@@ -111,6 +114,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
         PinnedArena one(bytes, 0, std::vector<uint64_t>(bounds.begin() + 1, bounds.end()));
         std::swap(base, one.base); std::swap(map_, one.map_); std::swap(map_bytes_, one.map_bytes_);
         std::swap(reg_, one.reg_);
+        std::swap(pieces_, one.pieces_);
         backing = one.backing; note = one.note; registered_bytes = one.registered_bytes;
         registered_slices = one.registered_slices; slice_starts = one.slice_starts;
         return;
@@ -127,6 +131,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                               std::to_string(n) + " B)");
         }
         layer_base.push_back((uint8_t*) p);
+        pieces_.emplace_back(p, (size_t) n);
         slice_starts.push_back(bounds[l]);
     }
     base = layer_base[0];
@@ -200,7 +205,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
         const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
-        register_pieces((uint8_t*) base, bytes, bounds, reg_);
+        register_pieces((uint8_t*) base, bytes, bounds, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
         note = "shared file mapping registered in device-sized slices; no mlock";
@@ -248,8 +253,40 @@ uint8_t* PinnedArena::at(uint64_t off) const {
     return layer_base[l] + (off - bounds_[l]);
 }
 
+bool PinnedArena::register_on(int device, std::string& err) {
+    for (const auto& o : other_reg_)
+        if (o.first == device) return true;
+    std::vector<void*> regs;
+    try {
+        const sycl::context ctx = Runtime::at(device).context();
+        for (const auto& p : pieces_) {
+            sycl::ext::oneapi::experimental::prepare_for_device_copy(p.first, p.second, ctx);
+            regs.push_back(p.first);
+        }
+    } catch (const std::exception& e) {
+        for (void* r : regs)
+            sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::at(device).context());
+        err = std::string("registering the expert arena on GPU ") + std::to_string(device) + ": " + e.what();
+        return false;
+    }
+    other_reg_.emplace_back(device, std::move(regs));
+    return true;
+}
+
 PinnedArena::~PinnedArena() {
     if (shared_fd_ >= 0) ::close(shared_fd_);
+    for (auto& o : other_reg_) {
+        try {
+            auto& r = Runtime::at(o.first);
+            r.finish();   // no copy may still read the mapping
+            for (void* p : o.second) sycl::ext::oneapi::experimental::release_from_device_copy(p, r.context());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "Xe runtime: releasing the expert arena on GPU %d failed: %s; terminating\n", o.first,
+                         e.what());
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
+    }
     if (!layer_base.empty()) {
         for (uint8_t* p : layer_base) Runtime::get().free(p);
         return;

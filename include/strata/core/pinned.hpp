@@ -55,6 +55,12 @@ struct PinnedArena {
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
 
+    /// Registers the arena for device copies on engine device `device` too (a layer split's later GPU): registered
+    /// with one GPU's context only, it is pageable memory to the others, and a CUDA GPU copied from it at a fraction
+    /// of the rate, blocking the host.  Released by the destructor.  False (and `err`) when the device refuses; the
+    /// copies are then correct, only slower.
+    bool register_on(int device, std::string& err);
+
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).
@@ -68,6 +74,8 @@ private:
     void* map_ = nullptr;          // the mapping `base` is aligned inside
     size_t map_bytes_ = 0;
     std::vector<void*> reg_;       // the starts of the mapping's registrations for device copies
+    std::vector<std::pair<void*, size_t>> pieces_;   // what is registered (or host USM) on the first device
+    std::vector<std::pair<int, std::vector<void*>>> other_reg_;   // register_on: a device, its registrations
 };
 
 struct LoadStats {

@@ -1990,6 +1990,10 @@ LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
 
 ArenaExpertSource::~ArenaExpertSource() { close(); }
 
+bool ArenaExpertSource::register_on(int device, std::string& err) {
+    return arena_ == nullptr || static_cast<PinnedArena*>(arena_)->register_on(device, err);
+}
+
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, const std::string& shared_arena_file) {
     close();
