@@ -3009,6 +3009,20 @@ int main(int argc, char** argv) {
             used += b;
             sized.push_back((int64_t) lay.blob_bytes(pr.first));
         }
+        // its prompt path borrows from this cache, and every stage reads prompts in one chunk size: a cache that holds
+        // all its layers' experts in less than the room gets empty slots too, up to what the largest chunk borrows
+        // (B70 + 4070, IQ2_XS, K=45: the 4070's 3 layers held 1.3 GiB, and 30K-token prompts read in 3072-token
+        // chunks took 25.3 s against 14.6 s on the B70 alone in 32768-token ones)
+        if (o.prefill_chunk > 0 && !o.no_prefill_borrow && sized.size() == st.profile.size()) {
+            const int64_t top = o.prefill_auto ? std::max<int64_t>(8192, std::min<int64_t>(32768, o.max_context))
+                                               : o.prefill_chunk;
+            const int64_t want = (int64_t) strata::prefill::Prefill::bytes_needed(g, st.ss, top) * 100 / 85 +
+                                 128 * (int64_t) lay.max_blob;
+            while (used < want && used + (int64_t) lay.max_blob <= room) {
+                used += (int64_t) lay.max_blob;
+                sized.push_back((int64_t) lay.max_blob);
+            }
+        }
         if (sized.empty() ||
             !(native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
                           : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err))) {
