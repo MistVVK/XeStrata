@@ -2351,14 +2351,19 @@ int main(int argc, char** argv) {
     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
     // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
-    const int64_t split_pf_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
-    auto stage_room = [&](int dev, bool later) -> int64_t {
+    // A stage's prompt path has buffers of its own (it borrows no cache slots): its chunk's buffers and the streamed
+    // ring, as Prefill::bytes_needed counts them on that GPU.  (Upstream's 160 MiB + 680 KiB a token left the ring out:
+    // ~1 GiB of IQ3_S blobs at 384 slots, and on the B70 with --layer-split 34 the cache left 12 MiB free and the first
+    // verify window failed to launch.)
+    auto stage_room = [&](int dev, bool later, const strata::core::SessionState& s) -> int64_t {
         const strata::core::OnDevice on(dev);
         size_t fb = 0, tb = 0;
         if (const bool e = strata::gpu::mem_info(&fb, &tb); !e)
             std::fprintf(stderr, "strata generate: layer split: CUDA%d free memory: %s\n", dev < 0 ? 0 : dev,
                          strata::gpu::last_error());
-        const int64_t reserve = ((int64_t) o.vram_reserve_mib + split_pf_mib + (later ? 1024 : 0)) << 20;
+        const int64_t pf = o.prefill_chunk > 0
+                               ? (int64_t) strata::prefill::Prefill::bytes_needed(g, s, o.prefill_chunk) : 0;
+        const int64_t reserve = (((int64_t) o.vram_reserve_mib + (later ? 1024 : 0)) << 20) + pf;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     if (multi_gpu && split_auto) {
@@ -2368,7 +2373,7 @@ int main(int argc, char** argv) {
         std::vector<double> layer_ms((size_t) ns);
         for (int i = 0; i < ns; ++i) {
             const int dev = i == 0 ? 0 : stages[(size_t) i - 1]->dev;
-            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0);
+            cap[(size_t) i] = stage_room(i == 0 ? -1 : dev, i > 0, i == 0 ? ss : stages[(size_t) i - 1]->ss);
             int sms = 0, khz = 0;
             if (!strata::gpu::device_speed(dev, &sms, &khz) || khz <= 0) khz = 1800000;
             const double speed = std::max(1.0, (double) sms * (double) khz / 1e6);   // SMs x GHz
@@ -2474,7 +2479,12 @@ int main(int argc, char** argv) {
         // The batched prompt path's chunk buffers are allocated later, so reserve room for them here.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
-        const int64_t prefill_mib = (o.prefill_chunk > 0 && !borrow) ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
+        // a layer split's first stage: its prompt path's buffers and ring, counted (see stage_room)
+        const int64_t prefill_mib =
+            (o.prefill_chunk > 0 && !borrow)
+                ? (multi_gpu ? (int64_t) (strata::prefill::Prefill::bytes_needed(g, ss, o.prefill_chunk) >> 20) + 1
+                             : 160 + (o.prefill_chunk * 680) / 1024)
+                : 0;
         // the draft layer's head and logits are allocated when it binds, after this: the CJK draft subset makes them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (upstream b981f63)
         const int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
@@ -2707,7 +2717,7 @@ int main(int argc, char** argv) {
     for (auto& stp : stages) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
-        const int64_t room = stage_room(st.dev, true);
+        const int64_t room = stage_room(st.dev, true, st.ss);
         const strata::core::OnDevice on(st.dev);
         std::vector<int64_t> sized;
         int64_t used = 0;
