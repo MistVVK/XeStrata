@@ -1291,11 +1291,6 @@ int main(int argc, char** argv) {
                                  "(--conversation-cache-mib); not saving conversations\n");
         o.conversation_save.clear();
     }
-    if (o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0 && !o.layer_split.empty()) {
-        std::fprintf(stderr, "strata serve: conversation parking does not support --layer-split; disable parking with "
-                             "--conversation-cache-mib 0\n");
-        return 2;
-    }
     const bool pcie_given = o.pcie_frac >= 0.0;
     std::vector<int64_t> split_at;
     std::vector<int> split_devs;
@@ -4198,6 +4193,22 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots);
+        // a layer split parks every GPU's session (its layers), each copied on its own device
+        std::vector<strata::core::ConversationStage> conv_stages;
+        if (multi_gpu) {
+            conv_stages.push_back({&ss, 0});
+            for (auto& st : stages) conv_stages.push_back({&st->ss, st->dev});
+        }
+        auto snapshot_bytes = [&](const strata::core::ConversationView& v, size_t& bytes, std::string& e) {
+            return conv_stages.empty() ? strata::core::conversation_snapshot_bytes(v, ss, g, mtp.kv_state(), bytes, e)
+                                       : strata::core::conversation_split_bytes(v, conv_stages, g, mtp.kv_state(),
+                                                                                bytes, e);
+        };
+        auto snapshot_validate = [&](const strata::core::SavedConversation& image, std::string& e) {
+            return conv_stages.empty() ? strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), e)
+                                       : strata::core::conversation_split_validate(image, conv_stages, g,
+                                                                                   mtp.kv_state(), e);
+        };
         // ---- --conversation-save: the parked conversations in a folder, read back after a restart.  A file is used
         // only by an engine with the same model files, engine version and settings its state depends on.
         strata::core::ConversationDisk disk;
@@ -4221,6 +4232,10 @@ int main(int argc, char** argv) {
             fp += "\nkv=" + o.kv + " rot=" + (rot ? rot : "") + " max_context=" + std::to_string(o.max_context) +
                   " mtp_window=" + std::to_string(o.mtp_window) + " turn_token=" + std::to_string(o.turn_token) +
                   " no_ple=" + std::to_string((int) o.no_ple) + " cvec=" + cvec_summary;
+            if (multi_gpu) {   // a layer split's files hold each GPU's state: read only by the same split
+                fp += "\nsplit=";
+                for (const int64_t k : split_at) fp += std::to_string(k) + ",";
+            }
             strata::core::ConversationDiskOptions dopt;
             dopt.dir = o.conversation_save;
             dopt.fingerprint = std::move(fp);
@@ -4228,6 +4243,7 @@ int main(int argc, char** argv) {
             dopt.max_age = std::chrono::hours(o.conversation_save_hours);
             dopt.checkpoints = (size_t) o.conversation_save_checkpoints;
             dopt.compress = o.conversation_save_compress;
+            dopt.stage_parts = multi_gpu ? stages.size() : 0;
             std::string de;
             if (disk.open(std::move(dopt), de))
                 std::fprintf(stderr, "strata serve: conversation save: %s holds %zu usable conversations (%zu MiB in "
@@ -4262,7 +4278,7 @@ int main(int argc, char** argv) {
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse();
             size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, err)) {
+            if (!snapshot_bytes(view, estimate, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
                 err.clear();   // a recoverable miss must not poison the batched draft prefill's error channel
                 return true;
@@ -4302,8 +4318,10 @@ int main(int argc, char** argv) {
                 }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), err,
-                                                              std::move(reuse), &reused_bytes))
+                if (conv_stages.empty() ? !strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(),
+                                                                                    err, std::move(reuse), &reused_bytes)
+                                        : !strata::core::conversation_split_save(image, view, conv_stages, g,
+                                                                                 mtp.kv_state(), err))
                     return false;
                 if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after "
@@ -5518,7 +5536,7 @@ int main(int argc, char** argv) {
             }
             // the whole image is checked before the outgoing state is parked or overwritten: an invalid one is
             // dropped and the request falls back to the prefix it had
-            if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g, mtp.kv_state(), err)) {
+            if (incoming && !snapshot_validate(*incoming, err)) {
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot from %s (%s)\n",
                              in_source, err.c_str());
                 incoming.reset();
@@ -5570,13 +5588,16 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err) !=
+                if ((conv_stages.empty()
+                         ? strata::core::conversation_snapshot_restore(*incoming, ss, g, mtp.kv_state(), err)
+                         : strata::core::conversation_split_restore(*incoming, conv_stages, g, mtp.kv_state(), err)) !=
                     strata::core::ConversationRestore::restored) {
                     // validated above: a failure here is fatal, never a session to decode from half restored
                     std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                     return 1;
                 }
                 if (std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
+                    const strata::core::OnDevice on_draft(conv_stages.empty() ? -1 : conv_stages.back().device);
                     uint64_t draft_hash = 0;
                     if (!strata::core::conversation_kv_verify(incoming->kv.back(), mtp.kv_state(), g,
                                                               int64_t(incoming->live.ids.size()), false, draft_hash, err)) {
@@ -5595,7 +5616,8 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = in_tokens;
                 from_live = in_live;
-                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr)
+                // (a layer split captures in full: its K/V is copied from several devices)
+                if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr && conv_stages.empty())
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()));
                 incoming.reset();   // the running state and checkpoint copies are not needed any more
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s, from %s) in %.1f ms; "
@@ -6447,15 +6469,15 @@ int main(int argc, char** argv) {
                 auto capture = [&](strata::core::SavedConversation& image) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     size_t estimate = 0;
-                    if (!ver.wait_commit(de) ||
-                        !strata::core::conversation_snapshot_bytes(view, ss, g, mtp.kv_state(), estimate, de))
-                        return false;
+                    if (!ver.wait_commit(de) || !snapshot_bytes(view, estimate, de)) return false;
                     if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
                                                                  estimate, floor)) {
                         de = "physical RAM admission";
                         return false;
                     }
-                    return strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), de);
+                    return conv_stages.empty()
+                               ? strata::core::conversation_snapshot_save(image, view, ss, g, mtp.kv_state(), de)
+                               : strata::core::conversation_split_save(image, view, conv_stages, g, mtp.kv_state(), de);
                 };
                 try {
                     strata::core::SavedConversation image;
