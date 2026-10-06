@@ -16,7 +16,7 @@ The contrib build (below) runs on NVIDIA GPUs as well, through the same kernels:
 XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
 
 - free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new); icpx is refused.
-- contrib (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (`third_party/main/oneMath`, Apache-2.0): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones. It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
+- contrib (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (Apache-2.0, fetched by CMake with XeStrata's patches in `third_party/main/oneMath/patches`): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones. It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
 - contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): the same free source built with Intel oneAPI's icpx and the runtime libraries it links, with oneMKL for the dense matrix products (through oneMath) and the SYCL image encoder (ggml-sycl), for Intel GPUs. setup builds in this mode only when asked (`--license contrib-icpx`).
 
 Rules:
@@ -39,7 +39,7 @@ Material from other projects goes into `third_party/`, one folder per project wi
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
 - Code transcribed from such a project into XeStrata's own sources (the kernels in `src/` that follow ggml, for example) is part of XeStrata under the LGPL, with the original notice kept in a comment.
 - `third_party/nonfree/<project>/`: anything that is not free software.
-- XeStrata's changes to `third_party/main/oneMath/` stay under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them: a changed file keeps its Apache-2.0 header, gains a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`), and gets no LGPL SPDX line. The changes are listed in `third_party/main/README.md`.
+- XeStrata's changes to oneMath are patches in `third_party/main/oneMath/patches/` (`NN-<id>.patch`, applied in order), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them. A patch starts with SPDX lines (the changed files' copyright holders, XeStrata's line, `Apache-2.0`) and what it changes; in each file it changes, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`). The patches are listed in `third_party/main/README.md`.
 
 XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
 
@@ -80,7 +80,6 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
-`third_party/main/oneMath/` is not linted: it is oneMath as released, with XeStrata's few changes marked in their files.
 clang-tidy reads `compile_commands.json` from the build folder (`build/xe`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).

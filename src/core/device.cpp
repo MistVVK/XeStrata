@@ -4,15 +4,12 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 
-#include <level_zero/ze_api.h>
-#include <sycl/ext/oneapi/backend/level_zero.hpp>
 
 #include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -51,16 +48,10 @@ std::string unusable(const sycl::device& d) {
     return {};
 }
 
-// Whether the GPU is the processor's own graphics (its memory is the system RAM).  Level Zero reports it; the other
-// backends have no such query, and their GPUs are taken as discrete cards.
-bool integrated(const sycl::device& d) {
-    if (d.get_backend() != sycl::backend::ext_oneapi_level_zero) return false;
-    ze_device_properties_t p;
-    std::memset(&p, 0, sizeof p);
-    p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-    const auto h = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(d);
-    return zeDeviceGetProperties(h, &p) == ZE_RESULT_SUCCESS && (p.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0;
-}
+// Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
+// Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
+// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).
+bool integrated(const sycl::device& d) { return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu); }
 
 std::string pci_of(const sycl::device& d) {
     if (!d.has(sycl::aspect::ext_intel_pci_address)) return "?";

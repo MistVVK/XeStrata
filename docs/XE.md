@@ -13,12 +13,14 @@ The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its transla
 XeStrata xe0.1.39 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated.
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
-The CUDA build is retired and its sources are removed.
+The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib build, [Build and run](#build-and-run)).
+Upstream's CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
 
-It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's.
+It is developed and measured on an Intel Arc Pro B70 (Xe2, 32 GB); the speeds in the records are that card's unless they say otherwise.
+On NVIDIA it is checked on an RTX 4070 and an RTX 3070.
 The engine chooses its paths from what the GPU reports (AGENTS.md, the first rule).
-A GPU without the matrix engines (XMX) takes the DP4a paths.
+The prompt path's matrix products use a kernel of their own on Xe2's XMX (xmx_gemm), a joint_matrix product that takes the reported tile shape on the Arc A series' XMX and NVIDIA's tensor cores (mma_gemm), and the DP4a paths on a GPU without matrix engines.
 
 A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
@@ -88,11 +90,14 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
   Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
   Validated to run on an RTX 4070 (sm_89).
+  The engine links no maker's driver library: the SYCL runtime and oneMath open the ones that are there at run time.
+  So it runs without NVIDIA's driver and CUDA on a PC with only Intel GPUs, and without Level Zero on one with only NVIDIA GPUs
+  (checked on the development machine with the other maker's libraries made unreadable; on such a PC itself `unverified`).
 - **contrib-icpx** (`-DSTRATA_LICENSE=contrib-icpx`): built with Intel oneAPI's icpx, which is not free software (validated: 2026.1.1).
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
-The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (`third_party/main/oneMath`, Apache-2.0):
+The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
 oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
 Which backends are built follows the GPUs of the machine it is built on (every maker it has).
 An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
@@ -114,7 +119,9 @@ A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
-`third_party/main/oneMath` is oneMath v0.9 with XeStrata's changes (cuBLAS's BF16 product), listed in [third_party/main/README.md](../third_party/main/README.md).
+CMake fetches oneMath v0.9 from GitHub when it configures (checking the archive's SHA-256) and applies XeStrata's changes (cuBLAS's BF16 product, `third_party/main/oneMath/patches/`).
+On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
+The patches are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
 coder-iq1_m's prefill of 997 tokens went from 1421 to 1350 ms on the B70 and stayed the same on the RTX 4070 (3845 ms).
 
@@ -318,7 +325,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 
 | For | Free | contrib-icpx (`--license contrib-icpx`) |
 | --- | --- | --- |
-| Building the engine | `libze-dev` 1.28.2 | also `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
+| Building the engine | — (nothing besides the SYCL compiler) | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch` (to apply XeStrata's changes to oneMath) |
 | Building intel/llvm 7 or later (setup builds it here) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx is used) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
@@ -327,7 +334,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 | Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
 
 The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
-`intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
+`intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch`, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 
 #### Fedora 44
 

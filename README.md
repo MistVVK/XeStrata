@@ -7,12 +7,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](README.ja.md)
 
-Run a 125-billion-parameter AI model on one Intel Arc GPU and an ordinary PC.
+Run a 125-billion-parameter AI model on one Intel Arc or NVIDIA GPU and an ordinary PC.
 
 XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that
 normally runs on a server, on your own PC.
-It uses one Intel Arc GPU and Linux, and installs with one command.
-It is free software, and it builds and runs with free software only.
+It uses one Intel Arc or NVIDIA GPU and Linux, and installs with one command.
+It is free software, and on an Intel GPU it also builds and runs with free software only.
 
 > **Contents:** [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
 > [Choosing a model](#choosing-a-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
@@ -22,35 +22,40 @@ It is free software, and it builds and runs with free software only.
 
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
+The same code is compiled for NVIDIA GPUs as well (the contrib build).
 The models, the install, the app and the API are much the same as Strata's.
 
 How it differs from Strata:
 
-- **For Intel Arc.** NVIDIA and AMD GPUs are not supported.
+- **For Intel Arc,** and it runs on NVIDIA GPUs too. AMD GPUs are not supported.
 - **One GPU only.** There is no sharing of the model across several GPUs.
 - **Linux only.** Windows and WSL are not supported.
-- **Builds with free software only** (a build Debian main could take). Non-free tools such as Intel oneAPI are used
-  only when you choose them ([For developers](#for-developers)).
+- **Builds with free software only, too** (`--license free`, free enough for Debian main). The default contrib build
+  uses Intel's oneMKL and, for an NVIDIA GPU, NVIDIA's CUDA toolkit, which are not free software
+  ([For developers](#for-developers)).
 
 ## What you need
 
 | | |
 | --- | --- |
-| GPU | Intel Arc (A series, B series). 12 GB of VRAM or more is recommended (less works, but slower). |
+| GPU | Intel Arc (A series, B series), or an NVIDIA GPU with tensor cores (Volta or later). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
 | OS | Linux (not WSL). Checked on Ubuntu 26.04; setup and a start also checked on Fedora 44 in a container. |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
-- **Matrix engines (XMX):** a GPU with XMX uses them; one without computes with DP4a instructions.
-  Which one is chosen from what the GPU reports. Without XMX, prompts are read more slowly, but it runs.
-- **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). Other Arc cards have not been
-  checked. Smaller cards are checked by limiting the memory and the XMX the B70 may use.
+- **Matrix engines:** Intel's XMX and NVIDIA's tensor cores are used; a GPU without them computes with DP4a
+  instructions. Which one is chosen from what the GPU reports. Without matrix engines, prompts are read more slowly,
+  but it runs.
+- **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). On NVIDIA, an RTX 4070 and an
+  RTX 3070 are checked. On an Arc A380 only the arithmetic is checked, without running a model. Other GPUs have not
+  been checked. Smaller cards are checked by limiting the memory and the XMX the B70 may use.
 - **The processor's own graphics:** checked up to starting and reading a prompt. Its memory is shared with the RAM,
   and most have no XMX, so it is slow.
-- **Packages:** you need Intel's GPU runtime (Level Zero) and a SYCL compiler. setup does not install system
-  packages, so install the ones in the table in [docs/XE.md](docs/XE.md#packages) first.
+- **Packages:** an Intel GPU needs its runtime (Level Zero) and oneMKL; an NVIDIA GPU needs its driver and the CUDA
+  toolkit. setup can build the SYCL compiler (intel/llvm). setup does not install system packages, so install the
+  ones in the table in [docs/XE.md](docs/XE.md#packages) first.
 
 ## Choosing a model
 
@@ -157,7 +162,8 @@ Run `./setup.sh` again. It continues where it stopped.
 **It says it cannot find or use the GPU.**
 Check these three things:
 
-- Check that Intel's GPU runtime is installed ([docs/XE.md](docs/XE.md#packages)).
+- Check that Intel's GPU runtime, or for an NVIDIA GPU its driver (whether `nvidia-smi` sees it), is installed
+  ([docs/XE.md](docs/XE.md#packages)).
 - Check that your user can open the GPU's device (`/dev/dri/renderD*`; the `render` group).
 - If the OS does not see a discrete GPU, check Above 4G Decoding and Re-Size BAR in the BIOS.
 
@@ -202,9 +208,9 @@ Models like this one normally run on servers with hundreds of gigabytes of GPU m
 - **Guess, then check:** a small helper built into the model guesses the next few words, and the big model checks
   them all at once. It keeps the ones that are right and writes the next word itself. The big model always decides,
   so the quality of the answer does not change.
-- **Long texts are read in large pieces** (up to 8,192 tokens at a time).
+- **Long texts are read in large pieces** (up to 32,768 tokens at a time).
 
-On Intel GPUs, a GPU with XMX computes on its matrix engines, and one without uses DP4a instructions.
+Matrix products run on XMX on Intel GPUs and on tensor cores on NVIDIA GPUs; a GPU without matrix engines uses DP4a instructions.
 Every part is explained in [docs/DETAILS.md](docs/DETAILS.md#how-it-works), and how it is done on Intel GPUs and
 what has been checked in [docs/XE.md](docs/XE.md).
 
@@ -241,8 +247,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
-   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0, with XeStrata's changes): the contrib and
-     contrib-icpx modes' dense matrix products;
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the contrib and contrib-icpx modes' dense
+     matrix products, which CMake fetches with XeStrata's changes (`third_party/main/oneMath/patches/`, under the
+     same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib
      modes' compiler, which setup builds with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same
      license);
@@ -265,7 +272,7 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
   notices are kept in [NOTICE](NOTICE).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
-   - oneMath with XeStrata's changes (`third_party/main/oneMath/`): Apache-2.0 (its googletest: BSD-3-Clause).
+   - XeStrata's patches to oneMath (`third_party/main/oneMath/`): Apache-2.0.
    - ggml's `ggml-common.h` (`third_party/main/ggml/`, an unmodified copy): MIT.
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental

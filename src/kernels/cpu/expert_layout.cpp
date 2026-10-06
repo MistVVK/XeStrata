@@ -73,6 +73,25 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
+bool cpu_avxvnni_ok() {
+#if defined(STRATA_HAVE_AVXVNNI)
+    static const bool ok = [] {
+        if (const char* e = std::getenv("STRATA_NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
+        if (!cpu_avx2_ok()) return false;
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        __cpuid_count(0, 0, a, b, c, d);
+        if (a < 7) return false;
+        __cpuid_count(7, 0, a, b, c, d);
+        if (a < 1) return false;                           // no sub-leaf 1
+        __cpuid_count(7, 1, a, b, c, d);
+        return ((a >> 4) & 1u) != 0;                       // AVX-VNNI
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)
@@ -99,6 +118,9 @@ std::string cpu_name() {
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+#if defined(STRATA_HAVE_AVXVNNI)
+    else if (cpu_avxvnni_ok()) q2_0_gguf_rows_multi_avxvnni(w, row_bytes, nblocks, a, nt, out, r0, r1);
+#endif
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 

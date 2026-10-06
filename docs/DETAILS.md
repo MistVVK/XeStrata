@@ -206,10 +206,11 @@ setup's estimate of how much of a model the GPU holds is upstream's (its VRAM le
 The GPU, CPU, RAM and disk are in the [README](../README.md#what-you-need).
 This adds only what the README leaves out.
 
-- **Packages**: Intel's GPU runtime (Level Zero) and a SYCL compiler.
+- **Packages**: an Intel GPU needs its runtime (Level Zero), an NVIDIA GPU its driver and the CUDA toolkit, and an
+  Intel GPU in the default contrib build oneMKL. setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
   What Ubuntu 26.04 and Fedora 44 need is in [XE.md](XE.md#packages).
-- **The GPU device**: your user must be able to open `/dev/dri/renderD*` (the `render` group).
+- **The GPU device**: for an Intel GPU, your user must be able to open `/dev/dri/renderD*` (the `render` group).
 - **Disk**: about 60–110 GB for the model and about 6 GB for the MTP layer (1 GB more with images).
   **The original model's Q2_0 on an AVX-512 CPU** also writes a one-time copy of its experts (about 40 GB) for the fast CPU kernel.
   An NVMe SSD is strongly recommended.
@@ -839,7 +840,7 @@ Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | faster than the CPU encoder: 7–9× with Vulkan, 13–20× with SYCL (nonfree) | up to 1,024 |
+| **GPU** (recommended) | faster than the CPU encoder: 7–9× with Vulkan, 13–20× with SYCL (contrib-icpx) | up to 1,024 |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -847,7 +848,7 @@ That is the same value as the text-only default, but the engine then no longer l
 ([XE.md](XE.md#the-vram-reserve-on-a-small-card)).
 The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower (not measured on the B70).
 
-The two GPU encoder builds (free Vulkan, nonfree SYCL), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
+The two GPU encoder builds (Vulkan, and SYCL in contrib-icpx), how their results differ, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
@@ -939,7 +940,10 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 
 | Symptom | What to do |
 | --- | --- |
-| `no Intel GPU on the xe or i915 driver found` | The Intel GPU is not on the xe or i915 driver; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
+| `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
+| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib build only: run setup again with `--license contrib`. |
+| `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([XE.md](XE.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
 | `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([XE.md](XE.md#packages)). |
 | `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prompts taking about 1.6 times as long ([XE.md](XE.md#the-sycl-compiler)). |
@@ -972,7 +976,8 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   The cache adapts to the conversation while you chat.
 - **RAM:** all 24,576 experts, in one large mapping registered for device copies.
   The CPU computes the experts that are not on the GPU **in place**, at the same time as the GPU works on the cached ones
-  (AVX-512 / AVX2 kernels, ggml's for the i-quants).
+  (AVX-512 / AVX2 kernels, ggml's for the i-quants; on a CPU with AVX-VNNI the Q2_0 and IQ4_NL dots use it,
+  `STRATA_NO_AVXVNNI=1` goes back to AVX2).
 - **SSD:** the 28.8 GB n-gram table, read a few rows per token through the OS cache.
 - **Speculation:** the model's own MTP layer drafts up to 3 tokens; one pass over all 48 layers checks them.
   On the B70 a check advances 2.1–3.4 tokens on average ([record](../bench/results/2026-10-03-mtp-accept/README.md)).
@@ -980,7 +985,8 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   but only where its measured acceptance and cost say it pays.
   The drafts are checked like the MTP's, so the output is the same.
 - **Prompts** are processed in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
-  On a GPU with XMX the products run on the matrix engines.
+  The matrix products run on XMX on Intel GPUs and on tensor cores on NVIDIA GPUs, and the contrib and contrib-icpx
+  builds hand the dense ones to oneMKL or cuBLAS through oneMath.
 
 Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)** (measured on CUDA).
 
@@ -990,7 +996,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
 The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm, oneMath with its changes, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
+The exceptions stay under their own licenses: the patches to intel/llvm and oneMath, `ggml-common.h`, Outfit and `third_party/nonfree/` (below).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
@@ -1005,7 +1011,8 @@ The model files are not part of it; their licenses apply to them (below).
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
 - **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the contrib and contrib-icpx modes' dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA).
-  v0.9 is in `third_party/main/oneMath/`, with XeStrata's changes (cuBLAS's BF16 product) marked in each file's header. See `third_party/main/oneMath/LICENSE`.
+  It is not in the repository: CMake fetches v0.9,
+  with XeStrata's changes (cuBLAS's BF16 product) from `third_party/main/oneMath/patches/`, under oneMath's license. See `third_party/main/oneMath/LICENSE`.
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.

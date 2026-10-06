@@ -296,19 +296,10 @@ if(STRATA_ENABLE_XE)
                       -foffload-fp32-prec-sqrt
                       "SHELL:${_strata_spirv_translator} --spirv-ext=+SPV_KHR_integer_dot_product")
 
-  # Level Zero (libze-dev; free, MIT): the runtime asks it what the SYCL device does not report, such as whether a
-  # GPU is the processor's own (src/core/device.cpp)
-  find_path(STRATA_ZE_INCLUDE level_zero/ze_api.h)
-  find_library(STRATA_ZE_LOADER ze_loader)
-  if(NOT STRATA_ZE_INCLUDE OR NOT STRATA_ZE_LOADER)
-    message(FATAL_ERROR "The Xe backend needs the Level Zero headers and loader (Debian / Ubuntu: libze-dev)")
-  endif()
-
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC include)
-  target_include_directories(strata_core PRIVATE ${STRATA_ZE_INCLUDE})
-  target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform ${STRATA_ZE_LOADER})
+  target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)
@@ -405,6 +396,8 @@ if(STRATA_ENABLE_XE)
   # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS); a GPU
   # without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time, so the engine starts
   # without the library of a GPU it does not use.
+  set(STRATA_ONEMATH_SOURCE "" CACHE STRING
+      "oneMath v0.9's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
   if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
     if(NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
@@ -437,7 +430,43 @@ if(STRATA_ENABLE_XE)
       add_link_options(${_strata_cuda_base_opts})
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
-    add_subdirectory(third_party/main/oneMath ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
+    # oneMath is not in the repository: the pinned release, with XeStrata's changes to it
+    # (third_party/main/oneMath/patches/NN-<id>.patch) applied in order.  `patch`, not `git apply`: the source
+    # folder is inside this repository's work tree, where git apply takes the paths as this repository's.
+    find_program(STRATA_PATCH patch REQUIRED)
+    file(GLOB _strata_onemath_patches CONFIGURE_DEPENDS
+         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/[0-9][0-9]-*.patch)
+    list(SORT _strata_onemath_patches)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_onemath_patches})
+    if(STRATA_ONEMATH_SOURCE)
+      set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
+    else()
+      set(_strata_onemath_url
+        URL https://github.com/uxlfoundation/oneMath/archive/6ff3a43e555dbb20357017d48f0f6c6263259895.tar.gz
+        URL_HASH SHA256=4d431378064867e3b6b3bb3271cdfc6decfe7580a676f1c70bd5c338f8731a94)
+    endif()
+    set(_strata_onemath_patch)
+    set(_strata_onemath_key "${_strata_onemath_url}")
+    foreach(onemath_patch_file ${_strata_onemath_patches})
+      list(APPEND _strata_onemath_patch
+           COMMAND ${STRATA_PATCH} -p1 -N -s --no-backup-if-mismatch -i ${onemath_patch_file})
+      file(SHA256 ${onemath_patch_file} _h)
+      string(APPEND _strata_onemath_key ";${_h}")
+    endforeach()
+    list(POP_FRONT _strata_onemath_patch)
+    # a changed patch does not change what FetchContent fetches, so it would keep the tree patched before: start
+    # from the archive again
+    if(NOT _strata_onemath_key STREQUAL _STRATA_ONEMATH_KEY)
+      file(REMOVE_RECURSE ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
+                          ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
+    endif()
+    include(FetchContent)
+    FetchContent_Populate(strata_onemath QUIET ${_strata_onemath_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
+      PATCH_COMMAND ${_strata_onemath_patch}
+      SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
+    set(_STRATA_ONEMATH_KEY "${_strata_onemath_key}" CACHE INTERNAL "the archive and patches the oneMath tree has")
+    add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
     unset(BUILD_SHARED_LIBS)
   endif()
@@ -587,6 +616,16 @@ target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+# AVX-VNNI (Intel Core 12th gen and later, AMD Zen 5): the Q2_0 and IQ4_NL rows' integer dot as vpdpbusd, chosen at run
+# time (cpu_avxvnni_ok); without the compiler flag the AVX2 kernels serve every CPU.
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag(-mavxvnni STRATA_CXX_AVXVNNI)
+if(STRATA_CXX_AVXVNNI)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/q2_avxvnni.cpp)
+  set_source_files_properties(src/kernels/cpu/q2_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
+                              "-mavx2;-mavxvnni;-mfma;-mf16c")
+  target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_HAVE_AVXVNNI=1)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -635,6 +674,11 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  if(STRATA_CXX_AVXVNNI)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avxvnni.cpp)
+    set_source_files_properties(src/kernels/cpu/iq_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
+                                "-mavx2;-mavxvnni;-mfma;-mf16c")
+  endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)

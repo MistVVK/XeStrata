@@ -29,14 +29,9 @@ SPDX-FileCopyrightText = "2023-2026 The ggml authors"
 SPDX-License-Identifier = "MIT"
 
 [[annotations]]
-path = ["third_party/main/oneMath/**"]
-SPDX-FileCopyrightText = ["2020-2025 Intel Corporation", "Codeplay Software Limited", "2025 SiPearl", "2022 Heidelberg University", "2021 The Regents of the University of California", "2026 MistVVK and the XeStrata contributors"]
+path = ["third_party/main/oneMath/LICENSE"]
+SPDX-FileCopyrightText = "The oneMath contributors"
 SPDX-License-Identifier = "Apache-2.0"
-
-[[annotations]]
-path = ["third_party/main/oneMath/deps/googletest/**"]
-SPDX-FileCopyrightText = "2008 Google Inc."
-SPDX-License-Identifier = "BSD-3-Clause"
 
 [[annotations]]
 path = ["third_party/main/intel-llvm/LICENSE.TXT"]

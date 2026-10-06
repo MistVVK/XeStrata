@@ -25,5 +25,8 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                         float* const* out, int r0, int r1);
+/// The same with AVX-VNNI (src/kernels/cpu/iq_avxvnni.cpp), bitwise the same; called only when cpu_avxvnni_ok().
+void iq4nl256_down_rows_avxvnni(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
+                                float* const* out, int r0, int r1);
 
 }  // namespace strata::kernels::cpu

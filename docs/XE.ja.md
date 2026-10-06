@@ -13,13 +13,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 XeStrata xe0.1.39 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
-CUDA のビルドは廃止してソースも消しました。
+同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib のビルド、[ビルド](#ビルド)）。
+upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
 
 開発と測定は Intel Arc Pro B70（Xe2、32 GB）で行っています。
-記録にある速さは、どれもこの GPU のものです。
+記録にある速さは、断りがなければこの GPU のものです。NVIDIA は RTX 4070 と RTX 3070 で確かめています。
 エンジンは経路を GPU が報告する能力で選びます（AGENTS.md の最初の規則）。
-行列エンジン（XMX）のない GPU は、DP4a の経路を使います。
+プリフィルの行列積は、Xe2 の XMX には専用のカーネル（xmx_gemm）を、Arc A シリーズの XMX と NVIDIA の Tensor Core には
+報告されたタイルの形で動く joint_matrix の積（mma_gemm）を使い、行列エンジンのない GPU は DP4a の経路を使います。
 
 小さい GPU は、B70 を小さく見せて確かめます。
 `STRATA_VRAM_LIMIT_MIB` はエンジンから見える VRAM を、`STRATA_MAX_ALLOC_MIB` は想定する最大の確保量を制限し、
@@ -92,11 +94,14 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
   Ubuntu 26.04 の `nvidia-cuda-toolkit` 12.4 と intel/llvm v7.1.1 で、sm_89 向けのビルドが通ることを確かめています。
   RTX 4070（sm_89）で動くことを確かめています。
+  エンジンはメーカーのドライバーのライブラリを直接リンクせず、SYCL のランタイムと oneMath が、あるものだけを実行時に開きます。
+  そのため、Intel の GPU だけの PC では NVIDIA のドライバーと CUDA がなくても、NVIDIA の GPU だけの PC では Level Zero がなくても動きます
+  （開発機で、もう一方のライブラリを読めなくして確かめました。実際にそれだけの PC では `unverified`）。
 - **contrib-icpx**（`-DSTRATA_LICENSE=contrib-icpx`）: 自由ソフトウェアでない Intel oneAPI の icpx でビルドします（2026.1.1 で確かめています）。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
-contrib と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（`third_party/main/oneMath`、Apache-2.0）経由で、
+contrib と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（Apache-2.0）経由で、
 Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
 どの後端を作るかは、ビルドする機械の GPU で決めます（メーカーが複数あればすべて）。
 Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
@@ -118,7 +123,9 @@ PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 CUDA 12.0〜12.3 のドライバーで CUDA 12.4 のツールキットを使う組み合わせは確かめていません（`unverified`）。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
-`third_party/main/oneMath` は oneMath v0.9 に XeStrata の変更（cuBLAS の BF16 の積）を加えたもので、変更は [third_party/main/README.md](../third_party/main/README.md) にあります。
+oneMath は configure のときに CMake が GitHub から v0.9 を取ってきて（アーカイブの SHA-256 を確かめます）、XeStrata の変更（cuBLAS の BF16 の積、`third_party/main/oneMath/patches/`）を当てます。
+ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
+パッチは [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
 coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1350 ms、RTX 4070 では同じ（3845 ms）でした。
 
@@ -323,7 +330,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 
 | 用途 | free | contrib-icpx（`--license contrib-icpx`） |
 | --- | --- | --- |
-| エンジンのビルド | `libze-dev` 1.28.2 | 加えて `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
+| エンジンのビルド | —（SYCL のコンパイラのほかに要るものはありません） | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`（oneMath に XeStrata の変更を当てる） |
 | intel/llvm 7 以降のビルド（setup がここで作ります） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |
@@ -332,7 +339,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 | 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
 
 contrib（`--license contrib`）では、free の列のうち intel/llvm をビルドするためのものと、
-`intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
+`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
 
 #### Fedora 44
 

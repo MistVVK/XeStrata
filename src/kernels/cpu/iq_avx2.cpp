@@ -19,6 +19,8 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 
+#include "iq4nl_rows256.hpp"
+
 #include <immintrin.h>
 
 #include <cmath>
@@ -392,56 +394,18 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     }
 }
 
-// ---- IQ4_NL (type 20): 32-value blocks of 18 bytes (f16 d + 16 nibble bytes) against Q8_0 activations.
-// ggml-cpu's own AVX-2 dot (ggml_vec_dot_iq4_nl_q8_0) is single-token: every token redoes the nibble ->
-// kvalues_iq4nl pshufb decode and the |w| half of the signed x signed product.  Here both are computed once
-// per block; every token then costs a sign, a maddubs, a madd and an fmadd.  The arithmetic is ggml's - only
-// the order of the float additions differs.
-template <int NT>
-void iq4nl_rows(const uint8_t* w, size_t row_bytes, int n, const block_q8_0* const* y, float* const* out,
-                int r0, int r1) {
-    const __m128i values = _mm_loadu_si128((const __m128i*) kvalues_iq4nl);
-    const __m128i m4b = _mm_set1_epi8(0x0f);
-    const __m256i ones = _mm256_set1_epi16(1);
-    const int nb = n / QK4_NL;
-    for (int r = r0; r < r1; ++r) {
-        const uint8_t* row = w + (size_t) r * row_bytes;
-        __m256 accf[NT];
-        for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
-        for (int ib = 0; ib < nb; ++ib) {
-            const uint8_t* blk = row + (size_t) ib * sizeof(block_iq4_nl);
-            const __m128i bits = _mm_loadu_si128((const __m128i*) (blk + 2));
-            const __m128i lo = _mm_and_si128(bits, m4b);                      // values 0..15
-            const __m128i hi = _mm_and_si128(_mm_srli_epi16(bits, 4), m4b);    // values 16..31
-            const __m256i q4 = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_shuffle_epi8(values, lo)),
-                                                       _mm_shuffle_epi8(values, hi), 1);
-            const __m256i aq = _mm256_sign_epi8(q4, q4);   // |w|: the unsigned operand of maddubs
-            const float dx = h2f(u16(blk));
-            for (int t = 0; t < NT; ++t) {
-                const block_q8_0& b = y[t][ib];
-                const __m256i q8 = _mm256_loadu_si256((const __m256i*) b.qs);
-                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(aq, _mm256_sign_epi8(q8, q4)), ones);
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * h2f(b.d)), _mm256_cvtepi32_ps(p), accf[t]);
-            }
-        }
-        for (int t = 0; t < NT; ++t) out[t][r] = hsum8(accf[t]);
+// ---- IQ4_NL (type 20): the down rows, in iq4nl_rows256.hpp with the AVX-VNNI build (iq_avxvnni.cpp)
+namespace {
+struct DotAvx2 {
+    static __m256i dot(__m256i u, __m256i s) {
+        return _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1));
     }
-}
+};
+}  // namespace
 
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt, float* const* out,
                         int r0, int r1) {
-    const block_q8_0* y[8];
-    for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
-    switch (nt) {
-        case 1: iq4nl_rows<1>(w, row_bytes, n, y, out, r0, r1); break;
-        case 2: iq4nl_rows<2>(w, row_bytes, n, y, out, r0, r1); break;
-        case 3: iq4nl_rows<3>(w, row_bytes, n, y, out, r0, r1); break;
-        case 4: iq4nl_rows<4>(w, row_bytes, n, y, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
-            iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
-        }
-    }
+    rows256::iq4nl_down_rows<DotAvx2>(w, row_bytes, n, hq, nt, out, r0, r1);
 }
 
 }  // namespace strata::kernels::cpu
