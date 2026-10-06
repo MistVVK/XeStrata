@@ -140,7 +140,7 @@ fastest (about 5-10 minutes).
 - **From a phone or another PC:** run `./setup.sh --setup --host 0.0.0.0 --api-key <secret>` and open the address
   the server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
-**Good to know:** it answers one request at a time. The first message of a conversation is read in full; after that
+**Good to know:** it answers one request at a time (several at once is opt-in: `"parallel": 2`, [BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that
 it keeps the conversation and reads only what is new, so follow-ups start right away.
 
 ## When something goes wrong

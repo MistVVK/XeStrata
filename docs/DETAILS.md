@@ -638,7 +638,7 @@ Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s 
 
 ### Current limits and sampling
 
-- One request at a time, and one conversation's history in the KV cache at a time.
+- One request at a time (several at once only with `"parallel"`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
   Switching between two chats re-reads the part where they diverge unless parking is on; the shared prefix, such as the system prompt, is reused.
 - Images only when set up with them ([below](#images)); no video.
 - **Temperature, top_p, top_k, min_p and seed** are honored per request (OpenAI and Anthropic fields).
