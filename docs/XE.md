@@ -77,13 +77,13 @@ Real-model checks of every quantization format, shared arenas across processes a
 
 The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's main, contrib and non-free.
 
-- **free** (the default, `-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
+- **free** (`-DSTRATA_LICENSE=free`): built with intel/llvm's DPC++ 7 or later (its SYCL runtime is libsycl 9).
   Free software only; no oneAPI environment is used.
   Validated with intel/llvm v7.1.1 built from source by `tools/intel_llvm_build.py` (see [Setup](#setup)).
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prompt path took about 1.6 times as long
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
-- **contrib** (`-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
+- **contrib** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
   Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
@@ -148,7 +148,7 @@ The free mode (intel/llvm in `.tools/intel-llvm/install`):
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/llvm7 \
-  -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang \
+  -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
@@ -195,7 +195,7 @@ setup.py fetches it; the image encoder also uses its `tools/mtmd`.
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/llvm7 -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/llvm7 --target strata -j6
 ```
 
@@ -250,11 +250,12 @@ Only one GPU is used; `--gpus` is refused.
 
 ### The SYCL compiler
 
-setup builds in the mode `--license` names ([above](#build-and-run)), free unless told otherwise.
+setup builds in the mode `--license` names ([above](#build-and-run)), contrib unless told otherwise.
 
 - **free**: a free compiler, for Intel GPUs (chosen in the order below).
-- **contrib**: intel/llvm with its CUDA target (`.tools/intel-llvm-contrib`; without one, setup asks and builds it here),
-  for Intel and NVIDIA GPUs.
+- **contrib**: for Intel and NVIDIA GPUs.
+  With an NVIDIA GPU on the machine it uses intel/llvm with its CUDA target (`.tools/intel-llvm-contrib`; without one, setup asks and builds it here),
+  without one a compiler chosen as for free.
   The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
 - **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
 

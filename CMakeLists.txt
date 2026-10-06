@@ -16,14 +16,14 @@ add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}"
 # AVX-512 kernels are per-file and chosen at run time either way).
 option(STRATA_PORTABLE "ggml-cpu for any AVX2 CPU; OFF: -march=native" ON)
 # The build's mode (AGENTS.md, "Free and non-free builds"), after the Debian archive's areas:
-# - free (the default): free software only, free enough for Debian main.  intel/llvm's DPC++ 7 or later (clang++ with
+# - free: free software only, free enough for Debian main.  intel/llvm's DPC++ 7 or later (clang++ with
 #   -fsycl; tools/intel_llvm_build.py builds it, or a distribution's package as new), for Intel GPUs.
-# - contrib: free software that needs non-free parts to build or run: intel/llvm with its CUDA target, for NVIDIA GPUs
-#   as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run, and oneMKL and
-#   cuBLAS for the dense products (through oneMath).
+# - contrib (the default): free software that needs non-free parts to build or run: intel/llvm with its CUDA target,
+#   for NVIDIA GPUs as well (STRATA_CUDA_ARCHS), which needs NVIDIA's CUDA toolkit to build and its driver to run, and
+#   oneMKL and cuBLAS for the dense products (through oneMath).
 # - contrib-icpx: the same with Intel oneAPI's icpx (and the runtime libraries it links, libimf, libsvml and others)
 #   and oneMKL, Intel GPUs only.
-set(STRATA_LICENSE free CACHE STRING "build mode: free, contrib or contrib-icpx")
+set(STRATA_LICENSE contrib CACHE STRING "build mode: free, contrib or contrib-icpx")
 set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib contrib-icpx)
 if(NOT STRATA_LICENSE MATCHES "^(free|contrib|contrib-icpx)$")
   message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: one of free, contrib, contrib-icpx")

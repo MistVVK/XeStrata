@@ -105,11 +105,12 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 setup checks the GPU, the RAM and the CPU, chooses a SYCL compiler, builds the engine, downloads the model and starts
 it. Your browser opens `http://127.0.0.1:8095`.
 
-- **The compiler:** setup uses a free compiler, intel/llvm's DPC++ 7 or later. When the distribution's `dpclang++`
-  is older, setup asks whether to build intel/llvm here (about 13 minutes; [details](docs/XE.md#the-sycl-compiler)).
+- **The compiler:** by default setup makes the contrib build with intel/llvm's DPC++ 7 or later, one with the CUDA target when there is an NVIDIA GPU.
+  When the distribution's `dpclang++` is older, setup asks whether to build intel/llvm here (about 13 minutes; [details](docs/XE.md#the-sycl-compiler)).
   When the GPU's XMX cannot be used, it asks whether to build without XMX or stop.
 
-  `--license contrib-icpx` builds with Intel oneAPI's icpx, `--license contrib` for NVIDIA GPUs as well (both use parts that are not free software).
+  contrib uses parts that are not free software (oneMKL, and the CUDA toolkit for an NVIDIA GPU).
+  `--license free` builds with free software only (Intel GPUs), `--license contrib-icpx` with Intel oneAPI's icpx.
 - **Time:** the first time, the download (60-110 GB) and the build take a while. If you stop it, the next run
   continues where it stopped. The driver compiles the GPU code the first time it is used, so setup ends by running
   the model once to get that done.
@@ -210,8 +211,8 @@ what has been checked in [docs/XE.md](docs/XE.md).
 ## For developers
 
 - **Three build modes,** chosen by the CMake option `STRATA_LICENSE`:
-   - free (the default): free software only, with intel/llvm's DPC++ as the compiler;
-   - contrib (`-DSTRATA_LICENSE=contrib`): intel/llvm with its CUDA target, making code for NVIDIA GPUs as well;
+   - free (`-DSTRATA_LICENSE=free`): free software only, with intel/llvm's DPC++ as the compiler;
+   - contrib (the default): intel/llvm with its CUDA target, making code for NVIDIA GPUs as well;
      it needs NVIDIA's CUDA toolkit and driver and oneMKL, none of them free software;
    - contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): may also use Intel oneAPI's icpx and other non-free tools, for Intel GPUs.
 

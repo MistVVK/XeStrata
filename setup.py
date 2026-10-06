@@ -763,9 +763,9 @@ def oneapi_lib_dirs() -> list:
 
 
 # ------------------------------------------------------------------------------------------------ the SYCL compiler
-# AGENTS.md, "Free and non-free builds": three build modes (--license).  free (the default) uses free software only:
+# AGENTS.md, "Free and non-free builds": three build modes (--license).  free uses free software only:
 # intel/llvm's DPC++ 7 or later, the distribution's (dpclang++) or one built from source (tools/intel_llvm_build.py,
-# --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib: intel/llvm
+# --intel-llvm-build; setup offers to build it when the distribution's is older), for Intel GPUs.  contrib (the default): intel/llvm
 # built with its CUDA target (.tools/intel-llvm-contrib), for Intel and NVIDIA GPUs, with oneMKL and cuBLAS for the
 # dense products.  contrib-icpx: Intel oneAPI's icpx and oneMKL,
 # Intel GPUs only.  Whether the Intel GPU has its matrix engines (XMX) for a compiler is asked of the GPU itself
@@ -793,7 +793,7 @@ def license_mode(a=None) -> str:
     if a is not None and getattr(a, "license", None):
         return a.license
     st = load_settings()
-    return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "free")
+    return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "contrib")
 
 
 def mkl_root() -> str | None:
@@ -958,10 +958,11 @@ def choose_compiler(a, gpu: dict) -> dict:
         comp = icpx_compiler()
         if comp is None:
             fail("--license contrib-icpx builds with Intel's icpx, which is not installed", ICPX_HOW)
-    elif mode == "contrib":
+    elif mode == "contrib" and cuda_archs():
         comp, d = contrib_compiler(a, st)
         kept = {"intel_llvm_contrib": str(d)}
     else:
+        # free, and contrib on a PC without NVIDIA GPUs: no CUDA target is needed, so the free mode's compiler
         llvm_dir = a.intel_llvm or st.get("intel_llvm")
         comp = None
         if llvm_dir:
@@ -985,6 +986,8 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp = free_compiler(build_intel_llvm(a))
             llvm_dir = str(INTEL_LLVM_DEFAULT)
         kept = {"intel_llvm": llvm_dir} if llvm_dir else {}
+        if mode == "contrib":
+            comp["license"], comp["onemkl"] = "contrib", intel_gpu_present()
     if comp["onemkl"] and mkl_root() is None:
         fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed", MKL_HOW)
     if gpu.get("vendor") == "nvidia":
@@ -2174,7 +2177,7 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
     ap.add_argument("--license", choices=LICENSES,
-                    help="the build mode: free (the default) builds with free software only, for Intel GPUs; contrib "
+                    help="the build mode: free builds with free software only, for Intel GPUs; contrib (the default) "
                          "builds with intel/llvm's CUDA target for Intel and NVIDIA GPUs, and hands the dense matrix "
                          "products to oneMKL and cuBLAS; contrib-icpx builds with Intel oneAPI's icpx and oneMKL, for "
                          "Intel GPUs, with the SYCL image encoder. Kept for later runs")

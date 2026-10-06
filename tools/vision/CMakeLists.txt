@@ -25,8 +25,8 @@ set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/main/llama.cpp" CAC
 option(STRATA_VISION_VULKAN "run the vision encoder on the GPU through Vulkan (builds ggml-vulkan)" OFF)
 option(STRATA_VISION_SYCL "run the vision encoder on the Intel GPU through SYCL (ggml-sycl; needs icpx and oneMKL)"
        OFF)
-# AGENTS.md: the free build (the default) uses free software only; ggml-sycl links oneMKL, which is not
-set(STRATA_LICENSE free CACHE STRING "build mode: free, contrib or contrib-icpx (icpx, oneMKL)")
+# AGENTS.md: the free build uses free software only; ggml-sycl links oneMKL, which is not
+set(STRATA_LICENSE contrib CACHE STRING "build mode: free, contrib or contrib-icpx (icpx, oneMKL)")
 if(STRATA_VISION_SYCL AND NOT STRATA_LICENSE STREQUAL "contrib-icpx")
   message(FATAL_ERROR "STRATA_VISION_SYCL needs oneMKL, which is not free software: use STRATA_VISION_VULKAN, or allow "
                       "it with -DSTRATA_LICENSE=contrib-icpx")

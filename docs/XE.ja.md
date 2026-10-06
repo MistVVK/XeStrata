@@ -80,13 +80,13 @@ nonfree のビルドの 4 トークンの窓は Intel のランタイムの中�
 CMake のオプション `STRATA_LICENSE` で選びます。
 分け方は Debian のアーカイブの main・contrib・non-free に合わせています。
 
-- **free**（既定、`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
+- **free**（`-DSTRATA_LICENSE=free`）: intel/llvm の DPC++ 7 以降（SYCL ランタイムが libsycl 9）でビルドします。
   自由ソフトウェアだけで済み、oneAPI の環境は使いません。
   `tools/intel_llvm_build.py` でソースからビルドしたもの（v7.1.1）で確かめています（[setup](#setup) を参照）。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、プロンプトの経路が約 1.6 倍遅くなっていました
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
-- **contrib**（`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
+- **contrib**（既定、`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
@@ -152,7 +152,7 @@ free の方式では次のとおりです（intel/llvm は `.tools/intel-llvm/in
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/llvm7 \
-  -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang \
+  -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_LICENSE=free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
@@ -199,7 +199,7 @@ setup.py が取ってきます。画像のエンコーダーは、その `tools/
 ```bash
 L=$PWD/.tools/intel-llvm/install
 cmake -S . -B build/llvm7 -DCMAKE_CXX_COMPILER=$L/bin/clang++ -DCMAKE_C_COMPILER=$L/bin/clang -DSTRATA_ENABLE_XE=ON \
-  -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
+  -DSTRATA_LICENSE=free -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/llvm7 --target strata -j6
 ```
 
@@ -255,11 +255,12 @@ icpx なら oneAPI のもの、ここで作った intel/llvm ならそのもの�
 
 ### SYCL のコンパイラ
 
-setup は、`--license` で選んだモード（[上](#ビルド)）でビルドします。指定がなければ free です。
+setup は、`--license` で選んだモード（[上](#ビルド)）でビルドします。指定がなければ contrib です。
 
 - **free**: 自由ソフトウェアのコンパイラで、Intel の GPU 向けに作ります（下の順で選びます）。
-- **contrib**: CUDA のターゲット付きの intel/llvm（`.tools/intel-llvm-contrib`、なければ尋ねてからここでビルドします）で、
-  Intel と NVIDIA の GPU 向けに作ります。
+- **contrib**: Intel と NVIDIA の GPU 向けに作ります。
+  NVIDIA の GPU があれば CUDA のターゲット付きの intel/llvm（`.tools/intel-llvm-contrib`、なければ尋ねてからここでビルドします）を、
+  なければ free と同じ順で選んだコンパイラを使います。
   NVIDIA の GPU のアーキテクチャは nvidia-smi の報告（compute capability）から決め、そのときは NVIDIA の CUDA ツールキット（`nvcc`）が要ります。
 - **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。
 

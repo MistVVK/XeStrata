@@ -103,12 +103,13 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んでエンジンをビルドし、モデルをダウンロードして起動します。
 ブラウザで `http://127.0.0.1:8095` が開きます。
 
-- **コンパイラ**: 自由ソフトウェアのコンパイラ（intel/llvm の DPC++ 7 以降）を使います。
+- **コンパイラ**: 既定は contrib のビルドで、intel/llvm の DPC++ 7 以降を使い、NVIDIA の GPU があれば CUDA のターゲット付きのものにします。
   ディストリビューションの `dpclang++` が 7 より古ければ、setup はこの場で intel/llvm をビルドするかを尋ねます（13 分ほど、
   [詳細](docs/XE.ja.md#sycl-のコンパイラ)）。
   GPU の XMX が使えないときは、XMX なしでビルドするか止めるかを尋ねます。
 
-  `--license contrib-icpx` で Intel oneAPI の icpx、`--license contrib` で NVIDIA の GPU も使えるビルドにします（どちらも自由ソフトウェアでない部品を使います）。
+  contrib は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
+  `--license free` で自由ソフトウェアだけ（Intel の GPU）、`--license contrib-icpx` で Intel oneAPI の icpx のビルドにします。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
   GPU のコードは初めて使うときにドライバーがコンパイルするので、setup は最後にモデルを一度動かしてそれを済ませます。
 - **起動中は PC が重くなります**: モデルを起動すると、RAM に 23〜50 GB を読み込みます。初回はとくに時間がかかり、
@@ -205,8 +206,8 @@ Intel の GPU では、XMX のある GPU は行列エンジンで、ない GPU �
 ## 開発する人へ
 
 - **ビルドの 3 つの方式**: CMake のオプション `STRATA_LICENSE` で選びます。
-   - free（既定）: 自由ソフトウェアだけでビルドします。コンパイラは intel/llvm の DPC++ です。
-   - contrib（`-DSTRATA_LICENSE=contrib`）: CUDA のターゲット付きの intel/llvm で、NVIDIA の GPU 向けのコードも作ります。
+   - free（`-DSTRATA_LICENSE=free`）: 自由ソフトウェアだけでビルドします。コンパイラは intel/llvm の DPC++ です。
+   - contrib（既定）: CUDA のターゲット付きの intel/llvm で、NVIDIA の GPU 向けのコードも作ります。
      NVIDIA の CUDA ツールキットとドライバー、oneMKL（どれも自由ソフトウェアではありません）が要ります。
    - contrib-icpx（`-DSTRATA_LICENSE=contrib-icpx`）: Intel oneAPI の icpx なども使えます。Intel の GPU だけを扱います。
    - contrib と contrib-icpx では、密な行列積を oneMath 経由で oneMKL（Intel）や cuBLAS（NVIDIA）に任せます。
