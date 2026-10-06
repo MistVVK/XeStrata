@@ -1286,8 +1286,9 @@ int main(int argc, char** argv) {
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
         if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
-        else if (ok)
-            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
+        else if (ok)   // without --split-device: the other discrete GPUs (the processor's own graphics only by name)
+            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d)
+                if (!strata::core::device_info(d).integrated) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
         if (ok && split_auto && split_devs.empty()) {
