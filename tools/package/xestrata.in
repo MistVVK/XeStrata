@@ -1,0 +1,13 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# xestrata - XeStrata's command in the deb and rpm packages: setup and start (setup.py, the same options as
+# ./setup.sh), or `xestrata chat` for the terminal chat (chat.py).  The Python files were compiled when the package
+# was built; nothing is written next to them.
+PYTHONDONTWRITEBYTECODE=1
+export PYTHONDONTWRITEBYTECODE
+if [ "$1" = chat ]; then
+  shift
+  exec python3 "@CMAKE_INSTALL_FULL_DATADIR@/xestrata/chat.py" "$@"
+fi
+exec python3 "@CMAKE_INSTALL_FULL_DATADIR@/xestrata/setup.py" "$@"

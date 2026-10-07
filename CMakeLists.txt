@@ -100,6 +100,8 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
+# The deb and rpm packages (cmake/packaging.cmake; tools/package/build.sh builds them in a clean container)
+option(STRATA_PACKAGE "install rules and CPack for the deb and rpm packages" OFF)
 
 # Warnings live on an INTERFACE target the project's own code links, NOT in add_compile_options: applied
 # globally they would also hit FetchContent'd Catch2, whose warnings are not this project's to fix.
@@ -751,4 +753,8 @@ if(STRATA_BUILD_TESTS)
   if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt)
     add_subdirectory(tests)
   endif()
+endif()
+
+if(STRATA_PACKAGE)
+  include(cmake/packaging.cmake)
 endif()

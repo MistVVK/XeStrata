@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The model set up last, served while the user is logged in: systemctl --user enable --now xestrata.  Only once a
+# model is set up (`xestrata` in a terminal): without one, setup would ask its questions with no one to answer.
+[Unit]
+Description=XeStrata (Qwen3.8-Flash-Next server)
+After=network.target
+ConditionPathExistsGlob=%h/.config/xestrata/xestrata-*.json
+
+[Service]
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/xestrata --no-browser
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
