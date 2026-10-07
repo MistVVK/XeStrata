@@ -206,7 +206,8 @@ setup's estimate of how much of a model the GPU holds is upstream's (its VRAM le
 The GPU, CPU, RAM and disk are in the [README](../README.md#what-you-need).
 This adds only what the README leaves out.
 
-- **Packages**: an Intel GPU needs its runtime (Level Zero), an NVIDIA GPU its driver and the CUDA toolkit, and an
+- **Packages**: with the deb and rpm packages ([README](../README.md#install)), apt or dnf installs what is needed.
+  From the source, an Intel GPU needs its runtime (Level Zero), an NVIDIA GPU its driver and the CUDA toolkit, and an
   Intel GPU in the default contrib build oneMKL. setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
   What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages).
@@ -217,7 +218,16 @@ This adds only what the README leaves out.
 - **Time**: the first run takes a while to download and to build the engine.
   With `--intel-llvm-build`, building intel/llvm takes another 13–20 minutes.
 
-The first start installs:
+With the packages, the first start writes these, and nothing in the program's folders (`/usr`):
+
+- `~/.local/share/xestrata`: the model files (`models/`, `packs/`, `mtp/`, 70–120 GB)
+- `~/.config/xestrata`: the settings (`settings.json`) and the model configs (`xestrata-<model>.json`)
+- `~/.local/state/xestrata`: the logs
+
+`xestrata --remove-data` lists them with their sizes and deletes them when you type yes.
+Removing the packages leaves them.
+
+Installed from the source, the first start installs:
 
 - in this XeStrata folder: `.venv/` (the Python environment), `engine/` (the built engine), `third_party/main/llama.cpp`,
   and with `--intel-llvm-build` `.tools/intel-llvm/`
@@ -233,6 +243,8 @@ setup finds the files there and writes the configs again.
 ## Install and start
 
 ### Run `./setup.sh`
+
+With the packages, run `xestrata` instead of `./setup.sh`: the same options, and no engine is built.
 
 **The first time** it asks a few questions and does the rest:
 

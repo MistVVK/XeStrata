@@ -209,7 +209,8 @@ GPU がモデルのどれだけを持てるかの setup の見積もりは upstr
 GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なもの) にあります。
 ここでは、それを補うことだけを書きます。
 
-- **パッケージ**: Intel の GPU にはそのランタイム（Level Zero）、NVIDIA の GPU にはドライバーと CUDA ツールキット、
+- **パッケージ**: deb と rpm のパッケージ（[README](../README.ja.md#インストール)）なら、要るものは apt や dnf が入れます。
+  ソースから入れるときは、Intel の GPU にはそのランタイム（Level Zero）、NVIDIA の GPU にはドライバーと CUDA ツールキット、
   既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、先に入れておきます。
   Ubuntu 26.04 と Fedora 44 で要るものは [BUILD.ja.md](BUILD.ja.md#パッケージ) にあります。
@@ -220,7 +221,16 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 - **時間**: 初回は、ダウンロードとエンジンのビルドに時間がかかります。
   `--intel-llvm-build` を使うなら、intel/llvm のビルドにさらに 13〜20 分かかります。
 
-初回の起動は、次のものを入れます。
+パッケージでは、初回の起動は次のものを書きます。プログラムのフォルダー（`/usr`）には何も書きません。
+
+- `~/.local/share/xestrata`: モデルのファイル（`models/`、`packs/`、`mtp/`、70〜120 GB）
+- `~/.config/xestrata`: 設定（`settings.json`）とモデルの設定（`xestrata-<モデル>.json`）
+- `~/.local/state/xestrata`: ログ
+
+`xestrata --remove-data` は、これらを大きさとともに一覧し、yes と打てば消します。
+パッケージを消しても、これらは残ります。
+
+ソースから入れたときは、初回の起動は次のものを入れます。
 
 - この XeStrata のフォルダーに: `.venv/`（Python の環境）、`engine/`（ビルドしたエンジン）、`third_party/main/llama.cpp`、
   `--intel-llvm-build` なら `.tools/intel-llvm/`
@@ -237,6 +247,8 @@ setup はそこでファイルを見つけ、設定を書き直します。
 ## インストールと起動
 
 ### `./setup.sh` を実行する
+
+パッケージでは、`./setup.sh` の代わりに `xestrata` を実行します。オプションは同じで、エンジンのビルドはしません。
 
 **初回**は、いくつか質問をして、あとは自分で進めます。
 
