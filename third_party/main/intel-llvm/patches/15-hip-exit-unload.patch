@@ -1,0 +1,64 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-exit-unload: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+At a process's exit the SYCL runtime unregisters its device images from the executable's finalizers, which
+run after the HIP runtime has torn itself down, and the HIP adapter's urProgramRelease then unloaded the
+module: glibc aborted with "double free or corruption" in amd::roc::Device::RemoveKernel, so every SYCL
+program that had used an AMD GPU ended with SIGABRT.  Fixed, an exit handler registered once a module is
+loaded (after the HIP runtime is up, so it runs before the runtime's teardown) marks the exit, and a program
+released after it is not unloaded: the process is ending and the driver reclaims it.
+---
+diff --git a/unified-runtime/source/adapters/hip/program.cpp b/unified-runtime/source/adapters/hip/program.cpp
+index cd45448..0e4955e 100644
+--- a/unified-runtime/source/adapters/hip/program.cpp
++++ b/unified-runtime/source/adapters/hip/program.cpp
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: no module unload after the process began to exit (hip-exit-unload)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -17,7 +18,21 @@
+ #else
+ #include <amd_comgr/amd_comgr.h>
+ #endif
++
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
+ namespace {
++// Set by an exit handler registered after the HIP runtime is up, so it runs
++// before the runtime's own teardown: a program released after that (the SYCL
++// runtime unregisters its device images in the executable's finalizers) is
++// not unloaded, as the runtime's module structures are gone by then
++std::atomic<bool> ProcessExiting{false};
++void watchProcessExit() {
++  static std::once_flag Flag;
++  std::call_once(Flag, [] { std::atexit([] { ProcessExiting = true; }); });
++}
++
+ template <typename ReleaseType, ReleaseType Release, typename T>
+ struct COMgrObjCleanUp {
+   COMgrObjCleanUp(T Obj) : Obj{Obj} {}
+@@ -235,6 +250,7 @@ ur_result_t ur_program_handle_t_::buildProgram(const char *BuildOptions) {
+ 
+   UR_CHECK_ERROR(hipModuleLoadDataEx(&Module, static_cast<const void *>(Binary),
+                                      NumberOfOptions, Options, OptionVals));
++  watchProcessExit();
+ 
+   BuildStatus = UR_PROGRAM_BUILD_STATUS_SUCCESS;
+ 
+@@ -447,7 +463,7 @@ urProgramRelease(ur_program_handle_t hProgram) {
+     try {
+       ScopedDevice Active(hProgram->getDevice());
+       auto HIPModule = hProgram->get();
+-      if (HIPModule) {
++      if (HIPModule && !ProcessExiting) {
+         UR_CHECK_ERROR(hipModuleUnload(HIPModule));
+       }
+     } catch (ur_result_t Err) {

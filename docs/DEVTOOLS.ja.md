@@ -107,7 +107,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 8 つで、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 10 で、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -126,6 +126,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   修正後は `amdgcn--amdhsa` を受け付けます（`hip-libclc-target`。`sycl` ブランチでは libclc の AMD の対象の作りが変わっています）。
   8 つ目: HIP のアダプタも、3 つ目の CUDA と同じく、ホストのメモリの登録を何もしない関数のまま関数表から漏らしていて、ローダーが `UR_RESULT_ERROR_UNINITIALIZED` で断っていました（`pinned_shared_test` と `elementwise_parity` が落ちていました）。
   修正後は `hipHostRegister` でページを固定し、関数表にも入れます（`hip-host-register`。RX 9060 XT で CTest が通りました）。
+  9 つ目: HIP のアダプタのキューが空かどうかの問い合わせが、まだ動いているストリームの答え（`hipErrorNotReady`）をエラーとして毎回記録していました。
+  修正後は CUDA のアダプタと同じく、記録せずに「空でない」と答えます（`hip-queue-empty`）。
+  10 番目: プロセスの終了時、SYCL のランタイムが実行ファイルの終了処理でデバイスの像を外すころには HIP のランタイムがもう片付いていて、HIP のアダプタがモジュールを外すときに glibc が「double free or corruption」で止めていました（AMD の GPU を使った SYCL のプログラムはどれも SIGABRT で終わっていました）。
+  修正後は、終了が始まったあとに解放するプログラムのモジュールは外しません（`hip-exit-unload`）。
   CUDA の修正は contrib のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
