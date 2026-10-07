@@ -1,0 +1,82 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-host-register: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The HIP adapter's host memory registration (urUSMImportExp, urUSMReleaseExp, which
+sycl_ext_oneapi_copy_optimize's prepare_for_device_copy calls) did nothing, and the adapter left them out
+of its table, so the loader refused them (UR_RESULT_ERROR_UNINITIALIZED), as the CUDA adapter did before
+cuda-host-register and cuda-host-register-table.  Fixed, the memory is page-locked with hipHostRegister
+(portable: for every device), so copies from it are DMA transfers, and the functions are in the table.
+---
+diff --git a/unified-runtime/source/adapters/hip/ur_interface_loader.cpp b/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
+index 35b7945..3e02e89 100644
+--- a/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
++++ b/unified-runtime/source/adapters/hip/ur_interface_loader.cpp
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration in the adapter's table (hip-host-register)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -441,6 +442,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
+   pDdiTable->pfnPoolGetDevicePoolExp = urUSMPoolGetDevicePoolExp;
+   pDdiTable->pfnPoolTrimToExp = urUSMPoolTrimToExp;
+   pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;
++  pDdiTable->pfnImportExp = urUSMImportExp;
++  pDdiTable->pfnReleaseExp = urUSMReleaseExp;
+   return UR_RESULT_SUCCESS;
+ }
+ 
+diff --git a/unified-runtime/source/adapters/hip/usm.cpp b/unified-runtime/source/adapters/hip/usm.cpp
+index aa2b945..241a9bf 100644
+--- a/unified-runtime/source/adapters/hip/usm.cpp
++++ b/unified-runtime/source/adapters/hip/usm.cpp
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration with hipHostRegister (hip-host-register)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -270,14 +271,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
+   return UR_RESULT_SUCCESS;
+ }
+ 
+-UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t, void *,
+-                                                   size_t Size) {
++UR_APIEXPORT ur_result_t UR_APICALL urUSMImportExp(ur_context_handle_t hContext,
++                                                   void *pMem, size_t Size) {
+   UR_ASSERT(Size > 0, UR_RESULT_ERROR_INVALID_VALUE);
++  // page-locked for every device, so copies from and to it are DMA transfers
++  try {
++    ScopedDevice Active(hContext->getDevices()[0]);
++    const hipError_t Result =
++        hipHostRegister(pMem, Size, hipHostRegisterPortable);
++    if (Result != hipErrorHostMemoryAlreadyRegistered)
++      UR_CHECK_ERROR(Result);
++  } catch (ur_result_t Err) {
++    return Err;
++  }
+   return UR_RESULT_SUCCESS;
+ }
+ 
+-UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t,
+-                                                    void *) {
++UR_APIEXPORT ur_result_t UR_APICALL urUSMReleaseExp(ur_context_handle_t hContext,
++                                                    void *pMem) {
++  try {
++    ScopedDevice Active(hContext->getDevices()[0]);
++    const hipError_t Result = hipHostUnregister(pMem);
++    if (Result != hipErrorHostMemoryNotRegistered)
++      UR_CHECK_ERROR(Result);
++  } catch (ur_result_t Err) {
++    return Err;
++  }
+   return UR_RESULT_SUCCESS;
+ }
+ 
