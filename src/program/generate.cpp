@@ -1639,12 +1639,6 @@ int main(int argc, char** argv) {
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
     if (multi_gpu)
         for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
-    strata::prefill::Gemm::prepare();
-    if (multi_gpu)
-        for (const int d : split_devs) {
-            const strata::core::OnDevice on(d);
-            strata::prefill::Gemm::prepare();
-        }
     {
         // the GPU this run drives and the paths it takes (chosen from what it reports, never from its name)
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
@@ -3010,6 +3004,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: pre-filled %lld of %lld slots from the profile; slot 0 verified\n",
                      (long long) prefilled, (long long) want);
     }
+    // The matrix products' library (oneMath's backend) is loaded once the cache is sized, beside the rest of the start,
+    // so that what it holds comes out of the reserve as other run-time allocations do, not out of the cache: hipBLASLt
+    // holds 0.2-0.3 GiB (172 MiB for its handle, ~78 for each kernel type's code), which loaded before the sizing cost
+    // the RX 9060 XT 209 slots and 6% of its decode speed.
+    strata::prefill::Gemm::prepare();
+    if (multi_gpu)
+        for (const int d : split_devs) {
+            const strata::core::OnDevice on(d);
+            strata::prefill::Gemm::prepare();
+        }
 
 
     for (auto& stp : stages) {
