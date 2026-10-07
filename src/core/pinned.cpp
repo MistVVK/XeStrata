@@ -67,6 +67,26 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
         start = end;
     }
 }
+
+// Upstream #771: with transparent huge pages "always" the kernel backs a mapping with huge pages where it can; an
+// extra MADV_HUGEPAGE only adds direct reclaim and compaction on every fault (defrag=madvise), which on a fragmented
+// machine stretched a 25 s start to 432 s.  So it is not asked for there; STRATA_NO_ARENA_THP=1 skips it anywhere.
+// Returns why it was skipped, or an empty string when it should be asked for.
+std::string thp_request_skipped() {
+    if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+    std::string mode;
+    if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
+        char line[128] = {0};
+        if (std::fgets(line, sizeof line, f) != nullptr) {
+            const char* open = std::strchr(line, '[');
+            const char* close = open ? std::strchr(open, ']') : nullptr;
+            if (open && close) mode.assign(open + 1, close);
+        }
+        std::fclose(f);
+    }
+    return mode == "always" ? "transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
+                            : std::string();
+}
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
@@ -83,7 +103,8 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
         throw DeviceError("mmap of the expert arena failed for " + std::to_string(bytes) + " bytes");
     }
     base = (void*) (((uintptr_t) map_ + kHugePage - 1) & ~(uintptr_t) (kHugePage - 1));
-    const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+    const std::string thp_skip = thp_request_skipped();
+    const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
     try {
         register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_);
@@ -102,7 +123,9 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
     note = std::string("one mapping registered for device copies") +
            (reg_.size() > 1 ? " in " + std::to_string(reg_.size()) + " pieces (the GPU's largest allocation)" : "") +
            "; " +
-           (huge ? "transparent huge pages requested (madvise)" : "madvise(MADV_HUGEPAGE) refused: 4 KB pages") +
+           (!thp_skip.empty() ? thp_skip
+            : huge             ? "transparent huge pages requested (madvise)"
+                               : "madvise(MADV_HUGEPAGE) refused: 4 KB pages") +
            "; no mlock";
 }
 
@@ -204,7 +227,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                  (off_t) kArenaHeaderBytes) == MAP_FAILED) {
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
-        const bool huge = madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
+        const bool huge = thp_request_skipped().empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
         register_pieces((uint8_t*) base, bytes, bounds, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
