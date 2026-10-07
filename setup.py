@@ -1578,7 +1578,7 @@ def data_folder(requested: str | None) -> tuple:
                 (folder / d).rmdir()                    # empty now
             except OSError:
                 pass
-        for c in folder.glob("xestrata-*.json"):
+        for c in model_config_files(folder):
             repoint_config(c, folder, dest)
         if has_data(folder):
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
@@ -1635,11 +1635,17 @@ def remove_data() -> int:
     return 0
 
 
+def model_config_files(folder: Path) -> list:
+    """Upstream #346: the xestrata-*.json files of a folder that can be model configs. The server keeps a config's Chat
+    settings next to it as xestrata-<model>.shared-settings.json: it matches the pattern but is no config."""
+    return [p for p in folder.glob("xestrata-*.json") if not p.name.endswith(".shared-settings.json")]
+
+
 def previous_config(elsewhere_first: list, settings: dict):
     """The most recently used model config of another Strata folder on this PC, for a folder that has none yet."""
     cands = []
     for folder in [*elsewhere_first, *other_installs(settings)]:
-        cands += list(folder.glob("xestrata-*.json"))
+        cands += model_config_files(folder)
     cands = [c for c in dict.fromkeys(cands) if c.is_file()]
     return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
 
@@ -1699,7 +1705,7 @@ def model_config(path: Path) -> bool:
 
 
 def installed_configs():
-    return [p for p in sorted(CONF.glob("xestrata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p in sorted(model_config_files(CONF), key=lambda p: p.stat().st_mtime, reverse=True)
             if model_config(p)]
 
 
