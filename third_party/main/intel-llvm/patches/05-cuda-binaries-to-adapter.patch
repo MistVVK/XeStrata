@@ -8,10 +8,18 @@ The SYCL runtime hands the CUDA adapter the device images themselves, as it does
 cuda-select-binary-2 (the several-images path; with cuda-binaries-to-adapter-2).
 ---
 diff --git a/sycl/source/detail/program_manager/program_manager.cpp b/sycl/source/detail/program_manager/program_manager.cpp
-index 58773bb..9421e81 100644
+index 8e43d89..1309a75 100644
 --- a/sycl/source/detail/program_manager/program_manager.cpp
 +++ b/sycl/source/detail/program_manager/program_manager.cpp
-@@ -1267,10 +1267,12 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
+@@ -4,6 +4,7 @@
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ // Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed the device image itself (cuda-binary-to-adapter)
++// Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed every NVIDIA image (cuda-binaries-to-adapter)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -1268,10 +1269,12 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
      return nullptr;
  
    const size_t NumImgs = DeviceFilteredImgs.size();

@@ -13,10 +13,15 @@ amdgcn--amdhsa is a known target.  The sycl branch has reorganized libclc's AMD 
 (amdgcn-amd-amdhsa-llvm).
 ---
 diff --git a/libclc/CMakeLists.txt b/libclc/CMakeLists.txt
-index d723fea52..a2c746f1e 100644
+index d723fea..25f8f2a 100644
 --- a/libclc/CMakeLists.txt
 +++ b/libclc/CMakeLists.txt
-@@ -175,6 +175,7 @@ endif()
+@@ -1,3 +1,4 @@
++# Modified 2026 by MistVVK and the XeStrata contributors: amdgcn--amdhsa is a known target (hip-libclc-target)
+ cmake_minimum_required(VERSION 3.20.0)
+ 
+ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+@@ -175,6 +176,7 @@ endif()
  # List of all targets. Note that some are added dynamically below.
  set( LIBCLC_TARGETS_ALL
    amdgcn--
@@ -24,7 +29,7 @@ index d723fea52..a2c746f1e 100644
    amdgcn-amd-amdhsa
    clspv--
    clspv64--
-@@ -253,6 +254,7 @@ add_subdirectory( utils )
+@@ -253,6 +255,7 @@ add_subdirectory( utils )
  set( r600--_devices cedar cypress barts cayman )
  set( amdgcn--_devices tahiti )
  set( amdgcn-mesa-mesa3d_devices ${amdgcn--_devices} )

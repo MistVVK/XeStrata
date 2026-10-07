@@ -8,10 +8,18 @@ The HIP adapter copied the command-buffer's map of sync points for every node it
 a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms).
 ---
 diff --git a/unified-runtime/source/adapters/hip/command_buffer.cpp b/unified-runtime/source/adapters/hip/command_buffer.cpp
-index c75375d..30da35a 100644
+index c75375d..2f495e9 100644
 --- a/unified-runtime/source/adapters/hip/command_buffer.cpp
 +++ b/unified-runtime/source/adapters/hip/command_buffer.cpp
-@@ -103,7 +103,7 @@ static ur_result_t getNodesFromSyncPoints(
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: the command-buffer's sync points are not copied for every node (hip-sync-points)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -103,7 +104,7 @@ static ur_result_t getNodesFromSyncPoints(
      std::vector<hipGraphNode_t> &HIPNodesList) {
    // Map of ur_exp_command_buffer_sync_point_t to ur_event_handle_t defining
    // the event associated with each sync-point

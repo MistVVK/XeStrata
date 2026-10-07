@@ -9,10 +9,18 @@ now they page-lock the memory with cuMemHostRegister, so copies from it are DMA 
 GPU's work.
 ---
 diff --git a/unified-runtime/source/adapters/cuda/usm.cpp b/unified-runtime/source/adapters/cuda/usm.cpp
-index c805c10..1d021d3 100644
+index c805c10..f307c5f 100644
 --- a/unified-runtime/source/adapters/cuda/usm.cpp
 +++ b/unified-runtime/source/adapters/cuda/usm.cpp
-@@ -203,14 +203,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration with cuMemHostRegister (cuda-host-register)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -203,14 +204,32 @@ urUSMGetMemAllocInfo(ur_context_handle_t hContext, const void *pMem,
    return Result;
  }
  

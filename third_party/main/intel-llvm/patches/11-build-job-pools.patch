@@ -10,10 +10,15 @@ job pools again.  A pool defined twice makes Ninja refuse the build file ("dupli
 limited the links.  Fixed, each pool is appended only once.
 ---
 diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
-index d0a094fa0..7ee095fb8 100644
+index d0a094f..e4ae4c2 100644
 --- a/llvm/cmake/modules/HandleLLVMOptions.cmake
 +++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
-@@ -57,7 +57,12 @@ if(LLVM_PARALLEL_COMPILE_JOBS)
+@@ -1,3 +1,4 @@
++# Modified 2026 by MistVVK and the XeStrata contributors: each job pool is defined once (build-job-pools)
+ # This CMake module is responsible for interpreting the user defined LLVM_
+ # options and executing the appropriate CMake commands to realize the users'
+ # selections.
+@@ -57,7 +58,12 @@ if(LLVM_PARALLEL_COMPILE_JOBS)
    if(NOT CMAKE_GENERATOR MATCHES "Ninja")
      message(WARNING "Job pooling is only available with Ninja generators.")
    else()
@@ -27,7 +32,7 @@ index d0a094fa0..7ee095fb8 100644
      set(CMAKE_JOB_POOL_COMPILE compile_job_pool)
    endif()
  endif()
-@@ -81,7 +86,10 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
+@@ -81,7 +87,10 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
      set(LLVM_PARALLEL_LINK_JOBS "2")
    endif()
    if(LLVM_PARALLEL_LINK_JOBS)

@@ -8,10 +8,18 @@ The CUDA adapter left urUSMImportExp and urUSMReleaseExp out of its table, so th
 (UR_RESULT_ERROR_UNINITIALIZED); with cuda-host-register.
 ---
 diff --git a/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp b/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
-index 50c588d..836bc02 100644
+index 50c588d..64ad4b7 100644
 --- a/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
 +++ b/unified-runtime/source/adapters/cuda/ur_interface_loader.cpp
-@@ -444,6 +444,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: host memory registration in the adapter's table (cuda-host-register-table)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -444,6 +445,8 @@ UR_DLLEXPORT ur_result_t UR_APICALL urGetUSMExpProcAddrTable(
    pDdiTable->pfnPoolGetDevicePoolExp = urUSMPoolGetDevicePoolExp;
    pDdiTable->pfnPoolTrimToExp = urUSMPoolTrimToExp;
    pDdiTable->pfnContextMemcpyExp = urUSMContextMemcpyExp;

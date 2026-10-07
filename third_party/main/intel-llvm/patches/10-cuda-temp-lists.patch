@@ -10,10 +10,18 @@ lists as PTX and objects, so every link left each device image's split bitcode, 
 (22 GB of a tmpfs /tmp in a day of builds).  spir64 registers them as lists and leaves nothing.
 ---
 diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
-index 7aeb681..b2eb487 100644
+index 7aeb681..68eed8b 100644
 --- a/clang/lib/Driver/ToolChains/Clang.cpp
 +++ b/clang/lib/Driver/ToolChains/Clang.cpp
-@@ -11088,6 +11088,11 @@ void SYCLPostLink::ConstructJob(Compilation &C, const JobAction &JA,
+@@ -3,6 +3,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: temporary lists and tables registered with their types (cuda-temp-lists)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -11088,6 +11089,11 @@ void SYCLPostLink::ConstructJob(Compilation &C, const JobAction &JA,
           "single input file expected");
    addArgs(CmdArgs, TCArgs, {Inputs.front().getFilename()});
    std::string OutputFileName(Output.getFilename());
@@ -26,10 +34,18 @@ index 7aeb681..b2eb487 100644
    // All the inputs are encoded as commands.
    C.addCommand(std::make_unique<Command>(
 diff --git a/clang/lib/Driver/ToolChains/SYCL.cpp b/clang/lib/Driver/ToolChains/SYCL.cpp
-index 9a234ee..bddf4bc 100644
+index 9a234ee..24e149c 100644
 --- a/clang/lib/Driver/ToolChains/SYCL.cpp
 +++ b/clang/lib/Driver/ToolChains/SYCL.cpp
-@@ -166,6 +166,11 @@ void SYCL::constructLLVMForeachCommand(Compilation &C, const JobAction &JA,
+@@ -3,6 +3,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: temporary lists and tables registered with their types (cuda-temp-lists)
+ //
+ //===----------------------------------------------------------------------===//
+ #include "SYCL.h"
+@@ -166,6 +167,11 @@ void SYCL::constructLLVMForeachCommand(Compilation &C, const JobAction &JA,
    // llvm-foreach --in-file-list=a.list --in-replace='{}' -- echo '{}'
    ArgStringList ForeachArgs;
    std::string OutputFileName(T->getToolChain().getInputFilename(Output));

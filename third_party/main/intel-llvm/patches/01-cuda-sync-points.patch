@@ -8,10 +8,18 @@ The CUDA adapter copied the command-buffer's map of sync points for every node i
 a SYCL graph took the square of its node count (2600 kernels: 90 ms on an RTX 4070; Level Zero 2 ms).
 ---
 diff --git a/unified-runtime/source/adapters/cuda/command_buffer.cpp b/unified-runtime/source/adapters/cuda/command_buffer.cpp
-index c33719b..62831b8 100644
+index c33719b..45eef0f 100644
 --- a/unified-runtime/source/adapters/cuda/command_buffer.cpp
 +++ b/unified-runtime/source/adapters/cuda/command_buffer.cpp
-@@ -158,7 +158,7 @@ static ur_result_t getNodesFromSyncPoints(
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: the command-buffer's sync points are not copied for every node (cuda-sync-points)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -158,7 +159,7 @@ static ur_result_t getNodesFromSyncPoints(
      std::vector<CUgraphNode> &CuNodesList) {
    // Map of ur_exp_command_buffer_sync_point_t to ur_event_handle_t defining
    // the event associated with each sync-point

@@ -7,10 +7,18 @@ cuda-binaries-to-adapter-2: a fix to intel/llvm v7.1.1, applied by tools/intel_l
 The second half of cuda-binaries-to-adapter: the images stored for the CUDA adapter as for the HIP one.
 ---
 diff --git a/sycl/source/detail/program_manager/program_manager.cpp b/sycl/source/detail/program_manager/program_manager.cpp
-index 9421e81..f2321ce 100644
+index 1309a75..2319ad2 100644
 --- a/sycl/source/detail/program_manager/program_manager.cpp
 +++ b/sycl/source/detail/program_manager/program_manager.cpp
-@@ -1281,7 +1281,7 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+ // Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed the device image itself (cuda-binary-to-adapter)
+ // Modified 2026 by MistVVK and the XeStrata contributors: the CUDA adapter is handed every NVIDIA image (cuda-binaries-to-adapter)
++// Modified 2026 by MistVVK and the XeStrata contributors: NVIDIA images in a fatbin selected by architecture (cuda-binaries-to-adapter-2)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -1283,7 +1284,7 @@ const RTDeviceBinaryImage *getBinImageFromMultiMap(
          DeviceFilteredImgs[BinaryCount]->getRawData();
      UrBinaries[BinaryCount].pDeviceTargetSpec =
          getUrDeviceTarget(RawImg.DeviceTargetSpec);

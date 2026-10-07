@@ -9,10 +9,18 @@ reported no matrix combinations; such a GPU runs sm_90's shapes (the mma instruc
 compute capability of 9.0 or more the table lacks reports those.
 ---
 diff --git a/sycl/source/detail/device_impl.hpp b/sycl/source/detail/device_impl.hpp
-index bf3d38a..0cd2a33 100644
+index bf3d38a..0e18943 100644
 --- a/sycl/source/detail/device_impl.hpp
 +++ b/sycl/source/detail/device_impl.hpp
-@@ -2219,6 +2219,12 @@ public:
+@@ -3,6 +3,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: matrix combinations for compute capabilities above 9.0 (cuda-newer-matrix)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -2219,6 +2220,12 @@ public:
          return 0.f;
        };
        float ComputeCapability = GetArchNum(DeviceArch);
