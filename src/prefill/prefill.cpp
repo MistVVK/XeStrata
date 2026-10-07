@@ -110,24 +110,35 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 struct Alloc {
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
+    uint64_t failed_bytes = 0;          ///< the take that could not be allocated; the failure message names it
     bool count_only = false;
     std::vector<void*>* owned = nullptr;
     template <typename T> T* take(size_t n, bool& ok) {
         const uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) { used += bytes; return nullptr; }
         if (base != nullptr) {
-            if (used + bytes > cap) { ok = false; return nullptr; }
+            if (used + bytes > cap) { ok = false; failed_bytes = bytes; return nullptr; }
             T* p = (T*) (base + used);
             used += bytes;
             return p;
         }
         void* p = nullptr;
-        if (!strata::gpu::alloc_device(&p, bytes)) { ok = false; return nullptr; }
+        if (!strata::gpu::alloc_device(&p, bytes)) { ok = false; failed_bytes = bytes; return nullptr; }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
     }
 };
+
+// upstream 4a9b9041 (#796): what a failed carve had and wanted, for the "do not fit" error
+std::string fit_failure(const Alloc& o) {
+    size_t fb = 0, tb = 0;
+    const bool known = strata::gpu::mem_info(&fb, &tb);
+    return " (" + (known ? std::to_string(fb >> 20) + " of " + std::to_string(tb >> 20) + " MiB free at the failure; "
+                         : std::string()) +
+           std::to_string(o.used >> 20) + " MiB taken, the failing buffer wanted " + std::to_string(o.failed_bytes >> 20) +
+           " MiB)";
+}
 
 }  // namespace
 
@@ -579,7 +590,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
     }
     if (!carve(T, &o)) {
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
+              fit_failure(o);
         return false;
     }
     return true;
@@ -693,7 +705,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH);
     if (!ok || !carve((size_t) chunk, &o)) {
-        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
+              fit_failure(o);
         return false;
     }
     return true;
