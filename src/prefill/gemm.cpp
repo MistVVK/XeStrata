@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::prefill {
 
@@ -247,6 +248,26 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
     else
         strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+}
+
+bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds, int G,
+                      int64_t N, int64_t K, void* stream) {
+#if STRATA_ONEMATH
+    // Only where the grouped kernel would run on DP4a: with matrix engines it beats a product an expert (on the B70 56
+    // and 55 TFLOP/s against oneMKL's 45 and 44).  Without them, a product an expert (dozens to hundreds of rows): a
+    // 4K prompt's experts took 1.7 s through hipBLASLt on the RX 9060 XT, against 8.5 s in the grouped DP4a kernel.  A
+    // failed product leaves the whole call to the grouped kernel, which writes every row again.
+    if (std::strcmp(strata::kernels::gemm_path(XmxType::f16), "DP4a") != 0) return false;
+    for (int e = 0; e < G; ++e) {
+        const int64_t r0 = bounds[e], rows = (int64_t) bounds[e + 1] - r0;
+        if (rows > 0 && !blas<sycl::half>(X + r0 * K, W + e * w_stride, Y + r0 * N, rows, N, K, N, false, stream))
+            return false;
+    }
+    return true;
+#else
+    (void) X; (void) W; (void) w_stride; (void) Y; (void) bounds; (void) G; (void) N; (void) K; (void) stream;
+    return false;
+#endif
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

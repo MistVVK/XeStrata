@@ -1789,12 +1789,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                         const int64_t r0 = m.xb_host[j0], nr = m.xb_host[j + 1] - r0;
                         pt.mark(kPfGemmGU, cs);
-                        strata::kernels::xmx_gemm_grouped(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_dev + j0, q + 1, maxr,
-                                                          1280, N, m.cs);
+                        if (!Gemm::f16_groups(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_host.data() + j0, q + 1, 1280, N, m.cs))
+                            strata::kernels::xmx_gemm_grouped(m.Xs, m.dq_gu, GU_ELEMS, m.GU, m.xb_dev + j0, q + 1, maxr,
+                                                              1280, N, m.cs);
                         swiglu_interleaved(m.GU + r0 * 1280, m.Hh + r0 * 640, nr, m.cs);
                         pt.mark(kPfGemmD, cs);
-                        strata::kernels::xmx_gemm_grouped(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_dev + j0, q + 1, maxr, N,
-                                                          640, m.cs);
+                        if (!Gemm::f16_groups(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_host.data() + j0, q + 1, N, 640, m.cs))
+                            strata::kernels::xmx_gemm_grouped(m.Hh, m.dq_d, D_ELEMS, m.Dm, m.xb_dev + j0, q + 1, maxr, N,
+                                                              640, m.cs);
                         return true;
                     };
                     if (!stream_all) {
