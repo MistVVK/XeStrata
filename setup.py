@@ -138,7 +138,10 @@ MODELS: dict[str, dict[str, Any]] = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
                             "experts come from the SSD while it answers, so it is slower than the 2-3-bit "
                             "models", "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",),
-                   "budget": True, "experimental": True},
+                   "budget": True, "experimental": True,
+                   # upstream #967: images are allowed (the same base model and image encoder as UD-IQ4_XS), with a
+                   # warning: reported working by hand upstream (#967, #971), not run with this file
+                   "vision": True, "vision_untested": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -2721,7 +2724,7 @@ def main() -> int:
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values"}[kv])
-    if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
+    if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
         vision = "none"
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {model} yet: off")
@@ -2736,6 +2739,9 @@ def main() -> int:
         vision = "gpu" if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
+    if vision != "none" and MODELS[model].get("vision_untested"):
+        warn(f"images with {model} are untested: users report them working upstream, but this file has not been run "
+             "with images (upstream #967); tell us if the answers look wrong")
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model
     # files into RAM once (--resident-experts; the engine keeps what fits the RAM it finds free and reads the rest
     # from the files).  mmap: they are read through the OS file cache.  The GPU's share: its VRAM less the dense

@@ -298,8 +298,9 @@ class Validation(FakeRoot):
         self.assertRejected("strata_install", {"backend": "hip"}, "unknown argument")
         self.assertRejected("strata_install", {"command": "setup.py --build"}, "unknown argument")
         self.assertRejected("strata_install", {"family": "swift", "model": "IQ3_S"}, "has no IQ3_S")
-        self.assertRejected("strata_install", {"family": "unsloth", "model": "UD-Q4_K_XL", "vision": "yes"},
-                            "images are not available")
+        res, err = self.call("strata_install", {"family": "unsloth", "model": "UD-Q4_K_XL", "vision": "yes"})
+        self.assertFalse(err, res)                      # #967: images are allowed with UD-Q4_K_XL (setup warns)
+        self.assertEqual(res["plan"]["images"], "yes")
         self.assertRejected("strata_install", {"vision": "yes\nrm"}, "control characters")
 
     def test_data_dir_paths(self):
@@ -563,7 +564,7 @@ class Helpers(unittest.TestCase):
         self.assertTrue(fam["images"])
         by = {x["model"]: x for x in fam["sizes"]}
         self.assertEqual((by["UD-IQ4_XS"]["experimental"], by["UD-IQ4_XS"]["images"]), (False, True))
-        self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, False))
+        self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, True))   # #967
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
 

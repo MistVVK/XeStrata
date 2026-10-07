@@ -157,7 +157,7 @@ It keeps a RAM budget of them, the most-used first after the ones the GPU holds 
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:
 36 GiB on a 64 GB PC with a 128K context.
 The rest come from the SSD while it answers.
-No images yet.
+Images can be chosen, with a warning that this file has not been run with them (upstream #967; reported working upstream).
 
 ```sh
 ./setup.sh --setup --family unsloth

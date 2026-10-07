@@ -69,7 +69,7 @@ FALLBACK_MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
                             "experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth",), "budget": True,
-                   "experimental": True},
+                   "experimental": True, "vision": True},   # upstream #967: images allowed (setup warns: untested)
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
