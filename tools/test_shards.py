@@ -75,6 +75,23 @@ class ShardCheck(unittest.TestCase):
         self.assertIn(f"{whole - 40:,} of {whole:,} bytes", msg)
         self.assertIn("40 missing", msg)
 
+    def test_single_tensor_shard_with_extra_bytes_is_refused(self):
+        # #657: the PLE table's shard is exactly as long as its one tensor; 612 extra bytes are a damaged file
+        s = self.dir / "m-00002-of-00002.gguf"
+        whole = write_gguf(s, names=("per_layer_token_embd.weight",))
+        S.check_shards([s])
+        s.write_bytes(s.read_bytes() + bytes(612))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        msg = str(cm.exception)
+        self.assertIn("m-00002-of-00002.gguf is longer than its tensor", msg)
+        self.assertIn(f"{whole + 612:,} bytes, {whole:,} expected", msg)
+        # a shard with several tensors is not held to the rule
+        t = self.dir / "m-00001-of-00002.gguf"
+        write_gguf(t)
+        t.write_bytes(t.read_bytes() + bytes(612))
+        S.check_shards([t])
+
     def test_truncated_header_is_refused(self):
         s = self.dir / "m-00001-of-00002.gguf"
         write_gguf(s)
