@@ -73,20 +73,34 @@ python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree
 clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォルダーは消します（その大きさは測っていません）。
 このランタイムは Arc Pro B70 に XMX（FP16 と BF16）を使わせます。6.2 のランタイムは使わせません。
 
-### contrib 用のビルド（CUDA と HIP）
+### HIP（AMD の GPU）
+
+ROCm の HIP が入っていれば、スクリプトは HIP のターゲット（AMD の GPU）も付けてビルドします（free と contrib のどちらでも）。
+HIP も ROCm も自由ソフトウェアで、Ubuntu の universe と Fedora のリポジトリにあります。
+
+```sh
+sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
+sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
+```
+
+- ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダーか `/usr/lib64`）を探します。
+  見つからなければ HIP なしでビルドします。
+- AMD の GPU 向けのコードには、libclc の libspirv（AMD 向け）と ROCm のデバイスライブラリが要ります。
+  Fedora のデバイスライブラリは `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode` にあり、コンパイラには `--rocm-device-lib-path` で渡します。
+- Fedora 44（ROCm 7.1.1）のコンテナで、RX 9060 XT（gfx1200）に `-fsycl-targets=amd_gpu_gfx1200` でコンパイルした SYCL のカーネルが正しく動きました。
+  HIP のアダプタは一度に確保できる大きさを 1 GiB と報告しますが、実際には 12 GiB まで確保できました。
+
+### contrib 用のビルド（CUDA）
 
 contrib のビルド（[BUILD.ja.md](BUILD.ja.md#ビルド)）は、CUDA のターゲット付きの intel/llvm で NVIDIA の GPU 向けのコードも作ります。
-`--contrib` は同じ clone を CUDA のターゲット付きで、ROCm の HIP が入っていれば HIP（AMD の GPU）も付けて、`.tools/intel-llvm-contrib/` にビルドします。
+`--contrib` は同じ clone を CUDA のターゲット付きで（ROCm があれば HIP も付けて）、`.tools/intel-llvm-contrib/` にビルドします。
 CUDA のターゲットには NVIDIA の CUDA ツールキットが要ります。これは自由ソフトウェアではありません（Ubuntu では multiverse、Debian では non-free）。
 
 ```sh
 sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
-sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # HIP, optional
 python3 tools/intel_llvm_build.py --contrib --keep-build
 ```
 
-- ROCm は AMD の `/opt/rocm` か、ディストリビューションのもの（ヘッダーは `/usr/include`、ライブラリは multiarch のフォルダー）を探します。
-  見つからなければ HIP なしでビルドします。
 - Ubuntu では、ROCm のメタパッケージ（`rocm`、`rocm-dev`）と `nvidia-cuda-toolkit` を同時に入れられません。
   `rocm-dev` が引く `librocthrust-dev` と、`nvidia-cuda-dev` が引く `libthrust-dev` が、どちらも `/usr/include/thrust` を持っていて衝突するためで、apt は片方を入れると、もう片方を消します。
   HIP には上の 4 つだけで足ります（rocThrust は要りません）。
@@ -110,6 +124,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   7 つ目: libclc は AMD 向けの libspirv を対象名 `amdgcn--amdhsa` でだけ作るのに、その名前を受け付ける対象の一覧に入れていませんでした。
   別の名前（`amdgcn-amd-amdhsa`）で設定するとビルドは通るものの AMD 向けの libspirv がなく、AMD の GPU 向けの SYCL のプログラムはどれもコンパイルできませんでした。
   修正後は `amdgcn--amdhsa` を受け付けます（`hip-libclc-target`。`sycl` ブランチでは libclc の AMD の対象の作りが変わっています）。
+  CUDA の修正は contrib のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。

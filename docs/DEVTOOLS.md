@@ -73,20 +73,34 @@ On the development machine (28 threads, 91 GiB) v7.1.1 built in 13 minutes.
 The clone (2.8 GB) and `install/` (0.7 GB) stay; the build tree is deleted (its size was not measured).
 This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
-### The contrib build (CUDA and HIP)
+### HIP (AMD GPUs)
+
+Where ROCm's HIP is installed, the script builds the HIP target (AMD GPUs) as well, in the free mode and the contrib one.
+HIP and ROCm are free software, in Ubuntu's universe and Fedora's repositories.
+
+```sh
+sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # Ubuntu
+sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocminfo   # Fedora 44
+```
+
+- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder or `/usr/lib64`).
+  Without it the build has no HIP.
+- Code for AMD GPUs needs libclc's libspirv for AMD and ROCm's device libraries.
+  Fedora's device libraries are in `/usr/lib64/rocm/llvm/lib/clang/20/lib/amdgcn/bitcode`; give them to the compiler with `--rocm-device-lib-path`.
+- In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
+  The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
+
+### The contrib build (CUDA)
 
 The contrib build ([BUILD.md](BUILD.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
-`--contrib` builds the same clone with the CUDA target and, where ROCm's HIP is installed, HIP (AMD GPUs), into `.tools/intel-llvm-contrib/`.
+`--contrib` builds the same clone with the CUDA target (and HIP where ROCm is installed) into `.tools/intel-llvm-contrib/`.
 The CUDA target needs NVIDIA's CUDA toolkit, which is not free software (Ubuntu: multiverse; Debian: non-free).
 
 ```sh
 sudo apt install nvidia-cuda-toolkit           # 12.4 on Ubuntu 26.04
-sudo apt install hipcc libamdhip64-dev libhsa-runtime-dev rocminfo   # HIP, optional
 python3 tools/intel_llvm_build.py --contrib --keep-build
 ```
 
-- ROCm is looked for in AMD's `/opt/rocm` or the distribution's (headers in `/usr/include`, libraries in the multiarch folder).
-  Without it the build has no HIP.
 - On Ubuntu, ROCm's metapackages (`rocm`, `rocm-dev`) and `nvidia-cuda-toolkit` cannot be installed together.
   `librocthrust-dev` (pulled in by `rocm-dev`) and `libthrust-dev` (pulled in by `nvidia-cuda-dev`) both carry `/usr/include/thrust` and conflict, so installing one makes apt remove the other.
   HIP needs only the four packages above (not rocThrust).
@@ -110,6 +124,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Seventh, libclc builds the AMD libspirv only for the target name `amdgcn--amdhsa`, but left that name out of the targets it accepts.
   Configured with another name (`amdgcn-amd-amdhsa`), the build went through without an AMD libspirv, and no SYCL program for AMD GPUs compiled.
   Fixed, `amdgcn--amdhsa` is accepted (`hip-libclc-target`; the `sycl` branch has reorganized libclc's AMD target).
+  The CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.

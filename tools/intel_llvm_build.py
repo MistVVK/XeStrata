@@ -8,14 +8,13 @@ matrix engines (Ubuntu 26.04's 6.2 lists none for the Arc Pro B70; intel/llvm ad
     tools/intel_llvm_build.py [--contrib] [--rebuild] [--keep-build] [--tag TAG] [--yes]
 
 .tools/intel-llvm/src is the clone, build/ the build tree, install/ the toolchain (bin/clang++, lib/libsycl.so).
---contrib builds the same clone with the CUDA target (NVIDIA GPUs; it needs NVIDIA's CUDA toolkit, which is not free
-software: the contrib build mode) and, where ROCm's HIP is installed, the HIP target (AMD GPUs), into
-.tools/intel-llvm-contrib/ (build/, install/).  A
-finished install/ carries XESTRATA.json (the tag, its commit, the date, the GPUs' matrix engines as tools/xmx_probe.cpp
-saw them).  Run again, it uses a finished install of the same tag as it is, asks before building another tag over an
-older one, and continues an interrupted build where it stopped.  build/ is deleted once install/ is done, unless
---keep-build: keeping it makes the next tag's build incremental.  v7.1.1 built in 13 minutes on 28 threads and keeps
-3.5 GB (the clone 2.8, install/ 0.7).
+Where ROCm's HIP is installed (free software), it builds the HIP target (AMD GPUs) as well.  --contrib builds the same
+clone with the CUDA target too (NVIDIA GPUs; it needs NVIDIA's CUDA toolkit, which is not free software: the contrib
+build mode), into .tools/intel-llvm-contrib/ (build/, install/).  A finished install/ carries XESTRATA.json (the tag,
+its commit, the date, the GPUs' matrix engines as tools/xmx_probe.cpp saw them).  Run again, it uses a finished install
+of the same tag as it is, asks before building another tag over an older one, and continues an interrupted build where
+it stopped.  build/ is deleted once install/ is done, unless --keep-build: keeping it makes the next tag's build
+incremental.  v7.1.1 built in 13 minutes on 28 threads and keeps 3.5 GB (the clone 2.8, install/ 0.7).
 
 Prints the toolchain's folder on its last line.  setup.py runs it for --intel-llvm-build."""
 import argparse
@@ -147,13 +146,16 @@ def rocm_dirs() -> tuple | None:
     return None
 
 
-def contrib_options() -> list:
-    """configure.py's options for the contrib toolchain: CUDA, and HIP where ROCm is installed."""
-    if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
-        fail("the CUDA target needs NVIDIA's CUDA toolkit (not free software)",
-             "install it: sudo apt install nvidia-cuda-toolkit (Ubuntu: multiverse; Debian: non-free)")
-    opts = ["--cuda"]
-    libclc = ["nvptx64--nvidiacl"]
+def target_options(contrib: bool) -> list:
+    """configure.py's options for the GPU targets besides Intel's: HIP where ROCm is installed (free software, in both
+    modes), and CUDA for the contrib toolchain."""
+    opts, libclc = [], []
+    if contrib:
+        if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
+            fail("the CUDA target needs NVIDIA's CUDA toolkit (not free software)",
+                 "install it: sudo apt install nvidia-cuda-toolkit (Ubuntu: multiverse; Debian: non-free)")
+        opts.append("--cuda")
+        libclc.append("nvptx64--nvidiacl")
     rocm = rocm_dirs()
     if rocm is None:
         say("note: no ROCm HIP (hipcc's headers, libamdhip64): building without the HIP target (AMD GPUs)")
@@ -162,7 +164,7 @@ def contrib_options() -> list:
                  f"--cmake-opt=-DUR_HIP_LIB_DIR={rocm[1]}"]
         # the name libclc builds the AMD libspirv for (its list of known targets lacks it: the fix hip-libclc-target)
         libclc.append("amdgcn--amdhsa")
-    return opts + [f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"]
+    return opts + ([f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"] if libclc else [])
 
 
 def fix_sources() -> None:
@@ -200,7 +202,7 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
     options = [f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
                "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000"] + \
-        (contrib_options() if contrib else [])
+        target_options(contrib)
     # configured again when the tree was configured with other values of these options
     cache = BUILD / "CMakeCache.txt"
     text = cache.read_text(errors="replace") if cache.exists() else ""
@@ -230,8 +232,8 @@ def version_key(tag: str) -> tuple:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--contrib", action="store_true",
-                    help="with the CUDA target (NVIDIA GPUs, needs NVIDIA's CUDA toolkit) and, where ROCm is "
-                         "installed, HIP (AMD GPUs), into .tools/intel-llvm-contrib")
+                    help="with the CUDA target too (NVIDIA GPUs, needs NVIDIA's CUDA toolkit), into "
+                         ".tools/intel-llvm-contrib")
     ap.add_argument("--tag", default=TAG, help=f"the intel/llvm release to build (default {TAG})")
     ap.add_argument("--rebuild", action="store_true", help="build again even when a finished build is there")
     ap.add_argument("--keep-build", action="store_true", help="keep the build tree for the next update")
@@ -244,11 +246,13 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            # the CUDA and HIP adapters' fixes do not ask the free toolchain, which has neither, to be built again;
-            # nor do the fixes to the build itself (build-), which a finished toolchain does not need
+            # the CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP
+            # or one that would have it now (ROCm installed since); the fixes to the build itself (build-) none
+            hip = "hip" in have.get("backends", []) or rocm_dirs() is not None
             missing = [patch_id(p) for p in PATCHES if patch_id(p) not in have.get("fixes", [])
                        and not patch_id(p).startswith("build-")
-                       and (a.contrib or not patch_id(p).startswith(("cuda-", "hip-")))]
+                       and (a.contrib or not patch_id(p).startswith("cuda-"))
+                       and (hip or not patch_id(p).startswith("hip-"))]
             if not have.get("zstd"):
                 missing.append("zstd")
             if not missing:
@@ -273,8 +277,8 @@ def main() -> None:
     if have is None:
         fail(f"no finished build in {INSTALL}")
     if not have.get("gpus"):
-        say("note: this build's SYCL runtime lists no GPU (xmx_probe): the GPU's Level Zero driver (Intel's "
-            "compute-runtime) is missing or too old for it")
+        say("note: this build's SYCL runtime lists no Intel GPU (xmx_probe, which looks at Level Zero only): on a PC "
+            "with one, its Level Zero driver (Intel's compute-runtime) is missing or too old for it")
     elif not any(g.get("fp16") == "1" and g.get("bf16") == "1" for g in have.get("gpus", [])):
         say("note: no GPU reports FP16 and BF16 matrix engines to this build (xmx_probe); the engine will run its "
             "products without XMX")
