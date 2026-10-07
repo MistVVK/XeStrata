@@ -75,7 +75,9 @@ class HuggingFacePins(unittest.TestCase):
                 raise not_found(req.full_url)
             return Response(b"model bytes", status=200)
 
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+        # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+                mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
             dst = Path(d) / "m.gguf"
             _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
             self.assertEqual(dst.read_bytes(), b"model bytes")
