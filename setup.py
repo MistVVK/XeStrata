@@ -247,9 +247,23 @@ def fail(msg, hint=None) -> NoReturn:
     sys.exit(1)
 
 
+def flush_typed_ahead() -> None:
+    """Upstream #841: keys pressed while setup was busy (a download, a build) are not answers to the next question:
+    Enter pressed to "wake" a slow step answered "Go on anyway?" with its default.  Dropped before a question is asked,
+    on a terminal only (a pipe or a test keeps its input)."""
+    try:
+        if not sys.stdin.isatty():
+            return
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (ImportError, OSError, ValueError, AttributeError):
+        pass
+
+
 def ask(question, choices, default, yes):
     if yes:
         return default
+    flush_typed_ahead()
     while True:
         try:
             a = input(f"{question} [{default}]: ").strip()
@@ -686,6 +700,11 @@ def check_shards(shards):
         if have < need:
             fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
                  "delete it and run setup again (or copy the whole file into --gguf-dir)")
+        if len(g.tensors) == 1 and have - need >= 64:       # (a few bytes may be the last tensor's alignment padding)
+            # upstream #657: a shard that holds one tensor (the PLE table) is exactly as long as that tensor; extra
+            # bytes are a damaged or wrong file that the engine would refuse at start ("PLE table size mismatch")
+            fail(f"{s.name} is longer than its tensor: {have:,} bytes, {need:,} expected ({have - need:,} extra)",
+                 f"delete {s.name} and its .done mark and run setup again")
 
 
 def verify_sha256(s: Path, size: int, sha: str) -> None:
@@ -2190,6 +2209,35 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
         if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
             nv["mmproj"] = mm
             kept.append("vision mmproj")
+    kept += carry_profile_args(old, cfg)
+    return kept
+
+
+def flag_value(args: list, flag: str):
+    """The value after `flag` in an argument list, or None."""
+    for i, a in enumerate(args[:-1]):
+        if a == flag:
+            return str(args[i + 1])
+    return None
+
+
+def carry_profile_args(old: dict, cfg: dict) -> list[str]:
+    """Upstream #775: a learned expert profile the user wired in by hand (--expert-profile <their file>,
+    --expert-profile-save <file>) survives a setup run: setup writes the shipped profile, which a measured one of
+    their own beats.  Their --expert-profile replaces the shipped one only when it is another file that still exists;
+    --expert-profile-save is kept when the new config has none.  The names kept are returned."""
+    oargs, nargs = old.get("args"), cfg.get("args")
+    if not isinstance(oargs, list) or not isinstance(nargs, list):
+        return []
+    kept = []
+    mine, shipped = flag_value(oargs, "--expert-profile"), flag_value(nargs, "--expert-profile")
+    if mine and shipped and Path(mine).name != Path(shipped).name and Path(mine).is_file():
+        nargs[nargs.index("--expert-profile") + 1] = mine
+        kept.append("args --expert-profile")
+    save = flag_value(oargs, "--expert-profile-save")
+    if save and flag_value(nargs, "--expert-profile-save") is None:
+        nargs += ["--expert-profile-save", save]
+        kept.append("args --expert-profile-save")
     return kept
 
 

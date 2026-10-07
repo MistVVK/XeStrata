@@ -395,7 +395,7 @@ A relative path is in the XeStrata folder; one file per model.
 A profile per project works the same way: point the key at another file.
 The file is a fingerprint of what you used the model for: keep it on your PC.
 Without the key nothing is counted or written.
-setup rewrites the config when run again: add the key again then.
+A setup run again keeps the key, and `--expert-profile` (a file that still exists) and `--expert-profile-save` added to `"args"` by hand (upstream #775).
 
 ### When the draft head does not fit
 
