@@ -48,6 +48,8 @@ public:
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();
+    /// Waits for prepare's trial on the current GPU (the library and its first kernels loaded).
+    static void settle();
     /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
     /// (kernels::gemm_path).
     static const char* path();

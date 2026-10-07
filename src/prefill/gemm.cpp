@@ -153,6 +153,12 @@ void Gemm::prepare() {
 #endif
 }
 
+void Gemm::settle() {
+#if STRATA_ONEMATH
+    (void) backend(core::Runtime::get().compute().get_device());
+#endif
+}
+
 const char* Gemm::path() {
 #if STRATA_ONEMATH
     if (backend(core::Runtime::get().device()).blas) return "oneMath";
