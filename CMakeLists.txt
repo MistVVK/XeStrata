@@ -728,7 +728,9 @@ if(STRATA_NATIVE_EXPERTS)
     # UD-Q4_K_XL's expert pairs (and Q8_0 alone) and OrcaRouter Q4_K_S's q4_K/q5_0 on synthetic ggml-quantized
     # weights at 2560/640 (upstream efeffd8, d652cd6): GPU and CPU experts against the float reference, GPU
     # dequantizers against to_float
-    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl)
+    # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
+    # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
+    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
       string(REPLACE "/" "_" pair_name "${pair}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
