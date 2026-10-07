@@ -924,6 +924,18 @@ It is `"max_tokens"` in the `"vision"` section of `xestrata-<model>.json`, which
 More tokens keep more detail (small text, charts, screenshots) and take longer to encode, on the CPU most of all.
 A setup run again keeps the value for the same encoder place (GPU or CPU).
 
+**A minimum of image tokens** (upstream #767): `"min_tokens": N` written by hand in the `"vision"` section of `xestrata-<model>.json` is passed to the encoder as `--min-tokens N` (mtmd's `image_min_tokens`): a small picture is scaled up to at least N tokens.
+llama.cpp's mtmd prints that Qwen-VL models want at least 1,024 for pointing at or counting small items.
+The default is no minimum.
+A higher minimum changes the image answers and takes longer to encode (the CPU of an i7-14700, 14 threads: a 512x384 picture as 192 tokens in 0.9 s, with `--min-tokens 256` as 266 tokens in 1.5 s).
+A setup run again keeps the value.
+
+**Flash attention in the CPU encoder** (upstream #660): ggml's fast CPU kernel for flash attention needs the encoder's head size (72) to be a multiple of the vector width.
+It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a kernel several times slower that adds in FP16.
+`strata-vision` therefore turns flash attention off in a CPU build whose ggml has AVX-512, and leaves it at `auto` (on) otherwise.
+`--flash-attn on|off|auto` overrides that.
+Upstream measured a 1024x1024 picture on a Ryzen 7 7700X with 8 threads: AVX2 8-10 s with it and 14-15 s without, AVX-512 44 s with it and 13 s without.
+
 ### Sending a picture
 
 **Terminal chat:** type `/image <path to a picture>`, press Enter, then type your question.
