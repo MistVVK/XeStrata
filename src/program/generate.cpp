@@ -1884,16 +1884,21 @@ int main(int argc, char** argv) {
             prompt[(size_t) i] = o.prefill_chunk > 0 && own_prompt
                                      ? (int64_t) strata::prefill::Prefill::bytes_needed(ga, s_ctx, o.prefill_chunk) : 0;
         }
-        auto cap_of = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
+        // the room for experts a stage has, before it is clamped at 0: below what the prompt path needs, the stage
+        // cannot start (upstream 09e5ab4f)
+        auto cap_raw = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
             const int64_t base_reserve =   // --vram-reserve-later-mib: the later cards' own reserve (upstream 5c4105c0)
                 i > 0 && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
             const int64_t reserve = (base_reserve + (i > 0 ? 1024 : 0)) << 20;
             const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
                                  (1 + std::max(o.batch, 0));
-            const int64_t c = free0[(size_t) i] - reserve - (int64_t) weights_of(lo, hi) - sess - prompt[(size_t) i] -
-                              (last ? (int64_t) head_bytes : 0);
-            return std::max<int64_t>(c, 0);
+            return free0[(size_t) i] - reserve - (int64_t) weights_of(lo, hi) - sess - prompt[(size_t) i] -
+                   (last ? (int64_t) head_bytes : 0);
         };
+        // what a stage needs at least for its prompt path: its own buffers are in prompt[] already; a stage that
+        // borrows them lends cache slots for the last-resort chunk of 512 tokens
+        const int64_t prompt_min = own_prompt || o.prefill_chunk <= 0
+                                       ? 0 : (int64_t) strata::prefill::Prefill::bytes_needed(ga, s_ctx, 512);
         // each GPU reading its own memory (bytes per ms; random bytes: a memset's run of one value is compressed on
         // some GPUs, and the B70 then read it at over 1.7 TB/s)
         std::vector<double> bw((size_t) ns);
@@ -1967,11 +1972,15 @@ int main(int argc, char** argv) {
         const double hop_ms = 0.1;   // a hand-off between two GPUs (5 tokens: ~60 us measured, B70 -> RTX 4070)
         // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
+        bool startable = true;   // predict's: every stage can start its prompt path
         auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
             const int nst = (int) at.size() + 1;
+            startable = true;
             for (int i = 0; i < nst; ++i) {
                 const int64_t lo = i == 0 ? 0 : at[(size_t) i - 1], hi = i + 1 < nst ? at[(size_t) i] : L;
-                cap[(size_t) i] = cap_of(i, nst == 1 ? 0 : lo, nst == 1 ? -1 : hi, i + 1 == nst);
+                const int64_t raw = cap_raw(i, nst == 1 ? 0 : lo, nst == 1 ? -1 : hi, i + 1 == nst);
+                if (raw < prompt_min) startable = false;
+                cap[(size_t) i] = std::max<int64_t>(raw, 0);
             }
             std::fill(used.begin(), used.end(), 0);
             std::fill(layer_held.begin(), layer_held.end(), 0.0);
@@ -2010,18 +2019,30 @@ int main(int argc, char** argv) {
         }
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;
-        int64_t best_held = 0;
+        int64_t best_held = 0, best_room = 0;
+        bool gate = true;   // only placements whose every stage can start its prompt path (upstream 09e5ab4f)
         auto consider = [&]() {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
-            if (ms < best_ms) { best = at; best_ms = ms; best_mass = hm; best_held = held; }
+            if (gate && !startable) return;
+            // the room the fullest stage keeps after its cache: on a tie the balanced placement wins (upstream 08cdd8bf)
+            int64_t room = INT64_MAX;
+            for (size_t i = 0; i < at.size() + 1; ++i) room = std::min(room, cap[i] - used[i]);
+            if (ms < best_ms - 1e-9 || (ms <= best_ms + 1e-9 && room > best_room)) {
+                best = at; best_ms = ms; best_mass = hm; best_held = held; best_room = room;
+            }
         };
+        auto search = [&] {
         if (ns == 2) {
             for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
         } else if (ns == 3) {
             for (int64_t k1 = 2; k1 + 1 < L; ++k1)
                 for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
+        } else if (ns == 4) {   // every four-way placement as well (upstream e2b32892): ~15,000 for 48 layers
+            for (int64_t k1 = 2; k1 + 2 < L; ++k1)
+                for (int64_t k2 = k1 + 1; k2 + 1 < L; ++k2)
+                    for (int64_t k3 = k2 + 1; k3 < L; ++k3) { at[0] = k1; at[1] = k2; at[2] = k3; consider(); }
         } else {
             double total = 0;
             for (const double c : bw) total += c;
@@ -2032,6 +2053,18 @@ int main(int argc, char** argv) {
                                                     i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
             }
             consider();
+        }
+        };
+        search();
+        if (best.empty()) {   // no placement can start on paper: the choice without the gate, and what is short
+            gate = false;
+            search();
+            std::fprintf(stderr, "strata generate: layer split auto: WARNING: no placement leaves every card room for the "
+                                 "prompt path's buffers (%lld MiB a stage%s); the engine may run out of VRAM at start: a "
+                                 "smaller --max-context, a smaller --prefill chunk or a smaller --vram-reserve-mib leaves "
+                                 "more\n",
+                         (long long) (std::max<int64_t>(prompt_min, 0) >> 20),
+                         own_prompt ? ", its own buffers counted in" : " lent from its cache");
         }
         split_at = best;
         split_auto = false;   // from here on, as an explicit --layer-split
