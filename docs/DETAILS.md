@@ -595,6 +595,11 @@ A prompt read from the start is also checkpointed at the end of its system promp
 so the root exists for agent clients with long system prompts and tool lists.
 Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
+A one-shot request that no later request continues (a classification call, a probe) can send `"strata_checkpoint": false` in its body.
+It takes no checkpoint at the start of its last turn nor every 16K tokens, and its session is neither kept nor parked for a next request.
+It still starts from a checkpoint it matches, and still takes the system-prompt root when that reaches `--prompt-cache-root`.
+Without the field, or with `true`, nothing changes.
+
 ### Several conversations (opt-in)
 
 Add `--conversation-cache-mib 8192 --conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at most 8 GiB of RAM.

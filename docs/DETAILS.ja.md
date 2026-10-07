@@ -605,6 +605,11 @@ print(r.choices[0].message.content)
 長いシステムプロンプトとツールの一覧を持つエージェントのクライアントにも、この起点ができます。
 エンジンの設定は `--prompt-cache N`（0 でオフ）、`--prompt-cache-every N`、`--prompt-cache-root N`（0 でシステムプロンプトのチェックポイントなし）、`--turn-token ID` です。
 
+続きの要求が来ない使い捨ての要求（分類や確認の呼び出し）は、本文に `"strata_checkpoint": false` を書けます。
+最後の発言の始まりと 16K トークンごとのチェックポイントを取らず、そのセッションを次の要求のために残しも置きもしません。
+合うチェックポイントからは読み始め、`--prompt-cache-root` に届くシステムプロンプトの起点は取ります。
+書かないか `true` なら、これまでと同じです。
+
 ### 複数の会話を置いておく（任意）
 
 設定の `args` に `--conversation-cache-mib 8192 --conversation-cache-slots 4` を足すと、最大 4 つの会話を、合わせて 8 GiB までの RAM に置いておけます。
