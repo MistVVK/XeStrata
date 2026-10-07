@@ -103,6 +103,78 @@ def hf_unpinned(url: str) -> str:
     return re.sub(r"^(https?://[^/]+/.+?/resolve/)[0-9a-f]{40}/", r"\1main/", url, count=1)
 
 
+# ModelScope (www.modelscope.cn) hosts every repository above under the same name, with the same file paths and
+# sizes, and is reachable from mainland China where huggingface.co often is not.  It serves a repository's current
+# files (no pinned revision), so a file from it is checked against the SHA-256 ModelScope publishes for it, and the
+# MTP tensors against the pinned checkpoint's own hashes (tools/mtp_fetch.py).
+# --source / STRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
+# serving current files, not our pinned revision: setup never switches to it by itself, it recommends it, #908).
+MS_DEFAULT = "https://www.modelscope.cn"
+SOURCES = ("auto", "modelscope", "huggingface")
+HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/[^/]+/(?P<path>.+)$")
+_sources = {}                                      # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
+_ms_files = {}
+
+
+def ms_endpoint() -> str:
+    return (os.environ.get("MODELSCOPE_ENDPOINT") or "").strip().rstrip("/") or MS_DEFAULT
+
+
+def reachable(url: str, timeout: float = 5.0) -> bool:
+    """Whether `url` answers a HEAD request with success (2xx, after redirects) within `timeout` seconds."""
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"}),
+                               timeout=timeout).close()
+        return True
+    except OSError:                                    # HTTPError too: an error page is not the file
+        return False
+
+
+def model_source() -> str:
+    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
+    everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
+    by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
+    want = (os.environ.get("STRATA_SOURCE") or "auto").strip().lower()
+    key = (want, os.environ.get("HF_ENDPOINT") or "", ms_endpoint())
+    if key not in _sources:
+        _sources[key] = "modelscope" if want in ("ms", "modelscope") else "huggingface"
+    return _sources[key]
+
+
+def source_hint(url: str) -> str:
+    """The recommendation that goes with a failed download from Hugging Face: ModelScope, by an explicit choice."""
+    if "huggingface" in url or "hf-mirror" in url:
+        return ("; if huggingface.co does not reach you (mainland China), the same files are on ModelScope: run setup "
+                "with --source modelscope (docs/DETAILS.md)")
+    return ""
+
+
+def ms_file(url: str):
+    """(repo, path) when `url` is a Hugging Face file of a repository setup knows (HF_REVISIONS), else None."""
+    m = HF_FILE.match(url)
+    if m is None or m.group("repo") not in HF_REVISIONS:
+        return None
+    return m.group("repo"), m.group("path")
+
+
+def ms_url(repo: str, path: str) -> str:
+    return f"{ms_endpoint()}/models/{repo}/resolve/master/{path}"
+
+
+def ms_meta(repo: str, path: str):
+    """(size, sha256) ModelScope publishes for a file, or None when it cannot be asked."""
+    if repo not in _ms_files:
+        try:
+            api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
+            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "strata-setup"}),
+                                        timeout=60) as r:
+                files = json.loads(r.read())["Data"]["Files"]
+            _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    return _ms_files[repo].get(path)
+
+
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
@@ -646,6 +718,13 @@ def download(url, dst: Path, what=None):
         mark(dst)
         ok(f"{what or dst.name} copied")
         return
+    ms = ms_file(url) if model_source() == "modelscope" else None
+    if ms is not None:
+        if reachable(ms_url(*ms), timeout=30):
+            url = ms_url(*ms)
+        else:
+            warn(f"{what or dst.name}: ModelScope does not answer; downloading it from {hf_endpoint()}")
+            ms = None
     part = dst.with_name(dst.name + ".part")
     total = 0
     for attempt in range(5):
@@ -660,11 +739,13 @@ def download(url, dst: Path, what=None):
                 url = hf_unpinned(url)
                 continue
             if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})", "check your internet connection and run it again")
+                fail(f"cannot reach {url.split('/')[2]} ({e})",
+                     "check your internet connection and run it again" + source_hint(url))
             time.sleep(5)
         except OSError as e:
             if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})", "check your internet connection and run it again")
+                fail(f"cannot reach {url.split('/')[2]} ({e})",
+                     "check your internet connection and run it again" + source_hint(url))
             time.sleep(5)
     if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet)
         mark(dst)
@@ -705,7 +786,13 @@ def download(url, dst: Path, what=None):
              f"the server says {total:,}",
              "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
-    mark(dst)
+    meta = ms_meta(*ms) if ms is not None else None
+    if meta is not None and meta[1]:
+        verify_sha256(dst, meta[0], meta[1])           # ModelScope's published hash; kept in the finish mark
+    else:
+        if ms is not None:
+            warn(f"{what or dst.name}: ModelScope publishes no SHA-256 for it: the file is not verified")
+        mark(dst)
     ok(f"{what or dst.name} downloaded")
 
 
@@ -2406,6 +2493,10 @@ def main() -> int:
                                        "folder, remembered for every Strata folder on this PC")
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
+    ap.add_argument("--source", choices=SOURCES, default=None,
+                    help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
+                         "(mainland China: the same files, checked against ModelScope's published SHA-256; "
+                         "STRATA_SOURCE)")
     ap.add_argument("--license", choices=LICENSES,
                     help="the build mode: free builds with free software only, for Intel GPUs; contrib (the default) "
                          "builds with intel/llvm's CUDA target for Intel and NVIDIA GPUs, and hands the dense matrix "
@@ -2457,6 +2548,8 @@ def main() -> int:
                     help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.source:
+        os.environ["STRATA_SOURCE"] = a.source
     global ARGS
     ARGS = a
     if a.vision_tokens is not None and a.vision_tokens < 1:
@@ -2878,7 +2971,13 @@ def main() -> int:
             say(f"  The model files go in {models_dir}")
             say(f"  Files you already have: put them here with their original names ({', '.join(missing)}), or use "
                 "--gguf-dir <their folder>.")
-            if hf_endpoint() != HF_DEFAULT:
+            if model_source() == "modelscope":
+                say(f"  Downloading from ModelScope ({ms_endpoint()}); --source huggingface downloads from Hugging "
+                    "Face")
+                warn("ModelScope serves the repositories' current files, not the pinned revisions: each file is "
+                     "checked against the SHA-256 ModelScope itself publishes (self-attested); the MTP tensors against "
+                     "the pinned checkpoint's own hashes")
+            elif hf_endpoint() != HF_DEFAULT:
                 say(f"  Downloading from {hf_endpoint()} (HF_ENDPOINT)")
         for s in shards:
             if s.exists() and done(s):
@@ -2942,7 +3041,8 @@ def main() -> int:
     if corrupt or not (rt / "experts.bin").exists():
         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
         say("  only its ~5 GB of MTP tensors are downloaded.")
-        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)], env=env)
+        run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)],
+            env={**env, "STRATA_SOURCE": model_source()})
         run([sys.executable, str(ROOT / "tools" / "mtp_pack.py"), "--src", str(mtp), "--experts", "q2_0",
              "--out", str(mtp / "mtp-q2_0.gguf")], env=env)
         run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],

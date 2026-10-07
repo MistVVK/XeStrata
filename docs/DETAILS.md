@@ -331,6 +331,13 @@ Put them there with their original names, or point setup at them with `--gguf-di
 To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`):
 the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
 
+**From ModelScope** (mainland China, upstream #908): every repository setup downloads from (the GSQ-RCO models, Swift 1.5, the Coder, Unsloth's files, and the original checkpoint the MTP draft layer is taken from) is on [ModelScope](https://www.modelscope.cn) under the same name, with the same files.
+Setup never switches to it by itself (a download that fails says how).
+Choose it with `--source modelscope` (`STRATA_SOURCE=modelscope`).
+ModelScope serves a repository's current files (no pinned revision), so each file is checked against the SHA-256 ModelScope publishes for it, and the MTP tensors against the pinned checkpoint's own hashes.
+The published SHA-256 is ModelScope's own statement: a changed upstream repository would carry its own hash.
+Setup says so when you choose it.
+
 ### Tuning for your PC (`--calibrate`)
 
 Four engine settings depend on the PC more than on the model:

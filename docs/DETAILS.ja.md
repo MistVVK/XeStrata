@@ -338,6 +338,13 @@ setup の手順 5 は、ファイルを置く場所（`XeStrata-data/models/<大
 Hugging Face のミラーから取るなら、`HF_ENDPOINT` を設定します（例: `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`）。
 固定したリビジョンと確認は同じで、MTP のテンソルも同じホストから取ります。
 
+**ModelScope から**（中国本土、upstream #908）: setup がダウンロードするリポジトリ（GSQ-RCO のモデル、Swift 1.5、Coder、Unsloth のファイル、MTP の下書きの層を取る元のチェックポイント）は、どれも [ModelScope](https://www.modelscope.cn) に同じ名前・同じファイルであります。
+setup は自分では切り替えません（ダウンロードに失敗したときに案内します）。
+`--source modelscope`（`STRATA_SOURCE=modelscope`）で選びます。
+ModelScope はリポジトリのいまのファイルを出す（リビジョンを固定できない）ので、各ファイルを ModelScope が公開する SHA-256 で確かめ、MTP のテンソルは固定したチェックポイントのハッシュで確かめます。
+公開されている SHA-256 は ModelScope 自身の申告なので、元のリポジトリが変われば、そのハッシュも変わります。
+setup は、選んだときにそう言います。
+
 ### この PC に合わせて調整する（`--calibrate`）
 
 エンジンの 4 つの設定は、モデルよりも PC によって変わります。
