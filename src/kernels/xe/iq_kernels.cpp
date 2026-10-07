@@ -523,6 +523,29 @@ inline float vec_dot_q4_1_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx
     const float d8 = low_half(bq8_1->ds);
     return (float) sumi * ((float) bq4_1->dm[0] * d8) + (float) sumu * ((float) bq4_1->dm[1] * d8);
 }
+// Q6_K gate/up (Unsloth's UD-Q6_K_XL experts; upstream 87659162): llama.cpp's integer chain verbatim
+// (vecdotq.cuh vec_dot_q6_K_q8_1_impl_mmvq / vec_dot_q6_K_q8_1) - signed per-16-element scales, the -32 offset folded
+// into the per-byte value, the q8_1 block's ds.low for the scales (Q6_K has no learned min)
+constexpr int VDR_Q6_K = 1;
+inline float vec_dot_q6_K_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
+    const block_q6_K* bq6_K = (const block_q6_K*) vbq + kbx;
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 4);
+    const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) + (iqs % (QI6_K / 2)) / (QI6_K / 8);
+    const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+    const int vl = get_int_b2(bq6_K->ql, iqs);
+    const int vh = get_int_b2(bq6_K->qh, (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+    const int8_t* scales = bq6_K->scales + scale_offset;
+    float sumf = 0.0f;
+    for (int i = 0; i < QR6_K; ++i) {
+        const block_q8_1* b8 = bq8_1 + bq8_offset + (ptrdiff_t) 2 * i;
+        const int sc = scales[(ptrdiff_t) 4 * i];   // NOLINT(bugprone-signed-char-misuse): Q6_K scales are signed
+        const int vil = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int vi = xe::vsubss4(vil | vih, 0x20202020);   // (vil | vih) - 32
+        sumf += low_half(b8->ds) * (float) (dp4a(vi, get_int_b4(b8->qs, iqs % QI8_1), 0) * sc);
+    }
+    return (float) bq6_K->d * sumf;
+}
 inline float vec_dot_q8_0_q8_1(const void* vbq, const block_q8_1* bq8_1, int kbx, int iqs) {
     const block_q8_0* bq8_0 = (const block_q8_0*) vbq + kbx;
     int sumi = 0;
@@ -543,6 +566,7 @@ template<> struct Split<8> : WholeDot<vec_dot_q8_0_q8_1> {};    // Q8_0
 template<> struct Split<6> : WholeDot<vec_dot_q5_0_q8_1> {};    // Q5_0
 template<> struct Split<2> : WholeDot<vec_dot_q4_0_q8_1> {};    // Q4_0
 template<> struct Split<3> : WholeDot<vec_dot_q4_1_q8_1> {};    // Q4_1
+template<> struct Split<14> : WholeDot<vec_dot_q6_K_q8_1> {};   // Q6_K
 
 // ---------------------------------------------------------------- the formats
 // bsz = bytes per block, qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
@@ -570,6 +594,7 @@ template<> struct Fmt<8> : FmtOf<8, (int) sizeof(block_q8_0), 32, QI8_0 / VDR_Q8
 template<> struct Fmt<6> : FmtOf<6, (int) sizeof(block_q5_0), 32, QI5_0 / VDR_Q5_0, VDR_Q5_0> {};
 template<> struct Fmt<2> : FmtOf<2, (int) sizeof(block_q4_0), 32, QI4_0 / VDR_Q4_0, VDR_Q4_0> {};
 template<> struct Fmt<3> : FmtOf<3, (int) sizeof(block_q4_1), 32, QI4_1 / VDR_Q4_1, VDR_Q4_1> {};
+template<> struct Fmt<14> : FmtOf<14, (int) sizeof(block_q6_K), 256, QI6_K / VDR_Q6_K, VDR_Q6_K> {};
 
 // CUDA's __shfl_xor butterfly, in the same order, so a row's sum does not depend on the backend's reduction tree.
 inline float warp_sum(const sycl::sub_group& sg, float v) {
@@ -1070,6 +1095,24 @@ void dq_q4_1(const void* vx, int64_t ibs, const Out& o, int tid) {
     o.template put<4>(32 * ib + 4 * il, lo);
     o.template put<4>(32 * ib + 4 * il + 16, hi);
 }
+// llama.cpp's dequantize_q6_K (dequantize.cuh, written for 64 threads) folded onto 32 work-items: each of the 64 roles
+// runs at tid and tid + 32, its four values 32 apart
+template<typename Out>
+void dq_q6_k(const void* vx, int64_t ibs, const Out& o, int tid) {
+    const block_q6_K* x = (const block_q6_K*) vx + ibs;
+    const float d = (float) x->d;
+    for (int tt = tid; tt < 64; tt += 32) {
+        const int ip = tt / 32, il = tt - 32 * ip, is = 8 * ip + il / 16;
+        const uint8_t* ql = x->ql + (ptrdiff_t) 64 * ip + il;
+        const uint8_t qh = x->qh[32 * ip + il];
+        const int8_t* sc = x->scales + is;
+        const float v[4] = {d * (float) sc[0] * (float) ((int8_t) ((ql[0] & 0xF) | (((qh >> 0) & 3) << 4)) - 32),
+                            d * (float) sc[2] * (float) ((int8_t) ((ql[32] & 0xF) | (((qh >> 2) & 3) << 4)) - 32),
+                            d * (float) sc[4] * (float) ((int8_t) ((ql[0] >> 4) | (((qh >> 4) & 3) << 4)) - 32),
+                            d * (float) sc[6] * (float) ((int8_t) ((ql[32] >> 4) | (((qh >> 6) & 3) << 4)) - 32)};
+        for (int k = 0; k < 4; ++k) o.template put<1>(128 * ip + il + 32 * k, v + k);
+    }
+}
 template<typename Out>
 void dq_q8_0(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_q8_0* x = (const block_q8_0*) vx + ibs * (QK_K / QK8_0);
@@ -1111,6 +1154,7 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, const Out& o, int t
         case 6: dq_q5_0(vx, ibs, o, tid); break;
         case 2: dq_q4_0(vx, ibs, o, tid); break;
         case 3: dq_q4_1(vx, ibs, o, tid); break;
+        case 14: dq_q6_k(vx, ibs, o, tid); break;
         default: break;
     }
 }
@@ -1316,7 +1360,8 @@ sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs
 // dequant and xmx_gemm_grouped instead
 bool in_iq_gemm(int t) { return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }
 bool is_iq(int t) {
-    return in_iq_gemm(t) || t == 11 || t == 12 || t == 13 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3;
+    return in_iq_gemm(t) || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
+           t == 3;
 }
 
 void require(bool ok, const char* what) {
@@ -1347,6 +1392,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 6: return (size_t) (n / 32) * sizeof(block_q5_0);
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
+        case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
         case 30: return (size_t) n * 2;   // BF16: the token embedding only (iq_embed_rows, iq_dequant_f32)
         default: return 0;
     }
@@ -1461,8 +1507,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
     // the cases of native_expert_grouped's two switches, and the prompt path's dequantizer (iq_dequant_gu_f16 and the
     // down rows) for both
     const bool gu = in_iq_gemm(gu_type) ? gu_type != 20
-                                        : gu_type == 12 || gu_type == 13 || gu_type == 8 || gu_type == 6 ||
-                                          gu_type == 2 || gu_type == 3;
+                                        : gu_type == 12 || gu_type == 13 || gu_type == 14 || gu_type == 8 ||
+                                          gu_type == 6 || gu_type == 2 || gu_type == 3;
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
                    d_type == 2 || d_type == 3;
     const auto qk = [](int t) { return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : 256; };
@@ -1524,6 +1570,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 6: launch_native_gu<6, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 2: launch_native_gu<2, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         case 3: launch_native_gu<3, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+        case 14: launch_native_gu<14, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
         default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(L.gu_type));
     }
     const long long nh = (long long) cap_entries * L.n_ff;

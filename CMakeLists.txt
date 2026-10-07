@@ -730,14 +730,16 @@ if(STRATA_NATIVE_EXPERTS)
     # dequantizers against to_float
     # q5_0/q8_0 (Q5_0 gate/up, a llama-quantize "_M" file), q4_0/q4_0 and q4_0/q4_1 (a plain llama-quantize Q4_0 file:
     # gate/up Q4_0, down Q4_0 on 42 layers and Q4_1 on 6; upstream 16bdc707)
-    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
+    # q6_K/q8_0: Unsloth's UD-Q6_K_XL experts (upstream 87659162)
+    foreach(pair q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 iq3_xxs/iq4_nl q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
+                 q6_K/q8_0)
       string(REPLACE "/" "_" pair_name "${pair}")
       add_test(NAME native_expert_parity_${pair_name} COMMAND native_expert_parity --synthetic ${pair})
       set_tests_properties(native_expert_parity_${pair_name} PROPERTIES TIMEOUT 120)
     endforeach()
-    # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
-    add_test(NAME native_expert_parity_refuses_q6_K COMMAND native_expert_parity --synthetic q6_K/q8_0)
-    set_tests_properties(native_expert_parity_refuses_q6_K PROPERTIES WILL_FAIL TRUE)
+    # a pair without GPU kernels (Q3_K gate/up) is refused by native_expert_supported, not run
+    add_test(NAME native_expert_parity_refuses_q3_K COMMAND native_expert_parity --synthetic q3_K/q8_0)
+    set_tests_properties(native_expert_parity_refuses_q3_K PROPERTIES WILL_FAIL TRUE)
     # the device dequantizers on one real tensor of each type: needs the model's shards, so not in CTest
     add_executable(dequant_bf16_test src/kernels/dequant_bf16_test.cpp)
     target_link_libraries(dequant_bf16_test PRIVATE strata_kernels strata_artifact)
