@@ -6709,8 +6709,15 @@ int main(int argc, char** argv) {
                              (double) (d1.entries - ds0.entries) / (w * L), (double) (d1.hits - ds0.hits) / (w * L),
                              (double) (d1.pcie - ds0.pcie) / (w * L), dt_pre / w, dt_join / w, dt_adapt / w, (long long) (adapt_swaps_n - adapt_swaps0),
                              (long long) (adapt_sync_n - adapt_sync0));
-                const std::string pr = ver.profile_report();
-                if (!pr.empty()) std::fprintf(stderr, "strata decode GPU stages (millions of device-clock ticks per window):%s\n", pr.c_str());
+                for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile (upstream fe9c10ca, b4405a0e)
+                    const std::string pr = stage_ver(st).profile_report();
+                    if (pr.empty()) continue;
+                    if (st == 0)   // the first card's line keeps its text
+                        std::fprintf(stderr, "strata decode GPU stages (millions of device-clock ticks per window):%s\n", pr.c_str());
+                    else
+                        std::fprintf(stderr, "strata decode GPU stages, stage %d (millions of device-clock ticks per window):%s\n",
+                                     st, pr.c_str());
+                }
             }
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
