@@ -123,13 +123,23 @@ using Clock = std::chrono::steady_clock;
 // reads the file.  Swaps that need no exchange (`out` in the lend region is held in RAM already; or `in` is not) go
 // on as before; ones beyond the buffers' room wait for a later round.  Runs on the adaptive tier's thread while the
 // GPU commits and drafts: the copies back are on its stream, and waited for before the refills are queued.
-template <class Swap>
-bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::ExpertCache& cache,
-                          const std::vector<int32_t>& host_res, int64_t n_expert, std::vector<Swap>& swaps,
-                          strata::gpu::Stream stream) {
+//
+// With a layer split, `host_res` holds slot numbers of WHICHEVER cache owns the layer, so the copy back reads the
+// owning card's cache on that card's stream: `locate(layer)` names them (upstream fe9c10ca: reading a later stage's
+// slot number out of the first card's cache put another expert's bytes in RAM, and the answers turned to garbage).
+struct SwapHome {
+    strata::core::ExpertCache* cache;
+    strata::gpu::Stream stream;
+    int dev;   ///< -1: the first card
+};
+
+template <class Swap, class Locate>
+bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector<int32_t>& host_res, int64_t n_expert,
+                          std::vector<Swap>& swaps, Locate locate) {
     if (!src.complement_ready() || swaps.empty()) return true;
     struct Staged { int32_t layer, in, out; int64_t q; };
     std::vector<Staged> staged;
+    std::vector<SwapHome> used;   // the streams the copies back went on
     std::vector<Swap> kept;
     kept.reserve(swaps.size());
     for (const Swap& s : swaps) {
@@ -138,13 +148,21 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, strata::core::Exp
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
         if (slot < 0) continue;
-        if (strata::gpu::copy_async(src.exchange_buffer(q), cache.device_slot(slot), (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), stream) != true)
+        const SwapHome home = locate(s.layer);
+        const strata::core::OnDevice on(home.dev);
+        if (strata::gpu::copy_async(src.exchange_buffer(q), home.cache->device_slot(slot),
+                                    (size_t) strata::kernels::cpu::expert_layout().blob_bytes(s.layer), home.stream) != true)
             return false;
+        if (std::find_if(used.begin(), used.end(), [&](const SwapHome& h) { return h.stream == home.stream; }) == used.end())
+            used.push_back(home);
         staged.push_back({s.layer, s.in, s.out, q});
         kept.push_back(s);
     }
     if (!staged.empty()) {
-        if (strata::gpu::stream_sync(stream) != true) return false;
+        for (const SwapHome& h : used) {
+            const strata::core::OnDevice on(h.dev);
+            if (strata::gpu::stream_sync(h.stream) != true) return false;
+        }
         for (const Staged& x : staged)
             if (!src.stage_exchange(x.layer, x.in, x.out, x.q)) return false;
     }
@@ -4738,7 +4756,12 @@ int main(int argc, char** argv) {
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             bool main_live = false;
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            auto swap_home = [&](int32_t layer) {   // the cache that owns the layer, on its card's stream
+                const int stn = multi_gpu ? stage_of(layer) : 0;
+                GpuStage* gs = stn > 0 ? stages[(size_t) stn - 1].get() : nullptr;
+                return SwapHome{gs ? &gs->cache : &xcache, gs ? gs->adapt_stream : adapt_stream, gs ? gs->dev : -1};
+            };
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, swap_home)) return false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
@@ -7401,7 +7424,9 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (!resident_stage_swaps(src, xcache, host_res, g.n_expert, swaps, adapt_stream)) return false;
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,   // this loop refills the first card only
+                                      [&](int32_t) { return SwapHome{&xcache, adapt_stream, -1}; }))
+                return false;
             for (const Swap& s : swaps) {
                 const size_t in = (size_t) s.layer * g.n_expert + s.in, out = (size_t) s.layer * g.n_expert + s.out;
                 const int32_t slot = host_res[out];
