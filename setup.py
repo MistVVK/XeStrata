@@ -107,6 +107,8 @@ HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
+# KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
+KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (upstream #214)
 
@@ -1367,7 +1369,7 @@ def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8") -> float:
     """About how many GB of the model's experts the GPU's cache holds: its VRAM less ~5 GB for the dense weights,
     buffers and a 32K context's KV cache (upstream's figure, not measured on an Arc card: unverified), less the KV
     cache of a longer context (in VRAM in the low-RAM mode: its RAM has no room for KV streaming)."""
-    kv_tok = 13 * (576 if kv == "q4_0" else 1056)       # bytes per context token: 12 QSA layers + the draft layer
+    kv_tok = 13 * KV_CELL_BYTES.get(kv, 1056)           # bytes per context token: 12 QSA layers + the draft layer
     longer = max(0, ctx - 32768) * kv_tok / 1e9
     return max(0.0, min(MODELS[model]["arena_gb"], vram_gb - 5 - longer))
 
@@ -2120,7 +2122,7 @@ def parallel_slot_gb(ctx: int, kv: str, streaming: bool) -> float:
     """#465: the VRAM one batch slot's session takes: its KV cache (12 QSA layers; with KV streaming only the 32K
     positions the attention reads stay in VRAM) and the DeltaNet state (~0.17 GB).  Measured (upstream): 0.56 GiB at
     32K int8."""
-    kv_tok = 12 * (576 if kv == "q4_0" else 1056)
+    kv_tok = 12 * KV_CELL_BYTES.get(kv, 1056)
     return (min(ctx, 32768) if streaming else ctx) * kv_tok / 1e9 + 0.17
 
 
@@ -2874,16 +2876,16 @@ def main() -> int:
         args += ["--resident-experts" if resident else "--mmap-experts"]
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
-    # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 7.5 KB with 4-bit, so only when it fits.
-    kv_ram_gb = ctx * (13 * (576 if kv == "q4_0" else 1056)) / 1e9   # 12 QSA layers + the draft layer
-    # k8v4 never streams its KV (the engine refuses --kv-resident with it)
-    if kv != "k8v4" and ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
+    # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so
+    # only when it fits.
+    kv_ram_gb = ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9   # 12 QSA layers + the draft layer
+    if ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_ram_gb + 1:
         args += ["--kv-resident", "32768"]
         ok(f"KV streaming on: the context's KV cache lives in RAM ({kv_ram_gb:.1f} GB), more experts fit in VRAM")
         if budget is not None and a.resident_budget_gib is None:   # its RAM comes out of the experts' budget
             budget = resident_budget_gib(model, ram, kv_ram_gb)
             ok(f"RAM budget: {budget} GiB (less the KV cache's RAM)")
-    elif kv != "k8v4" and ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
+    elif ctx >= 65536:   # #620: say why, so a regenerated config without --kv-resident is no surprise
         ok(f"KV streaming off: it needs ~{kv_ram_gb:.1f} GB of RAM beside the ~{MODELS[model]['ram_gb']} GB {model} "
            f"uses, and this PC has {ram:.0f}; the KV cache stays in VRAM (fewer cached experts)")
     if budget is not None:     # UD-Q4_K_XL: the experts read from the GGUF in place, the most-used N GiB kept in RAM

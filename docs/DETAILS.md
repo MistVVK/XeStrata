@@ -78,7 +78,8 @@ It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 - `int8` (the default): 8 bits
 - `q4_0`: a Hadamard rotation before 4-bit rounding, half the memory.
   Measurably less precise on long documents (upstream measured perplexity 8–12% worse; needle tests still pass)
-- `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory
+- `k8v4`: 8-bit keys and 4-bit values, about three quarters of the memory.
+  It streams its KV like the other formats (about 10.6 KB of RAM per context token)
 
 ## Which model
 
