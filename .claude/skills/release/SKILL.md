@@ -8,11 +8,12 @@ argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 # Releasing XeStrata
 
 A release is the annotated tag `xe<VERSION>` on `main`, pushed to origin, and a **draft** GitHub release on it with the release notes and the five packages plus `SHA256SUMS`.
-Taking the draft out (publishing it) is the user's: they do it on the web page, or ask for `gh release edit xe<VERSION> --draft=false`.
+Taking the draft out (publishing it) is the user's: they do it on the web page, or ask for `gh release edit xe<VERSION> --repo MistVVK/XeStrata --draft=false`.
 
 Rules for the whole run:
 
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
+  Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
 - Pushing `main` and the tag, and creating the release, are outward-facing: do them only after the user's explicit go-ahead at step 8 of this run.
 - The check is the package build alone (the user's decision, 2026-10-07): no CTest, no incus run, unless the user asks for them.
@@ -100,9 +101,9 @@ Go on only when they say so.
 git push origin main
 git push origin xe<VERSION>
 d=build/release/xe<VERSION>
-gh release create xe<VERSION> --verify-tag --draft --title "XeStrata xe<VERSION>" --notes-file "$d/NOTES.md" \
+gh release create xe<VERSION> --repo MistVVK/XeStrata --verify-tag --draft --title "XeStrata xe<VERSION>" --notes-file "$d/NOTES.md" \
   "$d"/*.deb "$d"/*.rpm "$d/SHA256SUMS"
-gh release view xe<VERSION> --json url,isDraft
+gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
 ```
 
 Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s).
