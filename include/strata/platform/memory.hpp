@@ -32,4 +32,12 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
+/// Whether `advise_willneed` asks the OS for anything: not on Windows, nor with STRATA_READ_AHEAD=0.
+bool read_ahead_enabled();
+/// Asks the OS to start reading [p, p + bytes) of a file mapping, without waiting.  Linux reads at most one
+/// readahead window per request, so the range is asked for in 128 KiB steps.
+void advise_willneed(const void* p, uint64_t bytes);
+/// The same for [offset, offset + bytes) of an open file.
+void advise_willneed(int fd, uint64_t offset, uint64_t bytes);
+
 }  // namespace strata::platform

@@ -201,6 +201,11 @@ VRAM に載ったエキスパートのページは OS に返し（`STRATA_ARENA_
 GPU はマップを直接読まないので、`--pcie-frac 0` で動かします。
 B70 の Coder（アリーナ 23.4 GiB、すべて VRAM）では、23.38 GiB を OS に返し、出力は同じで、デコードも同じ速さ（28.3 tok/s）、プロンプトは少し遅く（54 から 48 tok/s）なりました。
 
+起動時の読み込み（重み、ネイティブの密な行列、プロフィールからの GPU のキャッシュの充填、RAM に置くエキスパート、MTP の下書きのファイル）は、読む前にカーネルへ先読みを頼みます（madvise・posix_fadvise の WILLNEED を 128 KiB ずつ、upstream cb33c0ba）。
+ページフォールトを 1 つずつ待たずに、ドライブに深いキューで読ませるためです。
+upstream の測定（Gen3 NVMe、RTX 5090、32 GB、Q2_0 を RAM に置いて 262K）では、起動が約 920 秒から 70 秒になりました。
+`STRATA_READ_AHEAD=0` で止め、`STRATA_FILL_AHEAD=N` でキャッシュの充填で先に頼む組の数を決めます（既定 256）。
+
 CPU 内蔵のグラフィックスは RAM を共有するので、省 RAM モードにはなりません。
 GPU がモデルのどれだけを持てるかの setup の見積もりは upstream のもの（VRAM から約 5 GB を引く）で、Arc では確かめていません（`unverified`）。
 

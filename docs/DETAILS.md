@@ -198,6 +198,11 @@ The pages of the experts in VRAM are handed back to the OS (`STRATA_ARENA_RELEAS
 The GPU does not read the mapping directly: run with `--pcie-frac 0`.
 With the Coder on the B70 (a 23.4 GiB arena, all in VRAM) it handed 23.38 GiB back, gave the same output, decoded as fast (28.3 tok/s) and read the prompt a little slower (54 to 48 tok/s).
 
+The loads at start (the weights, the native dense matrices, the GPU cache's fill from the profile, the experts kept in RAM, the MTP draft files) ask the kernel to read ahead before they read (madvise / posix_fadvise WILLNEED in 128 KiB steps, upstream cb33c0ba).
+The drive then sees a deep queue instead of one page fault at a time.
+Upstream measured it on a Gen3 NVMe (RTX 5090, 32 GB, Q2_0 kept in RAM at 262K): ready in 70 s instead of ~920 s.
+`STRATA_READ_AHEAD=0` turns it off; `STRATA_FILL_AHEAD=N` sets how many pairs the cache fill asks for ahead (default 256).
+
 The processor's own graphics share the RAM, so they never take the low-RAM mode.
 setup's estimate of how much of a model the GPU holds is upstream's (its VRAM less ~5 GB) and has not been checked on an Arc card (`unverified`).
 
