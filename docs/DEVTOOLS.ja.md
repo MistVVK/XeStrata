@@ -56,11 +56,11 @@ free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルし
 setup は `--intel-llvm-build` でこれを動かします。
 済んだビルドをどう使い回すかは [BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ) にあります。
 intel/llvm は自由ソフトウェア（Apache-2.0 with LLVM exceptions）で、自由ソフトウェアだけでビルドできます。
-要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel python3`）。
+要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3`）。
 
 ```sh
 sudo apt install git cmake ninja-build g++ python3 libhwloc-dev libzstd-dev
-python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update
+python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
 
 ビルドの構成は、リリースが指定するもの（Level Zero のヘッダーとローダー、emhash。どれも自由ソフトウェア）を取ってくるので、ネットワークが要ります。
@@ -108,6 +108,19 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
+
+## パッケージのビルド（Docker）
+
+deb と rpm のパッケージ（`tools/package/build.sh`、[BUILD.ja.md](BUILD.ja.md#deb-と-rpm-のパッケージ)）は、Docker のコンテナの中でビルドします。
+
+```sh
+sudo apt install docker.io            # 29.1.3
+sudo usermod -aG docker "$USER"       # ログインし直すと sudo なしで動きます
+```
+
+docker グループは root と同じ権限を持ちます。
+コンテナには GPU を渡さないので、GPU のための追加の道具（nvidia-container-toolkit など）は要りません。
+1 回のビルドで intel/llvm も作り、Fedora 44 の free でコンテナは最大 6.8 GB になりました（1 分ごとに測った値。cuda の版は CUDA ツールキットの分だけ増えます）。コンテナは終わると消えます。
 
 ## AVX-512 の経路を確かめる Intel SDE
 

@@ -56,11 +56,11 @@ An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm 
 setup runs it for `--intel-llvm-build`;
 [BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
-It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel python3`):
+It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3`):
 
 ```sh
 sudo apt install git cmake ninja-build g++ python3 libhwloc-dev libzstd-dev
-python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update
+python3 tools/intel_llvm_build.py            # --keep-build keeps the build tree for a quicker update; --jobs N
 ```
 
 Its configuration downloads what the release pins (Level Zero's headers and loader, emhash; all free software), so it needs the network.
@@ -108,6 +108,19 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
+
+## Building the packages (Docker)
+
+The deb and rpm packages (`tools/package/build.sh`, [BUILD.md](BUILD.md#the-deb-and-rpm-packages)) are built in Docker containers.
+
+```sh
+sudo apt install docker.io            # 29.1.3
+sudo usermod -aG docker "$USER"       # after logging in again it runs without sudo
+```
+
+The docker group has the same power as root.
+The containers get no GPU, so nothing extra for GPUs (such as nvidia-container-toolkit) is needed.
+A build makes intel/llvm too; for Fedora 44's free packages the container grew to 6.8 GB at most (measured every minute; the cuda variants add the CUDA toolkit). The container is removed at the end.
 
 ## Intel SDE (the AVX-512 paths)
 
