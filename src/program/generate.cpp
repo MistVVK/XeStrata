@@ -346,6 +346,12 @@ struct Options {
     int batch_cpu_split[2] = {0, 0};
     std::string spec_oracle;
     int spec_corrupt = 0;
+    /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
+    /// the window's argmax, and a draft is accepted when it matches it, so runs with different speculation
+    /// settings process the same text.
+    std::string spec_follow;
+    /// Per verify window: a line with its size, a hash of its final residual rows and its argmaxes.
+    std::string window_hashes;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
@@ -555,6 +561,12 @@ void usage() {
                  "  --gpu-only-full      MEASURE: replay pre+post for all 48 layers plus the LM head, no pool.\n"
                  "                       THE TRUE PER-TOKEN GPU FLOOR.  Quote this one, not --graph-only.\n"
                  "  --stats              print the per-stage breakdown\n"
+                 "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
+                 "                       accept the drafts that match it, so speculation settings compare on the\n"
+                 "                       same text (with --spec; not --serve)\n"
+                 "  --window-hashes PATH per verify window, a line with its index, position, size, a 64-bit hash of\n"
+                 "                       its final residual rows and its argmaxes: two builds that do the same\n"
+                 "                       arithmetic write the same file (use with --spec-follow, --adapt-every 0)\n"
                  "  --gpu-stages         R0.9: capture the layer as three graphs (mixer / ffn+router / post)\n"
                  "                       and time them from OUTSIDE the capture.  The per-stage table on the\n"
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
@@ -1176,6 +1188,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
+        else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+        else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
@@ -7247,16 +7261,24 @@ int main(int argc, char** argv) {
     const bool ended = o.stop_eos && !produced.empty() &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) produced.back()) != o.eos_ids.end();
     if (spec_pos >= 0 && (int64_t) produced.size() < o.max_new && !ended) {
-        std::vector<int64_t> oracle;
-        if (!o.spec_oracle.empty()) {
-            std::ifstream in(o.spec_oracle);
+        auto read_ids = [](const std::string& path, std::vector<int64_t>& ids) {
+            std::ifstream in(path);
             std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             std::string e;
-            if (!in || !parse_i64_list(text.c_str(), oracle, e)) {
-                std::fprintf(stderr, "strata generate: cannot read --spec-oracle %s\n", o.spec_oracle.c_str());
-                return 2;
-            }
+            return (bool) in && parse_i64_list(text.c_str(), ids, e);
+        };
+        std::vector<int64_t> oracle, follow;
+        if (!o.spec_oracle.empty() && !read_ids(o.spec_oracle, oracle)) {
+            std::fprintf(stderr, "strata generate: cannot read --spec-oracle %s\n", o.spec_oracle.c_str());
+            return 2;
         }
+        if (!o.spec_follow.empty() && !read_ids(o.spec_follow, follow)) {
+            std::fprintf(stderr, "strata generate: cannot read --spec-follow %s\n", o.spec_follow.c_str());
+            return 2;
+        }
+        // --spec-follow: the run ends with the continuation
+        const int64_t max_new = follow.empty() ? o.max_new : std::min<int64_t>(o.max_new, (int64_t) follow.size());
+        int64_t follow_differ = 0, follow_emitted = 0;
         if (thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
@@ -7410,6 +7432,13 @@ int main(int argc, char** argv) {
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<float> window_logits;       // --dump-logits: the emitted rows of a window
+        std::vector<uint8_t> fdiff((size_t) o.spec, 0);
+        std::FILE* hashes = o.window_hashes.empty() ? nullptr : std::fopen(o.window_hashes.c_str(), "w");
+        if (!o.window_hashes.empty() && hashes == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.window_hashes.c_str());
+            return 1;
+        }
+        std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
@@ -7431,7 +7460,7 @@ int main(int argc, char** argv) {
         // the low-RAM mode's tiers during the decode only (the startup fill and the prompt read files too)
         const int64_t file_reads0 = src.file_reads(), ram_reads0 = src.ram_reads();
         const uint64_t file_bytes0 = src.file_read_bytes();
-        while ((int64_t) produced.size() < o.max_new) {
+        while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
@@ -7480,6 +7509,27 @@ int main(int argc, char** argv) {
                              drive.d.fail ? drive.d.fail : "(no message)");
                 return 1;
             }
+            if (hashes != nullptr) {   // FNV-1a over the window's final residual rows (a test path: a plain copy)
+                const size_t n_floats = (size_t) T * (size_t) (g.hc * g.n_embd);
+                hash_rows.resize(n_floats);
+                if (!strata::gpu::copy(hash_rows.data(), ver.final_R_all(), n_floats * sizeof(float))) {
+                    std::fprintf(stderr, "strata generate: --window-hashes: %s\n", strata::gpu::last_error());
+                    return 1;
+                }
+                uint64_t h = 1469598103934665603ull;
+                const auto* bytes = (const uint8_t*) hash_rows.data();
+                for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
+                std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
+                for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
+                std::fprintf(hashes, "\n");
+            }
+            if (!follow.empty()) {   // the continuation stands in for the argmax
+                const size_t k0 = produced.size();
+                for (int i = 0; i < T && k0 + (size_t) i < follow.size(); ++i) {
+                    fdiff[(size_t) i] = outv[(size_t) i] != (int32_t) follow[k0 + (size_t) i];
+                    outv[(size_t) i] = (int32_t) follow[k0 + (size_t) i];
+                }
+            }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
             if (first_window) {
@@ -7504,10 +7554,11 @@ int main(int argc, char** argv) {
             if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
             bool eos = false;
             int emitted = 0;
-            for (int i = 0; i <= a && (int64_t) produced.size() < o.max_new && !eos; ++i, ++emitted) {
+            for (int i = 0; i <= a && (int64_t) produced.size() < max_new && !eos; ++i, ++emitted) {
                 produced.push_back(outv[(size_t) i]);
                 if (o.suffix_draft > 0) sfx.append(outv[(size_t) i]);
                 eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                if (!follow.empty()) { follow_differ += fdiff[(size_t) i]; ++follow_emitted; }
             }
             if (dump != nullptr && emitted > 0) {   // the rows of the emitted tokens; the rejected drafts' are not
                 window_logits.resize((size_t) emitted * (size_t) n_vocab);
@@ -7532,7 +7583,7 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
-            const bool drafted = !use_mtp || (int64_t) produced.size() >= o.max_new ||
+            const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
                                  mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
             if (adapt_thr.joinable()) adapt_thr.join();
             if (!adapt_ok) return 1;
@@ -7554,10 +7605,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (hashes != nullptr) std::fclose(hashes);
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
                     rounds > 0 ? (double) (drafts_ok + rounds) / (double) rounds : 0.0);
+        if (!follow.empty())
+            std::printf("%-24s %lld of %lld emitted tokens differ from the argmax\n", "follow",
+                        (long long) follow_differ, (long long) follow_emitted);
         if (o.spec_min_p > 0.0) {
             std::printf("%-24s", "window sizes");
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
