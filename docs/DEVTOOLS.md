@@ -107,7 +107,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are ten fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are eleven fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-08).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -130,6 +130,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fixed, as in the CUDA adapter, it answers "not empty" without a log (`hip-queue-empty`).
   Tenth, at a process's exit the SYCL runtime unregisters its device images from the executable's finalizers after the HIP runtime has torn itself down, and glibc aborted with "double free or corruption" when the HIP adapter unloaded the module (every SYCL program that had used an AMD GPU ended with SIGABRT).
   Fixed, a program released after the exit began is not unloaded (`hip-exit-unload`).
+  Eleventh, libclc took an amdgcn GPU for one without FMA instructions unless the compiler defined `__HAS_FMAF__`.
+  The AMD libspirv is built for no processor and lacks it, so `sycl::fma` and the math built on it ran a software FMA on every AMD GPU (the engine's DeltaNet recurrence about 95 µs a token on an RX 9060 XT).
+  Every amdgcn GPU has `v_fma_f32`: fixed, only r600 keeps the software FMA (`hip-libclc-fma`).
   The CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
