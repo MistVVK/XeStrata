@@ -43,4 +43,18 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap) {
     return v;
 }
 
+/// --prompt-cache-tail: the extra checkpoint near the prompt's end (`tail[i]`) is the first to go - it serves
+/// only a branch of the last request - unless it is the newest item (the one just saved: `n > 1` and the newest
+/// stamp).  With no such item this is the plain policy.  Never the root.
+inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, const bool* tail) {
+    if (tail != nullptr && n >= 2 && cap >= 2) {
+        size_t newest = 0;
+        for (size_t i = 1; i < n; ++i)
+            if (stamps[i] > stamps[newest]) newest = i;
+        for (size_t i = 1; i < n; ++i)
+            if (tail[i] && i != newest) return i;
+    }
+    return eviction_victim(stamps, n, cap);
+}
+
 }  // namespace strata::program::conv_cache

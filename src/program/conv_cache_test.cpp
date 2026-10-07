@@ -65,6 +65,16 @@ int main() {
         const size_t b = eviction_victim(stamps.data(), stamps.size(), 4);
         check(a == 1 && b == 1, "ties among equally stale leaves: the earlier index, deterministically");
     }
+    {   // --prompt-cache-tail: the tail checkpoint goes first; never the root, never the newest item
+        const std::vector<uint64_t> st = {1, 2, 3, 4, 5, 6, 7};
+        const bool t2[7] = {false, false, false, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, t2) == 3, "a stale tail checkpoint leaves before the oldest leaf");
+        const bool t3[7] = {false, false, false, false, false, false, true};
+        check(eviction_victim(st.data(), st.size(), 6, t3) == 1, "the newest item, even a tail, is not the victim");
+        const bool t4[7] = {true, false, false, false, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, t4) == 1, "the root is never the victim, tail flag or not");
+        check(eviction_victim(st.data(), st.size(), 6, nullptr) == 1, "no tail flags: the plain policy");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

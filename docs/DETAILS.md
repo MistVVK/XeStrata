@@ -600,6 +600,14 @@ It takes no checkpoint at the start of its last turn nor every 16K tokens, and i
 It still starts from a checkpoint it matches, and still takes the system-prompt root when that reaches `--prompt-cache-root`.
 Without the field, or with `true`, nothing changes.
 
+Two options are off by default (both on one GPU).
+
+- `--prompt-cache-tail` (an engine argument): one more checkpoint at a chunk boundary within one chunk of the prompt's end.
+  A continuation that branches between the every-16K checkpoints reads less again. This checkpoint is evicted first and pushes out no other.
+- `STRATA_CACHE_MESSAGE_BOUNDARY=1` (the engine's environment): a checkpoint before the last user message (at the end of the turn before it).
+  An agent that keeps a long history and replaces only the last message does not read the history again.
+  It applies to a history of 8,192 tokens or more with a last message of at most 1,024; it splits the prompt's chunks and costs a fresh request the time of the snapshot.
+
 ### Several conversations (opt-in)
 
 Add `--conversation-cache-mib 8192 --conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at most 8 GiB of RAM.
