@@ -21,6 +21,9 @@ constexpr double kDecay = 0.97;       // lookup counts: older windows fade
 constexpr double kPriorQ[DraftPolicy::kBuckets] = {0.75, 0.88, 0.93, 0.96};
 constexpr double kPriorN = 4.0;
 constexpr int kProbes = 3;       // a lookup window size is tried this often before its guessed cost can veto it
+// A size not measured for this many rounds is tried again when a confident lookup could use it: its cost was set in
+// one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
+constexpr double kStaleRounds = 300.0;
 
 }  // namespace
 
@@ -50,6 +53,8 @@ double DraftPolicy::cost_ms(int t) const {
     return den > 0 ? num / den : kShape[t];
 }
 
+bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
+
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
     return 1.0 + 0.7 * (t - 1);       // before any MTP window of this size: a typical acceptance
@@ -69,15 +74,17 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         const double r = e / cost_ms(k + 1);
         if (r > best) { best = r; best_t = k + 1; }
     }
+    const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
     if (best_t > 0 && best > base * (1.0 + margin_)) {
         p.lookup = true;
         p.t = best_t;
+        // a wider size whose cost has gone stale is re-measured, so one slow stretch cannot price it out for good
+        if (best_t < t_full && q >= 0.85 && stale(t_full)) p.t = t_full;
         return p;
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    const int t_full = std::min(lookup_k, max_t_ - 1) + 1;
-    if (t_full > p.t && cost_n_[t_full] < kProbes && q >= 0.85) {
+    if (t_full > p.t && (cost_n_[t_full] < kProbes || stale(t_full)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -89,7 +96,9 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     if (round_ms > 0) {
         cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
         cost_n_[t] += 1.0;
+        last_[t] = rounds_;
     }
+    rounds_ += 1.0;
     if (lookup) {
         const int b = bucket(match);
         ok_[b] = kDecay * ok_[b] + accepted;

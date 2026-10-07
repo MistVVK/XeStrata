@@ -44,12 +44,15 @@ public:
 private:
     static int bucket(int match);
     double mtp_tokens(int t) const;
+    bool stale(int t) const;               // a size not measured for a long stretch of rounds
 
     int max_t_;
     double margin_;
     std::array<double, kMaxT + 1> cost_{}, cost_n_{};      // round ms by window size
     std::array<double, kMaxT + 1> mtp_tok_{}, mtp_n_{};    // tokens committed by MTP windows of that size
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
+    double rounds_ = 0;                                    // rounds observed so far
+    std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
 };
 
 }  // namespace strata::spec
