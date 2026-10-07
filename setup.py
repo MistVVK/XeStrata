@@ -58,6 +58,21 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 ROOT = Path(__file__).resolve().parent
+
+
+def xdg_dir(var: str, default: str) -> Path:
+    return Path(os.environ.get(var) or Path.home() / default) / "xestrata"
+
+
+# A deb or rpm package installs this folder read-only (/usr/share/xestrata) with a PACKAGED record (where the engine
+# package puts the engine).  Then nothing is compiled, the Python packages are the distribution's, and what setup
+# writes for a model (its config, the logs) goes to the user's XDG folders instead of next to this file.
+PACKAGED: dict[str, Any] | None = None
+if (ROOT / "PACKAGED").is_file():
+    PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
+CONF = xdg_dir("XDG_CONFIG_HOME", ".config") if PACKAGED else ROOT        # the model configs, xestrata-<model>.json
+STATE = xdg_dir("XDG_STATE_HOME", ".local/state") if PACKAGED else ROOT   # the logs, and the engine's working folder
+SETUP_CMD = "xestrata" if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
 # on any day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -460,6 +475,18 @@ def gpu_problem(g, together=False):
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    if g.get("vendor") == "nvidia" and PACKAGED:
+        meta = packaged_engine()
+        archs = [int(x[3:]) for x in meta.get("cuda_archs", []) if x[3:].isdigit()]   # "sm_75" -> 75
+        if not archs:
+            return (f"{meta.get('package', 'this package')} has no NVIDIA code: an NVIDIA GPU needs "
+                    "xestrata-contrib-cuda<version> in its place")
+        # unknown without nvidia-smi: the engine says so if it has no code for the card
+        cc = g.get("cc") or ""
+        if re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < min(archs):
+            return (f"compute capability {g.get('cc')} is older than the sm_{min(archs)} {meta.get('package')} has "
+                    "code for: xestrata-contrib-cuda12.4 in its place has code for it (from Volta, sm_70)")
+        return None
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
     return None
@@ -800,10 +827,25 @@ MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icp
 def license_mode(a=None) -> str:
     """The build mode: --license, else the one kept in the settings.  Settings from before the three modes kept
     "nonfree": true for icpx, which is contrib-icpx now."""
+    if PACKAGED:
+        return packaged_engine().get("license", "free")
     if a is not None and getattr(a, "license", None):
         return a.license
     st = load_settings()
     return st.get("license") or ("contrib-icpx" if st.get("nonfree") else "contrib")
+
+
+def packaged_engine() -> dict:
+    """The installed package's engine record (BUILD.json): its license, NVIDIA architectures and library folders."""
+    eng = Path(PACKAGED["engine"]) if PACKAGED else ROOT / "engine"
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    if not meta or not (eng / EXE).is_file():
+        fail("the XeStrata package has no engine (its files are missing)",
+             "install it again: sudo apt install --reinstall <package> (Ubuntu), sudo dnf reinstall <package> (Fedora)")
+    return meta
 
 
 def mkl_root() -> str | None:
@@ -1220,7 +1262,9 @@ def recorded_compiler(meta: dict) -> dict:
 def update_installed_engine() -> None:
     """An engine or image encoder whose sources changed since it was compiled (a `git pull`) is compiled again before
     the model starts.  If that fails, a previous Xe engine is kept and starts as before; upstream's CUDA engine cannot
-    run here."""
+    run here.  A package's engine is updated by apt or dnf."""
+    if PACKAGED:
+        return
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if not info.exists() or not (eng / EXE).exists():
@@ -1296,7 +1340,7 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
     lines = ["If the start stops with \"no VRAM is left for the expert cache\" (the engine's log says how much is "
              "short):"]
     if tips:
-        lines.append("  run ./setup.sh again with " + " and ".join(tips) +
+        lines.append(f"  run {SETUP_CMD} again with " + " and ".join(tips) +
                      ", or close other programs that use the GPU.")
     else:
         lines.append("  close other programs that use the GPU.")
@@ -1489,19 +1533,27 @@ def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
         cfg_file.write_text(json.dumps(new_cfg, indent=1), encoding="utf-8")
 
 
+def default_data_dir() -> Path:
+    """Where the model files go unless the settings name a folder: next to this Strata folder, or for a package (whose
+    folder is read-only) in the user's XDG data folder."""
+    return xdg_dir("XDG_DATA_HOME", ".local/share") if PACKAGED else ROOT.parent / "XeStrata-data"
+
+
 def data_folder(requested: str | None) -> tuple:
     """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
     and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
     settings = load_settings()
     dest = Path(requested).expanduser().resolve() if requested else \
-        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "XeStrata-data"
+        Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
     try:
         dest.mkdir(parents=True, exist_ok=True)
     except OSError as e:                                # e.g. no write access next to the Strata folder
+        if PACKAGED:
+            fail(f"cannot use {dest} for the model files ({e})", "choose another folder with --data-dir")
         warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
         dest = ROOT
     elsewhere = []
-    for folder in [ROOT, *other_installs(settings)]:
+    for folder in [*([] if PACKAGED else [ROOT]), *other_installs(settings)]:
         if folder == dest or not has_data(folder):
             continue
         if not same_drive(folder, dest):
@@ -1527,7 +1579,9 @@ def data_folder(requested: str | None) -> tuple:
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
         else:
             ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
-    installs = [str(ROOT)] + [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
+    # the Strata folders this user ran (a package's folder holds no model files or configs: not one of them)
+    installs = [*([] if PACKAGED else [str(ROOT)])] + \
+        [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
     save_settings({**settings, "data_dir": str(dest), "installs": installs[:20]})
     return dest, elsewhere
 
@@ -1596,12 +1650,14 @@ def model_config(path: Path) -> bool:
 
 
 def installed_configs():
-    return [p for p in sorted(ROOT.glob("xestrata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return [p for p in sorted(CONF.glob("xestrata-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
             if model_config(p)]
 
 
 def source_version() -> str:
     """The engine version the source tree builds (CMakeLists.txt's project version)."""
+    if PACKAGED:
+        return str(PACKAGED.get("version", "0"))
     m = re.search(r"project\(XeStrata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
     return m.group(1) if m else "0"
 
@@ -1754,7 +1810,7 @@ def draft_vocab_note(vram_gb: float, chosen: str | None) -> list[str]:
         return []
     return [f"Tip for a {vram_gb:.0f} GB card: the draft layer's default token subset (with Chinese, Japanese and "
             f"Korean) needs up to ~{DRAFT_VOCAB_MIB['cjk']} MiB of VRAM.",
-            f"  For English and code answers, ./setup.sh --draft-vocab en needs up to ~{DRAFT_VOCAB_MIB['en']} MiB "
+            f"  For English and code answers, {SETUP_CMD} --draft-vocab en needs up to ~{DRAFT_VOCAB_MIB['en']} MiB "
             f"(cyrillic: ~{DRAFT_VOCAB_MIB['cyrillic']}) and leaves the rest to the expert cache - and it is the",
             "  fix when the start stops with \"the draft head does not fit\". The model keeps the choice."]
 
@@ -1793,11 +1849,13 @@ def update_install(have: list) -> int:
     files are not touched."""
     have = [p for p in have if model_config(p)]        # #549: an xestrata-*.json that is no model config is skipped
     if not have:
-        say("  No model is installed in this XeStrata folder yet: run ./setup.sh to set it up - it finds an earlier")
+        say(f"  No model is installed in this XeStrata folder yet: run {SETUP_CMD} to set it up - it finds an "
+            "earlier")
         say("  install's model files next to it and reuses them.")
         return 0
-    pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+    if not PACKAGED:
+        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
     update_installed_engine()
     for cfg_path in have:
         cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
@@ -1805,7 +1863,7 @@ def update_install(have: list) -> int:
             refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
         ok(f"{cfg.get('model_name', cfg_path.stem)}: up to date")
     say()
-    ok("XeStrata is updated. Start the model with ./setup.sh when you want it.")
+    ok(f"XeStrata is updated. Start the model with {SETUP_CMD} when you want it.")
     return 0
 
 
@@ -1943,7 +2001,7 @@ def warm_up(cfg_path: Path) -> None:
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         port = sk.getsockname()[1]
-    log = cfg_path.with_name(cfg_path.stem + "-warmup.log")
+    log = STATE / (cfg_path.stem + "-warmup.log")
     base = f"http://127.0.0.1:{port}"
     say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes) ...")
     t0 = time.time()
@@ -2621,20 +2679,37 @@ def main() -> int:
 
     # ---- 3. python packages
     step(3, "Python packages")
-    pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
+    if PACKAGED:                                       # the distribution's, which the package depends on
+        ok("the distribution's Python packages (installed with XeStrata's package)")
+    else:
+        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, cmake, ninja, pillow, psutil")
 
     # ---- 4. the engine
     step(4, "the Strata engine")
-    llama = get_llama_cpp()
-    ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    comp = choose_compiler(a, gpu)
-    enc = gpu_encoder(comp)
-    eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
-    # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when this
-    # config uses the SYCL image encoder (oneMKL): a free install never puts oneAPI on the engine's library path
-    lib_dirs = list(dict.fromkeys(comp["lib_dirs"] + (oneapi_lib_dirs() if vision == "gpu" and enc == "gpu" else [])))
-    ok(f"engine: {eng / EXE}")
+    if PACKAGED:                                       # the package's: nothing is compiled
+        llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
+        eng = Path(PACKAGED["engine"])
+        meta = packaged_engine()
+        enc = "vulkan"
+        # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
+        # without it the engine takes its own kernels)
+        lib_dirs = list(meta.get("lib_dirs", []))
+        if meta.get("license") == "contrib" and (mkl := mkl_root()):
+            lib_dirs.append(str(Path(mkl) / "lib"))
+        ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
+    else:
+        llama = get_llama_cpp()
+        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+        comp = choose_compiler(a, gpu)
+        enc = gpu_encoder(comp)
+        eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp)
+        # the runtime of the compiler the engine was built with (none for the distribution's), and oneAPI's only when
+        # this config uses the SYCL image encoder (oneMKL): a free install never puts oneAPI on the engine's library
+        # path
+        lib_dirs = list(dict.fromkeys(comp["lib_dirs"] +
+                                      (oneapi_lib_dirs() if vision == "gpu" and enc == "gpu" else [])))
+        ok(f"engine: {eng / EXE}")
 
     # ---- 5. the model files
     step(5, f"downloading {fam['title']} {model}")
@@ -2711,14 +2786,14 @@ def main() -> int:
         run([sys.executable, str(ROOT / "tools" / "mtp_rt.py"), "--gguf", str(mtp / "mtp-q2_0.gguf"), "--out", str(rt)],
             env=env)
     # a setup run again without --draft-vocab keeps the subset this model's config chose before
-    draft_vocab = a.draft_vocab or saved_draft_vocab(ROOT / f"xestrata-{tag.lower()}.json")
+    draft_vocab = a.draft_vocab or saved_draft_vocab(CONF / f"xestrata-{tag.lower()}.json")
     refresh_draft_vocab(rt, draft_vocab or "cjk")
     ok(f"MTP draft layer: {rt}")
     for line in draft_vocab_note(gpu_expert_vram(gpu), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 
     # ---- 7. the start script
-    step(7, "writing the start script")
+    step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile                   # the PLE table's shard: shard 2 (original) or 1 (Swift)
     ple = next((s for s in shards if any(t.name == "per_layer_token_embd.weight" for t in GGUFFile(s).tensors)), None)
@@ -2772,10 +2847,10 @@ def main() -> int:
         # the package's profile, with llama.cpp's flags (the engine takes the same ones)
         args += ["--control-vector-scaled", f"{esp}:1.0", "--control-vector-layer-range", "4", "44",
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
-    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT),
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(pack / "tokenizer"),
                            "model_name": f"{fam['name']}-{model.lower()}",
-                           "log": str(ROOT / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+                           "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
@@ -2806,7 +2881,7 @@ def main() -> int:
         for line in parallel_note(None, gpu_expert_vram(gpu), MODELS[model]["arena_gb"], ctx, kv, streaming):
             say("  " + line)
     if vision != "none":
-        vt = vision_tokens(a.vision_tokens, vision, ROOT / f"xestrata-{tag.lower()}.json")
+        vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
                    "threads": max(1, (os.cpu_count() or 8) // 2)}
@@ -2824,7 +2899,9 @@ def main() -> int:
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
-    cfg_path = ROOT / f"xestrata-{tag.lower()}.json"
+    cfg_path = CONF / f"xestrata-{tag.lower()}.json"
+    CONF.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
     cal = saved_calibration(cfg)
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
@@ -2832,15 +2909,16 @@ def main() -> int:
         cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
         ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
-    script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not a.no_start and not a.yes and ask(
             "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
-            "meanwhile; later: ./setup.sh --calibrate)", ["y", "n"], "y", a.yes) == "y":
+            f"meanwhile; later: {SETUP_CMD} --calibrate)", ["y", "n"], "y", a.yes) == "y":
         calibrate_config(cfg_path)
-    ok(f"start script: {script.name}")
+    if script is not None:
+        ok(f"start script: {script.name}")
 
     say()
     say("All set.")
@@ -2849,7 +2927,8 @@ def main() -> int:
     if a.host and a.host not in ("127.0.0.1", "localhost"):
         say(f"  Other devices:    the server window prints this PC's address (http://<IP>:{port}/)"
             + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
-    say(f"  Next time:        just run ./setup.sh (or {script.name}) - it starts right away")
+    say(f"  Next time:        just run {SETUP_CMD}" + (f" (or {script.name})" if script else "") +
+        " - it starts right away")
     if vision != "none":
         say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
     if a.no_start:
