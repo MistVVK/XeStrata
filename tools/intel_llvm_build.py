@@ -176,7 +176,7 @@ def fix_sources() -> None:
         say(f"applied {patch.name}")
 
 
-def build(tag: str, keep_build: bool, contrib: bool) -> None:
+def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) -> None:
     need = missing_prerequisites()
     if need:
         fail("intel/llvm's build needs: " + ", ".join(need), "install them: sudo apt install " + " ".join(need))
@@ -204,7 +204,7 @@ def build(tag: str, keep_build: bool, contrib: bool) -> None:
              f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
              "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON"]
             + (contrib_options() if contrib else []))
-    jobs = max(2, min(os.cpu_count() or 4, int(ram_gb() // 3)))
+    jobs = jobs or max(2, min(os.cpu_count() or 4, int(ram_gb() // 3)))
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -241,6 +241,8 @@ def main() -> None:
     ap.add_argument("--rebuild", action="store_true", help="build again even when a finished build is there")
     ap.add_argument("--keep-build", action="store_true", help="keep the build tree for the next update")
     ap.add_argument("--yes", action="store_true", help="answer the questions with their defaults")
+    ap.add_argument("--jobs", type=int, metavar="N",
+                    help="compile N files at once (default: the threads, at most one per 3 GB of RAM)")
     a = ap.parse_args()
     if a.contrib:
         set_out(ROOT / ".tools" / "intel-llvm-contrib")
@@ -257,19 +259,19 @@ def main() -> None:
             elif ask(f"intel/llvm {a.tag} is built without the fixes {', '.join(missing)}; build it again with them? "
                      "build = with the fixes (with --keep-build's tree, minutes), keep = as it is", ["build", "keep"],
                      "build", a.yes) == "build":
-                build(a.tag, a.keep_build, a.contrib)
+                build(a.tag, a.keep_build, a.contrib, a.jobs)
         elif version_key(have.get("tag", "")) < version_key(a.tag):
             choice = ask(f"intel/llvm {have.get('tag')} is built; build {a.tag} over it? "
                          "keep = use the one built, build = build the new one", ["keep", "build"], "keep", a.yes)
             if choice == "build":
-                build(a.tag, a.keep_build, a.contrib)
+                build(a.tag, a.keep_build, a.contrib, a.jobs)
         else:
             say(f"intel/llvm {have.get('tag')} is built (newer than {a.tag}): using it")
     else:
         if (BUILD / "build.ninja").exists() and not a.rebuild:
             say("an interrupted build is there: continuing it")
         say(f"building intel/llvm {a.tag} in {OUT} (13 minutes on 28 threads; with --contrib longer) ...")
-        build(a.tag, a.keep_build, a.contrib)
+        build(a.tag, a.keep_build, a.contrib, a.jobs)
     have = finished()
     if have is None:
         fail(f"no finished build in {INSTALL}")
