@@ -322,6 +322,8 @@ Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's
 A running request finishes first.
 The experts of the pieces given back are computed on the CPU: the same answers, slower.
 `GET /v1/status` shows the current size under `"vram"`.
+A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
+While a request runs or waits, it waits up to 300 s, then answers `409`.
 Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.1.1 does not).
 
 ### Model files downloaded by hand, or from a mirror
