@@ -54,6 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
+SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
@@ -166,8 +167,8 @@ ENGINE_REQUEST = re.compile(
 
 DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
-                   "script) or --draft-vocab en (English and code, ~215 MiB less than the default). Run ./setup.sh "
-                   "--draft-vocab en once and the model keeps it; or a smaller --context in setup.")
+                   "script) or --draft-vocab en (English and code, ~215 MiB less than the default). Run "
+                   f"{SETUP_CMD} --draft-vocab en once and the model keeps it; or a smaller --context in setup.")
 
 
 def start_failure_hint(log: str | None, offset: int) -> str:
@@ -3710,7 +3711,8 @@ def warn_tight_ram(arena_mib) -> None:
         print(f"[strata] WARNING: RAM is tight - the model's experts take {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + "Linux may stop the engine in the middle of an answer. "
-              + "Close other programs, or run ./setup.sh --setup and pick a smaller size (Q2_0 / IQ2_XS).", flush=True)
+              + f"Close other programs, or run {SETUP_CMD} --setup and pick a smaller size (Q2_0 / IQ2_XS).",
+              flush=True)
 
 
 def lan_addresses() -> list[str]:
