@@ -163,7 +163,9 @@ UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
-CONTEXTS = [8192, 32768, 65536, 131072, 262144, 393216, 524288]
+# 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
+# costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
+CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 FAMILIES: dict[str, dict[str, Any]] = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
@@ -626,6 +628,8 @@ def download(url, dst: Path, what=None):
         return
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
+        if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
+            break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
@@ -1314,8 +1318,10 @@ def ctx_ram_need(model, ctx, low_ram=False):
 
 def ram_ctx(model, ram, low_ram=False) -> int:
     """The longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It is part
-    of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note."""
-    return max(c for c in CONTEXTS if c <= 131072 or (ctx_ram_need(model, c, low_ram) or 0) <= ram)
+    of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note.
+    The 200K menu step is never the recommendation (upstream #608)."""
+    # 204800 is a menu step between 128K and 256K, never the recommendation: where 256K does not fit, 128K stays
+    return max(c for c in CONTEXTS if c <= 131072 or (c != 204800 and (ctx_ram_need(model, c, low_ram) or 0) <= ram))
 
 
 # The low-RAM mode (upstream de159b5 / 872af82): a PC whose GPU holds much of a model's experts but whose RAM cannot
