@@ -1586,6 +1586,49 @@ def data_folder(requested: str | None) -> tuple:
     return dest, elsewhere
 
 
+def folder_size(path: Path) -> int:
+    total = 0
+    for dirpath, _, files in os.walk(path):
+        for f in files:
+            try:
+                total += (Path(dirpath) / f).lstat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def remove_data() -> int:
+    """--remove-data: what XeStrata keeps for this user, which apt and dnf leave when they remove the program - the
+    model files, the prepared packs and the MTP layer in the data folder, the settings and model configs, the logs -
+    listed with their sizes and deleted after a yes typed at the question (--yes is not one).  GGUF files given with
+    --gguf-dir are the user's own and stay; in a Strata folder (no package), its own files stay too."""
+    settings = load_settings()
+    data = Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
+    targets = [data / d for d in DATA_ITEMS] + [settings_path().parent]
+    if PACKAGED:
+        targets += [CONF, STATE]
+    targets = [t for t in dict.fromkeys(targets) if t.exists()]
+    if not targets:
+        say("Nothing of XeStrata's is kept for this user.")
+        return 0
+    say("These folders hold what XeStrata keeps for you:")
+    for t in targets:
+        say(f"  {t}  ({folder_size(t) / 1e9:.1f} GB)")
+    if not sys.stdin.isatty() or input("Delete them? Type yes to delete: ").strip().lower() != "yes":
+        say("Nothing was deleted.")
+        return 1
+    for t in targets:
+        shutil.rmtree(t, ignore_errors=True)
+        if t.exists():
+            warn(f"could not delete all of {t}")
+    try:
+        data.rmdir()                                   # the data folder, when nothing else is in it
+    except OSError:
+        pass
+    ok("deleted")
+    return 0
+
+
 def previous_config(elsewhere_first: list, settings: dict):
     """The most recently used model config of another Strata folder on this PC, for a folder that has none yet."""
     cands = []
@@ -2312,6 +2355,9 @@ def main() -> int:
                          "request then compiles it: ~30 s more)")
     ap.add_argument("--build", action="store_true", help=argparse.SUPPRESS)   # the engine is always compiled here
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--remove-data", action="store_true",
+                    help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "
+                         "program with apt or dnf leaves them)")
     ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
@@ -2333,6 +2379,8 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as --check lists them, e.g. --gpu 0, not {a.gpu!r}")
+    if a.remove_data:
+        return remove_data()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (an Intel GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
