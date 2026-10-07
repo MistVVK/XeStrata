@@ -7,6 +7,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/platform/memory.hpp"
 
 #include "strata/core/gpu.hpp"
 #include <climits>
@@ -53,6 +54,7 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
         bool status = strata::gpu::alloc_device(&weights, bytes);
         if (status)
             status = strata::gpu::alloc_device(&scratch, strata::kernels::native_q8_1_bytes((int) n_in, 1));
+        strata::platform::advise_willneed(gguf.tensor_data(*tensor), bytes);
         if (status)
             status = strata::gpu::copy(weights, gguf.tensor_data(*tensor), bytes);
         if (!status) {
@@ -160,6 +162,7 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
             bytes_ = 0;
             return false;
         }
+        strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
         if (!strata::gpu::alloc_host(&host_, bytes_)) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";

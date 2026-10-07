@@ -1712,15 +1712,17 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
+        const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_preset : o.embd_gguf, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
         strata::core::set_native_embed(&native_embed);
         std::fprintf(stderr, "strata generate: native pack: %s experts (largest blob %.2f MB), token embedding "
-                             "%s in mapped host memory (%.0f MiB)\n",
+                             "%s in mapped host memory (%.0f MiB, %.1f s)\n",
                      o.pack.c_str(), (double) strata::kernels::cpu::expert_layout().max_blob / 1e6,
-                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0);
+                     strata::ggml_type_name((uint32_t) native_embed.type()), (double) native_embed.bytes() / 1048576.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - embed_t0).count());
     }
     // Plan v0.3 P1: tensors served in native form are not also loaded in canonical form (~2.7 GB of VRAM back
     // to the expert cache with --native).  `--keep-canonical` loads both, as before.
@@ -2600,12 +2602,14 @@ int main(int argc, char** argv) {
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
+        const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_gguf, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes\n",
-                     (unsigned long long) native_head.weight_bytes());
+        std::fprintf(stderr, "strata generate: experimental native Q5_K head, %llu bytes, in %.1f s\n",
+                     (unsigned long long) native_head.weight_bytes(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;

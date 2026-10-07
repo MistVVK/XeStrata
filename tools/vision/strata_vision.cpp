@@ -23,6 +23,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <algorithm>
+#include <fcntl.h>
+#include <unistd.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +83,18 @@ int main(int argc, char** argv) {
     mtmd_helper_log_set(quiet_log, nullptr);
     llama_backend_init();
 
+    const auto load_t0 = std::chrono::steady_clock::now();
+    // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
+    // STRATA_READ_AHEAD=0 turns it off, as in the engine
+    if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
+        const int fd = open(mmproj.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            const off_t n = lseek(fd, 0, SEEK_END);
+            for (off_t at = 0; at < n; at += (off_t) (128 << 10))
+                (void) posix_fadvise(fd, at, std::min<off_t>((off_t) (128 << 10), n - at), POSIX_FADV_WILLNEED);
+            close(fd);
+        }
+    }
     llama_model_params mp = llama_model_default_params();
     mp.vocab_only = true;
     llama_model* text = llama_model_load_from_file(model.c_str(), mp);
@@ -110,6 +125,8 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         return 1;
     }
+    std::fprintf(stderr, "strata-vision: model files loaded in %.1f s\n",
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
     {
@@ -124,6 +141,7 @@ int main(int argc, char** argv) {
     // real picture.  The server starts this process before the engine, so the engine sizes its expert cache from
     // what is really left. (A square image well above any cap; mtmd scales it to the token limit.)
     {
+        const auto warm_t0 = std::chrono::steady_clock::now();
         const uint32_t side = 2048;
         std::vector<unsigned char> rgb((size_t) side * side * 3, 128);
         mtmd_bitmap* bm = mtmd_bitmap_init(side, side, rgb.data());
@@ -139,7 +157,8 @@ int main(int argc, char** argv) {
                     warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
             }
         }
-        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens\n", warm_tokens);
+        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);
         // READY tells the server the encoder's buffers are allocated, and it starts the engine on what is left: an
