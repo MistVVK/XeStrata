@@ -2790,8 +2790,17 @@ def main() -> int:
                 ok(f"model files found in {models_dir}")
                 break
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
-    need = (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
-        (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0)
+    # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
+    # .part files already on the disk count
+    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
+    to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    # upstream ed15a3d0: count only what step 6 will still write - the AVX-512 Q2_0 conversion when its pack is not
+    # there yet, a new MTP draft layer only when none is
+    pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+    pack_bin = (pack_now / "experts.bin").exists() and (pack_now / "index.txt").exists()
+    mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
+    q2_avx = model == "Q2_0" and avx512 and family == "qwen"
+    need = to_fetch + (2 if mtp_have else 8) + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB", "use --models-dir on a bigger drive")
 
