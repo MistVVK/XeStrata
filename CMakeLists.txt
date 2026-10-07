@@ -419,6 +419,19 @@ if(STRATA_ENABLE_XE)
       set(_strata_oldest ${_strata_cuda_archs})
       list(SORT _strata_oldest COMPARE NATURAL)
       list(GET _strata_oldest 0 CUDA_TARGETS)
+      # oneMath's FindcuBLAS requires libcuda, which comes with NVIDIA's driver: on a machine without it (a package's
+      # container) the toolkit's link stub, which names the same libcuda.so.1 the driver gives at run time.  It goes on
+      # the library path while oneMath is added: FindCUDA clears CUDA_CUDA_LIBRARY on its first run and searches again.
+      find_library(_strata_libcuda cuda NO_CACHE HINTS "${_strata_cuda_root}/lib64" "${_strata_cuda_root}/lib")
+      if(NOT _strata_libcuda)
+        find_path(_strata_libcuda_stubs libcuda.so NO_CACHE NO_DEFAULT_PATH
+                  PATHS "${_strata_cuda_root}/lib64/stubs" "${_strata_cuda_root}/lib/stubs"
+                        "${_strata_cuda_root}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/lib/stubs"
+                        "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/stubs")
+        if(_strata_libcuda_stubs)
+          list(APPEND CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
+        endif()
+      endif()
     endif()
     set(BUILD_FUNCTIONAL_TESTS OFF)
     set(BUILD_EXAMPLES OFF)
@@ -469,6 +482,9 @@ if(STRATA_ENABLE_XE)
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
     set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
     unset(BUILD_SHARED_LIBS)
+    if(_strata_libcuda_stubs)
+      list(REMOVE_ITEM CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
+    endif()
   endif()
 
   # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes (above) and XeStrata's own
