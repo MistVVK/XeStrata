@@ -269,8 +269,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
-   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: contrib と contrib-icpx の密な行列積。
-     CMake が取得し、XeStrata の変更（`third_party/main/oneMath/patches/`、同じライセンス）を当てます。
+   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib と contrib-icpx、free では AMD の GPU）。
+     CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
@@ -290,7 +290,7 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
   XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
-   - oneMath への XeStrata の変更のパッチ（`third_party/main/oneMath/`）: Apache-2.0。
+   - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
    - ggml の `ggml-common.h`（`third_party/main/ggml/`、変えていない写し）: MIT。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、

@@ -1014,7 +1014,7 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
 Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
-例外は、元のライセンスのままの intel/llvm と oneMath へのパッチ、`ggml-common.h`、Outfit、`third_party/nonfree/` です（下）。
+例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`ggml-common.h`、Outfit、`third_party/nonfree/` です（下）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
@@ -1028,9 +1028,8 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
-- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: contrib と contrib-icpx の密な行列積を、oneMKL（Intel）と cuBLAS（NVIDIA）に渡す層。
-  リポジトリには含めず、CMake が v0.9 を取ってきます。
-  そのとき当てる XeStrata の変更（cuBLAS の BF16 の積）は `third_party/main/oneMath/patches/` にあり、oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。
+- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib と contrib-icpx では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib では rocBLAS と hipBLASLt（AMD）に渡す層。
+  リポジトリには含めず、CMake が XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)。XeStrata の変更として cuBLAS の BF16 の積と rocBLAS の後端の hipBLASLt が入った oneMath）を取ってきます。oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。

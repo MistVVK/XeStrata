@@ -87,9 +87,9 @@ A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
-CMake fetches oneMath v0.9 from GitHub when it configures (checking the archive's SHA-256) and applies XeStrata's changes (cuBLAS's BF16 product, `third_party/main/oneMath/patches/`).
+CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-1`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend).
 On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
-The patches are listed in [third_party/main/README.md](../third_party/main/README.md).
+The changes are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.
 coder-iq1_m's prefill of 997 tokens went from 1421 to 1350 ms on the B70 and stayed the same on the RTX 4070 (3845 ms).
 
@@ -304,7 +304,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 
 | For | Free | contrib-icpx (`--license contrib-icpx`) |
 | --- | --- | --- |
-| Building the engine | — (nothing besides the SYCL compiler) | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch` (to apply XeStrata's changes to oneMath) |
+| Building the engine | — (nothing besides the SYCL compiler) | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | Building intel/llvm 7 or later (setup builds it here) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx is used) |
 | Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
 | The CPU image encoder | `build-essential` | the same |
@@ -313,7 +313,7 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 | Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
 
 The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
-`intel-oneapi-mkl-sycl-devel` 2026.1.0, `patch`, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
+`intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 
 #### Fedora 44
 

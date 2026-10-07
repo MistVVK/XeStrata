@@ -1118,8 +1118,7 @@ def cmake_build(src, bdir, target, defs, env=None):
     run([cmake, "--build", str(bdir), "--target", target, "-j", str(jobs)], env=env)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml",
-                  "third_party/main/oneMath/patches")
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml")
 VISION_SOURCES = ("tools/vision",)
 
 

@@ -277,9 +277,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
-   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the contrib and contrib-icpx modes' dense
-     matrix products, which CMake fetches with XeStrata's changes (`third_party/main/oneMath/patches/`, under the
-     same license);
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib and
+     contrib-icpx modes, and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
+     changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
@@ -302,7 +302,7 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
   notices are kept in [NOTICE](NOTICE).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
-   - XeStrata's patches to oneMath (`third_party/main/oneMath/`): Apache-2.0.
+   - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
    - ggml's `ggml-common.h` (`third_party/main/ggml/`, an unmodified copy): MIT.
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental

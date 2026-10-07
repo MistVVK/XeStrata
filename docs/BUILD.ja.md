@@ -89,9 +89,9 @@ PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 CUDA 12.0〜12.3 のドライバーで CUDA 12.4 のツールキットを使う組み合わせは確かめていません（`unverified`）。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
-oneMath は configure のときに CMake が GitHub から v0.9 を取ってきて（アーカイブの SHA-256 を確かめます）、XeStrata の変更（cuBLAS の BF16 の積、`third_party/main/oneMath/patches/`）を当てます。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-1`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt）が入った oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
-パッチは [third_party/main/README.md](../third_party/main/README.md) にあります。
+変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
 coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1350 ms、RTX 4070 では同じ（3845 ms）でした。
 
@@ -307,7 +307,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 
 | 用途 | free | contrib-icpx（`--license contrib-icpx`） |
 | --- | --- | --- |
-| エンジンのビルド | —（SYCL のコンパイラのほかに要るものはありません） | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`（oneMath に XeStrata の変更を当てる） |
+| エンジンのビルド | —（SYCL のコンパイラのほかに要るものはありません） | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
 | intel/llvm 7 以降のビルド（setup がここで作ります） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx を使うので不要） |
 | エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
 | CPU の画像エンコーダー | `build-essential` | 同じ |
@@ -316,7 +316,7 @@ free の列は、まっさらな Ubuntu 26.04 で必要なものでもありま�
 | 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
 
 contrib（`--license contrib`）では、free の列のうち intel/llvm をビルドするためのものと、
-`intel-oneapi-mkl-sycl-devel` 2026.1.0、`patch`、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
+`intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
 
 #### Fedora 44
 
