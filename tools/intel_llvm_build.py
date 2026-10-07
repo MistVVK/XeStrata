@@ -242,8 +242,10 @@ def main() -> None:
     have = finished()
     if have and not a.rebuild:
         if have.get("tag") == a.tag:
-            # the CUDA and HIP adapters' fixes do not ask the free toolchain, which has neither, to be built again
+            # the CUDA and HIP adapters' fixes do not ask the free toolchain, which has neither, to be built again;
+            # nor do the fixes to the build itself (build-), which a finished toolchain does not need
             missing = [patch_id(p) for p in PATCHES if patch_id(p) not in have.get("fixes", [])
+                       and not patch_id(p).startswith("build-")
                        and (a.contrib or not patch_id(p).startswith(("cuda-", "hip-")))]
             if not have.get("zstd"):
                 missing.append("zstd")

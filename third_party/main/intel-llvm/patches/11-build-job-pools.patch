@@ -1,0 +1,41 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+build-job-pools: a fix to intel/llvm v7.1.1's build, applied by tools/intel_llvm_build.py (none in its sycl branch either, 2026-10-08).
+
+xptifw, built in the tree, includes HandleLLVMOptions a second time, which appends the compile and link
+job pools again.  A pool defined twice makes Ninja refuse the build file ("duplicate pool
+'link_job_pool'"), so the configuration failed whenever LLVM_RAM_PER_LINK_JOB or LLVM_PARALLEL_LINK_JOBS
+limited the links.  Fixed, each pool is appended only once.
+---
+diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
+index d0a094fa0..7ee095fb8 100644
+--- a/llvm/cmake/modules/HandleLLVMOptions.cmake
++++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
+@@ -57,7 +57,12 @@ if(LLVM_PARALLEL_COMPILE_JOBS)
+   if(NOT CMAKE_GENERATOR MATCHES "Ninja")
+     message(WARNING "Job pooling is only available with Ninja generators.")
+   else()
+-    set_property(GLOBAL APPEND PROPERTY JOB_POOLS compile_job_pool=${LLVM_PARALLEL_COMPILE_JOBS})
++    # Projects built in the tree (xptifw) include this file again: a pool
++    # defined twice makes the Ninja file invalid.
++    get_property(pools GLOBAL PROPERTY JOB_POOLS)
++    if(NOT "${pools}" MATCHES "(^|;)compile_job_pool=")
++      set_property(GLOBAL APPEND PROPERTY JOB_POOLS compile_job_pool=${LLVM_PARALLEL_COMPILE_JOBS})
++    endif()
+     set(CMAKE_JOB_POOL_COMPILE compile_job_pool)
+   endif()
+ endif()
+@@ -81,7 +86,10 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
+     set(LLVM_PARALLEL_LINK_JOBS "2")
+   endif()
+   if(LLVM_PARALLEL_LINK_JOBS)
+-    set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_job_pool=${LLVM_PARALLEL_LINK_JOBS})
++    get_property(pools GLOBAL PROPERTY JOB_POOLS)
++    if(NOT "${pools}" MATCHES "(^|;)link_job_pool=")
++      set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_job_pool=${LLVM_PARALLEL_LINK_JOBS})
++    endif()
+     set(CMAKE_JOB_POOL_LINK link_job_pool)
+   endif()
+ elseif(LLVM_PARALLEL_LINK_JOBS)
