@@ -19,6 +19,13 @@ else
   mapfile -t files < <( { git diff --name-only --diff-filter=d HEAD; git ls-files --others --exclude-standard; } | sort -u)
 fi
 [ ${#files[@]} -gt 0 ] || { echo "nothing to lint"; exit 0; }
+all=("${files[@]}")
+# upstream's records (tools/lint/records.txt): gitleaks and reuse only
+mapfile -t records < <(grep -v -e '^#' -e '^$' "$C/records.txt")
+mapfile -t files < <(printf '%s\n' "${files[@]}" | while read -r f; do
+  for r in "${records[@]}"; do [ "$f" = "$r" ] || [ "${f#"$r"/}" != "$f" ] && continue 2; done
+  echo "$f"
+done)
 
 status=0
 run() {   # run NAME TOOL ARGS...: run a lint, or say it is not installed
@@ -72,7 +79,7 @@ fi
 [ ${#js[@]} -gt 0 ] && run eslint eslint --no-eslintrc -c "$C/eslintrc.js" "${js[@]}"
 for f in "${html[@]}"; do run "tidy $f" tidy -config "$C/tidy.conf" -errors -quiet "$f"; done
 [ ${#text[@]} -gt 0 ] && run codespell codespell --config "$C/codespell.cfg" "${text[@]}"
-for f in "${files[@]}"; do
+for f in "${all[@]}"; do
   [ -f "$f" ] || continue
   gitleaks detect --no-git --redact --no-banner --exit-code 1 --source "$f" >/dev/null 2>&1 \
     || { echo "== gitleaks: a possible secret in $f (gitleaks detect --no-git --redact --source $f)"; status=1; }

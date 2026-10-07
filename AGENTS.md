@@ -80,6 +80,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
+The records that came from upstream's `bench/results` (other people's measurements, listed in `tools/lint/records.txt`) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/xe`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).
