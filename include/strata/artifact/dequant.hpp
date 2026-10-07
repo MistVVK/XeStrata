@@ -112,6 +112,22 @@ inline void dequantize_q5_0(const uint8_t* block, float* out) {
         out[j + 16] = (float)(x1 - 16) * d;
     }
 }
+// ---- Q5_1: 32 elements from a 24-byte block: fp16 d, fp16 m, then Q5_0's qh[4] and qs[16]. The 5-bit codes are
+// unsigned and the block's minimum m is added instead of Q5_0's fixed -16 offset (dequantize_row_q5_1).
+inline void dequantize_q5_1(const uint8_t* block, float* out) {
+    const float d = fp16_to_fp32(read_u16(block));
+    const float m = fp16_to_fp32(read_u16(block + 2));
+    const uint8_t* qh = block + 4;
+    const uint8_t* qs = block + 8;
+    const uint32_t h =
+        (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) | ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
+    for (int j = 0; j < 16; ++j) {
+        const int x0 = (int)(qs[j] & 0x0F) | (int)(((h >> j) & 1u) << 4);
+        const int x1 = (int)(qs[j] >> 4) | (int)(((h >> (j + 16)) & 1u) << 4);
+        out[j] = (float)x0 * d + m;
+        out[j + 16] = (float)x1 * d + m;
+    }
+}
 // ---- IQ4_NL: 32 elements from an 18-byte block. Non-linear 4-bit codebook, NOT a linear grid, so
 // the table must be exact. Copied verbatim from ggml-common.h `kvalues_iq4nl` at 3cf03257:
 //     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113

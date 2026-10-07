@@ -28,6 +28,7 @@ bool cpu_block(int type, const uint8_t* b, float* out) {
     switch (type) {
     case 2: dequantize_q4_0(b, out); return true;
     case 6: dequantize_q5_0(b, out); return true;
+    case 7: dequantize_q5_1(b, out); return true;
     case 8: dequantize_q8_0(b, out); return true;
     case 11: dequantize_q3_K(b, out); return true;
     case 12: dequantize_q4_K(b, out); return true;

@@ -704,6 +704,12 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_BUILD_TESTS)
+    # the Q5_1 block dequantizer (a Q5_1 PLE table, upstream #651) against ggml's, synthetic blocks: no model, no GPU
+    add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
+    target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+  endif()
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
     # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest
     add_executable(native_expert_parity src/kernels/native_expert_parity.cpp)
