@@ -119,7 +119,7 @@ set -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_CXX_COMPILER="$llvm/install/bin/clang++" -DCMAKE_C_COMPILER="$llvm/install/bin/clang" \
   -DSTRATA_LICENSE="$license" -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" -DSTRATA_PACKAGE=ON -DSTRATA_PACKAGE_NAME="$pkgname" \
-  -DSTRATA_PACKAGE_VISION_DIR=/build/vision
+  -DSTRATA_PACKAGE_VISION_DIR=/build/vision -DSTRATA_HIP_ARCHS=
 if [ "$license" = contrib ]; then
   # the PTX version: the toolkit's (empty); the driver must support this CUDA version
   set -- "$@" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_ONEMKL=ON -DMKL_ROOT=/opt/intel/oneapi/mkl/latest \

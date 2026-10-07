@@ -35,8 +35,11 @@ endif()
 # capability (from nvidia-smi) its architecture and the cuBLAS backend.
 # - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
 # - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
+# - STRATA_HIP_ARCHS: AMD architectures, RDNA2 and later, e.g. gfx1200 for the RX 9060 XT (free and contrib: ROCm is
+#   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; empty: none
 set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (contrib); auto: this PC's")
 set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
+set(STRATA_HIP_ARCHS auto CACHE STRING "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's")
 set(STRATA_CUDA_PATH auto CACHE STRING
     "the CUDA toolkit for the NVIDIA code and cuBLAS (contrib), e.g. /usr/local/cuda-13.1; auto: the best one here")
 set(STRATA_CUDA_PTX auto CACHE STRING
@@ -56,6 +59,23 @@ if(STRATA_CUDA_ARCHS STREQUAL "auto")
       endforeach()
       list(REMOVE_DUPLICATES _strata_cuda_archs)
     endif()
+  endif()
+endif()
+include(cmake/StrataHip.cmake)
+set(_strata_hip_archs "${STRATA_HIP_ARCHS}")
+if(STRATA_HIP_ARCHS STREQUAL "auto")
+  set(_strata_hip_archs "")
+  if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
+    strata_hip_detect(_strata_hip_found)
+    # this PC's AMD GPUs the engine runs on; the others (an older integrated one, say) are left out
+    foreach(arch IN LISTS _strata_hip_found)
+      strata_hip_supported(${arch} ok)
+      if(ok)
+        list(APPEND _strata_hip_archs ${arch})
+      else()
+        message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
+      endif()
+    endforeach()
   endif()
 endif()
 set(_strata_onemkl "${STRATA_ONEMKL}")
@@ -78,6 +98,7 @@ endif()
 if(STRATA_LICENSE STREQUAL "contrib")
   message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
 endif()
+message(STATUS "AMD architectures '${_strata_hip_archs}'")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -199,6 +220,10 @@ if(STRATA_ENABLE_XE)
       message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
                           "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
     endif()
+    if(_strata_hip_archs)
+      message(FATAL_ERROR "STRATA_HIP_ARCHS: icpx has no AMD target; configure with intel/llvm built with ROCm's HIP "
+                          "(tools/intel_llvm_build.py) and -DSTRATA_LICENSE=free or contrib")
+    endif()
   else()
     if(STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
@@ -216,9 +241,12 @@ if(STRATA_ENABLE_XE)
                           "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++")
     endif()
   endif()
-  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each
-  # NVIDIA architecture's code.  Without them no -fsycl-targets: the compiler's default, SPIR-V alone.
+  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS and
+  # STRATA_HIP_ARCHS each NVIDIA and AMD architecture's code.  Without them no -fsycl-targets: the compiler's default,
+  # SPIR-V alone.
   set(_strata_sycl_targets "")
+  set(_strata_sycl_list spir64)
+  set(_strata_sycl_opts "")
   if(_strata_cuda_archs)
     if(NOT STRATA_LICENSE STREQUAL "contrib")
       message(FATAL_ERROR "STRATA_CUDA_ARCHS needs NVIDIA's CUDA toolkit, which is not free software: "
@@ -280,7 +308,17 @@ if(STRATA_ENABLE_XE)
                           "targets (intel/llvm built with CUDA: tools/intel_llvm_build.py --contrib; NVIDIA's CUDA "
                           "toolkit)")
     endif()
-    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_targets}" ${_strata_cuda_opts})
+    set(_strata_sycl_list ${_strata_sycl_targets})
+    set(_strata_sycl_opts ${_strata_cuda_opts})
+  endif()
+  if(_strata_hip_archs)
+    strata_hip_choose("${_strata_hip_archs}" _strata_hip_targets _strata_hip_opts)
+    list(APPEND _strata_sycl_list ${_strata_hip_targets})
+    list(APPEND _strata_sycl_opts ${_strata_hip_opts})
+  endif()
+  if(_strata_cuda_archs OR _strata_hip_archs)
+    list(JOIN _strata_sycl_list "," _strata_sycl_list)
+    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_list}" ${_strata_sycl_opts})
   endif()
   add_library(strata_sycl INTERFACE)
   # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and

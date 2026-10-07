@@ -50,6 +50,10 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ディストリビューションのパッケージも 7 以降なら使えます。それより古いもの（Ubuntu 26.04 の `dpclang++` 6.2）は、CMake と setup が断ります。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、プロンプトの経路が約 1.6 倍遅くなっていました
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
+  ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
+  ROCm は自由ソフトウェアなので、free でも contrib でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
+  `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、ROCm のデバイスライブラリ（`ockl.bc`）の場所は `STRATA_ROCM_DEVICE_LIBS` で変えられます。
+  RX 9060 XT（gfx1200、Fedora 44、ROCm 7.1.1）で CTest が通ることを確かめています。
 - **contrib**（既定、`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
@@ -195,6 +199,7 @@ LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
 ```
 
 別の機械向けには、`STRATA_CUDA_ARCHS` に GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
+AMD の GPU は `STRATA_HIP_ARCHS` に並べます（RX 6800 は `gfx1030`、RX 7900 XTX は `gfx1100`、RX 9060 XT は `gfx1200`）。
 同じ実行ファイルが Intel の GPU でも動きます。
 
 - **ジョブ数**: SYCL の翻訳単位 1 つのコンパイルに数 GB のメモリを使います。
@@ -366,7 +371,7 @@ tools/package/build.sh fedora44 cuda13.4
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
   `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数。intel/llvm のリンクは、空いている RAM に収まる数まで）。
 - **GPU なしでビルドできます**: コンテナには GPU も手元の PC のものも渡しません。
-  手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
+  手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_HIP_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
   `STRATA_PORTABLE=OFF`）は、`STRATA_PACKAGE=ON` では断ります。`build.sh` がすべて指定します。
 - **ネットワーク**: ディストリビューションのパッケージ、intel/llvm、llama.cpp、oneMath、cuda の版では NVIDIA と Intel のリポジトリ
   （CUDA ツールキットと oneMKL）を取ってきます。

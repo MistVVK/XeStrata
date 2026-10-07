@@ -49,6 +49,10 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   A distribution's package of version 7 or later serves as well; an older one (Ubuntu 26.04's `dpclang++` 6.2) is refused by CMake and setup.
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prompt path took about 1.6 times as long
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
+  With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
+  ROCm is free software, so this is the same in the free and contrib modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
+  `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them; `STRATA_ROCM_DEVICE_LIBS` gives the place of ROCm's device libraries (`ockl.bc`).
+  Validated: CTest passes on an RX 9060 XT (gfx1200, Fedora 44, ROCm 7.1.1).
 - **contrib** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
@@ -193,6 +197,7 @@ LD_LIBRARY_PATH=$C/lib build/contrib/strata-device
 ```
 
 For another machine, `STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
+`STRATA_HIP_ARCHS` lists AMD GPUs' (`gfx1030` for the RX 6800, `gfx1100` for the RX 7900 XTX, `gfx1200` for the RX 9060 XT).
 The same executable runs on Intel GPUs too.
 
 - **Jobs**: one SYCL translation unit takes several GB to compile.
@@ -364,7 +369,7 @@ tools/package/build.sh fedora44 cuda13.4
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
   `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - **No GPU needed**: the container gets no GPU and nothing of this PC's.
-  CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
+  CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
   `STRATA_CUDA_PTX`, and `STRATA_PORTABLE=OFF`) are refused with `STRATA_PACKAGE=ON`; `build.sh` sets them all.
 - **Network**: it fetches the distribution's packages, intel/llvm, llama.cpp, oneMath, and for the cuda variants NVIDIA's
   and Intel's repositories (the CUDA toolkit and oneMKL).
