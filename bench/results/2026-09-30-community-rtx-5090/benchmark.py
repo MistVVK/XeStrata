@@ -29,12 +29,12 @@ def main():
     from strata_tokenizer import Tokenizer
     from serve.frontend import ChatTemplate, openai_to_messages
     directory = args.pack / "tokenizer"
-    vocab = json.loads((directory / "vocab.json").read_text())
+    vocab = json.loads((directory / "vocab.json").read_text(encoding="utf-8"))
     tokens = [None] * len(vocab)
     for token, number in vocab.items():
         tokens[number] = token
-    tokenizer = Tokenizer(tokens, (directory / "merges.txt").read_text().splitlines(),
-                          json.loads((directory / "token_type.json").read_text()))
+    tokenizer = Tokenizer(tokens, (directory / "merges.txt").read_text(encoding="utf-8").splitlines(),
+                          json.loads((directory / "token_type.json").read_text(encoding="utf-8")))
     template = ChatTemplate(directory / "chat_template.jinja")
     initial = get(args.url + "/v1/status")
     (args.out / "initial-status.json").write_text(json.dumps(initial, indent=2) + "\n")

@@ -253,6 +253,25 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.req("POST", "/load", {}, {"Content-Type": "application/json",
                                                         "Origin": f"http://127.0.0.1:{self.port}"})[0], 200)
 
+    # --- /slots/0?action=save|restore (session files)
+    def test_slots_need_json_from_the_own_page(self):
+        self.start()
+        body = {"filename": "a.bin"}
+        for action in ("save", "restore"):
+            path = f"/slots/0?action={action}"
+            self.assertEqual(self.req("POST", path, b"filename=a.bin",
+                                      {"Content-Type": "application/x-www-form-urlencoded"})[0], 415, path)
+            self.assertEqual(self.req("POST", path, body, {"Content-Type": "text/plain"})[0], 415, path)
+            for origin in ("http://evil.example.com", "null"):
+                self.assertEqual(self.req("POST", path, body, {"Content-Type": "application/json",
+                                                               "Origin": origin})[0], 403, (path, origin))
+            # JSON without an Origin (curl, scripts) or from the own page reaches the slot API: off here, so 501
+            self.assertEqual(self.req("POST", path, body, {"Content-Type": "application/json"})[0], 501, path)
+            self.assertEqual(self.req("POST", path, body, {"Content-Type": "application/json",
+                                                           "Origin": f"http://127.0.0.1:{self.port}"})[0], 501, path)
+        self.assertEqual(self.req("POST", "/slots/0?action=save", body, {"Content-Type": "application/json"},
+                                  host="rebind.example.com")[0], 403)
+
 
 if __name__ == "__main__":
     unittest.main()

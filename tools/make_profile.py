@@ -14,6 +14,13 @@ traces used, most frequent first, then every pair still missing, interleaved acr
 no-op.  `--reorder` ranks the traces first and lets the base fill the rest, which is how a workload's trace decides
 the top; `--no-base` drops the base entirely.
 
+WATCH THE BASE: `take()` skips a pair it has already ranked, and the shipped base ranks all 24,576, so a plain
+`--base` run cannot be moved by any trace - the output is the base again.  `--reorder` (traces first) or
+`--no-base` is what makes a trace decide the top.  Which ordering is in use is not cosmetic: the layer-split cost
+model reads this RANKING as if it were a frequency curve, and the coverage curve in src/program/generate.cpp
+carries the measured hit rates that say how far off that goes (94.9% claimed against 69.2% measured at 5,805 pairs
+held, on the IQ3_S 4-way rig).
+
     python tools/make_profile.py [TRACE ...] [--base data/expert-profile.bin | --no-base] [--reorder] [--out PATH]
                                  [--n-expert 256]      (a pruned model: GSQ-RCO Coder keeps 256 of 512)
 

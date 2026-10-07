@@ -4,6 +4,7 @@
 """Model discovery, on-demand loading and safe unloading over the actual HTTP API."""
 import json
 import io
+import os
 import subprocess
 import time
 import unittest
@@ -48,6 +49,41 @@ class ResidentEngine(StrataEngine):
 
 
 class Lifecycle(unittest.TestCase):
+    def test_close_cleans_up_after_a_broken_stdin_pipe(self):
+        for running in (False, True):
+            with self.subTest(running=running):
+                engine = StrataEngine("missing-executable", [], lazy=True)
+                read_fd, write_fd = os.pipe()
+                stdin = os.fdopen(write_fd, "w")
+                self.addCleanup(stdin.close)
+                os.close(read_fd)                       # the engine's end of the pipe is already gone
+                stdin.write("pending")                  # buffered: flush() and close() will hit the broken pipe
+                proc = mock.Mock(stdin=stdin, stdout=io.StringIO())
+                self.addCleanup(proc.stdout.close)
+                proc.poll.side_effect = [None if running else 0, 0]
+                engine.proc, engine.pump, engine.log = proc, mock.Mock(), io.StringIO()
+                self.addCleanup(engine.log.close)
+                engine.ended, engine.progress, engine.last = False, (1, 2), {"generated": 1}
+
+                engine.close()
+
+                self.assertTrue(stdin.closed)
+                self.assertTrue(proc.stdout.closed)
+                self.assertTrue(engine.log.closed)
+                engine.pump.join.assert_called_once_with(timeout=2)
+                self.assertIsNone(engine.proc)
+                self.assertTrue(engine.ended)
+                self.assertIsNone(engine.progress)
+                self.assertEqual(engine.last, {})
+                if running:
+                    proc.terminate.assert_called_once()
+                    proc.wait.assert_called_once_with(timeout=20)
+                else:
+                    proc.terminate.assert_not_called()
+                    proc.wait.assert_not_called()
+                proc.kill.assert_not_called()
+                engine.close()                          # repeated cleanup is harmless
+
     def test_close_sends_eof_before_waiting(self):
         engine = StrataEngine("missing-executable", [], lazy=True)
         proc = mock.Mock()

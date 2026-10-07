@@ -108,8 +108,11 @@ class Structured(unittest.TestCase):
     def test_object_mode_strict_json_and_truncation(self):
         fmt = {"type": "json_object"}
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt)[0], 200)
-        for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', '```json\n{}\n```'):
+        for script in ('[]', '{"x":NaN}', '{"x":1,"x":2}', '{"x":1e999}', 'no json at all', '{"x":'):
             self.assertEqual(self.chat(script, response_format=fmt)[0], 502)
+        # #762: the JSON object is taken out of a code fence or the prose around it (the object itself stays strict)
+        for script in ('```json\n{}\n```', 'Here it is: {"answer":4} - done'):
+            self.assertEqual(self.chat(script, response_format=fmt)[0], 200, script)
         self.assertEqual(self.chat('{"answer":4}', response_format=fmt, max_tokens=5)[0], 502)
         # Plain text callers retain normal streaming, without a JSON validation gate.
         self.assertEqual(self.chat("Prose.", response_format={"type": "text"})[0], 200)
@@ -160,6 +163,50 @@ class Structured(unittest.TestCase):
                 self.assertEqual(code, 502, script)
                 self.assertEqual(reply["error"]["code"], "structured_output_failed")
             self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)
+
+    def test_root_unions_of_object_shapes_are_accepted(self):
+        # A root anyOf of object shapes (sent by apps written against llama.cpp's grammar path) still means
+        # "one JSON object", so it is accepted; a non-object answer is still refused.
+        claim = {"type": "object", "additionalProperties": False, "required": ["claim_text"],
+                 "properties": {"claim_text": {"type": "string", "minLength": 1}}}
+        empty = {"type": "object", "additionalProperties": False, "required": ["outcome"],
+                 "properties": {"outcome": {"type": "string", "enum": ["no_substantive_content"]}}}
+        schemas = [
+            {"anyOf": [claim, empty]},
+            {"oneOf": [claim, empty]},
+            {"allOf": [claim, {"required": ["claim_text"]}]},
+            {"$ref": "#/$defs/claim", "$defs": {"claim": claim}},
+            {"anyOf": [{"$ref": "#/$defs/claim"}, {"anyOf": [empty]}], "$defs": {"claim": claim}},
+        ]
+        for schema in schemas:
+            fmt = {"type": "json_schema", "json_schema": {"name": "union", "strict": True, "schema": schema}}
+            with self.subTest(schema=schema):
+                self.assertEqual(self.chat('{"claim_text":"The term is 12 months."}', response_format=fmt)[0], 200)
+                self.assertEqual(self.chat("[1, 2]", response_format=fmt)[0], 502)
+
+    def test_schemas_that_allow_non_objects_are_still_rejected(self):
+        obj = {"type": "object"}
+        schemas = [
+            {"type": "array", "items": obj},
+            {"type": "string"},
+            {"type": ["object", "null"]},
+            {"anyOf": [obj, {"type": "string"}]},
+            {"anyOf": []},
+            {"oneOf": [obj, {"type": "array"}]},
+            {"allOf": [{"type": "string"}]},
+            {"properties": {"x": {"type": "string"}}},           # no type: any JSON value validates
+            {"$ref": "#/$defs/a", "$defs": {"a": {"$ref": "#/$defs/a"}}},   # reference cycle
+            {"$ref": "#/$defs/missing", "$defs": {}},
+            {"$ref": "#/$defs/s", "$defs": {"s": {"type": "string"}}},
+        ]
+        with mock.patch.object(self.svc, "load") as load:
+            for schema in schemas:
+                fmt = {"type": "json_schema", "json_schema": {"name": "bad", "schema": schema}}
+                with self.subTest(schema=schema):
+                    code, reply = self.chat(response_format=fmt)
+                    self.assertEqual(code, 400)
+                    self.assertIn("only JSON objects", reply["error"]["message"])
+            load.assert_not_called()
 
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess

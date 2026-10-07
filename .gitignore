@@ -39,3 +39,9 @@ r[0-9][0-9][0-9]*/
 .ruff_cache/
 # tools/strata_mcp.py: the processes it started and their logs
 /.strata-mcp/
+# IDEs
+.vscode/
+.idea/
+.cursor/
+
+/.ccache/

@@ -31,6 +31,7 @@ import hashlib
 import hmac
 import codecs
 import json
+import math
 import os
 import queue
 import re
@@ -46,6 +47,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
@@ -56,7 +58,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            images_of, mark_think_literals, openai_to_messages, unmark_think_literals)
+                            forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages,
+                            tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
@@ -65,20 +68,135 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
+
+
+def popen(what: str, args: list, **kw):
+    """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
+    Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
+    OSError."""
+    try:
+        return subprocess.Popen(args, **kw)
+    except OSError as e:
+        if getattr(e, "winerror", None) in (4551, 1260):
+            raise OSError(f"Windows blocked {what} ({args[0]}): Smart App Control, or an application-control policy, "
+                          "does not let a program that is not signed run. Turn Smart App Control off (Windows "
+                          "Security > App & browser control > Smart App Control settings), or - for the image encoder "
+                          "only - run setup with --vision no (see docs/TROUBLESHOOTING.md)") from e
+        raise
+
+
+def listen_problem(host: str, port: int, e: OSError) -> str:
+    """#769: why the server cannot listen.  Only an address that is taken says "already in use"; anything else (a port
+    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said."""
+    import errno
+    code = getattr(e, "winerror", None) or e.errno
+    if code in (errno.EADDRINUSE, 10048):
+        return (f"port {port} is already in use - is Strata (or another server) already running? "
+                f"Close it, or start this one with a different --port")
+    what = e.strerror or str(e)
+    if code in (10013, errno.EACCES):
+        hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
+                "or a firewall rule forbids it: start this one with a different --port")
+    elif code in (10049, errno.EADDRNOTAVAIL):
+        hint = f"{host} is not an address of this PC: check \"host\" in the model's strata-<model>.json or --host"
+    else:
+        hint = "check --host and --port"
+    return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
+
+
+def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
+    """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
+    deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
+    room (the engine reads it back at once), on Windows the file is opened short-lived (the cache is not forced out
+    to the drive).  Anywhere else, or when /dev/shm is too small (Docker's default is 64 MB), it stays in the encoder's
+    own directory, as before."""
+    name = f"req-{uuid.uuid4().hex[:12]}.sve"
+    shm = Path("/dev/shm")
+    if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
+        try:
+            if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
+                return shm / f"strata-vision-{os.getpid()}-{name}"
+        except OSError:
+            pass
+    return Path(vision_dir) / name
+
+
+def write_temporary(path: Path, parts: list) -> None:
+    """#874: write `parts` (files) one after the other into `path`; on Windows with FILE_ATTRIBUTE_TEMPORARY
+    (os.O_SHORT_LIVED), so the file normally never reaches the drive before it is deleted."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
+        for part in parts:
+            f.write(Path(part).read_bytes())
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
-                         "elaboration."}
+                         "elaboration.",
+               # the template's own xhigh sentence (chat_template.jinja), which #728's recovery swaps for the low one
+               "xhigh": "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                        "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+                        "clarity in the final answer."}
 VISION_START = "<|vision_start|>"
 # #606: a reply that repeats one token this many times in a row is ended there ("length"): a model in a loop, or a
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
+# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
+# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
+# "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
+# low-effort instruction in place of the xhigh one.  Both off by default.
+HIGH_EFFORT = EFFORT_TEXT["xhigh"]
+LOW_EFFORT = EFFORT_TEXT["low"]
+LOOP_CHECK_EVERY = 512           # output tokens between two looks at the reasoning (at a clean parser boundary)
+LOOP_COVERAGE = 0.25             # the share of the last 2,000 words inside 12-word passages seen three times
+LOOP_HISTORY_WORDS = 30000       # how far back the passages are counted (bounds the cost of a look)
+
+
+def reasoning_repeat_coverage(text):
+    """Coverage of recent words by 12-word passages seen at least three times.
+
+    Only reasoning is supplied. The history (the last LOOP_HISTORY_WORDS words) detects repeated verification passes
+    separated by long code drafts; the recent window excludes old repetitions.
+    """
+    words = re.findall(r"\w+|[^\w\s]", text.lower())[-LOOP_HISTORY_WORDS:]
+    width, window = 12, 2000
+    if len(words) < window:
+        return 0.0
+    grams = [tuple(words[i:i + width]) for i in range(len(words) - width + 1)]
+    counts = collections.Counter(grams)
+    start = max(0, len(words) - window)
+    covered = set()
+    for i in range(start, len(grams)):
+        if counts[grams[i]] >= 3:
+            covered.update(range(i, i + width))
+    return len(covered) / (len(words) - start)
+
+
+def focused_recovery_prompt(tok, ids, generated):
+    """The prompt's ids with the xhigh effort sentence of the first system message replaced by the low one, then
+    every token generated so far.  A splice of token ids: the prompt is never decoded and encoded again, so a literal
+    `</think>` or vision marker in it (#537, #554) stays what it was.  None when the sentence is not there as whole
+    tokens in the first system message (a user's text never counts).  No answer or end-of-thinking is inserted."""
+    end = tok.encode(IM_END, parse_special=True)
+    if len(end) != 1 or end[0] not in ids:
+        return None
+    head = ids[:ids.index(end[0])]
+    if not tok.decode(head).startswith("<|im_start|>system\n"):
+        return None
+    old, new = tok.encode(HIGH_EFFORT, parse_special=False), tok.encode(LOW_EFFORT, parse_special=False)
+    for i in range(len(head) - len(old) + 1):
+        if head[i:i + len(old)] == old:
+            return ids[:i] + new + ids[i + len(old):] + list(generated)
+    return None
+
+
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
@@ -89,12 +207,34 @@ RATE_MIN_SPAN_S = 0.25      # younger than this there is no rate yet: the mean s
 # server (the engine's main thread waits, untimed, for its next command): the engine is ended and the request fails;
 # the next request starts it again.  The config's "engine_silence_s" sets it (0: wait forever, as before).
 ENGINE_SILENCE_S = 300.0
+# Disk sessions: the longest allowance an engine may announce (`SWAIT <phase> <s>`) for one step that blocks in a
+# single call (a file flush, the host->device transfer); the engine's own bound is the same (session_phase_limit_s).
+SESSION_WAIT_MAX_S = 3600
 # ... except while a prompt is read: a PP line comes once per chunk (up to 32768 tokens with --prefill auto, issue
 # #282), and the slowest PCs read ~100 tok/s, so a first chunk can take minutes before the first line.  Until the first
 # PP the wait adds the chunk's tokens at PP_FLOOR_TOK_S; after one, a chunk may take PP_SLACK x the last one's time.
 PP_CHUNK_MAX = 32768
 PP_FLOOR_TOK_S = 50.0
 PP_SLACK = 3.0
+# Reads that had no timeout (#1317).  A blocking read of the image encoder's pipe or of the engine's READY line that
+# never returned held the request turn for good: the engine then sat idle in its command loop, so no watchdog could
+# fire and every later request queued behind it (the "lost step" class of #481).  Generous on purpose: a cold model
+# load, a slow disk or a slow CPU encode is not a hang.  Only a process that says nothing at all for this long is
+# ended; the next request starts it again.
+# STRATA_ENGINE_READY_S / STRATA_VISION_READY_S / STRATA_VISION_ENCODE_S override them (0 = wait for ever, as before).
+
+
+def _timeout_env(name: str, default: float) -> float | None:
+    try:
+        v = float(os.environ.get(name, default))
+    except ValueError:
+        v = default
+    return None if v <= 0 else v
+
+
+VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
+VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
+ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -146,6 +286,23 @@ class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
     EngineDied, so the request ends with an error and the next one starts the engine again."""
+
+
+class SessionRefused(ValueError):
+    """Disk sessions: the engine refused or failed a SAVE / RESTORE and is still in step (`SERR <kind> <published>
+    <reason>`).  `kind` is the engine's category - invalid (400), storage (507), memory (503), io (500); `published`:
+    a save whose new file already replaced the old one before a later step (the folder flush) failed."""
+
+    STATUS = {"invalid": 400, "storage": 507, "memory": 503, "io": 500}
+
+    def __init__(self, kind: str, message: str, published: bool = False):
+        super().__init__(message)
+        self.kind = kind if kind in self.STATUS else "io"
+        self.published = published
+
+    @property
+    def status(self) -> int:
+        return self.STATUS[self.kind]
 
 
 class EngineStuck(RuntimeError):
@@ -321,6 +478,12 @@ def btrace(*a):
 EOS_IDS = {248044, 248046}   # <|endoftext|>, <|im_end|>: the engine's default --eos-ids
 
 
+# The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
+# finished, #267): the process may stay alive and even print DONE, but it must not take another request.
+FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
+                  "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished")
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -331,6 +494,7 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note: str | None = None       # #481: why the server ended a silent engine (death_note says it)
+    last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -365,7 +529,10 @@ class StrataEngine:
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
+        self.progress_ms = 0             # PP's own milliseconds since the prompt started (its third field)
+        self.reused = 0                  # RESUME: prompt tokens not read again (a client takes them out of the work)
         self.silent_note = None
+        self.last_err = None
         try:                            # a ready-made engine's BUILD.json says its version
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
@@ -383,10 +550,34 @@ class StrataEngine:
             if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
-        self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
-        self.max_context = 0
-        for line in self.proc.stdout:
+        if log:                                          # #779: when an engine started (a crash report has the time)
+            try:
+                assert not isinstance(self.log, int)
+                self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
+                               f"{' '.join(args)}\n")
+                self.log.flush()
+            except OSError:
+                pass
+        self.max_context = 0                             # before the new process is visible: never its predecessor's
+        self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
+        # stays for _pump (one reader at a time)
+        ready_q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
+        ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
+        timed_out = False
+        while True:
+            left = None if ready_deadline is None else ready_deadline - time.monotonic()
+            if left is not None and left <= 0:
+                timed_out = True
+                break
+            try:
+                line = ready_q.get(timeout=left)
+            except queue.Empty:
+                continue
+            if line is None:
+                break
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -398,6 +589,11 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            if timed_out:                               # still loading, or hung: end it, so the turn is not held
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
             try:                                        # its pipes and our handle on its log (the log stays)
                 self.proc.wait(timeout=5)
                 if self.proc.stdin is not None:
@@ -408,7 +604,9 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") +
+            why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                   "the engine exited before it was ready")
+            raise RuntimeError(why + (f" (see {log})" if log else "") +
                                start_failure_hint(log, log_start) + start_log_tail(log, log_start))
         self.known_ctx = self.max_context   # survives a failed restart: requests keep their limit and restart it
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
@@ -425,7 +623,13 @@ class StrataEngine:
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
-        self.slot_order = list(range(self.batch))
+        groups = int(args[args.index("--batch-groups") + 1]) if "--batch-groups" in args else 1
+        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
+        gs = self.batch // groups if self.batch else 0
+        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
+        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
+        self.slot_groups = groups
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
         # what each slot's session holds (prompt + every token a window fed), so a conversation's next turn goes to
@@ -433,13 +637,20 @@ class StrataEngine:
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
-        self.slot_cv = threading.Condition()
-        self.waiting = 0                                # requests waiting for the control lines (ctl)
-        self.wait_lens: list[list[int]] = []            # ... their prompt lengths (a long read gives way to short ones)
-        self.ctl_epoch = 0                              # how often the control lines were taken
+        # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
+        # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
+        # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
+        # new lists.
+        if "slot_cv" not in self.__dict__:
+            self.slot_cv = threading.Condition()
+            self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
+            self.ctl_epoch = 0                          # how often the control lines were taken
+            self.ctl = threading.Lock()                 # one admission or solo request on the control lines at a time
+        self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is (a request notes its own)
+        self._ctl_erred = False                         # #1059: the control lines ended on an ERR
         self._yielded = None                            # (slot, tokens read): the last request on them gave way
         self._ctl_mode, self._ctl_result, self._last_done = "solo", None, None
-        self.ctl = threading.Lock()                     # one admission or solo request on the control lines at a time
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
@@ -449,7 +660,20 @@ class StrataEngine:
         lp = self.__dict__.setdefault("lp_lines", collections.deque())   # (token id, LP line): logprobs
         last_t = None
         slot_q: list[queue.Queue] = getattr(self, "slot_q", [])
+        line = None
         for line in proc.stdout:
+            # checked before batch routing: a fatal line is never a slot's own
+            if line.startswith(FATAL_PREFIXES):
+                # release_gpu_waits invalidates the verifier, even if the native
+                # process stays alive and prints DONE afterwards.
+                if self.proc is proc:
+                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                    self.ended = True
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                break                           # publish EOF, never the trailing DONE
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -467,6 +691,8 @@ class StrataEngine:
             lines.put(line)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
+            if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it
+                self.last_err = line[4:].strip()        # (a failed batch window: every request reads its slot)
         lines.put(None)
         for q in slot_q:
             q.put(None)
@@ -487,7 +713,11 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
-        rc = self.proc.poll() if self.proc is not None else None
+        proc = self.proc                                 # None while a restart has not started the next one yet
+        rc = proc.poll() if proc is not None else None
+        if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
+            return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
+                    "github.com/Niko1221/Strata/issues with the log.")
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
@@ -497,7 +727,8 @@ class StrataEngine:
                 "smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
-        return self.proc is not None and not getattr(self, "ended", False) and self.proc.poll() is None
+        proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
+        return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
         if self.proc is None:
@@ -546,15 +777,31 @@ class StrataEngine:
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
+    @staticmethod
+    def _ready_pump(proc, out: queue.Queue) -> None:
+        """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
+        done = False
+        try:
+            for line in proc.stdout:
+                out.put(line)
+                if line.startswith("READY"):
+                    done = True
+                    return
+        except (OSError, ValueError):                   # the pipe closed under us (the engine was killed)
+            pass
+        finally:
+            if not done:
+                out.put(None)
+
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
         close() ends and waits for the old process first (EngineStuck when it cannot be ended).  A start that still
         exits before READY - a dead engine's VRAM can take a while to come back, notably on ROCm - is retried
         (PR #637)."""
-        self.close()
         info = dict(self.info)
         self.starting = True                     # prepare() answers 503 "starting" meanwhile (#344)
         try:
+            self.close()
             for i in range(tries):
                 # #344: not alive until READY - __init__ sets max_context to 0 and blocks until the engine says
                 # READY, and a request that saw alive() in that window skipped load() and failed with "context
@@ -575,6 +822,8 @@ class StrataEngine:
                     time.sleep(self.RESTART_RETRY_S)
         finally:
             self.starting = False
+            with self.slot_cv:                   # #1012: wake the requests that waited through it: they go on with the
+                self.slot_cv.notify_all()        # new engine, or (it did not start) end with a clean EngineDied
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -640,6 +889,17 @@ class StrataEngine:
         k = top_logprobs(sampling)
         if k is not None:
             keys += f" logprobs={k}"
+        # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
+        # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
+        if sampling.get("strata_checkpoint") is False:
+            keys += " ckpt=0"
+        # "strata_prefix" (resolved by Service.resolve_prefix to {"tokens": N}): the first N prompt tokens are a shared
+        # prefix - the engine pins the checkpoint there.  Absent or unresolved = as before.
+        prefix = sampling.get("strata_prefix")
+        if isinstance(prefix, dict):
+            pn = prefix.get("tokens")
+            if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
+                keys += f" pin={pn}"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -666,15 +926,21 @@ class StrataEngine:
         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
         true sends STOP once (the request is then read to its DONE)."""
         stopped = False
+        beat = time.monotonic()
         while True:
             try:
-                line = self.lines.get(timeout=10.0)
+                # A client can leave before the first PP/token.  Poll its Event as often as _take_control does;
+                # the ten-second HTTP heartbeat is independent of how promptly STOP reaches the engine.
+                line = self.lines.get(timeout=0.5)
             except queue.Empty:
                 if cancel.is_set() and not stopped:
                     self._send("STOP")
                     stopped = True
-                yield None
+                if time.monotonic() - beat >= 10.0:
+                    beat = time.monotonic()
+                    yield None
                 continue
+            beat = time.monotonic()
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
             if not line.startswith(("PP ", "INFO")):
@@ -689,7 +955,13 @@ class StrataEngine:
                 f = line.split()
                 if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                     self.progress = (int(f[1]), int(f[2]))
+                    self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                     self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                if not stopped and cancel.is_set():
+                    # #879: a Stop during the prompt read went out only after the first token (or after 10 s of
+                    # silence, which a stream of PP lines never allows): the engine read the whole prompt first
+                    self._send("STOP")
+                    stopped = True
                 yield None
             elif line.startswith("DONE"):
                 self._parse_done(line)
@@ -703,20 +975,26 @@ class StrataEngine:
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
+                self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
                 raise ValueError(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
 
-    def _drain_control(self, until: str, timeout: float = 300.0):
+    def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
-        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered)."""
+        request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
+        `born`: the engine process (self.gen) the request started on; once that one is gone there is nothing to
+        drain - its end line was read already (by the request's own EngineDied), and waiting for another one held
+        a request that had failed for the whole 300 s (#1012), or read the lines of the engine that replaced it."""
         end = time.monotonic() + timeout
         while time.monotonic() < end:
+            if born is not None and (self.gen != born or not self.alive()):
+                return None
             try:
-                line = self.lines.get(timeout=max(0.1, end - time.monotonic()))
+                line = self.lines.get(timeout=max(0.1, min(1.0, end - time.monotonic())))
             except queue.Empty:
-                break
+                continue
             if line is None:
                 return None
             if line.startswith("DONE"):
@@ -729,17 +1007,20 @@ class StrataEngine:
         """A slot whose consumer left (a stop token, a stop string, a disconnect): BSTOP it and free it once the engine
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
+        if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            return
         try:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
+        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
 
         def wait():
             end = time.monotonic() + 600.0
             tail = list(stream or [])
             while time.monotonic() < end:
                 try:
-                    line = self.slot_q[slot].get(timeout=5.0)
+                    line = q.get(timeout=5.0)
                 except queue.Empty:
                     continue
                 if line is None:
@@ -752,9 +1033,9 @@ class StrataEngine:
                         tail = []
                 if line.startswith("BDONE "):
                     break
-            self.slot_held[slot] = tail[:-1] if stream and tail else []
+            held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
-                self.slot_busy[slot] = False
+                busy[slot] = False
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
@@ -770,10 +1051,18 @@ class StrataEngine:
         beat = time.monotonic()
         try:
             while True:
+                if not self.alive() and not getattr(self, "starting", False):
+                    # #1012: the engine is gone and nobody is starting it again: this request was not sent, so it
+                    # ends now (a clean 503) instead of waiting for control lines nothing will answer on.  While a
+                    # restart is under way it keeps waiting and goes on with the new engine.
+                    raise EngineDied("the engine stopped while this request waited; it was not sent")
                 with self.slot_cv:
                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
                 if turn and self.ctl.acquire(timeout=0.5):
-                    break
+                    if self.alive():
+                        break
+                    self.ctl.release()                  # it died (or is being restarted) while this one was getting
+                    turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
                     with self.slot_cv:
                         self.slot_cv.wait(timeout=0.5)
@@ -784,8 +1073,9 @@ class StrataEngine:
                     yield None
         finally:
             with self.slot_cv:
-                self.waiting -= 1
-                self.wait_lens.remove(entry)
+                self.waiting = max(0, self.waiting - 1)
+                if entry in self.wait_lens:
+                    self.wait_lens.remove(entry)
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -818,15 +1108,19 @@ class StrataEngine:
         with a much shorter prompt (#656: `BYIELD <slot>`; the part read waits in a slot and the read goes on after).
         A consumer that stops early leaves the engine in step: the solo request is STOPped and read to its DONE, an
         admission to its BADM, a slot is BSTOPped and freed at its BDONE."""
-        self.progress = None
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
+        self.progress, self.progress_ms, self.reused = None, 0, 0
+        born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+        reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
-        holding = True
+        holding, born = True, self.gen                  # (the engine it now has the control lines of)
         btrace("ctl acquired")
         slot, gen0, reserved = None, None, None
         phase = "none"            # solo -> (admit -> slot) ; "done" once the engine has finished with this request
@@ -838,7 +1132,7 @@ class StrataEngine:
                     ok = yield from self._take_control(cancel, len(prompt))
                     if not ok:
                         return
-                    holding = True
+                    holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
@@ -846,6 +1140,7 @@ class StrataEngine:
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
+                    self._ctl_erred = False
 
                     def others():
                         with self.slot_cv:
@@ -882,6 +1177,8 @@ class StrataEngine:
                         left = int(max_new) - len(out)
                         if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
                             return
+                        if reused0 is None:
+                            reused0 = (self.last or {}).get("reused")
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -907,7 +1204,7 @@ class StrataEngine:
                         ok = yield from self._take_control(cancel, len(prompt), after_epoch=epoch)
                         if not ok:
                             return
-                        holding = True
+                        holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
@@ -918,6 +1215,7 @@ class StrataEngine:
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
                     self._ctl_mode, self._ctl_result, self._yielded = "batch", None, None
+                    self._ctl_erred = False
                     asked = False
                     for x in self._control(cancel, pending.append):
                         while pending:
@@ -990,6 +1288,8 @@ class StrataEngine:
                                 self.slot_busy[slot] = False
                                 self.slot_cv.notify_all()
                             slot, gen0 = None, None
+                            if reused0 is None:
+                                reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
                             solo_again += 1
                             btrace("back to the solo path")
@@ -999,15 +1299,21 @@ class StrataEngine:
             # a consumer that left early (or an error): keep the engine and this server in step
             btrace("finally phase", phase, "slot", slot, "holding", holding)
             try:
+                if phase in ("solo", "admit") and (self.gen != born or not self.alive()):
+                    phase = "none"                      # #1012: its engine is gone: nothing to stop or drain
+                if phase in ("solo", "admit") and self._ctl_erred:
+                    phase = "none"                      # #1059: it ended on the engine's ERR: no DONE to wait 300 s for
                 if phase == "solo":
                     self._send("STOP")
-                    self._drain_control("DONE")
+                    self._drain_control("DONE", born=born)
                 elif phase == "admit":
-                    line = self._drain_control("BADM")
+                    line = self._drain_control("BADM", born=born)
                     if line and line.startswith("BADM ") and line.split()[2:3] == ["1"]:
                         phase = "slot"
             except EngineDied:
                 pass
+            if reused0 is not None and isinstance(self.last, dict):
+                self.last = {**self.last, "reused": reused0}
             if holding:
                 self.ctl.release()
             if reserved is not None:
@@ -1026,6 +1332,9 @@ class StrataEngine:
                         self.slot_busy[slot] = False
                         self.slot_cv.notify_all()
 
+    slot_groups = 1         # --batch-groups (set when the engine starts)
+    SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
+
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
         prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
@@ -1038,9 +1347,17 @@ class StrataEngine:
             h = self.slot_held[b]
             return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
         best = max(free, key=held_prefix)
-        if held_prefix(best) > 0:
+        # without --batch-groups a held prefix of any length is taken, as before
+        if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
-        return min(free, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        # with --batch-groups: the group with the fewest busy slots first, so the requests spread over the
+        # pipeline's stages (two requests in one group leave the other stage idle); then empty, then least recent
+        busy_in: dict[int, int] = {}
+        for b in range(self.batch):
+            if self.slot_busy[b]:
+                busy_in[self.slot_group[b]] = busy_in.get(self.slot_group[b], 0) + 1
+        return min(free, key=lambda b: (busy_in.get(self.slot_group[b], 0) if self.slot_groups > 1 else 0,
+                                        bool(self.slot_held[b]), self.slot_used[b]))
 
     def slots_view(self) -> list[dict]:
         """/metrics: each batch slot - idle (with the tokens it holds for a next turn), reading or decoding."""
@@ -1060,10 +1377,12 @@ class StrataEngine:
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
+        if not self.alive():
+            raise EngineDied("the engine is unavailable; this request was not sent")
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
-        self.progress = None
+        self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
         self.__dict__.setdefault("lp_lines", collections.deque()).clear()   # this request's LP lines only
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -1080,6 +1399,7 @@ class StrataEngine:
         silence = float(self.silence_s or 0)
         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
         heard, read_to = time.monotonic(), 0
+        beat = heard
         try:
             while True:
                 wait = 10.0
@@ -1090,17 +1410,21 @@ class StrataEngine:
                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
                                            "the request")
                 try:
-                    line = self.lines.get(timeout=wait)
+                    line = self.lines.get(timeout=min(wait, 0.5))
                 except queue.Empty:
                     if cancel.is_set():
                         return
-                    if wait >= 10.0:
-                        yield None                        # the 10 s heartbeat (the deadline's short waits are not)
+                    if allow > 0 and time.monotonic() - heard >= allow:
+                        continue                          # enforce the expired deadline before another heartbeat
+                    if time.monotonic() - beat >= 10.0:
+                        beat = time.monotonic()
+                        yield None                        # polling cancellation does not add HTTP heartbeats
                     continue
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
+                beat = heard
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
@@ -1110,6 +1434,7 @@ class StrataEngine:
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
+                        self.progress_ms = float(f[3]) if len(f) >= 4 else 0.0
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
                         rate, chunk = self.prefill_tok_s_mean or 0.0, int(f[1]) - read_to
                         read_to = int(f[1])
@@ -1120,7 +1445,7 @@ class StrataEngine:
                     yield None
                 elif line.startswith("RESUME "):          # the reused tokens: the first chunk starts after them
                     try:
-                        read_to = int(line.split()[1])
+                        read_to = self.reused = int(line.split()[1])
                     except (IndexError, ValueError):
                         pass
                 elif line.startswith("DONE"):
@@ -1175,6 +1500,109 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
+    def session_file(self, action: str, path: str) -> dict:
+        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+        -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
+        is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
+        malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
+        step: the engine is ended (EngineDied) and the next request starts it again.  EngineDied also when it ended
+        by itself (a restore transfer that failed after the device state changed ends it on purpose: FATAL), and
+        EngineSilent (#481) when it printed nothing valid for engine_silence_s - a SESSION progress line (one per
+        block of the file moved, at most 16 MiB) counts only when its numbers are.  `SWAIT <phase> <seconds>` announces
+        a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
+        explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
+        that never ends is still ended."""
+        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+            raise ValueError("invalid session command")
+        proc = self.proc
+        try:
+            if proc is None or proc.stdin is None:
+                raise OSError("no engine")
+            proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            proc.stdin.flush()
+        except OSError:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        silence = float(self.silence_s or 0)
+        heard = time.monotonic()
+        want = "SAVED" if action == "save" else "RESTORED"
+
+        def out_of_step(line: str) -> EngineDied:
+            self.ended = True                               # not alive from now: the next request restarts it
+            try:
+                proc.kill()
+                proc.wait(timeout=20)
+            except (OSError, AttributeError, subprocess.TimeoutExpired):
+                pass
+            return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
+                              "the server ended the engine")
+
+        def count(s: str) -> int:
+            if not s.isdigit():                             # no sign, no blank, no fraction
+                raise ValueError
+            return int(s)
+
+        last_done = -1
+        allow = 0.0                                         # the announced blocking step's allowance, seconds
+        while True:
+            limit = max(silence, allow)
+            left = limit - (time.monotonic() - heard) if silence > 0 else None
+            try:
+                if left is not None and left <= 0:
+                    raise queue.Empty
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
+                                   + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")
+                                   ) from None
+            if line is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            f = line.split()
+            head = f[0] if f else ""
+            if head == "SESSION":                          # a large file moving: progress, and a heartbeat
+                try:
+                    if len(f) != 3:
+                        raise ValueError
+                    done, total = count(f[1]), count(f[2])
+                    if done > total or done < last_done:
+                        raise ValueError
+                except ValueError:
+                    raise out_of_step(line) from None
+                last_done = done
+                heard, allow = time.monotonic(), 0.0
+                continue
+            if head == "SWAIT":                            # a blocking step starts: its bounded allowance
+                try:
+                    if len(f) != 3 or not f[1].isalpha() or not f[1].isascii():
+                        raise ValueError
+                    seconds = count(f[2])
+                    if not 0 < seconds <= SESSION_WAIT_MAX_S:
+                        raise ValueError
+                except ValueError:
+                    raise out_of_step(line) from None
+                heard, allow = time.monotonic(), float(seconds)
+                continue
+            if head == "FATAL":
+                raise EngineDied(line[6:].strip() or "the engine ended during a session restore")
+            if head == "SERR":
+                parts = line.rstrip("\r\n").split(" ", 3)
+                if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
+                    raise out_of_step(line)
+                raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if head == want:
+                try:
+                    if len(f) != 4:
+                        raise ValueError
+                    tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
+                    if not math.isfinite(ms) or ms < 0:
+                        raise ValueError
+                except ValueError:
+                    raise out_of_step(line) from None
+                return {"tokens": tokens, "bytes": size, "ms": ms}
+            if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
+                heard = time.monotonic()
+                continue
+            raise out_of_step(line)
+
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
         a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
@@ -1200,15 +1628,30 @@ class StrataEngine:
             pass
         finally:
             if self.proc.poll() is not None:
-                if self.pump is not None:
+                if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
-                self.proc.stdin.close()
+                try:
+                    self.proc.stdin.close()             # buffered data may flush again after the engine has exited
+                except OSError:
+                    pass
                 self.proc.stdout.close()
                 if self.log not in (None, subprocess.DEVNULL):
                     self.log.close()
                 self.proc = None
                 self.ended = True
                 self.progress, self.last = None, {}
+                self.progress_ms, self.reused = 0, 0
+
+
+IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
+
+
+def network_path(path: str) -> bool:
+    r"""A path to another computer: \\host\share or //host/share (either slash), \\?\UNC\host\..., \\.\UNC\host\...
+    or the NT form \??\UNC\host\...  Windows connects to that host at the first look at the path (os.path.isfile is
+    enough) and signs in with the user's NTLM credentials.  \\?\ and \??\ name local files too; no client needs them."""
+    p = path.replace("/", "\\")
+    return p.startswith("\\\\") or p.startswith("\\??\\")
 
 
 def vision_label(cfg: dict) -> str:
@@ -1238,11 +1681,31 @@ class Vision:
 
     Every wait on it is bounded.  An encoder that stops or stops answering is marked dead: later image requests
     fail with the reason and text requests are unaffected."""
-    READY_TIMEOUT_S = 600      # loading the mmproj and the warm-up at the largest picture (a first GPU run compiles)
-    ENC_TIMEOUT_S = 300        # one picture at the token cap, with room for a loaded CPU
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None):
-        args = [cfg["exe"], "--mmproj", cfg["mmproj"], "--model", cfg["model"]]
+    @staticmethod
+    def work_dir() -> Path:
+        """#480: the directory for the encoder's files.  The engine reads the embeddings file named in a `GENI` line
+        and the encoder the output named in an `ENC <image> <out>` line, both split at spaces, so a space in the path
+        (a %TEMP% under a user name with a space) broke every image.  The system temp directory is used while its path
+        has no space, then the working directory, then the system drive's root; the plain temp directory is the last
+        resort (the encoder's own files are then named relative to it, see `_start`)."""
+        for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
+            try:
+                d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+            except OSError:
+                continue                                       # not writable, or no such drive
+            if " " not in str(d):
+                return d
+            try:
+                d.rmdir()                                      # just created, so still empty
+            except OSError:
+                pass
+        return Path(tempfile.mkdtemp(prefix="strata-vision-"))
+
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+        def absolute(p):                                # the encoder runs in its own dir (#480)
+            return os.path.abspath(p) if os.path.dirname(str(p)) else p
+        args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
             args.append("--gpu")
             if cfg.get("gpu_pci"):
@@ -1251,56 +1714,65 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
+        if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
+            args += ["--min-tokens", str(cfg["min_tokens"])]
         if cfg.get("gpu"):
             # ggml-sycl uses oneDNN whenever it was built with it; off unless asked for: without it the same image
             # gives the same embeddings every time (bench/results/2026-09-30-xe-vision-sycl)
             flag = "1" if cfg.get("onednn") else "0"
             env = dict(os.environ if env is None else env, GGML_SYCL_ENABLE_DNN=flag, GGML_SYCL_FA_ONEDNN=flag)
         self.label = vision_label(cfg)
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload (#208)
-        self.stopped = False
-        try:
-            self._start()
-        except RuntimeError:
-            shutil.rmtree(self.dir, ignore_errors=True)
-            raise
+        self.proc: subprocess.Popen | None = None
+        self.dead: str | None = None
+        self.stopped = True                             # until _start: a lazy encoder starts with the model
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if not lazy:
+            try:
+                self._start()
+            except (OSError, RuntimeError):
+                shutil.rmtree(self.dir, ignore_errors=True)
+                raise
 
     def _start(self):
         """Start the encoder process and wait (bounded) for its READY; RuntimeError when it does not come."""
         args, log, env = self.spawn
-        self.dead: str | None = None
-        self.proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log or subprocess.DEVNULL,
-                                     text=True, encoding="utf-8", bufsize=1, env=env)
+        self.dead = None
+        # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
+        self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                          cwd=self.dir)
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
-        line = self._line(self.READY_TIMEOUT_S)
+        line = self._line(VISION_READY_S)
         if line is None or not line.startswith("READY"):
-            why = ("no answer within %d s" % self.READY_TIMEOUT_S if line == "" else
+            why = ("no answer within %d s" % VISION_READY_S if line == "" else
                    "it exited" if line is None else line.strip())
             self._stop(why)
             raise RuntimeError("the vision encoder did not start: " + why)
+        self.stopped = False
 
     def alive(self) -> bool:
-        """False only after `unload`: the next request starts it again.  An encoder that died or stopped answering
-        stays marked dead (images off, with the reason) instead of being restarted at every request."""
+        """False after `unload` (and before a lazy encoder's first start): the next request starts it again.  An
+        encoder that died or stopped answering stays marked dead (images off, with the reason) instead of being
+        restarted at every request."""
         return not self.stopped
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
-        self._end()
-        self.stopped = True
+        self.close()
 
     def restart(self):
         """Start the encoder again after an unload; the cache of encoded images is kept.  RuntimeError when it does
         not start (it is then marked dead, so images are off until the server restarts)."""
-        try:
-            self.proc.kill()
-        except OSError:
-            pass
-        self._close_stdin()
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+            except OSError:
+                pass
+            self._close_stdin()
         try:
             self._start()
         finally:
@@ -1312,8 +1784,8 @@ class Vision:
             lines.put(line)
         lines.put(None)                             # end of output: the encoder exited
 
-    def _line(self, timeout: float) -> str | None:
-        """Its next line; "" when none came within `timeout`, None when it exited."""
+    def _line(self, timeout: float | None) -> str | None:
+        """Its next line; "" when none came within `timeout` (None: wait for ever), None when it exited."""
         try:
             return self.lines.get(timeout=timeout)
         except queue.Empty:
@@ -1337,20 +1809,61 @@ class Vision:
     @staticmethod
     def load(source: str) -> bytes:
         if source.startswith("data:"):
-            return base64.b64decode(source.split(",", 1)[1])
+            try:
+                return base64.b64decode(source.split(",", 1)[1])
+            except (IndexError, ValueError) as e:                # no comma, or not base64
+                raise ValueError(f"the image's data: URL could not be read ({e})") from None
         if source.startswith(("http://", "https://")):
-            req = urllib.request.Request(source, headers={"User-Agent": "strata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                return r.read()
+            return Vision.download(source)
         path = source[7:] if source.startswith("file://") else source
+        # refused before anything looks at the path: file://host/share/x.png is \\host\share\x.png ("file://C:/x.png",
+        # a drive, is a client's spelling of file:///C:/x.png)
+        host = re.split(r"[/\\]", path, maxsplit=1)[0] if source.startswith("file://") else ""
+        if network_path(path) or host and not re.fullmatch(r"[A-Za-z]:|localhost", host, re.IGNORECASE):
+            raise ValueError("an image file must be on this computer: network paths (\\\\host\\share, //host/share, "
+                             "file://host/...) are not read")
         if path and os.path.isfile(path):
-            return Path(path).read_bytes()
+            try:
+                return Path(path).read_bytes()
+            except OSError as e:
+                raise ValueError(f"the image could not be read from {path} ({e})") from None
         raise ValueError("an image must be a data: URL, an http(s) URL or a local file path")
 
     @staticmethod
+    def download(url: str) -> bytes:
+        """An image URL's bytes, at most IMAGE_URL_MAX of them: the whole response was read, so a huge or endless one
+        filled the memory.  One that cannot be read is a ValueError (a 400 that says so), not a dropped connection."""
+        too_big = f"the image URL's file is over {IMAGE_URL_MAX >> 20} MiB"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+                size = r.headers.get("Content-Length") or ""
+                if size.isdigit() and int(size) > IMAGE_URL_MAX:
+                    raise ValueError(too_big)
+                data = r.read(IMAGE_URL_MAX + 1)
+        except (OSError, HTTPException) as e:
+            raise ValueError(f"the image URL could not be read: {e}") from None
+        if len(data) > IMAGE_URL_MAX:
+            raise ValueError(too_big)
+        return data
+
+    @staticmethod
+    def _exif_rotated(data: bytes) -> bool:
+        """A JPEG whose EXIF Orientation says it is stored turned (phones do this for portrait photos): the decoder
+        (stb_image) ignores the tag.  False without Pillow, or when the tag is missing, 1 or unreadable (#1229)."""
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                return im.getexif().get(0x0112, 1) not in (None, 0, 1)
+        except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
+            return False
+
+    @staticmethod
     def normalize(data: bytes) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG."""
-        if data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
+        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
+        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
+        jpeg = data[:3] == b"\xff\xd8\xff"
+        if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):
             return data
         try:
@@ -1362,6 +1875,8 @@ class Vision:
         try:
             im = Image.open(io.BytesIO(data))
             im.load()
+            from PIL import ImageOps
+            im = ImageOps.exif_transpose(im)             # the camera's orientation tag, applied (#1229)
         except Exception as e:
             raise ValueError(f"the image could not be read ({e})") from None
         if im.mode in ("RGBA", "LA", "P") and "transparency" in im.info or im.mode in ("RGBA", "LA"):
@@ -1375,36 +1890,52 @@ class Vision:
         im.save(out, format="PNG")
         return out.getvalue()
 
-    def encode(self, source: str) -> tuple[Path, int]:
-        """-> (embeddings file, number of image tokens)."""
-        data = self.normalize(self.load(source))
+    def encode_all(self, sources: list) -> list[tuple[Path, int]]:
+        """encode() for every image of one request: the files of this request's earlier images are never evicted to
+        make room for a later one (#1072: with more than 64 unique images the first was deleted before the request
+        had read it)."""
+        out: list[tuple[Path, int]] = []
+        for src in sources:
+            out.append(self.encode(src, keep=[p for p, _ in out]))
+        return out
+
+    def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
+        """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
+        `keep`: files the caller still needs (never evicted by this call)."""
+        data = self.normalize(source if isinstance(source, bytes) else self.load(source))
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
+                self.cache[key] = self.cache.pop(key)                  # most recently used last
                 return self.cache[key]
             if self.dead:
                 raise ValueError("images are unavailable: " + self.dead)
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
-                self.proc.stdin.write(f"ENC {img} {out}\n")
+                if self.proc is None or self.proc.stdin is None:
+                    raise OSError("the vision encoder is not running")
+                self.proc.stdin.write(f"ENC {img.name} {out.name}\n")      # relative to the encoder's cwd (#480)
                 self.proc.stdin.flush()
-                line = self._line(self.ENC_TIMEOUT_S)
+                line = self._line(VISION_ENCODE_S)
             except OSError:                         # its stdin is closed: it exited
                 line = None
             finally:                                # #352: also when the encoder's pipe is gone
                 img.unlink(missing_ok=True)
             if line is None or line == "":
                 self._stop("the vision encoder stopped" if line is None else
-                           "the vision encoder did not answer within %d s" % self.ENC_TIMEOUT_S)
+                           "the vision encoder did not answer within %d s" % (VISION_ENCODE_S or 0))
                 raise ValueError("the image could not be read: " + self.dead)
             line = line.strip()
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else line))
             self.cache[key] = (out, int(line.split()[1]))
-            if len(self.cache) > 64:                                   # oldest first
-                old = next(iter(self.cache))
-                self.cache.pop(old)[0].unlink(missing_ok=True)
+            held = {str(p) for p in keep} | {str(out)}
+            for old in list(self.cache):                               # oldest first, but never one still in use
+                if len(self.cache) <= 64:
+                    break
+                if str(self.cache[old][0]) not in held:
+                    self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
     def _end(self):
@@ -1418,8 +1949,15 @@ class Vision:
         self._close_stdin()
 
     def close(self):
-        self._end()
-        shutil.rmtree(self.dir, ignore_errors=True)   # the pictures, their embeddings and the requests' combined files
+        if self.proc is not None:
+            self._end()
+        self.stopped = True
+
+    def shutdown(self):
+        """#914: close() for good: the server ends, so the encoder's directory (the pictures, their embeddings and the
+        requests' combined files) goes with it.  unload() keeps it for the restart."""
+        self.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -1491,7 +2029,7 @@ def engine_args(cfg: dict) -> list[str]:
     return conversation_save_args(cfg, learned_profile_args(cfg, args))
 
 
-PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT)
+PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
@@ -1509,7 +2047,7 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         return []
     if n <= 1:
         return []
-    if n > PARALLEL_MAX:
+    if n > PARALLEL_MAX and "--batch-mtp" not in args and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
         print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
@@ -1602,7 +2140,11 @@ class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
 
-    ALWAYS = ()                                     # specials matched without parse_special (type 4, as <think>)
+    ALWAYS: tuple[str, ...] = ()                    # specials matched without parse_special (type 4, as <think>)
+
+    @property
+    def control_tokens(self):
+        return [s for s in self.SPECIALS if s not in self.ALWAYS]
 
     def encode(self, text, parse_special=False, plain=()):
         out, i = [], 0
@@ -1676,6 +2218,108 @@ def model_switcher(svc, mode: str = "") -> dict:
             "choices": mine, "model": svc.model}
 
 
+OPENAI_MAX_STOP = 4                                  # OpenAI's limit on `stop`
+
+
+def stop_strings(req: dict) -> list[str]:
+    """The request's stop strings: OpenAI's `stop` (a string or a list of up to 4) or Anthropic's `stop_sequences`
+    (a list).  Empty strings are left out.  A bad value is a ValueError, so a 400 before anything is generated."""
+    req = req or {}
+    if req.get("stop") is not None:
+        stop = req["stop"]
+        stop = [stop] if isinstance(stop, str) else stop
+        if not isinstance(stop, list) or not all(isinstance(x, str) for x in stop):
+            raise ValueError("stop must be a string or a list of strings")
+        if len(stop) > OPENAI_MAX_STOP:
+            raise ValueError(f"stop takes at most {OPENAI_MAX_STOP} strings")
+    elif req.get("stop_sequences") is not None:
+        stop = req["stop_sequences"]
+        if not isinstance(stop, list) or not all(isinstance(x, str) for x in stop):
+            raise ValueError("stop_sequences must be a list of strings")
+    else:
+        return []
+    return [x for x in stop if x]
+
+
+class StopMatcher:
+    """Cuts the answer's text at the first stop string.  Text that could still be the start of a stop string is held
+    back (only that tail, never more), so a stop string split across tokens or chunks is still found and never sent."""
+
+    def __init__(self, stops: list[str]):
+        self.stops, self.held = stops, ""
+        self.hit: str | None = None
+
+    def push(self, text: str) -> str:
+        """-> the text that is safe to send now; after a match, self.hit is the stop string and nothing more comes."""
+        if self.hit is not None:
+            return ""
+        buf = self.held + text
+        first = None
+        for s in self.stops:
+            i = buf.find(s)
+            if i >= 0 and (first is None or i < first[0]):
+                first = (i, s)
+        if first is not None:
+            self.held, self.hit = "", first[1]
+            return buf[:first[0]]
+        keep = 0                                      # the longest end of buf that a stop string starts with
+        for s in self.stops:
+            for k in range(min(len(s) - 1, len(buf)), keep, -1):
+                if buf.endswith(s[:k]):
+                    keep = k
+                    break
+        self.held = buf[len(buf) - keep:] if keep else ""
+        return buf[:len(buf) - keep]
+
+    def flush(self) -> str:
+        held, self.held = self.held, ""
+        return held
+
+
+# Windows names that open a device whatever their extension or folder (Microsoft, "Naming Files, Paths, and Namespaces")
+_WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", *(f"com{i}" for i in "123456789\u00b9\u00b2\u00b3"),
+                *(f"lpt{i}" for i in "123456789\u00b9\u00b2\u00b3")}
+
+
+def slot_filename_problem(name) -> str | None:
+    """/slots/0 {"filename": NAME}: why NAME is not one plain file name inside the slot save path, on Linux and on
+    Windows alike (None when it is).  No separator or drive (`D:x`), no stream (`a:b`), no device (`NUL.txt`), no
+    trailing dot or space (Windows drops them), no control character, no leading dot (temporary files use it)."""
+    if not isinstance(name, str) or not name:
+        return "must be a non-empty string"
+    if len(name.encode("utf-8", "surrogatepass")) > 200:
+        return "is too long (at most 200 bytes)"
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        return "must not contain control characters"
+    if any(c in name for c in '/\\:*?"<>|'):
+        return "must be a plain file name (no / \\ : * ? \" < > |)"
+    if name.startswith("."):
+        return "must not start with a dot"
+    if name.endswith((".", " ")):
+        return "must not end with a dot or a space"
+    if name.split(".")[0].rstrip(" ").lower() in _WIN_DEVICES:
+        return "names a Windows device"
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return "is not valid Unicode"
+    return None
+
+
+def slot_save_dir(value, base: str | None = None) -> str:
+    """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
+    directory), created private to this user when missing.  ValueError for anything else."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("slot_save_path must be a directory path (a string)")
+    if any(ord(c) < 32 for c in value):
+        raise ValueError("slot_save_path must not contain control characters")
+    path = os.path.abspath(os.path.join(base, value) if base and not os.path.isabs(value) else value)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if not os.path.isdir(path):
+        raise ValueError(f"slot_save_path {path} is not a directory")
+    return path
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -1683,13 +2327,18 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
+        self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+        self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends in it
+        self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction rendered with its own tools
+        self.codex_thread_titles = False              # #923 (opt-in): Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.vram_reserve: int | None = None           # #533: the last POST /v1/vram reserve (None: the start's)
+        self.slot_save_path: str | None = None        # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -1709,7 +2358,7 @@ class Service:
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.status: dict = {"busy": False, "queued": 0}   # GET /status: what the model is doing right now
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots, #465): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -1726,7 +2375,9 @@ class Service:
                        "prompt_ms": 0.0, "decode_ms": 0.0,
                        "drafts_offered": 0, "drafts_accepted": 0}   # #457: the MTP drafts, summed where reported
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
-        self.last_request_at = None                      # when a request last started or finished
+        from serve.prometheus import Latencies
+        self.latencies = Latencies()                     # GET /metrics in Prometheus text: the latency histograms
+        self.last_request_at: float | None = None        # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
@@ -1736,14 +2387,80 @@ class Service:
         self.idle_unload_s: float = 0
         self.min_free_vram_mib = 0
         self.before_load = None
+        self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
+
+    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+        """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
+        to or from a file in slot_save_path.  -> (HTTP status, body)."""
+        def error(code, message):
+            return code, {"error": {"code": code, "message": message,
+                                    "type": "invalid_request_error" if code < 500 else "server_error"}}
+        if not self.slot_save_path or not hasattr(self.engine, "session_file"):
+            return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
+        if getattr(self.engine, "batch", 0):
+            # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
+            # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
+            return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
+        if slot != "0":
+            return error(400, "this server has one slot: 0")
+        if action not in ("save", "restore"):
+            return error(400, "action must be save or restore")
+        why = slot_filename_problem(filename)
+        if why:
+            return error(400, f"filename {why}")
+        path = os.path.join(self.slot_save_path, filename)
+        if action == "restore":
+            try:
+                os.lstat(path)                              # the engine opens it without following a link
+            except OSError:
+                return error(404, f"no saved session named {filename}")
+        self.last_request_at = time.time()                  # the idle unload counts this as activity
+        with self.status_lock:
+            self.status["queued"] += 1
+        waiting = True
+        try:
+            with self.fifo:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                waiting = False
+                if not self.loaded():
+                    return error(503, "the model is not loaded")
+                with self.status_lock:
+                    self.status.update(busy=True, phase="saving the session" if action == "save"
+                                       else "restoring a session", started=time.time(), first_token=None,
+                                       prompt_tokens=None, generated=None, max_tokens=None)
+                try:
+                    r = self.engine.session_file(action, path)
+                except SessionRefused as e:
+                    body = error(e.status, str(e))
+                    body[1]["error"]["kind"] = e.kind
+                    if e.published:
+                        body[1]["error"]["published"] = True
+                    return body
+                except ValueError as e:                     # the request itself (an invalid command)
+                    return error(400, str(e))
+                finally:
+                    with self.status_lock:
+                        self.status["busy"] = False
+                    self.last_request_at = time.time()
+        finally:
+            if waiting:                                     # never reached the FIFO (an exception while waiting)
+                with self.status_lock:
+                    self.status["queued"] -= 1
+        if action == "save":
+            return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
+                         "timings": {"save_ms": r["ms"]}}
+        return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
+                     "timings": {"restore_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -1768,6 +2485,12 @@ class Service:
         Other names are still served, as before."""
         asked = req.get("model") if isinstance(req, dict) else None
         return asked if isinstance(asked, str) and asked in self.aliases else self.model
+
+    def reported_ctx(self) -> int:
+        """The context the endpoints report (/v1/status, /v1/models, /props, /health, /slots, /metrics): the engine's,
+        or the last one it reported while it restarts (max_context is 0 until READY, and a client that sizes its
+        prompt from it would send nothing, #351).  Reporting only: requests are checked in prepare()."""
+        return int(getattr(self.engine, "max_context", 0) or getattr(self.engine, "known_ctx", 0) or 0)
 
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens`, else the
@@ -1815,9 +2538,14 @@ class Service:
             if free is not None and free < self.min_free_vram_mib:
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free")
+        vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[strata] starting the vision encoder again ...", flush=True)   # the engine sizes its cache
-            self.vision.restart()
+            print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
+            try:
+                self.vision.restart()
+            except Exception as e:
+                raise EngineDied(f"the vision encoder failed to start: {e}") from e
+            vision_started = True
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
@@ -1826,7 +2554,12 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
-        self.engine.restart()
+        try:
+            self.engine.restart()
+        except Exception:
+            if vision_started:
+                self.vision.unload()
+            raise
         print("[strata] the engine is running again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
@@ -2083,7 +2816,7 @@ class Service:
                         waiting=int(getattr(self.engine, "waiting", 0) or 0))
             if running and state == "idle":
                 live["state"] = "generating"
-        engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
+        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
@@ -2104,7 +2837,7 @@ class Service:
         def scaled(v, unit, digits=0):
             return round(v / unit, digits) if isinstance(v, (int, float)) else None
 
-        busy, ctx = bool(s.get("busy")), self.engine.max_context
+        busy, ctx = bool(s.get("busy")), self.reported_ctx()
         images = self.vision is not None and not getattr(self.vision, "dead", None)
         vision_error = self.vision_error or (getattr(self.vision, "dead", None) if self.vision is not None else None)
         return {
@@ -2156,18 +2889,53 @@ class Service:
 
     def encode_prompt(self, messages, tools, kwargs) -> list[int]:
         """The request's prompt: the template rendered and tokenized.  #537: a <think> / </think> written inside a
-        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are)."""
-        marked, marked_tools, changed = mark_think_literals(messages, tools)
+        message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
+        A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
+        the control tokens the template writes are control tokens."""
+        marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
         if not changed:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt)
+        prompt, plain = unmark_think_literals(prompt, self.literals)
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def _note_unreadable_tool_images(self, messages):
+        """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
+        image encoder, or the encoder refuses that picture - becomes a short note in its place instead of a 400.
+        Clients resend the whole history every turn, so one unreadable tool picture would fail every later request of
+        the conversation; a picture the user sends keeps the 400.  A picture that encodes stays in the cache, so the
+        prompt's own encode below finds it."""
+        fetched = {}                     # a URL's bytes, so prepare() does not download the same picture again
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") != "tool" or not isinstance(content, list):
+                continue
+            for n, item in enumerate(content):
+                if not isinstance(item, dict) or item.get("type") != "image":
+                    continue
+                why = "this server has no image encoder" if self.vision is None else None
+                if why is None:
+                    src = item["source"]
+                    try:
+                        if src.startswith(("http://", "https://")):
+                            src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
+                        with self.fifo:          # the encoder takes its turn with the requests (see below)
+                            self.vision.encode(src)
+                    except (ValueError, OSError) as e:
+                        why = str(e)
+                if why is not None:
+                    print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
+                    content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
+        return fetched
+
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context."""
+        the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
+        prompt; with thinking, Service.run writes it once the thinking is over."""
+        fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
+        if force and kwargs.get("enable_thinking", True) is False:
+            ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -2178,19 +2946,28 @@ class Service:
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
+            # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
+            # for as long as urlopen waited.
+            images = [fetched[src] if src in fetched else
+                      Vision.download(src) if src.startswith(("http://", "https://")) else src for src in images]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self.fifo:
-                encoded = [self.vision.encode(src) for src in images]
+                encoded = (self.vision.encode_all(images) if hasattr(self.vision, "encode_all")
+                           else [self.vision.encode(src) for src in images])
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
             literal = self.tok.encode(IMAGE_PAD, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
-                if t == pad and j > 0 and ids[j - 1] == start and k < len(encoded):
+                if t == pad and j > 0 and ids[j - 1] == start:
+                    # more pairs than images: text parts that cut both markers apart (the literal marks keep whole
+                    # ones text)
+                    if k == len(encoded):
+                        raise ValueError("the prompt and its images do not match")
                     out += [pad] * encoded[k][1]
                     k += 1
                 elif t == pad:
@@ -2200,11 +2977,6 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for path, _ in encoded:
-                    f.write(path.read_bytes())
-            self.embeddings.path = combined
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -2227,7 +2999,98 @@ class Service:
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's xestrata-<model>.json to shorten it to the room left (#545)")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
+        if images:
+            # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
+            # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
+            # one more for every retry of a 503.  run() deletes it; drop_embeddings() if run() never starts.
+            combined = combined_embeddings_path(self.vision.dir, sum(Path(p).stat().st_size for p, _ in encoded))
+            self.embeddings.path = combined             # first, so a half-written one is found as well
+            write_temporary(combined, [p for p, _ in encoded])
+        if req is not None and req.get("strata_prefix") is not None:
+            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    PREFIX_END = "\u0001strata-prefix-end\u0001"   # where a message's shared part ends in the rendered prompt
+
+    def resolve_prefix(self, spec, messages, tools, kwargs, ids, has_images=False) -> dict:
+        """R1: `"strata_prefix"` marks the start of the prompt as a shared read-only prefix: a long document that many
+        short questions follow.  Three ways to say where it ends: `{"messages": K}` (the first K messages), `{"message":
+        I, "chars": N}` (the first N characters of message I's text: a document and its question in one message) or
+        `{"tokens": N}`.  The engine reads the prompt in two parts there, keeps the checkpoint at the boundary pinned
+        (never evicted) and does not park the branch it leaves, so N questions cost one prefix.  Returns
+        {"tokens": N} (what the engine's `pin=N` takes: always a prefix of the prompt's ids, the tokenizer's merge
+        across the boundary included), or {} when the prefix cannot be marked (said in the log: the request is never
+        refused for it).  A malformed field is a 400."""
+        keys = ("messages", "message", "chars", "tokens")
+        if (not isinstance(spec, dict) or not spec or any(k not in keys for k in spec) or
+                set(spec) not in ({"messages"}, {"tokens"}, {"message", "chars"})):
+            raise ValueError('strata_prefix: {"messages": K} (the first K messages), {"message": I, "chars": N} '
+                             '(the first N characters of message I) or {"tokens": N}')
+        for k, v in spec.items():
+            if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
+                raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
+        if has_images:
+            print("[strata] strata_prefix ignored: the request has images", flush=True)
+            return {}
+        what = ",".join(f"{k}={v}" for k, v in spec.items())
+
+        def lcp(a, b):
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        def head_ids(msgs):
+            """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when there)."""
+            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            effort = kwargs.get("reasoning_effort")
+            off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
+            kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
+                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+            kw["add_generation_prompt"] = False
+            text = self.template.render(marked, tools=marked_tools, **kw)
+            cut = text.find(self.PREFIX_END)
+            if cut >= 0:
+                text = text[:cut]
+            if changed:
+                text, plain = unmark_think_literals(text, self.literals)
+                return self.tok.encode(text, parse_special=True, plain=plain)
+            return self.tok.encode(text, parse_special=True)
+
+        if "tokens" in spec:
+            n = spec["tokens"]
+        elif "messages" in spec:
+            k = spec["messages"]
+            if k >= len(messages):
+                print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and "
+                      "the prefix must leave at least the last one", flush=True)
+                return {}
+            head = head_ids(messages[:k])
+            n = lcp(head, ids)
+        else:
+            i, chars = spec["message"], spec["chars"]
+            text = messages[i].get("content") if 0 <= i < len(messages) else None
+            if not isinstance(text, str) or chars > len(text):
+                print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                return {}
+            cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
+            head = head_ids(cut)
+            n = lcp(head, ids)
+        if n < 1 or n >= len(ids) - 1:
+            print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+                  f"(common start {n})", flush=True)
+            return {}
+        return {"tokens": n}
+
+    def drop_embeddings(self) -> None:
+        """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
+        ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
+        then nothing else would.  The handler calls this when a request is done."""
+        path, self.embeddings.path = getattr(self.embeddings, "path", None), None
+        if path is not None:
+            Path(path).unlink(missing_ok=True)
 
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
@@ -2265,23 +3128,55 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
-        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
-        budget = self.reasoning_budget(sampling) if thinking else None   # #123: opt-in, off by default
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+        """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
+        budget = self.reasoning_budget(sampling) if thinking else None
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+        stop_list = stop_strings(sampling)
+        stops = StopMatcher(stop_list) if stop_list else None
+
+        def cut(evs):
+            """The events with the answer's text cut at a stop string (OpenAI stop, Anthropic stop_sequences)."""
+            if stops is None:
+                return evs
+            out = []
+            for ev in evs:
+                if stops.hit is not None:
+                    break                               # nothing after the stop string is sent
+                if ev.kind == "content":
+                    text = stops.push(ev.text or "")
+                    if text:
+                        out.append(Event("content", text))
+                    continue
+                held = stops.flush()                    # a stop string does not run across a tool call or thinking
+                if held:
+                    out.append(Event("content", held))
+                out.append(ev)
+            return out
+        opening = []                                    # without thinking the prompt ends with the forced opening:
+        if force and not thinking:                      # the parser reads it as if the model had written it
+            opening, force = parser.feed(force), None
+        tail = ""                                       # the last characters written (the newlines before a call)
+        answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         timings, before = None, None                    # this request's timings; the engine's `last` before it
+        recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
+        looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
-        emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
+        emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
+        # Only a DONE line replaces engine.last, so a request that died, errored or was disconnected must not have
+        # the PREVIOUS request's decode figures recorded as its own: each pass keeps its own DONE (a segment) if
+        # one arrived.  A reasoning-budget continuation is another native generation, not another API request,
+        # so the generated reasoning must not become this request's cached input (#615).
+        segments = []
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
@@ -2307,7 +3202,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new)
+                                  max_tokens=max_new, reasoning_recoveries=0)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -2316,10 +3211,15 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    for ev in opening:
+                        yield "event", ev
                     while True:
+                        segment_before = getattr(self.engine, "last", None)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             for t in gen:
                                 if t is None:               # heartbeat while the engine is quiet
@@ -2336,22 +3236,50 @@ class Service:
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
-                                thinking_n += parser.state == "reasoning"
+                                thinking_n += parser.state in ("reasoning", "rcall")
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
-                                evs = parser.feed(detok.push(t))
+                                piece = detok.push(t)
+                                tail = (tail + piece)[-2:]
+                                evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
+                                    if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                        reasoning_text += ev.text or ""
+                                    if ev.kind in ("content", "tool_start", "tool_call"):
+                                        answered = True
                                     yield "event", ev
+                                if stops is not None and stops.hit is not None:
+                                    finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
+                                    break
+                                if (self.reasoning_loop_recovery and not recovery_count and parser.state == "reasoning"
+                                        and n >= next_loop_check and not parser.buf and not parser.pending
+                                        and not detok.pending()):
+                                    next_loop_check = n + LOOP_CHECK_EVERY
+                                    repeat_coverage = reasoning_repeat_coverage(reasoning_text)
+                                    if repeat_coverage >= LOOP_COVERAGE:
+                                        if self.reasoning_loop_recovery == "stop":
+                                            looped = True        # #728: end the reply here, as for a repeated token
+                                            break
+                                        if not emb:              # "recover": not for a request with pictures
+                                            recover_prompt = focused_recovery_prompt(self.tok, ids, raw_ids)
+                                            if recover_prompt is not None:
+                                                break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
                                     if thought >= budget and not parser.buf and not detok.pending():
                                         wrap = True
+                                        break
+                                if force:
+                                    if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
+                                        force = None    # the model is writing a call of its own
+                                    elif parser.state == "content" and not parser.buf and not detok.pending():
+                                        opens = True
                                         break
                         except EngineDied as e:
                             finish = "error"
@@ -2375,28 +3303,87 @@ class Service:
                                 self._say_died(e)
                                 if not leaving and not cancel.is_set():
                                     raise
-                        if not wrap or cancel.is_set():
+                            segment_done = getattr(self.engine, "last", None)
+                            if segment_done is not None and segment_done is not segment_before:
+                                segments.append(dict(segment_done))
+                        if recover_prompt is not None and not cancel.is_set() and n < max_new:
+                            recovery_count += 1
+                            # Only the two settings that keep the same words coming are raised (temperature to at
+                            # least 1.0, presence penalty to at least 1.5): a client's top_p and top_k are never
+                            # touched, and its own request dict is copied, not changed.
+                            want = (max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                    max(1.5, float((sampling or {}).get("presence_penalty") or 0)))
+                            if want != tuple(float((sampling or {}).get(k) or 0)
+                                             for k in ("temperature", "presence_penalty")):
+                                sampling = {**(sampling or {}), "temperature": want[0], "presence_penalty": want[1]}
+                            prompt = recover_prompt
+                            with self.status_lock:
+                                st["reasoning_recoveries"] = recovery_count
+                            if trace is not None:
+                                trace["reasoning_recoveries"] = recovery_count
+                                trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
+                            print(f"[strata] repeated reasoning detected at {n} tokens "
+                                  f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
+                                  "instruction (reasoning_loop_recovery)", flush=True)
+                            continue
+                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                                and not answered and not wrap and not opens and parser.state == "reasoning"
+                                and (stops is None or stops.hit is None) and not cancel.is_set()):
+                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
+                            # an empty answer.  Close the thinking once and let it answer.
+                            close_retried = True
+                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            if max_new - n - len(extra) >= 1:
+                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
+                                for t in extra:
+                                    n += 1
+                                    raw_ids.append(t)
+                                    thinking_n += parser.state in ("reasoning", "rcall")
+                                    evs = cut(parser.feed(detok.push(t)))
+                                    self._note(n, evs, st, rate)
+                                    for ev in evs:
+                                        yield "event", ev
+                                prompt = prompt + seg + extra
+                                finish = "length"
+                                continue
+                        if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
                         # was generated plus the wrap-up, so the engine continues from the prefix it already holds.
-                        budget = None
-                        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+                        # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
+                        # thinking ended, after the blank line the template puts before a call.
+                        if wrap:
+                            budget = None
+                            text = REASONING_WRAP_UP + (force or "")
+                        else:
+                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                        force = None
+                        extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
-                        print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
-                              flush=True)
+                        if wrap:
+                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                                  flush=True)
                         for t in extra:
                             n += 1
                             raw_ids.append(t)
-                            thinking_n += parser.state == "reasoning"
-                            evs = parser.feed(detok.push(t))
+                            thinking_n += parser.state in ("reasoning", "rcall")
+                            evs = cut(parser.feed(detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
                                 yield "event", ev
+                        if stops is not None and stops.hit is not None:
+                            finish = "stop"
+                            break
                         prompt = prompt + seg + extra
                     if cancel.is_set():
                         finish = "cancel"
+                    elif looped:
+                        print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                              f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
+                              "strata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
                         print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
@@ -2410,10 +3397,7 @@ class Service:
                     # it is released the next request sets its own status, which this must not record or clear
                     with self.status_lock:
                         if st.get("busy"):
-                            # only this request's DONE counts: same object means no DONE arrived (death, error,
-                            # disconnect)
-                            last = dict(getattr(self.engine, "last", {}) or {}) \
-                                if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            last = request_stats(segments)          # only this request's own DONEs count
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -2431,6 +3415,8 @@ class Service:
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 # the request's whole prompt, and the tokens read of it (None: an older engine)
                                 "prompt_total": len(ids), "prompt_read": last.get("prompt_read"),
+                                "reasoning_recoveries": recovery_count,
+                                "reasoning_repeat_coverage": round(repeat_coverage, 3),
                                 "engine_generated": last.get("generated"),
                                 "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
@@ -2449,6 +3435,9 @@ class Service:
                             tot["decode_ms"] += last.get("decode_ms") or 0.0
                             tot["drafts_offered"] += last.get("drafts_offered") or 0
                             tot["drafts_accepted"] += last.get("drafts_accepted") or 0
+                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
+                            self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                                 timings = request_timings(seen, n, last)
@@ -2463,7 +3452,7 @@ class Service:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
-                            if finish == "length" and parser.state == "reasoning":   # #530
+                            if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "xestrata-<model>.json for every request) leaves room to answer", flush=True)
@@ -2483,10 +3472,20 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
-        for ev in parser.finish():
+        for ev in cut(parser.finish(finish)):
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
-                       "timings": timings, "reasoning_tokens": thinking_n}
+        if parser.rescued or parser.refused:
+            self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
+            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
+                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+        if stops is not None and stops.hit is None and stops.held:
+            yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
+        done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+                "timings": timings, "reasoning_tokens": thinking_n,
+                "reasoning_recoveries": recovery_count}
+        if stops is not None and stops.hit is not None:
+            done["stop_sequence"] = stops.hit
+        yield "done", done
 
 
 def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
@@ -2518,6 +3517,23 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
             # the speculative drafts, as llama.cpp names them (from PR #83, @mikicvi): only when the engine reported them
             **({"draft_n": int(last["drafts_offered"]), "draft_n_accepted": int(last["drafts_accepted"])}
                if last.get("drafts_offered") is not None else {})}
+
+
+def request_stats(segments: list[dict]) -> dict:
+    """Keep input/cache accounting at the original API boundary and total native work across continuations."""
+    if not segments:
+        return {}
+    result = dict(segments[-1])
+    for key in ("reused", "prompt_read"):
+        if key in segments[0]:
+            result[key] = segments[0][key]
+        else:
+            result.pop(key, None)
+    for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb"):
+        if any(segment.get(key) is not None for segment in segments):
+            result[key] = sum(segment.get(key) or 0 for segment in segments)
+    return result
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
@@ -2650,11 +3666,38 @@ def logprob_entry(tok, t, line: str):
     return e
 
 
-def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+# The engine's last PP line stops short of the prompt: up to `--short-read` tokens (generate.cpp's `short_read`, 64 by
+# default) are read through the verify windows instead of the batched path, so the batched path never reports the whole
+# prompt.  A PP that close to the end says the prompt is read.  It matters because a prompt shorter than one `--prefill`
+# chunk sends exactly one PP, that one: a client would see a bar that appears already full.  Such a line is dropped, and
+# the answer's first token ends the progress for the client anyway.
+PP_DONE_TAIL = 64
+
+
+def prompt_progress(svc: Service):
+    """The last PP line as llama.cpp's `prompt_progress`, so a client written for llama.cpp reads both servers: the
+    same four fields, `time_ms` elapsed since prompt reading started, and `processed` counting from token 0 so that a
+    client takes the reused prefix out with `cache` (llama.cpp's rule: the timed progress is
+    `(processed-cache)/(total-cache)`).  None when there is nothing to say: no PP yet, or the line that says the prompt
+    is read.  An engine too old to print RESUME gives `cache` 0, which only makes a reused prefix count as work."""
+    engine = svc.engine
+    if getattr(engine, "batch", 0):      # --batch: the engine's progress is one global line, not this request's
+        return None
+    progress = getattr(engine, "progress", None)
+    if not progress:
+        return None
+    read, total = progress
+    if total <= 0 or total - read <= PP_DONE_TAIL:
+        return None
+    return {"total": int(total), "cache": int(getattr(engine, "reused", 0) or 0), "processed": int(read),
+            "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
+
+
+def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """With `logprobs` asked (upstream's Intel port 4ba35fd), each chunk carries the log-probabilities of the tokens
     the engine wrote since the last one (the model's, before sampling, temperature and penalties; the stop token is
     not listed), under `content` or, while it thinks, `reasoning_content`."""
-    chunks = _openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run)
+    chunks = _openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run, force)
     lp = getattr(svc.engine, "lp_lines", None)
     if top_logprobs(req) is None or lp is None:
         yield from chunks
@@ -2679,11 +3722,14 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         chunks.close()                              # a client that went: the run stops now, as without logprobs
 
 
-def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None):
+def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
-    an empty delta and a `strata_mcp` field, which only the web app reads."""
+    an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
     model = svc.model_for(req)
+    # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
+    # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
+    want_progress = bool(req.get("return_progress"))
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -2693,9 +3739,12 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     finished = set()                               # ... and the ones whose final tool_call came (#211)
-    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
         if kind == "ping":
-            yield None
+            # a PP line: the prompt is being read and there is nothing to say yet.  It used to be only the SSE comment;
+            # now it carries the progress when the client asked, and stays the comment when there is nothing to report.
+            pp = prompt_progress(svc) if want_progress else None
+            yield None if pp is None else {**chunk({}), "prompt_progress": pp}
         elif kind == "mcp":
             c = chunk({})
             c["strata_mcp"] = x
@@ -2794,11 +3843,12 @@ def structured_chunks(chunks, validator):
     heartbeat = time.monotonic()
     try:
         for chunk in chunks:
-            if chunk is not None:
-                buffered.append(chunk)
-            if chunk is None or time.monotonic() - heartbeat >= 1:
+            progress = chunk is not None and "prompt_progress" in chunk
+            if chunk is not None and not progress:
+                buffered.append(chunk)      # a progress chunk carries no content: there is nothing in it to validate
+            if chunk is None or progress or time.monotonic() - heartbeat >= 1:
                 heartbeat = time.monotonic()
-                yield None
+                yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
@@ -2813,7 +3863,7 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
     yield "message_start", {"type": "message_start", "message": {
         "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
@@ -2824,7 +3874,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         return ("content_block_stop", {"type": "content_block_stop", "index": index})
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel):
+    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force):
         if kind == "ping":
             yield None
             continue
@@ -2868,12 +3918,17 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         else:
             if open_kind is not None:
                 yield close()
-            stop = "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+            assert isinstance(x, dict)                  # the run's last item: the DONE figures
+            stop = "stop_sequence" if x.get("stop_sequence") is not None else \
+                "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts, Anthropic's way: input_tokens leaves out what the conversation cache already held,
-            # which is cache_read_input_tokens (message_start could only say the whole prompt)
-            reused = min(x.get("reused") or 0, len(ids))
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None},
+            # which is cache_read_input_tokens (message_start could only say the whole prompt).  At least the last
+            # prompt token is always read, and Claude Code takes an input_tokens of 0 as "not given" and keeps
+            # message_start's whole prompt beside cache_read_input_tokens: the prompt counted twice (#1013)
+            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
+            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
+                                                                       "stop_sequence": x.get("stop_sequence")},
                                     "usage": {"input_tokens": len(ids) - reused, "cache_read_input_tokens": reused,
                                               "output_tokens": x["completion_tokens"]}}
             yield "message_stop", {"type": "message_stop"}
@@ -2905,21 +3960,126 @@ def anthropic_collect(events) -> dict:
                 blocks.pop()
         elif name == "message_delta":
             msg["stop_reason"] = e["delta"]["stop_reason"]
+            assert msg is not None
+            msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
     msg["content"] = blocks
     return msg
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
+CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (in memory)
+
+
+class BadBody(Exception):
+    """A request body that cannot be read (a malformed or oversized chunked body): the status and the sentence."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
+        body_read = False                                   # whether a handler took this request's body
+        DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
 
         def log_message(self, fmt, *args):
             pass
+
+        def handle_one_request(self):
+            super().handle_one_request()
+            self._drain_body()
+
+        def _chunked(self) -> bool:
+            """#893: a body sent as Transfer-Encoding: chunked (a relay or proxy that does not buffer it).  By RFC 9112
+            it wins over a Content-Length."""
+            te = self.headers.get("Transfer-Encoding", "") or ""
+            return te.split(",")[-1].strip().lower() == "chunked"
+
+        def _read_chunked(self, limit: int, keep: bool = True, deadline: float | None = None) -> bytes:
+            """Decode a chunked body: at most `limit` bytes (BadBody 413 beyond it - the size is checked before a chunk
+            is read, so a huge announced chunk is never allocated), BadBody 400 for a malformed one.  keep=False reads
+            and drops it (the drain); `deadline` (monotonic) ends the read early."""
+            parts: list[bytes] = []
+            total = 0
+            while True:
+                if deadline is not None:
+                    wait = deadline - time.monotonic()
+                    if wait <= 0:
+                        return b"".join(parts)
+                    self.connection.settimeout(wait)
+                line = self.rfile.readline(1025)
+                if not line.endswith(b"\n"):
+                    raise BadBody(400, "malformed chunked request body")
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise BadBody(400, "malformed chunk size in the request body") from None
+                if size < 0:
+                    raise BadBody(400, "malformed chunk size in the request body")
+                if size == 0:
+                    for _ in range(64):                       # the trailers, up to the blank line
+                        if self.rfile.readline(8193).strip() == b"":
+                            break
+                    return b"".join(parts)
+                total += size
+                if total > limit:
+                    self.close_connection = True
+                    raise BadBody(413, f"the request body is larger than {limit >> 20} MiB")
+                left = size
+                while left > 0:
+                    piece = self.rfile.read(min(left, 1 << 20))
+                    if not piece:
+                        raise BadBody(400, "the chunked request body ended early")
+                    left -= len(piece)
+                    if keep:
+                        parts.append(piece)
+                if self.rfile.read(2) != b"\r\n":
+                    raise BadBody(400, "malformed chunked request body")
+
+        def _body(self) -> bytes:
+            self.body_read = True
+            if self._chunked():
+                return self._read_chunked(CHUNKED_BODY_MAX)
+            return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+        def _drain_body(self):
+            """An answer sent before the body was read (a 401, a 403, /load, a method with no handler) must not close
+            the connection on unread bytes: the close then sends a reset, and a client that sends its body after the
+            headers (http.client, urllib, requests) gets a connection error instead of the answer.  So the body is
+            read and dropped here, once, after an answer, in pieces so that its size is never held in memory.  What
+            has not arrived DRAIN_SECONDS later is left unread: the limit is time, so that a conversation of many
+            megabytes, at any speed the client has, still gets its answer."""
+            headers = getattr(self, "headers", None)
+            if self.body_read or headers is None:
+                return
+            if self._chunked():
+                try:
+                    self._read_chunked(CHUNKED_BODY_MAX, keep=False, deadline=time.monotonic() + self.DRAIN_SECONDS)
+                except (BadBody, OSError):
+                    self.close_connection = True
+                return
+            try:
+                left = int(headers.get("Content-Length", 0))
+            except ValueError:
+                return
+            if left <= 0:
+                return
+            deadline = time.monotonic() + self.DRAIN_SECONDS
+            try:
+                while left > 0 and (wait := deadline - time.monotonic()) > 0:
+                    self.connection.settimeout(wait)         # a client that never sends what it announced
+                    piece = self.rfile.read1(min(left, 1 << 20))   # one socket read: read() would wait for it all
+                    if not piece:
+                        break
+                    left -= len(piece)
+            except OSError:
+                pass
 
         def parse_request(self):
             """Without an API key, every request (any method) first passes the Host check: DNS rebinding protection
@@ -2959,6 +4119,15 @@ def make_handler(svc: Service):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
+
+        def end_headers(self):
+            # HTTP/1.0 without keep-alive: the server closes the connection after every response.  Say so, or a
+            # client that pools connections (.NET's SocketsHttpHandler) can put its next request on this socket
+            # before the close reaches it, and that request fails with "response ended prematurely" without the
+            # server ever reading it (a .NET agent app, 2026-10-03: 25 of ~1000 requests, 1-24 ms after the previous
+            # answer).
+            self.send_header("Connection", "close")
+            super().end_headers()
 
         def _watch_client(self, cancel: threading.Event) -> None:
             """#430 #431: cancel the request as soon as its client hangs up.  A non-streamed request writes nothing
@@ -3041,7 +4210,7 @@ def make_handler(svc: Service):
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if hmac.compare_digest(given.encode(), svc.api_key.encode()):   # #213: constant-time
+            if key_matches(given, svc.api_key):
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -3083,6 +4252,16 @@ def make_handler(svc: Service):
                 self.wfile.write(body)
                 return
             if path == "/metrics":
+                from serve import prometheus
+                if prometheus.wants_prometheus(self.headers.get("Accept", ""), urlsplit(self.path).query):
+                    if self._authorized():   # a scraper: the text format, vLLM's names (serve/prometheus.py)
+                        body = prometheus.render(svc.metrics(), svc.latencies.snapshot()).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", prometheus.CONTENT_TYPE)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    return
                 if self._authorized():
                     # the last 12 requests; `?requests=all` every one kept (the Monitor's "Show all", issue #35)
                     self._json(200, svc.metrics(all_requests="requests=all" in self.path))
@@ -3122,7 +4301,7 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
-                self._json(200, {"status": "ok", "max_context": svc.engine.max_context, "model": svc.model,
+                self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/status":
@@ -3143,7 +4322,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.engine.max_context},
+                             "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
@@ -3161,8 +4340,20 @@ def make_handler(svc: Service):
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
                     with svc.status_lock:
                         busy = bool(svc.status.get("busy"))
-                    slot = {"id": 0, "n_ctx": svc.engine.max_context, "is_processing": busy}
-                    self._json(200, [slot] if loaded else [])
+                        # llama.cpp's name for what the slot's context holds: the running request's prompt size,
+                        # kept after it ends (the conversation cache carries it on).  A front-end's context meter
+                        # divides it by n_ctx; without the key it reads 0 % against Strata forever (#562).
+                        in_use = int(svc.status.get("prompt_tokens") or 0)
+                    if getattr(svc.engine, "batch", 0) and hasattr(svc.engine, "slots_view"):
+                        # --batch: one entry per slot (the same view /metrics has), not one for the whole engine
+                        n_ctx = svc.reported_ctx()
+                        slots = [{"id": s["slot"], "n_ctx": n_ctx, "is_processing": s["state"] != "idle",
+                                  "n_prompt_tokens": int(s.get("prompt_tokens") or s.get("held_tokens") or 0)}
+                                 for s in svc.engine.slots_view()]
+                    else:
+                        slots = [{"id": 0, "n_ctx": svc.reported_ctx(), "is_processing": busy,
+                                  "n_prompt_tokens": in_use}]
+                    self._json(200, slots if loaded else [])
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
@@ -3170,6 +4361,12 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
+            try:
+                self._post()
+            except BadBody as e:                              # #893: a malformed or oversized chunked body
+                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+
+        def _post(self):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
@@ -3197,6 +4394,9 @@ def make_handler(svc: Service):
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
             if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
                 return
+            # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
+            if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
                     r = svc.unload()
@@ -3213,7 +4413,7 @@ def make_handler(svc: Service):
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                 return
             try:
-                req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
@@ -3259,6 +4459,15 @@ def make_handler(svc: Service):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
+                elif path.startswith("/slots/"):
+                    query = parse_qs(self.path.partition("?")[2])
+                    try:
+                        code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
+                                                     req.get("filename"))
+                    except EngineDied as e:                  # EngineSilent included: the engine was ended
+                        code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
+                                                     "the engine again", "type": "server_error"}}
+                    self._json(code, body)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/messages":
@@ -3268,6 +4477,7 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
+                print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
                 else:
@@ -3288,6 +4498,7 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
             finally:
+                svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
                 record = self.record
@@ -3312,8 +4523,10 @@ def make_handler(svc: Service):
                       if k in ("temperature", "top_p", "top_k", "min_p", "seed", "repetition_penalty",
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = svc.shared.get("max_tokens", -1)
-            props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": 1, "model_alias": svc.model, "chat_template": svc.template.source,
+            props = {"default_generation_settings": {"n_ctx": svc.reported_ctx(), "params": params},
+                     "total_slots": max(1, int(getattr(svc.engine, "batch", 0) or 0)),   # #1004: the batch slots
+                     "model_alias": svc.model, "chat_template": svc.template.source,
+                     "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None},
                      "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
@@ -3326,6 +4539,18 @@ def make_handler(svc: Service):
 
         def _control_body(self) -> bool:
             """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+            if self._chunked():
+                self.body_read = True
+                try:
+                    self.connection.settimeout(2.0)
+                    self._read_chunked(65536, keep=False)
+                except BadBody as e:
+                    self._json(e.status, {"error": {"message": f"control request: {e}"}})
+                    return False
+                except OSError:
+                    self._json(400, {"error": {"message": "incomplete control request body"}})
+                    return False
+                return True
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -3342,6 +4567,7 @@ def make_handler(svc: Service):
                 complete = False
             finally:
                 self.connection.settimeout(timeout)
+                self.body_read = True                    # nothing left for the drain to wait for (#594)
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
             return complete
@@ -3352,12 +4578,7 @@ def make_handler(svc: Service):
             if not self.headers.get("Content-Type", "").startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
-            # The Origin must be this server's own address (host and port), or an origin the config trusts
-            # (trusted_origins: the web app behind a reverse proxy or tunnel).  Headers a proxy adds (X-Forwarded-*,
-            # CF-Ray, CF-Connecting-IP) prove nothing about the page that sent the request, so they open nothing.
-            origin = (self.headers.get("Origin") or "").rstrip("/")
-            if origin and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
-                    origin not in svc.trusted_origins:
+            if self._foreign_origin():
                 self._json(403, {"error": {"message": f"{what} only from Strata's own page (or an origin in the "
                                                       f"config's trusted_origins)"}})
                 return False
@@ -3377,7 +4598,7 @@ def make_handler(svc: Service):
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from XeStrata's own page only, as
             /settings (the key is checked before); every other key of the file stays as it is."""
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self._body()
             if not self._own_page("the run config can be changed"):
                 return
             if not svc.config_path:
@@ -3401,14 +4622,40 @@ def make_handler(svc: Service):
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
 
+        def _foreign_origin(self) -> bool:
+            """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
+            or an origin the config trusts (trusted_origins: the web app behind a reverse proxy or tunnel); no Origin
+            is a client that is no browser.  Headers a proxy adds (X-Forwarded-*, CF-Ray, CF-Connecting-IP) prove
+            nothing about the page that sent the request, so they open nothing."""
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            return bool(origin) and origin.split("://", 1)[-1] != self.headers.get("Host", "") and \
+                origin not in svc.trusted_origins
+
+        def _no_local_images(self, messages):
+            """A web page of another origin must not have a file on this computer read as an image.  Without an
+            api_key, _foreign_page refuses such a page unless cors_origins lets it in - and a page cors_origins lets
+            in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
+            and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
+            client that is no browser.  ValueError (a 400)."""
+            if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
+                                              for src in images_of(messages)):
+                raise ValueError("a web page of another origin cannot have a file on this computer read as an "
+                                 "image: send it as a data: URL (or add the page's origin to the config's "
+                                 "trusted_origins)")
+
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
-            body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = self._body()
             if not self._own_page("settings can be changed"):
                 return
             try:
                 req = json.loads(body or b"{}")
-                shared = svc.set_shared(req.get("defaults") if isinstance(req, dict) else None)
+                if not isinstance(req, dict) or "defaults" not in req:
+                    self._json(400, {"error": {"type": "invalid_request_error",
+                                               "message": 'the body must be {"defaults": {...}} to set them, '
+                                                          'or {"defaults": null} to clear them'}})
+                    return
+                shared = svc.set_shared(req["defaults"])
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
@@ -3467,6 +4714,10 @@ def make_handler(svc: Service):
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
             messages, tools, kw = openai_to_messages(req)
+            self._no_local_images(messages)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
+                tools = None
+            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -3481,14 +4732,17 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
+            if force and use_mcp:
+                raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
+            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -3521,9 +4775,29 @@ def make_handler(svc: Service):
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
+        def _responses_ready(self, req, events):
+            """Send a finished Responses result that did not run on the engine."""
+            if not req.get("stream"):
+                return self._json(200, responses_api.collect(events))
+            self._sse()
+            try:
+                for e in events:
+                    self.wfile.write(f"event: {e['type']}\n".encode() + b"data: " +
+                                     json.dumps(e, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+
         def _responses(self, req):
             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
+            try:
+                title = (responses_api.thread_title_events(req, svc.model_for(req))
+                         if svc.codex_thread_titles else None)
+            except ResponsesError as e:
+                return self._json(e.status, e.body())
+            if title is not None:
+                return self._responses_ready(req, title)
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
             except ResponsesError as e:
@@ -3610,12 +4884,13 @@ def make_handler(svc: Service):
             tools, names, skipped = responses_api.request_tools(req)
             kw = responses_api.template_kwargs(req, svc.shared)
             try:
-                messages, validator = prepare_format(responses_api.text_format(req), messages)
+                self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
+            except ValueError as e:
+                raise ResponsesError(str(e), "input") from None
+            try:
+                messages, validator = prepare_format(responses_api.text_format(req), messages, with_tools=bool(tools))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
-            if validator is not None and tools:
-                raise ResponsesError("a JSON text.format with tools is not supported", "text.format",
-                                     "unsupported_parameter")
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
                 print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
@@ -3627,14 +4902,31 @@ def make_handler(svc: Service):
                 svc.reasoning_budget(req)                    # a bad value is a 400 before anything is sent
             except ValueError as e:
                 raise ResponsesError(str(e), "reasoning_budget_tokens") from None
-            svc.load()
             try:
-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
+                stop_strings(req)
+            except ValueError as e:
+                raise ResponsesError(str(e), "stop") from None
+            svc.load()
+            # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
+            # starts as the cached one did; the parser and the response keep the request's own tools
+            shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
+            try:
+                try:
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                         req=req)
+                except ValueError:
+                    if shown is tools:
+                        raise
+                    shown = tools                            # too long with the kept tools: the request as sent
+                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                         req=req)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
+            if svc.codex_compaction_cache:
+                responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
@@ -3647,19 +4939,25 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            stop_strings(req)                                 # the same 400 as the request itself would get
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            self._no_local_images(messages)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
+                tools = None
+            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -3713,6 +5011,30 @@ def warn_tight_ram(arena_mib) -> None:
               + "Linux may stop the engine in the middle of an answer. "
               + f"Close other programs, or run {SETUP_CMD} --setup and pick a smaller size (Q2_0 / IQ2_XS).",
               flush=True)
+
+
+def warn_budget_over_ram(args) -> str | None:
+    """#1080: an explicit `--resident-budget-gib N` bigger than the RAM this PC has free (or than its total beside
+    ~6 GB for everything else) pushes experts into swap or the file tier: decode that is "dead slow" until the number is
+    removed.  A warning at start, never a refusal (recommend, never force).  -> the sentence printed, or None."""
+    try:
+        budget = float(args[list(args).index("--resident-budget-gib") + 1])
+    except (ValueError, IndexError):
+        return None
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        total, free = vm.total / 2**30, vm.available / 2**30
+    except Exception:  # noqa: BLE001 - psutil is optional here
+        return None
+    if budget <= free and budget <= total - 6:
+        return None
+    msg = (f"WARNING: the RAM budget for experts is {budget:g} GiB (--resident-budget-gib), but this PC has "
+           f"{free:.0f} GiB free of {total:.0f} GiB: what does not fit goes to swap or is read from disk, which can "
+           "make decoding very slow. Lower it (setup sizes it for this PC) or remove the argument to let the engine "
+           "choose.")
+    print("[strata] " + msg, flush=True)
+    return msg
 
 
 def lan_addresses() -> list[str]:
@@ -3820,6 +5142,30 @@ def host_allowed(host, names, any_host=False) -> bool:
                            or _name_in(name, names))
 
 
+def api_key_of(value) -> str:
+    """The key as a client can send it (#725).  An HTTP header loses the spaces and line ends around its value, so a
+    key kept with them (a config file or an environment file with CRLF line ends, a quoted " key ") matched no
+    request: every client got 401 with the right key.  A value that is only such characters raises ValueError, it
+    never means "no key" (#213)."""
+    key = "" if value is None else str(value)
+    if key and not key.strip():
+        raise ValueError("an API key was given but it is empty")
+    return key.strip()
+
+
+def key_matches(given: str, key: str) -> bool:
+    """given: a header's value as http.server read it, each byte one character.  A key with characters outside ASCII
+    arrives as UTF-8 from most clients and as Latin-1 from some; the right key passes in both forms (#725: the
+    bytes were re-encoded before, so a UTF-8 key never matched).  Constant-time (#213)."""
+    raw = given.encode("latin-1", "replace")
+    ok = hmac.compare_digest(raw, key.encode())
+    try:
+        ok |= hmac.compare_digest(raw, key.encode("latin-1"))
+    except UnicodeEncodeError:
+        pass
+    return ok
+
+
 def origin_allowed(origin: str, host, names, origins=()) -> bool:
     """A browser page's Origin that may use the model without an API key: this server's own page (the Origin is the
     request's own Host), a page on one of the names this server answers to (any port), or an origin the config lists
@@ -3870,7 +5216,8 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
     return out
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
+               "experimental_speed_projection")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -3900,6 +5247,10 @@ def clean_shared_defaults(d) -> dict:
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
+            value = int(value)
+        elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
+            if not number or value != int(value) or value < 0:
+                raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
             value = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
@@ -3996,7 +5347,8 @@ def main() -> int:
     ap.add_argument("--mcp-config", help="a JSON file with MCP servers in Claude Desktop's format ({\"mcpServers\": "
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
-    ap.add_argument("--lazy", action="store_true", help="start the text-only API unloaded; load on first request")
+    ap.add_argument("--lazy", action="store_true",
+                    help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
@@ -4009,6 +5361,9 @@ def main() -> int:
                          "\"min_free_vram_mib\" in the config; default: always load)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
+    ap.add_argument("--slot-save-path", default=None, metavar="DIR",
+                    help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
+                         "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
     if a.gpu is not None:
@@ -4016,9 +5371,8 @@ def main() -> int:
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         ThreadingHTTPServer((a.host, a.port), BaseHTTPRequestHandler).server_close()
-    except OSError:
-        ap.error(f"port {a.port} is already in use - is Strata (or another server) already running? "
-                 f"Close it, or start this one with a different --port")
+    except OSError as e:
+        ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
@@ -4046,10 +5400,9 @@ def main() -> int:
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         vision_error = vision_fallback = None
         lazy = a.lazy or cfg.get("lazy_load") is True
-        if lazy and cfg.get("vision"):
-            ap.error("lazy loading is text-only; disable vision in the config")
         if cfg.get("vision"):
-            print("loading the vision encoder ...", flush=True)
+            print("loading the vision encoder ..." if not lazy else
+                  "vision encoder unloaded; it starts with the model ...", flush=True)
             # relative paths are the config's cwd's, as for the engine below
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
@@ -4060,7 +5413,7 @@ def main() -> int:
                     print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
                 try:
                     vision = Vision(vc, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                                    env=env)
+                                    env=env, lazy=lazy)
                     break
                 except (OSError, RuntimeError) as e:    # the next one; with none left the model still serves text
                     failed.append(f"{vision_label(vc)}: {e}")
@@ -4073,6 +5426,7 @@ def main() -> int:
                 print(f"[strata] images: {vision.label} serves them ({vision_fallback})", flush=True)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
+        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
         if len(gpu_list(cfg)) > 1:
             print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         # a relative "exe" is the config's cwd's, made absolute here
@@ -4108,6 +5462,9 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
+    svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
@@ -4121,7 +5478,14 @@ def main() -> int:
         print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
               file=sys.stderr)
         return 2
-    svc.api_key = a.api_key or cfg.get("api_key", "")
+    try:
+        svc.api_key = api_key_of(a.api_key or cfg.get("api_key", ""))
+    except ValueError as e:
+        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
+        return 2
+    if not svc.api_key and "api_key" in cfg:     # #569: written, but empty: the server has none (a warning, not a stop)
+        print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
+              "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
@@ -4146,10 +5510,24 @@ def main() -> int:
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
+    # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
+    # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
+    if a.slot_save_path or cfg.get("slot_save_path"):
+        try:
+            svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
+                slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] {e}")
+        print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
+              "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
+    recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
+    if not isinstance(recovery, bool):
+        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+    svc.tool_call_recovery = recovery
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
@@ -4164,6 +5542,13 @@ def main() -> int:
         if budget:
             print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
+    recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
+    if recovery is True:
+        recovery = "recover"
+    if recovery is not False and recovery not in ("stop", "recover"):
+        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+                         f"not {recovery!r}")
+    svc.reasoning_loop_recovery = recovery
     svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
@@ -4222,7 +5607,7 @@ def main() -> int:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
+        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:

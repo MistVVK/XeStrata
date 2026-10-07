@@ -125,10 +125,34 @@ class CompatibilityTests(unittest.TestCase):
     def test_q2_ple_and_large_tensors_stay_native(self):
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q2_0"))
         self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q8_0"))
-        self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ3_XXS"))
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ3_XXS"))
+        self.assertFalse(iq_pack.needs_bf16("blk.1.ple_key.weight", "IQ4_XS"))
+        self.assertTrue(iq_pack.needs_bf16("blk.1.ple_key.weight", "Q6_K"))
         for name in ["blk.0.ffn_gate_exps.weight", "token_embd.weight", "output.weight",
                      "per_layer_token_embd.weight", "blk.0.attn_qkv.weight"]:
             self.assertFalse(iq_pack.needs_bf16(name, "IQ3_XXS"))
+
+    def test_iq_ple_keys_are_indexed_without_conversion(self):
+        for kind, block_bytes in [(Q.IQ3_XXS, 98), (Q.IQ4_XS, 136)]:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+                root = Path(tmp)
+                source = root / "model.gguf"
+                writer = GGUFWriter(source, "qwen4exp")
+                writer.add_tensor("blk.1.ple_key.weight", np.zeros((2, block_bytes), dtype=np.uint8),
+                                  raw_dtype=kind)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                before = source.read_bytes()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(iq_pack.index_standalone(source, root, iq_pack.Model(source)), 0)
+                _, rows = iq_pack.read_index(root / "index.txt")
+                row = rows["blk.1.ple_key.weight"]
+                self.assertEqual(row[2], "0")
+                self.assertEqual((root / "dense.bin").read_bytes(), b"")
+                self.assertEqual(json.loads((root / "conversions.json").read_text())["tensors"], [])
+                self.assertEqual(source.read_bytes(), before)
 
     def test_experts_bin_is_kept_only_with_this_ggufs_blobs(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

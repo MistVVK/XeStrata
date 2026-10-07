@@ -11,8 +11,13 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   per extra window row (more experts per window), so it wants a higher floor.
   --pool-workers  the CPU threads that compute experts.  Every physical core is not always best: on hybrid CPUs the
                   efficiency cores can make the whole window wait for them.
-The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
-per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
+  --adapt-every / --adapt-swaps / --adapt-decay
+                  how the VRAM expert tier follows the conversation: how often, how many experts it swaps in, how fast
+                  its use counts fade.  A PC whose CPU reads the missed experts slowly (DDR3, ~24 GB/s) gains from
+                  swapping more: 160 swaps every window measured +7.9% over the default tier on a Xeon E5-2673 v3
+                  (DDR3) with an RTX 4060 Ti on PCIe 3.0 x8 (Q2_0; with the swaps taking effect a window later, #764).
+The first two are measured through one engine (per-request `strata_tune` keys); the worker count and the adaptive
+tier need a restart per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
@@ -35,7 +40,14 @@ sys.path.insert(0, str(ROOT))
 MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+# the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
+# longer, the rest of the set as the engine has it
+ADAPT_CANDIDATES = (None, ("1", "80", "0.97"), ("1", "160", "0.97"))
+ADAPT_FLAGS = ("--adapt-every", "--adapt-swaps", "--adapt-decay")
 MAX_NEW = 128
+# the expert tier follows a text over some windows: 128-token answers end before it shows (on a Xeon E5-2673 v3 with
+# DDR3, every 1 / 160 / 0.97 measured +0.7% with 128 tokens and +7.9% with 512-token answers), so its step uses these
+TIER_MAX_NEW = 512
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
     "Explain in two paragraphs how a refrigerator moves heat from inside to outside.",
@@ -63,11 +75,13 @@ def with_arg(args: list[str], flag: str, value: str | None) -> list[str]:
     return out
 
 
-def worker_candidates(default: int) -> list[int]:
-    """The engine's own count, and fewer: two thirds and a half (at least 2), without repeats."""
+def worker_candidates(default: int, extra=()) -> list[int]:
+    """The engine's own count, and fewer: two thirds, a half and a quarter (at least 2), plus `extra` (the P-cores
+    minus one on a hybrid CPU, one socket's cores minus one on a 2-socket PC), without repeats.  Bench #780 #815
+    #707 #674: 4 beat 15 by 28.7% on 8P + 16E; 17-18 beat 35 by ~20% on 2-socket Xeons."""
     c = [default]
-    for w in (round(default * 2 / 3), round(default / 2)):
-        if w >= 2 and w not in c:
+    for w in (round(default * 2 / 3), round(default / 2), round(default / 4), *extra):
+        if 2 <= w < default and w not in c:
             c.append(w)
     return c
 
@@ -88,13 +102,14 @@ class Session:
         self.engine = engine
         self.ids_list = ids_list
 
-    def rate(self, tune: dict | None = None) -> float:
+    def rate(self, tune: dict | None = None, max_new: int | None = None) -> float:
         rates = []
         for ids in self.ids_list:
             sampling = {"temperature": 0}
             if tune:
                 sampling["strata_tune"] = tune
-            n = sum(1 for t in self.engine.generate(ids, MAX_NEW, sampling, threading.Event()) if t is not None)
+            n = sum(1 for t in self.engine.generate(ids, max_new or MAX_NEW, sampling, threading.Event())
+                    if t is not None)
             ms = (self.engine.last or {}).get("decode_ms") or 0.0
             if n > 8 and ms > 0:
                 rates.append(n / (ms / 1000.0))
@@ -122,13 +137,33 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    args = list(cfg["args"])
-    if isinstance(cfg.get("gpu"), list) and "--layer-split" not in args:   # several cards: measured as it runs
-        args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
-    return measure(args, ids_list, start_engine, say)
+    return measure(engine_args(cfg), ids_list, start_engine, say)
 
 
-def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
+def engine_args(cfg: dict) -> list[str]:
+    """The arguments the server starts this config's engine with (serve.server.engine_args), so the tuning measures
+    the engine as it runs.  #447: this used to read any "gpu" list as a layer split and add --layer-split auto, which
+    broke a one-card config with a helper card for the expert tier ("gpu": [0] + --expert-cache-device1: the engine
+    refuses a split that leaves no card without a stage), missed the "0,2" spelling, and ignored split_skip_if_fits."""
+    from serve.server import engine_args as server_args
+    return server_args(cfg)
+
+
+def engine_error(log: str | None, since: int = 0) -> str | None:
+    """#447: the engine's own reason for a failed start - the last line of its log written after byte `since` that is
+    its own ("strata ..." or "ERR ..."), else the last line there; None without a log or a new line."""
+    if not log:
+        return None
+    try:
+        with open(log, "rb") as f:
+            f.seek(since)
+            lines = [x.strip() for x in f.read()[-16384:].decode("utf-8", "replace").splitlines() if x.strip()]
+    except OSError:
+        return None
+    return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
+
+
+def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
     t0 = time.time()
     report: dict = {}
     say("  Loading the model for the measurements ...")
@@ -173,10 +208,10 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings
-    if d_workers and len(worker_candidates(d_workers)) > 1:
+    if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
         tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
         by_workers = {}
-        for w in worker_candidates(d_workers):
+        for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
             e = start_engine(with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)))
             try:
@@ -193,6 +228,32 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             base_rate = statistics.median(by_workers[w_best])
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
+    # 5. the adaptive expert tier (a restart each), with everything chosen so far
+    tuned = apply(base_args, settings)
+    by_adapt = {}
+    for adapt in ADAPT_CANDIDATES:
+        key = "default" if adapt is None else "/".join(adapt)
+        args = tuned
+        for flag, v in zip(ADAPT_FLAGS, adapt or (None,) * len(ADAPT_FLAGS)):
+            args = with_arg(args, flag, v)
+        which = "(the engine default)" if adapt is None else f"every {adapt[0]}, {adapt[1]} swaps, decay {adapt[2]}"
+        say(f"  Measuring the expert tier {which} (restarts the engine) ...")
+        e = start_engine(args)
+        try:
+            sa = Session(e, ids_list)
+            sa.warm_up(1)
+            by_adapt[key] = [sa.rate(max_new=TIER_MAX_NEW), sa.rate(max_new=TIER_MAX_NEW)]
+            say(f"    {statistics.median(by_adapt[key]):.1f} tok/s")
+        finally:
+            close(e)
+    a_best = pick(by_adapt, "default")
+    report["adapt"] = by_adapt
+    if a_best != "default":
+        for flag, v in zip(ADAPT_FLAGS, a_best.split("/")):
+            settings[flag] = v
+        base_rate = statistics.median(by_adapt[a_best])
+    elif by_adapt.get("default"):
+        base_rate = statistics.median(by_adapt["default"])
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     return {"settings": settings, "report": report}
@@ -211,7 +272,8 @@ def close(eng):
         proc.kill()
 
 
-DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None}   # None: the engine's own choice
+DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None,   # None: the engine's own choice
+            "--adapt-every": None, "--adapt-swaps": None, "--adapt-decay": None}
 
 
 def apply(args: list[str], settings: dict) -> list[str]:

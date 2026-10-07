@@ -38,6 +38,12 @@ REVISION = os.environ.get("STRATA_MTP_REVISION") or PINNED_REVISION
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
+# STRATA_SOURCE=modelscope (setup's --source): the same checkpoint from ModelScope.  It serves the repository's current
+# files, not a pinned revision, so REPO and PINNED are one URL here: every tensor is still checked against the pinned
+# revision's SHA256 below, so a tensor that differs from it is caught, not used.
+if (os.environ.get("STRATA_SOURCE") or "").strip().lower() in ("ms", "modelscope"):
+    MS_ENDPOINT = (os.environ.get("MODELSCOPE_ENDPOINT") or "").strip().rstrip("/") or "https://www.modelscope.cn"
+    REPO = PINNED = MS_ENDPOINT + "/models/Qwen/Qwen3.8-Flash-Next/resolve/master/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
 

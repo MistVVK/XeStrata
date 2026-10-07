@@ -433,7 +433,8 @@ class Strata:
 
     # ---- what is installed
     def configs(self) -> list[Path]:
-        return sorted(self.root.glob(CONFIG + "*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return sorted((p for p in self.root.glob(CONFIG + "*.json") if not p.name.endswith(".shared-settings.json")),
+                      key=lambda p: p.stat().st_mtime, reverse=True)   # #346: the Chat settings file is no config
 
     @staticmethod
     def read_config(path: Path) -> dict:

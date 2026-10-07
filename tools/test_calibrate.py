@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -24,8 +25,9 @@ import calibrate as CAL  # noqa: E402
 class FakeEngine:
     """Speed = f(pcie_frac, spec_min_p, workers): the GEN line's tune keys arrive as `strata_tune`."""
 
-    def __init__(self, args, speed, info_workers=6, starts=None):
+    def __init__(self, args, speed, info_workers=6, starts=None, adapt=None):
         self.args = list(args)
+        self.adapt_bonus = (adapt or {}).get(CAL.arg_value(args, "--adapt-swaps"), 1.0)
         w = CAL.arg_value(args, "--pool-workers")
         self.workers = int(w) if w else info_workers
         self.info = {"pool_workers": info_workers, "pcie_frac": 0.55, "spec_min_p": float(CAL.arg_value(args, "--spec-min-p") or 0)}
@@ -38,6 +40,7 @@ class FakeEngine:
     def generate(self, ids, max_new, sampling, cancel):
         tune = sampling.get("strata_tune") or {}
         rate = self.speed(tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]), self.workers)
+        rate *= self.adapt_bonus
         for _ in range(max_new):
             yield 1
         self.last = {"generated": max_new, "decode_ms": max_new / rate * 1000.0}
@@ -47,9 +50,10 @@ BASE = ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "8
 
 
 class Calibrate(unittest.TestCase):
-    def run_with(self, speed, workers=6, base=BASE):
+    def run_with(self, speed, workers=6, base=BASE, adapt=None):
         starts = []
-        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, speed, workers, starts), say=lambda *_: None)
+        res = CAL.measure(base, [[1, 2, 3]] * 3, lambda a: FakeEngine(a, speed, workers, starts, adapt),
+                          say=lambda *_: None)
         return res, starts
 
     def test_defaults_kept_when_flat(self):
@@ -73,8 +77,23 @@ class Calibrate(unittest.TestCase):
         # a hybrid CPU: half the workers is 20% faster
         res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6)
         self.assertEqual(res["settings"].get("--pool-workers"), "3")
-        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)))   # one start per worker count, plus the sweep
+        # one start per worker count and per expert-tier candidate, plus the sweep
+        self.assertEqual(len(starts), 1 + len(CAL.worker_candidates(6)) + len(CAL.ADAPT_CANDIDATES))
         self.assertEqual(CAL.arg_value(starts[0], "--spec-min-p"), "0.5")   # measured against the product default
+
+    def test_adaptive_tier(self):
+        # a slow-RAM PC: swapping 160 experts per round is 10% faster, 80 is 2% (noise)
+        res, starts = self.run_with(lambda f, p, w: 50.0, adapt={"160": 1.10, "80": 1.02})
+        self.assertEqual([res["settings"].get(f) for f in CAL.ADAPT_FLAGS], ["1", "160", "0.97"])
+        flat, _ = self.run_with(lambda f, p, w: 50.0, adapt={"160": 1.02})
+        self.assertFalse(any(f in flat["settings"] for f in CAL.ADAPT_FLAGS))
+        # the candidates are measured with the worker count chosen before
+        res, starts = self.run_with(lambda f, p, w: 60.0 if w == 3 else 50.0, workers=6, adapt={"160": 1.10})
+        self.assertEqual(res["settings"].get("--pool-workers"), "3")
+        self.assertTrue(all(CAL.arg_value(a, "--pool-workers") == "3" for a in starts[-len(CAL.ADAPT_CANDIDATES):]))
+        a = CAL.apply(BASE, res["settings"])
+        self.assertEqual(CAL.arg_value(a, "--adapt-swaps"), "160")
+        self.assertIsNone(CAL.arg_value(CAL.apply(a, {}), "--adapt-swaps"))   # an old calibration's tier goes
 
     def test_old_calibration_is_the_baseline_reset(self):
         # a config tuned earlier: the measurement starts from the product defaults, not from those values
@@ -94,9 +113,57 @@ class Calibrate(unittest.TestCase):
         self.assertIsNone(CAL.arg_value(b, "--pool-workers"))
         self.assertEqual(b.count("--spec-min-p"), 1)
 
+    def test_engine_args_are_the_servers(self):
+        # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts
+        helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
+        self.assertEqual(CAL.engine_args(helper), helper["args"])                 # one stage + a helper card: no split
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": 1}), BASE)
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": [0, 2]}), BASE + ["--layer-split", "auto"])
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": "0,2", "layer_split": "18"}),
+                         BASE + ["--layer-split", "18"])
+        own = BASE + ["--layer-split", ""]                                       # the config's own value wins
+        self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1]}), own)
+
+    def test_run_measures_with_the_servers_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            tok = Path(d)
+            (tok / "vocab.json").write_text(json.dumps({"a": 0, "b": 1}))
+            (tok / "merges.txt").write_text("")
+            (tok / "token_type.json").write_text(json.dumps([1, 1]))
+            seen = []
+            saved = CAL.measure
+            CAL.measure = lambda args, ids_list, start_engine, say=print, extra=(): seen.append(args) or {}
+            fake = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
+            try:
+                with mock.patch.dict(sys.modules, {"strata_tokenizer": fake}):
+                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0]}, start_engine=lambda a: None)
+            finally:
+                CAL.measure = saved
+        self.assertEqual(seen, [BASE])
+
+    def test_engine_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "strata-x.log"
+            log.write_text("strata generate: an old error\n", encoding="utf-8")
+            since = log.stat().st_size
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("loading ...\nstrata generate: --expert-cache-remote with a layer split needs a GPU that runs "
+                        "no stage (2 visible, 2 used by the split)\n\n")
+            self.assertEqual(CAL.engine_error(str(log), since), "strata generate: --expert-cache-remote with a layer "
+                             "split needs a GPU that runs no stage (2 visible, 2 used by the split)")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write("Segmentation fault\n")
+            self.assertIn("--expert-cache-remote", CAL.engine_error(str(log), since))   # the engine's own line first
+            self.assertEqual(CAL.engine_error(str(log), log.stat().st_size), None)   # nothing new since
+            self.assertIsNone(CAL.engine_error(None))
+            self.assertIsNone(CAL.engine_error(str(Path(d) / "missing.log")))
+
     def test_worker_candidates(self):
-        self.assertEqual(CAL.worker_candidates(6), [6, 4, 3])
-        self.assertEqual(CAL.worker_candidates(23), [23, 15, 12])
+        self.assertEqual(CAL.worker_candidates(6), [6, 4, 3, 2])
+        self.assertEqual(CAL.worker_candidates(23), [23, 15, 12, 6])        # a quarter: 4 beat 15 on 8P + 16E
+        self.assertEqual(CAL.worker_candidates(23, (7,)), [23, 15, 12, 6, 7])   # P-cores - 1
+        self.assertEqual(CAL.worker_candidates(35, (17,)), [35, 23, 18, 9, 17])  # 2 sockets: one socket's cores - 1
+        self.assertEqual(CAL.worker_candidates(6, (6, 1, 9)), [6, 4, 3, 2])      # none above the default, none below 2
         self.assertEqual(CAL.worker_candidates(3), [3, 2])
         self.assertEqual(CAL.worker_candidates(1), [1])
 

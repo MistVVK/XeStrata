@@ -54,7 +54,36 @@ def jsonschema_modules():
         return _jsonschema or None
 
 
-def prepare_format(response_format, messages):
+def _only_objects(node, root, refs=()):
+    """True when every value `node` accepts is a JSON object, so "return one JSON object" stays true.
+
+    `type: object`, an anyOf/oneOf whose branches all qualify (e.g. a root union of object shapes, which llama.cpp's
+    grammar path accepts and apps send), an allOf with a qualifying member, or a local `$ref` to one of these.
+    Anything that can also be an array, string, number, boolean or null (including `type: ["object", "null"]`) is
+    not, and a `$ref` cycle never qualifies.
+    """
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "object":
+        return True
+    ref = node.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#") and ref not in refs:
+        target = root
+        for part in ref[1:].split("/")[1:]:
+            part = part.replace("~1", "/").replace("~0", "~")
+            if not isinstance(target, dict) or part not in target:
+                return False
+            target = target[part]
+        return _only_objects(target, root, refs + (ref,))
+    for key in ("anyOf", "oneOf"):
+        branches = node.get(key)
+        if isinstance(branches, list) and branches and all(_only_objects(b, root, refs) for b in branches):
+            return True
+    branches = node.get("allOf")
+    return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
+
+
+def prepare_format(response_format, messages, with_tools=False):
     if response_format is None:
         return messages, None
     if not isinstance(response_format, dict):
@@ -74,8 +103,9 @@ def prepare_format(response_format, messages):
         if "strict" in spec and not isinstance(spec["strict"], bool):
             raise ValueError("response_format.json_schema.strict must be boolean")
         schema = spec["schema"]
-        if schema.get("type") != "object":
-            raise ValueError("response_format schema must have type object at its root")
+        if not _only_objects(schema, schema):
+            raise ValueError("response_format schema must accept only JSON objects at its root "
+                             "(type object, or anyOf/oneOf of object schemas)")
         modules = jsonschema_modules()
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
@@ -109,6 +139,10 @@ def prepare_format(response_format, messages):
                  "Use every required field, correct types, and only allowed fields. "
                  "Put all requested writing inside the appropriate JSON string fields.\nJSON Schema:\n" +
                  json.dumps(schema, ensure_ascii=False, allow_nan=False, separators=(",", ":")))
+    if with_tools:
+        # /v1/responses (#782): the schema is for the final answer; a turn that calls a tool is not an answer
+        directive += ("\nThis applies only to your final answer. To use a tool, call it as usual; the JSON object is "
+                      "what you write once you are done with the tools.")
     messages = [dict(message) for message in messages]
     if messages and messages[0].get("role") == "system":
         content = messages[0].get("content") or ""
@@ -119,6 +153,43 @@ def prepare_format(response_format, messages):
     else:
         messages.insert(0, {"role": "system", "content": directive})
     return messages, validator
+
+
+def _extract_json(text: str) -> str:
+    s = (text or "").strip()
+    if not s:
+        return ""
+    if s.startswith("```"):
+        first = s.find("\n")
+        if first != -1:
+            end = s.find("```", first + 1)
+            if end != -1:
+                s = s[first + 1:end].strip()
+    start = s.find("{")
+    if start == -1:
+        return s
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "\"":
+                in_str = False
+        else:
+            if ch == "\"":
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start:i + 1]
+    return s[start:]
 
 
 def validated_json(text, validator, finish):
@@ -137,7 +208,7 @@ def validated_json(text, validator, finish):
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); "
                                     "increase the output budget")
     try:
-        value = json.loads(text or "", object_pairs_hook=pairs, parse_constant=constant)
+        value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
         raise StructuredOutputError(f"model did not return valid JSON: {exc}") from exc

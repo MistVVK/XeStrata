@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,7 @@ FAKE_BATCH = r'''import queue, sys, threading, time
 args = sys.argv[1:]
 slots = int(args[args.index("--batch") + 1]) if "--batch" in args else 0
 fit = int(args[args.index("--fit") + 1]) if "--fit" in args else slots
+fail = "--fail-window" in args        # #997: the first window over two slots fails
 STEP = 0.02
 CH = 32
 lines, stop = queue.Queue(), threading.Event()
@@ -43,15 +45,20 @@ print("INFO engine=0.1.39" + (f" batch_slots={fit}" if fit >= 2 else "") +
       (" slot_cache=1" if "--slotcache" in args else ""), flush=True)
 print("READY 4096 stop", flush=True)
 LONG = list(b"LONGREPLY")
-def reply(ids):            # the rest of the reply after what the prompt already ends with (a request continued)
+def continued(ids):        # (the whole reply, how much of it the prompt already ends with: a request continued)
     ids = [int(x) for x in ids]
     long_one = any(ids[i:i + len(LONG)] == LONG for i in range(len(ids)))
     R = list(b"ok, " + b"la " * 15 + b"done." if long_one else b"ok, done.") + [257]
-    k = max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
+    return R, max(k for k in range(len(R)) if k == 0 or ids[-k:] == R[:k])
+def reply(ids):            # the rest of the reply after what the prompt already ends with
+    R, k = continued(ids)
     return R[k:]
 active = {}          # slot -> [tokens left, max_new, produced]
 stopped = set()      # BSTOPped slots: they end "cancel"
 def window():        # one batch window: every active slot one token
+    if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
+        print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
+        sys.exit(1)
     for b in sorted(active):
         left, max_new, produced = active[b]
         t = left.pop(0) if left else 257
@@ -65,6 +72,9 @@ def window():        # one batch window: every active slot one token
         else:
             active[b] = [left, max_new, produced]
 log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
+REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
+def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
+    return 0 if not REUSE else len(ids) - 1 if continued(ids)[1] else 3
 while True:
     try:
         line = lines.get(timeout=STEP if active else None)
@@ -85,6 +95,9 @@ while True:
         slot = int(f[1]) if f[0] == "BGEN" else None
         max_new = int(f[2] if f[0] == "BGEN" else f[1])
         ids = f[-1].split(",")
+        if bytes(int(x) & 255 for x in ids).find(b"REFUSEME") >= 0:   # #1059: refused up front, then idle (no DONE)
+            print("ERR refused: images are not enabled", flush=True)
+            continue
         if log:
             log.write(f"{f[0]} {slot} {len(ids)} {max(len(active), 0)}\n"); log.flush()
         toks = reply(ids)
@@ -116,7 +129,7 @@ while True:
             if log:
                 log.write(f"YIELD {given[0]} {given[1]}\n"); log.flush()
             print(f"YIELDED {given[0]} {given[1]}", flush=True)
-            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 0", flush=True)
+            print(f"DONE 0 {len(ids)} 5.0 0.0 cancel 0 0 {reused(ids)}", flush=True)
             if slot is not None:
                 print(f"BADM {slot} 0", flush=True)
             continue
@@ -129,7 +142,7 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 0", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}", flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:
@@ -152,6 +165,34 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(parallel_args({"parallel": "4"}, []), [])                   # said and ignored
         self.assertEqual(parallel_args({"parallel": True}, []), [])
         self.assertEqual(parallel_args({"parallel": 12}, []), ["--batch", "12"])     # the engine warns and caps
+
+    def test_parallel_above_the_window_says_so_unless_batch_mtp(self):
+        import contextlib
+        import io
+        import os
+
+        def said(args, env):
+            buf = io.StringIO()
+            old = os.environ.get("STRATA_BATCH_MTP")
+            if env is None:
+                os.environ.pop("STRATA_BATCH_MTP", None)
+            else:
+                os.environ["STRATA_BATCH_MTP"] = env
+            try:
+                with contextlib.redirect_stdout(buf):
+                    r = parallel_args({"parallel": 12}, args)
+            finally:
+                if old is None:
+                    os.environ.pop("STRATA_BATCH_MTP", None)
+                else:
+                    os.environ["STRATA_BATCH_MTP"] = old
+            self.assertEqual(r, ["--batch", "12"])
+            return "at most" in buf.getvalue()
+        self.assertTrue(said([], None))                  # 0.1.39: the window holds 8 rows
+        self.assertTrue(said([], "0"))
+        self.assertFalse(said(["--batch-mtp"], None))    # --batch-mtp waves more through the window
+        self.assertFalse(said([], "1"))
+
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
 
@@ -165,6 +206,7 @@ class PickSlot(unittest.TestCase):
         e.slot_held = [[] for _ in range(n)]
         e.slot_used = [0.0] * n
         e.slot_live = [None] * n
+        e.slot_group = [0] * n
         return e
 
     def test_the_slot_that_holds_the_conversation(self):
@@ -181,6 +223,21 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
 
+    def test_batch_groups_spread_requests_over_the_groups(self):
+        # #1249: with --batch-groups 2 over 4 slots (groups {0,1} and {2,3}) a second request goes to the other group,
+        # and a short held prefix does not pull it back into the busy one
+        e = self.engine(4)
+        e.slot_groups = 2
+        e.slot_group = [0, 0, 1, 1]
+        e.slot_busy[0] = True
+        e.slot_held[1] = [1, 2, 3]
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 2)
+        e.slot_held[1] = list(range(1, 601))                       # a long prefix is worth the unbalanced group
+        self.assertEqual(e.pick_slot(list(range(1, 700))), 1)
+        e.slot_groups, e.slot_group = 1, [0] * 4                   # without groups: any held prefix, as before
+        e.slot_held[1] = [1, 2, 3]
+        self.assertEqual(e.pick_slot([1, 2, 3, 4, 5]), 1)
+
     def test_slots_view(self):
         e = self.engine(2)
         e.slot_held[1] = [1, 2]
@@ -195,7 +252,7 @@ class PickSlot(unittest.TestCase):
 class ParallelService(unittest.TestCase):
     """The real StrataEngine and Service over HTTP, the fake engine behind them."""
 
-    def start(self, slots, fit=None, slot_cache=False):
+    def start(self, slots, fit=None, slot_cache=False, fail=False, reuse=False):
         import serve.server as server
         self.tmp = tempfile.TemporaryDirectory()
         script = Path(self.tmp.name) / "fake_strata.py"
@@ -204,6 +261,8 @@ class ParallelService(unittest.TestCase):
         real = server.subprocess.Popen
         extra = ["--batch", str(slots)] + (["--fit", str(fit)] if fit is not None else []) + ["--log", str(self.log)]
         extra += ["--slotcache"] if slot_cache else []
+        extra += ["--fail-window"] if fail else []
+        extra += ["--reuse"] if reuse else []
         with mock.patch.object(server.subprocess, "Popen",
                                lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
             self.engine = StrataEngine("strata", extra)
@@ -228,6 +287,13 @@ class ParallelService(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=60) as r:
             return json.loads(r.read().decode())
 
+    def message(self, text, max_tokens=64):
+        body = {"model": "m", "messages": [{"role": "user", "content": text}], "max_tokens": max_tokens}
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+
     def get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=10) as r:
             return json.loads(r.read().decode())
@@ -236,6 +302,18 @@ class ParallelService(unittest.TestCase):
         self.start(4, fit=2)
         self.assertEqual(self.engine.batch, 2)
         self.assertEqual(self.get("/v1/status")["concurrency"]["serving"], 2)
+
+    def test_stop_strings_in_a_batch_slot(self):
+        """#454: a stop string cuts the answer in --batch mode too, and the slot is freed for the next request."""
+        self.start(2)
+        body = {"messages": [{"role": "user", "content": "hi LONGREPLY"}], "max_tokens": 64, "reasoning_effort": "none",
+                "stop": ["la la"]}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            c = json.loads(r.read().decode())["choices"][0]
+        self.assertEqual((c["message"]["content"], c["finish_reason"]), ("ok, ", "stop"))
+        self.assertEqual(self.chat("again")["choices"][0]["message"]["content"], "ok, done.")
 
     def test_engine_turns_batching_off(self):
         self.start(4, fit=0)
@@ -380,6 +458,51 @@ class ParallelService(unittest.TestCase):
         slot = self.engine.slot_held.index(mine[0])
         self.assertEqual(self.engine.pick_slot(mine[0] + [10, 11]), slot)
         self.assertEqual(first["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_a_failed_window_names_its_error(self):
+        # #997 #890: a batch window fails while every request reads its own slot's lines, so no request reads the
+        # engine's ERR line before it exits; the server's note on the death gives it instead of a guess
+        self.start(2, fail=True)
+        errors = []
+
+        def go(t):
+            try:
+                self.chat(t)
+            except urllib.error.HTTPError as e:
+                errors.append(e.code)
+
+        threads = [threading.Thread(target=go, args=(t,)) for t in ("first question LONGREPLY", "second question")]
+        for th in threads:
+            th.start()
+            time.sleep(0.05)
+        for th in threads:
+            th.join(30)
+        self.assertEqual(len(errors), 2, errors)
+        note = self.engine.death_note()
+        self.assertIn("exited (code 1)", note)
+        self.assertIn("verify batch: layer 34 never rang (graph finished)", note)
+
+    def test_a_continued_request_reports_its_own_prompt_reuse(self):
+        """A request STOPped on the solo path and continued in a slot (or back on the solo path) is sent again as its
+        prompt + what it generated, and the engine holds all of that: the usage must still split the request's OWN
+        prompt (input_tokens + cache_read_input_tokens = the prompt, input_tokens >= 1).  input_tokens 0 makes Claude
+        Code count the prompt twice (message_start's input_tokens + cache_read_input_tokens): "Prompt is too long"
+        at half the context."""
+        self.start(2, slot_cache=True, reuse=True)
+        res = {}
+        long = threading.Thread(target=lambda: res.setdefault("long", self.message("LONGREPLY please", 200)))
+        long.start()
+        time.sleep(0.05)
+        self.message("short", 200)
+        long.join(30)
+        kinds = [x.split()[0] for x in self.log.read_text().splitlines()]
+        self.assertIn("BGEN", kinds)                    # it was continued: the case under test
+        u = res["long"]["usage"]
+        prompt = self.svc.history[[h["output_tokens"] for h in self.svc.history].index(
+            max(h["output_tokens"] for h in self.svc.history))]["prompt_total"]
+        self.assertGreaterEqual(u["input_tokens"], 1, u)
+        self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], prompt, u)
+        self.assertEqual(u["cache_read_input_tokens"], 3, u)    # the first read's reuse, not the continuation's
 
 
 if __name__ == "__main__":
