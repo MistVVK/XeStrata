@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -10,7 +11,12 @@
 #include <algorithm>
 
 #include <array>
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -147,6 +153,35 @@ void full_session(int fmt, int mode, int experts) {
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
+    {
+        // disk save path: metadata + streamed K/V give the same file as the captured image
+        SavedConversation meta;
+        std::vector<SessionKvSource> sources;
+        check(conversation_snapshot_sources(meta,sources,view,ss,g,draft.state,err),"disk-save sources");
+        check(meta.kv.empty() && sources.size()==b.kv.size(),"one source per K/V layer, none captured");
+        const SessionFileIdentity id{1,2};
+        namespace fs=std::filesystem;
+        const fs::path dir=fs::temp_directory_path()/("strata-snap-test-"+std::to_string(experts)+"-"+
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        fs::create_directories(dir);
+        const std::string p1=(dir/"streamed.bin").string(), p2=(dir/"captured.bin").string();
+        auto slurp=[](const std::string& p){ std::ifstream f(p,std::ios::binary);
+            return std::vector<char>((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>()); };
+        size_t n1=0,n2=0;
+        check(session_file_write(p1,meta,sources,id,n1,err),"streamed session write");
+        check(session_file_write(p2,b,id,n2,err),"captured session write");
+        SavedConversation x,y;
+        check(session_file_read(p1,id,x,n1,err) && session_file_read(p2,id,y,n2,err) && n1==n2,"both files read");
+        check(x.live.gdn==y.live.gdn && x.live.dead==y.live.dead && x.live.ids==y.live.ids &&
+              x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
+              "streamed file equals captured file");
+        check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        std::error_code ec;
+        fs::remove_all(dir,ec);
+        auto empty_ids=std::vector<int32_t>{};
+        const ConversationView none{empty_ids,images,checkpoints,true};
+        check(!conversation_snapshot_sources(meta,sources,none,ss,g,draft.state,err),"empty session refused");
+    }
     check(a.live.dead!=b.live.dead,"different opening-state spare keys in regression fixture");
     auto bad=a; bad.kv.back().k.pop_back();
     check(conversation_snapshot_restore(bad,ss,g,draft.state,err)==ConversationRestore::invalid,
@@ -240,6 +275,25 @@ int main() {
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
             check(conversation_kv_verify(a,f.state,f.g,upto,index,fingerprint,err),"verify restored authoritative and resident bytes without rewriting them");
+            {
+                // disk save streams the same bytes as a captured image, without the host copy
+                SessionKvSource src;
+                check(conversation_kv_source(src,f.state,f.g,upto,index,err),"K/V source for a disk save");
+                check(src.format==a.format && src.cells==a.cells && src.heads==a.heads && src.head_dim==a.head_dim &&
+                      src.page_size==a.page_size && src.pooled_rows==a.pooled_rows && src.idx_dim==a.idx_dim,
+                      "K/V source metadata equals the captured image");
+                const std::array<const ConversationBuffer*,5> parts={&a.k,&a.v,&a.k_scale,&a.v_scale,&a.pooled};
+                for (size_t i=0;i<5;++i) {
+                    check(src.sizes[i]==parts[i]->size(),"K/V source part size");
+                    std::vector<uint8_t> got(src.sizes[i]), want(src.sizes[i]);
+                    const size_t half=src.sizes[i]/2;   // two reads: offsets are honoured
+                    check(src.read(i,0,got.data(),half) && src.read(i,half,got.data()+half,src.sizes[i]-half),
+                          "K/V source reads");
+                    check(parts[i]->read(want.data(),0,want.size()) && got==want,"K/V source bytes equal the image");
+                }
+                SessionKvSource none;
+                check(!conversation_kv_source(none,f.state,f.g,-1,index,err),"K/V source rejects an invalid extent");
+            }
             if (mode==1) {
                 std::vector<int32_t> table((size_t)f.state.n_pages);
                 gpu_check(strata::gpu::copy(table.data(),f.state.page_table,table.size()*4));

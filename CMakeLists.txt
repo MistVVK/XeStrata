@@ -340,7 +340,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp)
+                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp
+                                   src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
@@ -623,6 +624,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
+  # the session files of SAVE / RESTORE (upstream aa17fe86): format, identity and the refusals (host only)
+  add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_file_test PRIVATE include)
+  add_test(NAME conversation_file_test COMMAND conversation_file_test)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp

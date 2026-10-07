@@ -157,12 +157,21 @@ public:
     /// A layer split: makes the blobs copy fast to engine device `device` as well (see PinnedArena::register_on).
     /// True when there is nothing to do; false (and `err`) when the device refuses, the copies then being slower.
     virtual bool register_on(int device, std::string& err) { (void) device; (void) err; return true; }
+    /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
+    /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
+    /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
+    const std::vector<std::pair<std::string, std::string>>& model_inputs() const { return inputs_; }
     /// The blob's bytes into `dst` (blob_bytes(layer) of them).  Safe from several threads for a source whose
     /// `transient` can be true.
     virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
     /// The `n` experts of `layer` the CPU is about to ask `blob` for, all at once: a source that reads a file may
     /// fetch them in parallel.  The bytes `blob` then returns are the same.  Default: nothing.
     virtual void prefetch(int64_t layer, const int64_t* experts, int64_t n) { (void) layer; (void) experts; (void) n; }
+protected:
+    /// What model_inputs() returns; set by a source's open().
+    void record_inputs(const std::string& pack_experts, const std::string& gguf,
+                       const strata::kernels::cpu::ExpertLayout& lay, bool from_gguf);
+    std::vector<std::pair<std::string, std::string>> inputs_;
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right

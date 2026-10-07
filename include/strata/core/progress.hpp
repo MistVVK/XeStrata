@@ -25,6 +25,9 @@ struct Progress {
     std::atomic<int64_t> chunk{-1};      ///< the prompt chunk (its first position) a batched-read stage is in
     std::atomic<int64_t> since_ms{0};    ///< when `where` was set (steady clock): how long a stage has lasted
     std::atomic<uint64_t> ticks{0};      ///< layers served: a window that still moves, slowly, against one that stopped
+    /// a step that blocks in one call (a file flush, a host->device transfer of a whole session) is given until this
+    /// time (steady ms; 0 = none) instead of the watchdog's limit - an explicit, bounded allowance, not a beat
+    std::atomic<int64_t> allow_until_ms{0};
 };
 
 inline int64_t progress_now_ms() {
@@ -58,5 +61,11 @@ inline void progress_at(const char* where, int64_t detail = -1, int64_t chunk = 
 
 inline void progress_beat() { progress().beats.fetch_add(1, std::memory_order_relaxed); }
 inline void progress_tick() { progress().ticks.fetch_add(1, std::memory_order_relaxed); }
+/// A beat that also sets (seconds > 0) or clears (0) the allowance of a blocking step: the watchdog does not fire
+/// before the allowance ends, and fires at its end if nothing beat since.
+inline void progress_allow(int64_t seconds) {
+    progress().allow_until_ms.store(seconds > 0 ? progress_now_ms() + seconds * 1000 : 0, std::memory_order_relaxed);
+    progress_beat();
+}
 
 }  // namespace strata::core

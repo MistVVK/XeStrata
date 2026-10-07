@@ -298,6 +298,58 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState& draft, std::string& error) {
+    if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
+    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss, g);
+    std::vector<SessionKvSource> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
+    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+    meta = std::move(captured);
+    sources = std::move(out);
+    return true;
+}
+
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
+                                      const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error) {
+    ConversationStateSizes z;
+    if (!conversation_session_sizes(g, ss, z, error)) return false;
+    if (ss.max_cells < 0) return fail(error, "invalid session cells");
+    const uint64_t tokens = std::min<uint64_t>(max_tokens, (uint64_t) ss.max_cells);
+    const size_t layers = owned_qsa(ss, g);
+    if ((owned_qsa(ss, g) && !ss.qsa_states)) return fail(error, "invalid session running-state targets");
+    size_t tails = 0, dead = 0, block_pos = 0;
+    if (!product(tails, {layers, z.tail}) || !product(dead, {layers, z.dead}) ||
+        !product(block_pos, {layers, z.block_pos})) return fail(error, "indexer byte count overflow");
+    SessionReadLimits l = limits;   // keeps the caller's admit / progress / max_file_bytes
+    l.max_tokens = tokens;
+    l.max_checkpoints = max_checkpoints;
+    l.max_kv_layers = layers + 1;
+    l.geometry = geometry_key(g);
+    l.layer_range = std::make_pair(ss.layer_lo, ss.layer_hi);
+    l.max_state_bytes = {z.gdn, ss.ple_hist ? z.ple : 0, tails, dead, block_pos};
+    l.max_kv_bytes.assign(layers + 1, {});
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        const int64_t upto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(st.max_cells, 0));
+        if (!conversation_kv_part_sizes(st, g, upto, true, l.max_kv_bytes[j], error)) return false;
+    }
+    const int64_t dupto = (int64_t) std::min<uint64_t>(tokens, (uint64_t) std::max<int64_t>(draft.max_cells, 0));
+    if (!conversation_kv_part_sizes(draft, g, dupto, false, l.max_kv_bytes.back(), error)) return false;
+    limits = std::move(l);
+    return true;
+}
+
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error) {
     if (!image.live.stage_parts.empty()) return fail(error, "layer-split parking is not supported");

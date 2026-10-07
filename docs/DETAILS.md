@@ -650,6 +650,37 @@ The answer matches a run without the restart, also on the small configuration (8
 Writing a conversation of 300-360 MiB takes 0.10-0.16 s; when the RAM cache pushes one out, the next request waits that long.
 Compressed, the same conversation takes 421 MiB, 0.30 s to read back and 0.23 s to write ([the record](../bench/results/2026-10-04-conversation-save-compress/README.md)).
 
+### Saving a conversation to a file and restoring it (opt-in)
+
+The conversation the engine holds can be saved to a named file and restored later, also after a restart.
+A request that continues the restored conversation does not read its long prompt again.
+Started with `--slot-save-path DIR` (`"slot_save_path"` in the config), the server takes llama-server's slot API save and restore, for slot 0 only.
+The file format is XeStrata's (Strata's), not llama.cpp's. There is no erase action.
+
+```bash
+curl -X POST "http://127.0.0.1:8095/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot": 0, "filename": "chat1.bin", "n_saved": 4996, "n_written": 312432956, "timings": {"save_ms": 200.7}}
+curl -X POST "http://127.0.0.1:8095/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot": 0, "filename": "chat1.bin", "n_restored": 4996, "n_read": 312432956, "timings": {"restore_ms": 162.3}}
+```
+
+- DIR becomes an absolute path at start (`--slot-save-path` from the server's working folder, `"slot_save_path"` from the config's `"cwd"`), created with mode 0700 when missing.
+  The files hold the conversation's tokens and state and are created with mode 0600. Nothing deletes them.
+- `filename` is a file name inside DIR only: no path, drive, `:`, Windows device name, control character, leading `.`, or trailing `.` or space.
+- Before a save, the disk must have room for the new file plus `--session-min-free-mib` (an engine argument; default 4096, 0 = no check).
+- A file is restored only by the same engine version with the same model files and settings (KV precision, context length, MTP, control vector and so on).
+  A file that does not match, or a damaged one, is refused, and the engine's conversation stays as it was.
+- Only the checkpoint at the start of the last turn is saved: a continuation that edits an earlier turn reads again from there.
+- Not with parallel requests (`"parallel"`) or a layer split over several GPUs (`501`, and the engine refuses).
+- The request must be `Content-Type: application/json` (else `415`); from a browser page only XeStrata's own page and trusted origins.
+- Status codes: `501` without a save folder or with parallel requests; `400` for another slot, action or name, or a file the engine refused; `404` for a restore of a missing file;
+  `503` while the model is not loaded or the RAM is short; `507` when the disk has no room; `500` for any other I/O failure and when the engine ended.
+  An engine that ended is started again by the next request.
+
+Measured on the B70 with IQ2_XS, the file of a 4,996-token conversation (INT8 KV) took 312 MB, 0.20 s to save and 0.16 s to restore.
+Restored after a restart, the continuation was answered in 0.31 s without reading the 4,996 tokens again (8 s to read them all), and the answer matched a run without the save.
+The same held on the small configuration (8 GB, no XMX) and with the icpx build.
+
 ### Current limits and sampling
 
 - One request at a time (several at once only with `"parallel"`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
