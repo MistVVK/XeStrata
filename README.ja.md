@@ -11,7 +11,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル
 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を、自分の PC で動かすためのソフトウェアです。
-GPU は Intel Arc か NVIDIA を 1 枚、OS は Linux を使い、インストールはコマンド 1 つです。
+GPU は Intel Arc か NVIDIA を 1 枚、OS は Linux を使います。Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージがあります。
 自由ソフトウェアで、Intel の GPU なら自由ソフトウェアだけでもビルドして動かせます。
 
 > **目次:** [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
@@ -30,9 +30,8 @@ Strata との主な違い:
 - **Intel Arc 向け**で、NVIDIA の GPU でも動きます。AMD の GPU には対応しません。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **Linux だけ**です。Windows と WSL には対応しません。
-- **自由ソフトウェアだけでもビルドできます**（`--license free`、Debian main に入れられる程度に自由な構成）。
-  既定の contrib のビルドは、自由ソフトウェアでない Intel の oneMKL と、NVIDIA の GPU には CUDA ツールキットを使います
-  （[開発する人へ](#開発する人へ)）。
+- **自由ソフトウェアだけでも動きます**（`xestrata-free`、Debian main に入れられる程度に自由な構成）。
+  contrib の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
 
 ## 必要なもの
 
@@ -42,7 +41,7 @@ Strata との主な違い:
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
-| OS | Linux（WSL は不可）。Ubuntu 26.04 で確かめ、Fedora 44 でもコンテナで setup と起動を確かめています。 |
+| OS | Linux（WSL は不可）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
 - **行列エンジン**: Intel の XMX と NVIDIA の Tensor Core を使い、ない GPU では DP4a の命令で計算します。
@@ -52,9 +51,6 @@ Strata との主な違い:
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
 - **CPU 内蔵のグラフィックス**: 起動とプロンプトの読み込みまでを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
-- **パッケージ**: Intel の GPU にはそのランタイム（Level Zero）と oneMKL、NVIDIA の GPU にはドライバーと CUDA ツールキットが要ります。
-  SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
-  setup は OS のパッケージを入れないので、[docs/XE.ja.md](docs/XE.ja.md#パッケージ) の表にあるものを先に入れてください。
 
 ## モデルの選び方
 
@@ -86,60 +82,94 @@ Strata との主な違い:
   2〜3 ビットの大きさより遅くなります（[詳細](docs/DETAILS.ja.md#unsloth-の-ud-q4_k_xl実験的)）。
 
 迷ったら **IQ2_XS** を選んでください。RAM が 32 GB しかない PC では、Coder が選べます。
-あとから別のモデルを足すときは `./setup.sh --setup` を実行します。
+あとから別のモデルを足すときは `xestrata --setup` を実行します。
 
 OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューにはありません。
 変換の手順は [docs/ORCA.ja.md](docs/ORCA.ja.md) にあります。
 
 ## インストール
 
-1. [このプロジェクトをダウンロード](https://github.com/MistVVK/XeStrata/archive/refs/heads/main.zip)して展開します
-   （`git clone` でも構いません）。
-1. [必要なもの](#必要なもの)のパッケージを入れます。
-1. 端末で **`./setup.sh`** を実行します。
-1. いくつかの質問に答えます。Enter を押せば、おすすめの選択になります。
-   - **モデルと大きさ**: [モデルの選び方](#モデルの選び方)を見てください。
-   - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
-   - **画像**: 画像も読ませるかどうか。
-   - **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
-     [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
+**1. パッケージを選びます。** どれか 1 つを入れます（一度に入るのは 1 つです）。
 
-setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んでエンジンをビルドし、モデルをダウンロードして起動します。
+| GPU | Ubuntu 26.04 | Fedora 44 |
+| --- | --- | --- |
+| Intel だけ（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
+| Intel と NVIDIA（Turing 以降） | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| NVIDIA の Volta（V100 など） | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
+
+- どのパッケージも、GPU のメーカーのドライバーやライブラリを必須にはしません。
+  free の版は Intel の GPU のランタイム（Level Zero）を推奨（Recommends、既定で入ります）にします。
+  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。使う GPU のものだけを入れます。
+   - Intel の GPU: `sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2`（Fedora は `sudo dnf install oneapi-level-zero intel-level-zero`）。
+   - NVIDIA の GPU: NVIDIA のドライバー。行列積を速くする cuBLAS は、Ubuntu では multiverse の `libcublas-13-1`（cuda12.4 は `libcublas12`）、
+     Fedora では NVIDIA の CUDA のリポジトリの `libcublas-13-4` です。
+   - Intel の GPU の行列積を速くする oneMKL は、Intel の apt / dnf のリポジトリ（oneAPI）にあります。
+   - cuBLAS と oneMKL は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
+- NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
+  V100 などの Volta を扱うドライバーは 580 の系列までです。
+- パッケージのファイルは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
+
+**2. 入れます。** 足りない依存は apt や dnf が入れます。
+
+```bash
+sudo apt install ./xestrata-free_*.deb      # Ubuntu
+sudo dnf install ./xestrata-free-*.rpm      # Fedora
+```
+
+**3. 端末で `xestrata` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
+
+- **モデルと大きさ**: [モデルの選び方](#モデルの選び方)を見てください。
+- **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
+- **画像**: 画像も読ませるかどうか。
+- **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
+  [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
+
+`xestrata` は、GPU と RAM と CPU を確かめ、モデルをダウンロードして起動します。
 ブラウザで `http://127.0.0.1:8095` が開きます。
 
-- **コンパイラ**: 既定は contrib のビルドで、intel/llvm の DPC++ 7 以降を使い、NVIDIA の GPU があれば CUDA のターゲット付きのものにします。
-  ディストリビューションの `dpclang++` が 7 より古ければ、setup はこの場で intel/llvm をビルドするかを尋ねます（13 分ほど、
-  [詳細](docs/XE.ja.md#sycl-のコンパイラ)）。
-  GPU の XMX が使えないときは、XMX なしでビルドするか止めるかを尋ねます。
-
-  contrib は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
-  `--license free` で自由ソフトウェアだけ（Intel の GPU）、`--license contrib-icpx` で Intel oneAPI の icpx のビルドにします。
-- **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
-  GPU のコードは初めて使うときにドライバーがコンパイルするので、setup は最後にモデルを一度動かしてそれを済ませます。
+- **時間**: 初回はダウンロード（60〜110 GB）に時間がかかります。途中で止めても、次は続きから始まります。
+  GPU のコードは初めて使うときにドライバーがコンパイルするので、最後にモデルを一度動かしてそれを済ませます。
 - **起動中は PC が重くなります**: モデルを起動すると、RAM に 23〜50 GB を読み込みます。初回はとくに時間がかかり、
   1〜3 分ほど PC の反応が遅くなることがあります。ウィンドウを閉じずに待ってください。
+- **置き場所**: モデルのファイルは `~/.local/share/xestrata`（`--data-dir` で変えられます）、設定は `~/.config/xestrata`、
+  ログは `~/.local/state/xestrata` に置きます。
 
-**次からは** `./setup.sh` を実行すると、すぐに起動します。止めるときはそのウィンドウを閉じます。
+**次からは** `xestrata` を実行すると、すぐに起動します。止めるときはそのウィンドウを閉じます。
 
-**更新**: `./update.sh` を実行します。git で取得したものなら `git pull` してから、エンジンと Python のパッケージと
-モデルの設定を更新します（モデルは起動しません）。新しい版をダウンロードして別の場所に展開し、そこで `./setup.sh` を
-実行しても構いません。モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data` に置くので、新しいコピーもそれを見つけて
-同じ設定で動きます。
+**ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
+（ブラウザは開きません）。先に `xestrata` で一度設定しておきます。
 
-**自分の PC に合わせる**: `./setup.sh --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
+**更新**: `sudo apt upgrade` か `sudo dnf upgrade` で更新します。モデルの設定は次の起動で更新します。
+
+**自分の PC に合わせる**: `xestrata --calibrate` は、エンジンの設定のいくつかをこの PC で測り、速いものを残します
 （5〜10 分ほど）。
+
+**別のパッケージに替える**: Ubuntu では入れたい方を `sudo apt install` すると入れ替わります。
+Fedora では `sudo dnf swap xestrata-free xestrata-contrib-cuda13.4` のようにします。
+
+**消す**: `xestrata --remove-data` でモデルのファイル・設定・ログを消してから（大きさを見せて確かめます）、パッケージを消します。
+
+```bash
+xestrata --remove-data
+sudo apt purge xestrata-free     # Ubuntu（入れたパッケージの名前）
+sudo dnf remove xestrata-free    # Fedora（同じ）
+```
+
+`xestrata --remove-data` をせずにパッケージを消すと、ホームのモデルのファイルと設定は残ります。
+
+ソースから `./setup.sh` で入れる方法は [docs/BUILD.ja.md](docs/BUILD.ja.md#ソースから入れる) にあります。
 
 ## 使い方
 
 - **ブラウザ**: `http://127.0.0.1:8095`（モデルが起動すると自動で開きます）。**Chat**、モデルと GPU・CPU・RAM の様子を
   見る **Monitor**、設定とアドレスを見る **About** があります。
-- **端末で会話**: `.venv/bin/python chat.py`
+- **端末で会話**: `xestrata chat`
 - **アプリやコーディングエージェント**: 「OpenAI 互換」の接続先として、ベース URL **`http://127.0.0.1:8095/v1`** を指定します。
   API キーとモデル名は何でも構いません。Anthropic の API を使うアプリは `http://127.0.0.1:8095/v1/messages` です。
 - **思考の深さ**: モデルは答える前に考えます。深さは **Off、Low、Medium、High** から選べます。チャットの画面のメニュー、
   `chat.py` の `/think low`、アプリの「reasoning effort」の設定で変えられます。Off がいちばん速く、難しい質問には High が向きます。
 - **画像**: チャットの画面では **Picture** を押します。`chat.py` では `/image <パス>` と入力します。アプリでは添付します。
-- **スマートフォンや別の PC から**: `./setup.sh --setup --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
+- **スマートフォンや別の PC から**: `xestrata --setup --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
   サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.ja.md#ストリーミングと接続)）。
 
 **知っておくと良いこと**: 要求は 1 つずつ処理します（複数を同時に処理するには `"parallel": 2`、[BATCHING](docs/BATCHING.ja.md)）。会話の最初のメッセージはすべて読み込みますが、
@@ -153,12 +183,13 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
 （とくにブラウザ）を閉じてからやり直してください。何度も起きるなら、小さい大きさ（Q2_0 か IQ2_XS）を選んでください。
 
 **ダウンロードやインストールの途中で止まった**
-`./setup.sh` をもう一度実行してください。止まったところから続けます。
+`xestrata` をもう一度実行してください。止まったところから続けます。
 
 **GPU が見つからない、使えないと言われた**
 次の 3 つを確かめてください。
 
-- Intel の GPU のランタイム、NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください（[docs/XE.ja.md](docs/XE.ja.md#パッケージ)）。
+- Intel の GPU のランタイム（Level Zero のドライバー）、NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください。
+  NVIDIA の GPU は contrib の版でだけ使えます。
 - 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`）を開けるか確かめてください（`render` グループ）。
 - 単体の GPU が OS から見えないときは、BIOS の Above 4G Decoding と Re-Size BAR を確かめてください。
 
@@ -171,7 +202,7 @@ B70 では、まれに起きることがあります。もう一度起動すれ�
 
 **ポート 8095 はすでに使われていると言われた**
 XeStrata がすでに動いています。そのウィンドウを探してください。ほかのプログラムが使っているなら、
-`./setup.sh --port 8081` のように別のポートを選べます。
+`xestrata --port 8081` のように別のポートを選べます。
 
 **とても遅く、ディスクのランプが点きっぱなし**
 RAM が足りていません。ほかのプログラムを閉じるか、小さい大きさ（Q2_0 か IQ2_XS）を選んでください。
@@ -181,11 +212,11 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 何度も起きるなら、ほかのプログラムを閉じるか、小さい大きさを選んでください。
 
 **プロンプトが文脈の長さを超えると言われた**
-会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`./setup.sh` で長い文脈を選び直してください。
+会話が、選んだ文脈の長さより長くなっています。新しい会話を始めるか、`xestrata --setup` で長い文脈を選び直してください。
 
 **解決しないとき**
 [詳しい対処の表](docs/DETAILS.ja.md#困ったとき)を見てください。それでも解決しなければ
-[issue](https://github.com/MistVVK/XeStrata/issues) を立て、XeStrata のフォルダーにある `xestrata-<モデル>.log` を添付してください。
+[issue](https://github.com/MistVVK/XeStrata/issues) を立て、`~/.local/state/xestrata/xestrata-<モデル>.log` を添付してください。
 
 ## しくみ
 
@@ -209,15 +240,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 ## 開発する人へ
 
-- **ビルドの 3 つの方式**: CMake のオプション `STRATA_LICENSE` で選びます。
-   - free（`-DSTRATA_LICENSE=free`）: 自由ソフトウェアだけでビルドします。コンパイラは intel/llvm の DPC++ です。
-   - contrib（既定）: CUDA のターゲット付きの intel/llvm で、NVIDIA の GPU 向けのコードも作ります。
-     NVIDIA の CUDA ツールキットとドライバー、oneMKL（どれも自由ソフトウェアではありません）が要ります。
-   - contrib-icpx（`-DSTRATA_LICENSE=contrib-icpx`）: Intel oneAPI の icpx なども使えます。Intel の GPU だけを扱います。
-   - contrib と contrib-icpx では、密な行列積を oneMath 経由で oneMKL（Intel）や cuBLAS（NVIDIA）に任せます。
-   - free と contrib-icpx の方式でビルドでき、テストが通る状態を保ちます。
-- **手順**: ビルドの手順は [docs/XE.ja.md](docs/XE.ja.md#ビルド)、開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は
-  [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
+- **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib、contrib-icpx）、setup の振る舞いと要るパッケージ、
+  deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
+  開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
   テストの実行、ライセンスの表示は [AGENTS.md](AGENTS.md) にまとめてあります。
 - **upstream の取り込み**: Strata 0.1.39 までの単一 GPU 向けの機能を Xe に移しています。`--coupled-draft` は MTP の
@@ -241,7 +266,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: contrib と contrib-icpx の密な行列積。
      CMake が取得し、XeStrata の変更（`third_party/main/oneMath/patches/`、同じライセンス）を当てます。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラ。
-     setup がビルドし、XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当てます。
+     XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、
   [HyperQwen](https://github.com/syv-ai/HyperQwen)。
@@ -264,5 +289,8 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
-- **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。
+- **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
+- **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）と llama.cpp の gguf-py（MIT）、
+  contrib の版には oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
+  自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は入れていません。
 - **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。

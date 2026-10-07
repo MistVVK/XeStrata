@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 [English](DEVTOOLS.md) | 日本語
 
 XeStrata の開発で、リント、確認、測定のために入れる道具をまとめます。
-ビルドと実行に要るものは [XE.ja.md](XE.ja.md#setup) にあります。
+ビルドと実行に要るものは [BUILD.ja.md](BUILD.ja.md#setup) にあります。
 ここにある道具は、エンジンのビルド、実行、テストには要らず、リポジトリにも同梱しません。
 道具は、ディストリビューションから入れるか、それぞれのプロジェクトから git が無視するフォルダーに入れます。
 自由ソフトウェアでないもの（Intel SDE、VTune）は、Intel から手で入れます。
@@ -49,12 +49,12 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/l
 
 ## intel/llvm をソースからビルドする
 
-free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルします（[XE.ja.md](XE.ja.md#ビルド)）。
+free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルします（[BUILD.ja.md](BUILD.ja.md#ビルド)）。
 ディストリビューションに DPC++ がないとき、またはその SYCL ランタイムが GPU に XMX がないと報告するときは、
 `tools/intel_llvm_build.py` がリリースをソースから `.tools/intel-llvm/` にビルドします。
 後者の例は、Ubuntu 26.04 の 6.2 と Arc Pro B70 の組み合わせです（intel/llvm は v7.0.0 で B70 の XMX に対応しました）。
 setup は `--intel-llvm-build` でこれを動かします。
-済んだビルドをどう使い回すかは [XE.ja.md](XE.ja.md#sycl-のコンパイラ) にあります。
+済んだビルドをどう使い回すかは [BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ) にあります。
 intel/llvm は自由ソフトウェア（Apache-2.0 with LLVM exceptions）で、自由ソフトウェアだけでビルドできます。
 要るパッケージは次のとおりです（Fedora 44 では `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel python3`）。
 
@@ -75,7 +75,7 @@ clone（2.8 GB）と `install/`（0.7 GB）は残り、ビルドの作業フォ�
 
 ### contrib 用のビルド（CUDA と HIP）
 
-contrib のビルド（[XE.ja.md](XE.ja.md#ビルド)）は、CUDA のターゲット付きの intel/llvm で NVIDIA の GPU 向けのコードも作ります。
+contrib のビルド（[BUILD.ja.md](BUILD.ja.md#ビルド)）は、CUDA のターゲット付きの intel/llvm で NVIDIA の GPU 向けのコードも作ります。
 `--contrib` は同じ clone を CUDA のターゲット付きで、ROCm の HIP が入っていれば HIP（AMD の GPU）も付けて、`.tools/intel-llvm-contrib/` にビルドします。
 CUDA のターゲットには NVIDIA の CUDA ツールキットが要ります。これは自由ソフトウェアではありません（Ubuntu では multiverse、Debian では non-free）。
 

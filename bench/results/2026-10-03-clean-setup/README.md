@@ -4,7 +4,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 # setup.py on a clean Ubuntu 26.04, free build — 2026-10-03
 
-`./setup.sh` run from start to end on a system with nothing but the packages of [docs/XE.md](../../../docs/XE.md#packages)'s free column.
+`./setup.sh` run from start to end on a system with nothing but the packages of [docs/XE.md](../../../docs/BUILD.md#packages)'s free column.
 The system is a fresh `ubuntu:26.04` container (Ubuntu 26.04.1) on the development machine, run as root, with the GPUs' render nodes passed in (`--device /dev/dri`), the repository at the commit before this record (`git archive`), the IQ2_XS model files mounted read-only (`--gguf-dir`), and an empty data folder holding only a copy of the MTP draft layer (to skip its 5 GB download).
 The GPU is the Arc Pro B70; the compiler is the distribution's `dpclang-6` 6.2.0, which gives the B70 no XMX, so setup ran with `--allow-no-xmx` (the DP4a prompt path).
 

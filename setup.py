@@ -820,7 +820,7 @@ ICPX_HOW = ("Intel oneAPI's compiler (not free software; Intel's apt repository)
             "         sudo apt update && sudo apt install intel-oneapi-compiler-dpcpp-cpp")
 FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./setup.sh --intel-llvm-build (13 minutes "
             "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
-MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/XE.md#packages): "
+MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as for icpx in docs/BUILD.md#packages): "
            "sudo apt install intel-oneapi-mkl-sycl-devel")
 
 
@@ -1053,7 +1053,7 @@ def choose_compiler(a, gpu: dict) -> dict:
             fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
                  f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
                  "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for "
-                 "this GPU: install a newer one (docs/XE.md#packages) and run setup again")
+                 "this GPU: install a newer one (docs/BUILD.md#packages) and run setup again")
         xmx = has_xmx(probed)
         if not xmx and not allow_no_xmx:
             say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX "

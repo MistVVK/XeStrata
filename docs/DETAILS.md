@@ -209,7 +209,7 @@ This adds only what the README leaves out.
 - **Packages**: an Intel GPU needs its runtime (Level Zero), an NVIDIA GPU its driver and the CUDA toolkit, and an
   Intel GPU in the default contrib build oneMKL. setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
-  What Ubuntu 26.04 and Fedora 44 need is in [XE.md](XE.md#packages).
+  What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages).
 - **The GPU device**: for an Intel GPU, your user must be able to open `/dev/dri/renderD*` (the `render` group).
 - **Disk**: about 60–110 GB for the model and about 6 GB for the MTP layer (1 GB more with images).
   **The original model's Q2_0 on an AVX-512 CPU** also writes a one-time copy of its experts (about 40 GB) for the fast CPU kernel.
@@ -244,7 +244,7 @@ setup finds the files there and writes the configs again.
 1. **Images?** (see [Images](#images)).
 1. **The experimental speed projection**: off by default ([below](#experimental-speed-projection-experimental-off-by-default)).
 
-Then it chooses the SYCL compiler and builds the engine ([XE.md](XE.md#the-sycl-compiler)),
+Then it chooses the SYCL compiler and builds the engine ([BUILD.md](BUILD.md#the-sycl-compiler)),
 downloads and prepares the model, runs it once to compile its GPU code, and **starts the model**.
 The model is 60–110 GB, so the first start takes a while; an interrupted download continues where it stopped.
 
@@ -944,10 +944,10 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
 | `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([XE.md](XE.md#packages)), or run setup again with `--license free`. |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
-| `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([XE.md](XE.md#packages)). |
-| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prompts taking about 1.6 times as long ([XE.md](XE.md#the-sycl-compiler)). |
+| `the SYCL runtime of ... lists no GPU` | The GPU's Level Zero driver (`libze-intel-gpu1`, Intel's compute-runtime) is missing or too old for it; install a newer one ([BUILD.md](BUILD.md#packages)). |
+| `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prompts taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
 | `no SYCL compiler for the engine` | There is no SYCL compiler: install the distribution's DPC++, or pass `--intel-llvm-build`. |
 | `alloc_device: ... refused` at start | Happens rarely on the B70 (3 in about 120 starts); starting again usually works ([XE.md](XE.md#the-output-heads-vram-refusal)). |
 | Python or the build tools could not be installed | Install what it names, then run it again. Everything already done is kept and skipped. |

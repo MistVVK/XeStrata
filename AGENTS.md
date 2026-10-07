@@ -60,7 +60,7 @@ Every file under the LGPL starts with its copyright holders and license in SPDX 
 
 The README and the documents in `docs/` are written in Japanese first: `README.ja.md` and `docs/<NAME>.ja.md` are the originals, and `README.md` and `docs/<NAME>.md` their English translations.
 A change goes into the Japanese file first and then into the English one in the same commit, so the two keep the same sections and content.
-The English files keep the headings that code, records and links point to (`docs/XE.md#packages`, for example); a Japanese file's anchors come from its own headings.
+The English files keep the headings that code, records and links point to (`docs/BUILD.md#packages`, for example); a Japanese file's anchors come from its own headings.
 
 ## Lints
 

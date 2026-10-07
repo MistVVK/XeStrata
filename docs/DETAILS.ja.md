@@ -212,7 +212,7 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 - **パッケージ**: Intel の GPU にはそのランタイム（Level Zero）、NVIDIA の GPU にはドライバーと CUDA ツールキット、
   既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、先に入れておきます。
-  Ubuntu 26.04 と Fedora 44 で要るものは [XE.ja.md](XE.ja.md#パッケージ) にあります。
+  Ubuntu 26.04 と Fedora 44 で要るものは [BUILD.ja.md](BUILD.ja.md#パッケージ) にあります。
 - **GPU のデバイス**: Intel の GPU は、自分のユーザーで `/dev/dri/renderD*` を開けることが要ります（`render` グループ）。
 - **ディスク**: モデルに約 60〜110 GB、MTP 層に約 6 GB（画像を使うならさらに 1 GB）。
   **AVX-512 の CPU で元のモデルの Q2_0** を選ぶと、速い CPU のカーネル用に、エキスパートのコピー（約 40 GB）を一度書きます。
@@ -248,7 +248,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
 1. **画像**: 使うかどうか（[画像](#画像)）。
 1. **実験的な速度向上用の射影**: 既定はオフです（[下](#実験的な速度向上用の射影実験的既定はオフ)）。
 
-そのあと、SYCL のコンパイラを選んでエンジンをビルドし（[XE.ja.md](XE.ja.md#sycl-のコンパイラ)）、
+そのあと、SYCL のコンパイラを選んでエンジンをビルドし（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）、
 モデルをダウンロードして用意し、GPU のコードのコンパイルを済ませるために一度動かしてから、**モデルを起動します**。
 モデルは 60〜110 GB あるので、初回は時間がかかります。
 ダウンロードが途中で止まっても、次は続きから始めます。
@@ -951,10 +951,10 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 | `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[XE.ja.md](XE.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
-| `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[XE.ja.md](XE.ja.md#パッケージ)）。 |
-| `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、プロンプトの読み込みに約 1.6 倍の時間がかかります（[XE.ja.md](XE.ja.md#sycl-のコンパイラ)）。 |
+| `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
+| `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、プロンプトの読み込みに約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
 | 起動時に `alloc_device: ... refused` | B70 でまれに起きます（約 120 回の起動で 3 回）。もう一度起動すれば、たいていは動きます（[XE.ja.md](XE.ja.md#出力ヘッドの-vram-の確保が断られる)）。 |
 | Python やビルドの道具を入れられなかった | 示されたものを入れて、もう一度実行します。済んだことは残っていて、飛ばします。 |

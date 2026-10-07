@@ -7,7 +7,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 English | [日本語](DEVTOOLS.ja.md)
 
 The tools a developer installs to lint, check and measure XeStrata.
-What building and running it needs is in [XE.md](XE.md#setup).
+What building and running it needs is in [BUILD.md](BUILD.md#setup).
 Nothing here is needed to build, run or test the engine, and nothing here is bundled.
 The tools come from the distribution, or from their own projects into folders git ignores.
 The non-free ones (Intel SDE, VTune) come from Intel by hand.
@@ -49,12 +49,12 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/l
 
 ## intel/llvm from source
 
-The free build compiles the engine with intel/llvm's DPC++ ([XE.md](XE.md#build-and-run)).
+The free build compiles the engine with intel/llvm's DPC++ ([BUILD.md](BUILD.md#build-and-run)).
 Where the distribution has no DPC++, or one whose SYCL runtime reports no XMX for the GPU,
 `tools/intel_llvm_build.py` builds a release from source into `.tools/intel-llvm/`.
 An example of the latter is Ubuntu 26.04's 6.2 with the Arc Pro B70 (intel/llvm added the B70's XMX in v7.0.0).
 setup runs it for `--intel-llvm-build`;
-[XE.md](XE.md#the-sycl-compiler) describes how it reuses a finished build.
+[BUILD.md](BUILD.md#the-sycl-compiler) describes how it reuses a finished build.
 intel/llvm is free software (Apache-2.0 with LLVM exceptions) and builds with free software only.
 It needs these packages (on Fedora 44: `git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel python3`):
 
@@ -75,7 +75,7 @@ This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
 ### The contrib build (CUDA and HIP)
 
-The contrib build ([XE.md](XE.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
+The contrib build ([BUILD.md](BUILD.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
 `--contrib` builds the same clone with the CUDA target and, where ROCm's HIP is installed, HIP (AMD GPUs), into `.tools/intel-llvm-contrib/`.
 The CUDA target needs NVIDIA's CUDA toolkit, which is not free software (Ubuntu: multiverse; Debian: non-free).
 
