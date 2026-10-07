@@ -627,6 +627,7 @@ void usage() {
                  "                       window (2..8; a count that cannot run is a warning and fewer slots or none)\n"
                  "  --layer-split K[,K2..]|auto  --serve: the next GPU runs layers from K on (docs/MULTIGPU.md);\n"
                  "                       auto chooses K from what this PC measures, before loading\n"
+                 "  --gpu ADDR           the GPU by PCI address (domain:bus:device.function), as STRATA_GPU_PCI\n"
                  "  --split-device D[,D2..]  the GPU for each split point, by engine number or PCI address\n"
                  "                       (default: the other discrete GPUs)\n"
                  "  --batch-groups G     with a layer split: the --batch slots in G groups pipelined through the GPUs\n"
@@ -1088,6 +1089,11 @@ int main(int argc, char** argv) {
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
     }
+    // --gpu ADDR: the GPU by PCI address from the command line instead of the caller's environment (upstream #852).
+    // The runtime reads STRATA_GPU_PCI when it starts, so this has to happen before anything else; the option loop
+    // below consumes the value again.
+    for (int i = 1; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--gpu") { setenv("STRATA_GPU_PCI", argv[i + 1], 1); break; }
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
@@ -1236,6 +1242,7 @@ int main(int argc, char** argv) {
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
+        else if (a == "--gpu") (void) next("--gpu");   // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;

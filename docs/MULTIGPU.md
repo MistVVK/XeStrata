@@ -47,7 +47,7 @@ A saved file is read only by an engine with the same split points; `--layer-spli
 ## GPU numbers
 
 The engine numbers the GPUs it can drive from 0.
-0 is the GPU setup chose with `STRATA_GPU_PCI`.
+0 is the GPU setup chose with `STRATA_GPU_PCI` (`--gpu <PCI address>` does the same when you run the engine yourself; upstream #852).
 The rest follow in this order: GPUs that are not the processor's own graphics, then the most memory, then the most compute units.
 The processor's own graphics is used only when `--split-device` (setup: `--gpus`) names it.
 

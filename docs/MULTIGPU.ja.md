@@ -47,7 +47,7 @@ setup は最初の GPU を `"gpu_pci"` に、後の GPU を `"split_pci"` に PC
 ## GPU の番号
 
 エンジンが使える GPU に、0 から番号を付けます。
-0 は setup が `STRATA_GPU_PCI` で選んだ GPU です。
+0 は setup が `STRATA_GPU_PCI` で選んだ GPU です（エンジンを直接動かすときは `--gpu <PCI アドレス>` でも同じ、upstream #852）。
 残りは、CPU 内蔵でない GPU、メモリの多い GPU、計算ユニットの多い GPU の順です。
 CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定したときだけ使います。
 
