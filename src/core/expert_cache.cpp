@@ -35,6 +35,18 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         return false;
     }
     const uint32_t version = hdr[0], nl = hdr[1], ne = hdr[2], want = hdr[3], n_ranked = hdr[4];
+    // the version comes first: the fields after it are only known to be these in a version 1 file, so a later
+    // format is refused by its number rather than read as if it were this one
+    if (version != 1) {
+        std::fclose(f);
+        char buf[256];
+        std::snprintf(buf, sizeof buf,
+                      "read_expert_profile: %s is a version %u profile but this engine reads version 1 - it was "
+                      "written by a different release's tools/make_profile.py or --expert-profile-save",
+                      path.c_str(), version);
+        err = buf;
+        return false;
+    }
     if ((int64_t) nl != n_layers || (int64_t) ne != n_expert) {
         std::fclose(f);
         char buf[256];
@@ -69,7 +81,6 @@ bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_ex
         ranked[(size_t) i] = {l, e};
     }
     slots = (int64_t) want;
-    (void) version;   // a future format bumps it; the layout check above is what protects this reader today
     return true;
 }
 

@@ -523,6 +523,10 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --spec N             the MTP drafter's verify window: how many tokens it proposes per check (setup\n"
+                 "                       writes 4; --suffix-draft lets it grow by 2, up to 8, where a repeat is likely)\n"
+                 "  --spec-min-p P       how sure the draft layer must be to extend a verify window by another guess\n"
+                 "                       (setup writes 0.5; --calibrate measures it on this PC, see docs/DETAILS.md)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -3973,6 +3977,17 @@ int main(int argc, char** argv) {
             (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;
         }
+        // #669 / #765: a big chunk lends many cache slots to the prompt path, and each lent slot's expert is read back
+        // from the SSD whenever the RAM could not keep its copy (31 GB: auto:32768 read prompts ~3x slower than auto).
+        // Said, never capped: --prefill is the user's, and with the RAM for them it is the faster one (+21-35%).
+        if (lend_from >= 0 && o.prefill_chunk > 8192 && xcache.slots() > lend_from &&
+            src.resident_lent_slots() < xcache.slots() - lend_from)
+            std::fprintf(stderr, "strata generate: WARNING: a prompt chunk of %lld tokens lends %lld cache slots to the "
+                                 "prompt path, but only %lld of their experts fit in RAM: the others are read from the "
+                                 "SSD on every chunk, and prompts can read ~3x slower than with --prefill auto (#669). "
+                                 "A smaller --prefill, or auto, keeps them all in RAM\n",
+                         (long long) o.prefill_chunk, (long long) (xcache.slots() - lend_from),
+                         (long long) src.resident_lent_slots());
         std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
                      (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
         mem_mark("the resident experts");
@@ -4765,6 +4780,14 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded - LOW: requests may stall;"
                                      " add --vram-reserve-mib %lld to the config's args (or lower --max-context)\n",
                              (long long) free_mib, (long long) (o.vram_reserve_mib + 512 - free_mib));
+                // #781 / #831: an explicit --expert-cache N is a byte budget that is not checked against the VRAM once
+                // the slots are written (auto is), so on a card it fills a smaller N is the cure: a few hundred slots
+                // can be the difference between 14 and 100 tok/s under WDDM.  Said, never changed.
+                if (!auto_cache)
+                    std::fprintf(stderr, "strata serve: the expert cache was set with --expert-cache (%lld slots): a "
+                                         "smaller one - or --expert-cache auto, which checks the free VRAM once the "
+                                         "slots are written - leaves room; decode can be several times slower with the "
+                                         "card this full\n", (long long) xcache.slots());
             }
         }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)
