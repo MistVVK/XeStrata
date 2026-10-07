@@ -1,0 +1,34 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-libclc-target: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+libclc builds the AMD libspirv (libspirv-amdgcn--amdhsa.bc and its remangled variants, which the driver
+links into every AMD device image) only for the target amdgcn--amdhsa, which buildbot/configure.py
+passes, but that name is missing from the targets LIBCLC_TARGETS_TO_BUILD accepts, so the configuration
+refused it.  With amdgcn-amd-amdhsa instead the build had no libspirv for AMD GPUs and no SYCL program
+compiled for them ("cannot find remangled-l64-signed_char.libspirv-amdgcn-amd-amdhsa.bc").  Fixed,
+amdgcn--amdhsa is a known target.  The sycl branch has reorganized libclc's AMD target since
+(amdgcn-amd-amdhsa-llvm).
+---
+diff --git a/libclc/CMakeLists.txt b/libclc/CMakeLists.txt
+index d723fea52..a2c746f1e 100644
+--- a/libclc/CMakeLists.txt
++++ b/libclc/CMakeLists.txt
+@@ -175,6 +175,7 @@ endif()
+ # List of all targets. Note that some are added dynamically below.
+ set( LIBCLC_TARGETS_ALL
+   amdgcn--
++  amdgcn--amdhsa
+   amdgcn-amd-amdhsa
+   clspv--
+   clspv64--
+@@ -253,6 +254,7 @@ add_subdirectory( utils )
+ set( r600--_devices cedar cypress barts cayman )
+ set( amdgcn--_devices tahiti )
+ set( amdgcn-mesa-mesa3d_devices ${amdgcn--_devices} )
++set( amdgcn--amdhsa_devices none )
+ set( amdgcn-amd-amdhsa_devices none )
+ set( clspv--_devices none )
+ set( clspv64--_devices none )

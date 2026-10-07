@@ -160,8 +160,8 @@ def contrib_options() -> list:
     else:
         opts += ["--hip", "--hip-platform", "AMD", f"--cmake-opt=-DUR_HIP_ROCM_DIR={rocm[0]}",
                  f"--cmake-opt=-DUR_HIP_LIB_DIR={rocm[1]}"]
-        # v7.1.1's configure.py names the AMD target amdgcn--amdhsa, which libclc refuses (amdgcn-amd-amdhsa)
-        libclc.append("amdgcn-amd-amdhsa")
+        # the name libclc builds the AMD libspirv for (its list of known targets lacks it: the fix hip-libclc-target)
+        libclc.append("amdgcn--amdhsa")
     return opts + [f"--cmake-opt=-DLIBCLC_TARGETS_TO_BUILD={';'.join(libclc)}"]
 
 
@@ -198,15 +198,17 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed).
     # The links take the most memory: LLVM limits them by the free RAM at configure time (LLVM_RAM_PER_LINK_JOB, in
     # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
+    options = [f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
+               "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000"] + \
+        (contrib_options() if contrib else [])
+    # configured again when the tree was configured with other values of these options
     cache = BUILD / "CMakeCache.txt"
-    if not (BUILD / "build.ninja").exists() or not cache.exists() or \
-            "SYCL_UR_FORCE_FETCH_LEVEL_ZERO:BOOL=ON" not in cache.read_text(errors="replace") or \
-            "LLVM_ENABLE_ZSTD:STRING=FORCE_ON" not in cache.read_text(errors="replace") or \
-            "LLVM_RAM_PER_LINK_JOB:" not in cache.read_text(errors="replace"):
-        run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release",
-             f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
-             "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000"]
-            + (contrib_options() if contrib else []))
+    text = cache.read_text(errors="replace") if cache.exists() else ""
+    wanted = [o.removeprefix("--cmake-opt=-D").split("=", 1) for o in options if o.startswith("--cmake-opt=-D")]
+    if not (BUILD / "build.ninja").exists() or \
+            not all(any(line.startswith(name + ":") and line.endswith("=" + value) for line in text.splitlines())
+                    for name, value in wanted):
+        run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release"] + options)
     jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])

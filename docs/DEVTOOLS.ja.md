@@ -91,10 +91,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` が引く `librocthrust-dev` と、`nvidia-cuda-dev` が引く `libthrust-dev` が、どちらも `/usr/include/thrust` を持っていて衝突するためで、apt は片方を入れると、もう片方を消します。
   HIP には上の 4 つだけで足ります（rocThrust は要りません）。
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
-- v7.1.1 の `configure.py` は AMD の libclc の対象名を `amdgcn--amdhsa` としていて、libclc が受け付けないので、スクリプトが `amdgcn-amd-amdhsa` で上書きします。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 6 つで、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 7 つで、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -108,6 +107,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   6 つ目: ビルドの中の xptifw が LLVM の CMake の設定（`HandleLLVMOptions`）をもう一度読み込み、リンクのジョブプールを二重に定義していました。
   リンクの数を絞る（`LLVM_RAM_PER_LINK_JOB`）と、Ninja がビルドファイルを断って設定が失敗していました（`duplicate pool 'link_job_pool'`）。
   修正後は、プールを一度だけ定義します（`build-job-pools`）。ビルドだけの修正なので、できあがったツールチェーンの作り直しは求めません。
+  7 つ目: libclc は AMD 向けの libspirv を対象名 `amdgcn--amdhsa` でだけ作るのに、その名前を受け付ける対象の一覧に入れていませんでした。
+  別の名前（`amdgcn-amd-amdhsa`）で設定するとビルドは通るものの AMD 向けの libspirv がなく、AMD の GPU 向けの SYCL のプログラムはどれもコンパイルできませんでした。
+  修正後は `amdgcn--amdhsa` を受け付けます（`hip-libclc-target`。`sycl` ブランチでは libclc の AMD の対象の作りが変わっています）。
+- スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。

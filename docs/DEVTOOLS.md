@@ -91,10 +91,9 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `librocthrust-dev` (pulled in by `rocm-dev`) and `libthrust-dev` (pulled in by `nvidia-cuda-dev`) both carry `/usr/include/thrust` and conflict, so installing one makes apt remove the other.
   HIP needs only the four packages above (not rocThrust).
   Packages that came in automatically with `rocm-dev` become `apt autoremove` candidates once it is gone; mark them with `sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo`.
-- v7.1.1's `configure.py` names the AMD libclc target `amdgcn--amdhsa`, which libclc refuses; the script gives `amdgcn-amd-amdhsa` instead.
 - The script applies fixes the release lacks to the sources before building, as the patches in `third_party/main/intel-llvm/patches/` (`NN-<id>.patch`, in order; under intel/llvm's Apache-2.0 WITH LLVM-exception), and records their ids in `install/XESTRATA.json`.
   A build of the same release without them is offered a rebuild.
-  There are six fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-08).
+  There are seven fixes now, none fixed in intel/llvm's `sycl` branch either (2026-10-08).
   First, the CUDA and HIP adapters copied the table of sync points whole for every node they added to a command-buffer, so finalizing a SYCL graph took the square of its node count (a 2600-kernel graph: 90 ms on an RTX 4070, 4 ms fixed; Level Zero 2 ms).
   Second, the SYCL runtime gave every NVIDIA GPU the first NVIDIA image it found, whatever its architecture.
   With an executable carrying code for several architectures, a GPU older than that image did not run and a newer one ran older code.
@@ -108,6 +107,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Sixth, xptifw, built in the tree, includes LLVM's CMake settings (`HandleLLVMOptions`) a second time, which defined the link job pool twice.
   With the links limited (`LLVM_RAM_PER_LINK_JOB`), Ninja refused the build file and the configuration failed (`duplicate pool 'link_job_pool'`).
   Fixed, each pool is defined once (`build-job-pools`); a fix to the build only, it asks no finished toolchain to be built again.
+  Seventh, libclc builds the AMD libspirv only for the target name `amdgcn--amdhsa`, but left that name out of the targets it accepts.
+  Configured with another name (`amdgcn-amd-amdhsa`), the build went through without an AMD libspirv, and no SYCL program for AMD GPUs compiled.
+  Fixed, `amdgcn--amdhsa` is accepted (`hip-libclc-target`; the `sycl` branch has reorganized libclc's AMD target).
+- The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
