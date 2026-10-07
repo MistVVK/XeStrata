@@ -333,12 +333,17 @@ the pinned revisions and the checks are the same, and the MTP tensors come from 
 
 ### Tuning for your PC (`--calibrate`)
 
-Three engine settings depend on the PC more than on the model:
+Four engine settings depend on the PC more than on the model:
 
 - the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`):
   a fast PCIe link and a slower CPU want more, a laptop's narrower link less;
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
-- how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster.
+- how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster;
+  it also tries one fewer than the P-cores, and one fewer than one socket's cores on a 2-socket PC;
+- how busily the VRAM expert cache follows the conversation (`--adapt-every`, `--adapt-swaps`, `--adapt-decay`, upstream #907):
+  a PC whose CPU reads the missed experts slowly (DDR3, or DDR4 in few channels) gains from swapping more.
+  Upstream measured 160 swaps every window 7.9% faster than the default on a Xeon E5-2673 v3 with DDR3 and an RTX 4060 Ti on PCIe 3.0 x8.
+  This step measures 512-token answers.
 
 The defaults were measured by upstream on a Ryzen 5 7600 with an RTX 5070.
 Some have been measured again on the B70 ([XE.md](XE.md#upstream-settings-not-remeasured-on-xe)).
