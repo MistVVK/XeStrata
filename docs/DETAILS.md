@@ -328,6 +328,10 @@ Where the GPU's runtime has no virtual memory it is off and the cache stays as i
 
 setup's step 5 prints the folder it expects them in (`XeStrata-data/models/<SIZE>/`; upstream #495).
 Put them there with their original names, or point setup at them with `--gguf-dir`.
+To see what a file really holds before using or downloading it, `./setup.sh --inspect <file>` (upstream #911) reads only its headers (a few MB, also over the network).
+It shows every weight group's real bits per weight and storage types, and whether the file is one setup installs (under any name), stored like one of them, or not one XeStrata runs (another architecture, or experts in a format no kernel reads).
+It takes a file, a folder, a URL, `ms:owner/repo` (ModelScope) or `hf:owner/repo`, optionally followed by a variant name.
+A name says little: Unsloth's `UD-IQ3_XXS` stores its routed experts at 3.22 bits per weight, `UD-Q4_K_XL` at 5.10, the original `Q2_0` at 2.25 and `IQ3_S` at 3.33.
 To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`):
 the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
 

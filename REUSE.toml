@@ -39,6 +39,11 @@ SPDX-FileCopyrightText = "The LLVM project contributors"
 SPDX-License-Identifier = "Apache-2.0 WITH LLVM-exception"
 
 [[annotations]]
+path = ["third_party/main/quantscope/**"]
+SPDX-FileCopyrightText = "2026 1872183316 (https://github.com/1872183316/quantscope)"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
 path = ["third_party/main/outfit/**"]
 SPDX-FileCopyrightText = "2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)"
 SPDX-License-Identifier = "OFL-1.1"
