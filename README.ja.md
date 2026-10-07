@@ -104,6 +104,7 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
    - NVIDIA の GPU: NVIDIA のドライバー。行列積を速くする cuBLAS は、Ubuntu では multiverse の `libcublas-13-1`（cuda12.4 は `libcublas12`）、
      Fedora では NVIDIA の CUDA のリポジトリの `libcublas-13-4` です。
    - Intel の GPU の行列積を速くする oneMKL は、Intel の apt / dnf のリポジトリ（oneAPI）にあります。
+     リポジトリの追加のしかたは Intel の手順（[APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）にあります。
    - cuBLAS と oneMKL は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
 - NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
   V100 などの Volta を扱うドライバーは 580 の系列までです。
