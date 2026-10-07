@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Several GPUs (the layer split)
 
 The model's layers can be spread over two or more GPUs in one PC.

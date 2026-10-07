@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # Several requests at once (batch slots)
 
 By default XeStrata serves **one request at a time**: the others wait in the server's queue.

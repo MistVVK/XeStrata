@@ -1,3 +1,7 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # 複数の GPU で動かす（層の分割）
 
 1 台の PC にある 2 枚以上の GPU に、モデルの層を分けて載せます。

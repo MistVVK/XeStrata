@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
 # 複数の要求を同時に処理する（バッチスロット）
 
 既定では、XeStrata は**要求を 1 つずつ**処理し、ほかの要求はサーバーのキューで待ちます。
