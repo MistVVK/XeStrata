@@ -80,3 +80,22 @@ function(strata_hip_choose archs targets_out opts_out)
   set(${targets_out} "${targets}" PARENT_SCOPE)
   set(${opts_out} "${opts}" PARENT_SCOPE)
 endfunction()
+
+# ROCm's clang (AMD's tree's, or the distribution's ROCm one: Fedora's /usr/lib64/rocm/llvm, Ubuntu's
+# /usr/lib/llvm-<N>), for HIP's CMake package (HIP_CXX_COMPILER): it links clang's runtime builtins where that compiler
+# has them, and intel/llvm's install has none, so asked with intel/llvm's clang it named a file that is not there.  The
+# newest one whose builtins exist; empty when there is none.
+function(strata_hip_cxx out)
+  file(GLOB compilers /opt/rocm/llvm/bin/clang++ /opt/rocm/lib/llvm/bin/clang++ /usr/lib64/rocm/llvm/bin/clang++
+                      /usr/lib/llvm-*/bin/clang++)
+  list(SORT compilers COMPARE NATURAL ORDER DESCENDING)
+  foreach(cxx IN LISTS compilers)
+    execute_process(COMMAND "${cxx}" -print-libgcc-file-name --rtlib=compiler-rt
+                    OUTPUT_VARIABLE builtins OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE r)
+    if(r EQUAL 0 AND EXISTS "${builtins}")
+      set(${out} "${cxx}" PARENT_SCOPE)
+      return()
+    endif()
+  endforeach()
+  set(${out} "" PARENT_SCOPE)
+endfunction()

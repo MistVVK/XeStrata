@@ -432,14 +432,18 @@ if(STRATA_ENABLE_XE)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   endif()
 
-  # The contrib modes' dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath; XeStrata's
-  # fork) with its oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs
-  # (STRATA_CUDA_ARCHS); a GPU without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time,
-  # so the engine starts without the library of a GPU it does not use.
+  # The dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath; XeStrata's fork) with its
+  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS) in the
+  # contrib modes, and its rocBLAS backend for AMD GPUs (STRATA_HIP_ARCHS; rocBLAS and hipBLASLt are free software) in
+  # the free and contrib modes; a GPU without a backend takes XeStrata's own kernels.  oneMath opens the backends at run
+  # time, so the engine starts without the library of a GPU it does not use.
   set(STRATA_ONEMATH_SOURCE "" CACHE STRING
       "oneMath's source archive (a local file or URL) to build from (empty: fetch the pinned one of XeStrata's fork)")
-  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
-    if(NOT MKL_ROOT)
+  if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+    set(_strata_onemkl OFF)   # oneMKL is not free software
+  endif()
+  if(_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs)
+    if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
       elseif(EXISTS /opt/intel/oneapi/mkl/latest)
@@ -452,6 +456,12 @@ if(STRATA_ENABLE_XE)
     set(TARGET_DOMAINS blas)
     set(ENABLE_MKLCPU_BACKEND OFF)
     set(ENABLE_MKLGPU_BACKEND ${_strata_onemkl})
+    if(_strata_hip_archs)
+      # the backend's own GPU code takes one architecture (the products themselves run inside rocBLAS and hipBLASLt)
+      set(ENABLE_ROCBLAS_BACKEND ON)
+      list(GET _strata_hip_archs 0 HIP_TARGETS)
+      strata_hip_cxx(HIP_CXX_COMPILER)
+    endif()
     if(_strata_cuda_archs AND _strata_cuda_cublas)
       set(ENABLE_CUBLAS_BACKEND ON)
       # the backend's own GPU code for the oldest architecture, which every NVIDIA GPU here runs (its default, sm_75's
@@ -478,6 +488,10 @@ if(STRATA_ENABLE_XE)
     # the cuBLAS backend's own GPU code in the same PTX version: this directory's options while oneMath is added
     get_directory_property(_strata_copts COMPILE_OPTIONS)
     get_directory_property(_strata_lopts LINK_OPTIONS)
+    if(_strata_hip_opts)   # ROCm's device libraries, for the rocBLAS backend's own GPU code
+      add_compile_options(${_strata_hip_opts})
+      add_link_options(${_strata_hip_opts})
+    endif()
     if(_strata_cuda_base_opts)
       add_compile_options(${_strata_cuda_base_opts})
       add_link_options(${_strata_cuda_base_opts})
@@ -510,8 +524,9 @@ if(STRATA_ENABLE_XE)
     endif()
   endif()
 
-  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes (above) and XeStrata's own
-  # kernels in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in the first Xe port).
+  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes and on AMD GPUs (above) and
+  # XeStrata's own kernels elsewhere in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in
+  # the first Xe port).
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
