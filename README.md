@@ -110,7 +110,9 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
    - cuBLAS and oneMKL are not free software; without them XeStrata's own kernels do the work.
 - An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
   The drivers for Volta (a V100) end with the 580 series.
-- The package files are made as [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages) describes.
+- The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
+  The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
+  To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).
 
 **2. Install it.** apt or dnf installs what it needs.
 

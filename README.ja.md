@@ -107,7 +107,9 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
    - cuBLAS と oneMKL は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
 - NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
   V100 などの Volta を扱うドライバーは 580 の系列までです。
-- パッケージのファイルは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
+- パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
+  一緒にある `SHA256SUMS` で、取ってきたファイルを確かめられます（`sha256sum -c SHA256SUMS --ignore-missing`）。
+  自分で作るときは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
 
 **2. 入れます。** 足りない依存は apt や dnf が入れます。
 
