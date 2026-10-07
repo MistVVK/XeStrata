@@ -420,16 +420,36 @@ def pci_name(vendor: int, device: int) -> str:
 
 def host_link(dev: Path):
     """The PCIe link between the card and the CPU, from sysfs: that of the first device below the root port.  A B70
-    sits behind its own switch, whose inner links report 2.5 GT/s x1."""
+    sits behind its own switch, whose inner links report 2.5 GT/s x1.  Upstream #912: the card's and the board's top
+    speeds when they differ (the root port is the board's end), and a note when the link has fewer lanes now than both
+    ends have."""
     parts = dev.resolve().parts
     i = next((k for k, x in enumerate(parts) if x.startswith("pci")), None)
     if i is None or len(parts) < i + 3:
         return None
-    top = Path(*parts[:i + 3])
+    root, top = Path(*parts[:i + 2]), Path(*parts[:i + 3])
+
+    def read(d: Path, name: str) -> str:
+        return (d / name).read_text(encoding="utf-8").strip()
+
     try:
-        return f"{(top / 'current_link_speed').read_text().strip()} x{(top / 'current_link_width').read_text().strip()}"
+        line = f"{read(top, 'current_link_speed')} x{read(top, 'current_link_width')}"
     except OSError:
         return None
+    try:
+        card, board = read(top, "max_link_speed"), read(root, "max_link_speed")
+        if card != board:
+            line += f" (the card supports {card}, the board {board})"
+        width, most = int(read(top, "current_link_width")), min(int(read(top, "max_link_width")),
+                                                                int(read(root, "max_link_width")))
+        if width < most:
+            # read now: some cards and laptops narrow the link while idle - a hint, not a verdict
+            line += (f"; {width} of {most} lanes right now (some cards narrow the link when idle). If it stays "
+                     "narrow under load: is the card in the slot wired x16, fully seated, not sharing lanes with an "
+                     "M.2 drive?")
+    except (OSError, ValueError):
+        pass
+    return line
 
 
 def nvidia_smi() -> dict:
