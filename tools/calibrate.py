@@ -86,6 +86,42 @@ def worker_candidates(default: int, extra=()) -> list[int]:
     return c
 
 
+def _cpulist(text: str) -> set:
+    """A kernel cpulist ("0-7,16") as a set of CPU numbers."""
+    out: set[int] = set()
+    for part in text.strip().split(","):
+        lo, _, hi = part.strip().partition("-")
+        if lo.isdigit():
+            out.update(range(int(lo), int(hi or lo) + 1))
+    return out
+
+
+def host_worker_extras(sys_root: str = "/sys") -> list[int]:
+    """P-cores - 1 (hybrid CPU) and one socket's cores - 1 (several sockets) of this PC: more counts to try (upstream
+    3772ded7).  From what the kernel reports: Intel's hybrid PMU lists (devices/cpu_core/cpus) name the P-cores' CPUs,
+    and each CPU's topology its socket and core; nothing is assumed of a model."""
+    try:
+        cpus = {}
+        for d in (Path(sys_root) / "devices" / "system" / "cpu").glob("cpu[0-9]*"):
+            top = d / "topology"
+            if top.is_dir():
+                cpus[int(d.name[3:])] = ((top / "physical_package_id").read_text(encoding="utf-8").strip(),
+                                         (top / "core_id").read_text(encoding="utf-8").strip())
+        out = []
+        p_list = Path(sys_root) / "devices" / "cpu_core" / "cpus"
+        if p_list.is_file() and (Path(sys_root) / "devices" / "cpu_atom" / "cpus").is_file():
+            p_cores = {cpus[c] for c in _cpulist(p_list.read_text(encoding="utf-8")) if c in cpus}
+            if p_cores:
+                out.append(len(p_cores) - 1)
+        sockets = {pkg for pkg, _ in cpus.values()}
+        if len(sockets) >= 2:
+            first = min(sockets)
+            out.append(len({core for pkg, core in cpus.values() if pkg == first}) - 1)
+        return out
+    except (OSError, ValueError):
+        return []
+
+
 def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
@@ -137,7 +173,7 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say)
+    return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras())
 
 
 def engine_args(cfg: dict) -> list[str]:
