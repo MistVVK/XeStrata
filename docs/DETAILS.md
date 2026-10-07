@@ -363,6 +363,8 @@ Some have been measured again on the B70 ([XE.md](XE.md#upstream-settings-not-re
 setup offers to measure them on your PC after an install; `./setup.sh --calibrate` does it any time.
 It measures the output speed with each setting and keeps one only when it is more than 3% faster.
 The result is remembered per PC and model in the settings file, so updates keep it.
+Measuring the worker count needs a fresh engine, so the model is loaded more than once, and the PC can stop responding for a minute or two each time (upstream #1197).
+When it finishes it starts the model (not with `--no-start`): do not start it a second time.
 
 ### Chat in the terminal
 
