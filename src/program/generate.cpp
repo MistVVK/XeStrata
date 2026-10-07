@@ -127,6 +127,20 @@ using Clock = std::chrono::steady_clock;
 // With a layer split, `host_res` holds slot numbers of WHICHEVER cache owns the layer, so the copy back reads the
 // owning card's cache on that card's stream: `locate(layer)` names them (upstream fe9c10ca: reading a later stage's
 // slot number out of the first card's cache put another expert's bytes in RAM, and the answers turned to garbage).
+// Upstream #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tier leaves an expert a helper GPU holds out of the
+// primary's promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache
+// (RemoteExperts::holds), so an expert the helper's tier swaps in or out later is followed.
+bool helper_holds(const strata::core::ExpertDispatch& d, int64_t layer, int32_t expert) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DISJOINT_ADAPT");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!on) return false;
+    for (int r = 0; r < d.remote_count; ++r)
+        if (d.remote[r]->holds(layer, expert)) return true;
+    return false;
+}
+
 struct SwapHome {
     strata::core::ExpertCache* cache;
     strata::gpu::Stream stream;
@@ -4792,7 +4806,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(drive.d, l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -7468,7 +7482,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !helper_holds(drive.d, l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
