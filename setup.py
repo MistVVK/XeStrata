@@ -2692,7 +2692,7 @@ def main() -> int:
         any_fits = False
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
-            vram = gpu_expert_vram(gpu)
+            vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
             if d.get("budget"):
                 fits = f"fits with {resident_budget_gib(m, ram)} GiB of its experts in RAM, the rest read from the SSD"
                 verdict = ("EXPERIMENTAL, " if d.get("experimental") else "") + fits if ram >= d["ram_gb"] \
@@ -2733,7 +2733,9 @@ def main() -> int:
                    key=lambda m: bool(MODELS[m].get("experimental")))
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
-    vram = gpu_expert_vram(gpu)
+    # the VRAM that holds experts instead of RAM: every card of a layer split holds its own layers' (upstream #642),
+    # each less the ~5 GB of dense weights and buffers low_ram_gpu_gb counts once
+    vram = gpu_expert_vram(gpu) + sum(max(0.0, gpu_expert_vram(gpu_info(i)) - 5) for i in sel[1:])
     for i, m in enumerate(names, 1):
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
