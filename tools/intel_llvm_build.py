@@ -102,7 +102,9 @@ def missing_prerequisites() -> list:
         need.append("libhwloc-dev")
     # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without
     # the headers the configuration leaves zstd out silently
-    if not Path("/usr/include/zstd.h").exists():
+    # and links them statically (LLVM_USE_STATIC_ZSTD): Debian's libzstd-dev has libzstd.a, Fedora's is libzstd-static
+    if not Path("/usr/include/zstd.h").exists() or not any(
+            Path(d, "libzstd.a").exists() for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/lib")):
         need.append("libzstd-dev")
     return need
 
@@ -134,13 +136,14 @@ def finished():
 
 
 def rocm_dirs() -> tuple | None:
-    """ROCm's HIP for the HIP target: AMD's own tree (/opt/rocm) or the distribution's (Debian and Ubuntu put the
-    headers in /usr/include, the libraries in the multiarch folder)."""
+    """ROCm's HIP for the HIP target: AMD's own tree (/opt/rocm) or the distribution's (the headers in /usr/include,
+    the libraries in Debian's and Ubuntu's multiarch folder or Fedora's /usr/lib64)."""
     if Path("/opt/rocm/include/hip/hip_runtime_api.h").exists():
         return Path("/opt/rocm"), Path("/opt/rocm/lib")
     if Path("/usr/include/hip/hip_runtime_api.h").exists():
-        for lib in sorted(Path("/usr/lib").glob("*/libamdhip64.so")):
-            return Path("/usr"), lib.parent
+        for lib in [*sorted(Path("/usr/lib").glob("*/libamdhip64.so")), Path("/usr/lib64/libamdhip64.so")]:
+            if lib.exists():
+                return Path("/usr"), lib.parent
     return None
 
 
