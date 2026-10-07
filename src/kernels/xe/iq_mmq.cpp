@@ -41,15 +41,23 @@ using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte acc
 
 // The tile shape (NVIDIA's int8 one on a warp; the only one written for so far) and the K step.
 constexpr int TM = 16, TN = 16, TK = 16, SG = 32;
-constexpr int NE = TM * TN / SG;      // accumulator elements a lane
+[[maybe_unused]] constexpr int NE = TM * TN / SG;   // accumulator elements a lane (the layout check)
 constexpr int KC = 128;               // K a step: four blocks of 32
 constexpr int NB = KC / 32;
 constexpr int LDA = KC + 16;          // local row strides in bytes (16-byte multiples, rows apart in the banks)
 constexpr int LDB = KC + 16;
 
+// AMD's device compile has joint_matrix on CDNA's matrix cores only, not for this shape: the matrix bodies are left out
+// (their types do not depend on a template parameter, so `if constexpr` alone does not drop them)
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#define STRATA_IQ_MMQ_MATRIX 0
+#else
+#define STRATA_IQ_MMQ_MATRIX 1
+#endif
+
 template<int S>
 constexpr bool built() {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#if !STRATA_IQ_MMQ_MATRIX
     return false;
 #else
     return STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= 720;   // int8 on NVIDIA's tensor cores from sm_72 on
@@ -254,6 +262,7 @@ struct Kernel {
         if constexpr (!built<TY>()) {
             (void) it;
         } else {
+#if STRATA_IQ_MMQ_MATRIX
             const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -347,6 +356,7 @@ struct Kernel {
                     }
                     sycl::group_barrier(sg);
                 }
+#endif
         }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
@@ -410,6 +420,7 @@ struct LayoutCheck {
         if constexpr (!built<0>()) {
             (void) it;
         } else {
+#if STRATA_IQ_MMQ_MATRIX
             const auto sg = it.get_sub_group();
             const int lid = (int) it.get_local_id(0);
             for (int i = lid; i < TM * TN; i += SG) { pi[i] = i; pf[i] = (float) i; }
@@ -423,6 +434,7 @@ struct LayoutCheck {
             bad |= n != NE;
             bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
             if (lid == 0) *out = bad ? 0 : 1;
+#endif
         }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
