@@ -6,8 +6,8 @@
 #   tools/package/build.sh ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]
 #   tools/package/build.sh fedora44    free|cuda13.4          [COMMIT]
 #
-# XESTRATA_JOBS=N compiles N files at once in every build in the container (default: as many as the threads, intel/llvm
-# at most one per 3 GB of RAM).
+# XESTRATA_JOBS=N compiles N files at once in every build in the container (default: as many as the threads;
+# intel/llvm's links as many as the free RAM allows).
 #
 # The input is the commit alone (git archive; HEAD unless named, and then the work tree must be clean): nothing of
 # the work tree's builds goes in.  The container starts from the distribution's image (its digest below), installs

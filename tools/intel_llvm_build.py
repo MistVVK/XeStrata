@@ -195,16 +195,19 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
     fix_sources()
     # The configuration downloads what its release pins (Level Zero's headers and loader: the runtime adapter needs
     # newer ones than Ubuntu 26.04's 1.28; emhash), all free software; giving it the distribution's failed.  Forced:
-    # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed)
+    # without pkg-config the adapter takes an installed loader without checking its version (Debian 13's 1.20 failed).
+    # The links take the most memory: LLVM limits them by the free RAM at configure time (LLVM_RAM_PER_LINK_JOB, in
+    # MB; 10000 is the value llvm/docs/CMake.rst suggests), and every other job runs on all the threads
     cache = BUILD / "CMakeCache.txt"
     if not (BUILD / "build.ninja").exists() or not cache.exists() or \
             "SYCL_UR_FORCE_FETCH_LEVEL_ZERO:BOOL=ON" not in cache.read_text(errors="replace") or \
-            "LLVM_ENABLE_ZSTD:STRING=FORCE_ON" not in cache.read_text(errors="replace"):
+            "LLVM_ENABLE_ZSTD:STRING=FORCE_ON" not in cache.read_text(errors="replace") or \
+            "LLVM_RAM_PER_LINK_JOB:" not in cache.read_text(errors="replace"):
         run([sys.executable, SRC / "buildbot" / "configure.py", "-o", BUILD, "-t", "Release",
              f"--cmake-opt=-DCMAKE_INSTALL_PREFIX={INSTALL}", "--cmake-opt=-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON",
-             "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON"]
+             "--cmake-opt=-DLLVM_ENABLE_ZSTD=FORCE_ON", "--cmake-opt=-DLLVM_RAM_PER_LINK_JOB=10000"]
             + (contrib_options() if contrib else []))
-    jobs = jobs or max(2, min(os.cpu_count() or 4, int(ram_gb() // 3)))
+    jobs = jobs or os.cpu_count() or 4
     started = time.time()
     run([sys.executable, SRC / "buildbot" / "compile.py", "-o", BUILD, "-j", str(jobs)])
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -216,16 +219,6 @@ def build(tag: str, keep_build: bool, contrib: bool, jobs: int | None = None) ->
                                   "gpus": gpus}, indent=1))
     if not keep_build:
         shutil.rmtree(BUILD, ignore_errors=True)
-
-
-def ram_gb() -> float:
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                return int(line.split()[1]) / 1024 / 1024
-    except OSError:
-        pass
-    return 16.0
 
 
 def version_key(tag: str) -> tuple:
@@ -242,7 +235,7 @@ def main() -> None:
     ap.add_argument("--keep-build", action="store_true", help="keep the build tree for the next update")
     ap.add_argument("--yes", action="store_true", help="answer the questions with their defaults")
     ap.add_argument("--jobs", type=int, metavar="N",
-                    help="compile N files at once (default: the threads, at most one per 3 GB of RAM)")
+                    help="compile N files at once (default: the threads; the links as many as the free RAM allows)")
     a = ap.parse_args()
     if a.contrib:
         set_out(ROOT / ".tools" / "intel-llvm-contrib")

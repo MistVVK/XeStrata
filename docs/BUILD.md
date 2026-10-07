@@ -362,7 +362,7 @@ tools/package/build.sh fedora44 cuda13.4
   for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
-  `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads, intel/llvm at most one per 3 GB of RAM).
+  `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - **No GPU needed**: the container gets no GPU and nothing of this PC's.
   CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
   `STRATA_CUDA_PTX`, and `STRATA_PORTABLE=OFF`) are refused with `STRATA_PACKAGE=ON`; `build.sh` sets them all.

@@ -364,7 +364,7 @@ tools/package/build.sh fedora44 cuda13.4
   コンテナの中でビルドの道具を入れ、intel/llvm（`tools/intel_llvm_build.py`、cuda の版では CUDA のターゲット付き）、
   画像のエンコーダー（CPU と Vulkan）、エンジンをビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
-  `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数、intel/llvm は RAM 3 GB あたり 1 まで）。
+  `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数。intel/llvm のリンクは、空いている RAM に収まる数まで）。
 - **GPU なしでビルドできます**: コンテナには GPU も手元の PC のものも渡しません。
   手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
   `STRATA_PORTABLE=OFF`）は、`STRATA_PACKAGE=ON` では断ります。`build.sh` がすべて指定します。
