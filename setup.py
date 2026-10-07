@@ -2811,6 +2811,9 @@ def main() -> int:
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
+        if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; upstream #625)
+            say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
+                "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")

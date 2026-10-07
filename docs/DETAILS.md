@@ -930,6 +930,14 @@ The default is no minimum.
 A higher minimum changes the image answers and takes longer to encode (the CPU of an i7-14700, 14 threads: a 512x384 picture as 192 tokens in 0.9 s, with `--min-tokens 256` as 266 tokens in 1.5 s).
 A setup run again keeps the value.
 
+**A Q8_0 encoder** (upstream #625): `"mmproj"` in the `"vision"` section can point to another mmproj file of this model, for example a Q8_0 one (`llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0` makes one).
+The file is smaller (590 MiB against 865 MiB for the BF16 one), the encoder takes about 280 MiB less RAM on the CPU, and at the default 300 tokens it can encode faster than BF16.
+It is the one to use with `--vision cpu`.
+Setup downloads the BF16 file, and a setup run again keeps a file of your own that still exists.
+Against BF16, upstream reports a cosine of the embeddings per image token of 0.997-0.999 on average (at 300, 768 and 1,024 tokens), 0.94-0.96 for the worst token.
+Above 768 tokens the encode time is within about 3% of BF16's.
+XeStrata has not measured its accuracy (`unverified`).
+
 **Flash attention in the CPU encoder** (upstream #660): ggml's fast CPU kernel for flash attention needs the encoder's head size (72) to be a multiple of the vector width.
 It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a kernel several times slower that adds in FP16.
 `strata-vision` therefore turns flash attention off in a CPU build whose ggml has AVX-512, and leaves it at `auto` (on) otherwise.
