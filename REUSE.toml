@@ -18,7 +18,7 @@ SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 Mis
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
 [[annotations]]
-path = ["cmake/BUILD.json.in"]
+path = ["cmake/BUILD.json.in", ".claude/skills/**/SKILL.md"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
