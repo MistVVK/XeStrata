@@ -2991,6 +2991,13 @@ int main(int argc, char** argv) {
             used += b;
             sized_slots.push_back((int64_t) lay.blob_bytes(pr.first));
         }
+        // upstream #831: the sized-slots loop walks the profile's pairs, so the profile's length is the ceiling; an
+        // explicit --expert-cache above it used to be cut with no word.  A warning only (the allocation is the same).
+        if (!auto_cache && o.expert_cache > 0 && sized_slots.size() == profile.size() && (size_t) o.expert_cache > profile.size())
+            std::fprintf(stderr, "strata generate: WARNING: --expert-cache %d is more than the %zu pairs of the profile %s: "
+                                 "%zu slots (the profile is the ceiling on a native pack; a profile that ranks every "
+                                 "(layer, expert) pair lifts it - tools/make_profile.py)\n", o.expert_cache,
+                         profile.size(), o.expert_profile.c_str(), profile.size());
         o.expert_cache = (int) sized_slots.size();
     }
     if (o.expert_cache > 0) {
@@ -3171,9 +3178,21 @@ int main(int argc, char** argv) {
                 sized.push_back((int64_t) lay.max_blob);
             }
         }
-        if (sized.empty() ||
-            !(native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
-                          : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err))) {
+        // upstream #841: a stage's cache can fail to open with the VRAM free (the free figure ran high): it is tried
+        // again with 90% of the slots, up to 3 times, each try said.  Nothing changes when the first open works.
+        bool stage_open = false;
+        for (int attempt = 0; !sized.empty(); ++attempt) {
+            stage_open = native_pack ? st.cache.open_sized(sized, g.n_layers, g.n_expert, err)
+                                     : st.cache.open((int64_t) sized.size(), g.n_layers, g.n_expert, (int64_t) lay.max_blob, err);
+            if (stage_open || attempt >= 3) break;
+            const size_t keep = sized.size() * 9 / 10;
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s; trying %zu of %zu slots "
+                                 "(try %d of 3)\n", st.dev, err.c_str(), keep, sized.size(), attempt + 1);
+            if (keep == 0) break;
+            st.cache.close();
+            sized.resize(keep);
+        }
+        if (!stage_open) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d expert cache: %s\n", st.dev,
                          sized.empty() ? ("no room (" + std::to_string(room >> 20) + " MiB left after the reserve; on a "
                                           "GPU without memory of its own the RAM the expert arena holds is gone)")
