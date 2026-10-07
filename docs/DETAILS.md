@@ -434,6 +434,7 @@ Parked and saved conversations carry the draft layer's K/V, so without `--mtp` t
 ## Using it
 
 The server listens on `http://127.0.0.1:8095` (change it with `--port` in setup, or in the run script).
+To switch between it and other model servers behind one address, see [LLAMA_SWAP.md](LLAMA_SWAP.md).
 
 | API | Endpoint |
 | --- | --- |
