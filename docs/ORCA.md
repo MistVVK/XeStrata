@@ -46,7 +46,8 @@ Python needs numpy, regex and that llama.cpp's gguf-py (`STRATA_GGUF_PY` can poi
 Use this model's own tokenizer, exported into the pack.
 Do not share another model's `dense.bin`, and do not rename the Orca files to pass them off as one of setup's GSQ-RCO models.
 
-The persistent server also needs the MTP runtime, prepared with the existing tools:
+The persistent server also uses the MTP runtime (optional: without it the drafts come from lookup only), prepared
+with the existing tools:
 
 ```sh
 .venv/bin/python tools/mtp_fetch.py fetch --out mtp

@@ -405,6 +405,11 @@ When the start stops with "the draft head does not fit", the engine says how muc
 and the server's start error repeats it.
 setup suggests `--draft-vocab en` on cards under 14 GB; it is only a suggestion, nothing changes unless you pass it.
 
+The server also runs without `--mtp` (upstream 3216d271).
+The drafts then come from the suffix and prompt lookup only (one token a round when neither fires), and every token is still verified against the model.
+The draft layer's VRAM (about 0.7-1 GiB with its head) goes to the expert cache: 1,000 to 1,678 slots in upstream's comparison on an 8 GB card.
+Parked and saved conversations carry the draft layer's K/V, so without `--mtp` the conversation cache's parking, `--conversation-save` and the session files are off.
+
 ---
 
 ## Using it
