@@ -936,6 +936,11 @@ std::string Verifier::profile_report() {
 
 bool Verifier::capture(int T, std::string& err) {
     if (exec_[T] != nullptr || !segs_[T].empty()) return true;
+    {   // said before the capture: a process that exits inside it leaves this line as the trace (upstream 0f931943)
+        size_t free_b = 0, total_b = 0;
+        if (strata::gpu::mem_info(&free_b, &total_b))
+            std::fprintf(stderr, "strata verify: capturing the %d-token window (%zu MiB of VRAM free)\n", T, free_b >> 20);
+    }
     if (!strata::gpu::begin_capture(cs_)) {
         err = "verify: begin capture failed";
         return false;
