@@ -96,10 +96,13 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel only (with free software only) | `xestrata-free` | `xestrata-free` |
-| Intel and NVIDIA (Turing or later) | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA's Volta (a V100, for example) | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
+| Intel (with free software only) | `xestrata-free` | `xestrata-free` |
+| Intel (for speed), NVIDIA (Turing or later), or both | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| NVIDIA's Volta (a V100, for example), or Intel and Volta | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
+- Every contrib package runs on both Intel and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
+- On a PC with Intel GPUs only, take a contrib package and oneMKL for speed.
+  oneMKL then does the prompt's dense matrix products, a little faster than XeStrata's own kernels (about 3% on a B70).
 - No package requires a GPU maker's driver or library.
   The free package recommends Intel's GPU runtime (Level Zero; recommendations are installed by default).
   The contrib packages only suggest the makers' ones and install none of them: install those of the GPU you use.

@@ -93,10 +93,13 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel だけ（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
-| Intel と NVIDIA（Turing 以降） | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA の Volta（V100 など） | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
+| Intel（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
+| Intel（速さを重視する）、NVIDIA（Turing 以降）、その両方 | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| NVIDIA の Volta（V100 など）、Intel と Volta の両方 | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
+- contrib の版は、どれも Intel と NVIDIA の両方の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
+- Intel の GPU だけの PC でも、速さを重視するなら contrib の版と oneMKL を入れます。
+  プロンプトの密な行列積を oneMKL で計算し、XeStrata 自身のカーネルより少し速くなります（B70 で 3% ほど）。
 - どのパッケージも、GPU のメーカーのドライバーやライブラリを必須にはしません。
   free の版は Intel の GPU のランタイム（Level Zero）を推奨（Recommends、既定で入ります）にします。
   contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。使う GPU のものだけを入れます。
