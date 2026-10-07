@@ -73,6 +73,10 @@ Environment variables change the model's assumptions:
 | `STRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
 | `STRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
 
+`--vram-reserve-later-mib N` is the VRAM left free on the second and later GPUs (default: `--vram-reserve-mib`'s value; upstream 5c4105c0).
+The GPU that drives the monitors needs more headroom than one that drives none.
+With the monitors on the last GPU, `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first GPU's cache that VRAM.
+
 ## Decoding several conversations
 
 With `--batch N` ([BATCHING](BATCHING.md)) and a layer split, every GPU keeps the slots' sessions of its own layers.

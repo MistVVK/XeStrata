@@ -73,6 +73,10 @@ CPU 内蔵の GPU は、`--split-device`（setup では `--gpus`）で指定し�
 | `STRATA_SPLIT_MASS_EXP` | 0.8 | よく使われる順で r 番目のエキスパートが使われる割合を (r+1)^-a としたときの a |
 | `STRATA_SPLIT_CPU_GBPS` | 測った値 | CPU が RAM を読む速さ（GB/s） |
 
+`--vram-reserve-later-mib N` は、2 枚目以降の GPU に残す VRAM です（既定は `--vram-reserve-mib` と同じ、upstream 5c4105c0）。
+モニターをつないだ GPU は、つないでいない GPU より多くの余裕が要ります。
+モニターが最後の GPU にあるなら、`--vram-reserve-mib 300 --vram-reserve-later-mib 1800` で、最初の GPU のキャッシュにその VRAM を回せます。
+
 ## まとめてデコードするとき
 
 `--batch N`（[BATCHING](BATCHING.ja.md)）と層の分割を一緒に使うと、各 GPU は自分の層のスロットのセッションを持ちます。

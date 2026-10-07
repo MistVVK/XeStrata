@@ -310,6 +310,9 @@ struct Options {
     /// command can give part of it back to other programs and take it again.  Off: one allocation.
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
+    /// `--vram-reserve-later-mib N`: the reserve on a layer split's later cards (default: the same as the first).
+    /// A card that drives no display needs less than the one the monitors are on.
+    int vram_reserve_later_mib = -1;
     /// Plan v0.3 P5: batched prompt processing in chunks of this many tokens (0 = the token path).
     int64_t prefill_chunk = 0;
     /// `--prefill auto`: the largest chunk (up to 32768, not past --max-context) whose buffers the expert cache can
@@ -1163,6 +1166,8 @@ int main(int argc, char** argv) {
             o.vram_reserve_mib = (int) std::strtol(next("--vram-reserve-mib"), nullptr, 10);
             o.vram_reserve_given = true;
         }
+        else if (a == "--vram-reserve-later-mib")
+            o.vram_reserve_later_mib = (int) std::strtol(next("--vram-reserve-later-mib"), nullptr, 10);
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -1862,7 +1867,9 @@ int main(int argc, char** argv) {
                                      ? (int64_t) strata::prefill::Prefill::bytes_needed(ga, s_ctx, o.prefill_chunk) : 0;
         }
         auto cap_of = [&](int i, int64_t lo, int64_t hi, bool last) -> int64_t {
-            const int64_t reserve = ((int64_t) o.vram_reserve_mib + (i > 0 ? 1024 : 0)) << 20;
+            const int64_t base_reserve =   // --vram-reserve-later-mib: the later cards' own reserve (upstream 5c4105c0)
+                i > 0 && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+            const int64_t reserve = (base_reserve + (i > 0 ? 1024 : 0)) << 20;
             const int64_t sess = (int64_t) strata::core::session_bytes(ga, o.max_context, Ka, lo, hi) *
                                  (1 + std::max(o.batch, 0));
             const int64_t c = free0[(size_t) i] - reserve - (int64_t) weights_of(lo, hi) - sess - prompt[(size_t) i] -
@@ -2791,7 +2798,9 @@ int main(int argc, char** argv) {
         const bool own = o.no_prefill_borrow || o.expert_profile.empty();
         const int64_t pf = o.prefill_chunk > 0 && own
                                ? (int64_t) strata::prefill::Prefill::bytes_needed(g, s, o.prefill_chunk) : 0;
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + (later ? 1024 : 0)) << 20) + pf;
+        const int64_t base_reserve =
+            later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+        const int64_t reserve = ((base_reserve + (later ? 1024 : 0)) << 20) + pf;
         return std::max<int64_t>((int64_t) fb - reserve, 0);
     };
     for (size_t i = 0; i < split_at.size(); ++i)
