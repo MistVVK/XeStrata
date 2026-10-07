@@ -2562,6 +2562,7 @@ def main() -> int:
         fail("this CPU has no AVX2; Strata needs at least AVX2")
     if a.check:
         say()
+        any_fits = False
         for m, d in MODELS.items():
             verdict = "fits" if ram >= d["ram_gb"] else "tight" if ram >= d["ram_gb"] - 8 else "does not fit"
             vram = gpu_expert_vram(gpu)
@@ -2573,7 +2574,14 @@ def main() -> int:
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}% of its "
                            "experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, vram)
                                           else "the rest is read from the SSD as needed)"))
+            any_fits = any_fits or not verdict.startswith("does not fit")
             say(f"  {m:10s} needs ~{d['ram_gb']} GB RAM: {verdict}")
+        if not any_fits:
+            # upstream #977: every size says "does not fit", so the verdict says so too (and the exit code, for
+            # scripts). It only reports: --model NAME --yes still installs one anyway.
+            say(f"\nThis PC cannot run Strata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
+                f"{need} GB). --model NAME --yes installs one anyway, slowly.")
+            return 1
         say("\nThis PC can run Strata. Run it again without --check to install.")
         return 0
 
