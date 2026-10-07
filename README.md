@@ -37,7 +37,7 @@ How it differs from Strata:
 
 | | |
 | --- | --- |
-| GPU | Intel Arc (A series, B series), or an NVIDIA GPU with tensor cores (Volta or later). 12 GB of VRAM or more is recommended (less works, but slower). |
+| GPU | Intel Arc (A series, B series), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
@@ -98,7 +98,7 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 | --- | --- | --- |
 | Intel (with free software only) | `xestrata-free` | `xestrata-free` |
 | Intel (for speed), NVIDIA (Turing or later), or both | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA's Volta (a V100, for example), or Intel and Volta | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
+| NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), or Intel and those | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
 - Every contrib package runs on both Intel and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
 - On a PC with Intel GPUs only, take a contrib package and oneMKL for speed.
@@ -113,7 +113,7 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
      Intel's guides show how to add them ([APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
    - cuBLAS and oneMKL are not free software; without them XeStrata's own kernels do the work.
 - An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
-  The drivers for Volta (a V100) end with the 580 series.
+  The drivers for Pascal and Volta (a P100, P40 or V100) end with the 580 series.
 - The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
   The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
   To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).

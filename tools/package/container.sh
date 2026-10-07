@@ -17,9 +17,9 @@ cuda_ver=${variant#cuda}
 pkgname=xestrata-$variant
 [ "$license" = free ] || pkgname=xestrata-contrib-$variant
 # the NVIDIA architectures SYCL names (intel/llvm 7.1.1's nvidia_gpu_sm_*; a newer GPU runs the newest one's PTX,
-# which its driver compiles): what each CUDA version builds, from Volta on (the engine's matrix path needs it)
+# which its driver compiles): what each CUDA version builds, from Pascal on (CUDA 13 dropped Pascal and Volta)
 case "$cuda_ver" in
-  12.4) archs="sm_70;sm_75;sm_80;sm_86;sm_89;sm_90" ;;
+  12.4) archs="sm_60;sm_61;sm_70;sm_75;sm_80;sm_86;sm_89;sm_90" ;;
   13.*) archs="sm_75;sm_80;sm_86;sm_89;sm_90" ;;
 esac
 

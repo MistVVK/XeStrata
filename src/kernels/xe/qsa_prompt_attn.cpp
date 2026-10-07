@@ -459,7 +459,9 @@ struct PromptAttnMma {
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
     void operator()(sycl::nd_item<2> it) const {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+        // an empty body where joint_matrix has no FP16 tensor cores (AMD's RDNA, NVIDIA before sm_70): the device
+        // does not report the 16 x 16 x 16 shape there, so this kernel is never launched
+#if defined(__SYCL_DEVICE_ONLY__) && (defined(__AMDGCN__) || (defined(__NVPTX__) && STRATA_NV_ARCH < 700))
         (void) it;
 #else
         using pm::CH;

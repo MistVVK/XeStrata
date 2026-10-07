@@ -485,7 +485,7 @@ def gpu_problem(g, together=False):
         cc = g.get("cc") or ""
         if re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < min(archs):
             return (f"compute capability {g.get('cc')} is older than the sm_{min(archs)} {meta.get('package')} has "
-                    "code for: xestrata-contrib-cuda12.4 in its place has code for it (from Volta, sm_70)")
+                    "code for: xestrata-contrib-cuda12.4 in its place has code for it (from Pascal, sm_60)")
         return None
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"

@@ -123,6 +123,14 @@ RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP
 Intel の GPU はこの形を報告しないので、これまでどおり XMX の FP16 の経路を使います。
 `STRATA_PREFILL_MMQ=0` を付けると FP16 の経路に戻ります。
 
+Pascal（sm_60・sm_61。P100、P40、GTX 10 系）にも、CUDA 12 のツールキットでコードを作ります。
+Tensor Core がないので、行列エンジンの経路は選ばれず、DP4a と FP32 の経路で動きます。
+sm_60 には dp4a の命令がないので、その積だけを 1 バイトずつの計算にしていて、和は同じ整数です（`src/kernels/xe/cuda_intrinsics.hpp`、upstream の e200e08f）。
+Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
+sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
+`STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、出力の速さは 3〜5% 遅い）。
+Pascal の実機では確かめていません（`unverified`）。
+
 ### エンジンの部品とテスト
 
 モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
@@ -378,11 +386,11 @@ tools/package/build.sh fedora44 cuda13.4
 | free | Ubuntu 26.04、Fedora 44 | — | — |
 | cuda13.1 | Ubuntu 26.04 | multiverse の `cuda-toolkit-13-1` | sm_75、sm_80、sm_86、sm_89、sm_90 |
 | cuda13.4 | Fedora 44 | NVIDIA のリポジトリの `cuda-toolkit-13-4` | sm_75、sm_80、sm_86、sm_89、sm_90 |
-| cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_70、sm_75、sm_80、sm_86、sm_89、sm_90 |
+| cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60、sm_61、sm_70、sm_75、sm_80、sm_86、sm_89、sm_90 |
 
 - cuda の版の名前は、ビルドに使った CUDA の版です。
   Fedora 44 向けの NVIDIA のリポジトリには CUDA 13.3 と 13.4 しかないので、Fedora では 13.4 を使います。CUDA 12 もないので、cuda12.4 は Ubuntu だけです。
-- CUDA 13 は Volta（sm_70）のコードを作らないので、V100 などは cuda12.4 を使います。
+- CUDA 13 は Pascal（sm_60・sm_61）と Volta（sm_70）のコードを作らないので、P100、P40、V100 などは cuda12.4 を使います。
 - intel/llvm 7.1.1 の SYCL には sm_90 より上の名前がないので、RTX 50 などの新しい GPU は sm_90 の PTX をドライバーがコンパイルして動かします。
 - PTX はツールキットの版なので、ドライバーはその CUDA の版に対応している必要があります。
 

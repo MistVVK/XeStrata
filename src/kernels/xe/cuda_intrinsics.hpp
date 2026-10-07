@@ -5,8 +5,11 @@
 // __dp4a is SPIR-V's non-saturating 4x8-bit dot product (SPV_KHR_integer_dot_product, enabled for the device
 // compile in CMakeLists.txt), which the B70 runs 4.2 times faster than the byte loop it replaces; CUDA's __dp4a
 // does not saturate either, so the sum is the same integer.  The others are written out with their PTX meaning.
-// Compiled for NVIDIA GPUs (__NVPTX__), __dp4a and __byte_perm are the PTX instructions themselves.
+// Compiled for NVIDIA GPUs (__NVPTX__), __dp4a and __byte_perm are the PTX instructions themselves; sm_60 (Pascal
+// GP100) has no dp4a instruction, and takes the byte loop, the same integer (upstream e200e08f's STRATA_DP4A).
 #pragma once
+
+#include "device_target.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -19,11 +22,11 @@ extern SYCL_EXTERNAL int __spirv_SDotKHR(int a, int b, int packed_format);   // 
 namespace strata::kernels::xe {
 
 inline int dp4a(int a, int b, int c) {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && STRATA_NV_ARCH >= 610
     int r;
     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
-#elif defined(__SYCL_DEVICE_ONLY__)
+#elif defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__)
     return c + __spirv_SDotKHR(a, b, 0);
 #else
     for (int k = 0; k < 4; ++k) c += (int) (int8_t) (a >> (8 * k)) * (int) (int8_t) (b >> (8 * k));

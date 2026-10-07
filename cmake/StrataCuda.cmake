@@ -182,7 +182,7 @@ function(strata_cuda_builds opts archs explicit key)
   else()
     foreach(arch IN LISTS sorted_archs)
       string(REPLACE "sm_" "" num "${arch}")
-      foreach(cand IN ITEMS ${arch} sm_90 sm_89 sm_87 sm_86 sm_80 sm_75 sm_72 sm_70)
+      foreach(cand IN ITEMS ${arch} sm_90 sm_89 sm_87 sm_86 sm_80 sm_75 sm_72 sm_70 sm_61 sm_60)
         string(REPLACE "sm_" "" cnum "${cand}")
         if(cnum GREATER num)                       # only code the GPU runs: its own or an older architecture's
           continue()
@@ -320,7 +320,7 @@ function(strata_cuda_choose archs explicit)
     message(FATAL_ERROR "contrib: no CUDA toolkit here builds code for the NVIDIA GPUs ${archs} (one that has them, "
                         "or STRATA_CUDA_ARCHS for others)")
   endif()
-  if(best_missing)   # CUDA 13 builds no Volta (sm_70) code, for one: a toolkit that still has it does
+  if(best_missing)   # CUDA 13 builds no Pascal or Volta (sm_6x, sm_70) code, for one: a toolkit that still has it does
     message(WARNING "contrib: the CUDA toolkit taken builds code for ${best_missing} NVIDIA GPUs (${archs}): "
                     "a GPU without code is not used; a CUDA toolkit that still has its architecture builds it")
   endif()

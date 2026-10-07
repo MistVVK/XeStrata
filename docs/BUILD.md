@@ -121,6 +121,14 @@ With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at mos
 Intel GPUs do not report that shape and keep the XMX FP16 path.
 `STRATA_PREFILL_MMQ=0` takes the FP16 path.
 
+Pascal (sm_60, sm_61: P100, P40, the GTX 10 series) gets code too, from a CUDA 12 toolkit.
+It has no tensor cores, so no matrix-engine path is chosen and it runs on the DP4a and FP32 paths.
+sm_60 has no dp4a instruction, so that one product is computed a byte at a time there, to the same integer (`src/kernels/xe/cuda_intrinsics.hpp`, upstream e200e08f).
+The kernels for the tensor cores compile an empty body in code for an architecture before sm_70 and are never launched on such a GPU.
+Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`STRATA_NO_XMX=1`)
+IQ2_XS gave the same answers as sm_89 code on all 8 questions (the expert cache size pinned; decode 3-5% slower).
+Pascal hardware itself is `unverified`.
+
 ### The engine's parts and tests
 
 The parts and tests that need no model build without llama.cpp (`STRATA_NATIVE_EXPERTS=OFF`).
@@ -376,11 +384,11 @@ tools/package/build.sh fedora44 cuda13.4
 | free | Ubuntu 26.04, Fedora 44 | — | — |
 | cuda13.1 | Ubuntu 26.04 | `cuda-toolkit-13-1` from multiverse | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda13.4 | Fedora 44 | `cuda-toolkit-13-4` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
-| cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
+| cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_60, sm_61, sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
 
 - A cuda variant is named after the CUDA version it is built with.
   NVIDIA's repository for Fedora 44 has CUDA 13.3 and 13.4 only, so Fedora's is 13.4; it has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
-- CUDA 13 builds no Volta (sm_70) code: a V100 takes cuda12.4.
+- CUDA 13 builds no Pascal (sm_60, sm_61) or Volta (sm_70) code: a P100, P40 or V100 takes cuda12.4.
 - intel/llvm 7.1.1's SYCL has no name above sm_90: newer GPUs (an RTX 50) run sm_90's PTX, which their driver compiles.
 - The PTX is the toolkit's version, so the driver must support that CUDA version.
 
