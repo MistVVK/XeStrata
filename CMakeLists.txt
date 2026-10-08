@@ -650,16 +650,29 @@ target_include_directories(strata_kernels_cpu PUBLIC include)
 set_source_files_properties(src/kernels/cpu/expert.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-# AVX-VNNI (Intel Core 12th gen and later, AMD Zen 5): the Q2_0 and IQ4_NL rows' integer dot as vpdpbusd, chosen at run
-# time (cpu_avxvnni_ok); without the compiler flag the AVX2 kernels serve every CPU.
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag(-mavxvnni STRATA_CXX_AVXVNNI)
-if(STRATA_CXX_AVXVNNI)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/q2_avxvnni.cpp)
-  set_source_files_properties(src/kernels/cpu/q2_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
-                              "-mavx2;-mavxvnni;-mfma;-mf16c")
+# AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
+# copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
+# compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
+# without the intrinsics builds the files without the copies.
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c")
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+__attribute__((target("avxvnni")))
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbusd_avx_epi32(_mm256_dpwssd_avx_epi32(a, a, b), a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_AVXVNNI_INTRINSICS)
+unset(CMAKE_REQUIRED_FLAGS)
+if(STRATA_HAVE_AVXVNNI_INTRINSICS)
+  set(_strata_avxvnni STRATA_AVXVNNI=1)
   target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_HAVE_AVXVNNI=1)
+else()
+  set(_strata_avxvnni STRATA_AVXVNNI=0)
 endif()
+set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -708,11 +721,7 @@ if(STRATA_NATIVE_EXPERTS)
   set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
                               "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-  if(STRATA_CXX_AVXVNNI)
-    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avxvnni.cpp)
-    set_source_files_properties(src/kernels/cpu/iq_avxvnni.cpp PROPERTIES COMPILE_OPTIONS
-                                "-mavx2;-mavxvnni;-mfma;-mf16c")
-  endif()
+  set_property(SOURCE src/kernels/cpu/iq_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
   if(STRATA_BUILD_TESTS)
@@ -720,6 +729,22 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
     target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+    # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp: gathered, AVX-VNNI) bit for bit against each other
+    # at 1..8 tokens and against ggml-cpu's dot, on random blocks (upstream a7336175, b211ba17); --bench: ms per expert
+    add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+    target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+    add_test(NAME iq_avx2_parity_iq3s_mt1
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+    # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (upstream 5208b320; --bench: its time)
+    add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
+    target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q8k_quant_parity COMMAND q8k_quant_parity)
+    # the opt-in AVX-2 Q2_0 bit-plane kernel (STRATA_Q2_BITPLANE=1) against the plain one, bitwise (upstream 2467bb68)
+    add_executable(q2_bitplane_parity src/kernels/cpu/q2_bitplane_parity.cpp)
+    target_link_libraries(q2_bitplane_parity PRIVATE strata_kernels_cpu)
+    add_test(NAME q2_bitplane_parity COMMAND q2_bitplane_parity)
+    set_tests_properties(q2_bitplane_parity PROPERTIES ENVIRONMENT "STRATA_Q2_BITPLANE=1")
   endif()
   if(STRATA_ENABLE_XE AND STRATA_BUILD_TESTS)
     # one native expert three ways on real GGUF rows (float reference, CPU, GPU): needs shard 1, not in CTest

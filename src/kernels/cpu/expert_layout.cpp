@@ -92,6 +92,50 @@ bool cpu_avxvnni_ok() {
 #endif
 }
 
+namespace {
+void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) { __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]); }
+}  // namespace
+
+int iq256_gather_setting() {
+    static const int s = [] {
+        const char* v = std::getenv("STRATA_IQ256_GATHER");
+        if (v == nullptr || v[0] == '\0') return -1;
+        return std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
+    }();
+    return s;
+}
+
+bool cpu_gather_fast() {
+    // From the feature bits CPUID reports, never a vendor string or a model (AGENTS.md): AVX-VNNI (Alder Lake,
+    // Sapphire Rapids and later; the older cores gather slowly or under the Downfall microcode) on a hybrid CPU
+    // (7.0:EDX[15]), whose performance cores cpu_gather_fast_here tells apart.  A CPU of one core type is not told
+    // apart from an E-core-only part this way, so it keeps the scalar decode (STRATA_IQ256_GATHER=1 turns it on).
+    static const bool ok = [] {
+        if (!cpu_avxvnni_ok()) return false;
+        unsigned r[4];
+        cpuid_regs(7, 0, r);
+        return ((r[3] >> 15) & 1u) != 0;                               // hybrid
+    }();
+    return ok;
+}
+
+bool cpu_gather_fast_here() {
+    if (!cpu_gather_fast()) return false;
+    static const unsigned max_leaf = [] { unsigned r[4]; cpuid_regs(0, 0, r); return r[0]; }();
+    // A CPUID can cost a microsecond under a hypervisor, so once per thread (the pool pins its workers)
+    thread_local int here = -1;
+    if (here < 0) {
+        unsigned type = 0;
+        if (max_leaf >= 0x1A) {
+            unsigned r[4];
+            cpuid_regs(0x1A, 0, r);
+            type = r[0] >> 24;
+        }
+        here = type == 0x40 ? 1 : 0;   // 40h a performance core, 20h an E-core
+    }
+    return here == 1;
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)
@@ -118,9 +162,6 @@ std::string cpu_name() {
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
-#if defined(STRATA_HAVE_AVXVNNI)
-    else if (cpu_avxvnni_ok()) q2_0_gguf_rows_multi_avxvnni(w, row_bytes, nblocks, a, nt, out, r0, r1);
-#endif
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
@@ -135,6 +176,7 @@ bool native_experts_available() noexcept { return false; }
 bool native_fmt(int, int, int64_t, int64_t, NativeFmt&, std::string& err) { err = "built without native experts"; return false; }
 void native_quant_act(const NativeFmt&, const float*, void*) { std::abort(); }
 void native_quant_h(const NativeFmt&, const float*, void*) { std::abort(); }
+int native_gu_mt_min(int) { return 2; }
 void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif

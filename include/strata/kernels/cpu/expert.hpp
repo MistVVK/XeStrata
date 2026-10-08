@@ -70,6 +70,14 @@ struct ActQ {
     int32_t sum[MAXC];
     float hx[MAXC];
     int nchunks;
+    /// The AVX-2 "bit-plane" image of `q` (src/kernels/cpu/q2_avx2.cpp explains it), filled only by
+    /// `act_quant_q8_1_avx2` with STRATA_Q2_BITPLANE=1 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
+    /// `qp[128p + 32k + 16h + i] = q[128p + 64h + 4i + k]`, `psum[8p + 4h + m]` = the sum of q[128p + 64h + 16m ..
+    /// + 16), `pscale[8p + 2c + e] = scale[4p + c]`.  `bp_pairs` is 0 when the image is absent (n % 128 != 0).
+    alignas(32) int8_t qp[H];
+    alignas(32) int32_t psum[H / 16];
+    alignas(32) float pscale[H / 16];
+    int bp_pairs = 0;
 };
 
 /// Per-worker scratch.  Owned by the caller and passed in, so the token path performs NO allocations
@@ -175,11 +183,15 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 /// The same two for CPUs without AVX-512 (src/kernels/cpu/q2_avx2.cpp, compiled for AVX2 only).
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                float* const* out, int r0, int r1);
+/// STRATA_Q2_BITPLANE=1 (read once): the AVX-2 Q2_0 kernel reads the bit-plane image instead of the legacy one.
+bool q2_bitplane_enabled();
+/// The pre-bit-plane AVX-2 kernel (the default), kept for A/B and parity.
+void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                      float* const* out, int r0, int r1);
+/// The same rows with AVX-VNNI on or off, not as cpu_avxvnni_ok() says (tests and benches; on only where it holds).
+void q2_0_gguf_rows_multi_avx2_v(bool vnni, const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
+                                 int nt, float* const* out, int r0, int r1);
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
-/// The Q2_0 rows with AVX-VNNI (src/kernels/cpu/q2_avxvnni.cpp, built when the compiler has -mavxvnni), bitwise the
-/// same as the AVX2 ones; called only when cpu_avxvnni_ok().
-void q2_0_gguf_rows_multi_avxvnni(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
-                                  float* const* out, int r0, int r1);
 
 void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
 

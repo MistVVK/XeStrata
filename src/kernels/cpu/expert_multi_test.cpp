@@ -21,6 +21,20 @@
 namespace c = strata::kernels::cpu;
 
 namespace {
+// the pool's path: the gate/up rows, the second activation quantization, the down rows (what the engine's expert
+// jobs run), for one expert and n tokens
+void rows_path(const uint8_t* blob, const c::ActQ* const* a1, int n, float* const* out, c::ExpertScratchMulti& ws) {
+    float* ffp[c::MAXT];
+    const c::ActQ* a2[c::MAXT];
+    for (int t = 0; t < n; ++t) ffp[t] = ws.ff[t];
+    c::s2_expert_gu_rows_multi(blob, a1, n, ffp, 0, c::FF);
+    for (int t = 0; t < n; ++t) {
+        c::act_quant_q8_1(ws.ff[t], c::FF, ws.a2[t]);
+        a2[t] = &ws.a2[t];
+    }
+    c::s2_expert_down_rows_multi(blob, a2, n, out, 0, c::H);
+}
+
 void make_blob(uint8_t* b, std::mt19937& rng) {
     for (size_t i = 0; i < c::O_GU_SCALES; ++i) b[i] = (uint8_t) rng();              // codes
     for (size_t i = c::O_GU_SCALES; i < c::BLOB; i += 2) {                            // fp16 scales ~0.004-0.016
@@ -74,6 +88,16 @@ int main(int argc, char** argv) {
                         ++fail;
                     }
                 }
+                static float out_rows[c::MAXT][c::H];
+                float* orow[c::MAXT] = {};
+                for (int t = 0; t < c::MAXT; ++t) orow[t] = out_rows[t];
+                rows_path(blob, a1, n, orow, wsm);
+                for (int t = 0; t < n; ++t)
+                    if (std::memcmp(static_cast<const void*>(out_rows[t]), static_cast<const void*>(out_multi[t]),
+                                    sizeof out_rows[t]) != 0) {
+                        std::fprintf(stderr, "FAIL expert %d n=%d token %d: rows path differs from the multi kernel\n", e, n, t);
+                        ++fail;
+                    }
             }
         }
         std::printf("expert_multi_test: %s\n", fail ? "FAILED" : "OK (every token bitwise equal to the single-token kernel)");
@@ -90,6 +114,11 @@ int main(int argc, char** argv) {
         if (n == 1) base = us;
         std::printf("tokens per expert %d: %7.1f us per expert (%.2fx one token; extra token = %.2f of one read), %.1f GB/s\n",
                     n, us, us / base, n > 1 ? (us / base - 1.0) / (n - 1) : 0.0, c::BLOB / (us * 1e3));
+        rows_path(&blobs[0], a1, n, outs, wsm);
+        const double r0 = now_ms();
+        for (int e = 0; e < E; ++e) rows_path(&blobs[(size_t) e * c::BLOB], a1, n, outs, wsm);
+        const double rus = 1000.0 * (now_ms() - r0) / E;
+        std::printf("   rows path (the pool's): %7.1f us per expert, %.1f GB/s\n", rus, c::BLOB / (rus * 1e3));
     }
     return 0;
 }

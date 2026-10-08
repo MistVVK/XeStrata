@@ -49,6 +49,17 @@ bool cpu_avx512_ok();
 /// Whether this CPU (and its OS) runs the AVX2 kernels (AVX, AVX2, FMA, F16C): the floor of every expert kernel
 /// (q2_avx2.cpp, iq_avx2.cpp, and ggml-cpu in the portable build).  STRATA_FORCE_AVX2 does not change it.
 bool cpu_avx2_ok();
+/// STRATA_IQ256_GATHER, the AVX-2 i-quant kernels' gathered grid decode (iq_avx2.cpp, upstream a7336175): -1 unset
+/// (auto, see cpu_gather_fast_here), 0 the scalar decode on every core, 1 the gathered one on every core.
+int iq256_gather_setting();
+/// Whether this CPU's performance cores gather the IQ grid entries faster than they assemble them from scalar loads,
+/// from what CPUID reports: an Intel CPU with AVX-VNNI (Alder Lake / Sapphire Rapids or newer; the older Intel cores
+/// gather slowly or under the Downfall microcode, AMD Zen 2/3 gather slowly) that is hybrid (CPUID 7.0:EDX[15]).
+/// A CPU of one core type is not told apart by CPUID from an E-core-only part, so it keeps the scalar decode.
+bool cpu_gather_fast();
+/// cpu_gather_fast() and the CALLING THREAD runs on a performance core: CPUID 1Ah core type 40h (the E-cores, 20h,
+/// gather slower than they assemble).  Probed once per thread: the pool pins each worker to one core.
+bool cpu_gather_fast_here();
 /// Whether the AVX-VNNI kernels run here: the build has them (STRATA_HAVE_AVXVNNI), the CPU has AVX2 and AVX-VNNI
 /// (CPUID 7.1 EAX bit 4).  STRATA_NO_AVXVNNI=1 answers no (to compare with the AVX2 kernels).
 bool cpu_avxvnni_ok();
