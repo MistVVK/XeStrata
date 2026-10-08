@@ -195,4 +195,70 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     });
 }
 
+bool native_norm_rope_usable(int head_dim, int n_rot) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_NO_NORM_ROPE");
+        return v == nullptr || std::strtol(v, nullptr, 10) == 0;
+    }();
+    return on && (head_dim == 128 || head_dim == 256) && n_rot == 64;
+}
+
+// upstream 088e8a82 (#783 PR-f): native_qsa_rms_norm_weighted (its 256-item form: the same partial sums, sub-group
+// sums and order) and native_rope_apply in one launch, so the result is the pair's bit for bit (rope_parity).  Every
+// item reads its values before the barrier, so out may be x (in_stride == head_dim).
+void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out, int rows, int head_dim,
+                              int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream) {
+    if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
+        (head_dim != 128 && head_dim != 256) || in_stride < head_dim || n_rot != 64 || !std::isfinite(epsilon) ||
+        epsilon < 0.0f || rope_scaling_invalid(scaling) != nullptr || (x == out && in_stride != head_dim) ||
+        reinterpret_cast<uintptr_t>(x) % 4 || reinterpret_cast<uintptr_t>(gamma) % 4 ||
+        reinterpret_cast<uintptr_t>(out) % 4 || reinterpret_cast<uintptr_t>(positions) % 4)
+        throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
+    constexpr int BlockSize = 256;
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    const int32_t* mtab = mrope_table();
+    const bool scaled = scaling.type != RopeScalingType::None;
+    const RopeKernelArgs ka = scaling.kernel_args(n_rot);
+    const RopeTab tab = rope_table_for(scaling);
+    const int n_cols = head_dim;
+    queue_for(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) rows * BlockSize, BlockSize),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int tid = (int) it.get_local_id(0);
+            const size_t row = it.get_group(0);
+            const float* in = x + row * (size_t) in_stride;
+            float* o = out + row * (size_t) n_cols;
+            float partial = 0.0f;
+            for (size_t col = tid; col < size_t(n_cols); col += BlockSize) {
+                const float v = in[col];
+                partial += v * v;
+            }
+            const int half = n_rot / 2;
+            const float x_tid = tid < n_cols ? in[tid] : 0.0f;
+            const float x_hi = tid < half ? in[tid + half] : 0.0f;
+            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            const int lane = tid % 32;
+            if (lane == 0) sums[tid / 32] = partial;
+            sycl::group_barrier(it.get_group());
+            partial = lane < BlockSize / 32 ? sums[lane] : 0.0f;
+            for (int offset = 16; offset; offset >>= 1) partial += sycl::permute_group_by_xor(sg, partial, offset);
+            const float mean = partial / (float) n_cols;
+            const float scale = sycl::rsqrt(mean + epsilon);
+            if (tid >= n_rot && tid < n_cols) {
+                o[tid] = scale * x_tid * gamma[tid];
+            } else if (tid < half) {
+                const float a = scale * x_tid * gamma[tid], b = scale * x_hi * gamma[tid + half];
+                const int p = mrope_pos(mtab, positions[row], tid);
+                float c, s;
+                if (!rope_tab_cs(tab, p, tid, c, s))
+                    rope_cos_sin((float) p * sycl::pow(theta_scale, float(tid)), scaled, ka, tid, c, s);
+                o[tid] = a * c - b * s;
+                o[tid + half] = a * s + b * c;
+            }
+        });
+    });
+}
+
 }  // namespace strata::kernels

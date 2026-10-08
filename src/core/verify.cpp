@@ -716,6 +716,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return false;
                 auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos,
                                         strata::gpu::Stream on) {
+                    if (native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable(cols, (int) s.n_rot)) {
+                        native_qsa_rms_norm_rope(data, cols, (const float*) norm->data, data, rows, cols, (int) s.n_rot, EPS,
+                                                 rope_scaling(), pos, on);
+                        return;
+                    }
                     if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, on);
                     else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, on);
                     if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, on);
@@ -739,16 +744,28 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)
                 const bool qbr = br && qb;
+                // q out of the q|gate rows, normed and rotated: one launch where the fused kernel applies, else the
+                // split copy and norm_rope (the batched rows only: native QSA and native RoPE are on)
+                auto q_split_norm_rope = [&](strata::gpu::Stream on) -> bool {
+                    if (native_norm_rope_usable((int) HD, (int) s.n_rot)) {
+                        native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
+                                                 qcur_ + tb * NH * HD, (int) (n * NH), (int) HD, (int) s.n_rot, EPS,
+                                                 rope_scaling(), pos_ + tb * NH, on);
+                        return true;
+                    }
+                    if (!strata::gpu::copy2d_async(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD,
+                                                   (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (n * NH), on)) {
+                        err = std::string("verify: the q/gate split failed: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, on);
+                    return true;
+                };
                 if (qbr) {
                     if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                     native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                 (int) (NH * 2 * HD), n, df_side_[0]);
-                    if (!strata::gpu::copy2d_async(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD,
-                                                   (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (n * NH), df_side_[0])) {
-                        err = std::string("verify: the q/gate split failed: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
+                    if (!q_split_norm_rope(df_side_[0])) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);
                     if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
@@ -842,11 +859,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (qbr) {
                     // the query side runs on the branches
                 } else if (qb) {
-                    if (!strata::gpu::copy2d_async(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (n * NH), cs)) {
-                        err = std::string("verify: the q/gate split failed: ") + strata::gpu::last_error();
-                        return false;
-                    }
-                    norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
+                    if (!q_split_norm_rope(cs)) return false;
                     if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
                     bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
                                               N, IQ * ID, n, cs);

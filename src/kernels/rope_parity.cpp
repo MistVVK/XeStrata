@@ -29,6 +29,7 @@
 // mixes two rotations.
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include "parity_device.hpp"
 #include "strata/core/gpu.hpp"
@@ -427,6 +428,66 @@ int main(int argc, char** argv) try {
         std::printf("  native path vs table path, none            %s (%lld of %d over 3e-3, worst rel %.3e)\n",
                     none_bad5 ? "*** WRONG ***" : "agrees", none_bad5, nrows * head_dim, worst5);
         bad += (int) none_bad5;
+
+        // ---- 6. THE FUSED RMSNorm + RoPE (`native_qsa_rms_norm_rope`, upstream 088e8a82) MUST BE BIT-IDENTICAL to
+        // `native_qsa_rms_norm_weighted` followed by `native_rope_apply`, for the q|gate split (in_stride ==
+        // 2 * head_dim) and in place (in_stride == head_dim), head_dim 128 and 256, unscaled and YaRN.
+        for (int hd6 : {128, 256}) {
+            const int nr6 = 64;
+            const int rows6 = 96;
+            std::vector<float> x6((size_t) rows6 * 2 * hd6), gamma6((size_t) hd6);
+            std::vector<int> pos6((size_t) rows6);
+            for (auto& v : x6) v = gauss2(rng2);
+            for (auto& g6 : gamma6) g6 = 0.5f + std::fabs(gauss2(rng2));
+            for (int r = 0; r < rows6; ++r) pos6[(size_t) r] = (r * 53 + 1) % npos;
+            float *d_x6 = nullptr, *d_g6 = nullptr, *d_ref6 = nullptr, *d_fus6 = nullptr;
+            int* d_pos6 = nullptr;
+            const size_t out6 = (size_t) rows6 * hd6 * sizeof(float);
+            check(strata::gpu::alloc_device(&d_x6, x6.size() * sizeof(float)), "malloc x6");
+            check(strata::gpu::alloc_device(&d_g6, gamma6.size() * sizeof(float)), "malloc g6");
+            check(strata::gpu::alloc_device(&d_ref6, out6), "malloc ref6");
+            check(strata::gpu::alloc_device(&d_fus6, out6), "malloc fus6");
+            check(strata::gpu::alloc_device(&d_pos6, pos6.size() * sizeof(int)), "malloc pos6");
+            check(strata::gpu::copy(d_x6, x6.data(), x6.size() * sizeof(float)), "copy x6");
+            check(strata::gpu::copy(d_g6, gamma6.data(), gamma6.size() * sizeof(float)), "copy g6");
+            check(strata::gpu::copy(d_pos6, pos6.data(), pos6.size() * sizeof(int)), "copy pos6");
+            std::vector<float> href((size_t) rows6 * hd6), hfus((size_t) rows6 * hd6);
+            long long fbad = 0;
+            auto compare = [&](const char* what) {
+                check(strata::gpu::stream_sync(cs5), what);
+                check(strata::gpu::copy(href.data(), d_ref6, out6), "back ref6");
+                check(strata::gpu::copy(hfus.data(), d_fus6, out6), "back fus6");
+                for (size_t i = 0; i < href.size(); ++i)   // the bits, not the values: the claim is bit-identity
+                    fbad += std::memcmp(&href[i], &hfus[i], 4) != 0;   // NOLINT(bugprone-suspicious-memory-comparison)
+            };
+            for (const auto& sc6 : {none5, yarn}) {
+                // (a) the q|gate split against the split copy, the norm and the rope
+                check(strata::gpu::copy2d_async(d_ref6, (size_t) hd6 * 4, d_x6, (size_t) 2 * hd6 * 4, (size_t) hd6 * 4,
+                                                (size_t) rows6, cs5), "split6");
+                strata::kernels::native_qsa_rms_norm_weighted(d_ref6, d_g6, d_ref6, hd6, rows6, 1e-6f, cs5);
+                strata::kernels::native_rope_apply(d_ref6, d_ref6, rows6, hd6, nr6, sc6, d_pos6, cs5);
+                strata::kernels::native_qsa_rms_norm_rope(d_x6, 2 * hd6, d_g6, d_fus6, rows6, hd6, nr6, 1e-6f, sc6,
+                                                          d_pos6, cs5);
+                compare("sync6a");
+                // (b) in place
+                check(strata::gpu::copy2d_async(d_ref6, (size_t) hd6 * 4, d_x6, (size_t) 2 * hd6 * 4, (size_t) hd6 * 4,
+                                                (size_t) rows6, cs5), "contig6");
+                check(strata::gpu::stream_sync(cs5), "sync6c");
+                check(strata::gpu::copy(d_fus6, d_ref6, out6), "copy fus6");
+                strata::kernels::native_qsa_rms_norm_weighted(d_ref6, d_g6, d_ref6, hd6, rows6, 1e-6f, cs5);
+                strata::kernels::native_rope_apply(d_ref6, d_ref6, rows6, hd6, nr6, sc6, d_pos6, cs5);
+                strata::kernels::native_qsa_rms_norm_rope(d_fus6, hd6, d_g6, d_fus6, rows6, hd6, nr6, 1e-6f, sc6, d_pos6, cs5);
+                compare("sync6b");
+            }
+            std::printf("  native_qsa_rms_norm_rope hd=%3d nr=%2d      %s (%lld of %d elements differ)\n", hd6, nr6,
+                        fbad ? "*** WRONG ***" : "bit-identical", fbad, rows6 * hd6 * 4);
+            bad += (int) fbad;
+            strata::gpu::free(d_x6);
+            strata::gpu::free(d_g6);
+            strata::gpu::free(d_ref6);
+            strata::gpu::free(d_fus6);
+            strata::gpu::free(d_pos6);
+        }
     }
 
     std::printf("\nrope: %d failures\n", bad);

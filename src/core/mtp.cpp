@@ -557,7 +557,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + row0 * 4;
     const int32_t* pos = pos_ + row0 * NH;
+    const bool fused_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
     auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
+        if (fused_nr && cols == (int) HD) {
+            native_qsa_rms_norm_rope(data, cols, gamma, data, rows, cols, (int) s.n_rot, EPS, rope_scaling(), p, cs);
+            return;
+        }
         native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
         if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
         else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
@@ -643,6 +648,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
       }
         if (!full) return true;
         native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
+        if (fused_nr) {   // every token's q at once, read out of its q|gate rows (row-independent)
+            native_qsa_rms_norm_rope(qfull_, (int) (2 * HD), f32("self_attn.q_norm.weight"), qcur_, (int) (T * NH), (int) HD,
+                                     (int) s.n_rot, EPS, rope_scaling(), pos, cs);
+            if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
+        } else
         for (int t = 0; t < T; ++t) {
             float* qc = qcur_ + t * NH * HD;
             if (!strata::gpu::copy2d_async(qc, (size_t) HD * 4, qfull_ + t * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) NH, cs)) {
