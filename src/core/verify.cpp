@@ -345,6 +345,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: stream create failed";
         return false;
     }
+    try {   // the GDN step's fastest form on this device for each window size, before any graph is recorded
+        if (g.ssm_v_heads > 0 && g.ssm_k_heads > 0)
+            strata::kernels::gdn_step_tune((int) g.ssm_conv_channels, (int) g.ssm_k_heads, (int) g.ssm_v_heads, cs_);
+    } catch (const std::exception& e) {
+        err = std::string("verify: ") + e.what();
+        return false;
+    }
     if (!strata::gpu::event_create(&commit_done_)) {
         err = "verify: event create failed";
         return false;

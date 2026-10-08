@@ -19,11 +19,14 @@
 #include <sycl/ext/oneapi/experimental/clock.hpp>
 #endif
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -266,25 +269,12 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
 }
 }  // namespace
 
-void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
-                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin) {
-    if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
-        n_tok > kVerifyMaxT)
-        fail("gdn_step_norm_multi: invalid arguments");
-    const int T = n_tok;
-    // the split from 3 tokens: at 2 its second launch cost more than the 4x work-groups gave (B70 and RTX 4070: 4
-    // tokens 11.0 -> 10.3 us and 9.9 -> 9.4 us, 2 tokens 7.3 -> 7.5 us and 6.2 -> 6.7 us).  STRATA_GDN_SPLIT=0: never.
-    static const bool split = [] {
-        const char* v = std::getenv("STRATA_GDN_SPLIT");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    if (split && T >= 3) {
-        done(stream, gdn_step_split(Q(stream), state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
-                                    t_out_begin), "gdn_step_norm_multi");
-        return;
-    }
-    const auto e = Q(stream).submit([&](sycl::handler& hd) {
+namespace {
+// One work-group a head (512 work-items: (column, row group)).
+sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+                           const int32_t* n_keep, int t_out_begin) {
+    return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
@@ -343,7 +333,176 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
         });
     });
-    done(stream, e, "gdn_step_norm_multi");
+}
+
+// upstream ae3b249f: the same arithmetic with the next token's q/k staged while the current one runs.
+sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+                           const int32_t* n_keep, int t_out_begin) {
+    return q.submit([&](sycl::handler& hd) {
+        // sk/sq: two buffers, the next token's staged while the current one runs; red_kv and red_o apart, so a token
+        // needs four barriers instead of six
+        constexpr size_t two_s = 2 * (size_t) S, rg_s = (size_t) RG * S;
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(two_s), hd), sq(sycl::range<1>(two_s), hd),
+            red_kv(sycl::range<1>(rg_s), hd), red_o(sycl::range<1>(rg_s), hd), wsum(sycl::range<1>(S / WARP), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rg_s, rg_s), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
+            const int qh = head % h_k;
+            const int qk = S * h_k;   // q at [0, qk), k at [qk, 2qk), v at [2qk, ...)
+            const int value_dim = S * h_v;
+            const int n = n_keep ? *n_keep : T;
+            if (n > 0) {
+                if (rg == 0) sk[col] = hbuf[qk + qh * S + col];
+                else if (rg == 1) sq[col] = hbuf[qh * S + col];
+            }
+            float s[RPG];
+            float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+            const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            for (int t = 0; t < n; ++t) {
+                const int cur = (t & 1) * S, nxt = ((t + 1) & 1) * S;
+                const float* ht = hbuf + (size_t) t * C;
+                // every work-item is done with the previous token (and its buffer, now nxt); the current one is staged
+                sycl::group_barrier(it.get_group());
+                if (t + 1 < n) {
+                    const float* hn = ht + C;
+                    if (rg == 0) sk[nxt + col] = hn[qk + qh * S + col];
+                    else if (rg == 1) sq[nxt + col] = hn[qh * S + col];
+                }
+                const float g = sycl::exp(gate[(size_t) t * h_v + head]);
+                float kv = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[cur + rg * RPG + r], kv);
+                red_kv[rg * S + col] = kv;
+                sycl::group_barrier(it.get_group());
+                const float kv_col = red_kv[col] + red_kv[S + col] + red_kv[2 * S + col] + red_kv[3 * S + col];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                float o = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) {
+                    s[r] = sycl::fma(g, s[r], sk[cur + rg * RPG + r] * delta);
+                    o = sycl::fma(s[r], sq[cur + rg * RPG + r], o);
+                }
+                if (t < t_out_begin) continue;   // a replayed token: its state update is needed, its output is not
+                red_o[rg * S + col] = o;
+                sycl::group_barrier(it.get_group());
+                float oc = 0.0f;
+                if (rg == 0) {
+                    oc = (red_o[col] + red_o[S + col] + red_o[2 * S + col] + red_o[3 * S + col]) * sycl::rsqrt((float) S);
+                    const float sq_part = warp_sum(sg, oc * oc);
+                    if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
+                }
+                sycl::group_barrier(it.get_group());
+                if (rg == 0) {
+                    const size_t at = (size_t) t * value_dim + (size_t) (head * S + col);
+                    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+                    const float scale = sycl::rsqrt(ss / (float) S + eps);
+                    y[at] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-z[at])));
+                }
+            }
+            if (n_keep != nullptr && n > 0)
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        });
+    });
+}
+
+// The three forms give the same bits; which is fastest depends on the device and the window (the split's 4x
+// work-groups and the prefetch's fewer barriers paid on the RTX 4070, the prefetch cost the B70 half again).
+// gdn_step_tune times them once per window size on the device; until then the one-group form runs.
+enum GdnForm : int8_t { kGdnPlain = 0, kGdnSplit = 1, kGdnPrefetch = 2, kGdnForms = 3 };
+struct GdnChoice { std::array<int8_t, kVerifyMaxT + 1> form{}; };
+core::PerDevice<GdnChoice>& gdn_choices() {
+    static core::PerDevice<GdnChoice> choices;
+    return choices;
+}
+int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head, split, prefetch)
+    static const int forced = [] {
+        const char* v = std::getenv("STRATA_GDN_STEP");
+        const long f = v == nullptr ? -1 : std::strtol(v, nullptr, 10);
+        return f >= 0 && f < kGdnForms ? (int) f : -1;
+    }();
+    return forced;
+}
+sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+                           const int32_t* n_keep, int t_out_begin) {
+    if (form == kGdnSplit)
+        return gdn_step_split(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
+    if (form == kGdnPrefetch)
+        return gdn_step_prefetch(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
+    return gdn_step_plain(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
+}
+}  // namespace
+
+void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
+    if (C <= 0 || h_k <= 0 || h_v <= 0 || h_v % h_k) fail("gdn_step_tune: invalid arguments");
+    auto& q = Q(stream);
+    gdn_choices().get(q.get_device(), [&] {
+        GdnChoice c;
+        const int forced = gdn_forced();
+        if (forced >= 0) {
+            c.form.fill((int8_t) forced);
+            return c;
+        }
+        // scratch inputs of the model's shape; small values keep the recurrence finite
+        const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
+        const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
+        float* buf = sycl::malloc_device<float>(n_state + n_h + 2 * n_g + 2 * n_y + S, q);
+        if (buf == nullptr) fail("gdn_step_tune: device allocation failed");
+        float *state = buf, *h = state + n_state, *gate = h + n_h, *beta = gate + n_g, *z = beta + n_g;
+        float *y = z + n_y, *gamma = y + n_y;
+        q.fill(buf, 0.01f, n_state + n_h + 2 * n_g + 2 * n_y + S).wait();
+        // timed as the engine runs them: 32 launches of each form in a graph (submitted one by one, the host's launch
+        // cost hid the kernels' on CUDA), the forms' graphs replayed in turns (a fresh process's B70 was still raising
+        // its clock under the first ones), the first round a warm-up, each form's fastest round kept
+        namespace sx = sycl::ext::oneapi::experimental;
+        using Exec = sx::command_graph<sx::graph_state::executable>;
+        for (int T = 1; T <= kVerifyMaxT; ++T) {
+            std::vector<Exec> exec;
+            for (int form = 0; form < kGdnForms; ++form) {
+                sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+                graph.begin_recording(q);
+                for (int i = 0; i < 32; ++i)
+                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0);
+                graph.end_recording(q);
+                exec.push_back(graph.finalize());
+            }
+            double t_min[kGdnForms] = {};
+            for (int round = 0; round < 6; ++round)
+                for (int form = 0; form < kGdnForms; ++form) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    q.ext_oneapi_graph(exec[form]);
+                    q.wait();
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                    if (round > 0 && (t_min[form] == 0.0 || us < t_min[form])) t_min[form] = us;
+                }
+            c.form[T] = kGdnPlain;
+            for (int form = 1; form < kGdnForms; ++form)
+                if (t_min[form] < t_min[c.form[T]]) c.form[T] = (int8_t) form;
+        }
+        sycl::free(buf, q);
+        char forms[kVerifyMaxT + 1] = {};
+        for (int T = 1; T <= kVerifyMaxT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
+        std::fprintf(stderr, "strata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
+                     "2 prefetch)\n", kVerifyMaxT, forms);
+        return c;
+    });
+}
+
+void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                         const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                         const int32_t* n_keep, void* stream, int t_out_begin) {
+    if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
+        n_tok > kVerifyMaxT)
+        fail("gdn_step_norm_multi: invalid arguments");
+    auto& q = Q(stream);
+    const int forced = gdn_forced();
+    const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];
+    done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin),
+         "gdn_step_norm_multi");
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
