@@ -119,7 +119,7 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
 | Intel、AMD（RDNA2 以降、[対応する GPU](#amd-の-gpu)）、その両方（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
-| Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| **おすすめ**: Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA の Pascal と Volta（P100、P40、V100 など）、それと Intel や AMD | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
 - **Pascal と Volta の GPU（P100、P40、GTX 10 シリーズ、V100 など）は `xestrata-contrib-cuda12.4` を使ってください。**

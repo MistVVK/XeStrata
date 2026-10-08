@@ -123,7 +123,7 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
 | Intel, AMD (RDNA2 or later, [the GPUs it runs on](#amd-gpus)), or both (with free software only) | `xestrata-free` | `xestrata-free` |
-| Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| **Recommended**: Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), with Intel or AMD or not | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
 - **Pascal and Volta GPUs (a P100, P40, GTX 10 series or V100) take `xestrata-contrib-cuda12.4`.**
