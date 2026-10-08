@@ -592,7 +592,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             }
             fused_gr_read_multi(fa, T, xn_, cs);
         }
-        // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write
+        // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write.  A window of more than
+        // one token routes in two launches (one router GEMV, one top-10 over all rows; each row bitwise the single
+        // call) and combines in one (upstream 868f2ef0)
+        const bool multi = T > 1 && native_router_enabled() && native_moe_combine_enabled() && g.n_expert == 512 &&
+                           K == 10;
+        if (multi) {
+            bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N,
+                                      (int) g.n_expert, T, cs);
+            native_router_top10_multi(logits_, ids_, w_, T, cs);
+        } else
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
             if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
@@ -614,11 +623,13 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             shared_expert(nullptr, nullptr, x_bf16_, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
                           nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_, shared_ + t * N,
                           N, g.n_ff, 32, cs, mixed_ + t * N, &nsw);
+            if (multi) continue;
             if (native_moe_combine_enabled())
                 native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             else
                 moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
         }
+        if (multi) native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
         gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);   // the T residual writes in one launch
         // ---- the final mixer and the main model's head
         for (int t = 0; t < T; ++t)
