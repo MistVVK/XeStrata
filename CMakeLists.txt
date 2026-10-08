@@ -507,6 +507,10 @@ if(STRATA_ENABLE_XE)
     endif()
     set(BUILD_FUNCTIONAL_TESTS OFF)
     set(BUILD_EXAMPLES OFF)
+    # oneMath declares CUDA_TARGETS and HIP_TARGETS as cache entries, which under its CMake 3.13 policies drop the
+    # values set above on a first configure (the rocBLAS backend then got an empty --offload-arch= and the compiler
+    # failed; the cuBLAS backend got its default architecture): CMP0126 keeps them
+    set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     # the cuBLAS backend's own GPU code in the same PTX version: this directory's options while oneMath is added
     get_directory_property(_strata_copts COMPILE_OPTIONS)
     get_directory_property(_strata_lopts LINK_OPTIONS)
@@ -539,6 +543,7 @@ if(STRATA_ENABLE_XE)
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
     set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
+    unset(CMAKE_POLICY_DEFAULT_CMP0126)
     set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
