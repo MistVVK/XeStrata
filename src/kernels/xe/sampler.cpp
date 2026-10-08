@@ -13,6 +13,7 @@
 #include "device_caps.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -42,6 +43,29 @@ inline float philox_uniform(uint64_t seed, uint64_t counter) {
     uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
     for (int i = 0; i < 10; ++i) philox4x32_round(c0, c1, c2, c3, (uint32_t) i, 0u);
     return (float) (c0 >> 8) * (1.0f / 16777216.0f);   // 24 bits: uniform in [0,1), never 1.0
+}
+
+// GUMBEL-MAX COUPLING (STRATA_SPEC_GUMBEL=1, upstream 6381df34, from llama.cpp-lab's --spec-coupled).  The pick is
+// argmax_i p_i / E_i with E_i = -log(u_i) ~ Exp(1) and u_i a hash of (seed, counter, TOKEN ID) - exactly equivalent
+// to argmax(log p_i + Gumbel_i), so it is an exact sample of p.  Unlike the inverse-CDF pick over a probability-sorted
+// list, the noise a token gets does not depend on which other tokens survived the cut, so a drafter whose candidate
+// set differs from the target's still agrees with it on the tokens they share.  The MTP drafter keys on the draft's
+// token id (via sub_to_id), the target on its row's token id.  D float (a GPU without FP64): u from the hash's top 24
+// bits, still in (0, 1).
+template <typename D>
+inline D gumbel_exp(uint64_t seed, uint64_t counter, uint32_t token) {
+    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    if constexpr (sizeof(D) == 8) {
+        const D u = ((D) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);   // (0, 1), never 0 or 1
+        return -sycl::log(u);
+    } else {
+        const D u = ((D) (uint32_t) (z >> 40) + 0.5f) * (1.0f / 16777216.0f);
+        return -sycl::log(u);
+    }
 }
 
 inline int history_count(const int* h, int n, int v) {
@@ -139,7 +163,8 @@ inline void block_argmax(const sycl::nd_item<1>& it, int n_vocab, float* sv, int
 // top_p, min_p, temperature and one Philox draw over a row's top_k list (ids, logits in the selection order),
 // computed redundantly by every work-item
 template <typename D>
-inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t, float* probability = nullptr) {
+inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& pp, int t,
+                          float* probability = nullptr, const int32_t* sub_to_id = nullptr) {
     const float inv_t = pp.temperature > 0.0f ? 1.0f / pp.temperature : 0.0f;
     int n_keep = k;
     float mx = sel_logit[0];
@@ -166,13 +191,22 @@ inline int pick_from_list(const int* sel_ids, const float* sel_logit, int k, con
     for (int i = 1; i < n_keep; ++i) smx = sycl::fmax(smx, scaled(i));
     D sum = 0;
     for (int i = 0; i < n_keep; ++i) sum += sycl::exp((D) scaled(i) - (D) smx);
-    const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
-    D cum = 0;
     int selected = n_keep - 1;
     int pick = sel_ids[selected];
-    for (int i = 0; i < n_keep; ++i) {
-        cum += sycl::exp((D) scaled(i) - (D) smx) / sum;
-        if ((D) u < cum) { pick = sel_ids[i]; selected = i; break; }
+    if (pp.gumbel) {
+        D best = -1;
+        for (int i = 0; i < n_keep; ++i) {
+            const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
+            const D r = sycl::exp((D) scaled(i) - (D) smx) / sum / gumbel_exp<D>(pp.seed, pp.counter + (uint64_t) t, (uint32_t) id);
+            if (r > best) { best = r; pick = sel_ids[i]; selected = i; }
+        }
+    } else {
+        const float u = philox_uniform(pp.seed, pp.counter + (uint64_t) t);
+        D cum = 0;
+        for (int i = 0; i < n_keep; ++i) {
+            cum += sycl::exp((D) scaled(i) - (D) smx) / sum;
+            if ((D) u < cum) { pick = sel_ids[i]; selected = i; break; }
+        }
     }
     if (probability) *probability = (float) (sycl::exp((D) scaled(selected) - (D) smx) / sum);
     return pick;
@@ -377,7 +411,7 @@ sycl::event split_stage2(sycl::queue& q, int n_tokens, int n_vocab, SamplerParam
             keep = sycl::min(keep, n_vocab);
             if (step_rec) chain.counter = core::coupled_draft_counter(step_rec[0]);
             float prob = 0;
-            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, &prob);
+            const int pick = pick_from_list<D>(&sel_ids[0], &sel_logit[0], keep, chain, t, &prob, sub_to_id);
             if (tid == 0) {
                 const int id = sub_to_id ? sub_to_id[pick] : pick;
                 out[t] = id;
@@ -407,10 +441,20 @@ void* split_scratch(sycl::queue& q, size_t bytes) {
     }
     return sc.p;
 }
+
+bool gumbel_env() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_SPEC_GUMBEL");
+        return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
 }  // namespace
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
-                   const SamplerParams& p, int* out, void* stream) {
+                   const SamplerParams& p_in, int* out, void* stream) {
+    SamplerParams p = p_in;
+    p.gumbel = p_in.gumbel || gumbel_env();   // the target's pick; greedy rows never read it
     if (n_tokens <= 0 || n_vocab <= 0) return;
     if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0))
         throw core::DeviceError("sample_tokens: penalty_last_n " + std::to_string(p.penalty_last_n) +
@@ -458,7 +502,11 @@ size_t coupled_draft_scratch_bytes(int nv) {
 void coupled_draft_stage(const SamplerParams* mapped_params, const int32_t* mapped_hist, SamplerParams* params,
                          int32_t* ring, int cap, void* stream) {
     auto& q = core::Runtime::get().stream(stream);
-    q.single_task([=] { *params = *mapped_params; });
+    const bool gumbel = gumbel_env();
+    q.single_task([=] {
+        *params = *mapped_params;
+        params->gumbel = gumbel;
+    });
     q.parallel_for(sycl::range<1>((size_t) cap), [=](sycl::id<1> i) {
         ring[i] = mapped_hist[i];
     });
