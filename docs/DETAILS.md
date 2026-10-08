@@ -221,6 +221,10 @@ a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `
   Which window first computes a swapped-in expert on the GPU depends on when its copy lands, so an answer can differ a little from run to run.
   `--adapt-async 0` restores the tier in which a window waits.
   Without page-locked exchange buffers, and with `--batch`, the waiting tier runs.
+  `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
+  copying the evicted expert into the RAM copy (the same tokens, fewer host copies).
+  It works only with a pack whose experts are all one size (the AVX-512 Q2_0 pack's `experts.bin`) and a fully
+  page-locked RAM copy; a native pack, whose blobs differ by layer, says so in the log and keeps the copying exchanges.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
 
 `--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.

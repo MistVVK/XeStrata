@@ -10,10 +10,14 @@
 #include "ggml.h"
 #endif
 
+#include "strata/core/gpu.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -291,10 +295,102 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+// STRATA_EXCHANGE_ROTATE (upstream 1e6cec80): 32 rounds of two swaps through a GPU cache, with and without the
+// rotation and with an unpinned copy (the rotation then stays off); the bytes, the residency, the RAM and device
+// aliases and the accounting after each
+void test_rotating_source(bool rotate, bool pin) {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), 1, 5, err), err);
+    const size_t bytes = (size_t)BLOB;
+    std::vector<std::vector<uint8_t>> truth(5, std::vector<uint8_t>(bytes));
+    {
+        std::ofstream out(dir.path / "experts.bin", std::ios::binary);
+        for (size_t e = 0; e < truth.size(); ++e) {
+            for (size_t i = 0; i < bytes; ++i) truth[e][i] = (uint8_t)((i * 131u + e * 37u) ^ (i >> 8));
+            out.write((const char*)truth[e].data(), (std::streamsize)bytes);
+        }
+        require((bool)out, "fixture write failed");
+    }
+    FileExpertSource src;
+    ExpertCache cache;
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(cache.open(2, 1, 5, BLOB, err), err);
+    for (int e : {2, 3}) {
+        const int slot = cache.admit(0, e);
+        require(slot >= 0 && cache.fill_slot_blocking(slot, truth[e].data(), err), err);
+    }
+    const std::vector<std::pair<int32_t, int32_t>> rank{{0,0},{0,1},{0,2},{0,3},{0,4}};
+    // Keep expert 4 on the file tier to check that the fallback survives rotation.
+    require(src.pin_cache_complement(cache, err, pin, {}, -1, 0, 2 * bytes, &rank), err);
+    require(src.reserve_exchanges(2, err), err);
+    require(src.exchange_rotation() == (rotate && pin), "rotation activation/fallback wrong");
+    require(src.reserve_exchanges(1, err), "smaller capacity rejected");
+    if (rotate && pin) require(!src.reserve_exchanges(3, err), "live arena growth accepted");
+    int incoming[2] = {0, 1}, outgoing[2] = {2, 3};
+    std::vector<uint8_t> actual(bytes);
+    double commit_ms = 0;
+    for (int round = 0; round < 32; ++round) {
+        const uint8_t* prior[2]{};
+        uint8_t* eviction[2]{};
+        for (int q = 0; q < 2; ++q) {
+            prior[q] = src.blob(0, incoming[q]); eviction[q] = src.exchange_buffer(q);
+            require(prior[q] && !std::memcmp(prior[q], truth[incoming[q]].data(), bytes), "wrong incoming bytes");
+            require(strata::gpu::copy(eviction[q], cache.device_slot(q), bytes), "D2H eviction failed");
+            require(src.stage_exchange(0, incoming[q], outgoing[q], q), "stage rejected");
+            require(!std::memcmp(src.blob(0, outgoing[q]), truth[outgoing[q]].data(), bytes), "staged override wrong");
+            require(cache.fill_slot_blocking(q, prior[q], err), err); // H2D completed before commit
+        }
+        require(!src.stage_exchange(0, incoming[0], outgoing[0], 0), "duplicate stage accepted");
+        require(!src.stage_exchange(0, incoming[0], 5, 0), "invalid expert accepted");
+        const auto t0 = std::chrono::steady_clock::now();
+        require(src.commit_exchanges() == 2, "commit count wrong");
+        commit_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        require(src.commit_exchanges() == 0, "empty commit not empty");
+        for (int q = 0; q < 2; ++q) {
+            require(!src.has_resident(0, incoming[q]) && src.has_resident(0, outgoing[q]), "residency wrong");
+            const uint8_t* held = src.blob(0, outgoing[q]);
+            require(!std::memcmp(held, truth[outgoing[q]].data(), bytes), "evicted bytes corrupted");
+            require(held == ((rotate && pin) ? eviction[q] : prior[q]), "wrong storage selected");
+            if (rotate && pin) require(src.exchange_buffer(q) == prior[q], "old input not recycled");
+            require(src.copy_blob(0, outgoing[q], actual.data()) && actual == truth[outgoing[q]], "copy_blob mismatch");
+            require(!src.transient(0, outgoing[q]), "resident became transient");
+            if (pin) {
+                require(src.pinned(0, outgoing[q]) && src.device_alias(0, outgoing[q]), "mapping lost");
+                require(strata::gpu::copy(actual.data(), src.device_alias(0, outgoing[q]), bytes),
+                        "device alias read failed");
+                require(actual == truth[outgoing[q]], "device alias points at stale expert");
+            }
+            require(cache.verify_slot(q, truth[incoming[q]].data(), err), err);
+            std::swap(incoming[q], outgoing[q]);
+        }
+        require(!src.has_resident(0, 4) && src.copy_blob(0, 4, actual.data()) && actual == truth[4], "file fallback changed");
+    }
+    require(src.exchanges() == 64, "exchange accounting wrong");
+    require(src.rotated_exchanges() == ((rotate && pin) ? 64u : 0u), "rotation accounting wrong");
+    require(src.avoided_exchange_copy_bytes() == ((rotate && pin) ? 64 * bytes : 0u), "avoided bytes wrong");
+    std::cout << "rotation integration: rotate=" << rotate << " pinned=" << pin
+              << " exchanges=64 commit_ms=" << commit_ms << " exact_bytes=PASS\n";
+    src.close();
+    require(!src.exchange_rotation() && !src.exchange_buffer(0), "close retained storage");
+    require(src.open(dir.path.string(), 1, 5, err), err);
+    require(!src.has_resident(0, 0) && !src.exchange_rotation(), "reopen retained residency");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--rotation-gpu") {
+            test_rotating_source(false, true);
+            test_rotating_source(true, true);
+            test_rotating_source(true, false);
+            std::cout << "file_expert_source_test --rotation-gpu: PASS\n";
+            return 0;
+        }
         test_complement_plan();
         test_resident_lend_region();
         test_resident_exchange();

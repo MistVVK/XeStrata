@@ -25,6 +25,7 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
@@ -468,6 +469,11 @@ public:
     /// The compact copy's blob of `(layer, expert)`, or null; not counted as a read (any thread).
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const;
     int64_t exchanges() const { return exchanges_; }
+    /// STRATA_EXCHANGE_ROTATE=1 (opt-in, upstream 1e6cec80): a swap hands the exchange buffer over instead of copying
+    /// the evicted blob into the RAM copy (equal-size blobs, a fully page-locked copy)
+    bool exchange_rotation() const { return exchange_storage_.active(); }
+    uint64_t rotated_exchanges() const { return exchange_storage_.exchanges(); }
+    uint64_t avoided_exchange_copy_bytes() const { return exchange_storage_.avoided_bytes(); }
     /// With the compact copy ready: blobs read from the mapped file since (what the plain mmap mode may read from
     /// the SSD).  0 in a steady resident mode; lend-region experts that did not fit the RAM count here.
     int64_t file_reads() const { return file_reads_.load(std::memory_order_relaxed); }
@@ -511,6 +517,8 @@ public:
     int64_t reads() const override { return reads_; }
 
 private:
+    /// The RAM copy's blob of residency index `index` (through the rotation's ownership table when it is on), or null
+    const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
@@ -572,6 +580,7 @@ private:
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
+    detail::ExchangeStorage exchange_storage_;   ///< STRATA_EXCHANGE_ROTATE: authoritative when active; the arenas still own the memory
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
     uint64_t complement_pin_limit_ = 0;
