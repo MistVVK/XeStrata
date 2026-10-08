@@ -44,6 +44,7 @@ public:
 
 private:
     std::vector<void*> weights_;
+    std::vector<void*> hc_q8_;   ///< STRATA_HC_Q8=1: the hyper-connection projections' Q8_0 copies
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
 };

@@ -93,6 +93,9 @@ struct WeightRef {
     const void* native_data = nullptr;
     void* native_q8_1 = nullptr;
     int native_type = -1;
+    /// STRATA_HC_Q8=1: a hyper-connection projection's Q8_0 values as the GGUF stores them, in kNativeQ8Rows' layout
+    /// (each row's qs, then its fp16 scales), owned by NativeDense, for the verify window's read
+    const void* hc_q8 = nullptr;
     /// Plan v0.3 P1: false when the loader SKIPPED this tensor's canonical bytes because another form serves it
     /// (native GGUF projections, the native head).  The metadata above stays valid; `data` is null.
     bool resident = true;

@@ -158,6 +158,8 @@ The quality has not been measured on Arc against llama.cpp (`unverified`).
 Its experts are Q4_K, Q5_K, Q5_1 and Q8_0 blocks, 77 GB of them: more than a 64 GB PC holds.
 setup downloads the shards from a pinned revision, checks their SHA-256 once, and packs the model with `--compat-bf16`.
 That turns its Q8_0 hyper-connection projections into BF16, the form the engine reads.
+`STRATA_HC_Q8=1` in the engine's environment makes the verify window's hyper-connection read (the final mixer's before the head too) read the GGUF's Q8_0 values themselves (upstream fe6c5260; 0.63 GiB more VRAM, and the answers change).
+On the B70 one read of 4 tokens went from 35.6 to 31.9 µs and the decode from 45.0 to 45.4 tokens/s; on an RTX 4070 the expert cache lost the VRAM and the decode went from 22.4 to 21.8 tokens/s.
 The engine reads the experts from the GGUF files in place.
 It keeps a RAM budget of them, the most-used first after the ones the GPU holds (`--resident-budget-gib N`).
 setup chooses the RAM less 24 GB for N, less the KV cache too when that lives in RAM:

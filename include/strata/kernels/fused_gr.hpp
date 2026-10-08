@@ -39,6 +39,10 @@ struct FusedGrArgs {
     float* rs = nullptr;               ///< workspace, hc floats
     float* inject_out = nullptr;       ///< hc floats (when w_inject)
     float* mixed = nullptr;            ///< n_embd
+    /// STRATA_HC_Q8=1: the GGUF's Q8_0 down and up projections in kNativeQ8Rows' layout (each row's int8 values,
+    /// then its fp16 scales), both or neither; fused_gr_read_multi reads them in place of w_down / w_up
+    const uint8_t* q8_down = nullptr;  ///< [hc_lr][hc*n_embd]
+    const uint8_t* q8_up = nullptr;    ///< [hc*n_embd][hc_lr]
 };
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr);

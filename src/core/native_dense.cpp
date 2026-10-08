@@ -11,6 +11,7 @@
 #include "strata/core/runtime.hpp"
 #include <algorithm>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <limits>
@@ -24,6 +25,25 @@ bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
     const long l = std::strtol(name.c_str() + 4, nullptr, 10);
     return l >= g_layer_lb && l < g_layer_le;
+}
+// STRATA_HC_Q8=1 (upstream fe6c5260, 58729711): the hyper-connection down and up projections (the final mixer's
+// too) as the GGUF's Q8_0 values for the verify window's read, beside the pack's BF16 rounding of them.  The GGUF's
+// inject rows are F32 holding BF16 values, so the read keeps the pack's BF16 for them.  Another summation order and
+// other weights: output-changing, so opt-in.
+bool hc_q8_requested() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HC_Q8");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+bool hc_q8_name(const std::string& name) {
+    if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;
+    if (name.rfind("blk.", 0) != 0) return false;
+    static const char* suffixes[] = {".hc_attn_down.weight", ".hc_attn_up.weight", ".hc_ffn_down.weight",
+                                     ".hc_ffn_up.weight"};
+    for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
+    return false;
 }
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
@@ -105,6 +125,7 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 NativeDense::~NativeDense() {
     if (scratch_) strata::gpu::free(scratch_);
     for (void* p : weights_) strata::gpu::free(p);
+    for (void* p : hc_q8_) strata::gpu::free(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
@@ -116,7 +137,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0;
+        uint64_t total = 0, hc_q8_bytes = 0;
+        std::vector<std::pair<WeightRef*, DevicePtr>> hc_q8;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
@@ -225,6 +247,31 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 total += bytes;
                 pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
+            for (const auto& tensor : gguf.tensors()) {
+                if (!hc_q8_requested() || tensor.type != 8 || !hc_q8_name(tensor.name) || !in_range(tensor.name))
+                    continue;
+                auto found = table.table_.find(tensor.name);
+                if (found == table.table_.end()) continue;
+                auto& ref = found->second;
+                if (ref.hc_q8 != nullptr) { err = "native dense: duplicate tensor " + tensor.name; return false; }
+                if (tensor.shape.size() != 2 || tensor.shape[0] != (uint64_t) ref.ne0 ||
+                    tensor.shape[1] != (uint64_t) ref.ne1 || ref.ne0 > INT_MAX || ref.ne1 > INT_MAX ||
+                    !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
+                    err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
+                }
+                const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
+                void* allocation = nullptr;
+                bool status = strata::gpu::alloc_device(&allocation, bytes);
+                DevicePtr data(allocation);
+                if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
+                if (!status) {
+                    err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
+                    return false;
+                }
+                strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                hc_q8_bytes += bytes;
+                hc_q8.emplace_back(&ref, std::move(data));
+            }
         }
         compute.wait();   // the Q6_K rewrites, before any other queue reads the weights
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
@@ -241,7 +288,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             weights_.push_back(item.data.release());
         }
         scratch_ = scratch.release();
-        bytes_ = total;
+        for (auto& [ref, data] : hc_q8) {
+            ref->hc_q8 = data.get();
+            hc_q8_.push_back(data.release());
+        }
+        bytes_ = total + hc_q8_bytes;
+        if (hc_q8_requested())
+            std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
+                         (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();

@@ -512,6 +512,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 a.bo_prev = bo_ + t * N; a.inj_prev = inj_prev + t * HC;
                 a.w_norm = (const float*) wn[half]->data; a.w_down = (const uint16_t*) wd[half]->data;
                 a.w_up = (const uint16_t*) wu[half]->data; a.w_inject = (const uint16_t*) wi[half]->data;
+                if (wd[half]->hc_q8 != nullptr && wu[half]->hc_q8 != nullptr) {   // STRATA_HC_Q8=1
+                    a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
+                }
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
             }
@@ -947,7 +950,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
-        const bool mix_multi = head_mix_multi_enabled() && head_ != nullptr && head_->loaded() &&
+        // STRATA_HC_Q8=1: the final mixer's Q8_0 projections are read in this form only
+        const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr;
+        const bool mix_multi = (head_mix_multi_enabled() || mix_q8) && head_ != nullptr && head_->loaded() &&
                                fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
         if (mix_multi) {
             // the final mixer, the window's tokens in one read (no pending write: the last layer's was done above)
@@ -960,6 +965,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
+                if (mix_q8) { fa[t].q8_down = (const uint8_t*) hd->hc_q8; fa[t].q8_up = (const uint8_t*) hu->hc_q8; }
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
             }
             try {
