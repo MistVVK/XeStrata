@@ -377,6 +377,57 @@ void gdn_conv(float* hist, const float* qkv, const float* w, float* h, int64_t T
         // C-3: tiled over tokens, each tile reading its 3 predecessors from the chunk (or the history before it);
         // the same expression per element, then the history written afterwards
         const size_t tiles = (size_t) ((T + CONV_TILE - 1) / CONV_TILE);
+        static const bool fused = [] {   // upstream 9668e324; STRATA_GDN_CONVL2=0: the conv, then the norm kernel
+            const char* v = std::getenv("STRATA_GDN_CONVL2");
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (fused) {
+            // a work-group is one head's S channels of one tile: the conv loop below, then, for the q/k heads, each
+            // token's L2 norm as the norm kernel computes it (the same sub-group sum, the four partials in order, the
+            // same v * rsqrt(ss + eps) on the stored value)
+            q.submit([&](sycl::handler& hd) {
+                sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) 4 * CONV_TILE), hd);
+                hd.parallel_for(sycl::nd_range<2>({tiles, (size_t) C}, {1, (size_t) S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                    const sycl::sub_group sg = it.get_sub_group();
+                    const int c = (int) it.get_global_id(1), tid = (int) it.get_local_id(1);
+                    const int64_t t0 = (int64_t) it.get_group(0) * CONV_TILE;
+                    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+                    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+                    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+                    const float* wc = w + (size_t) c * 4;
+                    const float w0 = wc[0], w1 = wc[1], w2 = wc[2], w3 = wc[3];
+                    for (int64_t t = t0; t < t1; ++t) {
+                        const float x = qkv[t * C + c];
+                        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+                        h[t * C + c] = s / (1.0f + sycl::exp(-s));
+                        v0 = v1; v1 = v2; v2 = x;
+                    }
+                    if ((int) it.get_group(1) >= 2 * HK) return;   // the v channels: no norm (the whole group)
+                    for (int64_t t = t0; t < t1; ++t) {
+                        const float v = h[t * C + c];
+                        const float sq = warp_sum(sg, v * v);
+                        if ((tid & 31) == 0) part[(t - t0) * 4 + (tid >> 5)] = sq;
+                    }
+                    sycl::group_barrier(it.get_group());
+                    for (int64_t t = t0; t < t1; ++t) {
+                        const int64_t k = t - t0;
+                        const float ss = part[k * 4] + part[k * 4 + 1] + part[k * 4 + 2] + part[k * 4 + 3];
+                        h[t * C + c] = h[t * C + c] * sycl::rsqrt(ss + eps);
+                    }
+                });
+            });
+            q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
+                const int c = (int) id[0];
+                float v[3];
+                for (int k = 0; k < 3; ++k) {
+                    const int64_t t = T - 3 + k;
+                    v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+                }
+                float* hc = hist + (size_t) c * 3;
+                hc[0] = v[0]; hc[1] = v[1]; hc[2] = v[2];
+            });
+            return;
+        }
         q.parallel_for(sycl::range<2>(tiles, C), [=](sycl::id<2> id) {
             const int c = (int) id[1];
             const int64_t t0 = (int64_t) id[0] * CONV_TILE;
