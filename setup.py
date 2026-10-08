@@ -478,32 +478,107 @@ def amd_elsewhere() -> str:
             "Fedora 44's has code for more AMD GPUs (README.md, AMD GPUs)")
 
 
+# The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
+# distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
+# optional conversation compression's), "icpx" for the contrib-icpx mode in its place, and each GPU maker's (Intel's
+# oneMKL in the contrib mode only, NVIDIA's in the contrib mode only, AMD's not in the contrib-icpx mode).
+PACKAGES = {
+    "ubuntu": {
+        "base": "python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc "
+                "spirv-headers mesa-vulkan-drivers libblosc2-dev",
+        "icpx": "python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc "
+                "intel-oneapi-mkl-sycl-devel",
+        "intel": "libze1 libze-intel-gpu1 libigc2 libigdfcl2",
+        "intel-contrib": "intel-oneapi-mkl-sycl-devel",
+        "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
+               "libhipblas-common-dev",
+        "nvidia": "nvidia-cuda-toolkit",
+    },
+    "fedora": {
+        "base": "python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel "
+                "glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
+        "icpx": "python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel",
+        "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
+        "intel-contrib": "intel-oneapi-mkl-sycl-devel",
+        "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
+               "hipblas-common-devel",
+        "nvidia": "cuda-toolkit-13-4",
+    },
+}
+
+
+def packages_for(distro: str, makers: set, mode: str) -> tuple:
+    """The packages (PACKAGES) for a distribution ("ubuntu", "fedora"), the GPU makers ("intel", "amd", "nvidia") and
+    the build mode, and the notes that go with them (the repositories, what a mode cannot build)."""
+    p = PACKAGES[distro]
+    names = (p["icpx"] if mode == "contrib-icpx" else p["base"]).split()
+    notes = []
+    if "intel" in makers:
+        names += p["intel"].split() + (p["intel-contrib"].split() if mode == "contrib" else [])
+    if "amd" in makers:
+        if mode == "contrib-icpx":
+            notes.append("AMD GPUs: not with contrib-icpx (icpx has no AMD target); --license free or contrib")
+        else:
+            names += p["amd"].split()
+    if "nvidia" in makers:
+        if mode == "contrib":
+            names += p["nvidia"].split()
+            notes.append("NVIDIA GPUs: NVIDIA's driver as well" +
+                         (" (cuda-toolkit-13-4 is in NVIDIA's CUDA repository)" if distro == "fedora" else ""))
+        else:
+            notes.append("NVIDIA GPUs: the contrib mode only (--license contrib)")
+    if any(n.startswith("intel-oneapi-") for n in names):
+        notes.append("intel-oneapi-* are in Intel's oneAPI repository (docs/BUILD.md, Packages)")
+    return list(dict.fromkeys(names)), notes
+
+
+def print_packages(spec: str, mode: str) -> int:
+    """setup --packages [DISTRO/MAKERS]: the install command for a distribution, GPU makers and build mode; without
+    DISTRO/MAKERS, this PC's distribution and GPUs."""
+    if spec:
+        distro, _, makers_s = spec.partition("/")
+        makers = {m.strip() for m in makers_s.split(",") if m.strip()}
+    else:
+        distro, makers = distro_id(), {g["vendor"] for g in gpus()}
+    distro = "ubuntu" if distro.startswith("ubuntu") else "fedora" if distro.startswith("fedora") else distro
+    if distro not in PACKAGES:
+        fail(f"--packages: no list for {distro or 'this distribution'}",
+             "the lists are for Ubuntu 26.04 and Fedora 44: e.g. --packages ubuntu26.04/intel,amd")
+    if not makers or not makers <= {"intel", "amd", "nvidia"}:
+        fail("--packages: the GPU makers are intel, amd and nvidia" + ("" if spec else " (no GPU of theirs found)"),
+             "e.g. --packages fedora44/intel,amd")
+    names, notes = packages_for(distro, makers, mode)
+    say(f"Packages for {distro}, {', '.join(sorted(makers))} GPUs, the {mode} build:")
+    say(("  sudo apt install " if distro == "ubuntu" else "  sudo dnf install ") + " ".join(names))
+    for n in notes:
+        say(f"  - {n}")
+    return 0
+
+
 def rocm_missing() -> list:
-    """The ROCm packages building the AMD code needs that are not installed, by the distribution's names: HIP's
-    headers (intel/llvm's HIP target), the device libraries the code links, ROCm's clang with its runtime (HIP's CMake
-    package, cmake/StrataHip.cmake), rocBLAS and hipBLASLt (oneMath's rocBLAS backend: the dense products), and
-    hipblas-common, which hipBLASLt's CMake package needs and its distribution package does not depend on."""
+    """The ROCm packages building the AMD code needs that are not installed (PACKAGES' AMD part): HIP's headers
+    (intel/llvm's HIP target), the device libraries the code links, ROCm's clang with its runtime (HIP's CMake package
+    asks it for clang's runtime builtins, which intel/llvm lacks: cmake/StrataHip.cmake), rocBLAS and hipBLASLt
+    (oneMath's rocBLAS backend: the dense products), and hipblas-common, which hipBLASLt's CMake package needs and its
+    distribution package does not depend on."""
     import glob
-    fedora = distro_id() == "fedora"
     inc = [Path("/usr/include"), Path("/opt/rocm/include")]
     clang_ok = False
     for cxx in glob.glob("/opt/rocm/llvm/bin/clang++") + glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + \
             glob.glob("/usr/lib/llvm-*/bin/clang++"):
         r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
-    have = {
-        ("rocm-hip-devel", "libamdhip64-dev"): any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
-        ("rocm-device-libs", "rocm-device-libs-21"): any(
-            glob.glob(g) for g in ("/opt/rocm/amdgcn/bitcode/ockl.bc",
-                                   "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
-                                   "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc")),
-        ("rocm-clang rocm-clang-runtime-devel", "clang-21 libclang-rt-21-dev"): clang_ok,
-        ("rocblas-devel", "librocblas-dev"): any((d / "rocblas" / "rocblas.h").exists() for d in inc),
-        ("hipblaslt-devel", "libhipblaslt-dev"): any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
-        ("hipblas-common-devel", "libhipblas-common-dev"): any((d / "hipblas-common" / "hipblas-common.h").exists()
-                                                               for d in inc),
-    }
-    return [names[0 if fedora else 1] for names, ok_ in have.items() if not ok_]
+    # in the order of PACKAGES' AMD part
+    have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
+            any(glob.glob(g) for g in ("/opt/rocm/amdgcn/bitcode/ockl.bc",
+                                       "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
+                                       "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc")),
+            clang_ok, clang_ok,
+            any((d / "rocblas" / "rocblas.h").exists() for d in inc),
+            any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
+            any((d / "hipblas-common" / "hipblas-common.h").exists() for d in inc)]
+    names = PACKAGES["fedora" if distro_id() == "fedora" else "ubuntu"]["amd"].split()
+    return [n for n, ok_ in zip(names, have) if not ok_]
 
 
 def gpus():
@@ -2460,10 +2535,10 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
     ap.add_argument("--license", choices=LICENSES,
-                    help="the build mode: free builds with free software only, for Intel GPUs; contrib (the default) "
-                         "builds with intel/llvm's CUDA target for Intel and NVIDIA GPUs, and hands the dense matrix "
-                         "products to oneMKL and cuBLAS; contrib-icpx builds with Intel oneAPI's icpx and oneMKL, for "
-                         "Intel GPUs, with the SYCL image encoder. Kept for later runs")
+                    help="the build mode: free builds with free software only, for Intel and AMD GPUs; contrib (the "
+                         "default) builds with intel/llvm's CUDA target for Intel, AMD and NVIDIA GPUs, and hands the "
+                         "dense matrix products to oneMKL, cuBLAS and rocBLAS; contrib-icpx builds with Intel oneAPI's "
+                         "icpx and oneMKL, for Intel GPUs, with the SYCL image encoder. Kept for later runs")
     ap.add_argument("--intel-llvm", metavar="DIR",
                     help="build the engine with the intel/llvm installed in DIR (bin/clang++); kept for later runs")
     ap.add_argument("--intel-llvm-build", action="store_true",
@@ -2499,6 +2574,10 @@ def main() -> int:
                          "request then compiles it: ~30 s more)")
     ap.add_argument("--build", action="store_true", help=argparse.SUPPRESS)   # the engine is always compiled here
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--packages", nargs="?", const="", metavar="DISTRO/MAKERS",
+                    help="print the command that installs the distribution packages building from the source needs, "
+                         "for the build mode (--license) and DISTRO/MAKERS, e.g. ubuntu26.04/intel,amd or "
+                         "fedora44/nvidia (default: this PC's distribution and GPUs), and exit")
     ap.add_argument("--remove-data", action="store_true",
                     help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "
                          "program with apt or dnf leaves them)")
@@ -2523,6 +2602,8 @@ def main() -> int:
             a.gpu = int(a.gpu)
         else:
             ap.error(f"--gpu takes a GPU number as --check lists them, e.g. --gpu 0, not {a.gpu!r}")
+    if a.packages is not None:
+        return print_packages(a.packages, a.license or "contrib")
     if a.remove_data:
         return remove_data()
     say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
