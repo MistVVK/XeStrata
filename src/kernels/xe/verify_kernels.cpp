@@ -560,6 +560,69 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
          "gdn_step_norm_multi");
 }
 
+bool graph_branch_pays(void* stream, void* side0, void* side1) {
+    namespace sx = sycl::ext::oneapi::experimental;
+    auto& q = Q(stream);
+    sycl::queue* side[2] = {&Q(side0), &Q(side1)};
+    float* buf = sycl::malloc_device<float>((size_t) 3 * 16 * 256, q);
+    if (buf == nullptr) return false;
+    // a kernel of a small projection's size (16 work-groups, a few microseconds)
+    auto small = [](sycl::queue& on, float* p) {
+        on.parallel_for(sycl::nd_range<1>((size_t) 16 * 256, 256), [=](sycl::nd_item<1> it) {
+            float v = (float) it.get_global_id(0);
+            for (int i = 0; i < 256; ++i) v = sycl::fma(v, 0.999f, 0.5f);
+            p[it.get_global_id(0)] = v;
+        });
+    };
+    std::vector<sx::command_graph<sx::graph_state::executable>> exec;
+    for (int branched = 0; branched < 2; ++branched) {
+        sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+        graph.begin_recording(q);
+        if (branched) {
+            graph.begin_recording(*side[0]);
+            graph.begin_recording(*side[1]);
+        }
+        for (int r = 0; r < 16; ++r) {
+            // the rest of a layer's launches, in a row in both graphs (a graph with branches may run all its nodes
+            // differently)
+            for (int i = 0; i < 8; ++i) small(q, buf);
+            if (branched) {
+                for (int i = 0; i < 2; ++i) {
+                    const sycl::event e = q.ext_oneapi_submit_barrier();
+                    side[i]->ext_oneapi_submit_barrier({e});
+                    small(*side[i], buf + (size_t) (1 + i) * 16 * 256);
+                }
+                small(q, buf);
+                for (int i = 0; i < 2; ++i) {
+                    const sycl::event e = side[i]->ext_oneapi_submit_barrier();
+                    q.ext_oneapi_submit_barrier({e});
+                }
+            } else {
+                for (int i = 0; i < 3; ++i) small(q, buf + (size_t) i * 16 * 256);
+            }
+        }
+        if (branched) {
+            graph.end_recording(*side[0]);
+            graph.end_recording(*side[1]);
+        }
+        graph.end_recording(q);
+        exec.push_back(graph.finalize());
+    }
+    double t_min[2] = {};
+    for (int round = 0; round < 6; ++round)
+        for (int v = 0; v < 2; ++v) {
+            const auto t0 = std::chrono::steady_clock::now();
+            q.ext_oneapi_graph(exec[v]);
+            q.wait();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (round > 0 && (t_min[v] == 0.0 || us < t_min[v])) t_min[v] = us;
+        }
+    sycl::free(buf, q);
+    std::fprintf(stderr, "strata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
+                 t_min[1] <= 0.95 * t_min[0] ? "used" : "not used");
+    return t_min[1] <= 0.95 * t_min[0];
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     Q(stream).single_task([=] {
         while (read_host(flag) < value) {

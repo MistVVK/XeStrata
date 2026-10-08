@@ -45,6 +45,11 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
 /// fastest; call it before any graph is recorded (once a device; later calls return at once).  Untuned, the
 /// one-work-group-a-head form runs.  STRATA_GDN_STEP=0|1|2 fixes the form.
 void gdn_step_tune(int conv_channels, int h_k, int h_v, void* stream);
+/// Whether side branches of a graph pay on this device: 16 rounds of eight small kernels in a row and three more,
+/// recorded in a row on `stream`, against the three as one on `stream` beside one on each of `side0` / `side1`
+/// (forked from `stream` and joined back, as the window's GDN layer branches), each graph replayed in turns; true when
+/// the branched graph takes at most 95% of the other's time.  Call it before any graph is recorded on these queues.
+bool graph_branch_pays(void* stream, void* side0, void* side1);
 /// Spin until *flag >= value (a mapped host flag).  The value is fixed at capture, so several rings can be
 /// outstanding at once (the split verify window keeps two).
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);

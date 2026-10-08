@@ -164,6 +164,8 @@ Verifier::~Verifier() {
     if (arena_b_) strata::gpu::free(arena_b_);
     if (h_commitb_) strata::gpu::free(h_commitb_);
     if (cs_) strata::gpu::stream_destroy(cs_);
+    for (strata::gpu::Stream s : df_side_)
+        if (s) strata::gpu::stream_destroy(s);
     if (copy_) { strata::gpu::stream_sync(copy_); strata::gpu::stream_destroy(copy_); }
     if (commit_done_) strata::gpu::event_destroy(commit_done_);
     if (arena_) strata::gpu::free(arena_);
@@ -357,6 +359,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = std::string("verify: ") + e.what();
         return false;
     }
+    {   // the mixer's side branches (upstream 2e4ddf6e) where they pay on this device: measured once (the RTX 4070
+        // +0.7%; the B70 lost 4%, its graphs' forks and joins cost more than the overlap gave).  STRATA_DF_BRANCH=0|1
+        // fixes the choice.
+        const char* v = std::getenv("STRATA_DF_BRANCH");
+        for (int i = 0; i < 2; ++i)
+            if (!df_side_[i]) df_side_[i] = strata::gpu::stream_create();
+        if (!df_side_[0] || !df_side_[1]) df_branch_ = false;
+        else if (v != nullptr) df_branch_ = std::strtol(v, nullptr, 10) != 0;
+        else {
+            try {
+                df_branch_ = strata::kernels::graph_branch_pays(cs_, df_side_[0], df_side_[1]);
+            } catch (const std::exception&) {
+                df_branch_ = false;   // a device that cannot record such a graph keeps one queue
+            }
+        }
+    }
     if (!strata::gpu::event_create(&commit_done_)) {
         err = "verify: event create failed";
         return false;
@@ -421,6 +439,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    // STRATA_DF_BRANCH: mixer work that reads only the layer's input on a side branch of the graph.  fork(i): side i
+    // after everything on cs so far; join(i): cs after everything on side i - a branch never races with what came
+    // before its fork or after its join.  Not in a split or batch window, nor under the profiler (its stamps are on cs).
+    const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_;
+    auto fork = [&](int i) { return strata::gpu::stream_fork(cs, df_side_[i]); };
+    auto join = [&](int i) { return strata::gpu::stream_join(cs, df_side_[i]); };
     const bool self_commit = T == 1 && !batch_rec_ && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
@@ -588,6 +612,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                if (br) {   // a/b and z beside q/k/v and the conv: they read only this layer's input (xm, xq_)
+                    if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, df_side_[0]);
+                    if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
+                                df_side_[1]);
+                }
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // each row from its own slot's conv history, one row each
@@ -602,12 +635,16 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
                                   self_commit);
                 stamp(l, 3, grp);
-                gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
-                             (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
-                             n, cs);
-                stamp(l, 4, grp);
-                native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
-                stamp(l, 5, grp);
+                if (br) {   // gate, beta and z, before the recurrence reads them
+                    if (!join(0) || !join(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                } else {
+                    gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
+                                 (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
+                                 (int) HV, n, cs);
+                    stamp(l, 4, grp);
+                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
+                    stamp(l, 5, grp);
+                }
                 // the output norm also writes ssm_out's q8_1 input (the same bytes, a launch fewer; upstream
                 // 22abb92d, 0a22c467 for the batch's rows).  STRATA_QFUSE=0: a quantize launch of its own.
                 static const bool qfuse = [] {
