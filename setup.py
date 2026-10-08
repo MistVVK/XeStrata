@@ -535,6 +535,13 @@ def packages_for(distro: str, makers: set, mode: str) -> tuple:
 def print_packages(spec: str, mode: str) -> int:
     """setup --packages [DISTRO/MAKERS]: the install command for a distribution, GPU makers and build mode; without
     DISTRO/MAKERS, this PC's distribution and GPUs."""
+    if PACKAGED and not spec:                          # the package's engine: what this PC's GPUs need
+        makers = {g["vendor"] for g in gpus() if gpu_problem(g) is None}
+        lines = runtime_commands(*runtime_missing(makers))
+        say("Packages for your GPUs:" if lines else "Your GPUs have the packages they need.")
+        for line in lines:
+            say(line)
+        return 0
     if spec:
         distro, _, makers_s = spec.partition("/")
         makers = {m.strip() for m in makers_s.split(",") if m.strip()}
@@ -553,6 +560,88 @@ def print_packages(spec: str, mode: str) -> int:
     for n in notes:
         say(f"  - {n}")
     return 0
+
+
+# Adding Intel's oneAPI repository (oneMKL) and NVIDIA's CUDA one on Fedora (cuBLAS), as tools/package/container.sh
+# does
+INTEL_REPO = {
+    "ubuntu": ("wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \\\n"
+               "    | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null\n"
+               "  echo \"deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] "
+               "https://apt.repos.intel.com/oneapi all main\" \\\n"
+               "    | sudo tee /etc/apt/sources.list.d/oneAPI.list\n"
+               "  sudo apt update"),
+    "fedora": ("printf '%s\\n' '[oneAPI]' 'name=Intel oneAPI repository' \\\n"
+               "    'baseurl=https://yum.repos.intel.com/oneapi' 'enabled=1' 'gpgcheck=1' 'repo_gpgcheck=1' \\\n"
+               "    'gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB' \\\n"
+               "    | sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null"),
+}
+NVIDIA_REPO_FEDORA = ("sudo dnf config-manager addrepo "
+                      "--from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/"
+                      "cuda-fedora44.repo")
+
+
+def pkg_installed(name: str) -> bool:
+    """Whether the distribution package (or, on Fedora, what provides the capability) is installed."""
+    cmd = (["rpm", "-q", "--whatprovides", name] if distro_id() == "fedora" else
+           ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}", name])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError:
+        return True                                    # no package manager to ask: nothing is said
+    return r.returncode == 0 and (distro_id() == "fedora" or r.stdout.startswith("ii"))
+
+
+def repo_added(url: str) -> bool:
+    """Whether apt's or dnf's sources name the repository at `url`."""
+    files = [Path("/etc/apt/sources.list"), *Path("/etc/apt/sources.list.d").glob("*"),
+             *Path("/etc/yum.repos.d").glob("*.repo")]
+    for f in files:
+        try:
+            if url in f.read_text(errors="replace"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def runtime_missing(makers: set) -> tuple:
+    """For the package's engine: the GPU makers' packages (BUILD.json's runtime) that the GPUs of `makers` need and
+    are not installed, those that would make them faster (oneMKL, cuBLAS: contrib), and the commands that add the
+    repositories those come from.  Empty for an engine without the record."""
+    rt = packaged_engine().get("runtime") or {}
+    need = [n for m in ("intel", "amd") if m in makers for n in rt.get(m, []) if not pkg_installed(n)]
+    fast = [n for m, k in (("intel", "onemkl"), ("nvidia", "cublas")) if m in makers for n in rt.get(k, [])
+            if not pkg_installed(n)]
+    d = "fedora" if distro_id() == "fedora" else "ubuntu"
+    repos = []
+    if any(n in rt.get("onemkl", []) for n in fast) and not repo_added("repos.intel.com/oneapi"):
+        repos.append(INTEL_REPO[d])
+    if d == "fedora" and any(n in rt.get("cublas", []) for n in fast) and \
+            not repo_added("developer.download.nvidia.com/compute/cuda"):
+        repos.append(NVIDIA_REPO_FEDORA)
+    return need, fast, repos
+
+
+def runtime_commands(need: list, fast: list, repos: list) -> list:
+    """The lines that install them: the repositories first, then the packages in one command."""
+    inst = "sudo dnf install " if distro_id() == "fedora" else "sudo apt install "
+    return [f"  {r}" for r in repos] + ([f"  {inst}{' '.join(need + fast)}"] if need or fast else [])
+
+
+def check_runtime(makers: set) -> None:
+    """Stops when the GPUs of `makers` lack their makers' packages, and says how to install them; names oneMKL and
+    cuBLAS too when they are missing, without stopping (XeStrata's own kernels do their work)."""
+    need, fast, repos = runtime_missing(makers)
+    if not need and not fast:
+        return
+    lines = runtime_commands(need, fast, repos)
+    if need:
+        fail("the GPU's libraries are missing: " + ", ".join(need),
+             "install them, then run it again:\n" + "\n".join(lines))
+    warn("faster with " + ", ".join(fast) + " (not free software; without them XeStrata's own kernels do the work):")
+    for line in lines:
+        say(line)
 
 
 def rocm_missing() -> list:
@@ -2577,7 +2666,8 @@ def main() -> int:
     ap.add_argument("--packages", nargs="?", const="", metavar="DISTRO/MAKERS",
                     help="print the command that installs the distribution packages building from the source needs, "
                          "for the build mode (--license) and DISTRO/MAKERS, e.g. ubuntu26.04/intel,amd or "
-                         "fedora44/nvidia (default: this PC's distribution and GPUs), and exit")
+                         "fedora44/nvidia (default: this PC's distribution and GPUs), and exit; with XeStrata's deb or "
+                         "rpm, the GPU makers' packages this PC's GPUs lack")
     ap.add_argument("--remove-data", action="store_true",
                     help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "
                          "program with apt or dnf leaves them)")
@@ -2699,6 +2789,8 @@ def main() -> int:
     if gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
         fail("no access to the GPU's compute device (/dev/kfd)",
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
+    if PACKAGED:                                       # the GPU makers' packages the package only suggests
+        check_runtime({x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]})
     if gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else

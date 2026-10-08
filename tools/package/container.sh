@@ -163,6 +163,14 @@ else
   esac
   suggests="$level_zero, $vulkan_icd, $cublas, $mklpkg, $rocm"
 fi
+# the same, by GPU maker, for setup to tell what a PC lacks (BUILD.json's "runtime"): what each maker's GPUs need,
+# and in the contrib packages oneMKL and cuBLAS, which make them faster
+json_list() { printf '["%s"]' "$(echo "$1" | sed 's/, */", "/g')"; }
+runtime="{\"intel\": $(json_list "$level_zero"), \"amd\": $(json_list "$rocm")"
+if [ "$license" = contrib ]; then
+  runtime="$runtime, \"onemkl\": $(json_list "$mklpkg"), \"cublas\": $(json_list "$cublas")"
+fi
+runtime="$runtime}"
 case "$distro" in
   ubuntu*)
     # the libraries the engine's own files link, from dpkg-shlibdeps; not oneMath's backends and the CUDA and HIP
@@ -187,7 +195,7 @@ case "$distro" in
   fedora*) generator=RPM ;;
 esac
 cmake -DSTRATA_PACKAGE_DEPENDS="$depends" -DSTRATA_PACKAGE_RECOMMENDS="$recommends" \
-  -DSTRATA_PACKAGE_SUGGESTS="$suggests" /build/engine
+  -DSTRATA_PACKAGE_SUGGESTS="$suggests" -DSTRATA_PACKAGE_RUNTIME="$runtime" /build/engine
 cd /build/engine
 cpack -G "$generator"
 find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;

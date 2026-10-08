@@ -22,6 +22,8 @@ set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with strata-vision-cpu a
 set(STRATA_PACKAGE_DEPENDS "" CACHE STRING "the package's dependencies, the distribution's names")
 set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, installed by default")
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
+set(STRATA_PACKAGE_RUNTIME "{}" CACHE STRING
+    "the GPU makers' packages by maker, as a JSON object, for setup to tell what a PC lacks (BUILD.json's runtime)")
 if(NOT STRATA_PACKAGE_NAME OR NOT STRATA_PACKAGE_VISION_DIR)
   message(FATAL_ERROR "STRATA_PACKAGE needs STRATA_PACKAGE_NAME and STRATA_PACKAGE_VISION_DIR "
                       "(tools/package/build.sh sets them)")
@@ -92,8 +94,8 @@ install(CODE "
       endif()
     endif()
   endforeach()")
-# the engine's record: setup.py reads its license, NVIDIA architectures and library folder (lib_dirs, which the server
-# puts on LD_LIBRARY_PATH for the libraries the UR adapters open)
+# the engine's record: setup.py reads its license, NVIDIA and AMD architectures, the GPU makers' packages (runtime)
+# and library folder (lib_dirs, which the server puts on LD_LIBRARY_PATH for the libraries the UR adapters open)
 set(_pkg_archs "")
 set(_pkg_hip_archs ${_strata_hip_archs})   # the AMD architectures (free and contrib)
 if(STRATA_LICENSE STREQUAL "contrib")
@@ -113,6 +115,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
  \"license\": \"${STRATA_LICENSE}\",
  \"cuda_archs\": [${_pkg_archs}],
  \"hip_archs\": [${_pkg_hip_archs}],
+ \"runtime\": ${STRATA_PACKAGE_RUNTIME},
  \"compiler\": {\"id\": \"${CMAKE_CXX_COMPILER_ID}\", \"version\": \"${CMAKE_CXX_COMPILER_VERSION}\"},
  \"lib_dirs\": [\"${_pkg_engine_abs}/lib\"]
 }
