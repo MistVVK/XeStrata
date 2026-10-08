@@ -350,7 +350,9 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
-    int32_t* one_ = nullptr;   ///< device 1: a one-token window's n_keep (it commits itself)
+    int32_t* one_ = nullptr;
+    float* ple_key_ = nullptr;   ///< the window rows' PLE key and value projections (ple_batch)
+    float* ple_val_ = nullptr;   ///< device 1: a one-token window's n_keep (it commits itself)
     uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM

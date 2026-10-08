@@ -128,6 +128,7 @@ void gate_t(sycl::queue& q, const float* key, const float* query, float* gate, i
 }  // namespace
 
 void ple_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool ple_native_bf16() { return native_bf16; }
 void ple_set_native_postops(bool enabled) { native_postops = enabled; }
 bool ple_native_postops_enabled() { return native_postops; }
 
@@ -222,7 +223,9 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 
     // ---- key = grouped_norm(ple_key @ emb): the optional native projection follows pinned CUDA Q8_1 MMVQ; the
     // default keeps its canonical Q8_0 path
-    if (w.key_bf16 != nullptr) {
+    if (w.pre_key != nullptr) {
+        q.memcpy(d_key, w.pre_key, (size_t) hc_dim * sizeof(float));
+    } else if (w.key_bf16 != nullptr) {
         bf16_gemv_fp32_mmvf(emb, w.key_bf16, d_key, n_embd, hc_dim, st);
     } else if (native_key) {
         native_quantize_q8_1(emb, w.key_native_q8_1, n_embd, 1, st);
@@ -237,7 +240,9 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     }
 
     // the value projection's independent option leaves the nonlinear PLE operations unchanged
-    if (native_bf16) {
+    if (w.pre_value != nullptr) {
+        q.memcpy(d_value, w.pre_value, (size_t) n_embd * sizeof(float));
+    } else if (native_bf16) {
         bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, st);
     } else {
         q.parallel_for(sycl::range<1>(n_embd), [=](sycl::id<1> i) { d_emb16[i] = bf16_bits(emb[i]); });
