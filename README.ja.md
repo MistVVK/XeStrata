@@ -122,6 +122,8 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 | Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA の Pascal と Volta（P100、P40、V100 など）、それと Intel や AMD | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
+- **Pascal と Volta の GPU（P100、P40、GTX 10 シリーズ、V100 など）は `xestrata-contrib-cuda12.4` を使ってください。**
+  CUDA 13 の版にはこれらの GPU のコードがなく、これらを扱う NVIDIA のドライバーも 580 の系列までです（CUDA 12.4 に対応）。
 - パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
   一緒にある `SHA256SUMS` で、取ってきたファイルを確かめられます（`sha256sum -c SHA256SUMS --ignore-missing`）。
   自分で作るときは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
@@ -136,6 +138,7 @@ sudo dnf install ./xestrata-free-*.rpm      # Fedora
 GPU を動かすためのパッケージは、PC の GPU によって違うので、ここでは入りません。
 次の手順で `xestrata` を初めて実行すると、PC の GPU と入れた版に合わせて、足りないパッケージとその入れ方を表示します。
 表示されたとおりに入れてから、もう一度 `xestrata` を実行します（あとで確かめ直すときは `xestrata --setup`）。
+自分のユーザーを `render` グループに入れておきます（`sudo usermod -aG render $USER` の後、ログインし直す）。
 
 **3. 端末で `xestrata` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
 

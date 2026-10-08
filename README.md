@@ -126,6 +126,8 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 | Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), with Intel or AMD or not | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
+- **Pascal and Volta GPUs (a P100, P40, GTX 10 series or V100) take `xestrata-contrib-cuda12.4`.**
+  The CUDA 13 packages have no code for them, and NVIDIA's drivers for them end with the 580 series (CUDA 12.4 works with it).
 - The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
   The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
   To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).
@@ -141,6 +143,7 @@ The packages that run the GPU depend on the PC's GPUs, so they are not installed
 The first time you run `xestrata` (the next step), it shows the packages the PC's GPUs and the installed package
 lack, and how to install them.
 Install them as it shows, then run `xestrata` again (to check again later: `xestrata --setup`).
+Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
 
 **3. Run `xestrata` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
 
