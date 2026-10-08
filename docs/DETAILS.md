@@ -656,6 +656,18 @@ It takes no checkpoint at the start of its last turn nor every 16K tokens, and i
 It still starts from a checkpoint it matches, and still takes the system-prompt root when that reaches `--prompt-cache-root`.
 Without the field, or with `true`, nothing changes.
 
+For many questions about one long document a request can say where the document ends (`"strata_prefix"`, opt-in, upstream 13d14a49).
+It takes `{"messages": 1}` (the first message is the document), `{"message": 0, "chars": 210000}` (the first 210,000 characters of message 0, for a client that sends the document and the question in one message) or `{"tokens": 12345}`.
+The engine reads the prompt in two parts there and pins the checkpoint at the boundary.
+A pinned checkpoint is never evicted, a parked conversation holding it stays parked, and `SAVE` keeps it.
+When a later question resumes from it, the question it leaves is not parked.
+The next question starts at the end of the document, so any number of questions cost one read of it.
+On the B70 with IQ2_XS, three questions after a 1,791-token prompt: the second and third reused 1,766 tokens and read only 19-20.
+The field is checked against the prompt's own ids (the prefix is always the longest common start), a prefix that cannot be marked is said in the server's log and ignored, and a malformed field is a 400.
+One pinned prefix at a time per engine (a new one replaces it); it needs `--prompt-cache 3` or more.
+`tools/research_run.py` runs a document and a question list against a server with and without the field.
+The engine's own key is `pin=N` on the `GEN` line.
+
 Two options are off by default (both on one GPU).
 
 - `--prompt-cache-tail` (an engine argument): one more checkpoint at a chunk boundary within one chunk of the prompt's end.
