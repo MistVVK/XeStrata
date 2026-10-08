@@ -214,6 +214,13 @@ The engine then reads the experts from the model files instead of copying them a
 a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `experts.bin`.
 
 - If the experts the GPU does not hold fit the RAM, they are copied into RAM once at start (`--resident-experts`).
+  The server then moves the adaptive tier's swaps (exchanges between the RAM copy and the GPU cache) on a helper
+  thread between verify windows (`--adapt-async`, opt-in upstream in b437b8ea, the default here).
+  No window waits for a whole round of swaps.
+  On an RTX 4070, swapping about 95 experts a round, decoding ran 14-15% faster (the B70 within the run-to-run spread).
+  Which window first computes a swapped-in expert on the GPU depends on when its copy lands, so an answer can differ a little from run to run.
+  `--adapt-async 0` restores the tier in which a window waits.
+  Without page-locked exchange buffers, and with `--batch`, the waiting tier runs.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
 
 `--low-ram on|off|resident|mmap` overrides the choice, and `./setup.sh --check` shows what each size would use.
