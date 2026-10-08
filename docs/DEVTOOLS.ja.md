@@ -107,7 +107,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   `rocm-dev` に引かれて自動で入ったものは、`rocm-dev` が消えると `apt autoremove` の対象になるので、`sudo apt-mark manual hipcc libamdhip64-dev libhsa-runtime-dev rocminfo` で手動の印を付けます。
 - スクリプトは、リリースにない修正を `third_party/main/intel-llvm/patches/` のパッチ（`NN-<id>.patch`、intel/llvm と同じ Apache-2.0 WITH LLVM-exception）として番号順にソースに当ててからビルドし、当てた修正の id を `install/XESTRATA.json` に残します。
   修正の足りない同じ版のビルドがあれば、作り直すかを尋ねます。
-  今の修正は 11 で、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
+  今の修正は 12 で、どれも intel/llvm の `sycl` ブランチでも直っていません（2026-10-08）。
   1 つ目: CUDA と HIP のアダプタが、コマンドバッファにノードを足すたびに同期点の表を丸ごとコピーしていて、SYCL のグラフの完成にノード数の 2 乗の時間がかかっていました（2600 カーネルのグラフで、RTX 4070 では 90 ms、修正後は 4 ms。Level Zero は 2 ms）。
   2 つ目: SYCL のランタイムが、どの NVIDIA の GPU にも最初に見つけた NVIDIA の像を、アーキテクチャを見ずに渡していました。
   いくつかのアーキテクチャのコードを持つ実行ファイルでは、その像より古い GPU は動かず、新しい GPU は古いコードを走らせていました。
@@ -133,6 +133,10 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   11 番目: libclc は、コンパイラが `__HAS_FMAF__` を定義しない amdgcn を、FMA の命令がない GPU として扱っていました。
   AMD 向けの libspirv はプロセッサを指定せずにビルドするのでこの定義がなく、`sycl::fma` とそれを使う数学関数が、どの AMD の GPU でもソフトウェアの FMA になっていました（RX 9060 XT でエンジンの DeltaNet の漸化式が 1 トークン約 95 µs）。
   amdgcn の GPU はどれも `v_fma_f32` を持つので、修正後はソフトウェアの FMA を r600 だけに残します（`hip-libclc-fma`）。
+  12 番目: いくつかの AMD のアーキテクチャのコードを持つプログラムで、カーネルバンドル（`get_kernel_bundle`）が最初のアーキテクチャの像を取り、GPU が断っていました（`hipErrorInvalidImage`）。
+  AMD の像には `compile_target` がなく、ランタイムは像を 1 つずつ、中身を渡さずに HIP のアダプタに尋ね、アダプタは合うものがないと最初の AMD の像を代わりに選ぶためです。
+  パッケージのように AMD の GPU をいくつも対象にしたエンジンは、使える GPU がないと言って止まっていました（キューに投げるカーネルは、像をまとめて中身ごと渡すので選べていました）。
+  修正後は、ランタイムが CUDA と同じく像そのものを HIP のアダプタにも渡し、アダプタはその GPU のアーキテクチャを含まない clang のオフロードバンドルを代わりに選びません（`hip-bundle-arch`）。
   CUDA の修正は contrib のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。
