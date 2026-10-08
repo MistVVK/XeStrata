@@ -30,7 +30,9 @@ CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用�
 
 ## Strata 0.1.40 の取り込み
 
-upstream の Strata 0.1.39 から 0.1.40.2（`e8ca9afd`）までの変更を、Windows と AMD（HIP）の実装を除いて Xe に移しています。
+upstream の Strata 0.1.39 から 0.1.40.2（`e8ca9afd`）までの変更を、Windows の実装を除いて Xe に移しています。
+AMD（HIP）の変更は、XeStrata の AMD の経路（同じ SYCL のカーネル）に当てはまるものを移しました: AMD の APU の統合メモリ（setup と、エンジンの内蔵 GPU の空き）と、全機種向けだった融合した RMSNorm + RoPE です。
+upstream の HIP 専用の速くするためのスイッチは、RX 9060 XT（gfx1200）で入り切りして測り、gfx11（RDNA3）と gfx103x（RDNA2）専用のものは試せる機器がないので移していません（[記録](../bench/results/2026-10-09-upstream-0140/README.md)）。
 upstream の `sycl/`（Intel の GPU 向けの別の移植）はコードに入れず、同じ B70 で速さを比べる相手にしています。
 NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きます（[BUILD](BUILD.ja.md)）。
 

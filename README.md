@@ -282,9 +282,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
-- **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows and AMD
-  implementations. Of the paths meant to be faster, those measured faster on the B70 or the RTX 4070 are carried
-  ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).
+- **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows
+  implementation. Of the paths meant to be faster, those measured faster on the B70, the RTX 4070 or the RX 9060 XT
+  are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits

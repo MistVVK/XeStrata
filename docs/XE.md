@@ -29,7 +29,9 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 
 ## Integration through Strata 0.1.40
 
-The changes of upstream Strata 0.1.39 to 0.1.40.2 (`e8ca9afd`) are carried into Xe, except the Windows and AMD (HIP) implementations.
+The changes of upstream Strata 0.1.39 to 0.1.40.2 (`e8ca9afd`) are carried into Xe, except the Windows implementation.
+Of the AMD (HIP) changes, those that apply to XeStrata's AMD path (the same SYCL kernels) are carried: an AMD APU's unified memory (setup, and the engine's free memory of an integrated GPU) and the fused RMSNorm + RoPE, which was meant for every GPU.
+Upstream's HIP-only speed switches were measured on and off on an RX 9060 XT (gfx1200); those for gfx11 (RDNA3) and gfx103x (RDNA2) only are not carried, with no such card to try them on ([record](../bench/results/2026-10-09-upstream-0140/README.md)).
 Upstream's `sycl/` (another port to Intel GPUs) is not taken in: it is measured against on the same B70.
 On NVIDIA GPUs the same kernels run in the contrib-llvm build ([BUILD](BUILD.md)).
 

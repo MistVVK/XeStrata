@@ -112,3 +112,33 @@ An 18-token chat with 256 tokens out, and 4,095 random token ids (Python `random
 
 XeStrata with `--prefill 4096` read the prompt at the same 1214.8 and 1216.2 tok/s.
 The port held 16,298 experts in VRAM and mirrored the 8,278 others in pinned host memory; its decode took about 2.5 s per verify window (47 windows, 211 of 214 drafts accepted).
+
+## AMD: RX 9060 XT (gfx1200)
+
+A Ryzen 7 5700X, 62 GB of RAM, ROCm 7.1.1 (Fedora 44), in a container; Coder IQ1_M (`--expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp`), 8K context for the 1K and 4K prompts (1,016 and 3,561 tokens), 256 greedy tokens.
+XeStrata is the free build (intel/llvm with the HIP target); upstream is its own HIP build of 0.1.40.2.
+
+Upstream's AMD switches, each on against its default (the second round; the first overlapped another job on the card):
+
+| Switch | Prompt, 4K (tok/s) | Decode (tok/s) |
+| --- | --- | --- |
+| default | 399.8 | 48.08 |
+| `STRATA_DENSE_MMQ=1` | 421.0 | 48.88 |
+| `STRATA_HIP_PROMPT_F16=1` (gfx103x) | 397.9 | 50.71 |
+| `STRATA_HIP_WMMA`, `SELECT_WMMA`, `Q8_PACKED`, `EXPERT_V2K`, `PF_FUSED`, `WMMA_GEMM`, `PF_GEMM`, `HC_UPMIX`, `PA_FAST`, `PF_PAD` | 398.7-400.2 | 48.04-48.13 |
+| `STRATA_HCD_EXACT=1` | 402.1 | 48.08 |
+| `STRATA_Q6_PACKED=1`, `EXPERT_V2=1`, `TSUM=1`, `HIP_ADAPT_KERNEL_COPY=1` | 399.4-400.2 | 47.15-47.62 |
+| `STRATA_PF_HCDOWN=1` | failed | |
+| `STRATA_SH_STREAM=1` | hung after the window capture (both rounds) | |
+
+Most of them are for gfx11 or gfx103x only and change nothing here.
+XeStrata against upstream, two interleaved rounds:
+
+| | Prompt, 1K | Prompt, 4K | Decode |
+| --- | --- | --- | --- |
+| XeStrata (fused norm + RoPE, the default) | 704.3, 703.8 | 749.4, 749.2 | 46.67-47.75 |
+| XeStrata, `STRATA_NO_NORM_ROPE=1` | 702.8, 701.4 | 747.1, 747.8 | 46.70-47.69 |
+| upstream | 301.4, 335.4 | 400.0, 400.0 | 46.33-49.66 |
+| upstream, `STRATA_DENSE_MMQ=1` | 350.1, 348.1 | 422.1, 421.5 | 47.32-48.12 |
+
+The fused norm + RoPE (upstream 088e8a82, off on HIP there) is bit-identical to the pair on the gfx1200 too (rope_parity); in captured graphs replayed back to back it took the q split, the norm and the RoPE from 10.7 to 9.4 µs on the B70 (36.1 to 9.7 µs at 8 rows) and from 4.2 to 2.1 µs on the RTX 4070; perfdec moved by +0.2% on the B70 and -0.2% to -1.0% on the RTX 4070 (within the spread).
