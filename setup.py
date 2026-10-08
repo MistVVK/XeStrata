@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Strata setup and start (Linux, Intel Arc and other Intel GPUs).
+"""Strata setup and start (Linux; Intel GPUs, RDNA2 or later AMD GPUs, NVIDIA GPUs).
 
     ./setup.sh installs Python if needed and runs this file
 
@@ -14,7 +14,8 @@ done again.
 
 What the first run does (each step is skipped when it is already done):
 
-  1. checks your PC: the GPU (Intel; NVIDIA in the contrib build, the default) and its driver, RAM, CPU, free disk space
+  1. checks your PC: the GPU (Intel, AMD; NVIDIA in the contrib build, the default) and its driver, RAM, CPU, free
+     disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
   4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md), and the image encoder when
@@ -373,6 +374,7 @@ def drm_memory(render: str, driver: str):
 
 def pci_name(vendor: int, device: int) -> str:
     """The card's name from the PCI ID database (hwdata), or its IDs."""
+    maker = {0x8086: "Intel", 0x1002: "AMD"}.get(vendor, f"0x{vendor:04x}")
     for f in ("/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"):
         try:
             text = Path(f).read_text(encoding="utf-8", errors="replace")
@@ -387,9 +389,9 @@ def pci_name(vendor: int, device: int) -> str:
                 short = b.group(1) if b else n
                 if short.startswith("Intel"):            # a bracket that names no product: the chip's name too
                     return f"{short} ({n[:n.find('[')].strip() or n})"
-                return "Intel " + short
+                return f"{maker} {short}"
         break
-    return f"Intel GPU 0x{device:04x}"
+    return f"{maker} GPU 0x{device:04x}"
 
 
 def host_link(dev: Path):
@@ -426,12 +428,89 @@ def nvidia_smi() -> dict:
     return found
 
 
+# The AMD GPUs the engine's kernels run on, as cmake/StrataHip.cmake checks them: RDNA2 and later (wave32 and the
+# integer dot instructions)
+AMD_ARCH = re.compile(r"gfx(103[0-9a-f]|11[0-9a-f]{2}|12[0-9a-f]{2})")
+
+
+def kfd_nodes() -> dict:
+    """Each AMD GPU the kernel's KFD (amdgpu's compute part) has, by PCI address ("0000:0c:00.0"): its ISA name
+    ("gfx1200"; gfx_target_version is major * 10000 + minor * 100 + stepping, the last two in hex in the name, as
+    cmake/StrataHip.cmake reads it) and whether it is a processor's own graphics (the node has CPU cores as well)."""
+    found = {}
+    for props in Path("/sys/class/kfd/kfd/topology/nodes").glob("*/properties"):
+        try:
+            f = dict(line.split(None, 1) for line in props.read_text().splitlines() if " " in line)
+            v, loc = int(f.get("gfx_target_version", "0")), int(f.get("location_id", "0"))
+        except (OSError, ValueError):
+            continue
+        if v == 0:
+            continue
+        pci = f"{int(f.get('domain', '0')):04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7:x}"
+        found[pci] = {"gfx": f"gfx{v // 10000}{(v // 100) % 100:x}{v % 100:x}",
+                      "integrated": int(f.get("cpu_cores_count", "0")) > 0}
+    return found
+
+
+def rocblas_archs() -> set | None:
+    """The AMD architectures the distribution's rocBLAS has code for (its kernels' file names), None without rocBLAS:
+    the engine's dense matrix products run in it, so an AMD GPU it has no code for cannot run the engine."""
+    dirs = [d for d in (Path("/usr/lib64/rocblas/library"), Path("/opt/rocm/lib/rocblas/library"),
+                        *Path("/usr/lib").glob("*/rocblas/*/library")) if d.is_dir()]
+    if not dirs:
+        return None
+    return {m.group(0) for d in dirs for f in d.iterdir() if (m := re.search(r"gfx[0-9a-f]+", f.name))}
+
+
+def distro_id() -> str:
+    """The distribution's ID in /etc/os-release ("ubuntu", "fedora"), empty when it cannot be read."""
+    try:
+        m = re.search(r"^ID=\"?([^\"\n]*)", Path("/etc/os-release").read_text(), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def amd_elsewhere() -> str:
+    """Where an AMD GPU that this distribution's rocBLAS lacks runs: Fedora 44's rocBLAS has code for more of them
+    (README.md, "AMD GPUs")."""
+    return ("see README.md (AMD GPUs)" if distro_id() == "fedora" else
+            "Fedora 44's has code for more AMD GPUs (README.md, AMD GPUs)")
+
+
+def rocm_missing() -> list:
+    """The ROCm packages building the AMD code needs that are not installed, by the distribution's names: HIP's
+    headers (intel/llvm's HIP target), the device libraries the code links, ROCm's clang with its runtime (HIP's CMake
+    package, cmake/StrataHip.cmake), rocBLAS and hipBLASLt (oneMath's rocBLAS backend: the dense products)."""
+    import glob
+    fedora = distro_id() == "fedora"
+    inc = [Path("/usr/include"), Path("/opt/rocm/include")]
+    clang_ok = False
+    for cxx in glob.glob("/opt/rocm/llvm/bin/clang++") + glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + \
+            glob.glob("/usr/lib/llvm-*/bin/clang++"):
+        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
+        clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
+    have = {
+        ("rocm-hip-devel", "libamdhip64-dev"): any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
+        ("rocm-device-libs", "rocm-device-libs-21"): any(
+            glob.glob(g) for g in ("/opt/rocm/amdgcn/bitcode/ockl.bc",
+                                   "/usr/lib64/rocm/llvm/lib/clang/*/lib/amdgcn/bitcode/ockl.bc",
+                                   "/usr/lib/llvm-*/lib/clang/*/amdgcn/bitcode/ockl.bc")),
+        ("rocm-clang rocm-clang-runtime-devel", "clang-21 libclang-rt-21-dev"): clang_ok,
+        ("rocblas-devel", "librocblas-dev"): any((d / "rocblas" / "rocblas.h").exists() for d in inc),
+        ("hipblaslt-devel", "libhipblaslt-dev"): any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
+    }
+    return [names[0 if fedora else 1] for names, ok_ in have.items() if not ok_]
+
+
 def gpus():
     """Every Intel GPU on the xe or i915 driver in PCI order (the order Level Zero numbers them), then every NVIDIA GPU
-    on NVIDIA's driver (after them, so that the Intel cards keep the numbers saved configs know them by), from sysfs,
-    the Intel driver's memory query and nvidia-smi: no tool of Strata's is needed before the engine is built.  Nothing
-    is decided from the device ID: the engine checks at start what the card reports (AGENTS.md)."""
-    found, nvidia = [], []
+    on NVIDIA's driver and every AMD GPU on amdgpu (after them, so that the Intel cards keep the numbers saved configs
+    know them by), from sysfs, the Intel driver's memory query, nvidia-smi and the KFD topology: no tool of Strata's is
+    needed before the engine is built.  Nothing is decided from the device ID: the engine checks at start what the
+    card reports (AGENTS.md)."""
+    found, nvidia, amd = [], [], []
+    kfd = None
     smi = None
     cards = [c for c in Path("/sys/class/drm").glob("card*") if re.fullmatch(r"card\d+", c.name)]
     for card in sorted(cards, key=lambda c: (c / "device").resolve().name):
@@ -439,15 +518,32 @@ def gpus():
         try:
             driver = (dev / "driver").resolve().name
             vendor = (dev / "vendor").read_text().strip()
-            if (vendor, driver) not in (("0x8086", "xe"), ("0x8086", "i915"), ("0x10de", "nvidia")):
+            if (vendor, driver) not in (("0x8086", "xe"), ("0x8086", "i915"), ("0x10de", "nvidia"),
+                                        ("0x1002", "amdgpu")):
                 continue
             did = int((dev / "device").read_text().strip(), 16)
+            if vendor == "0x1002":
+                # amdgpu reports its memory and how much of it the CPU sees (the BAR) in sysfs
+                vram_b = int((dev / "mem_info_vram_total").read_text())
+                vis_b = int((dev / "mem_info_vis_vram_total").read_text())
             # the BAR the CPU sees the memory through: BAR 2 on Intel's cards, BAR 1 on NVIDIA's
             bar = (dev / "resource").read_text().splitlines()[2 if vendor == "0x8086" else 1].split()
             bar_gb = (int(bar[1], 16) - int(bar[0], 16) + 1) / 2 ** 30 if int(bar[1], 16) else 0.0
         except (OSError, ValueError, IndexError):
             continue
         pci = dev.resolve().name
+        if vendor == "0x1002":
+            kfd = kfd_nodes() if kfd is None else kfd
+            node = kfd.get(pci, {})
+            render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
+            integrated = bool(node.get("integrated"))
+            name = f"{pci_name(0x1002, did)} ({node.get('gfx') or 'no KFD node'})"
+            amd.append({"name": name, "vram_gb": 0.0 if integrated else vram_b / 2 ** 30,
+                        "device_id": did, "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
+                        "bar_gb": vis_b / 2 ** 30, "link": host_link(dev),
+                        "render": f"/dev/dri/{render.name}" if render else None, "vendor": "amd",
+                        "gfx": node.get("gfx")})
+            continue
         if vendor == "0x10de":
             smi = nvidia_smi() if smi is None else smi
             info = smi.get(pci, {})
@@ -467,7 +563,7 @@ def gpus():
         found.append({"index": len(found), "name": pci_name(0x8086, did), "vram_gb": vram, "device_id": did,
                       "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
                       "bar_gb": visible, "link": host_link(dev), "render": node, "vendor": "intel"})
-    return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia)]
+    return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia + amd)]
 
 
 def gpu_problem(g, together=False):
@@ -489,6 +585,21 @@ def gpu_problem(g, together=False):
         return None
     if g.get("vendor") == "nvidia" and license_mode(ARGS) != "contrib":
         return "an NVIDIA GPU needs the contrib build (--license contrib: NVIDIA's CUDA toolkit, not free software)"
+    if g.get("vendor") == "amd":
+        if not PACKAGED and license_mode(ARGS) == "contrib-icpx":
+            return "icpx has no AMD target: an AMD GPU needs the free or contrib build (--license free or contrib)"
+        gfx = g.get("gfx")
+        if not gfx:
+            return "the kernel's KFD (amdgpu's compute part, /dev/kfd) does not list it"
+        if not AMD_ARCH.fullmatch(gfx):
+            return f"{gfx}: the engine needs an RDNA2 or later AMD GPU (gfx103x, gfx11xx, gfx12xx)"
+        if PACKAGED:
+            meta = packaged_engine()
+            if gfx not in meta.get("hip_archs", []):
+                return f"{meta.get('package', 'this package')} has no code for {gfx}: " + amd_elsewhere()
+        elif (have := rocblas_archs()) is not None and gfx not in have:
+            return (f"this distribution's rocBLAS, which the engine's dense matrix products run in, has no code for "
+                    f"{gfx}: " + amd_elsewhere())
     return None
 
 
@@ -530,7 +641,8 @@ def check_gpus(sel, found, what="") -> None:
         gpu_table(found)
         single = [x for x in found if gpu_problem(x) is None]
         hint = ("use " + " or ".join(f"--gpu {x['index']}" for x in single)) if single else \
-            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver, or with --license contrib an NVIDIA GPU"
+            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, " \
+            "or with --license contrib an NVIDIA GPU"
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
 
@@ -546,13 +658,14 @@ def choose_gpus(a, found) -> list:
     if not single:
         gpu_table(found)
         fail("none of your GPUs can run Strata",
-             "it needs an Intel GPU on the xe or i915 driver, or with --license contrib an NVIDIA GPU")
+             "it needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, or with --license "
+             "contrib an NVIDIA GPU")
     return [single[0]["index"]]
 
 
 def gpu_info(pick=None):
     """The GPU Strata runs on: `pick` (its number in gpus()) if given, else the one with the most VRAM (ties: the
-    lower number).  None when there is no Intel GPU on the xe or i915 driver.  The dict also says how many there are
+    lower number).  None when gpus() finds none.  The dict also says how many there are
     ("count")."""
     found = gpus()
     if not found:
@@ -868,7 +981,7 @@ def free_compiler(install: Path, license: str = "free") -> dict:
     lib = install / "lib"
     env = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join([str(lib), os.environ.get("LD_LIBRARY_PATH", "")]))
     return {"kind": "intel-llvm", "cxx": str(install / "bin" / "clang++"), "cc": str(install / "bin" / "clang"),
-            "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": [], "onemkl": False}
+            "env": env, "lib_dirs": [str(lib)], "license": license, "cuda_archs": [], "hip_archs": [], "onemkl": False}
 
 
 def new_enough(comp: dict) -> bool:
@@ -894,7 +1007,7 @@ def os_compiler() -> dict | None:
         return None
     cc = shutil.which(Path(cxx).name.replace("dpclang++", "dpclang")) or cxx
     return {"kind": "os", "cxx": cxx, "cc": cc, "env": dict(os.environ), "lib_dirs": [], "license": "free",
-            "cuda_archs": [], "onemkl": False}
+            "cuda_archs": [], "hip_archs": [], "onemkl": False}
 
 
 def icpx_compiler() -> dict | None:
@@ -903,7 +1016,12 @@ def icpx_compiler() -> dict | None:
         return None
     return {"kind": "icpx", "cxx": shutil.which("icpx", path=env.get("PATH")),
             "cc": shutil.which("icx", path=env.get("PATH")) or "icx", "env": env, "lib_dirs": oneapi_lib_dirs(),
-            "license": "contrib-icpx", "cuda_archs": [], "onemkl": True}
+            "license": "contrib-icpx", "cuda_archs": [], "hip_archs": [], "onemkl": True}
+
+
+def amd_archs() -> list:
+    """The ISA names of this PC's AMD GPUs the engine can run on: the build makes their code (STRATA_HIP_ARCHS)."""
+    return sorted({g["gfx"] for g in gpus() if g.get("vendor") == "amd" and gpu_problem(g) is None})
 
 
 def intel_gpu_present() -> bool:
@@ -1024,7 +1142,8 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp = free_compiler(d)
             if not new_enough(comp):
                 fail(f"--intel-llvm {d}: older than intel/llvm 7", FREE_HOW)
-        elif not a.intel_llvm_build and (c := os_compiler()) is not None:
+        elif not a.intel_llvm_build and not amd_archs() and (c := os_compiler()) is not None:
+            # (AMD GPUs take intel/llvm built here, which gets the HIP target from the ROCm installed)
             if new_enough(c):
                 comp = c
             else:
@@ -1042,8 +1161,27 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp["license"], comp["onemkl"] = "contrib", intel_gpu_present()
     if comp["onemkl"] and mkl_root() is None:
         fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed", MKL_HOW)
-    if gpu.get("vendor") == "nvidia":
-        # the tensor cores through cuBLAS and joint_matrix: the XMX question is Intel's
+    comp["hip_archs"] = amd_archs()
+    if comp["hip_archs"]:
+        if missing := rocm_missing():
+            fail("building for the AMD GPU needs ROCm's " + ", ".join(missing),
+                 ("install them: sudo dnf install " if distro_id() == "fedora" else "install them: sudo apt install ")
+                 + " ".join(missing) + ", then run it again")
+        if not any(Path(d).glob("libur_adapter_hip.so*") for d in comp["lib_dirs"]):
+            # intel/llvm gets the HIP target only when ROCm's HIP is there as it is built
+            llvm = Path(comp["cxx"]).parent.parent
+            if llvm.resolve() not in (INTEL_LLVM_DEFAULT.resolve(), INTEL_LLVM_CONTRIB.resolve()):
+                fail(f"{llvm}: this intel/llvm has no HIP target (AMD GPUs)",
+                     "build it with ROCm's HIP installed (tools/intel_llvm_build.py)")
+            say("  The intel/llvm built here has no HIP target (AMD GPUs): it was built before ROCm was installed.")
+            if ask("Build it again with the HIP target now?", ["y", "n"], "y", a.yes) != "y":
+                fail("stopped: no HIP target for the AMD GPU", "python3 tools/intel_llvm_build.py --rebuild" +
+                     (" --contrib" if llvm.resolve() == INTEL_LLVM_CONTRIB.resolve() else ""))
+            a.intel_llvm_rebuild = True
+            build_intel_llvm(a, contrib=llvm.resolve() == INTEL_LLVM_CONTRIB.resolve())
+    if gpu.get("vendor") in ("nvidia", "amd"):
+        # the tensor cores through cuBLAS and joint_matrix, AMD's WMMA and dot instructions: the XMX question is
+        # Intel's
         xmx = False
     else:
         probed = probe_gpu(comp, pci)
@@ -1069,10 +1207,11 @@ def choose_compiler(a, gpu: dict) -> dict:
     save_settings({**st, "license": mode, "allow_no_xmx": allow_no_xmx, **kept})
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
     comp["xmx"] = xmx
-    what = ("NVIDIA's tensor cores" if gpu.get("vendor") == "nvidia" else
-            "XMX" if xmx else "no XMX: the slower prompt path")
+    what = ("NVIDIA's tensor cores" if gpu.get("vendor") == "nvidia" else "an AMD GPU" if gpu.get("vendor") == "amd"
+            else "XMX" if xmx else "no XMX: the slower prompt path")
     ok(f"SYCL compiler: {comp['version']} ({mode}; {what}" +
-       (f"; NVIDIA code for {', '.join(comp['cuda_archs'])}" if comp["cuda_archs"] else "") + ")")
+       (f"; NVIDIA code for {', '.join(comp['cuda_archs'])}" if comp["cuda_archs"] else "") +
+       (f"; AMD code for {', '.join(comp['hip_archs'])}" if comp["hip_archs"] else "") + ")")
     return comp
 
 
@@ -1171,7 +1310,8 @@ def build_engine(visions, llama, comp: dict) -> Path:
     xe = engine_is_xe(meta)
     src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
-            "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"]}
+            "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"],
+            "hip_archs": comp.get("hip_archs", [])}
     engine_ok = xe and (eng / EXE).exists() and meta.get("src") == src and meta.get("compiler") == used
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
     missing = [v for v in dict.fromkeys(visions)
@@ -1193,6 +1333,7 @@ def build_engine(visions, llama, comp: dict) -> Path:
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}",
                      f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
+                     f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
                      f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
                      *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
                      "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
@@ -1240,6 +1381,7 @@ def recorded_compiler(meta: dict) -> dict:
         if comp["license"] == "contrib":
             comp["cuda_archs"] = cuda_archs()
             comp["onemkl"] = intel_gpu_present()
+        comp["hip_archs"] = amd_archs()
     elif rec["kind"] == "os":
         comp = os_compiler()
         if comp is not None and not new_enough(comp):
@@ -2380,7 +2522,7 @@ def main() -> int:
             ap.error(f"--gpu takes a GPU number as --check lists them, e.g. --gpu 0, not {a.gpu!r}")
     if a.remove_data:
         return remove_data()
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (an Intel GPU + system RAM + CPU)")
+    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
     roots = [data, *elsewhere]
     if a.models_dir is None:
@@ -2452,9 +2594,10 @@ def main() -> int:
     step(1, "checking your PC")
     found = gpus()
     if not found:
-        fail("no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found",
+        fail("no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found",
              "Strata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 kernel "
-             "driver, or with --license contrib an NVIDIA GPU on NVIDIA's driver (lspci -k shows the driver)")
+             "driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's driver "
+             "(lspci -k shows the driver)")
     if len(found) > 1 or gpu_problem(found[0]) is not None:
         gpu_table(found)
     gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
@@ -2469,6 +2612,9 @@ def main() -> int:
         x = gpu_info(i)
         ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
            f"{a.layer_split or 'auto'})")
+    if gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
+        fail("no access to the GPU's compute device (/dev/kfd)",
+             "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
     if gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
