@@ -679,17 +679,41 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
                     !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
                     return false;
+                auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos,
+                                        strata::gpu::Stream on) {
+                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, on);
+                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, on);
+                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, on);
+                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, on);
+                };
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
-                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
-                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, cs);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
-                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, cs);
+                    norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && !st.kv_q4;
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+                // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
+                // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
+                // attention (xq_ and mixed_ are not rewritten before then)
+                const bool qbr = br && qb;
+                if (qbr) {
+                    if (!fork(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                    native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                (int) (NH * 2 * HD), n, df_side_[0]);
+                    if (!strata::gpu::copy2d_async(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD,
+                                                   (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (n * NH), df_side_[0])) {
+                        err = std::string("verify: the q/gate split failed: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    norm_rope_on(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH, df_side_[0]);
+                    if (st.kv_rot) fwht256_inplace_cuda(qcur_ + tb * NH * HD, (int64_t) n * NH, df_side_[0]);
+                    if (!fork(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wiq->data, qidx_ + tb * IQ * ID, IQ * ID,
+                                              N, IQ * ID, n, df_side_[1]);
+                    norm_rope_on(qidx_ + tb * IQ * ID, wiqn, (int) (n * IQ), (int) ID, pos_i + tb * IQ, df_side_[1]);
+                }
                 if (qb) bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) wik->data, idx_raw + tb * ID, ID, N, ID, n, cs);
                 else for (int t = tb; t < te; ++t)
                     bf16_gemv_fp32_mmvf(mixed_ + t * N, (const uint16_t*) wik->data, idx_raw + t * ID, (int) N, (int) ID, cs);
@@ -770,9 +794,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                               rope_scaling(), cs);
                 }
                 stamp(l, 9, grp);
+                if (!qbr)
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
-                if (qb) {
+                if (qbr) {
+                    // the query side runs on the branches
+                } else if (qb) {
                     if (!strata::gpu::copy2d_async(qcur_ + tb * NH * HD, (size_t) HD * 4, qfull_ + tb * NH * 2 * HD, (size_t) HD * 2 * 4, (size_t) HD * 4, (size_t) (n * NH), cs)) {
                         err = std::string("verify: the q/gate split failed: ") + strata::gpu::last_error();
                         return false;
@@ -814,6 +841,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                               attn_ + t * NH * HD, 1, cs);
                     }
                 } else {
+                if (qbr && !join(1)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                 qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                  s, scores_ + (size_t) tb * max_blocks_, cs);
                 qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
@@ -823,6 +851,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
+                if (qbr && !join(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
                 qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
