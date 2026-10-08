@@ -677,9 +677,20 @@ bool Prefill::carve(size_t T, void* alloc) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
     }
     m.ring = ring_slots(T);
-    for (int i = 0; i < m.ring; ++i) {
-        m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
-        m.stage_live[i] = false;                        // a new buffer: nothing of an earlier layout to wait for
+    if (o.base == nullptr && m.ring > 0) {
+        // OWNED buffers: the ring in ONE allocation (upstream 4a9b9041).  384 separate 2.7 MiB allocations took
+        // 1,556 MiB on an RTX 4070 (each rounded up to its 2 MiB pages), one of the same total 1,038.  A borrowed
+        // region keeps its per-slot layout (and so its price, `bytes_needed`: the loans' slot counts do not move).
+        uint8_t* ring_base = o.take<uint8_t>((size_t) m.ring * MMQ_SLOT(), ok);   // slots 256-byte aligned, as alone
+        for (int i = 0; ok && i < m.ring; ++i) {
+            m.stage_dev[i] = ring_base + (size_t) i * MMQ_SLOT();
+            m.stage_live[i] = false;                    // a new buffer: nothing of an earlier layout to wait for
+        }
+    } else {
+        for (int i = 0; i < m.ring; ++i) {
+            m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
+            m.stage_live[i] = false;                    // a new buffer: nothing of an earlier layout to wait for
+        }
     }
     m.ple_emb = o.take<float>(T * N, ok);
     m.ple_norm = o.take<float>((size_t) strata::kernels::NG_HC_DIM, ok);
