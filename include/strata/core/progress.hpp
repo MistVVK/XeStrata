@@ -45,6 +45,8 @@ inline std::atomic<DiagFn>& release_gpu_fn() { static std::atomic<DiagFn> f{null
 inline void release_gpu_waits(std::FILE* f) {
     if (auto fn = release_gpu_fn().load()) fn(f);
 }
+/// --pipeline-windows: the pipelined loop's windows and the drafter's chain (set while that loop runs)
+inline std::atomic<DiagFn>& diag_pipeline_fn() { static std::atomic<DiagFn> f{nullptr}; return f; }
 
 inline Progress& progress() {
     static Progress p;

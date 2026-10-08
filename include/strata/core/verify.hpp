@@ -130,6 +130,43 @@ public:
     /// false with `err` when it failed.  Free when nothing is pending.
     bool wait_commit(std::string& err);
 
+    // ---- PIPELINED WINDOWS (--pipeline-windows, a layer split on two GPUs; upstream bfa532e9).  One conversation's
+    // windows with the stages overlapped: stage 0 runs window K+1 while stage 1 still runs window K.  The same window
+    // as `run`, driven without blocking the host, so one host thread keeps a window in flight on each stage.  Two
+    // verifiers per stage (one per window parity) share the stage's stream and each has its own hand-off.
+    // `pl_launch` stages and launches (it never captures: `capture_all` first, with nothing in flight), `service`
+    // serves the layers whose doorbells have rung and returns at once, `done` polls the window's completion,
+    // `pl_finish` reads the picks, `pl_commit_async` queues the commit.  Nothing chains to `next_`: the caller drives
+    // every stage.
+    /// The compute stream to use instead of a private one (the two verifiers of one stage share it).  Before `init`.
+    void set_stream(strata::gpu::Stream s) { ext_stream_ = s; }
+    /// Turns the device-planned layers and the all-resident window graph off: with windows in flight the adaptive
+    /// tier marks an expert evicted on the host before the device's residency table follows.  Before `init`.
+    void set_always_publish(bool on) { always_publish_ = on; }
+    strata::gpu::Stream stream() const { return cs_; }
+    int device() const { return device_; }
+    /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
+    bool capture_all(std::string& err);
+    bool pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err);
+    /// Stage a window ahead of its launch (positions, and the PLE rows from `ple_prev` = the two tokens before the
+    /// window as they WILL be).  A later `pl_launch` of the same window (T, pos0, tokens, and `ss.ple_prev` equal to
+    /// `ple_prev` by then) skips the staging; anything else stages again.
+    bool prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    /// 1: every layer served; 0: the GPU has not reached the next layer yet; -1: an error (`err`).
+    int service(PoolMultiFn pool, void* user, std::string& err);
+    bool in_flight() const { return fl_active_; }
+    /// The window's graph completed; false while it runs.  An error sets `err`.
+    bool done(std::string& err);
+    /// After `done`: the profile, the last stage's host sampling and picks (`out` may be null on an earlier stage).
+    bool pl_finish(int32_t* out, std::string& err);
+    /// The commit without a host sync; `ss.ple_prev` advances now (host side).  A second call for the same window
+    /// (after its state was restored) replays it with another count.
+    bool pl_commit_async(int n_keep, std::string& err);
+    /// Fold another verifier's counters and GPU profile into this one's (the two verifiers of one stage report once).
+    void absorb_stats(Verifier& o);
+    /// The watchdog's line for a pipelined verifier: in flight, layers served, the GPU's ring and flags, its events.
+    void diag_pipelined(std::FILE* f, const char* name) const;
+
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW (upstream PR #559) ================================
     //
     // A batch window holds S INDEPENDENT sequences, one token each: row s is slot s, at slot s's own position,
@@ -282,6 +319,18 @@ private:
     static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second half's up-stamp
                                                      // at slot 32 = the next layer's slot 0: upstream e5b47dd)
     bool prof_on_ = false;
+    void accumulate_profile(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
+    // pipelined windows (pl_launch ...)
+    strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
+    bool always_publish_ = false;
+    bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
+    strata::gpu::Event *ev_done_ = nullptr, *ev_commit_ = nullptr;
+    unsigned long long* prof_pin_ = nullptr;   ///< host copy of the stamps (pipelined windows)
+    bool fl_active_ = false, fl_prof_ = false, commit_live_ = false, pl_prestaged_ = false;
+    int fl_T_ = 0;
+    int64_t fl_k_ = 0, fl_total_ = 0;
+    double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
+    int32_t pl_prev_[2] = {-1, -1};
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]

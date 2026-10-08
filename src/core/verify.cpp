@@ -164,7 +164,10 @@ Verifier::~Verifier() {
         if (kv.second) strata::gpu::graph_destroy(kv.second);
     if (arena_b_) strata::gpu::free(arena_b_);
     if (h_commitb_) strata::gpu::free(h_commitb_);
-    if (cs_) strata::gpu::stream_destroy(cs_);
+    if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
+    if (ev_done_) strata::gpu::event_destroy(ev_done_);
+    if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
+    if (prof_pin_) strata::gpu::free(prof_pin_);
     for (strata::gpu::Stream s : df_side_)
         if (s) strata::gpu::stream_destroy(s);
     if (copy_) { strata::gpu::stream_sync(copy_); strata::gpu::stream_destroy(copy_); }
@@ -344,7 +347,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: copy stream create failed";
         return false;
     }
-    if (!(cs_ = strata::gpu::stream_create())) {
+    if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
+    else cs_ = strata::gpu::stream_create();
+    if (!cs_) {
         err = "verify: stream create failed";
         return false;
     }
@@ -391,11 +396,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)
     {
         const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
-        device_plan_ = v != nullptr && std::atoi(v) != 0;
+        // (not with set_always_publish: the device table may lag the host's while windows are in flight)
+        device_plan_ = !always_publish_ && v != nullptr && (int) std::strtol(v, nullptr, 10) != 0;
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
-        res_graph_ = hits.h_res != nullptr && hits.d_res != nullptr &&
+        res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr &&
                      (v == nullptr || std::strtol(v, nullptr, 10) != 0);
     }
     if (device_plan_ || res_graph_) {
@@ -446,7 +452,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_;
     auto fork = [&](int i) { return strata::gpu::stream_fork(cs, df_side_[i]); };
     auto join = [&](int i) { return strata::gpu::stream_join(cs, df_side_[i]); };
-    const bool self_commit = T == 1 && !batch_rec_ && one_token_self_commit();   // see Verifier::commit
+    // see Verifier::commit; not in a pipelined window (always_publish_), which a misprediction rolls back
+    const bool self_commit = T == 1 && !batch_rec_ && !always_publish_ && one_token_self_commit();
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -1486,34 +1493,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps
         strata::gpu::copy(prof_h_.data(), prof_, prof_h_.size() * 8);
-        const int64_t L = g.n_layers;
-        auto at = [&](int64_t l, int i) { return prof_h_[(size_t) (l * kProfPer + i)]; };
-        // The derived columns read stamps the hc-read kernels write themselves or the next layer's first.  A slot no
-        // kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns; a missing or out-of-order stamp now
-        // contributes nothing (upstream e5b47dd).
-        const auto gap = [](unsigned long long to, unsigned long long from) {
-            return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
-        };
-        for (int64_t l = 0; l < L; ++l) {
-            const int kind = is_qsa_layer(g, l) ? 1 : 0;
-            unsigned long long prev = at(l, 0);
-            for (int i = 1; i <= 24; ++i) {
-                const unsigned long long x = at(l, i);
-                if (x == 0 || x < prev) continue;
-                prof_sum_[kind][i] += (double) (x - prev);
-                prev = x;
-            }
-            if (l + 1 < L) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
-            const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
-            if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
-                prof_sum_[kind][27] += dn;      // hc-read0: norm
-                prof_sum_[kind][28] += dd;      //           down
-                prof_sum_[kind][29] += du;      //           up (through both halves, as before)
-                prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
-            }
-        }
-        prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
-        ++prof_windows_;
+        accumulate_profile(prof_h_.data());
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
@@ -1560,6 +1540,39 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("decode");
     progress_beat();
     return true;
+}
+
+void Verifier::accumulate_profile(const unsigned long long* stamps) {
+    const ModelGeometry& g = *g_;
+    const int64_t L = g.n_layers;
+    auto at = [&](int64_t l, int i) { return stamps[(size_t) (l * kProfPer + i)]; };
+    // The derived columns read stamps the hc-read kernels write themselves or the next layer's first.  A slot no
+    // kernel stamped is 0 and its unsigned difference wrapped to ~1e19 ns; a missing or out-of-order stamp now
+    // contributes nothing (upstream e5b47dd).
+    const auto gap = [](unsigned long long to, unsigned long long from) {
+        return (from != 0 && to != 0 && to >= from) ? (double) (to - from) : 0.0;
+    };
+    // only this stage's layers [lb_, le_) are ever stamped (a layer split); the head only on the last stage
+    for (int64_t l = lb_; l < le_; ++l) {
+        const int kind = is_qsa_layer(g, l) ? 1 : 0;
+        unsigned long long prev = at(l, 0);
+        for (int i = 1; i <= 24; ++i) {
+            const unsigned long long x = at(l, i);
+            if (x == 0 || x < prev) continue;
+            prof_sum_[kind][i] += (double) (x - prev);
+            prev = x;
+        }
+        if (l + 1 < le_) prof_sum_[kind][25] += gap(at(l + 1, 0), at(l, 24));
+        const double dn = gap(at(l, 27), at(l, 0)), dd = gap(at(l, 28), at(l, 27)), du = gap(at(l, 1), at(l, 28));
+        if (dn > 0 && dd > 0 && du > 0) {   // the split exists: show it split, not twice
+            prof_sum_[kind][27] += dn;      // hc-read0: norm
+            prof_sum_[kind][28] += dd;      //           down
+            prof_sum_[kind][29] += du;      //           up (through both halves, as before)
+            prof_sum_[kind][1] -= gap(at(l, 1), at(l, 0));   // (hc-read0 shown split)
+        }
+    }
+    if (le_ == L) prof_sum_[0][26] += gap(at(L, 1), at(L, 0));
+    ++prof_windows_;
 }
 
 void Verifier::set_plan_slot(int grp) {
@@ -2185,7 +2198,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && !last_batch_ && one_token_self_commit()) {
+    if (last_t_ == 1 && !last_batch_ && !always_publish_ && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
         if (ple_stage())
             for (int t = 0; t < n_keep; ++t) {
@@ -2219,6 +2232,272 @@ bool Verifier::commit(int n_keep, std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+// ================================ PIPELINED WINDOWS (see verify.hpp) ================================
+//
+// The window is run()'s, step for step: the same graph, the same staging, the same per-layer service, the same commit
+// graph.  Only the waits are split up: the host polls instead of spinning, so it can serve the other stage's window in
+// between.  A one-token window does not commit itself here (always_publish_): a speculative window may be rolled back.
+
+namespace {
+double now_ms() { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); }
+}  // namespace
+
+void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
+    // host-side state only: a GPU call from the watchdog's thread can wait behind a window that waits for the host
+    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
+    std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; commit launched %d\n",
+                 name, fl_active_ ? "IN FLIGHT" : "idle", last_t_, (long long) last_pos0_, (long long) fl_k_,
+                 (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_), rd(h_flagB_), (int) commit_live_);
+}
+
+bool Verifier::capture_all(std::string& err) {
+    const OnDevice on_device(device_);
+    if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
+    if (segmented_) { err = "verify: pipelined windows need a GPU whose running kernels see the host's writes"; return false; }
+    if (!always_publish_) { err = "verify: pipelined windows need set_always_publish before init"; return false; }
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture(T, err)) return false;
+    if (!capture_commit(err)) return false;
+    if ((ev_done_ == nullptr && !strata::gpu::event_create(&ev_done_)) ||
+        (ev_commit_ == nullptr && !strata::gpu::event_create(&ev_commit_))) {
+        err = "verify: event create failed";
+        return false;
+    }
+    if (prof_on_ && prof_pin_ == nullptr && !strata::gpu::alloc_host(&prof_pin_, prof_h_.size() * 8))
+        prof_pin_ = nullptr;   // the pipelined windows go unprofiled
+    return true;
+}
+
+// The host staging of a pipelined window: run()'s, with the PLE rows from `ple_prev` (the window's verifier is idle,
+// so its mapped rows are free to write)
+bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+    using namespace strata::kernels;
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        qsa_step_fill(h_step_ + (size_t) t * kStepCount, pos0 + t, s);
+        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
+        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
+        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
+        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) (pos0 + t);
+        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
+    }
+    if (ss.ple.ready() && ple_stage()) {
+        uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
+        int32_t prev[2] = {ple_prev[0], ple_prev[1]};
+        for (int t = 0; t < T; ++t) {
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + (size_t) t * PLE_N_HEADS);
+            prev[0] = prev[1];
+            prev[1] = tokens[t];
+        }
+        if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+    }
+    last_t_ = T;
+    last_pos0_ = pos0;
+    for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
+    pl_prev_[0] = ple_prev[0];
+    pl_prev_[1] = ple_prev[1];
+    return true;
+}
+
+bool Verifier::prestage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err) {
+    if (fl_active_) { err = "verify: a window is in flight on this verifier"; return false; }
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    if (!pl_stage(T, tokens, pos0, ple_prev, err)) return false;
+    pl_prestaged_ = true;
+    ms_host += ms_since(t0);
+    return true;
+}
+
+bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
+    const OnDevice on_device(device_);
+    if (fl_active_) { err = "verify: a window is already in flight on this verifier"; return false; }
+    if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
+    SessionState& ss = *ss_;
+    if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
+    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr) {
+        err = "verify: pipelined window not prepared (capture_all)";
+        return false;
+    }
+    const Clock::time_point t0 = Clock::now();
+    last_batch_ = false;
+    bool staged = pl_prestaged_ && last_t_ == T && last_pos0_ == pos0;
+    for (int t = 0; staged && t < T; ++t) staged = last_tokens_[t] == tokens[t];
+    if (staged && ss.ple.ready() && ple_stage())
+        staged = pl_prev_[0] == ss.ple_prev[0] && pl_prev_[1] == ss.ple_prev[1];
+    pl_prestaged_ = false;
+    if (!staged && !pl_stage(T, tokens, pos0, ss.ple_prev, err)) return false;
+    // the previous commit's words (h_commit_) are rewritten by this window's: wait for that graph here, before this
+    // window is launched, never in pl_commit_async behind it (on the B70 that wait did not return while the window
+    // waited for this thread)
+    if (commit_live_) {
+        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+        commit_live_ = false;
+    }
+    *(volatile uint32_t*) h_seq_ = 0;
+    *(volatile uint32_t*) h_flag_ = 0;
+    *(volatile uint32_t*) h_flagA_ = 0;
+    *(volatile uint32_t*) h_flagB_ = 0;
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    fl_T_ = T;
+    fl_k_ = 0;
+    fl_total_ = (le_ - lb_) * G;
+    fl_prof_ = prof_on_ && G == 1 && prof_pin_ != nullptr;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    ms_host += ms_since(t0);
+    if (!strata::gpu::graph_launch(exec_[T], cs_)) {
+        err = std::string("verify: launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (fl_prof_) strata::gpu::copy_async(prof_pin_, prof_, prof_h_.size() * 8, cs_);
+    if (!strata::gpu::event_record(ev_done_, cs_)) { err = "verify: event record failed"; return false; }
+    (void) strata::gpu::stream_idle(cs_);
+    fl_active_ = true;
+    fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
+    return true;
+}
+
+int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+    if (!fl_active_ || fl_k_ >= fl_total_) return 1;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const int T = fl_T_;
+    const int G = groups_[T] > 0 ? groups_[T] : 1;
+    const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    while (fl_k_ < fl_total_) {
+        const int64_t l = lb_ + fl_k_ / G;
+        const uint32_t want = (uint32_t) (fl_k_ + 1);
+        if (*(volatile uint32_t*) h_seq_ < want) {
+            const double now = now_ms();
+            if (now - fl_flush_ms_ > 2.0) {   // notice a dead graph, as run() does
+                fl_flush_ms_ = now;
+                if (strata::gpu::event_query(ev_done_) && *(volatile uint32_t*) h_seq_ < want) {
+                    err = "verify: layer " + std::to_string(l) + " never rang (graph finished)";
+                    return -1;
+                }
+            }
+            if (now - fl_since_ms_ > 20000.0) {
+                err = "verify: timed out at layer " + std::to_string(l);
+                return -1;
+            }
+            return 0;
+        }
+        const Clock::time_point b = Clock::now();
+        ms_wait += now_ms() - fl_since_ms_;
+        const int grp = (int) (fl_k_ % G);
+        cur_layer_ = want - 1;
+        set_plan_slot(grp);
+        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        progress_at("verify window (pipelined): the CPU experts of layer", l);
+        if (pool != nullptr)
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
+                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        progress_tick();
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        _mm_sfence();
+        if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
+            sink_.counts[0] = 0;
+            sink_.counts[1] = 0;
+            sink_.counts[2] = 0;
+            sink_.start[0] = 0;
+            sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = want;
+            raise_flag(h_flagB_, want);
+        }
+        *(volatile uint32_t*) h_flag_ = want;
+        ++fl_k_;
+        ms_pool += ms_since(b);
+        fl_since_ms_ = fl_flush_ms_ = now_ms();
+    }
+    return 1;
+}
+
+bool Verifier::done(std::string& err) {
+    if (!fl_active_ || fl_k_ < fl_total_) return false;
+    const OnDevice on_device(device_);
+    if (!strata::gpu::event_query(ev_done_)) {
+        if (now_ms() - fl_since_ms_ > 20000.0) err = "verify: the window never finished";
+        return false;
+    }
+    // no host function of this window may raise flag B in the next one
+    return strata::gpu::stream_idle(copy_);
+}
+
+bool Verifier::pl_finish(int32_t* out, std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    fl_active_ = false;
+    if (fl_prof_) accumulate_profile(prof_pin_);
+    ++windows;
+    const int T = fl_T_;
+    if (le_ < g.n_layers) {   // an earlier stage: the hand-off is written
+        // the next stage on another GPU reads a hand-off of its own context (run() copies it the same way); the caller
+        // launches that stage's window of this parity only after it has finished the one before, which read it
+        if (next_ != nullptr && next_->hand_in_ != hand_out_)
+            std::memcpy(const_cast<float*>(next_->hand_in_), hand_out_,
+                        (size_t) T * (size_t) handoff_floats(g) * sizeof(float));
+        return true;
+    }
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    if (head_sampling_ && (sampled || hist_d_ != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) last_pos0_;
+        sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
+        if (!strata::gpu::stream_sync(cs_)) {
+            err = "verify: the head sampling failed";
+            return false;
+        }
+    }
+    if (out != nullptr)
+        for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    progress_beat();
+    return true;
+}
+
+bool Verifier::pl_commit_async(int n_keep, std::string& err) {
+    const OnDevice on_device(device_);
+    if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    if (commit_live_) {   // a replay (pl_launch waited for the one before): its graph reads the words below
+        while (!strata::gpu::event_query(ev_commit_)) _mm_pause();
+    }
+    h_commit_[0] = n_keep;
+    h_commit_[1] = n_keep - 1;
+    for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!strata::gpu::graph_launch(commit_exec_, cs_)) {
+        err = std::string("verify: commit launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (!strata::gpu::event_record(ev_commit_, cs_)) { err = "verify: event record failed"; return false; }
+    commit_live_ = true;
+    if (ple_stage())
+        for (int t = 0; t < n_keep; ++t) {
+            ss_->ple_prev[0] = ss_->ple_prev[1];
+            ss_->ple_prev[1] = last_tokens_[t];
+        }
+    ms_commit += ms_since(t0);
+    return true;
+}
+
+void Verifier::absorb_stats(Verifier& o) {
+    ms_wait += o.ms_wait; ms_pool += o.ms_pool; ms_host += o.ms_host; ms_commit += o.ms_commit;
+    windows += o.windows;
+    o.ms_wait = o.ms_pool = o.ms_host = o.ms_commit = 0;
+    o.windows = 0;
+    for (int k = 0; k < 2; ++k)
+        for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
+    prof_windows_ += o.prof_windows_;
+    o.prof_windows_ = 0;
 }
 
 }  // namespace strata::core
