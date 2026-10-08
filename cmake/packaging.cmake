@@ -7,12 +7,13 @@
 # - the program XeStrata's users run (setup.py as `xestrata`, the server, the web app, the tools setup runs, gguf-py,
 #   the data files), in <datadir>/xestrata, read-only; the user's files go to the XDG folders (setup.py, PACKAGED).
 # - the engine: strata, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no distribution
-#   has as new: libsycl 9), with oneMath in the contrib mode, in <libdir>/xestrata/engine.
+#   has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the contrib mode),
+#   in <libdir>/xestrata/engine.
 #
 # The packages provide and conflict with xestrata-engine, so one is installed at a time, and installing another
 # replaces it.  Nothing non-free goes in: the contrib engine opens oneMKL, cuBLAS and NVIDIA's driver at run time (the
 # UR adapters, oneMath's backends).  No GPU maker's driver or library is required (tools/package/container.sh): the
-# free package recommends Intel's, the contrib ones only suggest every maker's.
+# free package recommends Intel's and AMD's, the contrib ones only suggest every maker's.
 
 include(GNUInstallDirs)
 
@@ -51,7 +52,7 @@ set_target_properties(strata PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata RUNTIME DESTINATION ${_pkg_engine})
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
-# the SYCL runtime the engine was built with: what libsycl loads for Level Zero (and CUDA in the contrib mode).
+# the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # libsycl-jit (157 MB) is left out: libsycl opens it only to compile kernels from source, which the engine does not.
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)
 get_filename_component(_pkg_sycl_lib "${_pkg_sycl_lib}/../lib" ABSOLUTE)
@@ -59,10 +60,9 @@ set(_pkg_runtime libsycl.so.9 libur_loader.so.0 libur_adapter_level_zero.so.0 li
                  libumf.so.1)
 if(STRATA_LICENSE STREQUAL "contrib")
   list(APPEND _pkg_runtime libur_adapter_cuda.so.0)
-  # AMD GPUs: the HIP adapter, which intel/llvm builds where ROCm's HIP is installed
-  if(EXISTS "${_pkg_sycl_lib}/libur_adapter_hip.so.0")
-    list(APPEND _pkg_runtime libur_adapter_hip.so.0)
-  endif()
+endif()
+if(_strata_hip_archs)
+  list(APPEND _pkg_runtime libur_adapter_hip.so.0)   # AMD GPUs
 endif()
 set(_pkg_runtime_files "")
 foreach(lib IN LISTS _pkg_runtime)
@@ -193,7 +193,8 @@ set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 set(_pkg_not_required libsycl libur_ libumf libonemath                      # bundled
                       libcuda libnvidia-ml libcublas                        # NVIDIA's
                       libmkl_                                               # Intel's oneMKL
-                      libamdhip64 libhsa-runtime64 libamd_comgr)            # AMD's ROCm
+                      libamdhip64 libhsa-runtime64 libamd_comgr             # AMD's ROCm
+                      librocblas libhipblaslt)
 list(JOIN _pkg_not_required "|" _pkg_not_required)
 set(CPACK_RPM_SPEC_MORE_DEFINE
 "%global __provides_exclude_from ^${_pkg_engine_abs}/.*$
