@@ -130,6 +130,29 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   ほかのビルドと並べて走らせたので、単独のビルドの時間は測っていません。
 - NVIDIA の GPU の上で動かすには、NVIDIA のドライバー（Ubuntu 26.04 では `nvidia-driver-610-open` など）が要ります。
 
+## ビルドを速くする（Ninja と ccache）
+
+開発の差分ビルドには、Make の代わりに Ninja を、コンパイラーの前に ccache を使います。
+どちらもビルドフォルダーの構成だけを変え、ソースもパッケージのビルドも変えません。
+
+- Ninja: 何を作り直すかの判断と並列の詰め方が Make より速く、小さな変更のあとの待ち時間が短くなります。
+- ccache: 同じソースを同じ設定でコンパイルした結果を覚えておき、もう一度のときはそれを返します。
+  変えて戻したファイルや、作り直したビルドフォルダーで効きます。
+  中身を変えたファイルは毎回コンパイルします。
+
+```sh
+sudo apt install ninja-build ccache
+```
+
+構成するときに `-G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` を足します。
+ジェネレーターは既存のビルドフォルダーでは変えられないので、フォルダーを作り直します（`build/contrib` なら、消してから同じ選択肢で構成し直します）。
+
+```sh
+cmake -S . -B build/contrib -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <ほかの選択肢>
+cmake --build build/contrib -j 28
+ccache -s          # ヒットの数
+```
+
 ## パッケージのビルド（Docker）
 
 deb と rpm のパッケージ（`tools/package/build.sh`、[BUILD.ja.md](BUILD.ja.md#deb-と-rpm-のパッケージ)）は、Docker のコンテナの中でビルドします。

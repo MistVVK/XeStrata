@@ -130,6 +130,29 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   It ran beside other builds, so its time alone was not measured.
 - Running on an NVIDIA GPU needs NVIDIA's driver (on Ubuntu 26.04, `nvidia-driver-610-open` or another).
 
+## Faster builds (Ninja and ccache)
+
+For the incremental builds of development, Ninja takes the place of Make and ccache goes in front of the compiler.
+Both change the build folder's configuration only, not the sources or the package builds.
+
+- Ninja: decides what to rebuild and fills the parallel jobs faster than Make, so a small change waits less.
+- ccache: keeps the result of compiling the same source with the same settings and returns it the next time.
+  It helps with a file changed and changed back, and with a build folder made again.
+  A file whose content changed is compiled every time.
+
+```sh
+sudo apt install ninja-build ccache
+```
+
+Configure with `-G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache` added.
+An existing build folder cannot change its generator, so make it again (for `build/contrib`: delete it and configure with the same options).
+
+```sh
+cmake -S . -B build/contrib -G Ninja -DCMAKE_CXX_COMPILER_LAUNCHER=ccache <the other options>
+cmake --build build/contrib -j 28
+ccache -s          # the hits
+```
+
 ## Building the packages (Docker)
 
 The deb and rpm packages (`tools/package/build.sh`, [BUILD.md](BUILD.md#the-deb-and-rpm-packages)) are built in Docker containers.
