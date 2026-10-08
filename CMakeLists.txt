@@ -6,8 +6,8 @@ project(XeStrata VERSION 0.1.39 LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "Strata supports Linux only")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.1.39")
-set(STRATA_UPSTREAM_COMMIT "6f32ec0")
+set(STRATA_UPSTREAM_VERSION "0.1.40.2")
+set(STRATA_UPSTREAM_COMMIT "e8ca9af")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's
 set(STRATA_VERSION_NAME "xe${PROJECT_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
