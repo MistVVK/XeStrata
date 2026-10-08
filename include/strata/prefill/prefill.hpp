@@ -24,6 +24,8 @@
 #include <memory>
 #include <string>
 
+namespace strata::kernels::cpu { class ExpertPool; }
+
 namespace strata::prefill {
 
 struct PrefillStats {
@@ -34,6 +36,8 @@ struct PrefillStats {
     int64_t experts_streamed = 0;   ///< expert blobs copied host -> device
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
+    int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
+    double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured with `auto`)
     double ms_ple = 0;
 };
 
@@ -42,6 +46,18 @@ namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
 
 class Prefill {
+public:
+    /// The CPU expert pool (decode's, idle while a prompt is read).  With STRATA_PREFILL_CPU_SHARE set, a chunk below
+    /// the streamed-walk size hands it the non-resident experts routed by at most MAXT of its tokens, fewest first, up
+    /// to a share of the experts it would stream (`auto`: measured, where both sides end together); their rows go to
+    /// the tail of the experts' outputs (upstream 978d3558).  Not bit-identical to the GPU's rows (the CPU's own
+    /// activation format).  Unset (default) or null: every expert on the GPU.  Only for a pool no other thread runs
+    /// meanwhile (no batch slots).  Set before `init`.
+    void set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
+
+private:
+    kernels::cpu::ExpertPool* cpu_pool_ = nullptr;
+
 public:
     /// E-9 (upstream c6c6594): the draft layer's K/V for prompt cells [cell0, cell0 + n) from their final residual
     /// rows `R_rows` (device) and `next_tokens` (host: the token at cell+1), in batches through this path's GEMMs

@@ -42,6 +42,8 @@ One run per cell ([record](../bench/results/2026-10-04-speed-matrix/README.md)).
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
+While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `STRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. `STRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
+
 ### Output (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
