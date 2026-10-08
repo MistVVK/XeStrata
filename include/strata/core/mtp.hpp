@@ -51,6 +51,13 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
+    /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
+    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
+    bool hnorm_per_stream() const { return hnorm_stream_; }
+    /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
+    static bool top2_env();
+    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     uint64_t vram_bytes() const { return vram_; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
@@ -130,6 +137,10 @@ private:
     int max_t_ = 0;
     int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
     int max_drafts_ = 1 << 30;
+    bool hnorm_stream_ = false;
+    void record_top2(int j);
+    std::vector<int32_t> top2_, dvocab_host_;
+    std::vector<float> lg_host_;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     strata::gpu::Stream cs_ = nullptr;

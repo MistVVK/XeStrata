@@ -29,8 +29,10 @@ inline float warp_sum(const sycl::sub_group& sg, float value) {
     return value;
 }
 
+// gamma: `groups` rows of n_cols, row r takes gamma row r % groups (1: one gamma for every row)
 template <int BlockSize>
-void norm(sycl::queue& q, const float* input, const float* gamma, float* output, int n_cols, int n_rows, float epsilon) {
+void norm(sycl::queue& q, const float* input, const float* gamma_all, float* output, int n_cols, int n_rows,
+          float epsilon, int groups = 1) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>(std::size_t(n_rows) * BlockSize, BlockSize),
@@ -38,6 +40,7 @@ void norm(sycl::queue& q, const float* input, const float* gamma, float* output,
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = int(it.get_local_id(0));
             const std::size_t row_offset = it.get_group(0) * std::size_t(n_cols);
+            const float* gamma = gamma_all + (it.get_group(0) % std::size_t(groups)) * std::size_t(n_cols);
             const float* in = input + row_offset;
             float* out = output + row_offset;
             float partial = 0.0f;
@@ -102,6 +105,20 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon);
+}
+
+void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* output,
+                                 int n_cols, int groups, int n_rows, float epsilon, void* stream) {
+    if (groups < 1) throw std::invalid_argument("native QSA requires positive bounded dimensions");
+    const auto count = elements(n_cols, n_rows);
+    if (!std::isfinite(epsilon) || epsilon < 0.0f)
+        throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
+    buffers(input, count * 4, gamma, std::size_t(n_cols) * groups * 4, output, stream);
+    auto& q = queue_for(stream);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
+    else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
+    else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
 }
 
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,

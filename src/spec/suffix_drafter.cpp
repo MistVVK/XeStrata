@@ -88,4 +88,14 @@ int SuffixDrafter::propose(int max_k, int32_t* out) {
     return k;
 }
 
+int SuffixDrafter::propose_after(const int32_t* extra, int n_extra, int max_k, int32_t* out) {
+    if (n_extra <= 0) return propose(max_k, out);
+    // the index holds the history's trigrams only: appended without indexing, the extra tokens just form the suffix
+    const size_t n0 = hist_.size();
+    hist_.insert(hist_.end(), extra, extra + n_extra);
+    const int k = propose(max_k, out);
+    hist_.resize(n0);
+    return k;
+}
+
 }  // namespace strata::spec

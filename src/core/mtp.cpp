@@ -318,9 +318,43 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     return true;
 }
 
+namespace {
+// STRATA_MTP_FULL_HEAD=1 (a diagnostic): draft over the whole vocabulary (the main head itself) instead of
+// rt/draft_vocab.bin's subset - the reference head, to measure what the subset costs in acceptance
+bool full_head_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_FULL_HEAD"); return v && v[0] == '1'; }();
+    return on;
+}
+}  // namespace
+
+bool MtpDrafter::top2_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TOP2"); return v && v[0] == '1'; }();
+    return on;
+}
+
+// STRATA_MTP_TOP2=1 (a diagnostic for tree drafts): draft j's runner-up under the draft layer, from the head logits
+// the step just wrote (row 0), on the host.  Slow; only for measuring what a second branch would have caught.
+void MtpDrafter::record_top2(int j) {
+    const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
+    if ((int64_t) lg_host_.size() < nv) lg_host_.resize((size_t) nv);
+    if ((int) top2_.size() < max_t_) top2_.assign((size_t) max_t_, -1);
+    if (j < 0 || j >= max_t_) return;
+    if (!strata::gpu::copy(lg_host_.data(), head_logits_, (size_t) nv * sizeof(float))) {
+        top2_[(size_t) j] = -1;
+        return;
+    }
+    int64_t b1 = -1, b2 = -1;
+    for (int64_t i = 0; i < nv; ++i) {
+        const float v = lg_host_[(size_t) i];
+        if (b1 < 0 || v > lg_host_[(size_t) b1]) { b2 = b1; b1 = i; }
+        else if (b2 < 0 || v > lg_host_[(size_t) b2]) b2 = i;
+    }
+    top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
+}
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
-    if (dhead_ == nullptr) {
+    if (dhead_ == nullptr && !full_head_env()) {
         if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
@@ -442,7 +476,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
         return false;
     }
     // the draft head's token subset, when tools/draft_vocab.py wrote one
-    if (dhead_ == nullptr) {
+    if (dhead_ == nullptr && !full_head_env()) {
         std::vector<uint8_t> raw;
         if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
             n_dvocab_ = (int64_t) (raw.size() / 4);
@@ -454,6 +488,8 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                 return false;
             }
             strata::gpu::copy(dvocab_, raw.data(), raw.size());
+            dvocab_host_.resize((size_t) n_dvocab_);
+            std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
             strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
             strata::gpu::device_sync();
             vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
@@ -495,7 +531,10 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
         native_mmvq(GGML_Q8_0, q8("fc_embedding.weight"), xq_, e2_, (int) N, (int) N, T, cs);
-        native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
+        if (hnorm_stream_)   // --mtp-hnorm stream: one RMS per stream, each scaled by its slice of the weight
+            native_qsa_rms_norm_grouped(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) N, (int) HC, (int) (T * HC), EPS, cs);
+        else
+            native_qsa_rms_norm_weighted(Rin_, f32("pre_fc_norm_hidden.weight"), hn_, (int) (HC * N), T, EPS, cs);
         for (int c0 = 0; c0 < T * HC; c0 += 8) {
             const int nc = (int) std::min<int64_t>(8, T * HC - c0);
             native_quantize_q8_1(hn_ + (size_t) c0 * N, xq_, (int) N, nc, cs);
@@ -895,6 +934,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         return false;
     }
     drafts[0] = ((volatile int32_t*) h_out_)[0];
+    if (top2_env()) record_top2(0);
     float pj = ((volatile float*) h_prob_)[0];
     if (probs) probs[0] = pj;
     int n = 1;
@@ -908,6 +948,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             return false;
         }
         drafts[j] = ((volatile int32_t*) h_out_)[j];
+        if (top2_env()) record_top2(j);
         pj = ((volatile float*) h_prob_)[j];
         if (probs) probs[j] = pj;
         ++n;

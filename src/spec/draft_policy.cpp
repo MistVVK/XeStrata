@@ -110,4 +110,49 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     }
 }
 
+double DraftPolicy::chain_rate(int match) const {
+    // prior: a chained draft is a lookup continuing the MTP's drafts - weaker evidence than a plain match of that length
+    constexpr double kChainPrior[kBuckets] = {0.45, 0.65, 0.8, 0.9};
+    const int b = bucket(match);
+    return (cok_[b] + kPriorN * kChainPrior[b]) / (cok_[b] + cbad_[b] + kPriorN);
+}
+
+int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
+    t_mtp = std::clamp(t_mtp, 1, max_t_);
+    const int kmax = std::min(k_avail, max_t_ - t_mtp);
+    if (kmax <= 0) return 0;
+    const double e0 = mtp_tokens(t_mtp), base = e0 / cost_ms(t_mtp), c = chain_rate(match);
+    p_mtp = std::clamp(p_mtp, 0.0, 1.0);
+    double gain = 0.0, ci = 1.0, best = 0.0;
+    int best_k = 0;
+    for (int k = 1; k <= kmax; ++k) {
+        ci *= c;
+        gain += ci;
+        const double r = (e0 + p_mtp * gain) / cost_ms(t_mtp + k);
+        if (r > best) { best = r; best_k = k; }
+    }
+    if (best_k > 0 && best > base * (1.0 + margin_)) return best_k;
+    // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
+    const int t_full = t_mtp + kmax;
+    if (cost_n_[t_full] < kProbes && p_mtp * c >= 0.6) return kmax;
+    return 0;
+}
+
+void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
+    const int t = std::clamp(t_mtp + k, 1, kMaxT);
+    if (round_ms > 0) {
+        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
+        cost_n_[t] += 1.0;
+    }
+    // the MTP part is an ordinary MTP window as far as its own drafts go
+    const int mtp_acc = std::min(accepted, t_mtp - 1);
+    const double got = mtp_acc + 1.0;
+    mtp_tok_[t_mtp] = mtp_n_[t_mtp] > 0 ? (1.0 - kTokAlpha) * mtp_tok_[t_mtp] + kTokAlpha * got : got;
+    mtp_n_[t_mtp] += 1.0;
+    if (accepted < t_mtp - 1) return;   // the chain was never reached: it says nothing about the lookup
+    const int b = bucket(match), ok = accepted - (t_mtp - 1);
+    cok_[b] = kDecay * cok_[b] + ok;
+    cbad_[b] = kDecay * cbad_[b] + (ok < k ? 1.0 : 0.0);
+}
+
 }  // namespace strata::spec

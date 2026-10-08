@@ -12,6 +12,7 @@
 
 #include "strata/core/layout.hpp"
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
@@ -824,7 +825,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             err = "prefill: the draft rows' copy failed";
             return false;
         }
-        rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
+        if (mtp.hnorm_per_stream())   // --mtp-hnorm stream: as the drafter's own pass (mtp.cpp)
+            strata::kernels::native_qsa_rms_norm_grouped(hn, w_nh, hn, (int) Nn, (int) g.hc, (int) (nb * g.hc), EPS, m.cs);
+        else
+            rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         to_f16(hn, hn16, nb * HCN, m.cs);
         m.gemm.native(hn16, kQ8_0, w_fh, h2, nb * g.hc, Nn, Nn);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);

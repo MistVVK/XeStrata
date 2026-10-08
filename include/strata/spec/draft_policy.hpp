@@ -38,6 +38,14 @@ public:
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
 
+    /// --lookup-chain: how many of `k_avail` lookup tokens to append after an MTP window of `t_mtp` tokens whose
+    /// drafts all hold with probability `p_mtp` (estimated from the draft layer's own probabilities): the k with the
+    /// best expected tokens per ms, E(t_mtp) + p_mtp (c + c^2 + .. + c^k) at the cost of t_mtp + k, if it beats the MTP
+    /// window alone by `margin`; c = the acceptance of chained drafts by match length (their own counts). 0 = none.
+    int chain(int t_mtp, double p_mtp, int k_avail, int match) const;
+    /// After a chained round: the MTP window's size, the chained tokens, the window's accepted drafts, its time.
+    void observe_chain(int t_mtp, int k, int accepted, int match, double round_ms);
+    double chain_rate(int match) const;
     double lookup_rate(int match) const;   // current q for a match length
     double cost_ms(int t) const;           // measured or scaled round time of a window of t tokens
 
@@ -53,6 +61,7 @@ private:
     std::array<double, kBuckets> ok_{}, bad_{};            // lookup drafts accepted / windows cut short, decayed
     double rounds_ = 0;                                    // rounds observed so far
     std::array<double, kMaxT + 1> last_{};                 // the round at which each size was last measured
+    std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
 };
 
 }  // namespace strata::spec

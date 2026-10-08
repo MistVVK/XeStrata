@@ -56,6 +56,12 @@ Output speed depends on the text as well.
 Speculative decoding runs faster when more of the drafted tokens are accepted, so a difference of a few percent between neighbouring cells means nothing
 (IQ2_XS is faster at 128K than at 64K because it accepted 0.768 of its drafts there against 0.683).
 
+`--lookup-chain K` (default 0, off) checks, after the draft layer's guesses, up to K more tokens that followed the same
+text earlier in the conversation (upstream 2312c83b).
+It speeds up handing back a given text nearly as it was, and slows ordinary chat a little
+(B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
+`--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
+
 ### Small cards and GPUs without XMX
 
 With the B70 made to look like a small card (`STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1`: 8 GB of VRAM, no XMX),

@@ -114,6 +114,23 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
+    {
+        // --lookup-chain: the match continues from the drafts appended to the history, which stays unchanged
+        SuffixDrafter d(3, 32, 256);
+        const int32_t hist[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 50, 51, 52, 1, 2};
+        d.append(hist, sizeof(hist) / sizeof(hist[0]));
+        const int32_t drafts[] = {3, 4};
+        int32_t out[8] = {};
+        const int k = d.propose_after(drafts, 2, 3, out);
+        check(k == 3 && out[0] == 5 && out[1] == 6 && out[2] == 7, "propose_after continues after the drafts");
+        check(d.last_match() >= 4, "propose_after match length counts the drafts");
+        check(d.size() == sizeof(hist) / sizeof(hist[0]), "propose_after leaves the history unchanged");
+        const int32_t miss[] = {99, 98, 97};
+        check(d.propose_after(miss, 3, 3, out) == 0, "propose_after without a match proposes nothing");
+        // the plain proposal is unaffected: the history's own suffix (52, 1, 2) has no earlier occurrence
+        check(d.propose(3, out) == 0, "propose after propose_after");
+        check(d.propose_after(nullptr, 0, 3, out) == d.propose(3, out), "propose_after with no drafts == propose");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

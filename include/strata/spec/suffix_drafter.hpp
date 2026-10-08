@@ -33,9 +33,15 @@ public:
     /// Write up to `max_k` proposed next tokens to `out`; returns how many (0 = no match of at least min_match).
     int propose(int max_k, int32_t* out);
 
+    /// --lookup-chain: as propose(), for the history followed by `extra` (the draft head's proposal for the next
+    /// tokens), so the lookup continues where those drafts end. The history itself is unchanged; the extra tokens are
+    /// only part of the suffix being matched and may be read back as part of a periodic continuation.
+    int propose_after(const int32_t* extra, int n_extra, int max_k, int32_t* out);
+
     /// Length of the match behind the last proposal (0 if none).
     int last_match() const { return last_match_; }
     size_t size() const { return hist_.size(); }
+    const std::vector<int32_t>& history() const { return hist_; }
 
 private:
     struct Slot {
