@@ -272,9 +272,112 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
     finish(stream, e, "qsa_block_scores");
 }
 
-bool qsa_block_scores_tc(const float*, const float*, const float*, const int32_t*, int64_t nq, int64_t,
-                         const QsaShapes&, float*, void*, int64_t) {
-    return nq <= 0;   // refused, as CUDA refuses a device without TF32 mma: the caller runs qsa_block_scores
+namespace {
+// upstream 65ce3299 (STRATA_SELECT_SIMT=1): the block scores below each query's n_bid as an FP32 tiled GEMM - rows
+// (query, indexer head) x columns (blocks), K = 128 through local memory in steps of 32, 2 queries x 4 heads x 4 blocks
+// a work-item, relu per head summed in registers.  The warp kernel spends 5 sub-group shuffles on 4 products.  FP32 in
+// another summation order, so not the warp kernel's bits (upstream keeps it opt-in; here the default, faster on both
+// cards measured).
+constexpr int SM_QT = 32, SM_NB = 64, SM_KC = 32, SM_QS = SM_QT * IDX_HEADS + 4, SM_KS = SM_NB + 4;
+sycl::event block_scores_simt(sycl::queue& q, const float* pooled, const float* q_idx, const int32_t* steps, int64_t nq,
+                              int64_t max_blocks, int64_t reach, float* out) {
+    const size_t gb = (size_t) ((reach + SM_NB - 1) / SM_NB), gq = (size_t) ((nq + SM_QT - 1) / SM_QT);
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>((size_t) SM_KC * SM_QS), h);
+        sycl::local_accessor<float, 1> ks(sycl::range<1>((size_t) SM_KC * SM_KS), h);
+        h.parallel_for(sycl::nd_range<2>({gq, gb * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+            const int64_t q0 = (int64_t) it.get_group(0) * SM_QT, b0 = (int64_t) it.get_group(1) * SM_NB;
+            const int64_t qlast = (q0 + SM_QT < nq ? q0 + SM_QT : nq) - 1;
+            if (b0 >= steps[qlast * kStepCount + kStepNBid]) return;   // n_bid rises with the position: the whole group
+            const int tid = (int) it.get_local_id(1), tx = tid & 15, ty = tid >> 4;
+            float acc[8][4] = {};
+            for (int kc = 0; kc < IDX_DIM; kc += SM_KC) {
+                for (int i = 0; i < 4; ++i) {   // the query rows: 128 x 8 float4
+                    const int idx = tid + i * 256, r = idx >> 3, k4 = idx & 7;
+                    sycl::float4 v(0.0f);
+                    if (q0 + (r >> 2) < nq)
+                        v = *reinterpret_cast<const sycl::float4*>(q_idx + (q0 * IDX_HEADS + r) * IDX_DIM + (int64_t) (kc + k4 * 4));
+                    qs[(k4 * 4 + 0) * SM_QS + r] = v.x(); qs[(k4 * 4 + 1) * SM_QS + r] = v.y();
+                    qs[(k4 * 4 + 2) * SM_QS + r] = v.z(); qs[(k4 * 4 + 3) * SM_QS + r] = v.w();
+                }
+                for (int i = 0; i < 2; ++i) {   // the pooled keys: 64 x 8 float4
+                    const int idx = tid + i * 256, c = idx >> 3, k4 = idx & 7;
+                    sycl::float4 v(0.0f);
+                    if (b0 + c < reach) v = *reinterpret_cast<const sycl::float4*>(pooled + (b0 + c) * IDX_DIM + (int64_t) (kc + k4 * 4));
+                    ks[(k4 * 4 + 0) * SM_KS + c] = v.x(); ks[(k4 * 4 + 1) * SM_KS + c] = v.y();
+                    ks[(k4 * 4 + 2) * SM_KS + c] = v.z(); ks[(k4 * 4 + 3) * SM_KS + c] = v.w();
+                }
+                sycl::group_barrier(it.get_group());
+#pragma unroll 8
+                for (int k = 0; k < SM_KC; ++k) {
+                    float qr[8], kr[4];
+                    for (int i = 0; i < 8; ++i) qr[i] = qs[k * SM_QS + ty * 8 + i];
+                    for (int j = 0; j < 4; ++j) kr[j] = ks[k * SM_KS + tx * 4 + j];
+                    for (int i = 0; i < 8; ++i)
+                        for (int j = 0; j < 4; ++j) acc[i][j] = sycl::fma(qr[i], kr[j], acc[i][j]);
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            for (int i = 0; i < 2; ++i) {
+                const int64_t qq = q0 + (int64_t) (ty * 2 + i);
+                if (qq >= nq) continue;
+                const int64_t n_bid = steps[qq * kStepCount + kStepNBid];
+                for (int j = 0; j < 4; ++j) {
+                    const int64_t b = b0 + (int64_t) (tx * 4 + j);
+                    if (b >= n_bid || b >= max_blocks) continue;
+                    float sc = 0.0f;
+                    for (int hh = 0; hh < IDX_HEADS; ++hh) {
+                        const float d = acc[i * 4 + hh][j];
+                        sc += d > 0.0f ? d : 0.0f;
+                    }
+                    out[qq * max_blocks + b] = sc;
+                }
+            }
+        });
+    });
+}
+// the tail block (b == n_bid, the dead key) of every query, as the warp kernel computes it
+sycl::event block_scores_tail(sycl::queue& q, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                              int64_t max_blocks, float* scores) {
+    return q.parallel_for(sycl::nd_range<1>((size_t) nq * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t qi = int64_t(it.get_group(0));
+        const int32_t* st = steps + qi * kStepCount;
+        const int64_t n_kv = st[kStepNKv], b = st[kStepNBid];
+        if (b >= max_blocks) return;
+        const int lane = int(sg.get_local_linear_id());
+        const float* kp = dead + (ptrdiff_t) lane * 4;
+        const float* qv = q_idx + qi * IDX_HEADS * IDX_DIM + (ptrdiff_t) lane * 4;
+        float score = 0.0f;
+        for (int hh = 0; hh < IDX_HEADS; ++hh) {
+            const float* q4 = qv + (ptrdiff_t) hh * IDX_DIM;
+            float d = kp[0] * q4[0] + kp[1] * q4[1] + kp[2] * q4[2] + kp[3] * q4[3];
+            for (int o = 16; o > 0; o >>= 1) d += sycl::permute_group_by_xor(sg, d, o);
+            score += d > 0.0f ? d : 0.0f;
+        }
+        if (lane == 0) {
+            if (n_kv % R != 0) score += 1e9f;
+            scores[qi * max_blocks + b] = score;
+        }
+    });
+}
+}  // namespace
+
+bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                         int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
+    if (nq <= 0) return true;
+    // no TF32 matrix scorer here (CUDA's mma.sync): the FP32 tiled one (a 38,738-token prompt on the B70 1,451 -> 1,536
+    // tok/s, the RTX 4070 1,013 -> 1,057); STRATA_SELECT_SIMT=0: refused, and the caller runs qsa_block_scores
+    static const bool simt = [] {
+        const char* v = std::getenv("STRATA_SELECT_SIMT");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!simt || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
+    auto& q = queue_for(stream);
+    const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
+    block_scores_simt(q, pooled, q_idx, steps, nq, max_blocks, reach, scores);
+    finish(stream, block_scores_tail(q, dead, q_idx, steps, nq, max_blocks, scores), "qsa_block_scores (simt)");
+    return true;
 }
 
 void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
