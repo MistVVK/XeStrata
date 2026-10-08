@@ -45,6 +45,15 @@ namespace strata::core {
 namespace {
 
 constexpr float EPS = 1e-6f;
+
+// STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
+bool mtp_catchup_all() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
 constexpr int GGML_Q8_0 = 8;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
@@ -848,6 +857,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    // the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected rows is not caught
+    // up - no later read reaches a cell past the one being drafted and the next round writes it first
+    if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
