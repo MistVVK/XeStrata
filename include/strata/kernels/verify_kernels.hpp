@@ -38,7 +38,9 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* y_q8_1 = nullptr);
+/// (`y_q8_1`: the outputs from t_out_begin on also as native_quantize_q8_1 writes them, value_dim per token - the same
+/// bytes, a launch fewer; upstream 22abb92d's QFUSE.)
 /// Times gdn_step_norm_multi's forms (the same bits) on the stream's device for every window size and keeps the
 /// fastest; call it before any graph is recorded (once a device; later calls return at once).  Untuned, the
 /// one-work-group-a-head form runs.  STRATA_GDN_STEP=0|1|2 fixes the form.

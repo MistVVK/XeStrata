@@ -12,6 +12,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "q8_1_finite.hpp"
 #include "strata/core/per_device.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
@@ -45,6 +46,19 @@ void done(void* stream, const sycl::event& e, const char* what) {
 inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
+}
+// The q8_1 block of a sub-group's 32 values, lane l's value xi (native_quantize_q8_1's quantizer, the same bytes):
+// contraction off, so the product that made xi cannot fuse into the sum's first add.
+inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block, const int lane) {
+#pragma clang fp contract(off)
+    float amax = sycl::fabs(xi), sum = xi;
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+        sum += sycl::permute_group_by_xor(sg, sum, o);
+    }
+    const float d = xe::q8_1_finite(amax / 127.0f);
+    block[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
+    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
 }
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);
@@ -193,9 +207,10 @@ namespace {
 // a head's 128 columns, follows in a second kernel: this one leaves the unnormalized output in y, and the norm sums
 // the squares by the same sub-groups (columns 32w .. 32w+31, the same butterfly) in the same order.
 constexpr int GS_COLS = 32;
+template <bool Q8>
 sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>((size_t) RG * GS_COLS), hd);
@@ -263,7 +278,11 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = sycl::rsqrt(ss / (float) S + eps);
             const float zz = z[at];
-            y[at] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+            const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+            y[at] = out;
+            if constexpr (Q8)
+                q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
+                           col & 31);
         });
     });
 }
@@ -271,14 +290,16 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
 
 namespace {
 // One work-group a head (512 work-items: (column, row group)).
+template <bool Q8>
 sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
     return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
-        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        // the q8_1 image takes registers: CUDA needs the work-group size bound for that kernel only
+        const auto body = [=](const sycl::nd_item<1>& it) {
             const sycl::sub_group sg = it.get_sub_group();
             const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
             const int qh = head % h_k;
@@ -325,27 +346,37 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
                     const float zz = z[(size_t) t * value_dim + head * S + col];
-                    y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+                    const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+                    y[(size_t) t * value_dim + (size_t) (head * S + col)] = out;
+                    if constexpr (Q8)
+                        q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
+                                   tid & 31);
                 }
             }
             if (n_keep != nullptr && n > 0)
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
-        });
+        };
+        if constexpr (Q8)
+            hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP), sycl::reqd_work_group_size(S * RG)]] { body(it); });
+        else
+            hd.parallel_for(sycl::nd_range<1>((size_t) h_v * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] { body(it); });
     });
 }
 
 // upstream ae3b249f: the same arithmetic with the next token's q/k staged while the current one runs.
+template <bool Q8>
 sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
     return q.submit([&](sycl::handler& hd) {
         // sk/sq: two buffers, the next token's staged while the current one runs; red_kv and red_o apart, so a token
         // needs four barriers instead of six
         constexpr size_t two_s = 2 * (size_t) S, rg_s = (size_t) RG * S;
         sycl::local_accessor<float, 1> sk(sycl::range<1>(two_s), hd), sq(sycl::range<1>(two_s), hd),
             red_kv(sycl::range<1>(rg_s), hd), red_o(sycl::range<1>(rg_s), hd), wsum(sycl::range<1>(S / WARP), hd);
-        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rg_s, rg_s), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        // the q8_1 image takes registers: CUDA needs the work-group size bound for that kernel only
+        const auto body = [=](const sycl::nd_item<1>& it) {
             const sycl::sub_group sg = it.get_sub_group();
             const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
             const int qh = head % h_k;
@@ -399,13 +430,21 @@ sycl::event gdn_step_prefetch(sycl::queue& q, float* state, const float* hbuf, i
                     const size_t at = (size_t) t * value_dim + (size_t) (head * S + col);
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
-                    y[at] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-z[at])));
+                    const float out = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-z[at])));
+                    y[at] = out;
+                    if constexpr (Q8)
+                        q8_1_store(sg, out, y_q8_1 + ((size_t) (t - t_out_begin) * value_dim + (size_t) (head * S + col)) / 32 * 36,
+                                   tid & 31);
                 }
             }
             if (n_keep != nullptr && n > 0)
                 #pragma unroll
                 for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
-        });
+        };
+        if constexpr (Q8)
+            hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rg_s, rg_s), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP), sycl::reqd_work_group_size(S * RG)]] { body(it); });
+        else
+            hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rg_s, rg_s), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] { body(it); });
     });
 }
 
@@ -428,12 +467,25 @@ int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head
 }
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
+    if (y_q8_1 != nullptr) {
+        if (form == kGdnSplit)
+            return gdn_step_split<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
+                                        y_q8_1);
+        if (form == kGdnPrefetch)
+            return gdn_step_prefetch<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                           t_out_begin, y_q8_1);
+        return gdn_step_plain<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
+                                    y_q8_1);
+    }
     if (form == kGdnSplit)
-        return gdn_step_split(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
+        return gdn_step_split<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
+                                     nullptr);
     if (form == kGdnPrefetch)
-        return gdn_step_prefetch(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
-    return gdn_step_plain(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin);
+        return gdn_step_prefetch<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
+                                        nullptr);
+    return gdn_step_plain<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
+                                 nullptr);
 }
 }  // namespace
 
@@ -450,10 +502,11 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         // scratch inputs of the model's shape; small values keep the recurrence finite
         const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
         const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
-        float* buf = sycl::malloc_device<float>(n_state + n_h + 2 * n_g + 2 * n_y + S, q);
+        float* buf = sycl::malloc_device<float>(n_state + n_h + 2 * n_g + 2 * n_y + S + n_y / 32 * 9, q);
         if (buf == nullptr) fail("gdn_step_tune: device allocation failed");
         float *state = buf, *h = state + n_state, *gate = h + n_h, *beta = gate + n_g, *z = beta + n_g;
         float *y = z + n_y, *gamma = y + n_y;
+        auto* yq = reinterpret_cast<uint8_t*>(gamma + S);   // the window's q8_1 image (36 bytes a 32-value block)
         q.fill(buf, 0.01f, n_state + n_h + 2 * n_g + 2 * n_y + S).wait();
         // timed as the engine runs them: 32 launches of each form in a graph (submitted one by one, the host's launch
         // cost hid the kernels' on CUDA), the forms' graphs replayed in turns (a fresh process's B70 was still raising
@@ -466,7 +519,7 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
                 sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
                 graph.begin_recording(q);
                 for (int i = 0; i < 32; ++i)
-                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0);
+                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq);
                 graph.end_recording(q);
                 exec.push_back(graph.finalize());
             }
@@ -494,14 +547,16 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
 
 void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1) {
     if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
         n_tok > kVerifyMaxT)
         fail("gdn_step_norm_multi: invalid arguments");
     auto& q = Q(stream);
     const int forced = gdn_forced();
     const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];
-    done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin),
+    if (y_q8_1 != nullptr && (S * h_v) % 32 != 0) fail("gdn_step_norm_multi: q8_1 blocks need 32 | value_dim");
+    done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
+                               static_cast<uint8_t*>(y_q8_1)),
          "gdn_step_norm_multi");
 }
 

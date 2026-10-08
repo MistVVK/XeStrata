@@ -608,19 +608,26 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 stamp(l, 4, grp);
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
+                // the output norm also writes ssm_out's q8_1 input (the same bytes, a launch fewer; upstream
+                // 22abb92d, 0a22c467 for the batch's rows).  STRATA_QFUSE=0: a quantize launch of its own.
+                static const bool qfuse = [] {
+                    const char* e = std::getenv("STRATA_QFUSE");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
                     for (int t = tb; t < te; ++t) {
                         float* stx = slot_ss(t).gdn_state + (size_t) (gi - slot_ss(t).gdn_ord0) * gdn_floats;
                         gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
                                             z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
-                                            (int) HK, (int) HV, 1, nullptr, cs, 0);
+                                            (int) HK, (int) HV, 1, nullptr, cs, 0,
+                                            qfuse ? (void*) (xq_ + (size_t) (t - tb) * (ZV / 32) * 36) : nullptr);
                     }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb);
+                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr);
                 stamp(l, 6, grp);
-                native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
+                if (!qfuse) native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
             } else {
                 // ======================= QSA =======================
