@@ -545,6 +545,37 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
     });
 }
 
+namespace {
+// STRATA_DBG_GDN=1 (upstream dfc8f74d): the window count a commit-only launch reads from device memory is checked
+// first by a one-work-item kernel, which hands the form 0 in place of a count past the window's rows (the commit
+// skipped, where the fault would be a read past the window) and leaves the count in host memory: the next call
+// reports it (no device printf, which CUDA's link warns about).  The default path is unchanged.
+struct GdnDbg { int32_t* keep; int32_t* bad; };
+const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
+    static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+    if (!dbg) return n_keep;
+    static core::PerDevice<GdnDbg> per_device;
+    const GdnDbg d = per_device.get(q.get_device(), [&q] {
+        GdnDbg r{sycl::malloc_device<int32_t>(1, q.get_device(), q.get_context()),
+                 sycl::malloc_host<int32_t>(2, q.get_context())};
+        if (!r.keep || !r.bad) throw core::DeviceError("gdn_step_norm_multi: allocation failed");
+        r.bad[0] = r.bad[1] = 0;
+        return r;
+    });
+    sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system> seen(d.bad[0]);
+    if (const int32_t n = seen.exchange(0); n != 0)
+        std::fprintf(stderr, "strata DBG: gdn_step commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n",
+                     n, d.bad[1]);
+    int32_t *keep = d.keep, *bad = d.bad;
+    q.single_task([=] {
+        const int n = *n_keep;
+        if (n > n_max) { bad[1] = n_max; bad[0] = n; }
+        *keep = n > n_max ? 0 : n;
+    });
+    return keep;
+}
+}  // namespace
+
 void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1) {
@@ -555,6 +586,7 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
     const int forced = gdn_forced();
     const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];
     if (y_q8_1 != nullptr && (S * h_v) % 32 != 0) fail("gdn_step_norm_multi: q8_1 blocks need 32 | value_dim");
+    if (n_keep != nullptr && t_out_begin >= n_tok) n_keep = gdn_dbg_keep(q, n_keep, n_tok);
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
                                static_cast<uint8_t*>(y_q8_1)),
          "gdn_step_norm_multi");
