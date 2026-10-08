@@ -259,9 +259,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
   and CPU report), the lints (`tools/lint/run.sh`), the tests, and the license notices.
-- **Upstream integration:** the single-GPU features of Strata up to 0.1.39 are carried into Xe. `--coupled-draft` samples
-  MTP drafts with the target model's sampling chain. Of the paths meant to be faster, only those measured faster on
-  Xe are carried ([docs/XE.md](docs/XE.md#integration-through-strata-0138)).
+- **Upstream integration:** the changes of Strata up to 0.1.40.2 are carried into Xe, except the Windows and AMD
+  implementations. Of the paths meant to be faster, those measured faster on the B70 or the RTX 4070 are carried
+  ([docs/XE.md](docs/XE.md#integration-through-strata-0140)).
 - **The README and docs:** the Japanese ones (README.ja.md, docs/*.ja.md) are written first, and the English ones (README.md, docs/*.md) are their translations.
 
 ## Credits

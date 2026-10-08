@@ -27,6 +27,37 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.1.40
+
+The changes of upstream Strata 0.1.39 to 0.1.40.2 (`e8ca9afd`) are carried into Xe, except the Windows and AMD (HIP) implementations.
+Upstream's `sycl/` (another port to Intel GPUs) is not taken in: it is measured against on the same B70.
+On NVIDIA GPUs the same kernels run in the contrib build ([BUILD](BUILD.md)).
+
+The main things carried:
+
+- Conversations saved to a file and restored (session files), `ckpt=0` for a request that takes no checkpoint, `pin=N` to keep a shared beginning, and `tools/research_run.py`.
+- The PLE table is read in the format the GGUF has it: IQ4_NL (the default table), Q4_0, Q5_0, Q5_1, Q8_0, FP8 (E4M3 with a scale) or BF16.
+  Upstream measured the mean per-row error against the BF16 table: Q8_0 0.53%, FP8 2.64%, Q5_1 3.78%, Q5_0 4.25%, IQ4_NL 7.60%, Q4_0 8.55%.
+- GPU kernels for the gate/up of native Q4_0, Q4_1, Q5_0 and Q6_K experts; the CPU experts' AVX-2 i-quant and Q2_0 kernels.
+- Fused kernels with fewer launches in the verify windows and the prompt path (#783 and others).
+- `STRATA_PREFILL_CPU_SHARE=auto` (the default): a short chunk's least-routed experts are computed by the idle CPU pool.
+- `--kv-grow`: the K/V takes VRAM only for the cells a request has reached, and the expert cache uses the rest.
+  It is on by default where the device's virtual memory mapping granularity is 2 MiB or more (on for the RTX 4070; the B70's is 64 KiB, off).
+- `--adapt-async` (the resident mode's default), `--batch-mtp` (the default with `--batch` and `--mtp`), `--pipeline-windows` (opt-in, [MULTIGPU](MULTIGPU.md)) and `--lookup-chain` (opt-in).
+- Setup's additions (`--inspect`, `--source modelscope`, a 200K context and more) and the server's changes.
+
+Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.
+One faster on only one of them is chosen at run time from what the device reports, or is opt-in ([record](../bench/results/2026-10-09-upstream-0140/README.md)).
+
+The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib (intel/llvm with CUDA) modes, and all 71 CTest cases pass in each (`expert_multi_test` skips on a CPU without AVX-512).
+The AVX-512 path passes `expert_multi_test` under Intel SDE (`-icx`).
+`expert_parity --selftest` and `pool_test --selftest` need the canonical pack and cannot run under SDE: `unverified` (they pass on AVX2).
+On the B70 the icpx and free builds completed all eight answers (thinking on and off), six of them identical.
+Prompt 1,148 tok/s, decode after it 98.6 tok/s, short chats 77.3 tok/s (icpx).
+The configuration with 8 GiB, 4 GiB, no XMX and six CPU workers, and the RTX 4070, completed the answers as well.
+On the UHD 770 the free and icpx builds started and gave a short answer.
+`--pipeline-windows` on two Intel GPUs is `unverified`.
+
 ## Integration through Strata 0.1.38
 
 Of upstream Strata's changes up to 0.1.38 (`99f3dbd0b21d1401b3769e0c0d963913607f380b`), the single-GPU Linux ones are carried into Xe.

@@ -28,6 +28,37 @@ CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe �
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.1.40 の取り込み
+
+upstream の Strata 0.1.39 から 0.1.40.2（`e8ca9afd`）までの変更を、Windows と AMD（HIP）の実装を除いて Xe に移しています。
+upstream の `sycl/`（Intel の GPU 向けの別の移植）はコードに入れず、同じ B70 で速さを比べる相手にしています。
+NVIDIA の GPU では contrib のビルドで同じカーネルが動きます（[BUILD](BUILD.ja.md)）。
+
+移したものの主なものは次のとおりです。
+
+- 会話をファイルに保存して戻す（セッションファイル）、使い捨ての要求でチェックポイントを取らない `ckpt=0`、共有の先頭を固定する `pin=N` と `tools/research_run.py`。
+- PLE の表は GGUF にある形式のまま読みます: IQ4_NL（既定の表）、Q4_0、Q5_0、Q5_1、Q8_0、FP8（E4M3 とスケール）、BF16。
+  upstream の測定では、BF16 の表と比べた行ごとの平均誤差は Q8_0 0.53%、FP8 2.64%、Q5_1 3.78%、Q5_0 4.25%、IQ4_NL 7.60%、Q4_0 8.55% です。
+- ネイティブのエキスパートの Q4_0、Q4_1、Q5_0、Q6_K の gate/up の GPU カーネル。CPU のエキスパートの AVX-2 の i-quant と Q2_0 のカーネル。
+- 検証の窓とプロンプトの経路で起動の数を減らすカーネルの融合（#783 ほか）。
+- `STRATA_PREFILL_CPU_SHARE=auto`（既定）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
+- `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
+  デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
+- `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in）。
+- setup の追加（`--inspect`、`--source modelscope`、200K の文脈など）とサーバーの変更。
+
+速くするための経路は、B70 か RTX 4070 で速くなり、もう一方で遅くならないものを移しました。
+片方だけで速いものは、機器が報告する値で実行時に選ぶか、opt-in にしています（[記録](../bench/results/2026-10-09-upstream-0140/README.md)）。
+
+取り込みは free（intel/llvm）、contrib-icpx（icpx）、contrib（intel/llvm と CUDA）でビルドし、どれも CTest の 71 件が通ります（`expert_multi_test` は AVX-512 のない CPU で飛ばします）。
+AVX-512 の経路は Intel SDE（`-icx`）で `expert_multi_test` が通ります。
+`expert_parity --selftest` と `pool_test --selftest` は正準形の pack がないので SDE では動かせず、`unverified` です（AVX2 では通ります）。
+B70 では icpx と free のビルドが 8 つの答え（思考あり・なし）をすべて最後まで出し、6 つが一致しました。
+プロンプト 1,148 tok/s、その後のデコード 98.6 tok/s、短い会話 77.3 tok/s（icpx）です。
+8 GiB・4 GiB・XMX なし・CPU のワーカー 6 つの構成と、RTX 4070 でも答えを最後まで出しました。
+UHD 770 では free と icpx のビルドが起動し、短い答えを返しました。
+2 枚の Intel の GPU での `--pipeline-windows` は `unverified` です。
+
 ## Strata 0.1.38 の取り込み
 
 upstream の Strata 0.1.38（`99f3dbd0b21d1401b3769e0c0d963913607f380b`）までの変更のうち、単一の GPU と Linux に関わるものを Xe に移しています。
