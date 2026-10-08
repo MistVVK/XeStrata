@@ -65,10 +65,12 @@ sycl::event launch_warp(sycl::queue& q, const uint16_t* x, const uint16_t* w, fl
 }
 
 // ggml-cuda mmvf: work-group size chosen for the fewest pair iterations, two ordered FMAs per pair, a warp sum, and
-// for more than one warp a second warp sum over 32 partials (zero beyond the warp count).
-template<int BLOCK_SIZE, int NT>
+// for more than one warp a second warp sum over 32 partials (zero beyond the warp count).  EXACT: n_tok is NT (the
+// rows' loop fixed at compile time; upstream 104a8485), else the first n_tok of NT rows.
+template<int BLOCK_SIZE, int NT, bool EXACT = false>
 sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                        int n_in, int64_t n_out, int n_tok) {
+                        int n_in, int64_t n_out, int n_tok_arg) {
+    const int n_tok = EXACT ? NT : n_tok_arg;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> partials(sycl::range<1>(NT * 32), h);
         h.parallel_for(sycl::nd_range<1>((size_t) n_out * BLOCK_SIZE, BLOCK_SIZE),
@@ -126,18 +128,18 @@ int mmvf_block_size(int64_t n_in) {
     return best;
 }
 
-template<int NT>
+template<int NT, bool EXACT = false>
 void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                    int64_t n_in, int64_t n_out, int n_tok) {
     switch (mmvf_block_size(n_in)) {
-        case 32: launch_mmvf<32, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 64: launch_mmvf<64, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 96: launch_mmvf<96, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 128: launch_mmvf<128, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 160: launch_mmvf<160, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 192: launch_mmvf<192, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 224: launch_mmvf<224, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 256: launch_mmvf<256, NT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 32: launch_mmvf<32, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 64: launch_mmvf<64, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 96: launch_mmvf<96, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 128: launch_mmvf<128, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 160: launch_mmvf<160, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 192: launch_mmvf<192, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 224: launch_mmvf<224, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 256: launch_mmvf<256, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
     }
 }
 
@@ -194,8 +196,16 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     auto& q = queue_for(stream);
-    if (n_tok <= 4) dispatch_mmvf<4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
-    else dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    switch (n_tok) {   // the window's usual row counts with their loop fixed at compile time (upstream 104a8485)
+        case 2: dispatch_mmvf<2, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok); break;
+        case 3: dispatch_mmvf<3, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok); break;
+        case 4: dispatch_mmvf<4, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok); break;
+        case 5: dispatch_mmvf<5, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok); break;
+        case 6: dispatch_mmvf<6, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok); break;
+        default:
+            if (n_tok <= 4) dispatch_mmvf<4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
+            else dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    }
     if (!stream) core::Runtime::get().finish(q);
 }
 
