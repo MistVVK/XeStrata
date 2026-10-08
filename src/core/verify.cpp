@@ -55,6 +55,17 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// A one-token window always keeps its token, so its graph advances the GDN conv history and recurrence state itself
+// (its indexer append and PLE history are final already) and Verifier::commit launches no commit graph after it
+// (upstream 352cad8f): the draft round then runs alone instead of beside the commit's kernels, which read and write
+// each GDN layer's state.  STRATA_ONE_TOKEN_COMMIT=0: the commit graph after every window.
+bool one_token_self_commit() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ONE_TOKEN_COMMIT");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
 // the head's hyper-connection read for the window's tokens in one fused_gr_read_multi (upstream edc592b1: its sums
 // are gr_read's); STRATA_HEAD_MIX_MULTI=0: gr_read per token
 bool head_mix_multi_enabled() {
@@ -292,6 +303,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
+        one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
     };
     Bump count;
@@ -317,6 +329,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
+    {
+        const int32_t one = 1;
+        if (!strata::gpu::copy(one_, &one, sizeof one)) { err = "verify: the arena could not be set"; return false; }
+    }
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
@@ -392,6 +408,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    const bool self_commit = T == 1 && !batch_rec_ && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
@@ -534,7 +551,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                           (int) (2 * HK), EPS, 1, cs, 0);
                     }
                 } else
-                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
+                // a one-token window keeps its token: it advances the conv history and the state itself (commit)
+                gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
+                                  self_commit);
                 stamp(l, 3, grp);
                 gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
@@ -552,7 +571,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, nullptr, cs, tb);
+                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb);
                 stamp(l, 6, grp);
                 native_quantize_q8_1(y_ + (size_t) tb * ZV, xq_, (int) ZV, n, cs);
                 native_mmvq(wout->native_type, wout->native_data, xq_, bo_ + tb * N, (int) ZV, (int) N, n, cs);
@@ -1895,6 +1914,16 @@ bool Verifier::commit(int n_keep, std::string& err) {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+    if (last_t_ == 1 && !last_batch_ && one_token_self_commit()) {
+        // a one-token window has advanced the state itself (record_window): no commit graph
+        if (ple_stage())
+            for (int t = 0; t < n_keep; ++t) {
+                ss_->ple_prev[0] = ss_->ple_prev[1];
+                ss_->ple_prev[1] = last_tokens_[t];
+            }
+        ms_commit += ms_since(t0);
+        return next_ == nullptr || next_->commit(n_keep, err);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const bool le = strata::gpu::graph_launch(commit_exec_, cs_);
     if (!le) { err = std::string("verify: commit launch: ") + strata::gpu::last_error(); return false; }

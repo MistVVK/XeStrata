@@ -24,9 +24,10 @@ namespace strata::kernels {
 inline constexpr int kVerifyMaxT = 8;
 
 /// For token t of T: conv over [history(3) | qkv_0 .. qkv_t] -> SiLU -> L2 norm of the q/k heads -> h[t].
-/// `history` is NOT written.  Bitwise `fused_gdn_conv_l2` per token.
+/// `history` is NOT written, except with `commit` (one token, t_begin 0: a one-token window keeps its token), which
+/// leaves it as gdn_conv_commit with n_keep 1 would.  Bitwise `fused_gdn_conv_l2` per token.
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0);
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin = 0, bool commit = false);
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.

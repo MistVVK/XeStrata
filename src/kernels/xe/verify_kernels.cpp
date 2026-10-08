@@ -50,9 +50,11 @@ inline uint32_t read_host(const uint32_t* p) {
 }  // namespace
 
 void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin) {
-    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT)
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
+    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
+        (commit && (n_tok != 1 || t_begin != 0)))
         fail("gdn_conv_l2_multi: invalid arguments");
+    float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
     const int C = channels;
     const auto e = Q(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(S / WARP), hd);
@@ -78,6 +80,12 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                 y *= sycl::rsqrt(ss + eps);
             }
             h[(size_t) t * C + c] = y;
+            if (hist_out != nullptr) {   // the window keeps its one token: [h1, h2, x], gdn_conv_commit's n_keep 1
+                float* ho = hist_out + (size_t) c * 3;
+                ho[0] = v1;
+                ho[1] = v2;
+                ho[2] = x;
+            }
         });
     });
     done(stream, e, "gdn_conv_l2_multi");
