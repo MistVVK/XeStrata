@@ -81,6 +81,26 @@ Only the part the attention reads stays in VRAM (`--kv-resident 32768`), so more
 The attention reads exactly the same values; only where the KV lives changes.
 It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 
+**The elastic K/V** (`--kv-grow` or `STRATA_KV_GROW=1`, upstream 9e3dbfe7): the whole KV cache in VRAM, taking VRAM only for the cells the requests reach.
+The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
+Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
+It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
+`STRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
+At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
+
+| | prompt (tokens/s) | decode after it | short chat decode | slots |
+| --- | ---: | ---: | ---: | ---: |
+| RTX 4070, KV streaming (default) | 791.6 | 73.60 | 58.50 | 4,102 |
+| RTX 4070, the whole K/V in VRAM | 770.2 | 66.70 | 56.70 | 3,149 |
+| RTX 4070, `--kv-grow` | 802.4 | 76.50 | 61.40 | 4,219 |
+| B70, KV streaming (default) | 1133.5 | 100.50 | 77.80 | 19,192 |
+| B70, the whole K/V in VRAM | 1245.9 | 101.00 | 78.60 | 18,347 |
+| B70, `--kv-grow` | 681.9 | 98.90 | 73.40 | 19,303 |
+
+On the B70 the slow side is the cache in virtual memory: with the K/V alone in it the prompt ran at 1291.5 and the decode after it at 105.10, faster than the whole K/V in VRAM.
+Unless asked, the device's reported virtual-memory granularity decides: on at 2 MiB or more, off below (the B70 reports 64 KiB).
+`--kv-grow` and `--no-kv-grow` (`STRATA_KV_GROW=1` and `0`) take precedence over it.
+
 **KV precision**: above an 8K context setup asks for the KV cache's precision (`--kv`).
 
 - `int8` (the default): 8 bits

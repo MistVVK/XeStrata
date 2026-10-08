@@ -272,6 +272,12 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 }
 
 
+namespace {
+bool g_cache_vmm = false;   // set_vmm
+}  // namespace
+
+void ExpertCache::set_vmm(bool enabled) { g_cache_vmm = enabled; }
+
 bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int64_t blob_bytes,
                        std::string& err) {
     close();
@@ -309,6 +315,18 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
 
     if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
+    } else if (g_cache_vmm && vmm_available()) {
+        // the elastic K/V: every chunk mapped now; the K/V may later take some of them (and give them back)
+        auto r = std::make_unique<VmmRange>();
+        if (!r->reserve(want) || !r->map_range(0, r->chunks(), [] { return (VmmChunk) 0; })) {
+            char buf[256];
+            std::snprintf(buf, sizeof buf, "ExpertCache: mapping %.2f GiB of VRAM failed: out of memory",
+                          (double) want / 1073741824.0);
+            err = buf;
+            return false;
+        }
+        base_ = r->base();
+        vmm_ = std::move(r);
     } else if (!strata::gpu::alloc_device((void**) &base_, (size_t) want)) {
         base_ = nullptr;
         char buf[256];
@@ -376,6 +394,9 @@ void ExpertCache::close() {
     off_.clear();
     if (!segs_.empty()) {
         release_segmented();
+    } else if (vmm_) {
+        vmm_.reset();   // unmaps and frees every chunk it still holds
+        base_ = nullptr;
     } else if (base_ != nullptr) {
         strata::gpu::free(base_);
         base_ = nullptr;

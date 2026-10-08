@@ -44,6 +44,9 @@
 #include "strata/kernels/ple.hpp"
 
 #include <cstdio>
+#include <functional>
+
+#include "strata/core/vmm.hpp"
 #include <cstdlib>
 #include <cstdint>
 #include <string>
@@ -233,6 +236,9 @@ struct QsaState {
     /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
     int kv_mode = 0;
     int64_t n_slots = 0;
+    /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
+    /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
+    int32_t kv_elastic = -1;
     strata::kernels::KvHostPools host;
     strata::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
@@ -276,6 +282,24 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
+/// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
+/// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
+/// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the
+/// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
+void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
+bool qsa_kv_elastic();
+/// Cells every elastic state can hold now (INT64_MAX when none is elastic).
+int64_t qsa_kv_elastic_cells();
+/// Chunks still to map for every elastic state to hold `cells` cells.
+int64_t qsa_kv_elastic_need(int64_t cells);
+/// Maps them, each from `take()` (0: a new chunk), the new memory zeroed.  Synchronous; nothing may be running on
+/// the device.  false: out of memory.
+bool qsa_kv_elastic_grow(int64_t cells, const std::function<VmmChunk()>& take);
+/// Unmaps the chunks past `cells` cells, each handed to `give`.  Returns how many.
+int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>& give);
+/// Physical bytes the elastic pools hold, and what all of them would at the full context.
+uint64_t qsa_kv_elastic_mapped_bytes();
+uint64_t qsa_kv_elastic_full_bytes();
 int64_t qsa_kv_resident();
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.

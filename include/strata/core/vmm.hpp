@@ -19,6 +19,9 @@ using VmmChunk = unsigned long long;
 bool vmm_available();
 /// The chunk size (0 when not available).
 uint64_t vmm_granularity();
+/// The device's own granularity is a chunk already (2 MiB or more): its virtual memory maps pages as large as an
+/// ordinary allocation's.  The elastic K/V's default (generate.cpp).
+bool vmm_large_pages();
 /// A new physical chunk on the current device (0: out of memory), and its release.
 VmmChunk vmm_chunk_new();
 void vmm_chunk_free(VmmChunk h);

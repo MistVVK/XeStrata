@@ -249,6 +249,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    int kv_grow = -1;                  ///< the elastic K/V (--kv-grow 1, --no-kv-grow 0, STRATA_KV_GROW; -1: by the device)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -506,6 +507,11 @@ void usage() {
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "  --kv-grow            the K/V takes VRAM only for the cells the requests reach and the expert\n"
+                 "                       cache holds the rest, giving slots back as the context grows (one GPU, with\n"
+                 "                       --expert-profile; STRATA_KV_GROW=1/0 also). --no-kv-grow: the whole\n"
+                 "                       --max-context allocated at start. Default: on where the device maps virtual\n"
+                 "                       memory in pages of 2 MiB or more and the setup allows it\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -1210,6 +1216,8 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-grow") o.kv_grow = 1;
+        else if (a == "--no-kv-grow") o.kv_grow = 0;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -2369,6 +2377,30 @@ int main(int argc, char** argv) {
         return 2;
     }
 
+    // the elastic K/V (--kv-grow, see kvg_ensure): one GPU, the whole K/V in VRAM (no streaming), a profiled cache
+    // that can give slots up, and every expert in RAM for the CPU to compute the ones it gives up; set before the
+    // session and the cache are sized
+    {
+        const char* ev = std::getenv("STRATA_KV_GROW");
+        bool remote = false;
+        for (const int r : o.expert_cache_remote) remote = remote || r > 0;
+        const int want = ev != nullptr && ev[0] != '\0' ? (ev[0] != '0' ? 1 : 0) : o.kv_grow;
+        // Default (-1): the device's own virtual-memory page size decides.  The B70 (Level Zero) reports 64 KiB and the
+        // expert cache in 2 MiB physical segments ran its prompts 45% slower there (the K/V alone was as fast as
+        // before); the RTX 4070 reports 2 MiB and was faster in every measure (DETAILS).
+        const bool asked = want > 0 || (want < 0 && strata::core::vmm_large_pages());
+        const bool on = asked && !multi_gpu && o.kv_resident <= 0 && !o.expert_profile.empty() &&
+                        !o.resident_cpu_experts && o.expert_cache != 0 && !remote && strata::core::vmm_available() &&
+                        // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
+                        o.batch == 0 && !o.vram_elastic;
+        if (want > 0 && !on)
+            std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU with virtual memory, a profile, the whole "
+                                 "K/V in VRAM, every expert in RAM, no --batch or --vram-elastic)\n");
+        const char* iv = std::getenv("STRATA_KV_GROW_INIT");
+        const long long init = iv != nullptr ? std::strtoll(iv, nullptr, 10) : 0;
+        strata::core::qsa_set_kv_elastic(on, init > 0 ? init : 16384);
+        strata::core::ExpertCache::set_vmm(on);
+    }
     void* sbuf = nullptr;
     // a layer split with explicit split points (upstream #216, the carve): every GPU's sessions hold the state of its
     // own layers only ([0, K) here, [lb, le) on a later stage); --layer-split auto and one GPU hold every layer
@@ -4022,6 +4054,211 @@ int main(int argc, char** argv) {
     std::vector<int32_t> host_res;
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
+
+    // ---- THE ELASTIC K/V (--kv-grow; vmm.hpp, upstream 9e3dbfe7).  Allocated for the whole --max-context up front,
+    // the K/V of a long context takes VRAM the expert cache could hold more experts in.  Here the K/V pools hold
+    // physical memory only for the cells the requests reach.  When a request needs more, slots just below the prompt
+    // path's loan give up their experts (the CPU computes those from RAM, like any miss) and their whole chunks are
+    // mapped into the K/V; a later short request hands them back and the slots are refilled with the profile's hottest
+    // experts.  Neither side's addresses move, so every captured graph stays valid.  The context is never smaller:
+    // --max-context cells always fit, the cache simply holds fewer experts while a long one is live.
+    struct KvGrow {
+        bool on = false;
+        int64_t top = 0, lo = 0;          // slots [lo, top) hold no expert; their whole chunks may be with the K/V
+        int64_t floor = 128;              // the cache keeps at least these slots
+        int64_t step = 8192;              // the K/V grows in whole steps of cells
+        int64_t cells = 0;                // what every K/V pool holds now
+        std::vector<strata::core::VmmChunk> spare;   // out of the cache, not (yet) in the K/V
+        int64_t grows = 0, trims = 0, fresh = 0, evicted = 0, refilled = 0;
+    } kvg;
+    auto kvg_start = [&](int64_t top) {
+        kvg.on = strata::core::qsa_kv_elastic() && xcache.vmm_range() != nullptr && d_res != nullptr &&
+                 !host_res.empty() && srcp != nullptr && top > kvg.floor;
+        if (!kvg.on) return;
+        kvg.top = kvg.lo = top;
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        if (const char* v = std::getenv("STRATA_KV_GROW_STEP"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
+            kvg.step = std::strtoll(v, nullptr, 10);
+        // tests: the cache keeps this many slots (its size: the K/V grows into new VRAM only)
+        if (const char* v = std::getenv("STRATA_KV_GROW_FLOOR"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
+            kvg.floor = std::strtoll(v, nullptr, 10);
+        std::fprintf(stderr, "strata generate: elastic K/V: %lld of %lld cells in VRAM (%.2f of %.2f GiB); the expert "
+                             "cache (%lld slots) gives the K/V room below slot %lld as the context grows\n",
+                     (long long) kvg.cells, (long long) o.max_context,
+                     (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                     (double) strata::core::qsa_kv_elastic_full_bytes() / 1073741824.0, (long long) xcache.slots(),
+                     (long long) top);
+    };
+    // Room for `cells` cells (rounded up to a step).  `quiesce` must leave nothing running on the device and land
+    // the adaptive tier's swaps (a swap in flight could still be writing a slot given up here).
+    auto kvg_ensure = [&](int64_t cells, const std::function<void()>& quiesce) -> bool {
+        if (!kvg.on || cells <= kvg.cells) return true;
+        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvg.step - 1) / kvg.step * kvg.step);
+        const int64_t need = strata::core::qsa_kv_elastic_need(target);
+        if (need == 0) { kvg.cells = strata::core::qsa_kv_elastic_cells(); return true; }
+        quiesce();
+        strata::core::VmmRange& r = *xcache.vmm_range();
+        const uint64_t G = strata::core::vmm_granularity();
+        std::vector<int32_t> owner;   // slot -> residency index
+        // The slots given up are the ones just below the prompt path's loan, and the loan is most of the cache: they
+        // hold experts of middling heat.  So an expert there that is hotter than the coldest one in the loan region
+        // moves into that one's slot (a device copy), and the coldest is given up instead - the cache then holds what
+        // a smaller cache would.  Heat: the adaptive tier's routing counts, then the profile's rank.
+        std::vector<int32_t> rank;
+        std::vector<std::pair<float, int32_t>> cold;   // the loan region's residents, hottest first
+        auto heat = [&](int32_t i) -> float {
+            const float u = drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i];
+            return u * 1048576.0f - (float) rank[(size_t) i];
+        };
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        int64_t gave = 0, moved = 0;
+        auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside [lo, top): a chunk a live slot shares stays
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+            int64_t k = 0;
+            for (int64_t c = c0; c < c1; ++c) k += r.mapped(c) ? 1 : 0;
+            return k;
+        };
+        while ((int64_t) kvg.spare.size() + freeable() < need && kvg.lo > kvg.floor) {
+            if (owner.empty()) {
+                owner.assign((size_t) xcache.slots(), -1);
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= 0 && host_res[i] < xcache.slots()) owner[(size_t) host_res[i]] = (int32_t) i;
+                rank.assign(host_res.size(), (int32_t) profile.size());
+                for (size_t q = 0; q < profile.size(); ++q)
+                    rank[(size_t) profile[q].first * (size_t) g.n_expert + (size_t) profile[q].second] = (int32_t) q;
+                for (size_t i = 0; i < host_res.size(); ++i)
+                    if (host_res[i] >= kvg.top) cold.emplace_back(heat((int32_t) i), (int32_t) i);
+                std::sort(cold.begin(), cold.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            }
+            --kvg.lo;
+            ++gave;
+            if (const int32_t oi = owner[(size_t) kvg.lo]; oi >= 0) {
+                const int64_t layer = oi / g.n_expert;
+                int32_t vi = -1;
+                if (!cold.empty() && cold.back().first < heat(oi)) {
+                    vi = cold.back().second;
+                    const int32_t vs = host_res[(size_t) vi];
+                    if (xcache.slot_offset(vs + 1) - xcache.slot_offset(vs) < lay.blob_bytes(layer) ||
+                        !strata::gpu::copy(xcache.device_slot(vs), xcache.device_slot((int32_t) kvg.lo),
+                                           (size_t) lay.blob_bytes(layer)))
+                        vi = -1;
+                    else {
+                        cold.pop_back();
+                        host_res[(size_t) oi] = vs;
+                        host_res[(size_t) vi] = strata::core::kNotResident;
+                        ++moved;
+                    }
+                }
+                if (vi < 0) host_res[(size_t) oi] = strata::core::kNotResident;
+                ++kvg.evicted;
+            }
+        }
+        // the moves still read the slots given up, and a chunk unmapped under a copy would fault it
+        if (gave > 0 && !strata::gpu::device_sync()) {
+            std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", strata::gpu::last_error());
+            return false;
+        }
+        {
+            const int64_t c0 = (int64_t) ((xcache.slot_offset(kvg.lo) + G - 1) / G);
+            const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+            for (int64_t c = c0; c < c1; ++c)
+                if (r.mapped(c))
+                    if (const strata::core::VmmChunk h = r.unmap(c)) kvg.spare.push_back(h);
+        }
+        if (gave > 0 && !strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t))) {
+            std::fprintf(stderr, "strata: the residency table upload failed: %s\n", strata::gpu::last_error());
+            return false;
+        }
+        int64_t fresh = 0;
+        const bool ok = strata::core::qsa_kv_elastic_grow(target, [&]() -> strata::core::VmmChunk {
+            if (kvg.spare.empty()) { ++fresh; return 0; }   // the cache is at its floor: new memory
+            const strata::core::VmmChunk h = kvg.spare.back();
+            kvg.spare.pop_back();
+            return h;
+        });
+        kvg.fresh += fresh;
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        ++kvg.grows;
+        std::fprintf(stderr, "strata: K/V grown to %lld cells (%.2f GiB); the expert cache gave %lld slots for it, "
+                             "%lld hotter experts moved to colder ones' slots (%lld of %lld slots hold experts)%s\n",
+                     (long long) kvg.cells, (double) strata::core::qsa_kv_elastic_mapped_bytes() / 1073741824.0,
+                     (long long) gave, (long long) moved, (long long) kvg.lo + (long long) (xcache.slots() - kvg.top),
+                     (long long) xcache.slots(),
+                     fresh > 0 ? " - and new VRAM, the cache being at its floor" : "");
+        if (!ok)
+            std::fprintf(stderr, "strata: the K/V could not grow to %lld cells (%s)\n", (long long) target,
+                         strata::gpu::last_error());
+        return ok;
+    };
+    // A request that needs far fewer cells than the K/V holds gives the rest back: the slots refill with the
+    // profile's hottest experts the GPU does not hold.  Run on a quiet device (as kvg_ensure's `quiesce`).
+    auto kvg_trim = [&](int64_t cells, int64_t hold) -> bool {   // `hold`: the cells a parked conversation could need
+        if (!kvg.on) return true;
+        // #1128: a parked conversation comes back through kvg_ensure's grow, so a K/V that fell to a short request's
+        // size is grown again (its experts shuffled again) after every short request in between: with
+        // STRATA_KV_GROW_HOLD=1 the K/V keeps the longest parked conversation's cells while it is parked
+        const int64_t want = std::max<int64_t>(cells, hold);
+        const int64_t target = std::max<int64_t>(kvg.step, (want + kvg.step - 1) / kvg.step * kvg.step);
+        if (kvg.cells < target + 2 * kvg.step || kvg.lo >= kvg.top) return true;
+        strata::core::qsa_kv_elastic_shrink(target, [&](strata::core::VmmChunk h) { kvg.spare.push_back(h); });
+        kvg.cells = strata::core::qsa_kv_elastic_cells();
+        strata::core::VmmRange& r = *xcache.vmm_range();
+        const uint64_t G = strata::core::vmm_granularity();
+        const int64_t c1 = (int64_t) (xcache.slot_offset(kvg.top) / G);
+        {   // one run from the lowest unmapped chunk, as long as the chunks handed back last
+            const int64_t c0 = (int64_t) (xcache.slot_offset(kvg.lo) / G);
+            int64_t cend = c0, need = (int64_t) kvg.spare.size();
+            while (cend < c1 && need > 0) need -= r.mapped(cend++) ? 0 : 1;
+            if (!r.map_range(c0, cend, [&]() -> strata::core::VmmChunk {
+                    if (kvg.spare.empty()) return 0;
+                    const strata::core::VmmChunk h = kvg.spare.back();
+                    kvg.spare.pop_back();
+                    return h;
+                }))
+                std::fprintf(stderr, "strata: the expert cache could not take its VRAM back from the K/V\n");
+        }
+        const int64_t lo0 = kvg.lo;
+        while (kvg.lo < kvg.top) {   // a slot whose chunks are all mapped again holds an expert again
+            const int64_t a = (int64_t) (xcache.slot_offset(kvg.lo) / G);
+            const int64_t b = (int64_t) ((xcache.slot_offset(kvg.lo + 1) + G - 1) / G);
+            bool all = true;
+            for (int64_t c = a; c < b && all; ++c) all = r.mapped(c);
+            if (!all) break;
+            ++kvg.lo;
+        }
+        // the refills on one queue and one sync (a blocking copy each was a round trip per expert)
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        std::vector<std::pair<size_t, int32_t>> filled;   // (residency index, slot), resident once the copies landed
+        size_t pi = 0;
+        for (int64_t s = lo0; s < kvg.lo; ++s) {
+            const uint64_t room = xcache.slot_offset(s + 1) - xcache.slot_offset(s);
+            for (; pi < profile.size(); ++pi) {
+                const int32_t l = profile[pi].first, e = profile[pi].second;
+                const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                const uint8_t* b = srcp->blob(l, e);
+                if (b == nullptr) continue;
+                strata::gpu::copy_async(xcache.device_slot((int32_t) s), b, (size_t) lay.blob_bytes(l), nullptr);
+                filled.emplace_back(i, (int32_t) s);
+                ++pi;
+                break;
+            }
+        }
+        if (!strata::gpu::device_sync()) {
+            std::fprintf(stderr, "strata: refilling the expert cache failed: %s\n", strata::gpu::last_error());
+            return false;
+        }
+        for (const auto& [i, s] : filled) host_res[i] = s;
+        kvg.refilled += (int64_t) filled.size();
+        if (!strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t))) return false;
+        for (const strata::core::VmmChunk h : kvg.spare) strata::core::vmm_chunk_free(h);   // new ones, if any
+        kvg.spare.clear();
+        ++kvg.trims;
+        std::fprintf(stderr, "strata: K/V trimmed to %lld cells; %lld slots back to the expert cache, refilled from "
+                             "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
+        return true;
+    };
     strata::core::TokenHits thits;
     const bool graph_hits = hit_fn != nullptr && !profile.empty() && !o.no_pool;
     if (graph_hits && !o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr) {
@@ -4339,6 +4576,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         mem_mark("the head and the prompt path");
+        kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -5897,6 +6135,13 @@ int main(int argc, char** argv) {
                         refuse(err);
                         continue;
                     }
+                    // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                    if (!kvg_ensure((int64_t) image.live.ids.size() + 256,
+                                    [&] { strata::gpu::device_sync(); apply_pending(true); })) {
+                        refuse("the K/V cannot grow to the saved conversation: no VRAM is left",
+                               strata::core::SessionError::memory);
+                        continue;
+                    }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
@@ -6128,6 +6373,15 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            auto kv_quiesce = [&] { strata::gpu::device_sync(); apply_pending(true); };
+            if (kvg.on) {   // the elastic K/V: this prompt's cells (it gives back what it does not need below)
+                // a failed growth may leave the tier half-changed: the engine stops (as for any device failure)
+                if (!kvg_ensure(n + 256, kv_quiesce)) {
+                    std::printf("ERR the K/V cannot grow to this prompt: no VRAM is left\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             int64_t resume = 0;
             bool from_live = false;
             // the live session and the checkpoints were read with the control vector one way: a switch reads the
@@ -6266,6 +6520,11 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
             }
+            // the elastic K/V: a parked conversation is restored whole, and it may be longer than this prompt
+            if (incoming && !kvg_ensure((int64_t) incoming->live.ids.size() + 256, kv_quiesce)) {
+                std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
+                return 1;
+            }
             if (incoming) {
                 const auto t0 = Clock::now();
                 if ((conv_stages.empty()
@@ -6318,6 +6577,22 @@ int main(int argc, char** argv) {
                              return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
+            // the elastic K/V: the outgoing session is parked and this request rewrites every cell from `resume` on,
+            // so cells past this prompt's are no longer anyone's - far more than it needs go back to the cache
+            if (kvg.on) {
+                kv_quiesce();
+                // STRATA_KV_GROW_HOLD=1 (opt-in, #1128): keep the K/V as long as the longest parked conversation;
+                // default: trim to this request alone
+                static const bool hold_on = [] {
+                    const char* v = std::getenv("STRATA_KV_GROW_HOLD");
+                    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+                }();
+                if (!kvg_trim(n + 256, hold_on ? conversations.longest_tokens() + 256 : 0)) {
+                    std::printf("ERR the K/V could not give its VRAM back to the expert cache\n");
+                    std::fflush(stdout);
+                    return 1;
+                }
+            }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
@@ -6875,6 +7150,12 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on_h(hist_dev);
                     strata::gpu::copy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t));
                 }
+                // the elastic K/V: the window's cells and the drafter's beyond them
+                if (kvg.on && p + T + 64 > kvg.cells &&
+                    !kvg_ensure(p + T + 64, [&] { strata::gpu::device_sync(); apply_pending(true); })) {
+                    std::printf("ERR the K/V cannot grow: no VRAM is left\n");
+                    return 1;
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
@@ -7292,6 +7573,7 @@ int main(int argc, char** argv) {
     int64_t spec_pos = -1;  // plan v0.3 P6: where the speculative loop starts (-1 = not used; a native pack's
                             // one-token prompt starts it at 0)
     strata::prefill::Prefill prefill;
+    bool kvg_started = false;   // the elastic K/V took this run's cells
     double prefill_batched_ms = 0;
     std::FILE* final_r = o.dump_final_r.empty() ? nullptr : std::fopen(o.dump_final_r.c_str(), "wb");
     std::vector<float> final_r_host(final_r ? (size_t) (g.hc * g.n_embd) : 0);
@@ -7316,6 +7598,10 @@ int main(int argc, char** argv) {
             const int64_t blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
             if (k > 0) {   // the lent slots are refilled after the prompt
                 const int32_t first = (int32_t) (xcache.slots() - k);
+                // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
+                kvg_started = true;
+                kvg_start(first);
+                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -7350,6 +7636,11 @@ int main(int argc, char** argv) {
                 if (prefill.draft_kv(mtp, R_rows, nxt.data(), T, p0, e)) return true;   // E-9
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
+        }
+        if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
+            kvg_started = true;
+            kvg_start(xcache.slots());
+            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         const int64_t n_batched = (o.prefill_until > 0 && o.prefill_until < n_prompt - 1) ? o.prefill_until : n_prompt - 1;
@@ -7396,6 +7687,10 @@ int main(int argc, char** argv) {
                      (long long) ps.experts_cpu, ps.cpu_share, ps.ms_ple);
     }
 
+    if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
+        kvg_start(xcache.slots());
+        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::gpu::device_sync(); })) return 1;
+    }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
         if (native_pack) { spec_pos = pos; break; }
@@ -8202,6 +8497,10 @@ int main(int argc, char** argv) {
                                               ? (double) xcache.resident() / (double) xcache.slots()
                                               : 0.0));
         }
+        if (kvg.on)
+            std::printf("%-24s %lld cells in VRAM, %lld grows, %lld trims, %lld experts given up, %lld refilled\n",
+                        "  elastic K/V", (long long) kvg.cells, (long long) kvg.grows, (long long) kvg.trims,
+                        (long long) kvg.evicted, (long long) kvg.refilled);
         if (tgraph.captured && tgraph.calls > 0) {
             const double per = (double) tgraph.calls;
             std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",

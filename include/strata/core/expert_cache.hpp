@@ -31,8 +31,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "strata/core/vmm.hpp"
 
 namespace strata::gpu { struct VmemSegment; }
 
@@ -192,6 +195,14 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one allocation, so the K/V can take
+    /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.
+    static void set_vmm(bool enabled);
+    /// The arena's range (null: one allocation).
+    VmmRange* vmm_range() { return vmm_.get(); }
+    /// Byte offset of slot `s` in the arena (s == slots(): the end).
+    uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
+
 private:
     int64_t slot_end(int64_t n) const { return off_.empty() ? n * blob_ : (int64_t) off_[(size_t) n]; }
     bool open_segmented(uint64_t want, std::string& err);
@@ -204,6 +215,7 @@ private:
     std::vector<strata::gpu::VmemSegment*> segs_;   ///< #533: each segment's memory (null: unmapped)
     std::vector<int64_t> seg_size_;       ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;             ///< #533: segments [0, mapped_segs_) are backed
+    std::unique_ptr<VmmRange> vmm_;       ///< the arena's range when it is in virtual memory (set_vmm, --kv-grow)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

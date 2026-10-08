@@ -15,6 +15,7 @@ namespace {
 struct Api {
     bool ok = false;
     uint64_t gran = 0;
+    uint64_t device_gran = 0;   ///< the device's own report
 };
 
 // The chunk: the device's granularity, rounded up to 2 MiB (CUDA's granularity).  Each chunk is a physical allocation
@@ -31,6 +32,7 @@ const Api& api() {
         if (!strata::gpu::vmem_supported()) return;
         const uint64_t g = strata::gpu::vmem_granularity();
         if (g == 0) return;
+        a.device_gran = g;
         a.gran = (kMinChunk + g - 1) / g * g;
         a.ok = true;
     });
@@ -43,6 +45,7 @@ strata::gpu::VmemSegment* seg(VmmChunk h) { return reinterpret_cast<strata::gpu:
 
 bool vmm_available() { return api().ok; }
 uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
+bool vmm_large_pages() { return api().ok && api().device_gran >= kMinChunk; }
 
 VmmChunk vmm_chunk_new() {
     if (!api().ok) return 0;

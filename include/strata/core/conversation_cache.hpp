@@ -131,6 +131,12 @@ public:
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
+    // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
+    int64_t longest_tokens() const {
+        int64_t n = 0;
+        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
+        return n;
+    }
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
