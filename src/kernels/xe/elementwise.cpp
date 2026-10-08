@@ -7,6 +7,7 @@
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 
+#include <algorithm>
 #include <limits>
 
 namespace strata::kernels {
@@ -197,6 +198,37 @@ void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* str
     if (n <= 0) return;
     queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
         dst[i] = reinterpret_cast<const volatile int32_t*>(src)[i];
+    });
+}
+
+namespace {
+struct MappedCopies { MappedCopy c[8]; };
+}  // namespace
+
+// upstream 4a5713fb: the draft graphs' inputs from mapped memory in one launch instead of one each
+void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
+    if (n <= 0) return;
+    if (n > 8) throw core::DeviceError("copy_from_mapped_multi: at most 8 copies");
+    MappedCopies a{};
+    int64_t most = 0;
+    for (int i = 0; i < n; ++i) {
+        a.c[i] = copies[i];
+        most = copies[i].words > most ? copies[i].words : most;
+    }
+    const int64_t units = (most + 3) / 4;
+    const size_t bx = (size_t) std::clamp<int64_t>((units + 255) / 256, 1, 32);
+    queue_for(stream).parallel_for(sycl::nd_range<2>({(size_t) n, bx * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+        const MappedCopy c = a.c[it.get_group(0)];
+        const int64_t i0 = (int64_t) it.get_global_id(1), st = (int64_t) it.get_global_range(1);
+        if ((c.words & 3) == 0 && ((uintptr_t) c.dst & 15) == 0 && ((uintptr_t) c.src & 15) == 0) {
+            const volatile sycl::uint4* s = static_cast<const volatile sycl::uint4*>(c.src);
+            sycl::uint4* d = static_cast<sycl::uint4*>(c.dst);
+            for (int64_t i = i0; i < c.words / 4; i += st) d[i] = const_cast<const sycl::uint4*>(s)[i];
+        } else {
+            const volatile int32_t* s = static_cast<const volatile int32_t*>(c.src);
+            int32_t* d = static_cast<int32_t*>(c.dst);
+            for (int64_t i = i0; i < c.words; i += st) d[i] = s[i];
+        }
     });
 }
 }  // namespace strata::kernels

@@ -762,24 +762,25 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
     if (coupled) coupled_draft_stage(m_cparams_, m_chist_, cparams_, cring_, kCoupledHistCap, cs_);
-    copy_i32_from_mapped(tok_, m_tok_, T, cs_);
-    copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
-    copy_i32_from_mapped(row_, m_row_, 2, cs_);
-    copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    const int ra = 2 * max_t_ - 1;
+    const int64_t NH = g_->n_head;
+    // the round's small inputs in one launch (upstream 4a5713fb), row a's cell (step row ra) among them; the window's
+    // residuals keep a launch of their own, a work-item a word (in the one launch they took twice as long on CUDA)
+    const int64_t sa = (int64_t) ra * 4, pa = ra * NH;
+    const MappedCopy in[6] = {{tok_, m_tok_, T}, {step_, m_step_, (int64_t) 2 * T * 4}, {pos_, m_pos_, NH * 2 * T},
+                              {row_, m_row_, 2}, {step_ + sa, m_step_ + sa, 4}, {pos_ + pa, m_pos_ + pa, NH}};
+    copy_from_mapped_multi(in, 6, cs_);
+    copy_from_mapped(Rin_, window_R_, T * HCN, cs_);
     // the catch-up: the layer's front for the window's T cells (their K/V), then its rest for row a only, on row
     // a's intermediates copied to row 0, at the cell the host staged in step row 2*max_t - 1 (upstream ca833116: the
     // full layer for row a ran its front again); the draft chain is one graph per step (`capture_step`) so the host
     // can stop it when a draft is unlikely
-    const int ra = 2 * max_t_ - 1;
     ok = record_forward(T, -1, cs_, err);
     if (ok && T > 1) {
         copy_row_to_first(row_, R_, HCN, inj_, g_->hc, mixed_, g_->n_embd, cs_);
         native_quantize_q8_1(mixed_, xq_, (int) g_->n_embd, 1, cs_);
     }
     if (ok) {
-        copy_i32_from_mapped(step_ + ra * 4, m_step_ + ra * 4, 4, cs_);
-        copy_i32_from_mapped(pos_ + ra * g_->n_head, m_pos_ + ra * g_->n_head, g_->n_head, cs_);
         coupled_rec_ = coupled;
         coupled_j_ = 0;
         ok = record_forward(1, ra, cs_, err, /*rest_only=*/true);
@@ -798,8 +799,9 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     const int64_t HCN = g_->hc * g_->n_embd;
     const int row = max_t_ + j - 1;
     if (!strata::gpu::begin_capture(cs_)) { err = "mtp: begin capture"; return false; }
-    copy_i32_from_mapped(step_ + row * 4, m_step_ + row * 4, 4, cs_);
-    copy_i32_from_mapped(pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head, cs_);
+    const int64_t sr = (int64_t) row * 4, pr = (int64_t) row * g_->n_head;
+    const MappedCopy in[2] = {{step_ + sr, m_step_ + sr, 4}, {pos_ + pr, m_pos_ + pr, g_->n_head}};
+    copy_from_mapped_multi(in, 2, cs_);
     coupled_rec_ = coupled;
     coupled_j_ = j;
     bool ok = record_forward(1, row, cs_, err);
