@@ -119,6 +119,11 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
 /// The `2*sigmoid` is what CENTRES the gate on 1, so a zero injection is a plain residual add - the source
 /// comment says so outright and `gr_write`'s test asserts it.  Note the block output is added to EVERY stream
 /// identically; only the weight is per-stream.
+/// gr_write for n_tok tokens (token t's R and R_out at t*hc*n_embd, block output at t*n_embd, injection at t*hc): one
+/// launch with the native MMVF path (bitwise the per-token calls), else one call a token.  STRATA_NO_MULTI_GR=1: one
+/// call a token.
+void gr_write_multi(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
+                    int n_tok, void* stream);
 void gr_write(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
               void* stream);
 

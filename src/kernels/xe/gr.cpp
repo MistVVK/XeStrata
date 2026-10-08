@@ -276,6 +276,23 @@ void native_gr_post(const float* residual, const float* block_out, const float* 
     if (!stream) core::Runtime::get().finish(q);
 }
 
+void native_gr_post_multi(const float* residual, const float* block_out, const float* inject,
+                          float* output, int n_embd, int hc, int n_tok, void* stream) {
+    check_shape(n_embd, hc);
+    const char* msg = "native GR postops require non-null four-byte aligned pointers";
+    check_pointer(residual, msg); check_pointer(block_out, msg); check_pointer(inject, msg); check_pointer(output, msg);
+    const float scale = 1.0f / float(hc);
+    const size_t hc_dim = (size_t) n_embd * hc;
+    auto& q = queue_for(stream);
+    q.parallel_for(sycl::range<2>((size_t) n_tok, hc_dim), [=](sycl::id<2> id) {
+        const size_t t = id[0], i = id[1];
+        const int c = int(i / n_embd), d = int(i % n_embd);
+        const float weight = scale_zero_bias(sigmoid_f(scale_zero_bias(inject[t * hc + c], scale)), 2.0f);
+        output[t * hc_dim + i] = sycl::fma(block_out[t * n_embd + d], weight, residual[t * hc_dim + i]);
+    });
+    if (!stream) core::Runtime::get().finish(q);
+}
+
 void gr_set_fp32_activations(bool enabled) { fp32_activations = enabled; }
 void gr_set_native_mmvf(bool enabled) { native_mmvf = enabled; }
 
@@ -361,6 +378,23 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         else launch_inject<uint16_t>(q, ws.xq, w_inject, hc_dim, hc, inject);
     }
     if (!stream) core::Runtime::get().finish(q);
+}
+
+void gr_write_multi(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,
+                    int n_tok, void* stream) {
+    if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0) return;
+    static const bool per_token = [] {
+        const char* v = std::getenv("STRATA_NO_MULTI_GR");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (native_mmvf && n_tok > 1 && !per_token) {
+        native_gr_post_multi(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, n_tok, stream);
+        return;
+    }
+    const size_t hc_dim = (size_t) s.hc * (size_t) s.n_embd;
+    for (int t = 0; t < n_tok; ++t)
+        gr_write(R + t * hc_dim, block_out + (size_t) t * s.n_embd, inject + (size_t) t * s.hc, s, R_out + t * hc_dim,
+                 stream);
 }
 
 void gr_write(const float* R, const float* block_out, const float* inject, const GrShapes& s, float* R_out,

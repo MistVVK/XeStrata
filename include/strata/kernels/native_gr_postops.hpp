@@ -25,6 +25,10 @@ void native_gr_pre_gated(const float* xn, float* gate, float* mixed,
 // inject[hc] -> SCALE(1/hc), sigmoid, SCALE(2), identity DSV4_HC_POST.
 // residual/output contain [n_embd,hc], block_out has n_embd elements.
 // output may equal residual exactly; all other overlaps are invalid.
+/// native_gr_post for n_tok tokens in one launch: token t's residual and output at t*hc*n_embd, its block output at
+/// t*n_embd, its injection at t*hc.
+void native_gr_post_multi(const float* residual, const float* block_out, const float* inject,
+                          float* output, int n_embd, int hc, int n_tok, void* stream);
 void native_gr_post(const float* residual, const float* block_out, const float* inject,
                     float* output, int n_embd, int hc, void* stream);
 
