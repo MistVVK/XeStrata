@@ -330,7 +330,7 @@ contrib（`--license contrib`）では、free の列のうち intel/llvm をビ�
 `intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
 
 AMD の GPU には、free でも contrib でも、ROCm の `libamdhip64-dev`、`rocm-device-libs-21`、`clang-21`、`libclang-rt-21-dev`、
-`librocblas-dev`、`libhipblaslt-dev`（universe）が要ります（Ubuntu で AMD の GPU を動かすことは `unverified` です）。
+`librocblas-dev`、`libhipblaslt-dev`、`libhipblas-common-dev`（universe）が要ります（Ubuntu で AMD の GPU を動かすことは `unverified` です）。
 
 #### Fedora 44
 
@@ -346,7 +346,7 @@ intel/llvm v7.1.1 のビルドに 14 分かかり、B70 に XMX が使えて、�
 | エンジンのビルド | `oneapi-level-zero-devel` 1.33.1 |
 | エンジンの実行 | `oneapi-level-zero` 1.33.1、`intel-level-zero` 26.35.39758.11（Intel の GPU の Level Zero のドライバー） |
 
-AMD の GPU には、`rocm-hip-devel`、`rocm-device-libs`、`rocm-clang`、`rocm-clang-runtime-devel`、`rocblas-devel`、`hipblaslt-devel` が要ります
+AMD の GPU には、`rocm-hip-devel`、`rocm-device-libs`、`rocm-clang`、`rocm-clang-runtime-devel`、`rocblas-devel`、`hipblaslt-devel`、`hipblas-common-devel` が要ります
 （7.1.1、RX 9060 XT のコンテナで確かめています）。
 
 `intel-compute-runtime`（OpenCL）も入れて試しましたが、Ubuntu での記録のとおり、エンジンには要らないはずです（`unverified`）。

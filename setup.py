@@ -481,7 +481,8 @@ def amd_elsewhere() -> str:
 def rocm_missing() -> list:
     """The ROCm packages building the AMD code needs that are not installed, by the distribution's names: HIP's
     headers (intel/llvm's HIP target), the device libraries the code links, ROCm's clang with its runtime (HIP's CMake
-    package, cmake/StrataHip.cmake), rocBLAS and hipBLASLt (oneMath's rocBLAS backend: the dense products)."""
+    package, cmake/StrataHip.cmake), rocBLAS and hipBLASLt (oneMath's rocBLAS backend: the dense products), and
+    hipblas-common, which hipBLASLt's CMake package needs and its distribution package does not depend on."""
     import glob
     fedora = distro_id() == "fedora"
     inc = [Path("/usr/include"), Path("/opt/rocm/include")]
@@ -499,6 +500,8 @@ def rocm_missing() -> list:
         ("rocm-clang rocm-clang-runtime-devel", "clang-21 libclang-rt-21-dev"): clang_ok,
         ("rocblas-devel", "librocblas-dev"): any((d / "rocblas" / "rocblas.h").exists() for d in inc),
         ("hipblaslt-devel", "libhipblaslt-dev"): any((d / "hipblaslt" / "hipblaslt.h").exists() for d in inc),
+        ("hipblas-common-devel", "libhipblas-common-dev"): any((d / "hipblas-common" / "hipblas-common.h").exists()
+                                                               for d in inc),
     }
     return [names[0 if fedora else 1] for names, ok_ in have.items() if not ok_]
 

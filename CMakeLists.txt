@@ -478,8 +478,10 @@ if(STRATA_ENABLE_XE)
         if(STRATA_PACKAGE)
           set(_strata_level FATAL_ERROR)
         endif()
-        message(${_strata_level} "hipBLASLt is not installed (Fedora: hipblaslt-devel; Ubuntu: libhipblaslt-dev): the "
-                                 "AMD GPUs' dense products run in rocBLAS alone, much slower on some GPUs")
+        message(${_strata_level} "hipBLASLt is not installed, or its CMake package lacks hipblas-common (Fedora: "
+                                 "hipblaslt-devel hipblas-common-devel; Ubuntu: libhipblaslt-dev "
+                                 "libhipblas-common-dev): the AMD GPUs' dense products run in rocBLAS alone, much "
+                                 "slower on some GPUs")
       endif()
     endif()
     if(_strata_cuda_archs AND _strata_cuda_cublas)

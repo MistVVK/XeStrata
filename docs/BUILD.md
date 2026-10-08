@@ -327,7 +327,7 @@ The contrib mode (`--license contrib`) needs the free column's packages for buil
 `intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 
 An AMD GPU needs, in the free and contrib modes, ROCm's `libamdhip64-dev`, `rocm-device-libs-21`, `clang-21`, `libclang-rt-21-dev`,
-`librocblas-dev` and `libhipblaslt-dev` (universe; running an AMD GPU on Ubuntu is `unverified`).
+`librocblas-dev`, `libhipblaslt-dev` and `libhipblas-common-dev` (universe; running an AMD GPU on Ubuntu is `unverified`).
 
 #### Fedora 44
 
@@ -343,7 +343,7 @@ intel/llvm v7.1.1 built in 14 minutes, the B70 got XMX, and the model it started
 | Building the engine | `oneapi-level-zero-devel` 1.33.1 |
 | Running it | `oneapi-level-zero` 1.33.1, `intel-level-zero` 26.35.39758.11 (the Level Zero driver for Intel GPUs) |
 
-An AMD GPU needs `rocm-hip-devel`, `rocm-device-libs`, `rocm-clang`, `rocm-clang-runtime-devel`, `rocblas-devel` and `hipblaslt-devel`
+An AMD GPU needs `rocm-hip-devel`, `rocm-device-libs`, `rocm-clang`, `rocm-clang-runtime-devel`, `rocblas-devel`, `hipblaslt-devel` and `hipblas-common-devel`
 (7.1.1, checked in a container with an RX 9060 XT).
 
 `intel-compute-runtime` (OpenCL) was installed too; as on Ubuntu, the engine should not need it (`unverified`).

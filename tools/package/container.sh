@@ -52,9 +52,9 @@ python3-requests, python3-pil, python3-psutil"
     fi
     # ROCm (universe, free software), for AMD GPUs in every package: HIP for intel/llvm's HIP target and adapter, the
     # device libraries the AMD code links, ROCm's clang with its runtime (HIP's CMake package), rocBLAS and hipBLASLt
-    # (oneMath's rocBLAS backend)
+    # (oneMath's rocBLAS backend; hipBLASLt's CMake package needs hipblas-common, which its package does not depend on)
     apt-get install -y -q --no-install-recommends libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev \
-      librocblas-dev libhipblaslt-dev
+      librocblas-dev libhipblaslt-dev libhipblas-common-dev
     ;;
   fedora*)
     dnf install -y -q git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3 patchelf curl unzip \
@@ -83,7 +83,8 @@ EOF
       dnf install -y -q intel-oneapi-mkl-sycl-devel
     fi
     # ROCm, for AMD GPUs in every package (as on Ubuntu above)
-    dnf install -y -q rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel
+    dnf install -y -q rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel \
+      hipblas-common-devel
     ;;
 esac
 if [ "$license" = contrib ]; then
