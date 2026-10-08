@@ -90,7 +90,7 @@ A PTX 7.8 build passed its 52 CTest tests on an RTX 4070.
 The driver needs CUDA 12.0 or later (525 or later) for the functions intel/llvm's CUDA adapter calls (SYCL graphs: `cuGraphAddKernelNode_v2`).
 A CUDA 12.0-12.3 driver with the CUDA 12.4 toolkit has not been tried (`unverified`).
 Both variables default to `auto`; a value given is used as it is (to build for another machine). contrib-icpx always builds the oneMKL backend.
-CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-1`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend).
+CMake fetches oneMath from XeStrata's fork on GitHub when it configures ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), tag `xestrata-2`, checking the archive's SHA-256): oneMath with XeStrata's changes (cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend, and the cuBLAS and rocBLAS backends' targets kept apart, so that one build makes both).
 On a machine without the network, give it the same archive with `STRATA_ONEMATH_SOURCE` (a local file or URL).
 The changes are listed in [third_party/main/README.md](../third_party/main/README.md).
 Where oneMath has no backend for the GPU the own kernels take the products.

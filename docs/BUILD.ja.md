@@ -92,7 +92,7 @@ PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 CUDA 12.0〜12.3 のドライバーで CUDA 12.4 のツールキットを使う組み合わせは確かめていません（`unverified`）。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。contrib-icpx はいつも oneMKL の後端を作ります。
-oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-1`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt）が入った oneMath です。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-2`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離）が入った oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
 変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
