@@ -93,6 +93,11 @@ Do not reformat code with clang-format or a similar tool: the code is formatted 
 Install the lint tools, Intel SDE and the GPU profilers as [docs/DEVTOOLS.md](docs/DEVTOOLS.md) describes, and keep that file current when a tool or its installation changes.
 Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (anything else built from source), which git ignores; nothing in the build or the tests may depend on either.
 
+## Packages
+
+Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
+A lower value applies to every build in the container, intel/llvm's included, and makes a package take much longer.
+
 ## AVX-512 code
 
 The development machine has no AVX-512, so the AVX-512 paths never run natively here.
