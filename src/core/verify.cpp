@@ -813,6 +813,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             return e == nullptr || std::strtol(e, nullptr, 10) != 0;
         }();
         bool g_ready = false;   // the shared expert's raw gates came with the router's launch
+        bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
@@ -853,23 +854,35 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = xq_;
-            if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
-            else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            // the experts' q8_1 image of the input first: the shared expert's gate and up read it instead of quantizing
+            // the same rows again (the same bytes), and the BF16 copy only for a gate that reads it (upstream
+            // be7889ed).  STRATA_VERIFY_QDEDUP=0: as before.
+            static const bool qdedup_on = [] {
+                const char* e = std::getenv("STRATA_VERIFY_QDEDUP");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            qdedup = qdedup_on && strata::kernels::cpu::expert_layout().native;
+            if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            if (!(qdedup && shared_expert_native_bf16())) {
+                if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
+                else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
+            }
             try {
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
                 gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs,
                                                        lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
-                                                       g_ready);
+                                                       g_ready, qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
+                                                                       : nullptr);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
         }
-        if (strata::kernels::cpu::expert_layout().native)
-            quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        else
+        if (strata::kernels::cpu::expert_layout().native) {
+            if (!qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+        } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
         return true;

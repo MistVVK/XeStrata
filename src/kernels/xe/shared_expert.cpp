@@ -127,24 +127,37 @@ bool shared_expert_native_bf16() { return native_bf16; }
 
 bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, bool gate_later, bool g_ready) {
+                         int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
-    native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+    const void* xq = x_q8_1;
+    if (xq == nullptr) {
+        native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+        xq = nw.q8_1;
+    }
     // gate and up in one launch where the layout allows (upstream b08cf3e1; STRATA_LFUSE_PAIR=0: two)
     static const bool pair_on = [] {
         const char* v = std::getenv("STRATA_LFUSE_PAIR");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (!(pair_on && nw.gate_type == nw.up_type &&
-          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, nw.q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok,
+          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, xq, gate, up, (int) n_embd, (int) n_ff, n_tok,
                            stream))) {
-        native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-        native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+        native_mmvq(nw.gate_type, nw.gate_data, xq, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+        native_mmvq(nw.up_type, nw.up_data, xq, up, (int) n_embd, (int) n_ff, n_tok, stream);
     }
-    native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
-    native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    // the SwiGLU and its q8_1 image in one launch (upstream be7889ed); STRATA_VERIFY_QDEDUP=0: two
+    static const bool fused_q8 = [] {
+        const char* v = std::getenv("STRATA_VERIFY_QDEDUP");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (fused_q8) {
+        native_swiglu_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+    } else {
+        native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
+        native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+    }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     if (native_bf16 && g_ready) {

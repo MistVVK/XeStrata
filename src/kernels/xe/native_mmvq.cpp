@@ -745,6 +745,33 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     });
 }
 
+void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    auto& q = validate_stream(stream);
+    const int n_total = n_in * ncols;
+    auto* y = static_cast<Q81Block*>(x_q8_1);
+    const std::size_t global = (std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS * QUANT_THREADS;
+    q.parallel_for(sycl::nd_range<1>(global, QUANT_THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        // contraction off: the SwiGLU product must not fuse into the sub-group sum's first add (the stored and
+        // reloaded value of the two launches is rounded on its own)
+#pragma clang fp contract(off)
+        const int i = (int) it.get_global_linear_id();
+        if (i >= n_total) return; // n_total is a multiple of 32: only whole sub-groups return.
+        const sycl::sub_group sg = it.get_sub_group();
+        const float g = gate[i];
+        const float xi = g / (1.0f + sycl::exp(-g)) * up[i];   // native_swiglu's expression
+        const float amax = warp_max(sg, sycl::fabs(xi));
+        const float sum = warp_sum(sg, xi);
+        const float d = xe::q8_1_finite(amax / 127.0f);
+        const int8_t qv = xe::q8_1_quant(xi, d, amax);
+        y[i / Q8K].qs[i % Q8K] = qv;
+        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
+    });
+}
+
 void native_q5_k_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q5KTraits>(w, x, y, n_in, n_out, ncols, s); }
 void native_q5_k_f32(const void* w, const float* x, void* xq, float* y, int n_in, int n_out, int ncols, void* s) { mmvq_f32<Q5KTraits>(w, x, xq, y, n_in, n_out, ncols, s); }
 void native_q2_0_mmvq(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* s) { mmvq<Q20Traits>(w, x, y, n_in, n_out, ncols, s); }

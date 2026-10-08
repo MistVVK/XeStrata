@@ -80,7 +80,9 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 /// `g_ready`: with the native BF16 gate, `g` already holds the raw gates (bf16_gemv_fp32_mmvf_multi_aux).
 bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, bool gate_later = false, bool g_ready = false);
+                         int64_t n_ff, void* stream, bool gate_later = false, bool g_ready = false,
+                         const void* x_q8_1 = nullptr);
+/// (`x_q8_1`: `x`'s q8_1 image as native_quantize_q8_1 writes it, made by the caller; gate and up read it.)
 /// Whether the shared expert's scalar gate is the native BF16 GEMV (shared_expert_set_native_bf16).
 bool shared_expert_native_bf16();
 
