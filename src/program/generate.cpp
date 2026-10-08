@@ -5755,6 +5755,7 @@ int main(int argc, char** argv) {
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());

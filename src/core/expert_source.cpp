@@ -2115,6 +2115,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             note_ = "mapped read-only from " + path + " (STRATA_ARENA_MMAP: not locked, not pinned)";
             gib_per_s_ = 0.0;
             load_seconds_ = load_read_s_ = load_copy_s_ = 0.0;
+            record_inputs(path, gguf_, lay, from_gguf);   // session files: the mapped experts.bin is a model input
             return true;
         }
     }
