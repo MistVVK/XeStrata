@@ -71,7 +71,7 @@ struct ActQ {
     float hx[MAXC];
     int nchunks;
     /// The AVX-2 "bit-plane" image of `q` (src/kernels/cpu/q2_avx2.cpp explains it), filled only by
-    /// `act_quant_q8_1_avx2` with STRATA_Q2_BITPLANE=1 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
+    /// `act_quant_q8_1_avx2` unless STRATA_Q2_BITPLANE=0 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
     /// `qp[128p + 32k + 16h + i] = q[128p + 64h + 4i + k]`, `psum[8p + 4h + m]` = the sum of q[128p + 64h + 16m ..
     /// + 16), `pscale[8p + 2c + e] = scale[4p + c]`.  `bp_pairs` is 0 when the image is absent (n % 128 != 0).
     alignas(32) int8_t qp[H];
@@ -183,9 +183,9 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 /// The same two for CPUs without AVX-512 (src/kernels/cpu/q2_avx2.cpp, compiled for AVX2 only).
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                float* const* out, int r0, int r1);
-/// STRATA_Q2_BITPLANE=1 (read once): the AVX-2 Q2_0 kernel reads the bit-plane image instead of the legacy one.
+/// Unless STRATA_Q2_BITPLANE=0 (read once): the AVX-2 Q2_0 kernel reads the bit-plane image instead of the legacy one.
 bool q2_bitplane_enabled();
-/// The pre-bit-plane AVX-2 kernel (the default), kept for A/B and parity.
+/// The pre-bit-plane AVX-2 kernel (STRATA_Q2_BITPLANE=0), kept for A/B and parity.
 void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                       float* const* out, int r0, int r1);
 /// The same rows with AVX-VNNI on or off, not as cpu_avxvnni_ok() says (tests and benches; on only where it holds).

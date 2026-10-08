@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/kernels/cpu/q2_bitplane_parity.cpp - the opt-in AVX-2 Q2_0 bit-plane kernel (STRATA_Q2_BITPLANE=1, PR #706).
+// src/kernels/cpu/q2_bitplane_parity.cpp - the AVX-2 Q2_0 bit-plane kernel (the default, PR #706).
 //
 //   1. against the legacy AVX-2 kernel: the integer part is exact, only the float summation order differs, so the
 //      two agree to a few ulps of the largest term (a relative bound on the row's magnitude);
 //   2. bitwise: a token's rows are the same alone, in a window of any width, and cut into any row ranges
 //      (the engine's pool splits rows between workers, a verify window changes the width);
-//   3. the legacy path is untouched when the switch is off (this test only runs with the switch on: ctest sets it).
+//   3. the legacy path is untouched when the switch is off (this test only runs with the switch on, the default).
 // Synthetic data, CPU only; skipped (pass) on a CPU without AVX2.
 #include "strata/kernels/cpu/expert.hpp"
 
@@ -23,7 +23,7 @@ namespace c = strata::kernels::cpu;
 
 int main() {
     if (!c::q2_bitplane_enabled()) {
-        std::printf("q2_bitplane_parity: STRATA_Q2_BITPLANE=1 is not set\n");
+        std::printf("q2_bitplane_parity: the bit-plane kernel is off (STRATA_Q2_BITPLANE=0)\n");
         return 1;
     }
     std::mt19937 rng(706);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
