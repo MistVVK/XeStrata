@@ -2047,7 +2047,11 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
         return []
     if n <= 1:
         return []
-    if n > PARALLEL_MAX and "--batch-mtp" not in args and os.environ.get("STRATA_BATCH_MTP", "0") in ("", "0"):
+    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / STRATA_BATCH_MTP=0 turn it off)
+    env = os.environ.get("STRATA_BATCH_MTP", "")
+    batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
+        "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
+    if n > PARALLEL_MAX and not batch_mtp:
         print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]

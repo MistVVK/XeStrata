@@ -151,6 +151,11 @@ public:
                        int32_t* out, std::string& err);
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
+    /// Commit an accepted prefix in each contiguous slot group of the last window (--batch-mtp, upstream 8cfb3fd7):
+    /// `keep` has one entry per slot (indexed by slot), each in 1..that slot's group length.
+    bool commit_slot_prefixes(const int* keep, std::string& err);
+    /// --batch-mtp: slot rotation makes many row layouts, so bound the captured batch graph pairs (LRU).  0 = unbounded.
+    void set_batch_graph_limit(size_t n) { batch_graph_limit_ = n; }
 
     // ---- The stages of a layer split as a PIPELINE (upstream PR #559, --batch-groups).  A batch window over the slot
     // GROUP [base, base + S) is launched on ONE stage with its commit right behind it on the stage's queue (a batch
@@ -231,11 +236,17 @@ private:
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    std::map<uint64_t, strata::gpu::Graph*> exec_bm_, commit_bm_;   ///< key: batch_key(rows, S, hbase)
+    /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)
+    std::map<std::vector<int>, strata::gpu::Graph*> exec_bm_, commit_bm_;
+    std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, with a graph limit)
+    uint64_t bm_tick_ = 0;
+    size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph; N: LRU-evict beyond N layouts
     int last_rows_[8] = {};                ///< the slots of the last batch window's rows
-    static uint64_t batch_key(const int* rows, int S, int hbase) {
-        uint64_t k = (uint64_t) S << 32 | (uint64_t) (hbase & 15) << 40;
-        for (int t = 0; t < S; ++t) k |= (uint64_t) (rows[t] & 15) << (4 * t);
+    static std::vector<int> batch_key(const int* rows, int S, int hbase) {
+        std::vector<int> k;
+        k.reserve((size_t) S + 1);
+        k.push_back(hbase);
+        for (int t = 0; t < S; ++t) k.push_back(rows[t]);
         return k;
     }
     int row_base_ = 0;                     ///< a batch window's first hand-off row (its slot group's base)

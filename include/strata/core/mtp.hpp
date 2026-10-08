@@ -45,8 +45,9 @@ public:
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// `shared` (--batch-mtp's slot drafters): its weights are used, not loaded again; this one keeps its own state.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768);
+              int64_t window = 32768, const MtpDrafter* shared = nullptr);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -68,7 +69,8 @@ public:
     /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
-    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
+    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
+              const MtpDrafter* shared = nullptr);
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
@@ -154,6 +156,9 @@ private:
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
+    // a slot drafter borrows the immutable weights and the draft head; each still owns its state and scratch
+    bool owns_weights_ = true;
+    bool owns_draft_head_ = true;
     uint8_t* experts_ = nullptr;
     void* state_arena_ = nullptr;
     QsaState st_;

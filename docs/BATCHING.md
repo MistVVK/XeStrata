@@ -23,10 +23,14 @@ Setup recommends it only where it does not cost speed (below); any number you as
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
+| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. One GPU only, off with a layer split. `STRATA_BATCH_MTP=0` turns it off as well. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
 The server reads the count the engine reports (`INFO batch_slots=N`), and `GET /v1/status` says it (`concurrency.serving`).
+
+With `--batch-mtp`, four greedy requests of 200 tokens in 4 slots gave every slot the same tokens as decoding it alone (`tools/batch_test.py`, `--pcie-frac 0 --adapt-every 1000000`).
+The aggregate went from 87.4 / 86.8 to 90.6 / 90.6 tokens/s on the B70 and from 45.2 / 44.0 to 44.6 / 43.8 tokens/s on the RTX 4070 (the run-to-run spread).
 
 ### What a slot costs, and what setup recommends
 
