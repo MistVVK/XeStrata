@@ -106,7 +106,10 @@ public:
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     /// `first_core`: the workers take the physical cores from that one on (a second pool beside a first, which took
     /// the cores below it: a layer split's stages each with workers of their own).
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0);
+    /// `tasks`: the row tasks of each batched expert phase (--pool-tasks), 0 = three per participating thread; a
+    /// count is capped by the phase's rows.
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0);
+    static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -169,6 +172,8 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    int phase_tasks(int64_t rows) const;
+    int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);

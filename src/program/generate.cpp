@@ -278,6 +278,7 @@ struct Options {
     bool graph_only = false;
     bool gpu_only_full = false;   ///< R0.3: pre + post + head, the true per-token GPU floor
     int pool_workers = 0;         ///< R2.2: 0 = "all physical cores minus the host's"; >0 overrides
+    int pool_tasks = 0;           ///< Batched CPU expert tasks per phase; 0 keeps the existing policy
     /// R2.2's first half, as an A/B arm.  **ON by default**, because the measurement that justifies it is the
     /// pool's own drain: 33.7 GB/s against 5/6 x 44.14 = 36.8 for five workers, on a machine whose sixth core
     /// is reserved for a host thread that has nothing to do while the drain runs.
@@ -650,6 +651,8 @@ void usage() {
                  "  --pool-workers N     R2.2: CPU expert pool worker count.  Default 0 = every physical core\n"
                  "                       except the one the host loop spins on.  A sweep is how the pool's\n"
                  "                       deviation from `cpu_s2` is attributed.\n"
+                 "  --pool-tasks N       Batched CPU expert tasks per GU/Down phase (0..4096). Default 0 =\n"
+                 "                       3 per participating thread; positive counts are capped by row count.\n"
                  "  --mmap-experts       the low-RAM mode: the experts from the files through the OS page cache\n"
                  "                       (experts.bin, or a native pack's GGUF files in place) instead of a\n"
                  "                       copy of them all in RAM; the GPU cache holds the most used\n"
@@ -1188,6 +1191,16 @@ int main(int argc, char** argv) {
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
         else if (a == "--pool-workers") o.pool_workers = std::atoi(next("--pool-workers"));
+        else if (a == "--pool-tasks") {
+            const char* v = next("--pool-tasks");
+            char* end = nullptr;
+            const long tasks = std::strtol(v, &end, 10);
+            if (end == v || *end != '\0' || tasks < 0 || tasks > strata::kernels::cpu::ExpertPool::kMaxTasks) {
+                std::fprintf(stderr, "strata generate: --pool-tasks expects an integer in 0..4096 (0 = automatic)\n");
+                return 2;
+            }
+            o.pool_tasks = (int) tasks;
+        }
         else if (a == "--no-host-worker") o.no_host_worker = true;
         else if (a == "--expert-cache") {
             const std::string v = next("--expert-cache");
@@ -2795,10 +2808,15 @@ int main(int argc, char** argv) {
                              "layer split on two GPUs\n");
     const int pipe_n0 = cpu_split ? o.batch_cpu_split[0] : 0, pipe_n1 = cpu_split ? o.batch_cpu_split[1] : 0;
     strata::kernels::cpu::ExpertPool pool(pipe_n0 > 0 ? pipe_n0 : o.pool_workers, /*pin=*/true,
-                                          /*host_works=*/!o.no_host_worker);
+                                          /*host_works=*/!o.no_host_worker, /*first_core=*/0, o.pool_tasks);
+    std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
+                 o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),
+                 o.pool_tasks ? " (capped by rows)" : " (automatic)",
+                 pool.workers() + (pool.host_works() ? 1 : 0));
     std::unique_ptr<strata::kernels::cpu::ExpertPool> pool1;
     if (pipe_n1 > 0) {
-        pool1 = std::make_unique<strata::kernels::cpu::ExpertPool>(pipe_n1, true, !o.no_host_worker, pipe_n0);
+        pool1 = std::make_unique<strata::kernels::cpu::ExpertPool>(pipe_n1, true, !o.no_host_worker, pipe_n0,
+                                                                   o.pool_tasks);
         std::fprintf(stderr, "strata generate: --batch-cpu-split (experimental): CPU experts in two pools, %d + %d "
                              "workers\n", pipe_n0, pipe_n1);
     }

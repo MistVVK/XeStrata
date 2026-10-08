@@ -366,6 +366,15 @@ The result is remembered per PC and model in the settings file, so updates keep 
 Measuring the worker count needs a fresh engine, so the model is loaded more than once, and the PC can stop responding for a minute or two each time (upstream #1197).
 When it finishes it starts the model (not with `--no-start`): do not start it a second time.
 
+`--pool-tasks N` sets how many row tasks each batched CPU expert phase (gate/up, then down) is cut into (upstream #949).
+It is neither the number of threads nor the tasks per expert.
+The default `0` keeps three per participating thread (the host included when it works too).
+Values `1` to `4096` are allowed, capped by the phase's row count.
+More tasks can even out the cores, but cost more scheduling:
+compare against `0` with the same worker count and workload.
+It changes neither the kernels, the phase barriers nor the PCIe placement; `--calibrate` does not tune it yet.
+For the server, add `"--pool-tasks", "192"` (for example) to the `args` of its configuration and restart it.
+
 ### Chat in the terminal
 
 ```sh
