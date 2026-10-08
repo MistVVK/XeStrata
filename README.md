@@ -135,14 +135,45 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
   (recommendations are installed by default). The ROCm libraries take about 1.4 GB; without an AMD GPU, leave them
   out with `--no-install-recommends` (apt) or `--setopt=install_weak_deps=False` (dnf), and install Level Zero
   separately (below).
-  The contrib packages only suggest the makers' ones and install none of them: install those of the GPU you use.
-   - An Intel GPU: `sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2` (Fedora: `sudo dnf install oneapi-level-zero intel-level-zero`).
-   - An AMD GPU: `sudo apt install libamdhip64-7 librocblas5 libhipblaslt1` (Fedora: `sudo dnf install rocm-hip rocblas hipblaslt`).
+  The contrib packages only suggest the makers' ones and install none of them: install those of the GPUs you use, as follows.
+   - **An Intel GPU**
+     1. Add Intel's oneAPI repository, which has oneMKL, which speeds up the dense matrix products (the contrib packages use it; the free package does not).
+        On Ubuntu:
+
+        ```bash
+        wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+          | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+          | sudo tee /etc/apt/sources.list.d/oneAPI.list
+        sudo apt update
+        ```
+
+        On Fedora:
+
+        ```bash
+        sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null <<'EOF'
+        [oneAPI]
+        name=Intel oneAPI repository
+        baseurl=https://yum.repos.intel.com/oneapi
+        enabled=1
+        gpgcheck=1
+        repo_gpgcheck=1
+        gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+        EOF
+        ```
+
+     1. Install the packages. The free package does not need the last one, `intel-oneapi-mkl-sycl-blas-2026.1`.
+
+        ```bash
+        sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2 intel-oneapi-mkl-sycl-blas-2026.1   # Ubuntu
+        sudo dnf install oneapi-level-zero intel-level-zero intel-oneapi-mkl-sycl-blas-2026.1            # Fedora
+        ```
+
+   - **An NVIDIA GPU**: install NVIDIA's driver. cuBLAS, which speeds up the matrix products, is
+     `sudo apt install libcublas-13-1` from multiverse on Ubuntu (`libcublas12` for cuda12.4).
+     On Fedora, add NVIDIA's CUDA repository first (`sudo dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo`, then `sudo dnf install libcublas-13-4`).
+   - **An AMD GPU**: `sudo apt install libamdhip64-7 librocblas5 libhipblaslt1` (Fedora: `sudo dnf install rocm-hip rocblas hipblaslt`).
      Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
-   - An NVIDIA GPU: NVIDIA's driver. cuBLAS, which speeds up the matrix products, is `libcublas-13-1` from multiverse on
-     Ubuntu (`libcublas12` for cuda12.4), and `libcublas-13-4` from NVIDIA's CUDA repository on Fedora.
-   - oneMKL, which speeds up an Intel GPU's matrix products, is in Intel's apt and dnf repositories (oneAPI).
-     Intel's guides show how to add them ([APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
    - cuBLAS and oneMKL are not free software; without them XeStrata's own kernels do the work.
 - An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
   The drivers for Volta (a V100) end with the 580 series.

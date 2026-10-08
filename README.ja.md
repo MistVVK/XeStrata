@@ -130,14 +130,45 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
   free の版は Intel の GPU のランタイム（Level Zero）と AMD の GPU の ROCm のライブラリを推奨（Recommends、既定で入ります）にします。
   ROCm のライブラリは 1.4 GB ほどあります。AMD の GPU がなければ、`--no-install-recommends`（apt）や
   `--setopt=install_weak_deps=False`（dnf）で外せます。その場合、Level Zero は別に入れます（下）。
-  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。使う GPU のものだけを入れます。
-   - Intel の GPU: `sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2`（Fedora は `sudo dnf install oneapi-level-zero intel-level-zero`）。
-   - AMD の GPU: `sudo apt install libamdhip64-7 librocblas5 libhipblaslt1`（Fedora は `sudo dnf install rocm-hip rocblas hipblaslt`）。
+  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。使う GPU のものだけを、次のように入れます。
+   - **Intel の GPU**
+     1. Intel の oneAPI のリポジトリを登録します。密な行列積を速くする oneMKL がここにあります（contrib の版で使います。free の版では要りません）。
+        Ubuntu では次のようにします。
+
+        ```bash
+        wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+          | gpg --dearmor | sudo tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null
+        echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+          | sudo tee /etc/apt/sources.list.d/oneAPI.list
+        sudo apt update
+        ```
+
+        Fedora では次のようにします。
+
+        ```bash
+        sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null <<'EOF'
+        [oneAPI]
+        name=Intel oneAPI repository
+        baseurl=https://yum.repos.intel.com/oneapi
+        enabled=1
+        gpgcheck=1
+        repo_gpgcheck=1
+        gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+        EOF
+        ```
+
+     1. パッケージを入れます。free の版では、最後の `intel-oneapi-mkl-sycl-blas-2026.1` は要りません。
+
+        ```bash
+        sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2 intel-oneapi-mkl-sycl-blas-2026.1   # Ubuntu
+        sudo dnf install oneapi-level-zero intel-level-zero intel-oneapi-mkl-sycl-blas-2026.1            # Fedora
+        ```
+
+   - **NVIDIA の GPU**: NVIDIA のドライバーを入れます。行列積を速くする cuBLAS は、Ubuntu では multiverse の
+     `sudo apt install libcublas-13-1`（cuda12.4 は `libcublas12`）です。
+     Fedora では NVIDIA の CUDA のリポジトリを登録してから入れます（`sudo dnf config-manager addrepo --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/cuda-fedora44.repo` の後、`sudo dnf install libcublas-13-4`）。
+   - **AMD の GPU**: `sudo apt install libamdhip64-7 librocblas5 libhipblaslt1`（Fedora は `sudo dnf install rocm-hip rocblas hipblaslt`）。
      自分のユーザーを `render` グループに入れます（`sudo usermod -aG render $USER` の後、ログインし直す）。
-   - NVIDIA の GPU: NVIDIA のドライバー。行列積を速くする cuBLAS は、Ubuntu では multiverse の `libcublas-13-1`（cuda12.4 は `libcublas12`）、
-     Fedora では NVIDIA の CUDA のリポジトリの `libcublas-13-4` です。
-   - Intel の GPU の行列積を速くする oneMKL は、Intel の apt / dnf のリポジトリ（oneAPI）にあります。
-     リポジトリの追加のしかたは Intel の手順（[APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）にあります。
    - cuBLAS と oneMKL は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
 - NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
   V100 などの Volta を扱うドライバーは 580 の系列までです。
