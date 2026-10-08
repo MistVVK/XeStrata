@@ -51,7 +51,10 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
   ROCm is free software, so this is the same in the free and contrib modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
-  `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them; `STRATA_ROCM_DEVICE_LIBS` gives the place of ROCm's device libraries (`ockl.bc`).
+  `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.1.1 has none for gfx1152 and gfx1153).
+  `STRATA_ROCM_DEVICE_LIBS` gives the place of ROCm's device libraries (`ockl.bc`).
+  An AMD GPU's dense products run in oneMath's rocBLAS backend, which the fork's change makes hand those with 16-bit inputs to hipBLASLt.
+  Without hipBLASLt, CMake warns (and stops with `STRATA_PACKAGE=ON`), and those products run in rocBLAS alone (at about a fifteenth of the speed on gfx12).
   Validated: CTest passes on an RX 9060 XT (gfx1200, Fedora 44, ROCm 7.1.1).
 - **contrib** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
@@ -221,6 +224,8 @@ The same executable runs on Intel GPUs too.
 
 1. It checks the GPU: through sysfs and the kernel driver's memory query, an Intel GPU on the xe or i915 driver,
    its VRAM, the render node's permissions, Resizable BAR and the PCIe link.
+   An AMD GPU on amdgpu has its gfx (`gfx1200`, for example) read from the kernel's KFD topology, and `/dev/kfd`'s permissions checked too.
+   A GPU older than RDNA2, or one the distribution's rocBLAS (in a package, its engine) has no code for, is shown as not usable ([README](../README.md#amd-gpus)).
 1. It checks RAM and CPU and asks its questions.
 1. It chooses the SYCL compiler ([below](#the-sycl-compiler)) and compiles the engine in `build-xe`.
 
@@ -244,6 +249,12 @@ setup builds in the mode `--license` names ([above](#build-and-run)), contrib un
   without one a compiler chosen as for free.
   The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
 - **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
+
+With an AMD GPU on the machine, free and contrib make the code for its gfx as well (`STRATA_HIP_ARCHS`).
+They then use intel/llvm built here, not the distribution's `dpclang++`.
+Without ROCm's packages ([the table below](#packages)), setup names the missing ones and stops.
+When the intel/llvm built here has no HIP target (built before ROCm was installed), setup asks whether to build it again.
+contrib-icpx cannot use AMD GPUs.
 
 contrib stops without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`) when the machine has an Intel GPU, and without the CUDA toolkit (`nvcc` and cuBLAS) when it has NVIDIA GPUs; with both, it wants both.
 contrib-icpx stops without oneMKL.
@@ -315,6 +326,9 @@ with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's in
 The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
 `intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
 
+An AMD GPU needs, in the free and contrib modes, ROCm's `libamdhip64-dev`, `rocm-device-libs-21`, `clang-21`, `libclang-rt-21-dev`,
+`librocblas-dev` and `libhipblaslt-dev` (universe; running an AMD GPU on Ubuntu is `unverified`).
+
 #### Fedora 44
 
 Fedora 44 has no DPC++ package, so the free mode builds intel/llvm with `--intel-llvm-build`.
@@ -328,6 +342,9 @@ intel/llvm v7.1.1 built in 14 minutes, the B70 got XMX, and the model it started
 | Building intel/llvm | `git`, `cmake` 4.3.0, `ninja-build`, `gcc-c++` 16.2.1, `hwloc-devel`, `libzstd-devel`, `libzstd-static` (since 2026-10-05: intel/llvm links zstd statically) |
 | Building the engine | `oneapi-level-zero-devel` 1.33.1 |
 | Running it | `oneapi-level-zero` 1.33.1, `intel-level-zero` 26.35.39758.11 (the Level Zero driver for Intel GPUs) |
+
+An AMD GPU needs `rocm-hip-devel`, `rocm-device-libs`, `rocm-clang`, `rocm-clang-runtime-devel`, `rocblas-devel` and `hipblaslt-devel`
+(7.1.1, checked in a container with an RX 9060 XT).
 
 `intel-compute-runtime` (OpenCL) was installed too; as on Ubuntu, the engine should not need it (`unverified`).
 The packages for the image encoders and running on Fedora's own kernel are not checked (`unverified`).
@@ -363,14 +380,15 @@ tools/package/build.sh fedora44 cuda13.4
   The default is HEAD, and then uncommitted changes in the work tree stop it; a third argument names another commit.
   Nothing of the work tree (`build-xe`, `.tools`, `.venv`) is used.
 - **A clean container each time**: the images are pinned by digest in `build.sh`.
-  In the container it installs the build tools and builds intel/llvm (`tools/intel_llvm_build.py`, with the CUDA target
-  for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
+  In the container it installs the build tools and the distribution's ROCm and builds intel/llvm (`tools/intel_llvm_build.py`,
+  with the HIP target, and the CUDA target for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
   `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - **No GPU needed**: the container gets no GPU and nothing of this PC's.
   CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and
   `STRATA_CUDA_PTX`, and `STRATA_PORTABLE=OFF`) are refused with `STRATA_PACKAGE=ON`; `build.sh` sets them all.
+  AMD GPUs get `STRATA_HIP_ARCHS=rocblas`: every RDNA2 or later GPU the distribution's rocBLAS has code for.
 - **Network**: it fetches the distribution's packages, intel/llvm, llama.cpp, oneMath, and for the cuda variants NVIDIA's
   and Intel's repositories (the CUDA toolkit and oneMKL).
 - **What comes out**: `build/pkg/<distro>-<variant>/` with the packages and `BUILDINFO` (the commit, the image, the intel/llvm
@@ -382,6 +400,13 @@ tools/package/build.sh fedora44 cuda13.4
 | cuda13.1 | Ubuntu 26.04 | `cuda-toolkit-13-1` from multiverse | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda13.4 | Fedora 44 | `cuda-toolkit-13-4` from NVIDIA's repository | sm_75, sm_80, sm_86, sm_89, sm_90 |
 | cuda12.4 | Ubuntu 26.04 | `nvidia-cuda-toolkit` | sm_70, sm_75, sm_80, sm_86, sm_89, sm_90 |
+
+Every variant has AMD code for the GPUs the distribution's rocBLAS (ROCm 7.1) has code for (but gfx1152 and gfx1153, which intel/llvm 7.1.1 has no target for).
+
+| Distribution | AMD code |
+| --- | --- |
+| Ubuntu 26.04 | gfx1030, gfx1100, gfx1101, gfx1151, gfx1200, gfx1201 |
+| Fedora 44 | gfx1030, gfx1031, gfx1035, gfx1036, gfx1100, gfx1101, gfx1102, gfx1103, gfx1150, gfx1151, gfx1200, gfx1201 |
 
 - A cuda variant is named after the CUDA version it is built with.
   NVIDIA's repository for Fedora 44 has CUDA 13.3 and 13.4 only, so Fedora's is 13.4; it has no CUDA 12 either, so cuda12.4 is Ubuntu's only.
@@ -396,7 +421,7 @@ Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package 
 | What | Where |
 | --- | --- |
 | the `xestrata` command (setup.py), the server, the web app, the tools setup runs, llama.cpp's gguf-py, the data files, a systemd user unit | `/usr/share/xestrata`, `/usr/bin/xestrata`, `/usr/lib/systemd/user/xestrata.service` |
-| the engine (`strata`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader and adapters, `libumf`), and in the cuda variants oneMath and the CUDA and HIP (AMD) adapters | `<libdir>/xestrata/engine` |
+| the engine (`strata`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
 
 - The packages provide and conflict with `xestrata-engine`: one is installed at a time, and installing another replaces it.
 - Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora 44 has libsycl 9, so the packages carry it.
@@ -406,14 +431,15 @@ Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package 
   The dependencies on the libraries the engine links come from `dpkg-shlibdeps` (deb) and rpmbuild (rpm).
   The bundled libraries are neither required nor provided.
 - No package requires a GPU maker's driver or library.
-  The free package recommends Intel's Level Zero driver.
+  The free package recommends Intel's Level Zero driver and, for AMD GPUs, ROCm's libraries (the HIP runtime, rocBLAS,
+  hipBLASLt), all free software.
   The contrib packages, which go on a PC with Intel, NVIDIA or AMD GPUs, only suggest the makers' ones (Level Zero, cuBLAS,
-  oneMKL, ROCm's HIP runtime): apt and dnf install recommendations by default, which would bring another maker's too.
+  oneMKL, ROCm's HIP runtime, rocBLAS and hipBLASLt): apt and dnf install recommendations by default, which would bring another maker's too.
   The UR adapters and oneMath's backends open them at run time, so the packages install without them, and a GPU without them is not used.
 - Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is bundled.
-- The contrib builds also make intel/llvm's HIP target and adapter with the distribution's ROCm (7.1, in Ubuntu's universe and
-  Fedora's own repositories), and carry the adapter. Once the engine builds code for AMD GPUs (`hip_archs` in `BUILD.json`),
-  it is used as it is.
+- Every variant's build makes intel/llvm's HIP target and adapter with the distribution's ROCm (7.1, in Ubuntu's universe
+  and Fedora's own repositories), and carries the adapter. The AMD code the engine has is recorded in `BUILD.json`
+  (`hip_archs`), from which setup decides whether a GPU can be used.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
   under `/usr` later and nothing goes in `/etc`, so removing the packages leaves nothing behind.
