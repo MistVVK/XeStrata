@@ -96,15 +96,27 @@ void scalar_gate(sycl::queue& q, const uint16_t* x_bf16, const uint16_t* w_bf16,
     else scalar_gate_t<float>(q, x_bf16, w_bf16, out, n_embd);
 }
 
-void native_scalar_sigmoid(sycl::queue& q, float* gate, int n) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> t) {
-        gate[t] = 1.0f / (1.0f + sycl::exp(-gate[t]));
-    });
-}
-
 void scale_rows(sycl::queue& q, float* out, const float* g, int n, int n_tok) {
     q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
         out[id[0] * n + id[1]] *= g[id[0]];
+    });
+}
+
+// the native gate's sigmoid and the row scale in one launch: each work-item takes its row's sigmoid of the raw gate
+// and scales four columns where the rows are 16-byte aligned (upstream 822251be)
+void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n_tok) {
+    if (n % 4 == 0 && (reinterpret_cast<uintptr_t>(out) & 15u) == 0) {
+        const int n4 = n / 4;
+        auto* out4 = reinterpret_cast<sycl::float4*>(out);
+        q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n4), [=](sycl::id<2> id) {
+            const float gt = 1.0f / (1.0f + sycl::exp(-g[id[0]]));
+            out4[id[0] * n4 + id[1]] *= gt;
+        });
+        return;
+    }
+    q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
+        const float gt = 1.0f / (1.0f + sycl::exp(-g[id[0]]));
+        out[id[0] * n + id[1]] *= gt;
     });
 }
 
@@ -125,20 +137,16 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), one sigmoid launch
+    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
-        native_scalar_sigmoid(q, g, n_tok);
     } else {
         for (int t = 0; t < n_tok; ++t) {
-            if (native_bf16) {
-                bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-                native_scalar_sigmoid(q, g + t, 1);
-            } else {
-                scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-            }
+            if (native_bf16) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
+            else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
         }
     }
-    scale_rows(q, out, g, (int) n_embd, n_tok);
+    if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
+    else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
@@ -226,11 +234,11 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // the per-token scalar gate, from the ORIGINAL hidden state, then the multiply
     if (use_native) {
         bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, s);
-        native_scalar_sigmoid(q, g, 1);
+        sigmoid_scale_rows(q, out, g, (int) n_embd, 1);
     } else {
         scalar_gate(q, x_bf16, gate_inp_bf16, g, (int) n_embd);
+        scale_rows(q, out, g, (int) n_embd, 1);
     }
-    scale_rows(q, out, g, (int) n_embd, 1);
     if (!stream) core::Runtime::get().finish(q);
 }
 
