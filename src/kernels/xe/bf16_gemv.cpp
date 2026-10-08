@@ -76,18 +76,27 @@ sycl::event launch_warp(sycl::queue& q, const uint16_t* x, const uint16_t* w, fl
 // ggml-cuda mmvf: work-group size chosen for the fewest pair iterations, two ordered FMAs per pair, a warp sum, and
 // for more than one warp a second warp sum over 32 partials (zero beyond the warp count).  EXACT: n_tok is NT (the
 // rows' loop fixed at compile time; upstream 104a8485), else the first n_tok of NT rows.
+// Aux: one more work-group, after the n_out rows, computes the 1-row product of the same x with w_aux into
+// y_aux[k * ldy_aux] (upstream b08cf3e1's router + shared gate launch).
+struct MmvfAux {
+    const uint16_t* w = nullptr;
+    float* y = nullptr;
+    int64_t ldy = 0;
+};
+
 template<int BLOCK_SIZE, int NT, bool EXACT = false>
 sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                        int n_in, int64_t n_out, int n_tok_arg) {
+                        int n_in, int64_t n_out, int n_tok_arg, MmvfAux aux = {}) {
     const int n_tok = EXACT ? NT : n_tok_arg;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> partials(sycl::range<1>(NT * 32), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_out * BLOCK_SIZE, BLOCK_SIZE),
+        h.parallel_for(sycl::nd_range<1>((size_t) (n_out + (aux.w ? 1 : 0)) * BLOCK_SIZE, BLOCK_SIZE),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0);
             const size_t rowi = it.get_group(0);
-            const uint16_t* row = w + rowi * n_in;
+            const bool is_aux = (int64_t) rowi == n_out;
+            const uint16_t* row = is_aux ? aux.w : w + rowi * n_in;
             const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
             if constexpr (BLOCK_SIZE > 32) {
                 if (t < 32)
@@ -119,7 +128,10 @@ sycl::event launch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint1
             }
             if (t == 0)
                 for (int k = 0; k < NT; ++k)
-                    if (k < n_tok) y[(size_t) k * ldy + rowi] = acc[k];
+                    if (k < n_tok) {
+                        if (is_aux) aux.y[(size_t) k * aux.ldy] = acc[k];
+                        else y[(size_t) k * ldy + rowi] = acc[k];
+                    }
         });
     });
 }
@@ -228,7 +240,7 @@ bool rows_form(sycl::queue& q, int64_t n_in, int64_t n_out, int n_tok) {
 
 template<int NT, bool EXACT = false>
 void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                   int64_t n_in, int64_t n_out, int n_tok, bool rows = false) {
+                   int64_t n_in, int64_t n_out, int n_tok, bool rows = false, MmvfAux aux = {}) {
     if (NT > 1 && rows) {
         switch (mmvf_block_size(n_in)) {
             case 32: launch_mmvf_rows<32, NT, 4, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
@@ -243,30 +255,30 @@ void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* 
         return;
     }
     switch (mmvf_block_size(n_in)) {
-        case 32: launch_mmvf<32, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 64: launch_mmvf<64, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 96: launch_mmvf<96, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 128: launch_mmvf<128, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 160: launch_mmvf<160, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 192: launch_mmvf<192, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 224: launch_mmvf<224, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
-        case 256: launch_mmvf<256, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok); break;
+        case 32: launch_mmvf<32, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 64: launch_mmvf<64, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 96: launch_mmvf<96, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 128: launch_mmvf<128, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 160: launch_mmvf<160, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 192: launch_mmvf<192, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 224: launch_mmvf<224, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        case 256: launch_mmvf<256, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
     }
 }
 
 // the multi-row call's kernels: the window's usual row counts with their loop fixed at compile time (upstream
 // 104a8485); rows: 4 rows a work-group
 void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                    int64_t n_in, int64_t n_out, int n_tok, bool rows) {
+                    int64_t n_in, int64_t n_out, int n_tok, bool rows, MmvfAux aux = {}) {
     switch (n_tok) {
-        case 2: dispatch_mmvf<2, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows); break;
-        case 3: dispatch_mmvf<3, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows); break;
-        case 4: dispatch_mmvf<4, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows); break;
-        case 5: dispatch_mmvf<5, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows); break;
-        case 6: dispatch_mmvf<6, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows); break;
+        case 2: dispatch_mmvf<2, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
+        case 3: dispatch_mmvf<3, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
+        case 4: dispatch_mmvf<4, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
+        case 5: dispatch_mmvf<5, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
+        case 6: dispatch_mmvf<6, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
         default:
-            if (n_tok <= 4) dispatch_mmvf<4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows);
-            else dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows);
+            if (n_tok <= 4) dispatch_mmvf<4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);
+            else dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);
     }
 }
 
@@ -325,6 +337,23 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
     auto& q = queue_for(stream);
     multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, n_out >= 64 && rows_form(q, n_in, n_out, n_tok));
     if (!stream) core::Runtime::get().finish(q);
+}
+
+bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
+                                   int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
+                                   int64_t ldy_aux, void* stream) {
+    if (n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out < 1 || (ldx & 1) != 0 || x == nullptr ||
+        w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr ||
+        (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w_aux) & 3u) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi_aux: 2..8 rows, even n_in/ldx, aligned pointers");
+    auto& q = queue_for(stream);
+    if (n_out >= 64 && rows_form(q, n_in, n_out, n_tok)) return false;   // the 4-rows form: two launches
+    MmvfAux aux;
+    aux.w = w_aux;
+    aux.y = y_aux;
+    aux.ldy = ldy_aux;
+    multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, false, aux);
+    return true;
 }
 
 void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream) {

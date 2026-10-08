@@ -425,6 +425,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    bool gate_later_[2] = {false, false};   // the group's shared rows still to be scaled by the combine (pre -> post)
     if (!batch_rec_) groups_[T] = G;
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
@@ -806,10 +807,23 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+        // STRATA_LFUSE_GATE=0: the shared expert's scalar gate in a launch of its own, and its sigmoid scale too
+        static const bool lfuse_gate = [] {
+            const char* e = std::getenv("STRATA_LFUSE_GATE");
+            return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+        }();
+        bool g_ready = false;   // the shared expert's raw gates came with the router's launch
         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
-                bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE, N,
-                                          NE, n, cs);
+                // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
+                const WeightRef* w_sg = v.get("ffn_gate_inp_shexp.weight");
+                if (lfuse_gate && w_sg != nullptr && w_sg->kind == WeightKind::Bf16InF32 && shared_expert_native_bf16())
+                    g_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
+                                                            logits_ + tb * NE, NE, N, NE, n, (const uint16_t*) w_sg->data,
+                                                            sh_g_ + tb, 1, cs);
+                if (!g_ready)
+                    bf16_gemv_fp32_mmvf_multi(mixed_ + tb * N, N, (const uint16_t*) w_router->data, logits_ + tb * NE, NE,
+                                              N, NE, n, cs);
                 native_router_top10_multi(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, n, cs);
             } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
         } else
@@ -842,8 +856,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
             else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
             try {
-                shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
-                                    sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs);
+                // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
+                gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
+                                                       sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
+                                                       sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs,
+                                                       lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
+                                                       g_ready);
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
@@ -939,7 +957,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
-                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs);
+                native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
+                                         gate_later_[grp] ? sh_g_ + tb : nullptr);
             } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
         } else
         for (int t = tb; t < te; ++t) {

@@ -123,10 +123,11 @@ void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n
 }  // namespace
 
 void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
+bool shared_expert_native_bf16() { return native_bf16; }
 
-void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream) {
+                         int64_t n_ff, void* stream, bool gate_later, bool g_ready) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
@@ -137,7 +138,9 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
+    if (native_bf16 && g_ready) {
+        // the router's launch computed the raw gates
+    } else if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
     } else {
         for (int t = 0; t < n_tok; ++t) {
@@ -145,8 +148,10 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
         }
     }
+    if (native_bf16 && gate_later) return true;                             // the combine scales the rows
     if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
     else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
+    return false;
 }
 
 uint64_t shared_expert_scratch_bytes(int64_t n_ff) {

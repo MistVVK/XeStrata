@@ -19,6 +19,8 @@ bool native_moe_combine_enabled();
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream);
 /// n_tok rows (parts [n,k,N], weights [n,k], shared/output [n,N]) in one launch, each as the single call.
+/// `shared_gate` (n_tok raw gates): the shared rows are scaled by their gate's sigmoid here, as shared_expert_multi's
+/// last step would have (upstream b08cf3e1: the same bits, one launch fewer).
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
-                              int64_t n_embd, int64_t k, int n_tok, void* stream);
+                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate = nullptr);
 }
