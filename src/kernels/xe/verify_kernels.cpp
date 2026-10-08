@@ -290,7 +290,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
     if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
     const auto e = Q(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
-        sycl::local_accessor<int32_t, 1> s_lead(sycl::range<1>(WG), h);
+        sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG), h);
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
@@ -304,12 +304,22 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
                 if (t == 0) *skip = 0;
                 return;
             }
+            // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
+            // (entries << 16 | 1) over the leaders numbers the groups and gives their starts (upstream fe4de5de)
+            int L = t, cnt = 0, pos = 0;
             if (t < n) {
-                int L = t;
                 for (int j = 0; j < t; ++j)
                     if (s_ids[j] == s_ids[t]) { L = j; break; }
-                s_lead[t] = L;
+                for (int j = 0; j < n; ++j) {
+                    if (s_ids[j] != s_ids[t]) continue;
+                    if (L == t) ++cnt;
+                    if (j < t) ++pos;
+                }
             }
+            const int pack = L == t && t < n ? (cnt << 16) | 1 : 0;
+            const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
+            s_excl[t] = excl;
+            const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
             sycl::group_barrier(grp);
             int32_t* counts = pl;
             int32_t* start = pl + 4;
@@ -319,14 +329,8 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
             int32_t* start2 = pl + ptr_off + 4 * capx;
             if (t < n) {
-                const int L = s_lead[t];
-                int g = 0, gstart = 0, pos = 0;
-                for (int j = 0; j < n; ++j) {
-                    const int Lj = s_lead[j];
-                    if (j < L && Lj == j) ++g;
-                    if (Lj < L) ++gstart;
-                    if (j < t && Lj == L) ++pos;
-                }
+                const int le = s_excl[L];
+                const int g = le & 0xffff, gstart = le >> 16;
                 dst[gstart + pos] = t;
                 tok[gstart + pos] = t / k;
                 if (L == t) {
@@ -337,8 +341,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             }
             sycl::group_barrier(grp);
             if (t != 0) return;
-            int groups = 0;
-            for (int i = 0; i < n; ++i) groups += s_lead[i] == i;
+            const int groups = total & 0xffff;
             start[groups] = n;
             start2[0] = n;
             counts[0] = groups;

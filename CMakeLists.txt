@@ -568,6 +568,10 @@ if(STRATA_ENABLE_XE)
     add_executable(gr_multi_parity src/kernels/gr_multi_parity.cpp)
     target_link_libraries(gr_multi_parity PRIVATE strata_kernels)
     add_test(NAME gr_multi_parity COMMAND gr_multi_parity)
+    # #783 PR-e: the verify window's device-built expert plan against a host replay of its contract
+    add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
+    target_link_libraries(resident_plan_parity PRIVATE strata_kernels)
+    add_test(NAME resident_plan_parity COMMAND resident_plan_parity)
     # KV streaming: streamed vs resident attention, bitwise (synthetic, no model).
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)
