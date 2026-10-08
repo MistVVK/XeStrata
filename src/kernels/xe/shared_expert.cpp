@@ -132,8 +132,17 @@ bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
     native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
-    native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-    native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    // gate and up in one launch where the layout allows (upstream b08cf3e1; STRATA_LFUSE_PAIR=0: two)
+    static const bool pair_on = [] {
+        const char* v = std::getenv("STRATA_LFUSE_PAIR");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (!(pair_on && nw.gate_type == nw.up_type &&
+          native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, nw.q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok,
+                           stream))) {
+        native_mmvq(nw.gate_type, nw.gate_data, nw.q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+        native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    }
     native_swiglu(q, gate, up, gate, (int) (n_ff * n_tok));
     native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
