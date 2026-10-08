@@ -484,6 +484,21 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     done(stream, e, "mtp_select");
 }
 
+void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
+                       void* stream) {
+    const size_t items = (size_t) 16 * 256;
+    const auto e = Q(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+        const int64_t row = *row_dev;
+        if (row == 0) return;   // already there
+        for (int64_t i = (int64_t) id[0]; i < a_n + b_n + c_n; i += (int64_t) items) {
+            if (i < a_n) a[i] = a[row * a_n + i];
+            else if (i < a_n + b_n) b[i - a_n] = b[row * b_n + (i - a_n)];
+            else c[i - a_n - b_n] = c[row * c_n + (i - a_n - b_n)];
+        }
+    });
+    done(stream, e, "copy_row_to_first");
+}
+
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream) {
     // the widest element the row size divides into (16, 4 or 1 bytes): a Q6_K head row of 2560 values is 2100 bytes
     auto launch = [&](auto elem) {

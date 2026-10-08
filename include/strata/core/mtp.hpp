@@ -108,7 +108,7 @@ public:
     bool idle(std::string& err);
 
 private:
-    bool record_forward(int T, int step_row0, strata::gpu::Stream cs, std::string& err);
+    bool record_forward(int T, int step_row0, strata::gpu::Stream cs, std::string& err, bool rest_only = false);
     bool capture_prefill(int T, std::string& err);
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
