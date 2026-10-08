@@ -12,6 +12,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
+#include "strata/core/per_device.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
 #if __has_include(<sycl/ext/oneapi/experimental/clock.hpp>)
@@ -657,9 +658,75 @@ sycl::event row_top_prob_launch(sycl::queue& q, const float* logits, int n_rows,
 }
 }  // namespace
 
+namespace {
+// row_top_prob over SPLIT work-groups a row (upstream 3e4aa1d6: one group a row left most of the GPU idle on the draft
+// head's 40,525 tokens).  Group b holds the one-group kernel's work-items [b * WG / SPLIT, (b + 1) * WG / SPLIT) with
+// their stride WG, so each sub-group's sum is the one-group kernel's; they go to the row's slots in a device scratch,
+// and the row's last group (a counter it resets) adds the WG / 32 sums in the same order: the same bits.
+constexpr int TOP_SPLIT = 8;
+struct TopScratch { float* part; uint32_t* count; };
+TopScratch top_scratch(sycl::queue& q) {
+    static core::PerDevice<TopScratch> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        const size_t rows = kVerifyMaxT;
+        TopScratch t{};
+        t.part = sycl::malloc_device<float>(rows * 32, q.get_device(), q.get_context());
+        t.count = sycl::malloc_device<uint32_t>(rows, q.get_device(), q.get_context());
+        if (!t.part || !t.count) throw core::DeviceError("row_top_prob: device allocation failed");
+        sycl::queue init(q.get_context(), q.get_device());   // not the caller's queue: it may be recording a graph
+        init.memset(t.count, 0, rows * sizeof(uint32_t)).wait();
+        return t;
+    });
+}
+template <int WG>
+sycl::event row_top_prob_split(sycl::queue& q, const float* logits, int n_rows, int n_vocab, const int32_t* ids,
+                               float* probs, TopScratch sc) {
+    constexpr int LW = WG / TOP_SPLIT;
+    static_assert(LW % 32 == 0, "whole sub-groups a group");
+    return q.parallel_for(sycl::nd_range<1>((size_t) n_rows * TOP_SPLIT * LW, LW), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int grp = (int) it.get_group(0), t = grp / TOP_SPLIT, b = grp % TOP_SPLIT;
+        const int tid = b * LW + (int) it.get_local_id(0);   // the one-group kernel's work-item
+        const float* l = logits + (size_t) t * n_vocab;
+        const float m = l[ids[t]];
+        float s = 0.0f;
+        for (int i = tid; i < n_vocab; i += WG) s += sycl::exp(l[i] - m);
+        s = warp_sum(sg, s);
+        if ((tid & 31) == 0) sc.part[t * 32 + (tid >> 5)] = s;
+        // the last of the row's groups to finish adds the sums
+        sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+        sycl::group_barrier(it.get_group());
+        if (it.get_local_id(0) != 0) return;
+        sycl::atomic_ref<uint32_t, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                         sycl::access::address_space::global_space> cnt(sc.count[t]);
+        if (cnt.fetch_add(1u) != TOP_SPLIT - 1) return;
+        sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+        float tot = 0.0f;
+        for (int w = 0; w < WG / 32; ++w) tot += sc.part[t * 32 + w];
+        probs[t] = 1.0f / tot;
+        cnt.store(0u);
+    });
+}
+}  // namespace
+
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream) {
     auto& q = Q(stream);
     const int wg = xe::work_group_upto_1024(q);   // the draft probabilities sum in another order below 1024
+    static const bool split = [] {   // STRATA_TOP_PROB_SPLIT=0: one work-group a row
+        const char* v = std::getenv("STRATA_TOP_PROB_SPLIT");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    // the split for the main model's head (248,320 tokens: RTX 4070 15.1 -> 10.2 us a row, B70 38.95 -> 38.79), not
+    // for a draft head's subset (40,525: the RTX 4070 3.98 -> 3.52 us, the B70 7.60 -> 7.85)
+    constexpr int kSplitMinVocab = 65536;
+    if (split && n_rows <= kVerifyMaxT && n_vocab >= kSplitMinVocab) {
+        const TopScratch sc = top_scratch(q);
+        const auto e = wg == 1024 ? row_top_prob_split<1024>(q, logits, n_rows, n_vocab, ids, probs, sc)
+                       : wg == 512 ? row_top_prob_split<512>(q, logits, n_rows, n_vocab, ids, probs, sc)
+                                   : row_top_prob_split<256>(q, logits, n_rows, n_vocab, ids, probs, sc);
+        done(stream, e, "row_top_prob");
+        return;
+    }
     const auto e = wg == 1024 ? row_top_prob_launch<1024>(q, logits, n_rows, n_vocab, ids, probs)
                    : wg == 512 ? row_top_prob_launch<512>(q, logits, n_rows, n_vocab, ids, probs)
                                : row_top_prob_launch<256>(q, logits, n_rows, n_vocab, ids, probs);
