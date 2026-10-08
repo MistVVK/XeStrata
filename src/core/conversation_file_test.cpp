@@ -643,6 +643,12 @@ int main() try {
         SessionSaveLive live;
         live.state_bytes = 5000; live.tokens = 1000; live.images = 1; live.kv_layers = 13;
         check(session_deepest_checkpoint(chain) == &chain[1], "save: deepest chosen by reference");
+        {   // pin=N: the pinned checkpoint is the one kept, even when a deeper periodic one exists
+            auto pinned_chain = chain;
+            pinned_chain[0].pinned = true;
+            check(session_deepest_checkpoint(pinned_chain) == &pinned_chain[0], "save: a pinned shared prefix beats a deeper checkpoint");
+            check(session_deepest_checkpoint(chain) == &chain[1], "save: no pin, the deepest as before");
+        }
         const uint64_t need = session_save_peak_bytes(&chain[1], live);
         check(need >= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (16u << 20) &&
               need <= 2 * (uint64_t) chain[1].bytes() + 5000 + 4000 + (18u << 20),

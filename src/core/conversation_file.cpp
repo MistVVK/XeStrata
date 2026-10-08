@@ -1126,9 +1126,14 @@ std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vecto
 }
 
 const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
+    // A pinned shared prefix (pin=N) is the resume point the next queries want, so with one in the chain the file
+    // keeps the deepest PINNED checkpoint, not a deeper periodic one a long private suffix made past it.  No pin:
+    // the deepest, as before.
     const ConversationCheckpoint* deepest = nullptr;
+    bool any_pinned = false;
+    for (const auto& c : chain) any_pinned = any_pinned || c.pinned;
     for (const auto& c : chain)
-        if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if ((!any_pinned || c.pinned) && (!deepest || c.ids.size() > deepest->ids.size())) deepest = &c;
     return deepest;
 }
 

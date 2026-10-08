@@ -57,4 +57,27 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, con
     return eviction_victim(stamps, n, cap);
 }
 
+/// The pin=N shared prefixes (`pinned[i]`): they are never the victim, whatever their stamp - the queries that branch
+/// from one keep coming back to it, and a least-recently-used rule would drop it while they still do.  The root and
+/// the tail rule are as above.  When every other item is pinned too, the policy falls back to the oldest pinned one:
+/// the cache still keeps to its `cap` (the caller limits how many pins it takes, so this is a backstop).
+inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, const bool* tail, const bool* pinned) {
+    if (pinned == nullptr) return eviction_victim(stamps, n, cap, tail);
+    if (cap < 2 || n < 2) return 0;
+    size_t newest = 0;
+    for (size_t i = 1; i < n; ++i)
+        if (stamps[i] > stamps[newest]) newest = i;
+    if (tail != nullptr)
+        for (size_t i = 1; i < n; ++i)
+            if (tail[i] && !pinned[i] && i != newest) return i;
+    size_t v = n;                    // the least recently used among the unpinned non-root items
+    for (size_t i = 1; i < n; ++i)
+        if (!pinned[i] && (v == n || stamps[i] < stamps[v])) v = i;
+    if (v != n) return v;
+    v = 1;                           // all pinned: the oldest of them (never the root, index 0)
+    for (size_t i = 2; i < n; ++i)
+        if (stamps[i] < stamps[v]) v = i;
+    return v;
+}
+
 }  // namespace strata::program::conv_cache

@@ -75,6 +75,21 @@ int main() {
         check(eviction_victim(st.data(), st.size(), 6, t4) == 1, "the root is never the victim, tail flag or not");
         check(eviction_victim(st.data(), st.size(), 6, nullptr) == 1, "no tail flags: the plain policy");
     }
+    {   // pin=N: a pinned shared prefix is never the victim, however stale its stamp
+        const std::vector<uint64_t> st = {1, 2, 30, 4, 5, 6, 7};
+        const bool pin1[7] = {false, true, false, false, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, pin1) == 3,
+              "the oldest checkpoint is pinned: the next least recently used leaves");
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr) == 1, "no pin flags: the plain policy");
+        const bool pin2[7] = {false, true, false, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, pin2) == 4, "two pins: the third oldest leaves");
+        const bool tail3[7] = {false, false, false, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, tail3, pin2) == 4, "a pinned item is not taken as the tail either");
+        const bool all[4] = {false, true, true, true};
+        const std::vector<uint64_t> s4 = {1, 9, 3, 5};
+        check(eviction_victim(s4.data(), s4.size(), 4, nullptr, all) == 2, "everything pinned: the oldest pin leaves, never the root");
+        check(eviction_victim(s4.data(), s4.size(), 1, nullptr, all) == 0, "a one-slot budget keeps no pin: the oldest leaves");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
