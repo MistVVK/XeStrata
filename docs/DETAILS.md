@@ -74,6 +74,18 @@ On a GPU without XMX the prompt path's products run through DP4a, so reading a p
 
 The text speed with images on has not been measured on the B70 yet.
 
+### AMD APUs
+
+On an AMD APU (Ryzen AI Max "Strix Halo" and the like) the CPU and the GPU share one memory (upstream c4a329fe).
+The GPU's part is the BIOS carve-out (which the OS does not see, so it is room beside the RAM) and the shared GTT pool.
+The GTT pool is the RAM itself, about half of it by the kernel's default.
+Setup counts the carve-out as room for experts (the low-RAM mode) and the carve-out plus the shared pool for the recommended context.
+It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 8040S, and recommends UD-IQ4_XS from about 80 GB of memory.
+The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
+Setup changes no host setting.
+The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `STRATA_UMA_HEADROOM_GIB` changes the 6).
+Running on an AMD APU has not been checked (`unverified`).
+
 ### Where the KV cache lives, and its precision
 
 **KV streaming**: at a context of 64K or more, setup keeps the context's KV cache in RAM.

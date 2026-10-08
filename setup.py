@@ -566,8 +566,45 @@ def kfd_nodes() -> dict:
             continue
         pci = f"{int(f.get('domain', '0')):04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7:x}"
         found[pci] = {"gfx": f"gfx{v // 10000}{(v // 100) % 100:x}{v % 100:x}",
-                      "integrated": int(f.get("cpu_cores_count", "0")) > 0}
+                      "integrated": int(f.get("cpu_cores_count", "0")) > 0, "simds": int(f.get("simd_count", "0"))}
     return found
+
+
+# AMD's APUs share one memory between the CPU and the GPU (upstream c4a329fe).  The GPU's own part is a BIOS
+# carve-out (amdgpu's mem_info_vram_total: RAM the OS does not see, so it is room beside the RAM), and it also reaches
+# the shared GTT pool (mem_info_gtt_total; the kernel's default is about half of the RAM), which is the RAM itself.  The
+# Ryzen AI Max "Strix Halo" APUs are told apart by name (gfx1151, an exception the owner allowed): one PCI id for the
+# three, their KFD SIMD count (two per CU) names them.
+UMA_OS_LEFT_GB = 6             # the unified memory kept for the OS (the engine keeps the same out of its figure)
+STRIX_HALO_GFX = "gfx1151"
+STRIX_HALO_BY_SIMDS = {80: "8060S", 64: "8050S", 32: "8040S"}
+STRIX_HALO_MODEL = "UD-IQ4_XS"  # upstream's Strix Halo guide measures it; its experts stay in memory from ~80 GB
+STRIX_HALO_MIN_GB = 80
+
+
+def amd_uma(carve_gb: float, gtt_gb: float, ram: float) -> dict:
+    """An AMD APU's memory: the BIOS carve-out, the shared pool the GPU reaches (the GTT pool, else half the RAM; at
+    most the RAM less what the OS keeps) and their sum, the memory the GPU can use in all."""
+    shared = gtt_gb if gtt_gb > 0 else ram / 2
+    shared = max(0.0, min(shared, ram - UMA_OS_LEFT_GB))
+    return {"carve_gb": max(0.0, carve_gb), "shared_gb": shared, "uma_gb": max(0.0, carve_gb) + shared}
+
+
+def strix_halo_notes(gpu, ram) -> list:
+    """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
+    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
+             f"OS + a {gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out); the model's experts live in it."]
+    if gpu.get("shared_gb", 0.0) < 0.75 * ram - 1:
+        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of shared memory (the GTT pool; the "
+                     "kernel's default is about half of the RAM). The kernel options ttm.pages_limit and "
+                     "ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes no host setting")
+    if gpu.get("carve_gb", 0.0) > 16:
+        notes.append(f"!the BIOS carve-out is {gpu['carve_gb']:.0f} GB: that memory is taken from the OS, while the "
+                     "GPU reaches the shared memory anyway. A small carve-out (512 MB - 2 GB) leaves the RAM to the "
+                     "model")
+    if ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB:
+        notes.append(f"  Recommended model: {STRIX_HALO_MODEL} (Unsloth); the menus list the others.")
+    return notes
 
 
 def rocblas_archs() -> set | None:
@@ -823,11 +860,19 @@ def gpus():
             render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
             integrated = bool(node.get("integrated"))
             name = f"{pci_name(0x1002, did)} ({node.get('gfx') or 'no KFD node'})"
-            amd.append({"name": name, "vram_gb": 0.0 if integrated else vram_b / 2 ** 30,
-                        "device_id": did, "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
-                        "bar_gb": vis_b / 2 ** 30, "link": host_link(dev),
-                        "render": f"/dev/dri/{render.name}" if render else None, "vendor": "amd",
-                        "gfx": node.get("gfx")})
+            if node.get("gfx") == STRIX_HALO_GFX and node.get("simds") in STRIX_HALO_BY_SIMDS:
+                name = f"AMD Radeon {STRIX_HALO_BY_SIMDS[node['simds']]} (Ryzen AI Max, Strix Halo, gfx1151)"
+            g = {"name": name, "vram_gb": 0.0 if integrated else vram_b / 2 ** 30,
+                 "device_id": did, "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
+                 "bar_gb": vis_b / 2 ** 30, "link": host_link(dev),
+                 "render": f"/dev/dri/{render.name}" if render else None, "vendor": "amd", "gfx": node.get("gfx")}
+            if integrated:                             # an APU: the carve-out and the shared pool (upstream c4a329fe)
+                try:
+                    gtt_gb = int((dev / "mem_info_gtt_total").read_text()) / 2 ** 30
+                except (OSError, ValueError):
+                    gtt_gb = 0.0
+                g.update(amd_uma(vram_b / 2 ** 30, gtt_gb, ram_gb()))
+            amd.append(g)
             continue
         if vendor == "0x10de":
             smi = nvidia_smi() if smi is None else smi
@@ -1798,8 +1843,9 @@ def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
 
 
 def gpu_expert_vram(gpu) -> float:
-    """The VRAM (GB) that can hold experts instead of RAM: none on the processor's graphics (its memory is the RAM)."""
-    return 0.0 if gpu.get("integrated") else gpu["vram_gb"]
+    """The VRAM (GB) that can hold experts instead of RAM: none on the processor's graphics (its memory is the RAM),
+    but an AMD APU's BIOS carve-out, which the OS does not see (upstream c4a329fe)."""
+    return gpu.get("carve_gb", 0.0) if gpu.get("integrated") else gpu["vram_gb"]
 
 
 def low_ram_needed(model, ram) -> bool:
@@ -2970,7 +3016,13 @@ def main() -> int:
     gpu = gpu_info(a.gpu)
     chosen = [gpu]
     mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else f"{gpu['vram_gb']:.0f} GB VRAM"
+    if "uma_gb" in gpu:
+        mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with the "
+               f"RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
     ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
+    if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
+        for line in strix_halo_notes(gpu, ram_gb()):
+            (warn if line.startswith("!") else say)(line.lstrip("!"))
     for i in sel[1:]:                                  # --gpus: the later layers' cards
         x = gpu_info(i)
         ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
@@ -2988,7 +3040,7 @@ def main() -> int:
         warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the "
              "CPU. "
              "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
-    if gpu.get("integrated"):
+    if gpu.get("integrated") and "uma_gb" not in gpu:
         warn("the processor's own graphics: Strata will run, but slowly - its memory is the system RAM, and it has "
              "no matrix engines (XMX) on most processors")
     elif gpu["vram_gb"] < 11:
@@ -3036,14 +3088,21 @@ def main() -> int:
     # ---- 2. the questions
     step(2, "your choices")
     fams = list(FAMILIES)
+    # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
+    halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
+    halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
+                if halo else None)
     if a.family:
         family = a.family
     else:
+        rec_fam = halo_fam or fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" +
-                ("   [experimental]" if d.get("experimental") else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
+                ("   [experimental]" if d.get("experimental") else "") +
+                (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == halo_fam and f != fams[0] else ""))
+        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], str(fams.index(rec_fam) + 1),
+                              a.yes)) - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
@@ -3069,6 +3128,8 @@ def main() -> int:
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    if family == halo_fam and STRIX_HALO_MODEL in names:
+        rec = str(names.index(STRIX_HALO_MODEL) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget = None
     if MODELS[model].get("budget"):
@@ -3110,7 +3171,8 @@ def main() -> int:
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose" + (" (--model)" if a.model else ""))
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
-    small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
+    # each card keeps its layers' KV of the whole context; an AMD APU, in the memory it can use in all
+    small = min(x.get("uma_gb", x["vram_gb"]) for x in chosen)
     rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     # upstream #406: the RAM rule is part of the recommendation (the smaller of the two), not a cap over the choice
     rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))

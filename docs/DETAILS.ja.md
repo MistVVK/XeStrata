@@ -73,6 +73,18 @@ XMX のない GPU では、プロンプトの経路の行列積を DP4a で計�
 
 画像を有効にしたときの文章の速さは、B70 ではまだ測っていません。
 
+### AMD の APU
+
+AMD の APU（Ryzen AI Max の Strix Halo など）では、CPU と GPU が 1 つのメモリを分け合います（upstream c4a329fe）。
+GPU の持ち分は、BIOS が割り当てる部分（OS からは見えないので、RAM とは別の置き場になります）と、共有の GTT のプールです。
+GTT のプールは RAM そのもので、カーネルの既定では RAM の約半分です。
+setup は、BIOS の割り当てをエキスパートの置き場（低 RAM モード）に、割り当てと共有の合計を文脈の長さの推奨に使います。
+Strix Halo（gfx1151）は名前で見分け、Radeon 8060S / 8050S / 8040S を名前に出し、メモリが約 80 GB 以上なら UD-IQ4_XS を勧めます。
+GPU が使える共有のメモリを増やすのは、カーネルの起動の選択肢 `ttm.pages_limit` と `ttm.page_pool_size`（4 KiB のページの数）です。
+setup はホストの設定を変えません。
+エンジンは、内蔵 GPU の空きを、ランタイムが報告する値と、Linux が返せるメモリ（`MemAvailable`）から 6 GiB を引いた値の小さい方として数えます（upstream 004b15cd、`STRATA_UMA_HEADROOM_GIB` で 6 を変えられます）。
+AMD の APU での実行は確かめていません（`unverified`）。
+
 ### KV キャッシュの置き場所と精度
 
 **KV のストリーミング**: 文脈が 64K 以上のとき、setup は文脈の KV キャッシュを RAM に置きます。
