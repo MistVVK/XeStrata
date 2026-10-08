@@ -22,7 +22,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
-The same code is compiled for AMD GPUs (the free and contrib builds) and NVIDIA GPUs (the contrib build) as well.
+The same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
 The models, the install, the app and the API are much the same as Strata's.
 
 How it differs from Strata:
@@ -30,7 +30,7 @@ How it differs from Strata:
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
 - **Linux only.** Windows and WSL are not supported.
-- **Runs with free software only, too** (`xestrata-free`, free enough for Debian main). The contrib packages use
+- **Runs with free software only, too** (`xestrata-free`, free enough for Debian main). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).
 
 ## What you need
@@ -127,21 +127,21 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 | Intel (for speed), NVIDIA (Turing or later), or both | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), or Intel and those | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
-- Every contrib package runs on Intel, AMD and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
-- On a PC with Intel GPUs only, take a contrib package and oneMKL for speed.
+- Every contrib-llvm package runs on Intel, AMD and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
+- On a PC with Intel GPUs only, take a contrib-llvm package and oneMKL for speed.
   oneMKL then does the prompt's dense matrix products, a little faster than XeStrata's own kernels (about 3% on a B70).
 - No package requires a GPU maker's driver or library.
   The free package recommends Intel's GPU runtime (Level Zero) and AMD's ROCm libraries for AMD GPUs
   (recommendations are installed by default). The ROCm libraries take about 1.4 GB; without an AMD GPU, leave them
   out with `--no-install-recommends` (apt) or `--setopt=install_weak_deps=False` (dnf), and `xestrata` shows how
   to install Level Zero for an Intel GPU (below).
-  The contrib packages only suggest the makers' ones and install none of them.
+  The contrib-llvm packages only suggest the makers' ones and install none of them.
 - Once a package is installed, `xestrata` shows what the PC's GPUs (Intel, AMD, NVIDIA) and the installed package lack,
   and how to install it (adding a repository first where needed). Without the GPU's runtime (Level Zero, ROCm) it stops
   there. `xestrata --packages` only shows how to install them.
   NVIDIA's driver is not among them: install it yourself.
   Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
-- cuBLAS and oneMKL, which speed up the matrix products (the contrib packages), are not free software; without them
+- cuBLAS and oneMKL, which speed up the matrix products (the contrib-llvm packages), are not free software; without them
   XeStrata's own kernels do the work.
 - An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
   The drivers for Pascal and Volta (a P100, P40 or V100) end with the 580 series.
@@ -232,7 +232,7 @@ Run `xestrata` again. It continues where it stopped.
 Check these three things:
 
 - Check that Intel's GPU runtime (its Level Zero driver), for an AMD GPU the ROCm libraries (HIP, rocBLAS, hipBLASLt),
-  or for an NVIDIA GPU its driver (whether `nvidia-smi` sees it), is installed. NVIDIA GPUs run with the contrib
+  or for an NVIDIA GPU its driver (whether `nvidia-smi` sees it), is installed. NVIDIA GPUs run with the contrib-llvm
   packages only. For an AMD GPU, check also that it is one [XeStrata runs on](#amd-gpus).
 - Check that your user can open the GPU's device (`/dev/dri/renderD*`, and `/dev/kfd` for an AMD GPU; the `render`
   group).
@@ -288,7 +288,7 @@ what has been checked in [docs/XE.md](docs/XE.md).
 
 ## For developers
 
-- **Building:** installing from the source, the three build modes (free, contrib, contrib-icpx), what setup does and the
+- **Building:** installing from the source, the three build modes (free, contrib-llvm, contrib-icpx), what setup does and the
   packages it needs, and how the deb and rpm packages are made are in [docs/BUILD.md](docs/BUILD.md).
   The development tools (lints, Intel SDE, GPU profilers): [docs/DEVTOOLS.md](docs/DEVTOOLS.md).
 - **Rules:** [AGENTS.md](AGENTS.md) covers them: independence from the hardware (code paths chosen from what the GPU
@@ -311,10 +311,10 @@ what has been checked in [docs/XE.md](docs/XE.md).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
-   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib and
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib-llvm and
      contrib-icpx modes, and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
      changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
-   - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib
+   - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).

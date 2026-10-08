@@ -13,7 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 XeStrata xe0.1.39 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
-同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib のビルド、[ビルド](BUILD.ja.md#ビルド)）。
+同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
 upstream の CUDA のビルドは廃止してソースも消しました。
 CUDA のソースは upstream の Strata（`3ce2523`）に残っていて、Xe の各ソースは移植元の CUDA のファイル名をコメントに書いています。
 
@@ -32,7 +32,7 @@ CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用�
 
 upstream の Strata 0.1.39 から 0.1.40.2（`e8ca9afd`）までの変更を、Windows と AMD（HIP）の実装を除いて Xe に移しています。
 upstream の `sycl/`（Intel の GPU 向けの別の移植）はコードに入れず、同じ B70 で速さを比べる相手にしています。
-NVIDIA の GPU では contrib のビルドで同じカーネルが動きます（[BUILD](BUILD.ja.md)）。
+NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きます（[BUILD](BUILD.ja.md)）。
 
 移したものの主なものは次のとおりです。
 
@@ -50,7 +50,7 @@ NVIDIA の GPU では contrib のビルドで同じカーネルが動きます�
 速くするための経路は、B70 か RTX 4070 で速くなり、もう一方で遅くならないものを移しました。
 片方だけで速いものは、機器が報告する値で実行時に選ぶか、opt-in にしています（[記録](../bench/results/2026-10-09-upstream-0140/README.md)）。
 
-取り込みは free（intel/llvm）、contrib-icpx（icpx）、contrib（intel/llvm と CUDA）でビルドし、どれも CTest の 71 件が通ります（`expert_multi_test` は AVX-512 のない CPU で飛ばします）。
+取り込みは free（intel/llvm）、contrib-icpx（icpx）、contrib-llvm（intel/llvm と CUDA）でビルドし、どれも CTest の 71 件が通ります（`expert_multi_test` は AVX-512 のない CPU で飛ばします）。
 AVX-512 の経路は Intel SDE（`-icx`）で `expert_multi_test` が通ります。
 `expert_parity --selftest` と `pool_test --selftest` は正準形の pack がないので SDE では動かせず、`unverified` です（AVX2 では通ります）。
 B70 では icpx と free のビルドが 8 つの答え（思考あり・なし）をすべて最後まで出し、6 つが一致しました。

@@ -75,7 +75,7 @@ This runtime gives the Arc Pro B70 XMX (FP16 and BF16); 6.2's does not.
 
 ### HIP (AMD GPUs)
 
-Where ROCm's HIP is installed, the script builds the HIP target (AMD GPUs) as well, in the free mode and the contrib one.
+Where ROCm's HIP is installed, the script builds the HIP target (AMD GPUs) as well, in the free mode and the contrib-llvm one.
 HIP and ROCm are free software, in Ubuntu's universe and Fedora's repositories.
 
 ```sh
@@ -90,9 +90,9 @@ sudo dnf install hipcc rocm-hip-devel rocm-runtime-devel rocm-device-libs rocmin
 - In a Fedora 44 container (ROCm 7.1.1), a SYCL kernel compiled with `-fsycl-targets=amd_gpu_gfx1200` ran correctly on an RX 9060 XT (gfx1200).
   The HIP adapter reports 1 GiB as the largest allocation, but 12 GiB could be allocated.
 
-### The contrib build (CUDA)
+### The contrib-llvm build (CUDA)
 
-The contrib build ([BUILD.md](BUILD.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
+The contrib-llvm build ([BUILD.md](BUILD.md#build-and-run)) also makes code for NVIDIA GPUs, with intel/llvm built with its CUDA target.
 `--contrib` builds the same clone with the CUDA target (and HIP where ROCm is installed) into `.tools/intel-llvm-contrib/`.
 The CUDA target needs NVIDIA's CUDA toolkit, which is not free software (Ubuntu: multiverse; Debian: non-free).
 
@@ -137,7 +137,7 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   AMD images carry no `compile_target`; the runtime asked the HIP adapter about each image alone without handing it the image, and the adapter falls back on the first AMD image when none matches.
   An engine for many AMD GPUs, as the packages build it, stopped with no usable GPU (kernels submitted to a queue were not affected: that path hands the adapter all the images and their bytes).
   Fixed, the runtime hands the HIP adapter the image too, as it does the CUDA one, and the adapter does not fall back on a clang offload bundle without the GPU's architecture (`hip-bundle-arch`).
-  The CUDA fixes ask only the contrib toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
+  The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
   It ran beside other builds, so its time alone was not measured.

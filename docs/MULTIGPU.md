@@ -8,7 +8,7 @@ The model's layers can be spread over two or more GPUs in one PC.
 The first GPU runs the early layers, the next GPU the layers after them.
 Each GPU holds its own layers' dense weights (the PLE tensors on every GPU), their sessions (the GDN recurrent state, the QSA K/V) and an expert cache of its own.
 The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
-GPUs of different makers can be combined (Intel and NVIDIA, in the contrib build).
+GPUs of different makers can be combined (Intel and NVIDIA, in the contrib-llvm build).
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
 The prompt path borrows its buffers from each GPU's expert cache, as on one GPU (with one chunk size on every GPU).

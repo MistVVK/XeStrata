@@ -256,7 +256,7 @@ This adds only what the README leaves out.
 
 - **Packages**: with the deb and rpm packages ([README](../README.md#install)), apt or dnf installs what is needed.
   From the source, an Intel GPU needs its runtime (Level Zero), an AMD GPU ROCm (HIP, rocBLAS, hipBLASLt and others),
-  an NVIDIA GPU its driver and the CUDA toolkit, and an Intel GPU in the default contrib build oneMKL.
+  an NVIDIA GPU its driver and the CUDA toolkit, and an Intel GPU in the default contrib-llvm build oneMKL.
   setup can build the SYCL compiler (intel/llvm).
   setup installs no system packages, so install them first.
   What Ubuntu 26.04 and Fedora 44 need is in [BUILD.md](BUILD.md#packages), and `./setup.sh --packages` prints the one-line command for this PC.
@@ -1124,9 +1124,9 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Symptom | What to do |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, the AMD GPU not on amdgpu, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
-| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib build only: run setup again with `--license contrib`. |
+| `an NVIDIA GPU needs the contrib build` | `--license free` or `--license contrib-icpx` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm or contrib-icpx build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
 | `no access to the GPU` | Your user cannot open `/dev/dri/renderD*`: `sudo usermod -aG render $USER`, then log in again. |
 | `no access to the GPU's compute device (/dev/kfd)` | Your user cannot open `/dev/kfd`, which AMD GPUs compute through: `sudo usermod -aG render $USER`, then log in again. |
 | `... the engine needs an RDNA2 or later AMD GPU` | AMD GPUs older than RDNA2 do not run it. |
@@ -1176,7 +1176,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
   The drafts are checked like the MTP's, so the output is the same.
 - **Prompts** are processed in chunks of up to 32,768 tokens, with the experts streamed to the GPU over PCIe.
   The matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA
-  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib and contrib-icpx builds, and to
+  GPUs, and the dense ones go through oneMath: to oneMKL or cuBLAS in the contrib-llvm and contrib-icpx builds, and to
   rocBLAS and hipBLASLt on AMD GPUs.
 
 Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)** (measured on CUDA).
@@ -1201,9 +1201,9 @@ The model files are not part of it; their licenses apply to them (below).
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
-- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib and contrib-icpx modes, and to rocBLAS and hipBLASLt (AMD) in the free and contrib modes.
+- **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm and contrib-icpx modes, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
   It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.
-- **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib modes' compiler and SYCL runtime.
+- **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
 - **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and [HyperQwen](https://github.com/syv-ai/HyperQwen);

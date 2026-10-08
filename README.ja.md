@@ -22,7 +22,7 @@ GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれかを 1 枚�
 
 [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）を、Intel の GPU に移したものです。
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU で動くようにしました。
-同じコードを、AMD の GPU 向け（free と contrib のビルド）と NVIDIA の GPU 向け（contrib のビルド）にもコンパイルします。
+同じコードを、AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
 Strata との主な違い:
@@ -31,7 +31,7 @@ Strata との主な違い:
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **Linux だけ**です。Windows と WSL には対応しません。
 - **自由ソフトウェアだけでも動きます**（`xestrata-free`、Debian main に入れられる程度に自由な構成）。
-  contrib の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
+  contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
 
 ## 必要なもの
 
@@ -123,20 +123,20 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 | Intel（速さを重視する）、NVIDIA（Turing 以降）、その両方 | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA の Pascal と Volta（P100、P40、V100 など）、Intel とそれらの両方 | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
-- contrib の版は、どれも Intel、AMD、NVIDIA の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
-- Intel の GPU だけの PC でも、速さを重視するなら contrib の版と oneMKL を入れます。
+- contrib-llvm の版は、どれも Intel、AMD、NVIDIA の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
+- Intel の GPU だけの PC でも、速さを重視するなら contrib-llvm の版と oneMKL を入れます。
   プロンプトの密な行列積を oneMKL で計算し、XeStrata 自身のカーネルより少し速くなります（B70 で 3% ほど）。
 - どのパッケージも、GPU のメーカーのドライバーやライブラリを必須にはしません。
   free の版は Intel の GPU のランタイム（Level Zero）と AMD の GPU の ROCm のライブラリを推奨（Recommends、既定で入ります）にします。
   ROCm のライブラリは 1.4 GB ほどあります。AMD の GPU がなければ、`--no-install-recommends`（apt）や
   `--setopt=install_weak_deps=False`（dnf）で外せます。その場合、Intel の GPU の Level Zero の入れ方は `xestrata` が表示します（下）。
-  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。
+  contrib-llvm の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。
 - 入れたあとで `xestrata` を実行すると、PC の GPU（Intel、AMD、NVIDIA）と入れた版に合わせて、足りないものと、その入れ方
   （要るならリポジトリの登録から）を表示します。GPU のランタイム（Level Zero、ROCm）がなければ、そこで止まります。
   `xestrata --packages` は、入れ方だけを表示します。
   NVIDIA のドライバーは、ここには出ないので、自分で入れます。
   自分のユーザーを `render` グループに入れておきます（`sudo usermod -aG render $USER` の後、ログインし直す）。
-- 行列積を速くする cuBLAS と oneMKL（contrib の版）は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
+- 行列積を速くする cuBLAS と oneMKL（contrib-llvm の版）は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
 - NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
   Pascal と Volta（P100、P40、V100 など）を扱うドライバーは 580 の系列までです。
 - パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
@@ -224,7 +224,7 @@ sudo dnf remove xestrata-free    # Fedora（同じ）
 
 - Intel の GPU のランタイム（Level Zero のドライバー）、AMD の GPU なら ROCm のライブラリ（HIP、rocBLAS、hipBLASLt）、
   NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください。
-  NVIDIA の GPU は contrib の版でだけ使えます。AMD の GPU は、[対応する GPU](#amd-の-gpu)かどうかも確かめてください。
+  NVIDIA の GPU は contrib-llvm の版でだけ使えます。AMD の GPU は、[対応する GPU](#amd-の-gpu)かどうかも確かめてください。
 - 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`、AMD の GPU では `/dev/kfd` も）を開けるか確かめてください（`render` グループ）。
 - 単体の GPU が OS から見えないときは、BIOS の Above 4G Decoding と Re-Size BAR を確かめてください。
 
@@ -276,7 +276,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 ## 開発する人へ
 
-- **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib、contrib-icpx）、setup の振る舞いと要るパッケージ、
+- **ビルド**: ソースから入れる方法、ビルドの 3 つの方式（free、contrib-llvm、contrib-icpx）、setup の振る舞いと要るパッケージ、
   deb と rpm のパッケージの作り方は [docs/BUILD.ja.md](docs/BUILD.ja.md) にあります。
   開発に使う道具（リント、Intel SDE、GPU のプロファイラー）は [docs/DEVTOOLS.ja.md](docs/DEVTOOLS.ja.md) にあります。
 - **守ること**: 機器に依存しないこと（GPU と CPU が報告する能力で経路を選ぶ）、リント（`tools/lint/run.sh`）、
@@ -298,9 +298,9 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
-   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib と contrib-icpx、free では AMD の GPU）。
+   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm と contrib-icpx、free では AMD の GPU）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
-   - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラ。
+   - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、

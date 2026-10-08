@@ -21,12 +21,12 @@ On a distribution without the packages, or for development, install from the rep
 
 setup checks the GPU, RAM and CPU, chooses a SYCL compiler and builds the engine ([Setup](#setup)), downloads the model and starts it.
 
-- **Compiler**: the default is the contrib build, with intel/llvm's DPC++ 7 or later, the one with the CUDA target when there is an NVIDIA GPU.
+- **Compiler**: the default is the contrib-llvm build, with intel/llvm's DPC++ 7 or later, the one with the CUDA target when there is an NVIDIA GPU.
   When the distribution's `dpclang++` is older, setup asks whether to build intel/llvm here (about 13 minutes;
   [details](#the-sycl-compiler)).
   When the GPU's XMX cannot be used, it asks whether to build without XMX or stop.
 
-  contrib uses parts that are not free software (oneMKL, and for NVIDIA GPUs the CUDA toolkit).
+  contrib-llvm uses parts that are not free software (oneMKL, and for NVIDIA GPUs the CUDA toolkit).
   `--license free` builds with free software only (Intel GPUs), `--license contrib-icpx` with Intel oneAPI's icpx.
 - **Time**: the first run takes a while for the download (60-110 GB) and the build. If it stops, the next run continues.
 - **Where things go**: the model files in `XeStrata-data` next to the XeStrata folder, the model configs
@@ -50,13 +50,13 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   6.2's SYCL runtime reported no XMX for the Arc Pro B70, and the prompt path took about 1.6 times as long
   ([record](../bench/results/2026-10-02-dp4a/README.md)).
   With intel/llvm built with ROCm's HIP, `STRATA_HIP_ARCHS` (`gfx1200`, for example) makes the code for AMD GPUs (RDNA2 and later: gfx103x, gfx11xx, gfx12xx) as well.
-  ROCm is free software, so this is the same in the free and contrib modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
+  ROCm is free software, so this is the same in the free and contrib-llvm modes ([DEVTOOLS.md](DEVTOOLS.md#hip-amd-gpus)).
   `auto` (the default) takes this PC's AMD GPUs as the kernel's KFD reports them, and `rocblas` every RDNA2 or later GPU the distribution's rocBLAS has code for and the SYCL compiler has a target for (the packages are built so; intel/llvm 7.1.1 has none for gfx1152 and gfx1153).
   `STRATA_ROCM_DEVICE_LIBS` gives the place of ROCm's device libraries (`ockl.bc`).
   An AMD GPU's dense products run in oneMath's rocBLAS backend, which the fork's change makes hand those with 16-bit inputs to hipBLASLt.
   Without hipBLASLt, CMake warns (and stops with `STRATA_PACKAGE=ON`), and those products run in rocBLAS alone (at about a fifteenth of the speed on gfx12).
   Validated: CTest passes on an RX 9060 XT (gfx1200, Fedora 44, ROCm 7.1.1).
-- **contrib** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
+- **contrib-llvm** (the default, `-DSTRATA_LICENSE=contrib`): intel/llvm built with its CUDA target (`tools/intel_llvm_build.py --contrib`), and with `STRATA_CUDA_ARCHS` (`sm_89`, for example) the code for NVIDIA GPUs as well.
   XeStrata's source is the free mode's and stays free software,
   but the build needs NVIDIA's CUDA toolkit and a run NVIDIA's driver, neither of them free software (XeStrata ships neither).
   Validated to build for sm_89 with Ubuntu 26.04's `nvidia-cuda-toolkit` 12.4 and intel/llvm v7.1.1.
@@ -68,7 +68,7 @@ The engine builds in three modes (AGENTS.md, "Free and non-free builds"), chosen
   Source oneAPI's environment before building. Intel GPUs only:
   Codeplay's plugins that gave icpx NVIDIA and AMD targets ended with oneAPI 2025.2, and from 2025.3 the CUDA and HIP adapters are not released as binaries.
 
-The contrib and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
+The contrib-llvm and contrib-icpx modes hand the prompt path's dense matrix products (`src/prefill/gemm.cpp`) to oneMath (Apache-2.0):
 oneMKL on Intel GPUs, cuBLAS on NVIDIA ones.
 Which backends are built follows the GPUs of the machine it is built on (every maker it has).
 An Intel GPU brings the oneMKL backend (`STRATA_ONEMKL`), which needs oneMKL (oneAPI's `intel-oneapi-mkl-devel`, found at `MKL_ROOT`, else `MKLROOT`, else `/opt/intel/oneapi/mkl/latest`).
@@ -105,8 +105,8 @@ On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error
 `STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
 `STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
 to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
-With `STRATA_NO_BF16_MMA=1` the contrib modes do not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
-`STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib modes too (to compare).
+With `STRATA_NO_BF16_MMA=1` the contrib-llvm and contrib-icpx modes do not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
+`STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm and contrib-icpx modes too (to compare).
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
 On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prompt path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
@@ -196,7 +196,7 @@ cmake --build build/llvm7 --target strata -j6
 ```
 
 With icpx: `source /opt/intel/oneapi/setvars.sh`, then `-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` instead.
-For NVIDIA GPUs (contrib), with intel/llvm built by `tools/intel_llvm_build.py --contrib`:
+For NVIDIA GPUs (contrib-llvm), with intel/llvm built by `tools/intel_llvm_build.py --contrib`:
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
@@ -249,24 +249,24 @@ Several GPUs are chosen with setup's `--gpus` (a layer split, [MULTIGPU](MULTIGP
 
 ### The SYCL compiler
 
-setup builds in the mode `--license` names ([above](#build-and-run)), contrib unless told otherwise.
+setup builds in the mode `--license` names ([above](#build-and-run)), contrib-llvm unless told otherwise.
 
 - **free**: a free compiler, for Intel GPUs (chosen in the order below).
-- **contrib**: for Intel and NVIDIA GPUs.
+- **contrib-llvm**: for Intel and NVIDIA GPUs.
   With an NVIDIA GPU on the machine it uses intel/llvm with its CUDA target (`.tools/intel-llvm-contrib`; without one, setup asks and builds it here),
   without one a compiler chosen as for free.
   The NVIDIA GPUs' architectures come from what nvidia-smi reports (the compute capability), and then NVIDIA's CUDA toolkit (`nvcc`) is needed.
 - **contrib-icpx**: Intel oneAPI's icpx, for Intel GPUs, with the SYCL image encoder.
 
-With an AMD GPU on the machine, free and contrib make the code for its gfx as well (`STRATA_HIP_ARCHS`).
+With an AMD GPU on the machine, free and contrib-llvm make the code for its gfx as well (`STRATA_HIP_ARCHS`).
 They then use intel/llvm built here, not the distribution's `dpclang++`.
 Without ROCm's packages ([the table below](#packages)), setup names the missing ones and stops.
 When the intel/llvm built here has no HIP target (built before ROCm was installed), setup asks whether to build it again.
 contrib-icpx cannot use AMD GPUs.
 
-contrib stops without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`) when the machine has an Intel GPU, and without the CUDA toolkit (`nvcc` and cuBLAS) when it has NVIDIA GPUs; with both, it wants both.
+contrib-llvm stops without oneMKL (`MKLROOT`, else `/opt/intel/oneapi/mkl/latest`) when the machine has an Intel GPU, and without the CUDA toolkit (`nvcc` and cuBLAS) when it has NVIDIA GPUs; with both, it wants both.
 contrib-icpx stops without oneMKL.
-NVIDIA GPUs can be used in the contrib mode only.
+NVIDIA GPUs can be used in the contrib-llvm mode only.
 The mode, a `--intel-llvm DIR` and an accepted build without XMX are kept in the settings for later runs.
 An older settings file's `nonfree` (icpx allowed) is read as contrib-icpx.
 
@@ -314,17 +314,17 @@ setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedor
 Install the other packages first.
 
 From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora).
-`./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib unless given).
+`./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib-llvm unless given).
 It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --license free`.
 
 | Choice | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| common (free, contrib) | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
 | common (contrib-icpx) | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
 | Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
-| Intel GPUs (contrib) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
-| AMD GPUs (free, contrib) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
-| NVIDIA GPUs (contrib) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver |
+| Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
+| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
+| NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
 - The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)).
@@ -419,7 +419,7 @@ Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package 
 - No package requires a GPU maker's driver or library.
   The free package recommends Intel's Level Zero driver and, for AMD GPUs, ROCm's libraries (the HIP runtime, rocBLAS,
   hipBLASLt), all free software.
-  The contrib packages, which go on a PC with Intel, NVIDIA or AMD GPUs, only suggest the makers' ones (Level Zero, cuBLAS,
+  The contrib-llvm packages, which go on a PC with Intel, NVIDIA or AMD GPUs, only suggest the makers' ones (Level Zero, cuBLAS,
   oneMKL, ROCm's HIP runtime, rocBLAS and hipBLASLt): apt and dnf install recommendations by default, which would bring another maker's too.
   The UR adapters and oneMath's backends open them at run time, so the packages install without them, and a GPU without them is not used.
 - Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is bundled.

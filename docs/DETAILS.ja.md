@@ -256,7 +256,7 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 
 - **パッケージ**: deb と rpm のパッケージ（[README](../README.ja.md#インストール)）なら、要るものは apt や dnf が入れます。
   ソースから入れるときは、Intel の GPU にはそのランタイム（Level Zero）、AMD の GPU には ROCm（HIP、rocBLAS、hipBLASLt ほか）、
-  NVIDIA の GPU にはドライバーと CUDA ツールキット、既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。
+  NVIDIA の GPU にはドライバーと CUDA ツールキット、既定の contrib-llvm のビルドで Intel の GPU を使うなら oneMKL が要ります。
   SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、先に入れておきます。
   Ubuntu 26.04 と Fedora 44 で要るものは [BUILD.ja.md](BUILD.ja.md#パッケージ) にあり、`./setup.sh --packages` がこの PC に合わせた 1 行のコマンドを出します。
@@ -1128,9 +1128,9 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 症状 | すること |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、AMD の GPU が amdgpu に、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
-| `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
+| `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
-| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
+| `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `no access to the GPU's compute device (/dev/kfd)` | AMD の GPU の計算に使う `/dev/kfd` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
 | `... the engine needs an RDNA2 or later AMD GPU` | RDNA2 より前の AMD の GPU では動きません。 |
@@ -1178,7 +1178,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **プロンプト**は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
   行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
-  密な行列積は oneMath 経由で、contrib と contrib-icpx のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
+  密な行列積は oneMath 経由で、contrib-llvm と contrib-icpx のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
 Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**（英語、CUDA での測定）にあります。
 
@@ -1202,9 +1202,9 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
-- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib と contrib-icpx では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib では rocBLAS と hipBLASLt（AMD）に渡す層。
+- **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm と contrib-icpx では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
   リポジトリには含めず、CMake が XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)。XeStrata の変更として cuBLAS の BF16 の積と rocBLAS の後端の hipBLASLt が入った oneMath）を取ってきます。oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。
-- **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラと SYCL のランタイム。
+- **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
 - **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)。

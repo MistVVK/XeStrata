@@ -120,7 +120,7 @@ python3 tools/parking_test.py --exe build/xe/strata --config xestrata-<model>.js
 STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
 ```
 
-All four passed on the B70 (IQ2_XS, contrib build) on 2026-10-06.
+All four passed on the B70 (IQ2_XS, contrib-llvm build) on 2026-10-06.
 
 ## Engine protocol (`--serve`)
 

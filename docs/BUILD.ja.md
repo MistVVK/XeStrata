@@ -20,12 +20,12 @@ XeStrata をソースから入れる方法、エンジンのビルドの方式�
 
 setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選んでエンジンをビルドし（[setup](#setup)）、モデルをダウンロードして起動します。
 
-- **コンパイラ**: 既定は contrib のビルドで、intel/llvm の DPC++ 7 以降を使い、NVIDIA の GPU があれば CUDA のターゲット付きのものにします。
+- **コンパイラ**: 既定は contrib-llvm のビルドで、intel/llvm の DPC++ 7 以降を使い、NVIDIA の GPU があれば CUDA のターゲット付きのものにします。
   ディストリビューションの `dpclang++` が 7 より古ければ、setup はこの場で intel/llvm をビルドするかを尋ねます（13 分ほど、
   [詳細](#sycl-のコンパイラ)）。
   GPU の XMX が使えないときは、XMX なしでビルドするか止めるかを尋ねます。
 
-  contrib は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
+  contrib-llvm は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
   `--license free` で自由ソフトウェアだけ（Intel の GPU）、`--license contrib-icpx` で Intel oneAPI の icpx のビルドにします。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
 - **置き場所**: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは
@@ -51,13 +51,13 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   6.2 の SYCL ランタイムは Arc Pro B70 に XMX がないと報告し、プロンプトの経路が約 1.6 倍遅くなっていました
   （[記録](../bench/results/2026-10-02-dp4a/README.md)）。
   ROCm の HIP 付きでビルドした intel/llvm なら、`STRATA_HIP_ARCHS`（例 `gfx1200`）で AMD の GPU（RDNA2 以降: gfx103x、gfx11xx、gfx12xx）向けのコードも作ります。
-  ROCm は自由ソフトウェアなので、free でも contrib でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
+  ROCm は自由ソフトウェアなので、free でも contrib-llvm でも同じです（[DEVTOOLS.ja.md](DEVTOOLS.ja.md#hipamd-の-gpu)）。
   `auto`（既定）はカーネルの KFD が報告するこの PC の AMD の GPU を選び、`rocblas` はディストリビューションの rocBLAS がコードを持つ RDNA2 以降の GPU のうち、SYCL のコンパイラにターゲットのあるものをすべて選びます（パッケージはこれでビルドします。intel/llvm 7.1.1 には gfx1152 と gfx1153 のターゲットがありません）。
   ROCm のデバイスライブラリ（`ockl.bc`）の場所は `STRATA_ROCM_DEVICE_LIBS` で変えられます。
   AMD の GPU の密な積は oneMath の rocBLAS の後端で計算し、フォークの変更で、16 ビットの入力の積は hipBLASLt に回します。
   hipBLASLt が見つからないと CMake は警告し（`STRATA_PACKAGE=ON` では止まります）、その積は rocBLAS だけで計算します（gfx12 では 15 分の 1 ほどの速さでした）。
   RX 9060 XT（gfx1200、Fedora 44、ROCm 7.1.1）で CTest が通ることを確かめています。
-- **contrib**（既定、`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
+- **contrib-llvm**（既定、`-DSTRATA_LICENSE=contrib`）: intel/llvm を CUDA のターゲット付きでビルドしたもの（`tools/intel_llvm_build.py --contrib`）を使い、
   `STRATA_CUDA_ARCHS`（例 `sm_89`）で NVIDIA の GPU 向けのコードも作ります。
   XeStrata のソースは free のときと同じで、自由ソフトウェアのままです。
   ただし、ビルドに NVIDIA の CUDA ツールキット、実行に NVIDIA のドライバが要り、どちらも自由ソフトウェアではありません（XeStrata には含めません）。
@@ -70,7 +70,7 @@ CMake のオプション `STRATA_LICENSE` で選びます。
   ビルドの前に oneAPI の環境を読み込みます。Intel の GPU だけを扱います。
   icpx に NVIDIA・AMD のターゲットを足す Codeplay のプラグインは oneAPI 2025.2 で終わり、2025.3 からは CUDA・HIP のアダプタがバイナリで出ないためです。
 
-contrib と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（Apache-2.0）経由で、
+contrib-llvm と contrib-icpx では、プロンプトの経路の密な行列積（`src/prefill/gemm.cpp`）を oneMath（Apache-2.0）経由で、
 Intel の GPU では oneMKL、NVIDIA の GPU では cuBLAS に任せます。
 どの後端を作るかは、ビルドする機械の GPU で決めます（メーカーが複数あればすべて）。
 Intel の GPU があれば oneMKL の後端（`STRATA_ONEMKL`）を作り、oneMKL（oneAPI の `intel-oneapi-mkl-devel`。場所は `MKL_ROOT`、なければ `MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）が要ります。
@@ -107,8 +107,8 @@ A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくな
 `STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
 `STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
 行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
-`STRATA_NO_BF16_MMA=1` のときは、contrib のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
-`STRATA_NO_BLAS=1` は、contrib のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+`STRATA_NO_BF16_MMA=1` のときは、contrib-llvm と contrib-icpx のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
+`STRATA_NO_BLAS=1` は、contrib-llvm と contrib-icpx のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
 行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、プロンプトの経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
@@ -198,7 +198,7 @@ cmake --build build/llvm7 --target strata -j6
 ```
 
 icpx では、`source /opt/intel/oneapi/setvars.sh` を読み込み、`-DCMAKE_CXX_COMPILER=icpx -DSTRATA_LICENSE=contrib-icpx` に替えます。
-NVIDIA の GPU 向け（contrib）では、`tools/intel_llvm_build.py --contrib` でビルドした intel/llvm を使います。
+NVIDIA の GPU 向け（contrib-llvm）では、`tools/intel_llvm_build.py --contrib` でビルドした intel/llvm を使います。
 
 ```bash
 C=$PWD/.tools/intel-llvm-contrib/install
@@ -252,24 +252,24 @@ icpx なら oneAPI のもの、ここで作った intel/llvm ならそのもの�
 
 ### SYCL のコンパイラ
 
-setup は、`--license` で選んだモード（[上](#ビルド)）でビルドします。指定がなければ contrib です。
+setup は、`--license` で選んだモード（[上](#ビルド)）でビルドします。指定がなければ contrib-llvm です。
 
 - **free**: 自由ソフトウェアのコンパイラで、Intel の GPU 向けに作ります（下の順で選びます）。
-- **contrib**: Intel と NVIDIA の GPU 向けに作ります。
+- **contrib-llvm**: Intel と NVIDIA の GPU 向けに作ります。
   NVIDIA の GPU があれば CUDA のターゲット付きの intel/llvm（`.tools/intel-llvm-contrib`、なければ尋ねてからここでビルドします）を、
   なければ free と同じ順で選んだコンパイラを使います。
   NVIDIA の GPU のアーキテクチャは nvidia-smi の報告（compute capability）から決め、そのときは NVIDIA の CUDA ツールキット（`nvcc`）が要ります。
 - **contrib-icpx**: Intel oneAPI の icpx で、Intel の GPU 向けに作り、画像のエンコーダーは SYCL のものにします。
 
-AMD の GPU があれば、free と contrib は、その GPU の gfx 向けのコードも作ります（`STRATA_HIP_ARCHS`）。
+AMD の GPU があれば、free と contrib-llvm は、その GPU の gfx 向けのコードも作ります（`STRATA_HIP_ARCHS`）。
 このときはディストリビューションの `dpclang++` を使わず、ここでビルドした intel/llvm を使います。
 ROCm のパッケージ（[下の表](#パッケージ)）が足りなければ、その名前を表示して止まります。
 ここでビルドした intel/llvm に HIP のターゲットがなければ（ROCm を入れる前にビルドしたもの）、ビルドし直すかを尋ねます。
 contrib-icpx では AMD の GPU は使えません。
 
-contrib は、この機械に Intel の GPU があれば oneMKL（`MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）、NVIDIA の GPU があれば CUDA ツールキット（`nvcc` と cuBLAS）がないと止まります。両方あれば両方を求めます。
+contrib-llvm は、この機械に Intel の GPU があれば oneMKL（`MKLROOT`、なければ `/opt/intel/oneapi/mkl/latest`）、NVIDIA の GPU があれば CUDA ツールキット（`nvcc` と cuBLAS）がないと止まります。両方あれば両方を求めます。
 contrib-icpx は oneMKL がないと止まります。
-NVIDIA の GPU は contrib でだけ使えます。
+NVIDIA の GPU は contrib-llvm でだけ使えます。
 モード、`--intel-llvm DIR`、XMX なしのビルドを受け入れたことは、設定に記録して次回以降も使います。
 以前の設定の `nonfree`（icpx を許す）は contrib-icpx として読みます。
 
@@ -317,17 +317,17 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 ほかのパッケージは、先に自分で入れておきます。
 
 次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`）の後ろに並べます。
-`./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib）に合わせて、その 1 行を出します。
+`./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib-llvm）に合わせて、その 1 行を出します。
 `./setup.sh --packages fedora44/intel,amd --license free` のように、ほかの組み合わせも出せます。
 
 | 選択 | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| 共通（free、contrib） | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
+| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
 | 共通（contrib-icpx） | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
 | Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
-| Intel の GPU（contrib） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
-| AMD の GPU（free、contrib） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
-| NVIDIA の GPU（contrib） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー |
+| Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
+| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
+| NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
 - 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)）のためです。
@@ -420,7 +420,7 @@ AMD のコードは、どの版にも、そのディストリビューション�
   同梱したライブラリは、依存にも提供にも出しません。
 - GPU のメーカーのドライバーとライブラリは、どのパッケージも必須にしません。
   free の版は Intel の Level Zero のドライバーと、AMD の GPU の ROCm のライブラリ（HIP の実行時、rocBLAS、hipBLASLt）を推奨（Recommends）にします。どちらも自由ソフトウェアです。
-  contrib の版は Intel・NVIDIA・AMD のどの GPU の PC にも入るように、メーカーのもの（Level Zero、cuBLAS、oneMKL、ROCm の HIP の実行時と rocBLAS と hipBLASLt）を
+  contrib-llvm の版は Intel・NVIDIA・AMD のどの GPU の PC にも入るように、メーカーのもの（Level Zero、cuBLAS、oneMKL、ROCm の HIP の実行時と rocBLAS と hipBLASLt）を
   すべて提案（Suggests）に留めます。apt も dnf も推奨は既定で入れるので、推奨にすると使わないメーカーのものまで入るためです。
   UR のアダプターと oneMath の後端がそれらを実行時に開くだけなので、なくても入り、ない GPU は使いません。
 - 自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は同梱しません。

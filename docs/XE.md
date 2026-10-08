@@ -13,7 +13,7 @@ The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its transla
 XeStrata xe0.1.39 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version follows the upstream version it has integrated.
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
-The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib build, [Build and run](BUILD.md#build-and-run)).
+The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
 Upstream's CUDA build is retired and its sources are removed.
 Upstream Strata (`3ce2523`) keeps them, and each Xe source names the CUDA file it ports in a comment.
 
@@ -31,7 +31,7 @@ The processor's own graphics (a UHD 770 on the development machine) is a second,
 
 The changes of upstream Strata 0.1.39 to 0.1.40.2 (`e8ca9afd`) are carried into Xe, except the Windows and AMD (HIP) implementations.
 Upstream's `sycl/` (another port to Intel GPUs) is not taken in: it is measured against on the same B70.
-On NVIDIA GPUs the same kernels run in the contrib build ([BUILD](BUILD.md)).
+On NVIDIA GPUs the same kernels run in the contrib-llvm build ([BUILD](BUILD.md)).
 
 The main things carried:
 
@@ -49,7 +49,7 @@ The main things carried:
 Of the paths meant to be faster, those faster on the B70 or the RTX 4070 without being slower on the other are carried.
 One faster on only one of them is chosen at run time from what the device reports, or is opt-in ([record](../bench/results/2026-10-09-upstream-0140/README.md)).
 
-The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib (intel/llvm with CUDA) modes, and all 71 CTest cases pass in each (`expert_multi_test` skips on a CPU without AVX-512).
+The integration builds in the free (intel/llvm), contrib-icpx (icpx) and contrib-llvm (intel/llvm with CUDA) modes, and all 71 CTest cases pass in each (`expert_multi_test` skips on a CPU without AVX-512).
 The AVX-512 path passes `expert_multi_test` under Intel SDE (`-icx`).
 `expert_parity --selftest` and `pool_test --selftest` need the canonical pack and cannot run under SDE: `unverified` (they pass on AVX2).
 On the B70 the icpx and free builds completed all eight answers (thinking on and off), six of them identical.
