@@ -331,6 +331,10 @@ contrib（`--license contrib`）では、free の列のうち intel/llvm をビ�
 
 AMD の GPU には、free でも contrib でも、ROCm の `libamdhip64-dev`、`rocm-device-libs-21`、`clang-21`、`libclang-rt-21-dev`、
 `librocblas-dev`、`libhipblaslt-dev`、`libhipblas-common-dev`（universe）が要ります（Ubuntu で AMD の GPU を動かすことは `unverified` です）。
+このうち `clang-21` と `libclang-rt-21-dev`（ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
+oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
+intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
+要るのはビルドのときだけで、実行には要りません。
 
 #### Fedora 44
 
@@ -348,6 +352,7 @@ intel/llvm v7.1.1 のビルドに 14 分かかり、B70 に XMX が使えて、�
 
 AMD の GPU には、`rocm-hip-devel`、`rocm-device-libs`、`rocm-clang`、`rocm-clang-runtime-devel`、`rocblas-devel`、`hipblaslt-devel`、`hipblas-common-devel` が要ります
 （7.1.1、RX 9060 XT のコンテナで確かめています）。
+`rocm-clang` と `rocm-clang-runtime-devel` は、Ubuntu の `clang-21` と `libclang-rt-21-dev` と同じく、HIP の CMake のパッケージのためにビルドのときだけ要ります。
 
 `intel-compute-runtime`（OpenCL）も入れて試しましたが、Ubuntu での記録のとおり、エンジンには要らないはずです（`unverified`）。
 画像のエンコーダーに要るパッケージと、Fedora 自身のカーネルでの動作は確かめていません（`unverified`）。

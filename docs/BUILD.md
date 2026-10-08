@@ -328,6 +328,10 @@ The contrib mode (`--license contrib`) needs the free column's packages for buil
 
 An AMD GPU needs, in the free and contrib modes, ROCm's `libamdhip64-dev`, `rocm-device-libs-21`, `clang-21`, `libclang-rt-21-dev`,
 `librocblas-dev`, `libhipblaslt-dev` and `libhipblas-common-dev` (universe; running an AMD GPU on Ubuntu is `unverified`).
+Of these, `clang-21` and `libclang-rt-21-dev` (ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
+HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
+intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
+They are needed to build only, not to run.
 
 #### Fedora 44
 
@@ -345,6 +349,7 @@ intel/llvm v7.1.1 built in 14 minutes, the B70 got XMX, and the model it started
 
 An AMD GPU needs `rocm-hip-devel`, `rocm-device-libs`, `rocm-clang`, `rocm-clang-runtime-devel`, `rocblas-devel`, `hipblaslt-devel` and `hipblas-common-devel`
 (7.1.1, checked in a container with an RX 9060 XT).
+`rocm-clang` and `rocm-clang-runtime-devel`, like Ubuntu's `clang-21` and `libclang-rt-21-dev`, are needed to build only, for HIP's CMake package.
 
 `intel-compute-runtime` (OpenCL) was installed too; as on Ubuntu, the engine should not need it (`unverified`).
 The packages for the image encoders and running on Fedora's own kernel are not checked (`unverified`).
