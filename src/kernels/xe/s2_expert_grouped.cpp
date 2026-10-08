@@ -27,6 +27,7 @@ using xe::dp4a;
 
 constexpr int H = 2560;
 constexpr int FF = 640;
+static_assert(FF % 32 == 0, "swiglu_q8_launch works in whole 32-value blocks");
 constexpr int QK = 64;                       // Q2_0's group: one fp16 scale per 64 weights
 constexpr int ROW_GU = H / 4;                // 640 B of codes per gate/up row (2 bits per element)
 constexpr int ROW_D = FF / 4;                // 160 B per down row
@@ -117,6 +118,40 @@ sycl::event swiglu_launch(sycl::queue& q, float* gate_up, long long n_pairs) {
         const float g = gate_up[i];
         const float u = gate_up[n_pairs + i];
         gate_up[i] = (g / (1.0f + sycl::exp(-g))) * u;
+    });
+}
+
+// swiglu_launch and quantize_q8_0_scaled in one kernel (upstream 3281ac32): one sub-group a 32-value block, each lane
+// its value's SwiGLU (written back to gate_up) and the block's scaled Q8_0, the same arithmetic as the two launches
+sycl::event swiglu_q8_launch(sycl::queue& q, float* gate_up, long long n_pairs, uint8_t* blocks, float* scales) {
+    const long long n_blocks = n_pairs / 32;
+    const size_t groups = (size_t) ((n_blocks + 7) / 8);
+    return q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const long long b = (long long) it.get_group(0) * 8 + (long long) sg.get_group_linear_id();
+        if (b >= n_blocks) return;   // uniform over the sub-group
+        const int lane = (int) sg.get_local_linear_id();
+        const long long i = b * 32 + lane;
+        const float g = gate_up[i];
+        const float u = gate_up[n_pairs + i];
+        const float xv = (g / (1.0f + sycl::exp(-g))) * u;
+        gate_up[i] = xv;
+        uint8_t* out = blocks + b * 34;
+        float amax = sycl::fabs(xv);
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
+        const float sc = amax > 0.f ? amax / 127.f : 0.f;
+        const float inv = sc > 0.f ? 1.f / sc : 0.f;
+        if (lane == 0) {
+            scales[b] = sc;
+            const uint16_t d16bits = f16_from_f32(sc);
+            out[0] = (uint8_t) (d16bits & 0xFF);
+            out[1] = (uint8_t) (d16bits >> 8);
+        }
+        const float t = xv * inv;
+        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
+        int v = (int) r;
+        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        out[2 + lane] = (uint8_t) (int8_t) v;
     });
 }
 
@@ -241,10 +276,13 @@ void hit_pipeline(const uint8_t* blob_base, const int32_t* slot_index, const int
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
     gu_launch(q, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) n, d_count, dst_index, tok_div);
-    swiglu_launch(q, gate_up, n * (long long) FF);
     void* s = &q;
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, n * (int64_t) FF, s);
-    else quantize_q8_0(gate_up, h_q8_0, n * (int64_t) FF, s);
+    if (x_scales != nullptr) {
+        swiglu_q8_launch(q, gate_up, n * (long long) FF, h_q8_0, h_scales);
+    } else {
+        swiglu_launch(q, gate_up, n * (long long) FF);
+        quantize_q8_0(gate_up, h_q8_0, n * (int64_t) FF, s);
+    }
     const auto e = down_launch(q, blob_base, slot_index, dst_index, blob_bytes, h_q8_0,
                                x_scales != nullptr ? h_scales : nullptr, out, (int) n, d_count);
     if (!stream) core::Runtime::get().wait(e, "moe_hit_grouped_s2");
@@ -427,10 +465,13 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             }
         });
     });
-    swiglu_launch(q, gate_up, cap_entries * (long long) FF);
     void* s = &q;
-    if (x_scales != nullptr) quantize_q8_0_scaled(gate_up, h_q8_0, h_scales, cap_entries * (int64_t) FF, s);
-    else quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, s);
+    if (x_scales != nullptr) {
+        swiglu_q8_launch(q, gate_up, cap_entries * (long long) FF, h_q8_0, h_scales);
+    } else {
+        swiglu_launch(q, gate_up, cap_entries * (long long) FF);
+        quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, s);
+    }
     const float* hs = x_scales != nullptr ? h_scales : nullptr;
     const auto e = q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> hs_q(sycl::range<1>(GMAX * (FF / 4)), hd);
