@@ -221,6 +221,7 @@ a native pack's from the GGUF files in place, the AVX-512 Q2_0 pack's from its `
   Which window first computes a swapped-in expert on the GPU depends on when its copy lands, so an answer can differ a little from run to run.
   `--adapt-async 0` restores the tier in which a window waits.
   Without page-locked exchange buffers, and with `--batch`, the waiting tier runs.
+  With `--pipeline-windows 2` ([MULTIGPU](MULTIGPU.md)) the decode loop queues each card's copies while that card has no window in flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when they were decided have completed (upstream 13eee452; `STRATA_PIPELINE_ADAPT_ASYNC=0`: the waiting tier).
   `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
   copying the evicted expert into the RAM copy (the same tokens, fewer host copies).
   It works only with a pack whose experts are all one size (the AVX-512 Q2_0 pack's `experts.bin`) and a fully

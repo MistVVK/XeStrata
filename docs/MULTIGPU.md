@@ -91,6 +91,31 @@ The fewer slots a group has, the fewer tokens share one read of the weights, so 
 threads, so that both stages' CPU experts run at once.
 Where the RAM bandwidth is the limit it is slower (below); it is an experiment for PCs with faster RAM, off by default.
 
+## One conversation with both cards busy (`--pipeline-windows`, opt-in)
+
+With a split the GPUs take turns on a verify window.
+The first GPU computes its layers and hands off, then waits while the last GPU computes the rest, the head and the draft.
+`--pipeline-windows 2` lets the first GPU start the **next** window while the last GPU still verifies this one (upstream bfa532e9).
+The next window is a guess: that this window is accepted whole and that its bonus token is the one the draft layer predicts (the draft layer runs on through the drafts of the window in flight).
+When the guess holds, half of the next window is already done.
+When it does not, the first GPU puts its state back (a copy of its recurrent state taken while the window ran) and the next window is built from the real tokens.
+A guessed window is only started when the draft layer's estimate says it is likely to be kept.
+`--pipeline-windows 1` overlaps only the short prompt reads that go through the verify windows (`--short-read`).
+
+It works with two GPUs, exactly two stages and `--serve`.
+
+- **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the first GPU's recurrent state on it (about 3 MiB per GDN layer of that GPU).
+- **Same text**: the last GPU only runs windows that are verified, and every window row computes what it would in any other window, so the tokens are the serial loop's.
+  With `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0` and the same expert caches the greedy output is identical bit for bit (measurements below).
+  The pipeline keeps its VRAM out of the caches, so against a run without the flag a few experts move from a GPU to the CPU, which rounds them differently, and a near-tie can flip.
+- **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split into three or more stages or onto one GPU (`--split-device 0`), or no draft layer.
+  A request with repetition penalties (`penalty_last_n`), coupled draft sampling or log-probabilities (`logprobs`), and `--lookup-chain`, decode serially.
+- **Nothing is queued on a card behind a window there that waits for the host.** On the B70 a graph or a copy submitted to the card while such a window ran did not return, and the engine stalled.
+  So a prompt read queues a window's commit after the window has completed (upstream queues the window, its commit and the next window back to back).
+  The adaptive tier runs at a verdict with no window in flight on either card (upstream runs it on a thread beside the windows).
+  With `--adapt-async 1` the decode loop queues each card's copies while that card has no window in flight (upstream 13eee452).
+- The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with `STRATA_PIPELINE_DEBUG=1` (upstream 2bfac510).
+
 ## Measurements
 
 Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of decode:
@@ -119,6 +144,19 @@ Eight conversations decoded together (IQ3_S, `--batch 8`, `--layer-split auto`, 
 | split, `--batch-groups 2` | 77.1-79.0 tok/s |
 | split, `--batch-groups 4` | 64.9 tok/s |
 | split, `--batch-groups 2 --batch-cpu-split 10,9` | 71.8 tok/s |
+
+`--pipeline-windows 2` (IQ2_XS, 32K context, 256 tokens after a prompt of about 4,900 tokens and three short chats, greedy, two interleaved runs each):
+
+| Split | Serial | `--pipeline-windows 2` |
+| --- | --- | --- |
+| K=24, after the long prompt | 115.6, 119.8 tok/s | 145.8, 125.8 tok/s |
+| K=24, short chats | 87.9, 88.2 tok/s | 90.6, 87.4 tok/s |
+| K=47 (auto), after the long prompt | 105.9 tok/s | 87.7 tok/s |
+| K=47 (auto), short chats | 81.3 tok/s | 59.3 tok/s |
+
+With auto's split (K=47) the 4070 holds one layer: there is nothing to overlap, and it is slower.
+At K=24 with `--resident-experts` (`--adapt-async` on by default): 111.4 -> 117.7 tok/s after the long prompt, 83.2 -> 70.7 tok/s in short chats (one run each).
+At K=24 with `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the first GPU's cache fixed with `--expert-cache 10000` and the serial run's last-GPU reserve matched with `--vram-reserve-later-mib 860`, all 8 answers (thinking on and off) were identical.
 
 ## Limits
 
