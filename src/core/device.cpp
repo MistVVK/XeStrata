@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -48,10 +49,7 @@ std::string unusable(const sycl::device& d) {
     return {};
 }
 
-// Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
-// Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
-// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).
-bool integrated(const sycl::device& d) { return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu); }
+bool integrated(const sycl::device& d) { return integrated_gpu(d); }
 
 std::string pci_of(const sycl::device& d) {
     if (!d.has(sycl::aspect::ext_intel_pci_address)) return "?";
@@ -333,6 +331,41 @@ uint64_t vram_limit_bytes() {
 uint64_t max_alloc_limit_bytes() {
     static const uint64_t v = env_mib("STRATA_MAX_ALLOC_MIB");
     return v;
+}
+
+// Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
+// Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
+// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
+// does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
+bool integrated_gpu(const sycl::device& d) {
+    if (d.has(sycl::aspect::ext_oneapi_is_integrated_gpu)) return true;
+    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return d.get_info<sycl::info::device::host_unified_memory>();
+#pragma clang diagnostic pop
+}
+
+// upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
+// subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
+// that figure and what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
+void apply_uma_limit(uint64_t& free) {
+    static const uint64_t headroom = [] {
+        const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
+        return (uint64_t) std::max(0LL, g) << 30;
+    }();
+    std::ifstream meminfo("/proc/meminfo");
+    std::string key;
+    uint64_t kb = 0;
+    while (meminfo >> key >> kb) {
+        if (key == "MemAvailable:") {
+            const uint64_t avail = kb << 10;
+            free = std::min(free, avail > headroom ? avail - headroom : 0);
+            return;
+        }
+        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    }
 }
 
 void apply_vram_limit(uint64_t& free, uint64_t& total) {

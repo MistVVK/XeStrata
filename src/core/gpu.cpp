@@ -281,6 +281,7 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
         }
         uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
         core::apply_vram_limit(free, total);
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;

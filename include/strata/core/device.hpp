@@ -43,6 +43,8 @@ uint64_t vram_limit_bytes();
 uint64_t max_alloc_limit_bytes();
 /// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.
 void apply_vram_limit(uint64_t& free, uint64_t& total);
+/// An integrated GPU's free memory: at most what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
+void apply_uma_limit(uint64_t& free);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
 uint64_t max_alloc_bytes();
 

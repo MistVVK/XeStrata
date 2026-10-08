@@ -14,6 +14,9 @@
 
 namespace strata::core {
 
+/// Whether a GPU is the processor's own graphics (src/core/device.cpp).
+bool integrated_gpu(const sycl::device& d);
+
 // One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
 // consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices
 // puts first; 1.. the other usable GPUs (device.cpp).  A runtime is created when its device is first used, so a run on
