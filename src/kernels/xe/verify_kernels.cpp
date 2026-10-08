@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -181,6 +182,89 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     done(stream, e, "gdn_ab_multi");
 }
 
+namespace {
+// upstream e3c3d6ba: the recurrence with each head's 128 state columns over 4 work-groups of 32
+// columns (128 work-items: the same (column, row group) work-items, each with the same 32 state rows), 4x the
+// work-groups of the one-group-a-head kernel.  Every column's arithmetic is that kernel's; the output norm, which needs
+// a head's 128 columns, follows in a second kernel: this one leaves the unnormalized output in y, and the norm sums
+// the squares by the same sub-groups (columns 32w .. 32w+31, the same butterfly) in the same order.
+constexpr int GS_COLS = 32;
+sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+                           const int32_t* n_keep, int t_out_begin) {
+    q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
+            red(sycl::range<1>((size_t) RG * GS_COLS), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int grp = (int) it.get_group(0), head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
+            const int tid = (int) it.get_local_id(0), lc = tid % GS_COLS, rg = tid / GS_COLS, col = c0 + lc;
+            const int qh = head % h_k;
+            const int qk = S * h_k;
+            const int value_dim = S * h_v;
+            const int n = n_keep ? *n_keep : T;
+            float s[RPG];
+            float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+            const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            for (int t = 0; t < n; ++t) {
+                const float* ht = hbuf + (size_t) t * C;
+                sycl::group_barrier(it.get_group());
+                if (tid < S) { sk[tid] = ht[qk + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
+                sycl::group_barrier(it.get_group());
+                const float g = sycl::exp(gate[(size_t) t * h_v + head]);
+                float kv = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+                red[rg * GS_COLS + lc] = kv;
+                sycl::group_barrier(it.get_group());
+                const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                float o = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) {
+                    s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
+                    o = sycl::fma(s[r], sq[rg * RPG + r], o);
+                }
+                sycl::group_barrier(it.get_group());
+                red[rg * GS_COLS + lc] = o;
+                sycl::group_barrier(it.get_group());
+                if (rg == 0 && t >= t_out_begin)
+                    y[(size_t) t * value_dim + (size_t) (head * S + col)] =
+                        (red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc]) * sycl::rsqrt((float) S);
+            }
+            if (n_keep != nullptr && n > 0)
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        });
+    });
+    const int rows = T - t_out_begin;
+    if (rows <= 0) return q.ext_oneapi_submit_barrier();
+    // y = oc * rsqrt(mean(oc^2) + eps) * gamma * sigmoid(z) a head and token, with the one-group kernel's sums
+    return q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> wsum(sycl::range<1>(S / WARP), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * rows * S, S), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int grp = (int) it.get_group(0), head = grp % h_v, t = grp / h_v + t_out_begin;
+            const int col = (int) it.get_local_id(0);
+            const int n = n_keep ? *n_keep : T;
+            if (t >= n) return;   // the whole group
+            const int value_dim = S * h_v;
+            const size_t at = (size_t) t * value_dim + (size_t) (head * S + col);
+            const float oc = y[at];
+            const float sq_part = warp_sum(sg, oc * oc);
+            if ((col & 31) == 0) wsum[col >> 5] = sq_part;
+            sycl::group_barrier(it.get_group());
+            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+            const float scale = sycl::rsqrt(ss / (float) S + eps);
+            const float zz = z[at];
+            y[at] = oc * scale * gamma[col] * (1.0f / (1.0f + sycl::exp(-zz)));
+        });
+    });
+}
+}  // namespace
+
 void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin) {
@@ -188,6 +272,17 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
         n_tok > kVerifyMaxT)
         fail("gdn_step_norm_multi: invalid arguments");
     const int T = n_tok;
+    // the split from 3 tokens: at 2 its second launch cost more than the 4x work-groups gave (B70 and RTX 4070: 4
+    // tokens 11.0 -> 10.3 us and 9.9 -> 9.4 us, 2 tokens 7.3 -> 7.5 us and 6.2 -> 6.7 us).  STRATA_GDN_SPLIT=0: never.
+    static const bool split = [] {
+        const char* v = std::getenv("STRATA_GDN_SPLIT");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (split && T >= 3) {
+        done(stream, gdn_step_split(Q(stream), state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                    t_out_begin), "gdn_step_norm_multi");
+        return;
+    }
     const auto e = Q(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
