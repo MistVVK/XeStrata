@@ -101,12 +101,15 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     done(stream, e, "gdn_conv_commit");
 }
 
-void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
-    if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) fail("gdn_ab_multi: invalid arguments");
-    const int n = n_embd, T = n_tok;
+namespace {
+// gdn_ab_multi for at most MAX_T tokens; EXACT: exactly MAX_T (the token loop fixed at compile time, upstream ae3b249f).
+// A lane unpacks its eight BF16 weights once for all tokens; the FMA order is the same as before.
+template <int MAX_T, bool EXACT>
+sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
+                          const float* dt, const float* ssm_a, float* gate, float* beta, int n, int h_v, int T_arg) {
     const size_t groups = (size_t) ((2 * h_v + 7) / 8);
-    const auto e = Q(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+    return q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const int T = EXACT ? MAX_T : T_arg;
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0) * 8 + (int) sg.get_group_linear_id();
         const int lane = (int) sg.get_local_linear_id();
@@ -116,26 +119,29 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
         const uint32_t* w = reinterpret_cast<const uint32_t*>((is_beta ? w_beta : w_alpha) + (size_t) r * n);
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
-        float acc[kVerifyMaxT];
+        float acc[MAX_T];
         #pragma unroll
-        for (int t = 0; t < kVerifyMaxT; ++t) acc[t] = 0.0f;
+        for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
         for (int j = lane; j < n / 8; j += 32) {
-            const uint32_t w0 = w[j * 4], w1 = w[j * 4 + 1], w2 = w[j * 4 + 2], w3 = w[j * 4 + 3];
+            const uint32_t* wj = w + (size_t) j * 4;
+            const uint32_t u0 = wj[0], u1 = wj[1], u2 = wj[2], u3 = wj[3];
+            const float w0 = lo(u0), w1 = hi(u0), w2 = lo(u1), w3 = hi(u1);
+            const float w4 = lo(u2), w5 = hi(u2), w6 = lo(u3), w7 = hi(u3);
             #pragma unroll
-            for (int t = 0; t < kVerifyMaxT; ++t) {
-                if (t >= T) break;
+            for (int t = 0; t < MAX_T; ++t) {
+                if (!EXACT && t >= T) break;
                 const float* xa = x + (size_t) t * n + j * 8;
                 float a = acc[t];
-                a = sycl::fma(lo(w0), xa[0], a); a = sycl::fma(hi(w0), xa[1], a);
-                a = sycl::fma(lo(w1), xa[2], a); a = sycl::fma(hi(w1), xa[3], a);
-                a = sycl::fma(lo(w2), xa[4], a); a = sycl::fma(hi(w2), xa[5], a);
-                a = sycl::fma(lo(w3), xa[6], a); a = sycl::fma(hi(w3), xa[7], a);
+                a = sycl::fma(w0, xa[0], a); a = sycl::fma(w1, xa[1], a);
+                a = sycl::fma(w2, xa[2], a); a = sycl::fma(w3, xa[3], a);
+                a = sycl::fma(w4, xa[4], a); a = sycl::fma(w5, xa[5], a);
+                a = sycl::fma(w6, xa[6], a); a = sycl::fma(w7, xa[7], a);
                 acc[t] = a;
             }
         }
         #pragma unroll
-        for (int t = 0; t < kVerifyMaxT; ++t) {
-            if (t >= T) break;
+        for (int t = 0; t < MAX_T; ++t) {
+            if (!EXACT && t >= T) break;
             const float a = warp_sum(sg, acc[t]);
             if (lane != 0) continue;
             if (is_beta) {
@@ -147,6 +153,23 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
             }
         }
     });
+}
+}  // namespace
+
+void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) fail("gdn_ab_multi: invalid arguments");
+    auto& q = Q(stream);
+    sycl::event e;
+    switch (n_tok) {
+        case 1: e = gdn_ab_launch<1, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 2: e = gdn_ab_launch<2, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 3: e = gdn_ab_launch<3, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 4: e = gdn_ab_launch<4, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 5: e = gdn_ab_launch<5, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 6: e = gdn_ab_launch<6, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        default: e = gdn_ab_launch<kVerifyMaxT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    }
     done(stream, e, "gdn_ab_multi");
 }
 
