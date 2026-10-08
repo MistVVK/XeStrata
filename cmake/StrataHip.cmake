@@ -38,6 +38,50 @@ function(strata_hip_supported arch out)
   endif()
 endfunction()
 
+# The architectures the distribution's rocBLAS has code for, of those the engine runs on and the SYCL compiler builds
+# for (STRATA_HIP_ARCHS=rocblas, for a package: the engine's dense products run in rocBLAS, so a GPU it lacks cannot
+# run the engine), from its kernels' file names (Fedora: /usr/lib64/rocblas/library; Ubuntu:
+# /usr/lib/<triplet>/rocblas/<version>/library).
+function(strata_hip_rocblas out)
+  file(GLOB files /usr/lib64/rocblas/library/* /usr/lib/*/rocblas/*/library/* /opt/rocm/lib/rocblas/library/*)
+  set(archs "")
+  foreach(file_path IN LISTS files)
+    get_filename_component(name "${file_path}" NAME)
+    if(name MATCHES "gfx[0-9a-f]+")
+      set(arch ${CMAKE_MATCH_0})
+      strata_hip_supported(${arch} ok)
+      if(ok)
+        list(APPEND archs ${arch})
+      endif()
+    endif()
+  endforeach()
+  list(REMOVE_DUPLICATES archs)
+  list(SORT archs)
+  set(built "")
+  foreach(arch IN LISTS archs)
+    strata_hip_compiler_knows(${arch} ok)
+    if(ok)
+      list(APPEND built ${arch})
+    else()
+      message(STATUS "AMD GPU ${arch}: rocBLAS has code for it, the SYCL compiler has no target for it")
+    endif()
+  endforeach()
+  set(${out} "${built}" PARENT_SCOPE)
+endfunction()
+
+# Whether the SYCL compiler has a target for `arch` (amd_gpu_gfx1200): intel/llvm 7.1.1 has none for gfx1152 and
+# gfx1153, which ROCm 7.1's rocBLAS has code for.  Asked of the driver alone (-###), without ROCm's device libraries.
+function(strata_hip_compiler_knows arch out)
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -fsycl -fsycl-targets=amd_gpu_${arch} -nogpulib "-###" -x c++ -c
+                          /dev/null -o /dev/null
+                  RESULT_VARIABLE r OUTPUT_QUIET ERROR_QUIET)
+  if(r EQUAL 0)
+    set(${out} ON PARENT_SCOPE)
+  else()
+    set(${out} OFF PARENT_SCOPE)
+  endif()
+endfunction()
+
 # The SYCL targets (amd_gpu_gfx1200) and options (ROCm's device libraries) for `archs`, after checking that each is
 # supported and that the SYCL compiler builds for them.
 function(strata_hip_choose archs targets_out opts_out)

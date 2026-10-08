@@ -36,10 +36,12 @@ endif()
 # - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
 # - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
 # - STRATA_HIP_ARCHS: AMD architectures, RDNA2 and later, e.g. gfx1200 for the RX 9060 XT (free and contrib: ROCm is
-#   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; empty: none
+#   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; rocblas: those the
+#   distribution's rocBLAS has code for (a package's); empty: none
 set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (contrib); auto: this PC's")
 set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
-set(STRATA_HIP_ARCHS auto CACHE STRING "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's")
+set(STRATA_HIP_ARCHS auto CACHE STRING
+    "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's; rocblas: those rocBLAS has")
 set(STRATA_CUDA_PATH auto CACHE STRING
     "the CUDA toolkit for the NVIDIA code and cuBLAS (contrib), e.g. /usr/local/cuda-13.1; auto: the best one here")
 set(STRATA_CUDA_PTX auto CACHE STRING
@@ -76,6 +78,12 @@ if(STRATA_HIP_ARCHS STREQUAL "auto")
         message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
       endif()
     endforeach()
+  endif()
+elseif(STRATA_HIP_ARCHS STREQUAL "rocblas")
+  strata_hip_rocblas(_strata_hip_archs)
+  if(NOT _strata_hip_archs)
+    message(FATAL_ERROR "STRATA_HIP_ARCHS=rocblas: no rocBLAS with code for an RDNA2 or later AMD GPU is installed "
+                        "(Fedora: rocblas-devel; Ubuntu: librocblas-dev)")
   endif()
 endif()
 set(_strata_onemkl "${STRATA_ONEMKL}")
@@ -461,6 +469,18 @@ if(STRATA_ENABLE_XE)
       set(ENABLE_ROCBLAS_BACKEND ON)
       list(GET _strata_hip_archs 0 HIP_TARGETS)
       strata_hip_cxx(HIP_CXX_COMPILER)
+      # hipBLASLt, which the fork's rocBLAS backend hands the 16-bit GEMMs to where it has kernels for the GPU: without
+      # it they run in rocBLAS, whose kernels for some GPUs are generic ones (gfx12 in ROCm 7.1: a fifteenth of the
+      # speed).  A package must have it.
+      find_package(hipblaslt QUIET)
+      if(NOT hipblaslt_FOUND)
+        set(_strata_level WARNING)
+        if(STRATA_PACKAGE)
+          set(_strata_level FATAL_ERROR)
+        endif()
+        message(${_strata_level} "hipBLASLt is not installed (Fedora: hipblaslt-devel; Ubuntu: libhipblaslt-dev): the "
+                                 "AMD GPUs' dense products run in rocBLAS alone, much slower on some GPUs")
+      endif()
     endif()
     if(_strata_cuda_archs AND _strata_cuda_cublas)
       set(ENABLE_CUBLAS_BACKEND ON)
