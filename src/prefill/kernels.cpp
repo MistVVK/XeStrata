@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
@@ -329,6 +330,70 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
                 const uint16_t hi = bf(x);
                 xn16[row * N + d] = hi;
                 if (xn16_lo) xn16_lo[row * N + d] = bf_lo(x, hi);
+            }
+        });
+    });
+}
+void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t layer, const float* w,
+                           float eps, float* rs_out, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo) {
+    constexpr int PER = (N + 255) / 256;
+    const kernels::Cvec& cv = kernels::cvec();
+    const kernels::CvecTables tb = kernels::cvec_tables();
+    if (tb.dir == nullptr || cv.n_embd != N || cv.hc != HC) throw core::DeviceError("gr_write_cvec_norm_rs: no control vector");
+    const float* dir = tb.dir + layer * N;
+    const float* s_l = tb.s;
+    const int* on = tb.on;
+    const int mode = cv.mode;
+    Q(stream).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
+        sycl::local_accessor<float, 1> part(sycl::range<1>(256 / WARP), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (T * HC) * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int64_t row = (int64_t) it.get_group(0);   // t * 4 + c
+            const int64_t t = row / HC;
+            const int c = (int) (row % HC);
+            const int tid = (int) it.get_local_id(0);
+            float* r = R + row * N;
+            const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+            const float sv = s_l[layer];
+            const bool steer = *on != 0 && sv != 0.0f;   // uniform over the group
+            float x[PER];
+            float dot = 0.0f;
+            int k = 0;
+            for (int d = tid; d < N; d += 256, ++k) {   // gr_write, then cvec_apply's dot
+                const float xv = sycl::fma(bo[t * N + d], sc, r[d]);
+                x[k] = xv;
+                if (steer && mode == 0) dot = sycl::fma(xv, dir[d], dot);
+            }
+            if (steer && mode == 0) {   // cvec_apply's two-level sum
+                for (int o = 16; o > 0; o >>= 1) dot += sycl::permute_group_by_xor(sg, dot, o);
+                if ((tid & 31) == 0) part[tid >> 5] = dot;
+                sycl::group_barrier(it.get_group());
+                if (tid < 32) {
+                    float p = tid < 256 / 32 ? part[tid] : 0.0f;
+                    for (int o = 16; o > 0; o >>= 1) p += sycl::permute_group_by_xor(sg, p, o);
+                    if (tid == 0) part[0] = p;
+                }
+                sycl::group_barrier(it.get_group());
+                dot = part[0] * sv;
+            }
+            float ss = 0.0f;
+            k = 0;
+            for (int d = tid; d < N; d += 256, ++k) {   // the update, then gr_norm_rs's sum of squares
+                float xv = x[k];
+                if (steer) xv = mode == 0 ? sycl::fma(-dot, dir[d], xv) : xv + dir[d];
+                r[d] = xv;
+                x[k] = xv;
+                ss += xv * xv;
+            }
+            const float rs = sycl::rsqrt(block_sum(it, ss, &sh[0]) / (float) N + eps);
+            if (tid == 0) rs_out[row] = rs;
+            k = 0;
+            for (int d = tid; d < N; d += 256, ++k) {
+                const float v = x[k] * rs * w[c * N + d];
+                const uint16_t hi = bf(v);
+                xn16[row * N + d] = hi;
+                if (xn16_lo) xn16_lo[row * N + d] = bf_lo(v, hi);
             }
         });
     });

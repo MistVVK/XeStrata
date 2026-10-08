@@ -2104,23 +2104,33 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)
                 const int64_t nl = half == 0 ? l : l + 1;
-                const bool fuse = nl < LE && !(half == 1 && nl == 1 && ple_on) &&
-                                  !(half == 1 && strata::kernels::cvec().covers(l));
+                // a steered layer's write, vector and next norm as one pass too (upstream 6448f0f7; the same bits);
+                // STRATA_CVEC_FUSE=0: gr_write, cvec_apply, then the next half's own norm
+                static const bool cvec_fuse = [] {
+                    const char* e = std::getenv("STRATA_CVEC_FUSE");
+                    return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+                }();
+                const bool steered = half == 1 && strata::kernels::cvec().covers(l);
+                const bool fuse = nl < LE && !(half == 1 && nl == 1 && ple_on) && (!steered || cvec_fuse);
                 const core::WeightRef* wnn = nullptr;
                 if (fuse) {
                     const core::LayerView vn(*m.wt, nl);
                     wnn = need(vn, half == 0 ? "hc_ffn_norm.weight" : "hc_attn_norm.weight", err);
                     if (!wnn) return false;
                 }
-                if (wnn) {
+                if (wnn && steered) {
+                    gr_write_cvec_norm_rs(m.R, m.bo, m.inj, HC, l, (const float*) wnn->data, EPS, m.xn, m.xn16, T, m.cs,
+                                          m.xn16_lo);
+                    normed = true;
+                } else if (wnn) {
                     gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.xn, m.xn16, T, m.cs,
                                      m.xn16_lo);
                     normed = true;
                 } else {
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
+                    if (steered)   // --control-vector-scaled
+                        strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
                 }
-                if (half == 1 && strata::kernels::cvec().covers(l))   // --control-vector-scaled
-                    strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts

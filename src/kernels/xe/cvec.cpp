@@ -79,6 +79,13 @@ inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 const Cvec& cvec() { return g_cvec; }
 
+CvecTables cvec_tables() {
+    if (!g_cvec.loaded()) return {};
+    const DevTables& t = here();
+    if (t.dir == nullptr) throw std::runtime_error("cvec_tables: the control vector is not on this device (cvec_replicate)");
+    return CvecTables{t.dir, t.s, t.on};
+}
+
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }

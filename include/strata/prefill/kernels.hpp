@@ -34,6 +34,12 @@ void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_l
 void gr_silu(const float* lo, uint16_t* lo16, int64_t T, void* stream, uint16_t* lo16_lo = nullptr);
 /// R[t, c, d] += bo[t, d] * 2 sigmoid(inj[t, c] / hc)   (inj has row stride inj_ld)
 void gr_write(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t T, void* stream);
+/// gr_write, cvec_apply(R, layer, ...) of the loaded control vector and gr_norm_rs of the next half in one pass over R
+/// (upstream 6448f0f7): gr_write's expression, cvec_apply's dot order and two-level sum, gr_norm_rs's sum order and
+/// block_sum - the same bits as the three launches.
+void gr_write_cvec_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, int64_t layer,
+                           const float* w_norm_next, float eps, float* rs_out, uint16_t* xn16, int64_t T, void* stream,
+                           uint16_t* xn16_lo = nullptr);
 /// R[t, c, :] = e[t, :] for all four streams (the embedding broadcast).
 void gr_broadcast(const float* e, float* R, int64_t T, void* stream);
 

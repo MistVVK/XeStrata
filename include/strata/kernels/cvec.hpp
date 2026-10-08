@@ -41,6 +41,9 @@ struct Cvec {
 
 /// The loaded vector (empty until `cvec_upload`).
 const Cvec& cvec();
+/// The current engine device's copy of the tables (`cvec_replicate`), for a kernel that applies the vector itself.
+struct CvecTables { const float* dir = nullptr; const float* s = nullptr; const int* on = nullptr; };
+CvecTables cvec_tables();
 
 /// Upload a vector built by the loader: `dir` is n_layers * n_embd, `s` n_layers (see `Cvec`).  Starts ON.
 bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
