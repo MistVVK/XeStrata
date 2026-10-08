@@ -144,6 +144,7 @@ private:
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     strata::gpu::Stream cs_ = nullptr;
+    strata::gpu::Stream side_ = nullptr;   ///< the shared expert's branch of the draft graphs
     strata::gpu::Graph* prefill_exec_[9] = {};
     strata::gpu::Graph* prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once

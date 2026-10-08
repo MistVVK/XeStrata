@@ -124,6 +124,7 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) strata::gpu::free(h_cparams_);
     if (h_chist_) strata::gpu::free(h_chist_);
     if (cs_) strata::gpu::stream_destroy(cs_);
+    if (side_) strata::gpu::stream_destroy(side_);
     if (dense_) strata::gpu::free(dense_);
     if (experts_) strata::gpu::free(experts_);
     if (state_arena_) strata::gpu::free(state_arena_);
@@ -308,7 +309,12 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             for (int64_t i = 0; i < cap_; ++i) id[(size_t) (t * (uint64_t) cap_ + (uint64_t) i)] = (int32_t) i;
         strata::gpu::copy(ident_, id.data(), id.size() * 4);
     }
-    if (!(cs_ = strata::gpu::stream_create())) { err = "mtp: stream"; return false; }
+    cs_ = strata::gpu::stream_create();
+    side_ = cs_ ? strata::gpu::stream_create() : nullptr;
+    if (!cs_ || !side_) {
+        err = "mtp: stream";
+        return false;
+    }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                  (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
@@ -640,6 +646,31 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         // call) and combines in one (upstream 868f2ef0)
         const bool multi = T > 1 && native_router_enabled() && native_moe_combine_enabled() && g.n_expert == 512 &&
                            K == 10;
+        // The shared expert reads mixed_ (and xq_, x_bf16_, its scratch) and writes shared_ only: a branch beside the
+        // router and the routed experts, joined before the combine (upstream 4a5713fb).  STRATA_MTP_SHARED_BRANCH=0:
+        // one queue.
+        static const bool branch_on = [] {
+            const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+        }();
+        const bool branch = branch_on && side_ != nullptr;
+        if (branch && !strata::gpu::stream_fork(cs, side_)) {
+            err = std::string("mtp: the shared expert's branch: ") + strata::gpu::last_error();
+            return false;
+        }
+        strata::gpu::Stream sh_cs = branch ? side_ : cs;
+        NativeSharedWeights nsw;
+        nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
+        nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
+        nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
+        nsw.q8_1 = xq_;
+        const SForm none{};
+        for (int t = 0; t < T; ++t) {
+            f32_to_bf16_bulk(mixed_ + t * N, x_bf16_, N, sh_cs);
+            shared_expert(nullptr, nullptr, x_bf16_, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
+                          nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_, shared_ + t * N,
+                          N, g.n_ff, 32, sh_cs, mixed_ + t * N, &nsw);
+        }
         if (multi) {
             bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N,
                                       (int) g.n_expert, T, cs);
@@ -655,18 +686,11 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
-        NativeSharedWeights nsw;
-        nsw.gate_type = GGML_Q8_0; nsw.gate_data = q8("mlp.shared_expert.gate_proj.weight");
-        nsw.up_type = GGML_Q8_0; nsw.up_data = q8("mlp.shared_expert.up_proj.weight");
-        nsw.down_type = GGML_Q8_0; nsw.down_data = q8("mlp.shared_expert.down_proj.weight");
-        nsw.q8_1 = xq_;
-        const SForm none{};
-        for (int t = 0; t < T; ++t) {
-            f32_to_bf16_bulk(mixed_ + t * N, x_bf16_, N, cs);
-            shared_expert(nullptr, nullptr, x_bf16_, none, nullptr, nullptr, nullptr, none, nullptr, nullptr, nullptr, none,
-                          nullptr, nullptr, nullptr, bf16("mlp.shared_expert_gate.weight"), sh_scratch_, shared_ + t * N,
-                          N, g.n_ff, 32, cs, mixed_ + t * N, &nsw);
-            if (multi) continue;
+        if (branch && !strata::gpu::stream_join(cs, side_)) {
+            err = std::string("mtp: the shared expert's branch: ") + strata::gpu::last_error();
+            return false;
+        }
+        for (int t = 0; t < T && !multi; ++t) {
             if (native_moe_combine_enabled())
                 native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
             else

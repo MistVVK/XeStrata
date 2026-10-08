@@ -370,9 +370,52 @@ void abandon_capture(Stream s) {
         std::lock_guard<std::mutex> lock(g_capture_mutex);
         auto it = g_captures.find(&queue);
         if (it == g_captures.end()) return;
-        it->second.end_recording(queue);
-        g_captures.erase(it);
+        const auto graph = it->second;
+        for (auto b = g_captures.begin(); b != g_captures.end();) {   // the queue and its open branches
+            if (b->second == graph) {
+                b->second.end_recording(*const_cast<sycl::queue*>(b->first));
+                b = g_captures.erase(b);
+            } else {
+                ++b;
+            }
+        }
     } catch (const std::exception& e) { fail("abandon_capture", e); }
+}
+
+bool stream_fork(Stream from, Stream to) {
+    try {
+        auto& a = q(from);
+        auto& b = q(to);
+        {
+            std::lock_guard<std::mutex> lock(g_capture_mutex);
+            auto it = g_captures.find(&a);
+            if (it != g_captures.end()) {
+                if (g_captures.count(&b)) { g_error = "stream_fork: the branch is already recording"; return false; }
+                auto graph = it->second;   // a handle: the branch records into the same graph
+                graph.begin_recording(b);
+                g_captures.emplace(&b, graph);
+            }
+        }
+        const sycl::event e = a.ext_oneapi_submit_barrier();
+        b.ext_oneapi_submit_barrier({e});
+        return true;
+    } catch (const std::exception& e) { return fail("stream_fork", e); }
+}
+
+bool stream_join(Stream into, Stream from) {
+    try {
+        auto& a = q(into);
+        auto& b = q(from);
+        const sycl::event e = b.ext_oneapi_submit_barrier();
+        a.ext_oneapi_submit_barrier({e});
+        std::lock_guard<std::mutex> lock(g_capture_mutex);
+        auto it = g_captures.find(&b);
+        if (it != g_captures.end()) {
+            it->second.end_recording(b);
+            g_captures.erase(it);
+        }
+        return true;
+    } catch (const std::exception& e) { return fail("stream_join", e); }
 }
 
 bool is_capturing(Stream s) {

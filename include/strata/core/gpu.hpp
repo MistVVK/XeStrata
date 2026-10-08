@@ -104,8 +104,13 @@ bool event_elapsed_ms(float* ms, const Event* from, const Event* to);
 bool begin_capture(Stream s);
 /// Stops recording and finalizes the graph.  An empty recording fails.
 bool end_capture(Stream s, Graph** out);
-/// Stops a recording in progress and discards it.
+/// Stops a recording in progress and discards it (and the branches stream_fork opened on it).
 void abandon_capture(Stream s);
+/// A branch: what `to` is given next runs after everything `from` was given so far, beside what `from` is given
+/// next.  While `from` records a graph, `to` records into the same graph until stream_join.
+bool stream_fork(Stream from, Stream to);
+/// The branch's end: what `into` is given next runs after everything `from` was given; `from` stops recording.
+bool stream_join(Stream into, Stream from);
 bool is_capturing(Stream s);
 bool graph_launch(const Graph* g, Stream s);
 size_t graph_nodes(const Graph* g);
