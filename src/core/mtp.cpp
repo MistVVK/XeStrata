@@ -123,6 +123,9 @@ MtpDrafter::~MtpDrafter() {
     if (cscratch_) strata::gpu::free(cscratch_);
     if (h_cparams_) strata::gpu::free(h_cparams_);
     if (h_chist_) strata::gpu::free(h_chist_);
+    if (ev_chain_) strata::gpu::event_destroy(ev_chain_);
+    for (strata::gpu::Event* e : ev_step_) if (e) strata::gpu::event_destroy(e);
+    if (h_force_) strata::gpu::free(h_force_);
     if (cs_) strata::gpu::stream_destroy(cs_);
     if (side_) strata::gpu::stream_destroy(side_);
     if (owns_weights_ && dense_) strata::gpu::free(dense_);
@@ -277,8 +280,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
-              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_);
+              mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
+              (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
         tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(R2 * 4); pos_ = b.take<int32_t>(R2 * NH); row_ = b.take<int32_t>(4);
         ident_ = b.take<int32_t>(T * (uint64_t) cap_);
@@ -840,6 +845,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
 
@@ -860,6 +866,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
@@ -882,7 +889,26 @@ bool MtpDrafter::idle(std::string& err) {
     return true;
 }
 
-bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
+bool MtpDrafter::prepare_prefill(std::string& err) {
+    const OnDevice on_device(device_);
+    const int64_t per_row = 1 + 4 + g_->n_head;
+    if (pf_cap_ < (int64_t) max_t_ * per_row) {
+        if (pf_dev_) strata::gpu::free(pf_dev_);
+        pf_dev_ = nullptr;
+        pf_cap_ = 0;
+        if (!strata::gpu::alloc_device((void**) &pf_dev_, (size_t) (max_t_ * per_row) * sizeof(int32_t))) {
+            err = "mtp prefill: the input records do not fit";
+            return false;
+        }
+        pf_cap_ = max_t_ * per_row;
+    }
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture_prefill_dev(T, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                         bool sync) {
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -951,6 +977,10 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
                 return false;
             }
         }
+        if (!sync) {   // the caller orders on stream(); the records are staged
+            ms_prefill += ms_since(t0);
+            return true;
+        }
         if (!strata::gpu::stream_sync(cs_)) {
             err = std::string("mtp prefill: ") + strata::gpu::last_error();
             return false;
@@ -986,6 +1016,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
     // the round runs for the cells up to the accepted row a (T = a + 1): the K/V of the rejected rows is not caught
     // up - no later read reaches a cell past the one being drafted and the next round writes it first
     if (!mtp_catchup_all()) T = a + 1;
@@ -1007,7 +1038,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
     h_row_[0] = a;
     h_row_[1] = 0;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
     if (!strata::gpu::graph_launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) || !strata::gpu::stream_sync(cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
         return false;
@@ -1037,6 +1070,114 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
+}
+
+bool MtpDrafter::stage_source_R(int T, std::string& err) {
+    if (src_R_ == nullptr || src_R_ == window_R_) return true;
+    if (!strata::gpu::copy_async((void*) window_R_, src_R_, (size_t) T * (size_t) (g_->hc * g_->n_embd) * sizeof(float),
+                                 cs_)) {
+        err = "mtp: staging the window's residual rows failed";
+        return false;
+    }
+    return true;
+}
+
+bool MtpDrafter::prepare_chain(std::string& err) {
+    const OnDevice on_device(device_);
+    if (!force_on_ || h_force_ == nullptr) { err = "mtp: chains need set_force_capture before load"; return false; }
+    for (int T = 1; T <= max_t_; ++T)
+        if (!capture_round(T, false, err)) return false;
+    for (int j = 1; j <= max_t_ - 2; ++j)
+        if (!capture_step(j, false, err)) return false;
+    if (ev_chain_ == nullptr && !strata::gpu::event_create(&ev_chain_)) {
+        err = "mtp: event creation failed";
+        return false;
+    }
+    for (strata::gpu::Event*& e : ev_step_)
+        if (e == nullptr && !strata::gpu::event_create(&e)) {
+            err = "mtp: event creation failed";
+            return false;
+        }
+    return true;
+}
+
+bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
+                              int n_out, int n_early, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
+    if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
+    if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_force < 0 || n_force > n_out ||
+        n_force > 16) {
+        err = "mtp: chain arguments out of range";
+        return false;
+    }
+    if (!mtp_catchup_all()) T = a + 1;   // as draft(): the catch-up up to the accepted row
+    if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    for (int j = 1; j < n_out; ++j)
+        if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    const Clock::time_point t0 = Clock::now();
+    const int64_t NH = g_->n_head;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, p + a);                                      // output 0's cell
+    for (int j = 1; j < n_out; ++j) put(max_t_ + j - 1, p + a + j);  // every step's cell, staged at once
+    for (int j = 0; j < 16; ++j) h_force_[j] = j < n_force ? force[j] : -1;
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
+    chain_early_ = std::max(0, std::min(n_early, n_out));
+    bool ok = strata::gpu::graph_launch(round_exec_[T], cs_);
+    if (ok && chain_early_ >= 1) ok = strata::gpu::event_record(ev_step_[0], cs_);
+    for (int j = 1; ok && j < n_out; ++j) {
+        ok = strata::gpu::graph_launch(step_exec_[j], cs_);
+        if (ok && j < chain_early_) ok = strata::gpu::event_record(ev_step_[j], cs_);
+    }
+    if (!ok || !strata::gpu::event_record(ev_chain_, cs_)) {
+        err = std::string("mtp chain: ") + strata::gpu::last_error();
+        return false;
+    }
+    steps_seen_ = 0;
+    chain_live_ = true;
+    chain_n_ = n_out;
+    ms_draft += ms_since(t0);
+    ++rounds;
+    return true;
+}
+
+int MtpDrafter::chain_outputs_ready(std::string& err) {
+    (void) err;
+    if (!chain_live_) return chain_n_;
+    const OnDevice on_device(device_);
+    while (steps_seen_ < chain_early_ && strata::gpu::event_query(ev_step_[steps_seen_])) {
+        chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
+        chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
+        ++steps_seen_;
+    }
+    return steps_seen_;
+}
+
+int MtpDrafter::chain_poll(std::string& err) {
+    (void) err;
+    if (!chain_live_) return 1;
+    const OnDevice on_device(device_);
+    if (!strata::gpu::event_query(ev_chain_)) return 0;
+    chain_live_ = false;
+    for (int j = 0; j < chain_n_; ++j) {
+        chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
+        chain_prob_[j] = ((volatile float*) h_prob_)[j];
+    }
+    for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
+    return 1;
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,

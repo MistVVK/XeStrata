@@ -52,6 +52,7 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    int max_t() const { return max_t_; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
     void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
@@ -74,7 +75,13 @@ public:
 
     /// Prompt cells [cell0, cell0 + n): residual rows `R_rows` (device, hc*n_embd each) and `next_tokens` (host,
     /// the token at position cell+1).  Runs in batches of up to max_t rows.
-    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err);
+    /// `sync` false: returns without waiting for the drafter's stream (the caller orders on it: `stream()`).
+    bool prefill(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err,
+                 bool sync = true);
+    /// --pipeline-windows: capture the prefill graphs and size its input records for windows of up to max_t rows now,
+    /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
+    bool prepare_prefill(std::string& err);
+    strata::gpu::Stream stream() const { return cs_; }
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -95,6 +102,29 @@ public:
     /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
     void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
     bool coupled() const { return coupled_active_; }
+
+    // ---- --pipeline-windows 2 (upstream 8ba583fe): the chain as one asynchronous launch (the round and its steps back
+    // to back, no host wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher
+    // forcing: the drafts of a window already in flight), each output read once the event after its step has completed.
+    /// Before `load`: the round/step graphs get the forcing kernel (a no-op while its token is -1).
+    void set_force_capture(bool on) { force_on_ = on; }
+    /// The rows the next round reads (null: the bound `window_R`), copied into the bound buffer before the round.
+    void set_source_R(const float* rows) { src_R_ = rows; }
+    /// Capture the round graphs for T = 1..max_t and every step graph now (a capture syncs the drafter's stream).
+    bool prepare_chain(std::string& err);
+    /// The catch-up over T cells from `p` (as draft()), then `n_out` outputs from row `a`: output j is the chain's
+    /// own pick, and step j (1 <= j <= n_force) takes force[j - 1] as its input token instead of output j - 1.
+    /// `n_early`: an event after each of the first `n_early` outputs (chain_outputs_ready).
+    bool chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force, int n_out,
+                      int n_early, std::string& err);
+    /// 1: every output is in chain_tok()/chain_prob(); 0: still running; -1: an error.
+    int chain_poll(std::string& err);
+    /// How many of the chain's first outputs (up to `n_early`; all of them once the chain is done) have landed in
+    /// chain_tok()/chain_prob(); -1: an error.
+    int chain_outputs_ready(std::string& err);
+    bool chain_live() const { return chain_live_; }
+    const int32_t* chain_tok() const { return chain_tok_; }
+    const float* chain_prob() const { return chain_prob_; }
 
     double ms_draft = 0, ms_prefill = 0;
     int64_t rounds = 0;
@@ -149,6 +179,16 @@ private:
     strata::gpu::Stream side_ = nullptr;   ///< the shared expert's branch of the draft graphs
     strata::gpu::Graph* prefill_exec_[9] = {};
     strata::gpu::Graph* prefill_dev_exec_[9] = {};
+    // --pipeline-windows 2 (chain_launch)
+    bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
+    bool force_on_ = false, chain_live_ = false;
+    const float* src_R_ = nullptr;
+    int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
+    strata::gpu::Event* ev_chain_ = nullptr;
+    strata::gpu::Event* ev_step_[8] = {};               ///< after each of the first n_early outputs
+    int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
+    int32_t chain_tok_[8] = {};
+    float chain_prob_[8] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
     strata::gpu::Graph* round_exec_[9] = {};

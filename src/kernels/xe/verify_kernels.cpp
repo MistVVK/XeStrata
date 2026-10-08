@@ -897,6 +897,14 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     done(stream, e, "mtp_select");
 }
 
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
+    const auto e = Q(stream).single_task([=] {
+        const int32_t f = reinterpret_cast<const volatile int32_t*>(force)[j];
+        if (f >= 0) *tok = f;
+    });
+    done(stream, e, "force_token");
+}
+
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
                        void* stream) {
     const size_t items = (size_t) 16 * 256;
