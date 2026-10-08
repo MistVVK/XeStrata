@@ -37,5 +37,9 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 /// channel) is advanced past the T tokens.
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                               float* query_norm, float* gated, float* gate, int T, void* stream);
+/// native_ple_postops_batch that also writes the history after each of the T tokens to `snap` (T x 9 x 10240: the
+/// values T ple_history_advance calls leave), for a verify window's commit (upstream 2e4ddf6e).
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
 
 } // namespace strata::kernels

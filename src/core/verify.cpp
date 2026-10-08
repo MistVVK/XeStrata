@@ -24,6 +24,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -551,7 +552,27 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return false;
                 }
             }
-            for (int t = tb; t < te; ++t) {
+            // with the batched projections and the native post-ops, the rows' post-ops in one pass that also writes
+            // the commit's history snapshots: native_ple_postops_batch's arithmetic is the rows' calls with the history
+            // advanced after each (upstream 2e4ddf6e's STRATA_DF_PLE).  Scratch: the group's expert rows (parts_,
+            // hit_out_, combined by now) and lo_ (the next read rewrites it).  STRATA_DF_PLE=0: row by row.
+            static const bool df_ple = [] {
+                const char* e = std::getenv("STRATA_DF_PLE");
+                return e == nullptr || std::strtol(e, nullptr, 10) != 0;
+            }();
+            const bool ple_pass = df_ple && batched && dec_batch && !batch_rec_ && ple_native_postops_enabled();
+            if (ple_pass) {
+                try {
+                    native_ple_postops_batch_snap(ple_key_ + (size_t) tb * NG_HC_DIM, Rt(tb), ple_val_ + tb * N,
+                                                  ss.ple.hist, ss.ple.w, parts_ + (size_t) tb * K * N,
+                                                  hit_out_ + (size_t) tb * K * N, lo_ + (size_t) tb * g.hc_lr, n,
+                                                  hist_snap_ + (size_t) tb * HS, cs);
+                } catch (const std::exception& e) {
+                    err = std::string("verify PLE (window): ") + e.what();
+                    return false;
+                }
+            }
+            for (int t = tb; t < te && !ple_pass; ++t) {
                 if (batched) {
                     pw.pre_key = ple_key_ + (size_t) t * NG_HC_DIM;
                     pw.pre_value = ple_val_ + t * N;

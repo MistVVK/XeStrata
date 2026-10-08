@@ -176,6 +176,11 @@ void native_ple_postops(const float* projected_key, const float* hidden,
 
 void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                               float* query_norm, float* gated, float* gate_out, int T, void* stream) {
+    native_ple_postops_batch_snap(key, hidden, value, history, w, query_norm, gated, gate_out, T, nullptr, stream);
+}
+
+void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
+                                   float* query_norm, float* gated, float* gate_out, int T, float* snap, void* stream) {
     if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate_out)
         throw std::invalid_argument("native PLE postops batch: null input or empty batch");
     auto& q = queue_for(stream);
@@ -203,7 +208,19 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
         }
         hidden[i] = hidden[i] + (gated[i] + silu(sum));
     });
-    // the history after the chunk: the last nine normalized rows (older ones from the history when T < 9)
+    // the history after each token (snap: pure copies, what T advances leave), then after the chunk: the last nine
+    // normalized rows (older ones from the history when T < 9)
+    if (snap != nullptr)
+        q.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
+            const int c = int(id[0]);
+            for (int t = 0; t < T; ++t) {
+                float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
+                for (int r = 0; r < HISTORY; ++r) {
+                    const int p = r + t + 1 - HISTORY;   // after t + 1 advances row r holds token p, or an older row
+                    out[r] = p >= 0 ? query_norm[size_t(p) * D + c] : history[size_t(c) * HISTORY + (r + t + 1)];
+                }
+            }
+        });
     q.parallel_for(sycl::range<1>(D), [=](sycl::id<1> id) {
         const int c = int(id[0]);
         float h[HISTORY];
