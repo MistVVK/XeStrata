@@ -35,6 +35,13 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
                        const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr);
 
+/// n_tok kv_append_q8_step calls in one launch (token j: step + j * step_stride, kcur / vcur + j * cur_stride), the
+/// same stores (the tokens' cells are distinct).  With k_q == v_q and kcur == vcur (K8V4's folded halves) only one
+/// plane is written.
+void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
+                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr);
+
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch `[id][kv_head][head_dim]`; the grid is sized by
 /// `max_ids` (capacity), the kernel reads the real count from `step`.
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,

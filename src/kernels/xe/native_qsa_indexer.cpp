@@ -84,15 +84,17 @@ sycl::queue& queue_for(void* stream) {
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
 
-void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
-                               const float* gamma, float epsilon, const QsaIndexerBuffers& b,
-                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
+void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device, int pos_stride, int n_steps,
+                                     int32_t pos_base, const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                                     const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    if (n_steps <= 0) return;
     if (!stream || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
         max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
         int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
         rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency and explicit stream");
-    const Span spans[] = {{raw,D*4},{relative_pos_device,4},{gamma,D*4},{b.tail,(R-1)*D*4},
+    const std::size_t pos_span = n_steps == 1 || pos_stride <= 0 ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+    const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,std::size_t(D)*4},{b.tail,std::size_t(R-1)*D*4},
         {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
@@ -111,36 +113,49 @@ void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_dev
         sycl::local_accessor<float, 1> values(sycl::range<1>(D), h);
         sycl::local_accessor<float, 1> partials(sycl::range<1>(32), h);
         h.parallel_for(sycl::nd_range<1>(THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int pos = *relative_pos_device, d = int(it.get_local_id(0));
-            if (pos < 0 || pos >= mc) return;   // uniform
-            const int slot = pos % R;
-            float incoming = 0.0f;
-            if (d < D) {
-                incoming = through_f16(raw[d]);
-                if (slot < R - 1) tail[slot * D + d] = incoming;
+            const int d = int(it.get_local_id(0));
+            // the cells in order; a work-item reads back only the tail and dead lanes it wrote itself, so the barrier
+            // between cells guards the work-group's local values and partials only
+            for (int step = 0; step < n_steps; ++step) {
+                if (step > 0) sycl::group_barrier(it.get_group());
+                const int pos = relative_pos_device[std::size_t(step) * pos_stride];
+                if (pos < 0 || pos >= mc) continue;   // uniform
+                const int slot = pos % R;
+                float incoming = 0.0f;
+                if (d < D) {
+                    incoming = through_f16(raw[std::size_t(step) * D + d]);
+                    if (slot < R - 1) tail[slot * D + d] = incoming;
+                }
+                if (pos != 0 && slot != R - 1) continue;   // uniform
+                float mean = 0.0f;
+                if (d < D) {
+                    // the spare's four gather indices all name cell zero; completed blocks use chronological slices
+                    float sum = pos == 0 ? incoming : tail[d];
+                    for (int j = 1; j < R; ++j) sum = sum + (pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
+                    mean = sycl::fma(0.25f, sum, 0.0f);   // SCALE includes a zero bias
+                }
+                const float square_sum = norm_square_sum(it, mean, &partials[0]);
+                const float scale = sycl::rsqrt(square_sum / D + epsilon);
+                if (d < D) values[d] = scale * mean * gamma[d];
+                sycl::group_barrier(it.get_group());
+                if (d >= D) continue;
+                const int bl = pos / R;
+                const int rope_pos = pos == 0 ? 0 : pos_base + R * bl;
+                const float y = pooled_value(&values[0], d, rope_pos, theta_scale, mtab, pos == 0, scaled, ka, tab);
+                pooled[std::size_t(bl) * D + d] = y;
+                if (pos == 0) dead[d] = y;
+                else pooled[std::size_t(bl + 1) * D + d] = dead[d];
+                if (d == 0 && pos != 0) *block_pos = rope_pos;
             }
-            if (pos != 0 && slot != R - 1) return;   // uniform
-            float mean = 0.0f;
-            if (d < D) {
-                // the spare's four gather indices all name cell zero; completed blocks use chronological slices
-                float sum = pos == 0 ? incoming : tail[d];
-                for (int j = 1; j < R; ++j) sum = sum + (pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
-                mean = sycl::fma(0.25f, sum, 0.0f);   // SCALE includes a zero bias
-            }
-            const float square_sum = norm_square_sum(it, mean, &partials[0]);
-            const float scale = sycl::rsqrt(square_sum / D + epsilon);
-            if (d < D) values[d] = scale * mean * gamma[d];
-            sycl::group_barrier(it.get_group());
-            if (d >= D) return;
-            const int bl = pos / R;
-            const int rope_pos = pos == 0 ? 0 : pos_base + R * bl;
-            const float y = pooled_value(&values[0], d, rope_pos, theta_scale, mtab, pos == 0, scaled, ka, tab);
-            pooled[std::size_t(bl) * D + d] = y;
-            if (pos == 0) dead[d] = y;
-            else pooled[std::size_t(bl + 1) * D + d] = dead[d];
-            if (d == 0 && pos != 0) *block_pos = rope_pos;
         });
     });
+}
+
+void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device, int32_t pos_base,
+                               const float* gamma, float epsilon, const QsaIndexerBuffers& b,
+                               const QsaShapes& s, int64_t max_cells, const RopeScaling& scaling, void* stream) {
+    native_qsa_indexer_append_steps(raw, relative_pos_device, 0, 1, pos_base, gamma, epsilon, b, s, max_cells, scaling,
+                                    stream);
 }
 
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,

@@ -1441,6 +1441,33 @@ int main(int argc, char** argv) try {
                 strata::kernels::native_qsa_indexer_append(drawAll.p + t * IDXD, dpos.p + t, BASE, dw_kn.p, EPS, bufsA, S,
                                                            MC, sc, cs);
             strata::kernels::native_qsa_indexer_append_batch(drawAll.p, NB, 0, BASE, dw_kn.p, EPS, bufsB, S, MC, sc, cs);
+            // native_qsa_indexer_append_steps - the verify window's n cells in one launch (positions at a stride:
+            // kStepCount in a window, 1 in the commit graph) - leaves the same buffers as the sequential calls
+            for (const int stride : {1, 5}) {
+                Dev<float> pooledC(prows), deadC(IDXD), tailC(trows);
+                Dev<int32_t> bposC(1), dposC((size_t) NB * stride);
+                check(strata::gpu::memset(pooledC.p, 0, prows * 4), "zero");
+                check(strata::gpu::memset(deadC.p, 0, IDXD * 4), "zero");
+                check(strata::gpu::memset(tailC.p, 0, trows * 4), "zero");
+                check(strata::gpu::memset(bposC.p, 0, 4), "zero");
+                std::vector<int32_t> hp((size_t) NB * stride, -1);
+                for (int64_t t = 0; t < NB; ++t) hp[(size_t) t * stride] = (int32_t) t;
+                dposC.put(hp);
+                strata::kernels::QsaIndexerBuffers bufsC{tailC.p, deadC.p, pooledC.p, bposC.p};
+                strata::kernels::native_qsa_indexer_append_steps(drawAll.p, dposC.p, stride, (int) NB, BASE, dw_kn.p, EPS,
+                                                                 bufsC, S, MC, sc, cs);
+                check(strata::gpu::stream_sync(cs), "sync");
+                const std::vector<float> pc = pooledC.get(prows), dc = deadC.get((size_t) IDXD), tc = tailC.get(trows);
+                const std::vector<int32_t> bc = bposC.get(1);
+                const std::vector<float> pa2 = pooledA.get(prows), da2 = deadA.get((size_t) IDXD), ta2 = tailA.get(trows);
+                const std::vector<int32_t> ba2 = bposA.get(1);
+                const bool same = std::memcmp(pc.data(), pa2.data(), pc.size() * 4) == 0 &&
+                                  std::memcmp(dc.data(), da2.data(), dc.size() * 4) == 0 &&
+                                  std::memcmp(tc.data(), ta2.data(), tc.size() * 4) == 0 && bc[0] == ba2[0];
+                std::printf("  %-44s %s\n", (std::string("append_steps (stride ") + std::to_string(stride) + ") vs sequential, " + var.name).c_str(),
+                            same ? "bit-identical" : "*** WRONG ***");
+                if (!same) ++g_bad;
+            }
             check(strata::gpu::stream_sync(cs), "sync");
             const std::vector<float> pa = pooledA.get(prows), pb = pooledB.get(prows);
             const std::vector<float> da = deadA.get((size_t) IDXD), db = deadB.get((size_t) IDXD);

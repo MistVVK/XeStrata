@@ -30,23 +30,27 @@ void validate(const QsaShapes& s, const char* what) {
 
 }  // namespace
 
-void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host) {
+void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
+                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host) {
     validate(s, "kv_append_q8");
+    if (n_tok < 1) return;
     const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
     const int groups = head_dim / KV_Q8_GROUP;
+    const int planes = (k_q == v_q && kcur == vcur) ? 1 : 2;
     const KvHostPools hp = host ? *host : KvHostPools{};
     const int32_t* table = page_table;
     const auto e = queue_for(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> warp_max(sycl::range<1>(2), hd);
-        hd.parallel_for(sycl::nd_range<3>({2, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP}, {1, 1, KV_Q8_GROUP}),
+        hd.parallel_for(sycl::nd_range<3>({(size_t) n_tok * planes, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP},
+                                          {1, 1, KV_Q8_GROUP}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const long long pos = (long long) step[kStepPos];
+            const int j = (int) it.get_group(0) / planes;
+            const long long pos = (long long) step[(long long) j * step_stride + kStepPos];
             const int h = (int) it.get_group(2), g = (int) it.get_group(1), t = (int) it.get_local_id(2);
-            const bool is_v = it.get_group(0) == 1;
+            const bool is_v = (int) it.get_group(0) % planes == 1;
             const sycl::sub_group sg = it.get_sub_group();
-            const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
+            const float x = (is_v ? vcur : kcur)[(long long) j * cur_stride + (long long) h * head_dim + (long long) g * KV_Q8_GROUP + t];
             float a = sycl::fabs(x);
             for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, sycl::permute_group_by_xor(sg, a, o));
             if ((t & 31) == 0) warp_max[t >> 5] = a;
@@ -73,6 +77,12 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
         });
     });
     if (!stream) core::Runtime::get().wait(e, "kv_append_q8");
+}
+
+void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                       const KvHostPools* host) {
+    kv_append_q8_steps(k_q, v_q, k_scale, v_scale, page_table, step, 0, kcur, vcur, 0, 1, s, stream, host);
 }
 
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,

@@ -93,20 +93,24 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     finish(stream, e, "fwht256");
 }
 
-void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
-                       const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host) {
+void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                        int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
+                        void* stream, const KvHostPools* host) {
+    if (n_steps <= 0) return;
     need_256(s, "kv_append_q4");
     const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
+    const int planes = (k_q4 == v_q4 && kcur == vcur) ? 1 : 2;
     const KvHostPools hp = host ? *host : KvHostPools{};
     const int32_t* table = page_table;
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<3>({2, (size_t) (head_dim / QK4_0), (size_t) kv_heads * WARP}, {1, 1, WARP}),
+        sycl::nd_range<3>({(size_t) n_steps * planes, (size_t) (head_dim / QK4_0), (size_t) kv_heads * WARP},
+                          {1, 1, WARP}),
         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const long long pos = (long long) step[kStepPos];
+            const int j = (int) it.get_group(0) / planes;
+            const long long pos = (long long) step[(long long) j * step_stride + kStepPos];
             const int h = (int) it.get_group(2), b = (int) it.get_group(1), t = (int) it.get_local_id(2);
-            const bool is_v = it.get_group(0) == 1;
-            const float x = (is_v ? vcur : kcur)[h * head_dim + b * QK4_0 + t];
+            const bool is_v = (int) it.get_group(0) % planes == 1;
+            const float x = (is_v ? vcur : kcur)[((long long) j * kv_heads + h) * head_dim + (long long) b * QK4_0 + t];
             uint8_t byte;
             const uint16_t d = q4_group(it.get_sub_group(), x, byte);
             const long long page = (long long) table[pos / page_size];
@@ -116,6 +120,12 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
                          t, d, byte);
         });
     finish(stream, e, "kv_append_q4");
+}
+
+void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
+                       const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
+                       const KvHostPools* host) {
+    kv_append_q4_steps(k_q4, v_q4, page_table, step, 0, 1, kcur, vcur, s, stream, host);
 }
 
 void kv_append_q4(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,

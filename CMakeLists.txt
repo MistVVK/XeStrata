@@ -556,6 +556,10 @@ if(STRATA_ENABLE_XE)
     add_executable(kv_q4_parity src/kernels/kv_q4_parity.cpp)
     target_link_libraries(kv_q4_parity PRIVATE strata_kernels)
     add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+    # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
+    add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
+    target_link_libraries(kv_steps_parity PRIVATE strata_kernels)
+    add_test(NAME kv_steps_parity COMMAND kv_steps_parity)
     # KV streaming: streamed vs resident attention, bitwise (synthetic, no model).
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)

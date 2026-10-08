@@ -516,12 +516,29 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.k_proj.weight"), xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(GGML_Q8_0, q8("self_attn.v_proj.weight"), xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
+        // the T tokens' K norm, rotation and K/V append each run once over all T rows (the rope keeps each token's
+        // positions); STRATA_NO_BATCH_KV_STEP=1 appends per token
+        static const bool no_batch_kv = [] {
+            const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
         for (int t = 0; t < T; ++t) {
-            norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
-            if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp)
-                fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
-                fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
-            }
+            float* kc = kcur_ + t * NKV * HD;
+            if (native_rope_enabled()) native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos + t * NH, cs);
+            else rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pos + t * NH, cs);
+        }
+        if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp)
+            fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
+            fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+        }
+        if (!no_batch_kv && st_.kv_q4)
+            kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
+        else if (!no_batch_kv && st_.kv_int8)
+            kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
+                               (int) (NKV * HD), T, s, cs, &st_.host);
+        else
+        for (int t = 0; t < T; ++t) {
             if (st_.kv_q4) {
                 kv_append_q4_step(st_.k_q4, st_.v_q4, st_.page_table, step + t * 4, kcur_ + t * NKV * HD,
                                   vcur_ + t * NKV * HD, s, cs, &st_.host);
