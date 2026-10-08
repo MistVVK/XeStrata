@@ -418,6 +418,7 @@ AMD のコードは、どの版にも、そのディストリビューション�
 - 自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は同梱しません。
 - どの版のビルドでも、ディストリビューションの ROCm（Ubuntu の universe と Fedora の公式にある 7.1）で intel/llvm の HIP のターゲットと
   アダプターを作り、アダプターを同梱します。エンジンが持つ AMD のコードは `BUILD.json` の `hip_archs` に記録し、setup はそれで GPU が使えるかを判断します。
+- 推奨と提案に入れたメーカーのものは、メーカーごとに `BUILD.json` の `runtime` にも記録します。setup は、使う GPU のメーカーのもので入っていないものを apt か dnf に尋ねて調べ、入れ方（要るならリポジトリの登録から）を表示します。GPU のランタイムがなければ止まり、oneMKL と cuBLAS がなければ表示だけして続けます。
 - `third_party/nonfree/` は入れません。チャットテンプレートは、setup がモデルの pack に書いたものを使います。
 - Python はビルドのときにバイトコンパイルし、`xestrata` は `PYTHONDONTWRITEBYTECODE=1` で動かします。`/usr` に後から何も書かず、
   `/etc` にも何も置かないので、パッケージを消せば何も残りません。

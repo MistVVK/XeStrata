@@ -418,6 +418,7 @@ Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package 
 - Every variant's build makes intel/llvm's HIP target and adapter with the distribution's ROCm (7.1, in Ubuntu's universe
   and Fedora's own repositories), and carries the adapter. The AMD code the engine has is recorded in `BUILD.json`
   (`hip_archs`), from which setup decides whether a GPU can be used.
+- The makers' packages the package recommends or suggests are recorded in `BUILD.json` too, by maker (`runtime`). setup asks apt or dnf which of those of the GPUs it uses are missing, and shows how to install them (adding a repository first where needed). Without the GPU's runtime it stops; without oneMKL or cuBLAS it only shows them and goes on.
 - `third_party/nonfree/` is not packaged: the chat template is the one setup writes into the model's pack.
 - The Python files are compiled when the package is built, and `xestrata` runs with `PYTHONDONTWRITEBYTECODE=1`: nothing is written
   under `/usr` later and nothing goes in `/etc`, so removing the packages leaves nothing behind.
