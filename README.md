@@ -139,11 +139,9 @@ sudo apt install ./xestrata-free_*.deb      # Ubuntu
 sudo dnf install ./xestrata-free-*.rpm      # Fedora
 ```
 
-The packages that run the GPU depend on the PC's GPUs, so they are not installed here.
-The first time you run `xestrata` (the next step), it shows the packages the PC's GPUs and the installed package
-lack, and how to install them.
-Install them as it shows, then run `xestrata` again (to check again later: `xestrata --setup`).
-Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
+The GPU's drivers and the like are installed separately: `xestrata` shows what is missing and the command to install it
+(to check again later: `xestrata --setup`).
+Also run `sudo usermod -aG render $USER` and log in again.
 
 **3. Run `xestrata` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
 

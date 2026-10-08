@@ -135,10 +135,8 @@ sudo apt install ./xestrata-free_*.deb      # Ubuntu
 sudo dnf install ./xestrata-free-*.rpm      # Fedora
 ```
 
-GPU を動かすためのパッケージは、PC の GPU によって違うので、ここでは入りません。
-次の手順で `xestrata` を初めて実行すると、PC の GPU と入れた版に合わせて、足りないパッケージとその入れ方を表示します。
-表示されたとおりに入れてから、もう一度 `xestrata` を実行します（あとで確かめ直すときは `xestrata --setup`）。
-自分のユーザーを `render` グループに入れておきます（`sudo usermod -aG render $USER` の後、ログインし直す）。
+GPU のドライバーなどは別に入れます。`xestrata` を実行すると、足りないものと入れるコマンドを表示します（あとで確かめ直すときは `xestrata --setup`）。
+また、`sudo usermod -aG render $USER` を実行して、ログインし直します。
 
 **3. 端末で `xestrata` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
 
