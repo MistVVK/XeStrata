@@ -671,7 +671,8 @@ sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, co
     });
 }
 
-// 1, 2, 4 or 8 columns a pass, 8 at a time past 8 (the verify window takes up to 8 tokens)
+// up to 8 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes); 8 at a
+// time past 8 (the verify window takes up to 8 tokens)
 template<int TY>
 sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                         int n_out, int ncols) {
@@ -680,11 +681,17 @@ sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, cons
         const int n = ncols - c0;
         const block_q8_1* xc = x + (size_t) c0 * (n_in / 32);
         float* yc = y + (size_t) c0 * n_out;
-        const int take = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
-        if (take == 8) e = launch_mmvq_n<TY, 8>(q, w, row_bytes, xc, yc, n_in, n_out);
-        else if (take == 4) e = launch_mmvq_n<TY, 4>(q, w, row_bytes, xc, yc, n_in, n_out);
-        else if (take == 2) e = launch_mmvq_n<TY, 2>(q, w, row_bytes, xc, yc, n_in, n_out);
-        else e = launch_mmvq_n<TY, 1>(q, w, row_bytes, xc, yc, n_in, n_out);
+        const int take = n >= 8 ? 8 : n;
+        switch (take) {
+            case 8: e = launch_mmvq_n<TY, 8>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 7: e = launch_mmvq_n<TY, 7>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 6: e = launch_mmvq_n<TY, 6>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 5: e = launch_mmvq_n<TY, 5>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 4: e = launch_mmvq_n<TY, 4>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 3: e = launch_mmvq_n<TY, 3>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            case 2: e = launch_mmvq_n<TY, 2>(q, w, row_bytes, xc, yc, n_in, n_out); break;
+            default: e = launch_mmvq_n<TY, 1>(q, w, row_bytes, xc, yc, n_in, n_out);
+        }
         c0 += take;
     }
     return e;
