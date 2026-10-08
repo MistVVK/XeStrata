@@ -337,8 +337,8 @@ int check_down(int d_type) {
 
 #if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
 // #152 through the engine's dispatch: where native_gu_rows gives a format the multi-token kernel from one token on
-// (native_gu_mt_min 1: IQ3_S where its grid is gathered, or every format under STRATA_IQ_MT_MIN=1), each token's
-// gate/up rows must be the same alone and in any group.
+// (native_gu_mt_min 1: every format but IQ2_XXS on a CPU without AVX-512, or every format under
+// STRATA_IQ_MT_MIN=1), each token's gate/up rows must be the same alone and in any group.
 int check_engine_width(int type) {
     const int mt = cpu::native_gu_mt_min(type);
     if (mt != 1) {

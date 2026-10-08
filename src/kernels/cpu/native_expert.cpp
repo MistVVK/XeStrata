@@ -98,16 +98,18 @@ int native_gu_mt_min(int gu_type) {
     // kernels for every group: output independent of the drafting, at a measured -1..-3% decode on IQ3_S (AVX-512).
     static const char* env = std::getenv("STRATA_IQ_MT_MIN");
     static const int mt_min = env ? (int) std::strtol(env, nullptr, 10) : 2;
-    // IQ3_S where the AVX-2 kernel gathers its grid (cpu_gather_fast, unless STRATA_IQ256_GATHER=0) on a CPU without
-    // AVX-512: there that kernel beats ggml's dot for ONE token too (14900KF P-core, an expert's gate/up rows: 0.34 ->
-    // 0.19 ms; its E-cores, which keep the scalar decode: 0.71 -> 0.68), and in decode most CPU experts serve one token
-    // of the window.  So IQ3_S takes it for every group, and those rows no longer depend on the drafting.  A machine-
-    // wide rule, not a per-core one: every core rounds an expert the same.  Every probe here is in expert_layout.cpp
-    // and cpu_avx2_ok() comes first, so no AVX2 code runs before the check.  STRATA_IQ_MT_MIN set keeps its rule.
-    // Opt-in (STRATA_IQ3S_MT1=1): it changes a lone token's IQ3_S rounding on those CPUs, so the default stays 0.1.39's.
-    static const bool iq3s_one = env == nullptr && std::getenv("STRATA_IQ3S_MT1") != nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
-                                 !cpu_avx512_ok() && iq256_gather_setting() != 0 && cpu_gather_fast();
-    return iq3s_one && gu_type == 21 ? 1 : mt_min;
+    // A CPU with AVX-2 and without AVX-512 (whose kernel is iq256_gu_rows): there the multi-token kernel beats ggml's
+    // dot for ONE token too, and in decode most CPU experts serve one token of the window.  An expert's gate/up
+    // rows, one token, kernel against ggml's dot (i7-14700 P-core, iq_avx2_parity --bench --dispatch): IQ2_S 0.145 /
+    // 0.185 ms, IQ3_S 0.162 / 0.298, IQ4_XS 0.099 / 0.115, IQ3_XXS 0.182 / 0.188, IQ2_XS 0.185 / 0.188; its E-core:
+    // IQ2_S 0.285 / 0.390; without AVX-VNNI (STRATA_NO_AVXVNNI=1) IQ2_S 0.153 / 0.211.  IQ2_XXS was slower (0.154 /
+    // 0.147) and keeps ggml's dot for one token.  The formats that take it no longer depend on the drafting.  A
+    // machine-wide rule, not a per-core one: every core rounds an expert the same.  Every probe here is in
+    // expert_layout.cpp and cpu_avx2_ok() comes first, so no AVX2 code runs before the check.  STRATA_IQ_MT_MIN set
+    // keeps its rule.
+    static const bool avx2_one = env == nullptr && cpu_avx2_ok() && std::getenv("STRATA_NO_IQ256") == nullptr &&
+                                 !cpu_avx512_ok();
+    return avx2_one && gu_type != 16 ? 1 : mt_min;   // 16: IQ2_XXS
 }
 
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,

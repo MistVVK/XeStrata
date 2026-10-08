@@ -746,8 +746,6 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
     target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
-    add_test(NAME iq_avx2_parity_iq3s_mt1
-             COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
     # the AVX-2 Q8_K activation quantizer against ggml's, byte for byte (upstream 5208b320; --bench: its time)
     add_executable(q8k_quant_parity src/kernels/cpu/q8k_quant_parity.cpp)
     target_link_libraries(q8k_quant_parity PRIVATE strata_kernels_cpu)
