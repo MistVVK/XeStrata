@@ -2178,6 +2178,29 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 std::fclose(f);
             }
         }
+        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
+            // draft-layer distillation data (opt-in, upstream 48d10a49): every position's final multi-stream residual
+            // as BF16 (round-to-nearest-even), rows in position order, appended across chunks and requests:
+            // [n][hc*n_embd]
+            strata::gpu::stream_sync(m.cs);
+            if (std::FILE* f = std::fopen(dump, "ab")) {
+                constexpr int64_t kRows = 512;
+                std::vector<float> rows((size_t) (kRows * D));
+                std::vector<uint16_t> out((size_t) (kRows * D));
+                for (int64_t t0 = 0; t0 < T; t0 += kRows) {
+                    const int64_t nr = std::min<int64_t>(kRows, T - t0);
+                    strata::gpu::copy(rows.data(), m.R + t0 * D, (size_t) (nr * D) * 4);
+                    for (int64_t i = 0; i < nr * D; ++i) {
+                        uint32_t u;
+                        std::memcpy(&u, &rows[(size_t) i], 4);
+                        u += 0x7fffu + ((u >> 16) & 1u);
+                        out[(size_t) i] = (uint16_t) (u >> 16);
+                    }
+                    std::fwrite(out.data(), 2, (size_t) (nr * D), f);
+                }
+                std::fclose(f);
+            }
+        }
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
             if (!strata::gpu::stream_sync(m.cs)) {
