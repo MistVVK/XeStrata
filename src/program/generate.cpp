@@ -909,6 +909,19 @@ bool adapt_nowait() {
     return v;
 }
 
+/// #463 without the stall (upstream d69424c9, #764): a verify window takes the adaptive tier's previous swaps only once
+/// they are this many windows old, and then waits for their copies (which have landed by then).  The window that first
+/// computes a swapped-in expert on the GPU depends only on the window count, as with #463's wait, so the answers are as
+/// reproducible.  Default 1 = #463 (the very next window waits for the copies); STRATA_ADAPT_LAG=2 is opt-in.  The batch
+/// paths are not lagged.
+int adapt_lag() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ADAPT_LAG");
+        return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 1;
+    }();
+    return v;
+}
+
 /// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
     static const bool on = std::getenv("STRATA_TRACE") != nullptr;
@@ -4836,6 +4849,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         strata::gpu::Event* adapt_ev = nullptr;
         strata::gpu::event_create(&adapt_ev);
         // a layer split's later stages keep a copy of the residency table on their devices, and swap on their own
@@ -4863,6 +4877,7 @@ int main(int argc, char** argv) {
             }
             src.commit_exchanges();
             pending.clear();
+            pending_age = 0;
             res_upload();
         };
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
@@ -6750,7 +6765,8 @@ int main(int argc, char** argv) {
                 // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
                 // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
                 // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-                apply_pending(!adapt_nowait());
+                if (adapt_nowait()) apply_pending(false);
+                else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
                 if (hist_n > 0) {
                     // the tails the penalties count over, ONE PER ROW: the tokens the state has consumed, the
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
@@ -7557,6 +7573,7 @@ int main(int argc, char** argv) {
         }
         // plan v0.3 P6: swaps in flight - (residency index, slot) admitted when adapt_ev has completed
         std::vector<std::pair<int32_t, int32_t>> pending;
+        int pending_age = 0;   // the windows the pending swaps have waited (adapt_lag)
         strata::gpu::Event* adapt_ev = nullptr;
         strata::gpu::event_create(&adapt_ev);
         int64_t adapt_rounds = 0;   // counted here: `rounds` is declared below the adapt lambda
@@ -7580,6 +7597,7 @@ int main(int argc, char** argv) {
             }
             src.commit_exchanges();
             pending.clear();
+            pending_age = 0;
             if (d_res != nullptr)
                 strata::gpu::copy(d_res, host_res.data(), host_res.size() * sizeof(int32_t));
         };
@@ -7757,7 +7775,8 @@ int main(int argc, char** argv) {
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-            apply_pending(!adapt_nowait());
+            if (adapt_nowait()) apply_pending(false);
+            else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

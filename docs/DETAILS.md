@@ -432,6 +432,11 @@ The file is a fingerprint of what you used the model for: keep it on your PC.
 Without the key nothing is counted or written.
 A setup run again keeps the key, and `--expert-profile` (a file that still exists) and `--expert-profile-save` added to `"args"` by hand (upstream #775).
 
+An expert the adaptive tier swaps in is used on the GPU by the next window, which waits for its copy first.
+`STRATA_ADAPT_LAG=2` in the engine's environment uses it from the second window, so nothing waits (upstream #764; the
+answers change by that much, and are the same run to run with the same settings).
+The output went from 59.1 to 64.2 tokens/s on an RTX 4070 and from 76.5 to 76.9 on the B70 (IQ2_XS).
+
 ### When the draft head does not fit
 
 The MTP draft layer's head covers a token subset (`./setup.sh --draft-vocab cjk|cyrillic|fr|en`; upstream #474).
