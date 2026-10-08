@@ -348,6 +348,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     try {   // the GDN step's fastest form on this device for each window size, before any graph is recorded
         if (g.ssm_v_heads > 0 && g.ssm_k_heads > 0)
             strata::kernels::gdn_step_tune((int) g.ssm_conv_channels, (int) g.ssm_k_heads, (int) g.ssm_v_heads, cs_);
+        // and the multi-row BF16 GEMV's form for the window's shapes: the router, the indexer's key and query, the
+        // PLE block's key and value
+        for (const int64_t n_out : {(int64_t) g.n_expert, (int64_t) g.idx_key_dim, (int64_t) g.idx_q_heads * g.idx_key_dim,
+                                    (int64_t) strata::kernels::NG_HC_DIM, (int64_t) g.n_embd})
+            strata::kernels::bf16_gemv_fp32_mmvf_multi_tune(g.n_embd, n_out, cs_);
     } catch (const std::exception& e) {
         err = std::string("verify: ") + e.what();
         return false;

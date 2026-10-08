@@ -51,5 +51,9 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 /// the weight read once, every output bit-identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
+/// Times bf16_gemv_fp32_mmvf_multi's two forms (a row a work-group, 4 rows a work-group: the same bits) on the stream's
+/// device for an n_in x n_out matrix and 2..8 rows, and keeps the faster for each; call it before any graph is
+/// recorded (once a device and shape).  Untuned shapes take a row a work-group.  STRATA_MMVF_ROWS=0|1 fixes the form.
+void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream);
 
 }  // namespace strata::kernels
