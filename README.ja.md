@@ -118,27 +118,10 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
-| AMD（RDNA2 以降、[対応する GPU](#amd-の-gpu)）、Intel と AMD の両方 | `xestrata-free` | `xestrata-free` |
-| Intel（速さを重視する）、NVIDIA（Turing 以降）、その両方 | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA の Pascal と Volta（P100、P40、V100 など）、Intel とそれらの両方 | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
+| Intel、AMD（RDNA2 以降、[対応する GPU](#amd-の-gpu)）、その両方（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
+| Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| NVIDIA の Pascal と Volta（P100、P40、V100 など）、それと Intel や AMD | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
-- contrib-llvm の版は、どれも Intel、AMD、NVIDIA の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
-- Intel の GPU だけの PC でも、速さを重視するなら contrib-llvm の版と oneMKL を入れます。
-  プロンプトの密な行列積を oneMKL で計算し、XeStrata 自身のカーネルより少し速くなります（B70 で 3% ほど）。
-- どのパッケージも、GPU のメーカーのドライバーやライブラリを必須にはしません。
-  free の版は Intel の GPU のランタイム（Level Zero）と AMD の GPU の ROCm のライブラリを推奨（Recommends、既定で入ります）にします。
-  ROCm のライブラリは 1.4 GB ほどあります。AMD の GPU がなければ、`--no-install-recommends`（apt）や
-  `--setopt=install_weak_deps=False`（dnf）で外せます。その場合、Intel の GPU の Level Zero の入れ方は `xestrata` が表示します（下）。
-  contrib-llvm の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。
-- 入れたあとで `xestrata` を実行すると、PC の GPU（Intel、AMD、NVIDIA）と入れた版に合わせて、足りないものと、その入れ方
-  （要るならリポジトリの登録から）を表示します。GPU のランタイム（Level Zero、ROCm）がなければ、そこで止まります。
-  `xestrata --packages` は、入れ方だけを表示します。
-  NVIDIA のドライバーは、ここには出ないので、自分で入れます。
-  自分のユーザーを `render` グループに入れておきます（`sudo usermod -aG render $USER` の後、ログインし直す）。
-- 行列積を速くする cuBLAS と oneMKL（contrib-llvm の版）は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
-- NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
-  Pascal と Volta（P100、P40、V100 など）を扱うドライバーは 580 の系列までです。
 - パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
   一緒にある `SHA256SUMS` で、取ってきたファイルを確かめられます（`sha256sum -c SHA256SUMS --ignore-missing`）。
   自分で作るときは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
@@ -149,6 +132,10 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 sudo apt install ./xestrata-free_*.deb      # Ubuntu
 sudo dnf install ./xestrata-free-*.rpm      # Fedora
 ```
+
+GPU を動かすためのパッケージは、PC の GPU によって違うので、ここでは入りません。
+次の手順で `xestrata` を初めて実行すると、PC の GPU と入れた版に合わせて、足りないパッケージとその入れ方を表示します。
+表示されたとおりに入れてから、もう一度 `xestrata` を実行します（あとで確かめ直すときは `xestrata --setup`）。
 
 **3. 端末で `xestrata` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
 

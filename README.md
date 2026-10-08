@@ -122,29 +122,10 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel (with free software only) | `xestrata-free` | `xestrata-free` |
-| AMD (RDNA2 or later, [the GPUs it runs on](#amd-gpus)), or Intel and AMD | `xestrata-free` | `xestrata-free` |
-| Intel (for speed), NVIDIA (Turing or later), or both | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
-| NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), or Intel and those | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
+| Intel, AMD (RDNA2 or later, [the GPUs it runs on](#amd-gpus)), or both (with free software only) | `xestrata-free` | `xestrata-free` |
+| Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
+| NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), with Intel or AMD or not | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
-- Every contrib-llvm package runs on Intel, AMD and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
-- On a PC with Intel GPUs only, take a contrib-llvm package and oneMKL for speed.
-  oneMKL then does the prompt's dense matrix products, a little faster than XeStrata's own kernels (about 3% on a B70).
-- No package requires a GPU maker's driver or library.
-  The free package recommends Intel's GPU runtime (Level Zero) and AMD's ROCm libraries for AMD GPUs
-  (recommendations are installed by default). The ROCm libraries take about 1.4 GB; without an AMD GPU, leave them
-  out with `--no-install-recommends` (apt) or `--setopt=install_weak_deps=False` (dnf), and `xestrata` shows how
-  to install Level Zero for an Intel GPU (below).
-  The contrib-llvm packages only suggest the makers' ones and install none of them.
-- Once a package is installed, `xestrata` shows what the PC's GPUs (Intel, AMD, NVIDIA) and the installed package lack,
-  and how to install it (adding a repository first where needed). Without the GPU's runtime (Level Zero, ROCm) it stops
-  there. `xestrata --packages` only shows how to install them.
-  NVIDIA's driver is not among them: install it yourself.
-  Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
-- cuBLAS and oneMKL, which speed up the matrix products (the contrib-llvm packages), are not free software; without them
-  XeStrata's own kernels do the work.
-- An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
-  The drivers for Pascal and Volta (a P100, P40 or V100) end with the 580 series.
 - The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
   The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
   To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).
@@ -155,6 +136,11 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 sudo apt install ./xestrata-free_*.deb      # Ubuntu
 sudo dnf install ./xestrata-free-*.rpm      # Fedora
 ```
+
+The packages that run the GPU depend on the PC's GPUs, so they are not installed here.
+The first time you run `xestrata` (the next step), it shows the packages the PC's GPUs and the installed package
+lack, and how to install them.
+Install them as it shows, then run `xestrata` again (to check again later: `xestrata --setup`).
 
 **3. Run `xestrata` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
 
