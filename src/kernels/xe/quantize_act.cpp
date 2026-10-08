@@ -84,25 +84,33 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
     if (n <= 0) return;
     require_multiple(n, QK8_0, "quantize_q8_0_scaled");
     if (scales == nullptr) throw core::DeviceError("quantize_q8_0_scaled: scales is null");
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n / QK8_0)), [=](sycl::id<1> id) {
-        const int64_t b = (int64_t) id[0];
-        const float* xb = x + b * QK8_0;
+    // one sub-group a block (upstream 3281ac32): lane i holds value i, the block's max by xor shuffles (fmax ignores
+    // NaN as the sequential walk did, and the max does not depend on the order)
+    const int64_t n_blocks = n / QK8_0;
+    const size_t groups = (size_t) ((n_blocks + 7) / 8);
+    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256),
+                                                  [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int64_t b = (int64_t) it.get_group(0) * 8 + (int64_t) sg.get_group_linear_id();
+        if (b >= n_blocks) return;   // uniform over the sub-group
+        const int lane = (int) sg.get_local_linear_id();
+        const float xv = x[b * QK8_0 + lane];
         uint8_t* out = blocks + b * 34;
-        float amax = 0.0f;
-        for (int i = 0; i < QK8_0; ++i) amax = sycl::fmax(amax, sycl::fabs(xb[i]));
+        float amax = sycl::fabs(xv);
+        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
         const float s = amax > 0.f ? amax / 127.f : 0.f;
         const float inv = s > 0.f ? 1.f / s : 0.f;
-        scales[b] = s;
-        const uint16_t d16bits = f16_from_f32(s);
-        out[0] = (uint8_t) (d16bits & 0xFF);
-        out[1] = (uint8_t) (d16bits >> 8);
-        for (int i = 0; i < QK8_0; ++i) {
-            const float t = xb[i] * inv;
-            const float r = t + (t >= 0.f ? 0.5f : -0.5f);
-            int v = (int) r;
-            v = v < -127 ? -127 : (v > 127 ? 127 : v);
-            out[2 + i] = (uint8_t) (int8_t) v;
+        if (lane == 0) {
+            scales[b] = s;
+            const uint16_t d16bits = f16_from_f32(s);
+            out[0] = (uint8_t) (d16bits & 0xFF);
+            out[1] = (uint8_t) (d16bits >> 8);
         }
+        const float t = xv * inv;
+        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
+        int v = (int) r;
+        v = v < -127 ? -127 : (v > 127 ? 127 : v);
+        out[2 + lane] = (uint8_t) (int8_t) v;
     });
     finish(stream, e, "quantize_q8_0_scaled");
 }
