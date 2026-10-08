@@ -308,58 +308,31 @@ setup.py は OS のパッケージを入れず、apt も sudo も実行しませ
 setup.sh は、venv の使える Python 3 がないときだけ、それを `sudo apt-get`（Fedora では `sudo dnf`）で入れます。
 ほかのパッケージは、先に自分で入れておきます。
 
-#### Ubuntu 26.04
+次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`）の後ろに並べます。
+`./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib）に合わせて、その 1 行を出します。
+`./setup.sh --packages fedora44/intel,amd --license free` のように、ほかの組み合わせも出せます。
 
-開発機（Ubuntu 26.04.1）で使っているパッケージです。
-free の列は、まっさらな Ubuntu 26.04 で必要なものでもあります。
-コンテナで、この列と `python3-venv` だけを入れて、setup を最初から最後まで通しました（[記録](../bench/results/2026-10-03-clean-setup/README.md)。
-そのときは intel/llvm の代わりに `dpclang-6` でした。intel/llvm をビルドする今の手順でまっさらな Ubuntu から通すことは `unverified` です）。
-`intel-opencl-icd` は、エンジンを動かすだけなら要りません。
-
-| 用途 | free | contrib-icpx（`--license contrib-icpx`） |
+| 選択 | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| エンジンのビルド | —（SYCL のコンパイラのほかに要るものはありません） | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1（Intel の apt リポジトリ）、`intel-ocloc` 26.05.37020.3、`intel-oneapi-mkl-sycl-devel` 2026.1.0 |
-| intel/llvm 7 以降のビルド（setup がここで作ります） | `git`、`cmake`、`ninja-build`、`g++`、`libhwloc-dev`、`libzstd-dev` | （icpx を使うので不要） |
-| エンジンの実行 | `libze1` 1.28.2、`libze-intel-gpu1` 26.05.37020.3、`intel-opencl-icd` 26.05.37020.3（`libze-intel-gpu-legacy1-1` 24.35 も入っていますが、B70 は新しいランタイムを使います） | 同じ |
-| CPU の画像エンコーダー | `build-essential` | 同じ |
-| GPU の画像エンコーダー（[画像](XE.ja.md#画像)） | Vulkan: `libvulkan-dev` 1.4.341、`glslc` 2026.1、`spirv-headers` 1.6.1、`mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
-| SYCL の画像エンコーダーの oneDNN（任意。選んだときだけ） | — | `intel-oneapi-dnnl-devel` 2026.0.2 |
-| 保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)） | `libblosc2-dev` 2.23.0（ビルドのときに見つかれば組み込む） | 同じ |
+| 共通（free、contrib） | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
+| 共通（contrib-icpx） | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
+| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
+| Intel の GPU（contrib） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
+| AMD の GPU（free、contrib） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
+| NVIDIA の GPU（contrib） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー |
 
-contrib（`--license contrib`）では、free の列のうち intel/llvm をビルドするためのものと、
-`intel-oneapi-mkl-sycl-devel` 2026.1.0、NVIDIA の GPU を使うなら `nvidia-cuda-toolkit` 12.4 と NVIDIA のドライバー（`nvidia-driver-610-open`）が要ります。
-
-AMD の GPU には、free でも contrib でも、ROCm の `libamdhip64-dev`、`rocm-device-libs-21`、`clang-21`、`libclang-rt-21-dev`、
-`librocblas-dev`、`libhipblaslt-dev`、`libhipblas-common-dev`（universe）が要ります（Ubuntu で AMD の GPU を動かすことは `unverified` です）。
-このうち `clang-21` と `libclang-rt-21-dev`（ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
-oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
-intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
-要るのはビルドのときだけで、実行には要りません。
-
-#### Fedora 44
-
-Fedora 44 には DPC++ のパッケージがないので、free では `--intel-llvm-build` で intel/llvm をビルドします。
-2026-10-04 に、開発機（Ubuntu 26.04 のカーネル 7.0 と xe ドライバー）の上の Fedora 44 のコンテナで、
-次のパッケージだけを入れて setup を最後まで通しました。
-intel/llvm v7.1.1 のビルドに 14 分かかり、B70 に XMX が使えて、起動したモデルは質問に答えました。
-
-| 用途 | パッケージ（確かめた版） |
-| --- | --- |
-| Python | `python3` 3.14.7（setup.sh が `dnf` で入れることもできます） |
-| intel/llvm のビルド | `git`、`cmake` 4.3.0、`ninja-build`、`gcc-c++` 16.2.1、`hwloc-devel`、`libzstd-devel`、`libzstd-static`（2026-10-05 から、intel/llvm が zstd を静的にリンクするため） |
-| エンジンのビルド | `oneapi-level-zero-devel` 1.33.1 |
-| エンジンの実行 | `oneapi-level-zero` 1.33.1、`intel-level-zero` 26.35.39758.11（Intel の GPU の Level Zero のドライバー） |
-
-AMD の GPU には、`rocm-hip-devel`、`rocm-device-libs`、`rocm-clang`、`rocm-clang-runtime-devel`、`rocblas-devel`、`hipblaslt-devel`、`hipblas-common-devel` が要ります
-（7.1.1、RX 9060 XT のコンテナで確かめています）。
-`rocm-clang` と `rocm-clang-runtime-devel` は、Ubuntu の `clang-21` と `libclang-rt-21-dev` と同じく、HIP の CMake のパッケージのためにビルドのときだけ要ります。
-
-`intel-compute-runtime`（OpenCL）も入れて試しましたが、Ubuntu での記録のとおり、エンジンには要らないはずです（`unverified`）。
-画像のエンコーダーに要るパッケージと、Fedora 自身のカーネルでの動作は確かめていません（`unverified`）。
+- `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
+- 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話を再起動後も使う任意)）のためです。
+  contrib-icpx で SYCL の画像エンコーダーに oneDNN を使うなら、`intel-oneapi-dnnl-devel` も入れます。
+- AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
+  oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
+  intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
+  要るのはビルドのときだけで、実行には要りません。
+- 確かめていない組み合わせ（`unverified`）: Ubuntu で AMD の GPU を動かすこと、Fedora の contrib-icpx。
 
 #### ほかのディストリビューション
 
-同じ日に、同じ方法で openSUSE Leap 16.0 も試しました。
+2026-10-04 に、openSUSE Leap 16.0 をコンテナで試しました。
 そのままでは動きません。
 compute-runtime（`libze_intel_gpu1`）が 25.18 と古く、Arc Pro B70 を列挙しないためです。
 intel/llvm のビルドは通りますが、setup は GPU が見えないとして止まります。

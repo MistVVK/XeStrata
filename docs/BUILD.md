@@ -302,61 +302,34 @@ The packages it needs are in [the table below](#packages) and in [DEVTOOLS.md](D
 ### Packages
 
 setup.py installs no system packages and runs neither apt nor sudo.
-setup.sh only installs Python 3 with venv, through `sudo apt-get` (`sudo dnf` on Fedora), when there is none.
+setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedora) only when there is none.
 Install the other packages first.
 
-#### Ubuntu 26.04
+From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora).
+`./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib unless given).
+It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --license free`.
 
-The packages on the development machine (Ubuntu 26.04.1).
-The free column is also what a clean Ubuntu 26.04 needs:
-in a container with only this column and `python3-venv`, setup ran from start to end ([record](../bench/results/2026-10-03-clean-setup/README.md);
-with `dpclang-6` then instead of intel/llvm: from a clean Ubuntu with today's intel/llvm build it is `unverified`).
-`intel-opencl-icd` is not needed to run the engine.
-
-| For | Free | contrib-icpx (`--license contrib-icpx`) |
+| Choice | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Building the engine | — (nothing besides the SYCL compiler) | `intel-oneapi-compiler-dpcpp-cpp` 2026.1.1 (Intel's apt repository), `intel-ocloc` 26.05.37020.3, `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
-| Building intel/llvm 7 or later (setup builds it here) | `git`, `cmake`, `ninja-build`, `g++`, `libhwloc-dev`, `libzstd-dev` | (not needed: icpx is used) |
-| Running it | `libze1` 1.28.2, `libze-intel-gpu1` 26.05.37020.3, `intel-opencl-icd` 26.05.37020.3 (`libze-intel-gpu-legacy1-1` 24.35 is also installed; the B70 uses the new runtime) | the same |
-| The CPU image encoder | `build-essential` | the same |
-| The GPU image encoder (see [Images](XE.md#images)) | Vulkan: `libvulkan-dev` 1.4.341, `glslc` 2026.1, `spirv-headers` 1.6.1, `mesa-vulkan-drivers` 26.0.8 | SYCL: `intel-oneapi-mkl-sycl-devel` 2026.1.0 |
-| oneDNN for the SYCL image encoder (optional; off unless chosen) | — | `intel-oneapi-dnnl-devel` 2026.0.2 |
-| Compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)) | `libblosc2-dev` 2.23.0 (built in when the build finds it) | the same |
+| common (free, contrib) | `python3-venv git cmake ninja-build build-essential libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` |
+| common (contrib-icpx) | `python3-venv build-essential libblosc2-dev intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` | `python3 gcc-c++ blosc2-devel intel-oneapi-compiler-dpcpp-cpp intel-ocloc intel-oneapi-mkl-sycl-devel` |
+| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` |
+| Intel GPUs (contrib) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` |
+| AMD GPUs (free, contrib) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` |
+| NVIDIA GPUs (contrib) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver |
 
-The contrib mode (`--license contrib`) needs the free column's packages for building intel/llvm,
-`intel-oneapi-mkl-sycl-devel` 2026.1.0, and for an NVIDIA GPU `nvidia-cuda-toolkit` 12.4 and NVIDIA's driver (`nvidia-driver-610-open`).
-
-An AMD GPU needs, in the free and contrib modes, ROCm's `libamdhip64-dev`, `rocm-device-libs-21`, `clang-21`, `libclang-rt-21-dev`,
-`librocblas-dev`, `libhipblaslt-dev` and `libhipblas-common-dev` (universe; running an AMD GPU on Ubuntu is `unverified`).
-Of these, `clang-21` and `libclang-rt-21-dev` (ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
-HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
-intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
-They are needed to build only, not to run.
-
-#### Fedora 44
-
-Fedora 44 has no DPC++ package, so the free mode builds intel/llvm with `--intel-llvm-build`.
-On 2026-10-04 setup ran from start to end in a Fedora 44 container on the development machine
-(Ubuntu 26.04's kernel 7.0 and xe driver), with only these packages installed.
-intel/llvm v7.1.1 built in 14 minutes, the B70 got XMX, and the model it started answered a question.
-
-| For | Packages (versions checked) |
-| --- | --- |
-| Python | `python3` 3.14.7 (setup.sh can also install it through `dnf`) |
-| Building intel/llvm | `git`, `cmake` 4.3.0, `ninja-build`, `gcc-c++` 16.2.1, `hwloc-devel`, `libzstd-devel`, `libzstd-static` (since 2026-10-05: intel/llvm links zstd statically) |
-| Building the engine | `oneapi-level-zero-devel` 1.33.1 |
-| Running it | `oneapi-level-zero` 1.33.1, `intel-level-zero` 26.35.39758.11 (the Level Zero driver for Intel GPUs) |
-
-An AMD GPU needs `rocm-hip-devel`, `rocm-device-libs`, `rocm-clang`, `rocm-clang-runtime-devel`, `rocblas-devel`, `hipblaslt-devel` and `hipblas-common-devel`
-(7.1.1, checked in a container with an RX 9060 XT).
-`rocm-clang` and `rocm-clang-runtime-devel`, like Ubuntu's `clang-21` and `libclang-rt-21-dev`, are needed to build only, for HIP's CMake package.
-
-`intel-compute-runtime` (OpenCL) was installed too; as on Ubuntu, the engine should not need it (`unverified`).
-The packages for the image encoders and running on Fedora's own kernel are not checked (`unverified`).
+- The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
+- The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-across-restarts-opt-in)).
+  With contrib-icpx and oneDNN for the SYCL image encoder, install `intel-oneapi-dnnl-devel` too.
+- The AMD row's `clang-21` and `libclang-rt-21-dev` (on Fedora `rocm-clang` and `rocm-clang-runtime-devel`: ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
+  HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
+  intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
+  They are needed to build only, not to run.
+- Not checked (`unverified`): running an AMD GPU on Ubuntu, and contrib-icpx on Fedora.
 
 #### Other distributions
 
-openSUSE Leap 16.0 was tried the same way on the same day.
+openSUSE Leap 16.0 was tried in a container on 2026-10-04.
 It does not run as it is:
 its compute-runtime (`libze_intel_gpu1`) is 25.18, too old to list the Arc Pro B70.
 intel/llvm builds, but setup stops because it sees no GPU.

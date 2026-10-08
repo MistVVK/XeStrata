@@ -210,11 +210,12 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 ここでは、それを補うことだけを書きます。
 
 - **パッケージ**: deb と rpm のパッケージ（[README](../README.ja.md#インストール)）なら、要るものは apt や dnf が入れます。
-  ソースから入れるときは、Intel の GPU にはそのランタイム（Level Zero）、NVIDIA の GPU にはドライバーと CUDA ツールキット、
-  既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
+  ソースから入れるときは、Intel の GPU にはそのランタイム（Level Zero）、AMD の GPU には ROCm（HIP、rocBLAS、hipBLASLt ほか）、
+  NVIDIA の GPU にはドライバーと CUDA ツールキット、既定の contrib のビルドで Intel の GPU を使うなら oneMKL が要ります。
+  SYCL のコンパイラ（intel/llvm）は setup がビルドできます。
   setup は OS のパッケージを入れないので、先に入れておきます。
-  Ubuntu 26.04 と Fedora 44 で要るものは [BUILD.ja.md](BUILD.ja.md#パッケージ) にあります。
-- **GPU のデバイス**: Intel の GPU は、自分のユーザーで `/dev/dri/renderD*` を開けることが要ります（`render` グループ）。
+  Ubuntu 26.04 と Fedora 44 で要るものは [BUILD.ja.md](BUILD.ja.md#パッケージ) にあり、`./setup.sh --packages` がこの PC に合わせた 1 行のコマンドを出します。
+- **GPU のデバイス**: 自分のユーザーで `/dev/dri/renderD*`（AMD の GPU では `/dev/kfd` も）を開けることが要ります（`render` グループ）。
 - **ディスク**: モデルに約 60〜110 GB、MTP 層に約 6 GB（画像を使うならさらに 1 GB）。
   **AVX-512 の CPU で元のモデルの Q2_0** を選ぶと、速い CPU のカーネル用に、エキスパートのコピー（約 40 GB）を一度書きます。
   NVMe の SSD を強く勧めます。
@@ -960,11 +961,17 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 
 | 症状 | すること |
 | --- | --- |
-| `no Intel GPU on the xe or i915 driver and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
+| `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、AMD の GPU が amdgpu に、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 | `an NVIDIA GPU needs the contrib build` | `--license free` か `--license contrib-icpx` を選んでいます。NVIDIA の GPU は contrib のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
 | `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib か contrib-icpx のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |
 | `no access to the GPU` | 自分のユーザーで `/dev/dri/renderD*` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
+| `no access to the GPU's compute device (/dev/kfd)` | AMD の GPU の計算に使う `/dev/kfd` を開けません。`sudo usermod -aG render $USER` のあと、ログインし直します。 |
+| `... the engine needs an RDNA2 or later AMD GPU` | RDNA2 より前の AMD の GPU では動きません。 |
+| `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
+| `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
+| `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
+| `an AMD GPU needs the free or contrib build` | `--license contrib-icpx` を選んでいます。icpx には AMD の対象がないので、`--license free` か `--license contrib` で setup をやり直します。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、プロンプトの読み込みに約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
@@ -1003,8 +1010,8 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
   ただし、測った当たり方と費用から、得になるところでだけ使います。
   推測は MTP のものと同じに確かめるので、出力は変わりません。
 - **プロンプト**は、最大 32,768 トークンの塊で処理し、エキスパートは PCIe で GPU に流します。
-  行列積は、Intel の GPU では XMX、NVIDIA の GPU では Tensor Core で計算し、
-  contrib と contrib-icpx のビルドでは密な行列積を oneMath 経由で oneMKL か cuBLAS に任せます。
+  行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
+  密な行列積は oneMath 経由で、contrib と contrib-icpx のビルドでは oneMKL か cuBLAS に、AMD の GPU では rocBLAS と hipBLASLt に任せます。
 
 Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**（英語、CUDA での測定）にあります。
 
