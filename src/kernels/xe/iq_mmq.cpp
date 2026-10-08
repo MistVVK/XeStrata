@@ -41,15 +41,32 @@ using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte acc
 
 // The tile shape (NVIDIA's int8 one on a warp; the only one written for so far) and the K step.
 constexpr int TM = 16, TN = 16, TK = 16, SG = 32;
-constexpr int NE = TM * TN / SG;      // accumulator elements a lane
+[[maybe_unused]] constexpr int NE = TM * TN / SG;   // accumulator elements a lane (the layout check)
 constexpr int KC = 128;               // K a step: four blocks of 32
 constexpr int NB = KC / 32;
 constexpr int LDA = KC + 16;          // local row strides in bytes (16-byte multiples, rows apart in the banks)
 constexpr int LDB = KC + 16;
 
+// AMD's device compile has joint_matrix on CDNA's matrix cores only, not for this shape: the joint_matrix bodies are
+// left out (their types do not depend on a template parameter, so `if constexpr` alone does not drop them).  RDNA3 and
+// RDNA4 (GFX11, GFX12) take the same products through their int8 WMMA instructions instead (STRATA_IQ_MMQ_WMMA).
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#define STRATA_IQ_MMQ_MATRIX 0
+#if defined(__GFX11__) || defined(__GFX12__)
+#define STRATA_IQ_MMQ_WMMA 1
+#else
+#define STRATA_IQ_MMQ_WMMA 0
+#endif
+#else
+#define STRATA_IQ_MMQ_MATRIX 1
+#define STRATA_IQ_MMQ_WMMA 0
+#endif
+
 template<int S>
 constexpr bool built() {
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#if STRATA_IQ_MMQ_WMMA
+    return true;
+#elif !STRATA_IQ_MMQ_MATRIX
     return false;
 #else
     return STRATA_NV_ARCH == 0 || STRATA_NV_ARCH >= 720;   // int8 on NVIDIA's tensor cores from sm_72 on
@@ -254,6 +271,7 @@ struct Kernel {
         if constexpr (!built<TY>()) {
             (void) it;
         } else {
+#if STRATA_IQ_MMQ_MATRIX
             const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -347,6 +365,110 @@ struct Kernel {
                     }
                     sycl::group_barrier(sg);
                 }
+#elif STRATA_IQ_MMQ_WMMA
+            // The int8 WMMA of RDNA3 (GFX11) and RDNA4 (GFX12), 16 x 16 x 16 on 32 lanes; lane l holds column l % 16 of
+            // B and of the accumulator, row l % 16 of A.  GFX12: each lane 8 of the 16 K values (l / 16 picks which),
+            // the accumulator's rows 8 (l / 16) + e.  GFX11: each lane all 16 K values (lanes 16-31 repeat 0-15), the
+            // accumulator's rows 2 e + l / 16.  The same products and scales as the joint_matrix body above, in the
+            // positions those layouts give.
+            const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+            const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
+            const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
+            if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
+            const auto sg = it.get_sub_group();
+            const int sgid = (int) sg.get_group_linear_id(), lid = (int) it.get_local_id(0);
+            const int lane = (int) sg.get_local_linear_id(), lo = lane & 15, hi = lane >> 4;
+            constexpr int lanes = NSG * SG;
+            const int ms = sgid / NSGN * SGM * TM, ns = sgid % NSGN * SGN * TN;
+            const uint8_t* wx = w + (size_t) e * expert_bytes;
+            const auto base = lm.template get_multi_ptr<sycl::access::decorated::no>();
+            int8_t* al = local_as<int8_t>(base + A_OFF).get();
+            int8_t* bl = local_as<int8_t>(base + B_OFF).get();
+            float* xsl = local_as<float>(base + XS_OFF).get();
+            float* wsl = local_as<float>(base + WS_OFF).get();
+            using i8v = int __attribute__((ext_vector_type(8)));
+#if defined(__GFX12__)
+            using frag = int __attribute__((ext_vector_type(2)));
+            constexpr int KOFF = 8;   // bytes of K a lane holds past its half's start
+            auto row_of = [&](int el) { return hi * 8 + el; };
+#else
+            using frag = int __attribute__((ext_vector_type(4)));
+            constexpr int KOFF = 0;
+            auto row_of = [&](int el) { return el * 2 + hi; };
+#endif
+            float acc[SGM][SGN][8];
+            for (int i = 0; i < SGM; ++i)
+                for (int j = 0; j < SGN; ++j)
+                    for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
+
+            const int64_t kb = K / 32;   // activation scales a row
+            for (int64_t k0 = 0; k0 < K; k0 += KC) {
+                sycl::group_barrier(it.get_group());   // the last step's tiles are read
+                for (int v = lid; v < WM * (KC / 16); v += lanes) {
+                    const int rr = v / (KC / 16), c = v % (KC / 16) * 16;
+                    const int64_t row = m0 + rr;
+                    u32x4 val = {0u, 0u, 0u, 0u};
+                    if (row < rows) val = *reinterpret_cast<const u32x4*>(xq + (row0 + row) * K + k0 + c);
+                    *reinterpret_cast<u32x4*>(al + rr * LDA + c) = val;
+                }
+                for (int v = lid; v < WM * NB; v += lanes) {
+                    const int b = v / WM, rr = v % WM;
+                    const int64_t row = m0 + rr;
+                    xsl[v] = row < rows ? xs[(row0 + row) * kb + k0 / 32 + b] : 0.0f;
+                }
+                for (int v = lid; v < WN * NB; v += lanes) {
+                    const int nn = v / NB, b = v % NB;
+                    const Sub d = Dec<TY>::get(wx + (size_t) (n0 + nn) * row_bytes, (int) (k0 / 32) + b);
+                    u32x4* o = reinterpret_cast<u32x4*>(bl + nn * LDB + b * 32);
+                    o[0] = u32x4{d.v[0], d.v[1], d.v[2], d.v[3]};
+                    o[1] = u32x4{d.v[4], d.v[5], d.v[6], d.v[7]};
+                    wsl[(2 * b) * WN + nn] = d.s0;
+                    wsl[(2 * b + 1) * WN + nn] = d.s1;
+                }
+                sycl::group_barrier(it.get_group());
+                for (int b = 0; b < NB; ++b) {
+                    float xsr[SGM][8];   // the rows' scales of the block, in the accumulator's row order
+                    for (int i = 0; i < SGM; ++i)
+                        for (int el = 0; el < 8; ++el) xsr[i][el] = xsl[b * WM + ms + i * TM + row_of(el)];
+                    for (int h = 0; h < (HALF ? 2 : 1); ++h) {
+                        i8v ci[SGM][SGN];
+                        for (int i = 0; i < SGM; ++i)
+                            for (int j = 0; j < SGN; ++j) ci[i][j] = i8v{0, 0, 0, 0, 0, 0, 0, 0};
+                        for (int kk = HALF ? h * TK : 0; kk < (HALF ? h * TK + TK : 32); kk += TK) {
+                            frag a[SGM], bm[SGN];
+                            for (int i = 0; i < SGM; ++i)
+                                a[i] = *reinterpret_cast<const frag*>(al + (ms + i * TM + lo) * LDA + b * 32 + kk + hi * KOFF);
+                            for (int j = 0; j < SGN; ++j)
+                                bm[j] = *reinterpret_cast<const frag*>(bl + (ns + j * TN + lo) * LDB + b * 32 + kk + hi * KOFF);
+                            for (int i = 0; i < SGM; ++i)
+                                for (int j = 0; j < SGN; ++j)
+#if defined(__GFX12__)
+                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a[i], true, bm[j],
+                                                                                              ci[i][j], false);
+#else
+                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[i], true, bm[j],
+                                                                                        ci[i][j], false);
+#endif
+                        }
+                        for (int j = 0; j < SGN; ++j) {
+                            const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
+                            for (int i = 0; i < SGM; ++i)
+                                for (int el = 0; el < 8; ++el)
+                                    acc[i][j][el] += ws * xsr[i][el] * exact_float(ci[i][j][el]);
+                        }
+                    }
+                }
+            }
+            // straight out, the rows past the expert's last not written
+            for (int i = 0; i < SGM; ++i)
+                for (int j = 0; j < SGN; ++j) {
+                    const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
+                    for (int el = 0; el < 8; ++el) {
+                        const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
+                        if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + cb] = acc[i][j][el];
+                    }
+                }
+#endif
         }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
@@ -386,6 +508,14 @@ bool env_on(const char* name) {
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
+// RDNA3 and RDNA4, whose int8 WMMA the kernels' STRATA_IQ_MMQ_WMMA body takes: the device's architecture as SYCL
+// reports it, AMD's GFX11 and GFX12 (the architecture values carry the version: 0x0200000000110000 is gfx1100).
+bool amd_wmma(const sycl::device& d) {
+    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+    const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
+    return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
+}
+
 bool shape_reported(const sycl::device& d) {
     const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
     if (std::find(sgs.begin(), sgs.end(), (size_t) SG) == sgs.end()) return false;
@@ -410,6 +540,7 @@ struct LayoutCheck {
         if constexpr (!built<0>()) {
             (void) it;
         } else {
+#if STRATA_IQ_MMQ_MATRIX
             const auto sg = it.get_sub_group();
             const int lid = (int) it.get_local_id(0);
             for (int i = lid; i < TM * TN; i += SG) { pi[i] = i; pf[i] = (float) i; }
@@ -423,6 +554,7 @@ struct LayoutCheck {
             bad |= n != NE;
             bad = sycl::reduce_over_group(sg, bad, sycl::bit_or<int>());
             if (lid == 0) *out = bad ? 0 : 1;
+#endif
         }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
@@ -435,11 +567,13 @@ bool iq_mmq_usable(sycl::queue& q) {
     return per_device.get(q.get_device(), [&q] {
         if (env_on("STRATA_NO_XMX")) return false;
         const sycl::device d = q.get_device();
-        if (!shape_reported(d)) return false;
+        const bool wmma = amd_wmma(d);
+        if (!wmma && !shape_reported(d)) return false;
         using Big = Kernel<16, 2, 2>;
         if (d.get_info<sycl::info::device::local_mem_size>() < (size_t) Big::LOCAL ||
             d.get_info<sycl::info::device::max_work_group_size>() < (size_t) Big::NSG * SG)
             return false;
+        if (wmma) return true;   // its layout is the WMMA instructions' own, written out in the kernel
         int* out = sycl::malloc_device<int>(1, q);
         if (out == nullptr) return false;
         int res = 0;

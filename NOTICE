@@ -37,10 +37,9 @@ Every copyright holder whose work is in this repository, its license and where t
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright Codeplay Software Limited; changes Copyright 2026 MistVVK and the XeStrata contributors
-  Apache-2.0 - XeStrata's changes to oneMath (https://github.com/uxlfoundation/oneMath) v0.9, in
-  third_party/main/oneMath/patches/, which CMakeLists.txt applies to the release it fetches for the contrib and
-  contrib-icpx modes' dense matrix products. oneMath itself is not in this repository -
-  third_party/main/oneMath/LICENSE, LICENSES/Apache-2.0.txt
+  Apache-2.0 - XeStrata's changes to oneMath (https://github.com/uxlfoundation/oneMath), in XeStrata's fork
+  (https://github.com/MistVVK/oneMath, branch xestrata), whose tag CMakeLists.txt fetches for the dense matrix products. oneMath
+  itself is not in this repository - third_party/main/oneMath/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright the LLVM project contributors; changes Copyright 2026 MistVVK and the XeStrata contributors
   Apache-2.0 WITH LLVM-exception - XeStrata's fixes to intel/llvm (https://github.com/intel/llvm), in
   third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
@@ -52,7 +51,7 @@ Every copyright holder whose work is in this repository, its license and where t
 
 The deb and rpm packages (cmake/packaging.cmake) also carry, each with its license text: the SYCL runtime of
 intel/llvm (Apache-2.0 WITH LLVM-exception) built with XeStrata's fixes, llama.cpp's gguf-py (MIT, Copyright (c)
-2023-2026 The ggml authors), and in the contrib ones oneMath (Apache-2.0) with XeStrata's patches.
+2023-2026 The ggml authors), and in the contrib ones oneMath (Apache-2.0) with XeStrata's changes.
 
 The models are not part of this repository; each model's own license applies to its files.
 Neither are the vendors' libraries the contrib and contrib-icpx modes link (Intel oneMKL and the runtime libraries of

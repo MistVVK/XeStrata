@@ -15,15 +15,18 @@ The contrib build (below) runs on NVIDIA GPUs as well, through the same kernels:
 
 XeStrata builds in three modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
 
-- free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new); icpx is refused.
-- contrib (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (Apache-2.0, fetched by CMake with XeStrata's patches in `third_party/main/oneMath/patches`): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones. It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
+- free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new); icpx is refused. Besides XeStrata's own kernels it uses only kernels and libraries that are free software by the DFSG (what Debian main would take): oneMath with rocBLAS (ROCm) for AMD GPUs' dense matrix products, for example.
+- contrib (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (Apache-2.0; XeStrata's fork, which CMake fetches): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones, rocBLAS on AMD ones (the free mode's path). It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
 - contrib-icpx (`-DSTRATA_LICENSE=contrib-icpx`): the same free source built with Intel oneAPI's icpx and the runtime libraries it links, with oneMKL for the dense matrix products (through oneMath) and the SYCL image encoder (ggml-sycl), for Intel GPUs. setup builds in this mode only when asked (`--license contrib-icpx`).
+
+In reports, commit messages and documents, call the three modes free, contrib-llvm and contrib-icpx: "contrib" alone could be either of the last two.
+contrib-llvm is the mode the code calls `contrib` (`STRATA_LICENSE=contrib`, `--license contrib`, the packages `xestrata-contrib-cuda<version>`); those names stay as they are.
 
 Rules:
 
 - XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib or contrib-icpx mode can build or run, other than the paths for the GPUs only those modes reach (NVIDIA's, in the contrib mode).
 - A non-free dependency goes only on a path the contrib or contrib-icpx mode switches on, never in the free mode, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
-- Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib and contrib-icpx modes and through XeStrata's own kernels in the free mode (and where oneMath has no backend for the GPU); every other product is XeStrata's own kernels in every mode.
+- Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib and contrib-icpx modes, and in the free mode where oneMath's backend for the GPU is free software (rocBLAS for AMD GPUs); elsewhere (and where oneMath has no backend for the GPU) through XeStrata's own kernels. The AMD path is the same in the free and contrib modes. Every other product is XeStrata's own kernels, or a DFSG-free library's, in every mode.
 - Build and test a change to the SYCL code in the free and contrib-icpx modes: a free build (`build/llvm7`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-icpx one (`build/xe`, icpx). A change that NVIDIA's device compile sees is also built in the contrib mode (`build/contrib`, `STRATA_CUDA_ARCHS`), and run on an NVIDIA GPU where one is there (else `unverified`). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
 - `third_party/nonfree/` (below) stays optional in every mode.
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
@@ -39,7 +42,7 @@ Material from other projects goes into `third_party/`, one folder per project wi
 - `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
 - Code transcribed from such a project into XeStrata's own sources (the kernels in `src/` that follow ggml, for example) is part of XeStrata under the LGPL, with the original notice kept in a comment.
 - `third_party/nonfree/<project>/`: anything that is not free software.
-- XeStrata's changes to oneMath are patches in `third_party/main/oneMath/patches/` (`NN-<id>.patch`, applied in order), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them. A patch starts with SPDX lines (the changed files' copyright holders, XeStrata's line, `Apache-2.0`) and what it changes; in each file it changes, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`). The patches are listed in `third_party/main/README.md`.
+- XeStrata's changes to oneMath are commits in its fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), branch `xestrata`: oneMath's commit 6ff3a43 with XeStrata's changes on it), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them; CMake fetches a tag of it. In each file a change touches, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`); a new file carries XeStrata's copyright and the Apache-2.0 header. The changes are listed in `third_party/main/README.md`.
 
 XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
 
@@ -93,6 +96,11 @@ Do not reformat code with clang-format or a similar tool: the code is formatted 
 
 Install the lint tools, Intel SDE and the GPU profilers as [docs/DEVTOOLS.md](docs/DEVTOOLS.md) describes, and keep that file current when a tool or its installation changes.
 Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (anything else built from source), which git ignores; nothing in the build or the tests may depend on either.
+
+## Packages
+
+Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
+A lower value applies to every build in the container, intel/llvm's included, and makes a package take much longer.
 
 ## AVX-512 code
 

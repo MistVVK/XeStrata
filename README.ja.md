@@ -7,12 +7,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 [English](README.md) | 日本語
 
-1,250 億パラメーターの AI モデルを、Intel Arc か NVIDIA の GPU 1 枚と普通の PC で動かします。
+1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル
 **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を、自分の PC で動かすためのソフトウェアです。
-GPU は Intel Arc か NVIDIA を 1 枚、OS は Linux を使います。Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージがあります。
-自由ソフトウェアで、Intel の GPU なら自由ソフトウェアだけでもビルドして動かせます。
+GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれかを 1 枚、OS は Linux を使います。Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージがあります。
+自由ソフトウェアで、Intel と AMD の GPU なら自由ソフトウェアだけでもビルドして動かせます。
 
 > **目次:** [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
@@ -22,12 +22,12 @@ GPU は Intel Arc か NVIDIA を 1 枚、OS は Linux を使います。Ubuntu 2
 
 [Strata](https://github.com/Niko1221/Strata)（NVIDIA の GPU 向け）を、Intel の GPU に移したものです。
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、Intel の GPU で動くようにしました。
-同じコードを、NVIDIA の GPU 向けにもコンパイルします（contrib のビルド）。
+同じコードを、AMD の GPU 向け（free と contrib のビルド）と NVIDIA の GPU 向け（contrib のビルド）にもコンパイルします。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
 Strata との主な違い:
 
-- **Intel Arc 向け**で、NVIDIA の GPU でも動きます。AMD の GPU には対応しません。
+- **Intel Arc 向け**で、AMD と NVIDIA の GPU でも動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **Linux だけ**です。Windows と WSL には対応しません。
 - **自由ソフトウェアだけでも動きます**（`xestrata-free`、Debian main に入れられる程度に自由な構成）。
@@ -37,20 +37,45 @@ Strata との主な違い:
 
 | | |
 | --- | --- |
-| GPU | Intel Arc（A シリーズ、B シリーズ）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
+| GPU | Intel Arc（A シリーズ、B シリーズ）、AMD Radeon（RDNA2 以降、[AMD の GPU](#amd-の-gpu)）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
 | RAM | モデルの大きさによって 32〜62 GB（[モデルの選び方](#モデルの選び方)）。 |
 | ディスク | モデルに 60〜110 GB ほど、ほかに MTP 層に約 6 GB。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（WSL は不可）。パッケージは Ubuntu 26.04 と Fedora 44 向けです。ほかのディストリビューションでは[ソースから入れます](docs/BUILD.ja.md#ソースから入れる)。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
 
-- **行列エンジン**: Intel の XMX と NVIDIA の Tensor Core を使い、ない GPU では DP4a の命令で計算します。
+- **行列エンジン**: Intel の XMX、AMD の WMMA（RDNA3 以降）、NVIDIA の Tensor Core を使い、ない GPU では DP4a などの整数の内積の命令で計算します。
   どれを使うかは、GPU が報告する能力で決めます。行列エンジンがないとプロンプトの読み込みが遅くなりますが、動きます。
-- **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070 で確かめています。
+- **確かめた GPU**: 開発と確認は Arc Pro B70（Xe2、32 GB）で行っています。NVIDIA は RTX 4070 と RTX 3070、AMD は RX 9060 XT（RDNA4）で確かめています。
   Arc A380 では計算の正しさだけを確かめ、モデルは動かしていません。ほかの GPU は確かめていません。
   小さな GPU は、B70 で使えるメモリと XMX を制限して確かめています。
 - **CPU 内蔵のグラフィックス**: 起動とプロンプトの読み込みまでを確かめています。メモリが RAM と共有で、
   XMX のないものが多いので、遅くなります。
+
+### AMD の GPU
+
+AMD の GPU では、プロンプトの密な行列積をディストリビューションの ROCm の rocBLAS と hipBLASLt で計算します。
+そのため、XeStrata が動くのは、ディストリビューションの rocBLAS がコードを持っている GPU だけです。
+
+| GPU | gfx | Ubuntu 26.04 | Fedora 44 |
+| --- | --- | :-: | :-: |
+| RX 6800 / 6900 | gfx1030 | ○ | ○ |
+| RX 6700 | gfx1031 | × | ○ |
+| Ryzen の内蔵 GPU（RDNA2） | gfx1035、gfx1036 | × | ○ |
+| RX 7900 | gfx1100 | ○ | ○ |
+| RX 7800 / 7700 | gfx1101 | ○ | ○ |
+| RX 7600 | gfx1102 | × | ○ |
+| Ryzen の内蔵 GPU（780M など） | gfx1103 | × | ○ |
+| Ryzen AI の内蔵 GPU | gfx1150 | × | ○ |
+| Ryzen AI Max の内蔵 GPU | gfx1151 | ○ | ○ |
+| RX 9060 | gfx1200 | ○ | ○ |
+| RX 9070 | gfx1201 | ○ | ○ |
+
+- **RX 6700 と RX 7600 では Fedora 44 を使ってください。** Ubuntu 26.04 の rocBLAS には、これらの GPU のコードがありません。
+- RX 6600（gfx1032）と RX 6500 / 6400（gfx1034）は、どちらのディストリビューションの rocBLAS にもコードがないので動きません。
+- gfx1152 と gfx1153（Ryzen AI の一部の内蔵 GPU）は、Fedora 44 の rocBLAS にはコードがありますが、XeStrata が使う intel/llvm 7.1.1 にそのターゲットがないので動きません。
+- 自分の GPU の gfx は、`xestrata --check` が GPU の名前の後ろに出します。
+- 表は、どちらのディストリビューションも ROCm 7.1 の rocBLAS のものです。確かめたのは RX 9060 XT（gfx1200）だけです。
 
 ## モデルの選び方
 
@@ -94,21 +119,24 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
 | Intel（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
+| AMD（RDNA2 以降、[対応する GPU](#amd-の-gpu)）、Intel と AMD の両方 | `xestrata-free` | `xestrata-free` |
 | Intel（速さを重視する）、NVIDIA（Turing 以降）、その両方 | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA の Pascal と Volta（P100、P40、V100 など）、Intel とそれらの両方 | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
-- contrib の版は、どれも Intel と NVIDIA の両方の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
+- contrib の版は、どれも Intel、AMD、NVIDIA の GPU で動きます。版の違いは、ビルドに使った CUDA の版と、コードを持つ NVIDIA の世代だけです。
 - Intel の GPU だけの PC でも、速さを重視するなら contrib の版と oneMKL を入れます。
   プロンプトの密な行列積を oneMKL で計算し、XeStrata 自身のカーネルより少し速くなります（B70 で 3% ほど）。
 - どのパッケージも、GPU のメーカーのドライバーやライブラリを必須にはしません。
-  free の版は Intel の GPU のランタイム（Level Zero）を推奨（Recommends、既定で入ります）にします。
-  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。使う GPU のものだけを入れます。
-   - Intel の GPU: `sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2`（Fedora は `sudo dnf install oneapi-level-zero intel-level-zero`）。
-   - NVIDIA の GPU: NVIDIA のドライバー。行列積を速くする cuBLAS は、Ubuntu では multiverse の `libcublas-13-1`（cuda12.4 は `libcublas12`）、
-     Fedora では NVIDIA の CUDA のリポジトリの `libcublas-13-4` です。
-   - Intel の GPU の行列積を速くする oneMKL は、Intel の apt / dnf のリポジトリ（oneAPI）にあります。
-     リポジトリの追加のしかたは Intel の手順（[APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）にあります。
-   - cuBLAS と oneMKL は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
+  free の版は Intel の GPU のランタイム（Level Zero）と AMD の GPU の ROCm のライブラリを推奨（Recommends、既定で入ります）にします。
+  ROCm のライブラリは 1.4 GB ほどあります。AMD の GPU がなければ、`--no-install-recommends`（apt）や
+  `--setopt=install_weak_deps=False`（dnf）で外せます。その場合、Intel の GPU の Level Zero の入れ方は `xestrata` が表示します（下）。
+  contrib の版は、メーカーのものをすべて提案（Suggests）に留め、自動では入れません。
+- 入れたあとで `xestrata` を実行すると、PC の GPU（Intel、AMD、NVIDIA）と入れた版に合わせて、足りないものと、その入れ方
+  （要るならリポジトリの登録から）を表示します。GPU のランタイム（Level Zero、ROCm）がなければ、そこで止まります。
+  `xestrata --packages` は、入れ方だけを表示します。
+  NVIDIA のドライバーは、ここには出ないので、自分で入れます。
+  自分のユーザーを `render` グループに入れておきます（`sudo usermod -aG render $USER` の後、ログインし直す）。
+- 行列積を速くする cuBLAS と oneMKL（contrib の版）は自由ソフトウェアではありません。なくても XeStrata 自身のカーネルで動きます。
 - NVIDIA の GPU には、パッケージの CUDA の版（13.1、13.4、12.4）に対応したドライバーが要ります（`nvidia-smi` の CUDA Version）。
   Pascal と Volta（P100、P40、V100 など）を扱うドライバーは 580 の系列までです。
 - パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
@@ -194,9 +222,10 @@ sudo dnf remove xestrata-free    # Fedora（同じ）
 **GPU が見つからない、使えないと言われた**
 次の 3 つを確かめてください。
 
-- Intel の GPU のランタイム（Level Zero のドライバー）、NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください。
-  NVIDIA の GPU は contrib の版でだけ使えます。
-- 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`）を開けるか確かめてください（`render` グループ）。
+- Intel の GPU のランタイム（Level Zero のドライバー）、AMD の GPU なら ROCm のライブラリ（HIP、rocBLAS、hipBLASLt）、
+  NVIDIA の GPU ならそのドライバー（`nvidia-smi` で見えるか）が入っているか確かめてください。
+  NVIDIA の GPU は contrib の版でだけ使えます。AMD の GPU は、[対応する GPU](#amd-の-gpu)かどうかも確かめてください。
+- 自分のユーザーで GPU のデバイス（`/dev/dri/renderD*`、AMD の GPU では `/dev/kfd` も）を開けるか確かめてください（`render` グループ）。
 - 単体の GPU が OS から見えないときは、BIOS の Above 4G Decoding と Re-Size BAR を確かめてください。
 
 **XMX が使えないと言われた**
@@ -240,7 +269,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   合っているものは残し、次の 1 語は自分で書きます。決めるのはいつも大きなモデルなので、答えの品質は変わりません。
 - **長い文章は大きな塊で読みます**（一度に最大 32,768 トークン）。
 
-行列積は、Intel の GPU では XMX、NVIDIA の GPU では Tensor Core で計算し、行列エンジンのない GPU では DP4a の命令を使います。
+行列積は、Intel の GPU では XMX、AMD の GPU では WMMA（RDNA3 以降）、NVIDIA の GPU では Tensor Core で計算し、
+行列エンジンのない GPU では DP4a などの整数の内積の命令を使います。
 各部分の詳しい説明は [docs/DETAILS.ja.md](docs/DETAILS.ja.md#しくみ)、Intel の GPU での実装と確かめたことは
 [docs/XE.ja.md](docs/XE.ja.md) にあります。
 
@@ -268,8 +298,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。
-   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: contrib と contrib-icpx の密な行列積。
-     CMake が取得し、XeStrata の変更（`third_party/main/oneMath/patches/`、同じライセンス）を当てます。
+   - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib と contrib-icpx、free では AMD の GPU）。
+     CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib のコンパイラ。
      XeStrata の修正（`third_party/main/intel-llvm/patches/`、同じライセンス）を当ててビルドし、パッケージにはその SYCL の実行時を入れます。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
@@ -289,13 +319,13 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
   XeStrata の一部として LGPL です。MIT の条件どおり、著作権表示と許諾表示を [NOTICE](NOTICE) に残しています。
 - **例外**: `third_party/` の次のものは、元のライセンスのままです。プロジェクトごとのフォルダーに、ライセンスの文書と一緒に置いています。
    - intel/llvm への XeStrata の修正のパッチ（`third_party/main/intel-llvm/`）: Apache-2.0 WITH LLVM-exception。
-   - oneMath への XeStrata の変更のパッチ（`third_party/main/oneMath/`）: Apache-2.0。
+   - oneMath への XeStrata の変更（フォーク、`third_party/main/oneMath/`）: Apache-2.0。
    - ggml の `ggml-common.h`（`third_party/main/ggml/`、変えていない写し）: MIT。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。
-- **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）と llama.cpp の gguf-py（MIT）、
-  contrib の版には oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
+- **パッケージに入れているほかのもの**: intel/llvm の SYCL の実行時（Apache-2.0 WITH LLVM-exception）、llama.cpp の gguf-py（MIT）、
+  oneMath（Apache-2.0）を、それぞれのライセンスの文書と一緒に入れています。
   自由ソフトウェアでないもの（oneMKL、cuBLAS、NVIDIA のドライバー）は入れていません。
 - **モデル**: このリポジトリには含みません。モデルのファイルには、それぞれのライセンスが適用されます。

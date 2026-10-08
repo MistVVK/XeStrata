@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/cuda_intrinsics.hpp - CUDA's integer intrinsics as the Xe kernels ported from llama.cpp use them.
@@ -6,7 +7,8 @@
 // compile in CMakeLists.txt), which the B70 runs 4.2 times faster than the byte loop it replaces; CUDA's __dp4a
 // does not saturate either, so the sum is the same integer.  The others are written out with their PTX meaning.
 // Compiled for NVIDIA GPUs (__NVPTX__), __dp4a and __byte_perm are the PTX instructions themselves; sm_60 (Pascal
-// GP100) has no dp4a instruction, and takes the byte loop, the same integer (upstream e200e08f's STRATA_DP4A).
+// GP100) has no dp4a instruction, and takes the byte loop, the same integer (upstream e200e08f's STRATA_DP4A).  For
+// AMD GPUs (__AMDGCN__), the dot instruction of the GPU's family and v_perm_b32.
 #pragma once
 
 #include "device_target.hpp"
@@ -15,7 +17,7 @@
 
 #include <cstdint>
 
-#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__)
+#if defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
 extern SYCL_EXTERNAL int __spirv_SDotKHR(int a, int b, int packed_format);   // 0: PackedVectorFormat4x8Bit
 #endif
 
@@ -26,7 +28,11 @@ inline int dp4a(int a, int b, int c) {
     int r;
     asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
-#elif defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__)
+#elif defined(__SYCL_DEVICE_ONLY__) && (defined(__GFX11__) || defined(__GFX12__))
+    return __builtin_amdgcn_sudot4(true, a, true, b, c, false);   // v_dot4_i32_iu8, both operands signed, no clamp
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__GFX10__)
+    return __builtin_amdgcn_sdot4(a, b, c, false);                // RDNA2's v_dot4_i32_i8 (gfx103x), no clamp
+#elif defined(__SYCL_DEVICE_ONLY__) && !defined(__NVPTX__) && !defined(__AMDGCN__)
     return c + __spirv_SDotKHR(a, b, 0);
 #else
     for (int k = 0; k < 4; ++k) c += (int) (int8_t) (a >> (8 * k)) * (int) (int8_t) (b >> (8 * k));
@@ -41,6 +47,11 @@ inline int dp4a(int a, int b, int c) {
 inline uint32_t byte_perm(uint32_t x, uint32_t y, uint32_t s) {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
     return __nvvm_prmt(x, y, s & 0x7777u);   // prmt's default mode; bit 3 of each selector (sign replication) unused
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    // v_perm_b32: selector bytes 0-3 pick from its second operand, 4-7 from its first, so the nibbles are spread to
+    // bytes (as upstream's HIP backend does)
+    const uint32_t sel = (s & 0x7u) | ((s & 0x70u) << 4) | ((s & 0x700u) << 8) | ((s & 0x7000u) << 12);
+    return __builtin_amdgcn_perm(y, x, sel);
 #else
     uint32_t r = 0;
     for (int i = 0; i < 4; ++i) {

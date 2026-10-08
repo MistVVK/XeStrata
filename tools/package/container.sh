@@ -49,9 +49,12 @@ python3-requests, python3-pil, python3-psutil"
         > /etc/apt/sources.list.d/oneAPI.list
       apt-get update -q
       apt-get install -y -q --no-install-recommends intel-oneapi-mkl-sycl-devel
-      # ROCm's HIP (universe, free software): intel/llvm's HIP target and adapter, for AMD GPUs
-      apt-get install -y -q --no-install-recommends libamdhip64-dev
     fi
+    # ROCm (universe, free software), for AMD GPUs in every package: HIP for intel/llvm's HIP target and adapter, the
+    # device libraries the AMD code links, ROCm's clang with its runtime (HIP's CMake package), rocBLAS and hipBLASLt
+    # (oneMath's rocBLAS backend; hipBLASLt's CMake package needs hipblas-common, which its package does not depend on)
+    apt-get install -y -q --no-install-recommends libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev \
+      librocblas-dev libhipblaslt-dev libhipblas-common-dev
     ;;
   fedora*)
     dnf install -y -q git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3 patchelf curl unzip \
@@ -78,8 +81,10 @@ repo_gpgcheck=1
 gpgkey=$intel_key
 EOF
       dnf install -y -q intel-oneapi-mkl-sycl-devel
-      dnf install -y -q rocm-hip-devel   # ROCm's HIP, for intel/llvm's HIP target and adapter (AMD GPUs)
     fi
+    # ROCm, for AMD GPUs in every package (as on Ubuntu above)
+    dnf install -y -q rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel \
+      hipblas-common-devel
     ;;
 esac
 if [ "$license" = contrib ]; then
@@ -119,41 +124,57 @@ set -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_CXX_COMPILER="$llvm/install/bin/clang++" -DCMAKE_C_COMPILER="$llvm/install/bin/clang" \
   -DSTRATA_LICENSE="$license" -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" -DSTRATA_PACKAGE=ON -DSTRATA_PACKAGE_NAME="$pkgname" \
-  -DSTRATA_PACKAGE_VISION_DIR=/build/vision
+  -DSTRATA_PACKAGE_VISION_DIR=/build/vision -DSTRATA_HIP_ARCHS=rocblas
 if [ "$license" = contrib ]; then
   # the PTX version: the toolkit's (empty); the driver must support this CUDA version
   set -- "$@" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_ONEMKL=ON -DMKL_ROOT=/opt/intel/oneapi/mkl/latest \
     -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX=
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
-targets=strata
-[ "$license" = contrib ] && targets="strata onemath_backend_libs"
+targets="strata onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 
 # What the package depends on (Python's modules, and the libraries the engine links), recommends and suggests.  A GPU
-# maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver (the only
-# GPUs it runs), and the cuda ones, for a PC with Intel GPUs, NVIDIA GPUs or both, only suggest them, so that apt and
-# dnf do not install the other maker's.
+# maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver and AMD's
+# ROCm libraries (both free software, for the GPUs it runs), and the cuda ones, for a PC with GPUs of one maker or
+# more, only suggest every maker's, so that apt and dnf do not install the others'.
 depends=$python_deps
 recommends=""
 suggests=""
-if [ "$license" = free ]; then
-  recommends="$level_zero, $vulkan_icd"
-else
-  # the packages of the libraries the adapters and backends open: oneMKL's, and ROCm's HIP runtime for AMD GPUs
-  mkl=$(readlink -f /opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so)
-  hip=$(readlink -f "$(find /usr/lib /usr/lib64 -name 'libamdhip64.so' 2>/dev/null | head -n 1)")
+# the packages of the libraries the HIP adapter and oneMath's rocBLAS backend open: ROCm's HIP runtime, rocBLAS and
+# hipBLASLt
+pkg_of() {
+  f=$(readlink -f "$(find /usr/lib /usr/lib64 -name "$1" 2>/dev/null | head -n 1)")
   case "$distro" in
-    ubuntu*) mklpkg=$(dpkg -S "$mkl" | cut -d: -f1) hippkg=$(dpkg -S "$hip" | cut -d: -f1) ;;
-    fedora*) mklpkg=$(rpm -qf --qf '%{NAME}' "$mkl") hippkg=$(rpm -qf --qf '%{NAME}' "$hip") ;;
+    ubuntu*) dpkg -S "$f" | cut -d: -f1 ;;
+    fedora*) rpm -qf --qf '%{NAME}' "$f" ;;
   esac
-  suggests="$level_zero, $vulkan_icd, $cublas, $mklpkg, $hippkg"
+}
+rocm="$(pkg_of libamdhip64.so), $(pkg_of librocblas.so), $(pkg_of libhipblaslt.so)"
+if [ "$license" = free ]; then
+  recommends="$level_zero, $rocm, $vulkan_icd"
+else
+  # and oneMKL's
+  mkl=$(readlink -f /opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so)
+  case "$distro" in
+    ubuntu*) mklpkg=$(dpkg -S "$mkl" | cut -d: -f1) ;;
+    fedora*) mklpkg=$(rpm -qf --qf '%{NAME}' "$mkl") ;;
+  esac
+  suggests="$level_zero, $vulkan_icd, $cublas, $mklpkg, $rocm"
 fi
+# the same, by GPU maker, for setup to tell what a PC lacks (BUILD.json's "runtime"): what each maker's GPUs need,
+# and in the contrib packages oneMKL and cuBLAS, which make them faster
+json_list() { printf '["%s"]' "$(echo "$1" | sed 's/, */", "/g')"; }
+runtime="{\"intel\": $(json_list "$level_zero"), \"amd\": $(json_list "$rocm")"
+if [ "$license" = contrib ]; then
+  runtime="$runtime, \"onemkl\": $(json_list "$mklpkg"), \"cublas\": $(json_list "$cublas")"
+fi
+runtime="$runtime}"
 case "$distro" in
   ubuntu*)
-    # the libraries the engine's own files link, from dpkg-shlibdeps; not oneMath's backends and the CUDA adapter,
-    # whose oneMKL, cuBLAS, HIP and NVIDIA driver are suggested above
+    # the libraries the engine's own files link, from dpkg-shlibdeps; not oneMath's backends and the CUDA and HIP
+    # adapters, whose oneMKL, cuBLAS, ROCm and NVIDIA driver are recommended or suggested above
     DESTDIR=/stage cmake --install /build/engine
     eng=$(find /stage -type d -path '*/xestrata/engine' | head -n 1)
     mkdir -p /stage/debian
@@ -174,7 +195,7 @@ case "$distro" in
   fedora*) generator=RPM ;;
 esac
 cmake -DSTRATA_PACKAGE_DEPENDS="$depends" -DSTRATA_PACKAGE_RECOMMENDS="$recommends" \
-  -DSTRATA_PACKAGE_SUGGESTS="$suggests" /build/engine
+  -DSTRATA_PACKAGE_SUGGESTS="$suggests" -DSTRATA_PACKAGE_RUNTIME="$runtime" /build/engine
 cd /build/engine
 cpack -G "$generator"
 find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;

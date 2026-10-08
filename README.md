@@ -7,12 +7,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](README.ja.md)
 
-Run a 125-billion-parameter AI model on one Intel Arc or NVIDIA GPU and an ordinary PC.
+Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
 
 XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that
 normally runs on a server, on your own PC.
-It uses one Intel Arc or NVIDIA GPU and Linux; Ubuntu 26.04 and Fedora 44 have deb and rpm packages.
-It is free software, and on an Intel GPU it also runs with free software only.
+It uses one Intel Arc, AMD Radeon (RDNA2 or later) or NVIDIA GPU and Linux; Ubuntu 26.04 and Fedora 44 have deb and rpm packages.
+It is free software, and on an Intel or AMD GPU it also builds and runs with free software only.
 
 > **Contents:** [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
 > [Choosing a model](#choosing-a-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
@@ -22,12 +22,12 @@ It is free software, and on an Intel GPU it also runs with free software only.
 
 A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Intel GPUs.
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, so that it runs on Intel's GPUs.
-The same code is compiled for NVIDIA GPUs as well (the contrib build).
+The same code is compiled for AMD GPUs (the free and contrib builds) and NVIDIA GPUs (the contrib build) as well.
 The models, the install, the app and the API are much the same as Strata's.
 
 How it differs from Strata:
 
-- **For Intel Arc,** and it runs on NVIDIA GPUs too. AMD GPUs are not supported.
+- **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
 - **Linux only.** Windows and WSL are not supported.
 - **Runs with free software only, too** (`xestrata-free`, free enough for Debian main). The contrib packages use
@@ -37,21 +37,47 @@ How it differs from Strata:
 
 | | |
 | --- | --- |
-| GPU | Intel Arc (A series, B series), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
+| GPU | Intel Arc (A series, B series), AMD Radeon (RDNA2 or later, [AMD GPUs](#amd-gpus)), or an NVIDIA GPU (Pascal or later; Pascal has no tensor cores and runs the slower paths). 12 GB of VRAM or more is recommended (less works, but slower). |
 | CPU | x86-64 with AVX2. With AVX-512 (F, BW, VL, VNNI, VBMI) the CPU's part runs on AVX-512. |
 | RAM | 32-62 GB, depending on the model's size ([Choosing a model](#choosing-a-model)). |
 | Disk | About 60-110 GB for the model, and about 6 GB for the MTP layer. An SSD (NVMe) is strongly recommended. |
 | OS | Linux (not WSL). The packages are for Ubuntu 26.04 and Fedora 44; on other distributions, [install from the source](docs/BUILD.md#installing-from-the-source). |
 | BIOS | For a discrete GPU: Above 4G Decoding and Re-Size BAR on, CSM off. |
 
-- **Matrix engines:** Intel's XMX and NVIDIA's tensor cores are used; a GPU without them computes with DP4a
-  instructions. Which one is chosen from what the GPU reports. Without matrix engines, prompts are read more slowly,
+- **Matrix engines:** Intel's XMX, AMD's WMMA (RDNA3 or later) and NVIDIA's tensor cores are used; a GPU without
+  them computes with integer dot-product instructions such as DP4a. Which one is chosen from what the GPU reports. Without matrix engines, prompts are read more slowly,
   but it runs.
 - **GPUs checked:** development and checks are done on an Arc Pro B70 (Xe2, 32 GB). On NVIDIA, an RTX 4070 and an
-  RTX 3070 are checked. On an Arc A380 only the arithmetic is checked, without running a model. Other GPUs have not
+  RTX 3070 are checked; on AMD, an RX 9060 XT (RDNA4). On an Arc A380 only the arithmetic is checked, without running a model. Other GPUs have not
   been checked. Smaller cards are checked by limiting the memory and the XMX the B70 may use.
 - **The processor's own graphics:** checked up to starting and reading a prompt. Its memory is shared with the RAM,
   and most have no XMX, so it is slow.
+
+### AMD GPUs
+
+On AMD GPUs, the prompt's dense matrix products run in the distribution's ROCm rocBLAS and hipBLASLt.
+So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
+
+| GPU | gfx | Ubuntu 26.04 | Fedora 44 |
+| --- | --- | :-: | :-: |
+| RX 6800 / 6900 | gfx1030 | yes | yes |
+| RX 6700 | gfx1031 | no | yes |
+| Ryzen integrated graphics (RDNA2) | gfx1035, gfx1036 | no | yes |
+| RX 7900 | gfx1100 | yes | yes |
+| RX 7800 / 7700 | gfx1101 | yes | yes |
+| RX 7600 | gfx1102 | no | yes |
+| Ryzen integrated graphics (780M and others) | gfx1103 | no | yes |
+| Ryzen AI integrated graphics | gfx1150 | no | yes |
+| Ryzen AI Max integrated graphics | gfx1151 | yes | yes |
+| RX 9060 | gfx1200 | yes | yes |
+| RX 9070 | gfx1201 | yes | yes |
+
+- **On an RX 6700 or an RX 7600, use Fedora 44.** Ubuntu 26.04's rocBLAS has no code for these GPUs.
+- The RX 6600 (gfx1032) and the RX 6500 / 6400 (gfx1034) do not run: neither distribution's rocBLAS has code for them.
+- gfx1152 and gfx1153 (some Ryzen AI integrated graphics) do not run: Fedora 44's rocBLAS has code for them, but the
+  intel/llvm 7.1.1 XeStrata builds with has no target for them.
+- `xestrata --check` shows your GPU's gfx after its name.
+- The table is that of ROCm 7.1's rocBLAS on both distributions. Only the RX 9060 XT (gfx1200) has been checked.
 
 ## Choosing a model
 
@@ -97,21 +123,26 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
 | Intel (with free software only) | `xestrata-free` | `xestrata-free` |
+| AMD (RDNA2 or later, [the GPUs it runs on](#amd-gpus)), or Intel and AMD | `xestrata-free` | `xestrata-free` |
 | Intel (for speed), NVIDIA (Turing or later), or both | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), or Intel and those | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
-- Every contrib package runs on both Intel and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
+- Every contrib package runs on Intel, AMD and NVIDIA GPUs; they differ only in the CUDA version they were built with and the NVIDIA generations they have code for.
 - On a PC with Intel GPUs only, take a contrib package and oneMKL for speed.
   oneMKL then does the prompt's dense matrix products, a little faster than XeStrata's own kernels (about 3% on a B70).
 - No package requires a GPU maker's driver or library.
-  The free package recommends Intel's GPU runtime (Level Zero; recommendations are installed by default).
-  The contrib packages only suggest the makers' ones and install none of them: install those of the GPU you use.
-   - An Intel GPU: `sudo apt install libze1 libze-intel-gpu1 libigc2 libigdfcl2` (Fedora: `sudo dnf install oneapi-level-zero intel-level-zero`).
-   - An NVIDIA GPU: NVIDIA's driver. cuBLAS, which speeds up the matrix products, is `libcublas-13-1` from multiverse on
-     Ubuntu (`libcublas12` for cuda12.4), and `libcublas-13-4` from NVIDIA's CUDA repository on Fedora.
-   - oneMKL, which speeds up an Intel GPU's matrix products, is in Intel's apt and dnf repositories (oneAPI).
-     Intel's guides show how to add them ([APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
-   - cuBLAS and oneMKL are not free software; without them XeStrata's own kernels do the work.
+  The free package recommends Intel's GPU runtime (Level Zero) and AMD's ROCm libraries for AMD GPUs
+  (recommendations are installed by default). The ROCm libraries take about 1.4 GB; without an AMD GPU, leave them
+  out with `--no-install-recommends` (apt) or `--setopt=install_weak_deps=False` (dnf), and `xestrata` shows how
+  to install Level Zero for an Intel GPU (below).
+  The contrib packages only suggest the makers' ones and install none of them.
+- Once a package is installed, `xestrata` shows what the PC's GPUs (Intel, AMD, NVIDIA) and the installed package lack,
+  and how to install it (adding a repository first where needed). Without the GPU's runtime (Level Zero, ROCm) it stops
+  there. `xestrata --packages` only shows how to install them.
+  NVIDIA's driver is not among them: install it yourself.
+  Put your user in the `render` group (`sudo usermod -aG render $USER`, then log in again).
+- cuBLAS and oneMKL, which speed up the matrix products (the contrib packages), are not free software; without them
+  XeStrata's own kernels do the work.
 - An NVIDIA GPU needs a driver for the package's CUDA version (13.1, 13.4 or 12.4; `nvidia-smi` shows its CUDA Version).
   The drivers for Pascal and Volta (a P100, P40 or V100) end with the 580 series.
 - The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
@@ -200,9 +231,11 @@ Run `xestrata` again. It continues where it stopped.
 **It says it cannot find or use the GPU.**
 Check these three things:
 
-- Check that Intel's GPU runtime (its Level Zero driver), or for an NVIDIA GPU its driver (whether `nvidia-smi` sees it),
-  is installed. NVIDIA GPUs run with the contrib packages only.
-- Check that your user can open the GPU's device (`/dev/dri/renderD*`; the `render` group).
+- Check that Intel's GPU runtime (its Level Zero driver), for an AMD GPU the ROCm libraries (HIP, rocBLAS, hipBLASLt),
+  or for an NVIDIA GPU its driver (whether `nvidia-smi` sees it), is installed. NVIDIA GPUs run with the contrib
+  packages only. For an AMD GPU, check also that it is one [XeStrata runs on](#amd-gpus).
+- Check that your user can open the GPU's device (`/dev/dri/renderD*`, and `/dev/kfd` for an AMD GPU; the `render`
+  group).
 - If the OS does not see a discrete GPU, check Above 4G Decoding and Re-Size BAR in the BIOS.
 
 **It says XMX cannot be used.**
@@ -248,7 +281,8 @@ Models like this one normally run on servers with hundreds of gigabytes of GPU m
   so the quality of the answer does not change.
 - **Long texts are read in large pieces** (up to 32,768 tokens at a time).
 
-Matrix products run on XMX on Intel GPUs and on tensor cores on NVIDIA GPUs; a GPU without matrix engines uses DP4a instructions.
+Matrix products run on XMX on Intel GPUs, on WMMA on AMD GPUs (RDNA3 or later) and on tensor cores on NVIDIA GPUs;
+a GPU without matrix engines uses integer dot-product instructions such as DP4a.
 Every part is explained in [docs/DETAILS.md](docs/DETAILS.md#how-it-works), and how it is done on Intel GPUs and
 what has been checked in [docs/XE.md](docs/XE.md).
 
@@ -277,9 +311,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT);
-   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the contrib and contrib-icpx modes' dense
-     matrix products, which CMake fetches with XeStrata's changes (`third_party/main/oneMath/patches/`, under the
-     same license);
+   - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib and
+     contrib-icpx modes, and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
+     changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);
    - [intel/llvm](https://github.com/intel/llvm)'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
@@ -302,13 +336,13 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
   notices are kept in [NOTICE](NOTICE).
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
-   - XeStrata's patches to oneMath (`third_party/main/oneMath/`): Apache-2.0.
+   - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
    - ggml's `ggml-common.h` (`third_party/main/ggml/`, an unmodified copy): MIT.
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.
-- **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception) and llama.cpp's gguf-py
-  (MIT), and the contrib ones oneMath (Apache-2.0), each with its license text.
+- **What else the packages carry:** intel/llvm's SYCL runtime (Apache-2.0 WITH LLVM-exception), llama.cpp's gguf-py
+  (MIT) and oneMath (Apache-2.0), each with its license text.
   Nothing that is not free software (oneMKL, cuBLAS, NVIDIA's driver) is in them.
 - **The models** are not part of this repository; each model's own license applies to its files.

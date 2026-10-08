@@ -1,0 +1,35 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-libclc-fma: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+libclc took an amdgcn GPU for one without hardware FMA unless the compiler defined __HAS_FMAF__, which it does
+only for a named processor, and the AMD libspirv is built for none.  So sycl::fma (__spirv_ocl_fma) and the
+math built on it ran libclc's software FMA on every AMD GPU: a DeltaNet recurrence kernel of the engine took
+about 95 us a token on an RX 9060 XT, with its few FMAs a long chain of compares and selects.  Every amdgcn GPU
+has v_fma_f32: fixed, only r600 without __HAS_FMAF__ takes the software FMA.
+---
+diff --git a/libclc/clc/include/clc/math/math.h b/libclc/clc/include/clc/math/math.h
+index 2433f38..841cf8d 100644
+--- a/libclc/clc/include/clc/math/math.h
++++ b/libclc/clc/include/clc/math/math.h
+@@ -3,6 +3,7 @@
+ // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+ // See https://llvm.org/LICENSE.txt for license information.
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: amdgcn has hardware FMA (hip-libclc-fma)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -24,7 +25,9 @@
+ #define PNOR 0x100
+ #define PINF 0x200
+ 
+-#if (defined __AMDGCN__ || defined __R600__) && !defined __HAS_FMAF__
++// Every amdgcn GPU has v_fma_f32; the libraries built for amdgcn without a processor (the AMD libspirv) do not get
++// __HAS_FMAF__, so the AMD side of this test took the software FMA for every AMD GPU.  r600 only.
++#if defined __R600__ && !defined __HAS_FMAF__
+ #define __CLC_HAVE_HW_FMA32() (0)
+ #elif defined(CLC_SPIRV)
+ bool __attribute__((noinline)) __clc_runtime_has_hw_fma32(void);

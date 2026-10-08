@@ -35,6 +35,12 @@ public:
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
 
+    /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
+    /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
+    /// GPU: the caller runs kernels::xmx_gemm_grouped then.
+    static bool f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds,
+                           int G, int64_t N, int64_t K, void* stream);
+
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0);
@@ -42,6 +48,8 @@ public:
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();
+    /// Waits for prepare's trial on the current GPU (the library and its first kernels loaded).
+    static void settle();
     /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
     /// (kernels::gemm_path).
     static const char* path();

@@ -1,0 +1,58 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+hip-queue-empty: a fix to intel/llvm v7.1.1, applied by tools/intel_llvm_build.py.
+
+The HIP adapter's queue-empty query (sycl::queue::ext_oneapi_empty) took hipErrorNotReady, the answer for a
+stream still at work, as an error and logged it every time: an engine polling a busy queue wrote several
+lines to stderr per poll.  Fixed, as in the CUDA adapter, a busy stream answers "not empty" without a log.
+---
+diff --git a/unified-runtime/source/adapters/hip/queue.cpp b/unified-runtime/source/adapters/hip/queue.cpp
+index 54e3f49..fde9dcb 100644
+--- a/unified-runtime/source/adapters/hip/queue.cpp
++++ b/unified-runtime/source/adapters/hip/queue.cpp
+@@ -5,6 +5,7 @@
+ // Part of the Unified-Runtime Project, under the Apache License v2.0 with LLVM
+ // Exceptions. See LICENSE.TXT
+ // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++// Modified 2026 by MistVVK and the XeStrata contributors: a busy stream's hipErrorNotReady is not logged (hip-queue-empty)
+ //
+ //===----------------------------------------------------------------------===//
+ 
+@@ -111,20 +112,24 @@ UR_APIEXPORT ur_result_t UR_APICALL urQueueGetInfo(ur_queue_handle_t hQueue,
+   case UR_QUEUE_INFO_FLAGS:
+     return ReturnValue(hQueue->URFlags);
+   case UR_QUEUE_INFO_EMPTY: {
+-    bool IsReady = hQueue->allOf([](hipStream_t S) -> bool {
+-      const hipError_t Ret = hipStreamQuery(S);
+-      if (Ret == hipSuccess)
+-        return true;
++    // hipErrorNotReady is the answer for a stream still at work, not an
++    // error: as the CUDA adapter does, it is not logged
++    try {
++      bool IsReady = hQueue->allOf([](hipStream_t S) -> bool {
++        const hipError_t Ret = hipStreamQuery(S);
++        if (Ret == hipSuccess)
++          return true;
++
++        if (Ret == hipErrorNotReady)
++          return false;
+ 
+-      try {
+         UR_CHECK_ERROR(Ret);
+-      } catch (...) {
+         return false;
+-      }
+-
+-      return false;
+-    });
+-    return ReturnValue(IsReady);
++      });
++      return ReturnValue(IsReady);
++    } catch (ur_result_t Err) {
++      return Err;
++    }
+   }
+   case UR_QUEUE_INFO_DEVICE_DEFAULT:
+   case UR_QUEUE_INFO_SIZE:

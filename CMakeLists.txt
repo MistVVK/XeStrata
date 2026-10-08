@@ -35,8 +35,13 @@ endif()
 # capability (from nvidia-smi) its architecture and the cuBLAS backend.
 # - STRATA_CUDA_ARCHS: NVIDIA architectures (contrib only), e.g. sm_89 for the RTX 40 series; empty: none
 # - STRATA_ONEMKL: the oneMKL backend for Intel GPUs' dense products (contrib; contrib-icpx always has it)
+# - STRATA_HIP_ARCHS: AMD architectures, RDNA2 and later, e.g. gfx1200 for the RX 9060 XT (free and contrib: ROCm is
+#   free software; cmake/StrataHip.cmake); auto: this PC's, from the kernel's KFD topology; rocblas: those the
+#   distribution's rocBLAS has code for (a package's); empty: none
 set(STRATA_CUDA_ARCHS auto CACHE STRING "NVIDIA architectures to build for, e.g. sm_89 (contrib); auto: this PC's")
 set(STRATA_ONEMKL auto CACHE STRING "the oneMKL backend for Intel GPUs (contrib): ON, OFF or auto (this PC has one)")
+set(STRATA_HIP_ARCHS auto CACHE STRING
+    "AMD architectures to build for, e.g. gfx1200 (free, contrib); auto: this PC's; rocblas: those rocBLAS has")
 set(STRATA_CUDA_PATH auto CACHE STRING
     "the CUDA toolkit for the NVIDIA code and cuBLAS (contrib), e.g. /usr/local/cuda-13.1; auto: the best one here")
 set(STRATA_CUDA_PTX auto CACHE STRING
@@ -56,6 +61,29 @@ if(STRATA_CUDA_ARCHS STREQUAL "auto")
       endforeach()
       list(REMOVE_DUPLICATES _strata_cuda_archs)
     endif()
+  endif()
+endif()
+include(cmake/StrataHip.cmake)
+set(_strata_hip_archs "${STRATA_HIP_ARCHS}")
+if(STRATA_HIP_ARCHS STREQUAL "auto")
+  set(_strata_hip_archs "")
+  if(NOT STRATA_LICENSE STREQUAL "contrib-icpx")
+    strata_hip_detect(_strata_hip_found)
+    # this PC's AMD GPUs the engine runs on; the others (an older integrated one, say) are left out
+    foreach(arch IN LISTS _strata_hip_found)
+      strata_hip_supported(${arch} ok)
+      if(ok)
+        list(APPEND _strata_hip_archs ${arch})
+      else()
+        message(STATUS "AMD GPU ${arch}: not RDNA2 or later, no code for it")
+      endif()
+    endforeach()
+  endif()
+elseif(STRATA_HIP_ARCHS STREQUAL "rocblas")
+  strata_hip_rocblas(_strata_hip_archs)
+  if(NOT _strata_hip_archs)
+    message(FATAL_ERROR "STRATA_HIP_ARCHS=rocblas: no rocBLAS with code for an RDNA2 or later AMD GPU is installed "
+                        "(Fedora: rocblas-devel; Ubuntu: librocblas-dev)")
   endif()
 endif()
 set(_strata_onemkl "${STRATA_ONEMKL}")
@@ -78,6 +106,7 @@ endif()
 if(STRATA_LICENSE STREQUAL "contrib")
   message(STATUS "contrib: NVIDIA architectures '${_strata_cuda_archs}', oneMKL backend ${_strata_onemkl}")
 endif()
+message(STATUS "AMD architectures '${_strata_hip_archs}'")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -199,6 +228,10 @@ if(STRATA_ENABLE_XE)
       message(FATAL_ERROR "STRATA_CUDA_ARCHS: icpx has no NVIDIA target; configure with intel/llvm built with CUDA "
                           "(tools/intel_llvm_build.py --contrib) and -DSTRATA_LICENSE=contrib")
     endif()
+    if(_strata_hip_archs)
+      message(FATAL_ERROR "STRATA_HIP_ARCHS: icpx has no AMD target; configure with intel/llvm built with ROCm's HIP "
+                          "(tools/intel_llvm_build.py) and -DSTRATA_LICENSE=free or contrib")
+    endif()
   else()
     if(STRATA_LICENSE STREQUAL "contrib-icpx")
       message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx builds with icpx (-DCMAKE_CXX_COMPILER=icpx)")
@@ -216,9 +249,12 @@ if(STRATA_ENABLE_XE)
                           "-DCMAKE_CXX_COMPILER=.tools/intel-llvm/install/bin/clang++")
     endif()
   endif()
-  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS each
-  # NVIDIA architecture's code.  Without them no -fsycl-targets: the compiler's default, SPIR-V alone.
+  # The device targets: SPIR-V for Intel GPUs (compiled when the program starts), and with STRATA_CUDA_ARCHS and
+  # STRATA_HIP_ARCHS each NVIDIA and AMD architecture's code.  Without them no -fsycl-targets: the compiler's default,
+  # SPIR-V alone.
   set(_strata_sycl_targets "")
+  set(_strata_sycl_list spir64)
+  set(_strata_sycl_opts "")
   if(_strata_cuda_archs)
     if(NOT STRATA_LICENSE STREQUAL "contrib")
       message(FATAL_ERROR "STRATA_CUDA_ARCHS needs NVIDIA's CUDA toolkit, which is not free software: "
@@ -280,7 +316,17 @@ if(STRATA_ENABLE_XE)
                           "targets (intel/llvm built with CUDA: tools/intel_llvm_build.py --contrib; NVIDIA's CUDA "
                           "toolkit)")
     endif()
-    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_targets}" ${_strata_cuda_opts})
+    set(_strata_sycl_list ${_strata_sycl_targets})
+    set(_strata_sycl_opts ${_strata_cuda_opts})
+  endif()
+  if(_strata_hip_archs)
+    strata_hip_choose("${_strata_hip_archs}" _strata_hip_targets _strata_hip_opts)
+    list(APPEND _strata_sycl_list ${_strata_hip_targets})
+    list(APPEND _strata_sycl_opts ${_strata_hip_opts})
+  endif()
+  if(_strata_cuda_archs OR _strata_hip_archs)
+    list(JOIN _strata_sycl_list "," _strata_sycl_list)
+    set(_strata_sycl_targets "-fsycl-targets=${_strata_sycl_list}" ${_strata_sycl_opts})
   endif()
   add_library(strata_sycl INTERFACE)
   # CUDA divides and takes square roots with IEEE rounding by default; SYCL device code does not unless asked, and
@@ -409,14 +455,18 @@ if(STRATA_ENABLE_XE)
     add_test(NAME conversation_validation_test COMMAND conversation_validation_test)
   endif()
 
-  # The contrib modes' dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath) with its
-  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS); a GPU
-  # without a backend takes XeStrata's own kernels.  oneMath opens the backends at run time, so the engine starts
-  # without the library of a GPU it does not use.
+  # The dense products (src/prefill/gemm.cpp): oneMath (Apache-2.0, third_party/main/oneMath; XeStrata's fork) with its
+  # oneMKL backend for Intel GPUs (STRATA_ONEMKL) and its cuBLAS backend for NVIDIA GPUs (STRATA_CUDA_ARCHS) in the
+  # contrib modes, and its rocBLAS backend for AMD GPUs (STRATA_HIP_ARCHS; rocBLAS and hipBLASLt are free software) in
+  # the free and contrib modes; a GPU without a backend takes XeStrata's own kernels.  oneMath opens the backends at run
+  # time, so the engine starts without the library of a GPU it does not use.
   set(STRATA_ONEMATH_SOURCE "" CACHE STRING
-      "oneMath v0.9's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
-  if(STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$" AND (_strata_onemkl OR _strata_cuda_archs))
-    if(NOT MKL_ROOT)
+      "oneMath's source archive (a local file or URL) to build from (empty: fetch the pinned one of XeStrata's fork)")
+  if(NOT STRATA_LICENSE MATCHES "^(contrib|contrib-icpx)$")
+    set(_strata_onemkl OFF)   # oneMKL is not free software
+  endif()
+  if(_strata_onemkl OR _strata_cuda_archs OR _strata_hip_archs)
+    if(_strata_onemkl AND NOT MKL_ROOT)
       if(DEFINED ENV{MKLROOT})
         set(MKL_ROOT $ENV{MKLROOT})
       elseif(EXISTS /opt/intel/oneapi/mkl/latest)
@@ -429,6 +479,26 @@ if(STRATA_ENABLE_XE)
     set(TARGET_DOMAINS blas)
     set(ENABLE_MKLCPU_BACKEND OFF)
     set(ENABLE_MKLGPU_BACKEND ${_strata_onemkl})
+    if(_strata_hip_archs)
+      # the backend's own GPU code takes one architecture (the products themselves run inside rocBLAS and hipBLASLt)
+      set(ENABLE_ROCBLAS_BACKEND ON)
+      list(GET _strata_hip_archs 0 HIP_TARGETS)
+      strata_hip_cxx(HIP_CXX_COMPILER)
+      # hipBLASLt, which the fork's rocBLAS backend hands the 16-bit GEMMs to where it has kernels for the GPU: without
+      # it they run in rocBLAS, whose kernels for some GPUs are generic ones (gfx12 in ROCm 7.1: a fifteenth of the
+      # speed).  A package must have it.
+      find_package(hipblaslt QUIET)
+      if(NOT hipblaslt_FOUND)
+        set(_strata_level WARNING)
+        if(STRATA_PACKAGE)
+          set(_strata_level FATAL_ERROR)
+        endif()
+        message(${_strata_level} "hipBLASLt is not installed, or its CMake package lacks hipblas-common (Fedora: "
+                                 "hipblaslt-devel hipblas-common-devel; Ubuntu: libhipblaslt-dev "
+                                 "libhipblas-common-dev): the AMD GPUs' dense products run in rocBLAS alone, much "
+                                 "slower on some GPUs")
+      endif()
+    endif()
     if(_strata_cuda_archs AND _strata_cuda_cublas)
       set(ENABLE_CUBLAS_BACKEND ON)
       # the backend's own GPU code for the oldest architecture, which every NVIDIA GPU here runs (its default, sm_75's
@@ -452,51 +522,43 @@ if(STRATA_ENABLE_XE)
     endif()
     set(BUILD_FUNCTIONAL_TESTS OFF)
     set(BUILD_EXAMPLES OFF)
+    # oneMath declares CUDA_TARGETS and HIP_TARGETS as cache entries, which under its CMake 3.13 policies drop the
+    # values set above on a first configure (the rocBLAS backend then got an empty --offload-arch= and the compiler
+    # failed; the cuBLAS backend got its default architecture): CMP0126 keeps them
+    set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
     # the cuBLAS backend's own GPU code in the same PTX version: this directory's options while oneMath is added
     get_directory_property(_strata_copts COMPILE_OPTIONS)
     get_directory_property(_strata_lopts LINK_OPTIONS)
+    if(_strata_hip_opts)   # ROCm's device libraries, for the rocBLAS backend's own GPU code
+      add_compile_options(${_strata_hip_opts})
+      add_link_options(${_strata_hip_opts})
+    endif()
     if(_strata_cuda_base_opts)
       add_compile_options(${_strata_cuda_base_opts})
       add_link_options(${_strata_cuda_base_opts})
       set(CUDA_TOOLKIT_ROOT_DIR "${_strata_cuda_root}" CACHE PATH "the CUDA toolkit (cmake/StrataCuda.cmake)" FORCE)
     endif()
-    # oneMath is not in the repository: the pinned release, with XeStrata's changes to it
-    # (third_party/main/oneMath/patches/NN-<id>.patch) applied in order.  `patch`, not `git apply`: the source
-    # folder is inside this repository's work tree, where git apply takes the paths as this repository's.
-    find_program(STRATA_PATCH patch REQUIRED)
-    file(GLOB _strata_onemath_patches CONFIGURE_DEPENDS
-         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/main/oneMath/patches/[0-9][0-9]-*.patch)
-    list(SORT _strata_onemath_patches)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_strata_onemath_patches})
+    # oneMath is not in the repository: XeStrata's fork (https://github.com/MistVVK/oneMath, branch xestrata: oneMath's
+    # 6ff3a43 with XeStrata's changes as commits) at the tag pinned here
     if(STRATA_ONEMATH_SOURCE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/uxlfoundation/oneMath/archive/6ff3a43e555dbb20357017d48f0f6c6263259895.tar.gz
-        URL_HASH SHA256=4d431378064867e3b6b3bb3271cdfc6decfe7580a676f1c70bd5c338f8731a94)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-2.tar.gz
+        URL_HASH SHA256=304da86bd8e9b67791ae633bcbabf37a50b244bd0def7df3b661574aae5065f3)
     endif()
-    set(_strata_onemath_patch)
-    set(_strata_onemath_key "${_strata_onemath_url}")
-    foreach(onemath_patch_file ${_strata_onemath_patches})
-      list(APPEND _strata_onemath_patch
-           COMMAND ${STRATA_PATCH} -p1 -N -s --no-backup-if-mismatch -i ${onemath_patch_file})
-      file(SHA256 ${onemath_patch_file} _h)
-      string(APPEND _strata_onemath_key ";${_h}")
-    endforeach()
-    list(POP_FRONT _strata_onemath_patch)
-    # a changed patch does not change what FetchContent fetches, so it would keep the tree patched before: start
-    # from the archive again
-    if(NOT _strata_onemath_key STREQUAL _STRATA_ONEMATH_KEY)
+    # another archive is another tree: start from it again
+    if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
       file(REMOVE_RECURSE ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
                           ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
     endif()
     include(FetchContent)
     FetchContent_Populate(strata_onemath QUIET ${_strata_onemath_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
-      PATCH_COMMAND ${_strata_onemath_patch}
       SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-src
       SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_onemath-subbuild)
-    set(_STRATA_ONEMATH_KEY "${_strata_onemath_key}" CACHE INTERNAL "the archive and patches the oneMath tree has")
+    set(_STRATA_ONEMATH_KEY "${_strata_onemath_url}" CACHE INTERNAL "the archive the oneMath tree came from")
     add_subdirectory(${strata_onemath_SOURCE_DIR} ${CMAKE_BINARY_DIR}/onemath EXCLUDE_FROM_ALL)
+    unset(CMAKE_POLICY_DEFAULT_CMP0126)
     set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_strata_copts}" LINK_OPTIONS "${_strata_lopts}")
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
@@ -504,8 +566,9 @@ if(STRATA_ENABLE_XE)
     endif()
   endif()
 
-  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes (above) and XeStrata's own
-  # kernels in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in the first Xe port).
+  # plan v0.3 P5: batched prompt processing.  The GEMMs are oneMath's in the contrib modes and on AMD GPUs (above) and
+  # XeStrata's own kernels elsewhere in the free mode (src/kernels/xe/xmx_gemm.cpp; cuBLAS in the CUDA build, oneMKL in
+  # the first Xe port).
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.

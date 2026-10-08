@@ -1937,7 +1937,20 @@ int main(int argc, char** argv) {
     // and on every other GPU of a layer split, with its matrix products' library (each GPU builds its own kernels)
     if (multi_gpu)
         for (const int d : split_devs) strata::core::Runtime::at(d).preload_kernels();
-    strata::prefill::Gemm::prepare();
+    // The matrix products' library (oneMath's backend) loaded and its first products run before the first prompt, and
+    // what it holds on this GPU counted into the reserve when the cache is sized (blas_bytes), as for a library loaded
+    // at its first use: hipBLASLt holds 0.2-0.3 GiB (172 MiB for its handle, ~78 for each kernel type's code), which
+    // counted against the cache cost the RX 9060 XT 209 slots and 6% of its decode, and loaded at the first prompt
+    // (1.85 s of module loads) a quarter of a 4K prompt's speed.  Waited for here so that the VRAM it took is known.
+    int64_t blas_bytes = 0;
+    {
+        size_t f0 = 0, f1 = 0, tot = 0;
+        strata::gpu::mem_info(&f0, &tot);
+        strata::prefill::Gemm::prepare();
+        strata::prefill::Gemm::settle();
+        strata::gpu::mem_info(&f1, &tot);
+        blas_bytes = std::max<int64_t>(0, (int64_t) f0 - (int64_t) f1);
+    }
     if (multi_gpu)
         for (const int d : split_devs) {
             const strata::core::OnDevice on(d);
@@ -3195,6 +3208,7 @@ int main(int argc, char** argv) {
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
         strata::gpu::mem_info(&free_b, &total_b);
+        free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
         // The batched prompt path's chunk buffers are allocated later, so reserve room for them here.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead)
         const bool borrow = !o.no_prefill_borrow && !o.expert_profile.empty();
@@ -3218,8 +3232,9 @@ int main(int argc, char** argv) {
         if (!profile.empty()) slots = std::min<int64_t>(slots, (int64_t) profile.size());
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
-                             "draft head) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+                             "draft head; %lld MiB of it the matrix library's) -> %d slots\n",
+                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
+                     (long long) (blas_bytes >> 20), o.expert_cache);
         // #496 (upstream e1ee248, 4731a9b): the verify window cannot start without a cache, and a cache too small to
         // lend the prompt path a 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without
         // --prefill) makes it allocate its own on top - more than the reserve.  When the default reserve leaves less
