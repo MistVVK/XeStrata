@@ -341,7 +341,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
                                    src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
-                                   src/core/conversation_file.cpp)
+                                   src/core/conversation_file.cpp src/core/vmm.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
@@ -378,7 +378,7 @@ if(STRATA_ENABLE_XE)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
-    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test)
+    foreach(core_gpu_test expert_cache_per_layer_test native_dense_ple_key_test vmm_test)
       add_executable(${core_gpu_test} tests/core/${core_gpu_test}.cpp)
       target_link_libraries(${core_gpu_test} PRIVATE strata_engine)
       add_test(NAME ${core_gpu_test} COMMAND ${core_gpu_test})

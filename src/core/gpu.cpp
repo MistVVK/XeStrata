@@ -196,6 +196,27 @@ void vmem_unmap(void* va, size_t bytes, VmemSegment* seg) {
     delete seg;
 }
 
+VmemSegment* vmem_new(size_t bytes) {
+    try { return new VmemSegment{sx::physical_mem(rt().device(), rt().context(), bytes)}; }
+    catch (const std::exception& e) { fail("vmem_new", e); return nullptr; }
+}
+
+bool vmem_attach(VmemSegment* seg, void* va, size_t bytes) {
+    try {
+        seg->mem.map(reinterpret_cast<uintptr_t>(va), bytes, sx::address_access_mode::read_write);
+        return true;
+    } catch (const std::exception& e) { return fail("vmem_attach", e); }
+}
+
+bool vmem_detach(void* va, size_t bytes) {
+    try {
+        sx::unmap(va, bytes, rt().context());
+        return true;
+    } catch (const std::exception& e) { return fail("vmem_detach", e); }
+}
+
+void vmem_delete(VmemSegment* seg) { delete seg; }
+
 bool is_host_usm(const void* p) {
     if (!p) return false;
     try {

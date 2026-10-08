@@ -77,6 +77,12 @@ void vmem_free(void* va, size_t bytes);
 VmemSegment* vmem_map(void* va, size_t bytes);
 /// Unmaps `seg` from `va` and gives its memory back (the device must not be using it).
 void vmem_unmap(void* va, size_t bytes, VmemSegment* seg);
+/// The chunk form (the elastic K/V, vmm.hpp): a physical segment of `bytes` not mapped anywhere (null: no memory),
+/// mapped read-write at a reserved `va`, unmapped from it (it keeps its bytes and can be mapped elsewhere), freed.
+VmemSegment* vmem_new(size_t bytes);
+bool vmem_attach(VmemSegment* seg, void* va, size_t bytes);
+bool vmem_detach(void* va, size_t bytes);
+void vmem_delete(VmemSegment* seg);
 /// The device's compute units and maximum clock in kHz (cudaDevAttrMultiProcessorCount / ClockRate); device 0 only.
 bool device_speed(int device, int* units, int* khz);
 
