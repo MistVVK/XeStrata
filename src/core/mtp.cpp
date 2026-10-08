@@ -670,7 +670,23 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         }
         if (multi) native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
         gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);   // the T residual writes in one launch
-        // ---- the final mixer and the main model's head
+        // ---- the final mixer and the main model's head: the rows in one fused read (upstream edc592b1; the layers'
+        // read without an injection weight); STRATA_HEAD_MIX_MULTI=0: gr_read per row
+        static const bool head_mix_multi_on = [] {
+            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
+            return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (head_mix_multi_on && fused_gr_supported(N, HC, g.hc_lr)) {
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = R_ + (size_t) t * HC * N; fa[t].R_out = R_ + (size_t) t * HC * N; fa[t].apply = false;
+                fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
+                fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
+                fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = sample_ + t * N;
+            }
+            fused_gr_read_multi(fa, T, xn_, cs);
+        } else
         for (int t = 0; t < T; ++t)
             gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
                     bf16("hyper_connection_mixer.input_mix_weight_down.weight"),

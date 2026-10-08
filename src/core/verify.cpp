@@ -55,6 +55,15 @@ constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
+// the head's hyper-connection read for the window's tokens in one fused_gr_read_multi (upstream edc592b1: its sums
+// are gr_read's); STRATA_HEAD_MIX_MULTI=0: gr_read per token
+bool head_mix_multi_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
 // STRATA_NO_BATCH_KV_STEP=1: the window's and the commit's K/V and indexer appends one call per token again
 bool no_batch_kv() {
     static const bool on = [] {
@@ -919,7 +928,29 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
-        for (int t = 0; t < T; ++t) {
+        const bool mix_multi = head_mix_multi_enabled() && head_ != nullptr && head_->loaded() &&
+                               fused_gr_supported(g.n_embd, g.hc, g.hc_lr);
+        if (mix_multi) {
+            // the final mixer, the window's tokens in one read (no pending write: the last layer's was done above)
+            if (hn->kind != WeightKind::F32 || hd->kind != WeightKind::Bf16InF32 || hu->kind != WeightKind::Bf16InF32) {
+                err = "verify: the output_hc_* weights have the wrong engine forms";
+                return false;
+            }
+            FusedGrArgs fa[kFusedGrMaxT];
+            for (int t = 0; t < T; ++t) {
+                fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
+                fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
+                fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
+                fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+            }
+            try {
+                fused_gr_read_multi(fa, T, xn_, cs);
+            } catch (const std::exception& e) {
+                err = std::string("verify head mixer: ") + e.what();
+                return false;
+            }
+        }
+        for (int t = 0; t < T && !mix_multi; ++t) {
             BlockBuffers bb = ss.block;
             bb.R = Rt(t);
             bb.mixed = head_mixed_ + t * N;
