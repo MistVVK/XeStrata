@@ -470,7 +470,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
-    if (ple_on) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+    // The window's PLE rows: read from the table by the host after the launch, while the GPU runs layer 0, and
+    // copied in at layer 1 after the GPU's wait for layer 0's flag (upstream a36be1db reads them at layer 0's ring):
+    // the reads no longer hold the window's launch back (0.35 ms a window on the RTX 4070).  Not where the host
+    // raises no flag for layer 0 before layer 1: the resident graph, a batch window, a stage that starts after layer 0.
+    const bool ple_late = ple_on && !recording_res_ && !batch_rec_ && lb_ == 0;
+    if (ple_on && !ple_late) copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
 
     // ---- the embeddings, broadcast to the hc streams - or, in a later stage of a layer split, the previous stage's
     // residual, pending write and inject (see set_stage)
@@ -530,6 +535,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // already applied it)
         bool pending = l > 0 && !cvec().covers(l - 1);
         if (l == 1 && ple_on) {
+            if (ple_late && grp == 0) {
+                wait_flag_ge(m_flag_, 1, cs);
+                copy_from_mapped(ple_, m_ple_, (int64_t) T * N, cs);
+            }
             float* normalized = (float*) ((uint8_t*) ss.ple.scratch + ple_block_scratch_bytes());
             // the window's residual writes in one launch (each row its own R, block output and injection)
             if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -1409,15 +1418,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) (pos0 + t);
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
     }
-    if (ss.ple.ready() && ple_stage()) {
-        uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
+    const bool do_ple = ss.ple.ready() && ple_stage();
+    const bool ple_late = do_ple && !res && lb_ == 0;   // read after the launch below (record_window's ple_late)
+    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+    if (do_ple) {
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
-            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + t * PLE_N_HEADS);
+            ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
             prev[0] = prev[1];
             prev[1] = tokens[t];
         }
-        if (!ss.ple.table->gather_batch(rows, (size_t) T, h_ple_, err)) return false;
+        if (!ple_late && !ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
@@ -1435,6 +1446,23 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     VDBG("launched\n");
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
+    if (ple_late) {   // while the GPU runs layer 0 up to its experts; layer 1 waits for layer 0's flag
+        const Clock::time_point tp = Clock::now();
+        if (!ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) {
+            // the window is running: an empty plan and every flag raised let it finish before the error returns
+            sink_.counts[0] = sink_.counts[1] = sink_.counts[2] = 0;
+            sink_.start[0] = sink_.start2[0] = 0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile uint32_t*) h_flagA_ = UINT32_MAX;
+            raise_flag(h_flagB_, UINT32_MAX);
+            *flag = UINT32_MAX;
+            strata::gpu::stream_sync(cs_);
+            strata::gpu::stream_sync(copy_);
+            return false;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        ms_host += ms_since(tp);
+    }
     const int G = groups_[T] > 0 ? groups_[T] : 1;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     for (int64_t k = 0; !res && k < (le_ - lb_) * G; ++k) {   // the resident graph rings nothing
