@@ -4,6 +4,20 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.0.24 - 2026-10-09
+
+Better drafts for speculative decode on two GPUs or more.
+
+- **Better drafts** (#48 by @sociolog): the MTP draft block used to skip every expert it found missing from
+  VRAM. It now computes the missing ones among its route's 2 best-scored experts and skips the rest. It is the
+  default, set with `STRATA_GLM_MTP_KEEP=<n>`: `0` restores the old behaviour, `STRATA_GLM_MTP_MISS=1` fetches
+  every missing expert.
+  - On 2x Tesla V100: 82-83% of drafts accepted against 76-81%, decode at 128K 28.0-28.2 against
+    27.0-28.1 tokens/s, and never slower.
+  - On an RTX 3090 + 3060 split: 19.5 -> 20.6 tokens/s.
+  - The output stays the model's own: greedy tokens are identical with the CPU lane off.
+- Checked on 2x V100: the build, the tokens above, five draft settings over two rounds, and the GitHub checks.
+
 ## v1.0.23 - 2026-10-09
 
 - **The AMD build can no longer break unseen.** `tools/check_hip_compat.py` lists every CUDA runtime and cuBLAS
