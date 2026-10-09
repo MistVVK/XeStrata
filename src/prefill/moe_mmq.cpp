@@ -64,6 +64,38 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     });
 }
 
+bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream) {
+    if (g.first < 0 || g.n <= g.first || g.n > kGatherGroupMax) return false;
+    uintptr_t a = (uintptr_t) gu_dst | (uintptr_t) d_dst | up_off | gu_half_bytes | down_off | d_bytes | gu_stride |
+                  d_stride;
+    for (int q = g.first; q < g.n; ++q) a |= (uintptr_t) g.blob[q];
+    if (a % 16 != 0) return false;
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    struct Blobs { const u32x4* p[kGatherGroupMax]; } blobs{};
+    for (int q = g.first; q < g.n; ++q) blobs.p[q] = reinterpret_cast<const u32x4*>(g.blob[q]);
+    const int64_t h = (int64_t) (gu_half_bytes / 16), nd = (int64_t) (d_bytes / 16), total = 2 * h + nd;
+    const int64_t uo = (int64_t) (up_off / 16), dof = (int64_t) (down_off / 16);
+    const int64_t gs = (int64_t) (gu_stride / 16), ds = (int64_t) (d_stride / 16);
+    auto* gu = static_cast<u32x4*>(gu_dst);
+    auto* dd = static_cast<u32x4*>(d_dst);
+    const int first = g.first;
+    const size_t ne = (size_t) (g.n - g.first), groups = (size_t) std::min<int64_t>((total + 255) / 256, 256);
+    Q(stream).parallel_for(sycl::nd_range<2>({ne, groups * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+        const int q = first + (int) it.get_group(0);
+        const u32x4* src = blobs.p[q];
+        u32x4* ab = gu + q * gs;
+        u32x4* cd = dd + q * ds;
+        const int64_t step = (int64_t) it.get_global_range(1);
+        for (int64_t i = (int64_t) it.get_global_id(1); i < total; i += step) {
+            if (i < h) ab[i] = src[i];
+            else if (i < 2 * h) ab[i] = src[uo + (i - h)];
+            else cd[i - 2 * h] = src[dof + (i - 2 * h)];
+        }
+    });
+    return true;
+}
+
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
     if (rows <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) (rows * n_ff)), [=](sycl::id<1> id) {

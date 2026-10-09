@@ -5,7 +5,8 @@
 // quantized blocks (iq_mmq.hpp: llama.cpp's MMQ, written anew on joint_matrix): the activations are rounded to int8,
 // the products run on the int8 matrix engines.  The dequantize-to-FP16 path wrote ~10 MB of FP16 per expert and
 // multiplied in FP16; this reads the ~1.4-2 MB expert once.  A group of experts is gathered into one buffer
-// (`gather_native`, one per expert as its blob arrives) and multiplied in one launch per product.
+// (`gather_native` one expert at a time, `gather_native_group` a group's at once) and multiplied in one launch per
+// product.
 #pragma once
 
 #include <cstddef>
@@ -15,7 +16,7 @@ namespace strata::prefill::mmq {
 
 /// The GPU runs these products (iq_mmq_usable).
 bool built();
-/// They cover this ggml type (the i-quants and Q2_0 the packs use; IQ1_M is not covered).
+/// They cover this ggml type (the i-quants but IQ1_S, and Q2_0).
 bool supported(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
@@ -59,6 +60,16 @@ public:
 /// slot: gate rows then up rows at `gu_dst`, down at `d_dst`.
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
                    void* gu_dst, void* d_dst, void* stream);
+/// Experts [first, n) of a group, each a GGUF-native blob (gate rows at its start, up at `up_off`, down at
+/// `down_off`), into their slots of the group buffers (slot q at gu_dst + q * gu_stride and d_dst + q * d_stride), in
+/// one launch.  False, and nothing done, when an address or a size is not a multiple of 16 bytes (gather_native then).
+constexpr int kGatherGroupMax = 16;
+struct GatherGroup {
+    const uint8_t* blob[kGatherGroupMax] = {};
+    int first = 0, n = 0;
+};
+bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
+                         void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);

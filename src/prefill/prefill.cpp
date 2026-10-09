@@ -422,6 +422,7 @@ struct Prefill::Impl {
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
     strata::gpu::Event *copied[RING_MAX] = {}, *used[RING_MAX] = {};
+    int used_of[RING_MAX] = {};              // the slot whose `used` event releases this one (a gathered group's last)
     bool stage_live[RING_MAX] = {};
     // PLE
     float* ple_emb = nullptr;
@@ -791,11 +792,13 @@ bool Prefill::carve(size_t T, void* alloc) {
         for (int i = 0; ok && i < m.ring; ++i) {
             m.stage_dev[i] = ring_base + (size_t) i * MMQ_SLOT();
             m.stage_live[i] = false;                    // a new buffer: nothing of an earlier layout to wait for
+            m.used_of[i] = i;
         }
     } else {
         for (int i = 0; i < m.ring; ++i) {
             m.stage_dev[i] = o.take<uint8_t>((size_t) MAXBLOB(), ok);
             m.stage_live[i] = false;                    // a new buffer: nothing of an earlier layout to wait for
+            m.used_of[i] = i;
         }
     }
     m.ple_emb = o.take<float>(T * N, ok);
@@ -1295,7 +1298,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                 // the slot's last reader, the copy and its mark in one submission (copy_async_after)
-                const strata::gpu::Event* after = m.stage_live[sl] ? m.used[sl] : nullptr;
+                const strata::gpu::Event* after = m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr;
                 if (en.job < 0) {
                     strata::gpu::copy_async_after(m.stage_dev[sl], en.blob, bytes, m.copy, after, m.copied[sl]);
                     ++stats_.experts_dma;
@@ -1342,7 +1345,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     // the slot's last reader, the copy and its mark in one submission (copy_async_after)
-                    const strata::gpu::Event* after = m.stage_live[sl] ? m.used[sl] : nullptr;
+                    const strata::gpu::Event* after = m.stage_live[sl] ? m.used[m.used_of[sl]] : nullptr;
                     if (en.job < 0) {
                         strata::gpu::copy_async_after(m.stage_dev[sl], en.blob, bytes, m.copy, after, m.copied[sl]);
                         ++iss_dma;
@@ -1961,7 +1964,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             if (mmq_direct) {
                                 if (m.mgrp_live[par]) strata::gpu::stream_wait_event(m.copy, m.mgrp_used[par]);
                             } else if (m.stage_live[sl]) {
-                                strata::gpu::stream_wait_event(m.copy, m.used[sl]);
+                                strata::gpu::stream_wait_event(m.copy, m.used[m.used_of[sl]]);
                             }
                         };
                         const auto th = Clock::now();
@@ -1988,6 +1991,50 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         ++stats_.experts_streamed;
                         return true;
                     };
+                    // The streamed walk gathers an MMQ group in one launch, after one wait on its last streamed copy
+                    // (the copy queue is in order), and releases its ring slots with one event (upstream b3096357,
+                    // e8de49eb): a wait, a gather and a mark an expert were three submissions each, and the RTX 4070's
+                    // copy engine stood idle behind them.  Its slots go back to the issuer only then; a skipped ring
+                    // entry first flushes the open group (`flush`), so at most a group's entries are held back.
+                    // STRATA_PREFILL_GROUP_GATHER=0: one wait, gather and mark an expert.
+                    static const bool group_env = [] {
+                        const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+                        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+                    }();
+                    const bool group_gather = group_env && stream_all && use_mmq && !mmq_direct;
+                    mmq::GatherGroup gg;
+                    int gg_slots[MMQ_GROUP];
+                    int gg_nslots = 0;            // ring slots gathered by the next flush
+                    size_t gg_consumed = consumed;   // what the issuer may have back after the next flush
+                    auto flush = [&]() {
+                        if (gg.n > gg.first) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            if (gg_nslots > 0) {
+                                pt.mark(kPfWaitCopy, cs);
+                                strata::gpu::stream_wait_event(m.cs, m.copied[gg_slots[gg_nslots - 1]]);
+                                pt.mark(kPfDequant, cs);
+                            }
+                            if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
+                                                          m.grp_d, mmq_db, m.cs)) {
+                                for (int i = gg.first; i < gg.n; ++i) {   // not 16-byte aligned: one at a time
+                                    const uint8_t* b = gg.blob[i];
+                                    mmq::gather_native(b, b + f.up_off, mmq_gub / 2, b + f.down_off, mmq_db,
+                                                       m.grp_gu + i * mmq_gub, m.grp_d + i * mmq_db, m.cs);
+                                }
+                            }
+                            if (gg_nslots > 0) {
+                                const int rel = gg_slots[gg_nslots - 1];
+                                strata::gpu::event_record(m.used[rel], m.cs);
+                                for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                            }
+                            gg_nslots = 0;
+                            gg.first = gg.n;
+                        }
+                        if (gg_consumed > consumed) {
+                            consumed = gg_consumed;
+                            give_back(consumed);
+                        }
+                    };
                     // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                     // expert) is released once the blob is read
                     auto compute = [&](size_t j, const uint8_t* blob_dev, int slot) -> bool {
@@ -2000,11 +2047,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 if (slot < 0)
                                     strata::gpu::copy_async(slot_ptr((int) (j % MMQ_RING)), blob_dev,
                                                             (size_t) lay.blob_bytes(l), m.cs);
+                            } else if (group_gather) {
+                                gg.blob[q] = blob_dev;
+                                gg.n = (int) q + 1;
+                                if (slot >= 0) gg_slots[gg_nslots++] = slot;
+                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                flush();
+                                gg = mmq::GatherGroup{};
                             } else {
                                 // gather the expert into its group slot (its GGUF blocks; mmq_plan takes native packs)
                                 mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                    mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs);
-                                if (slot >= 0) strata::gpu::event_record(m.used[slot], m.cs);
+                                if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
                             }
                             if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                             // the group's products: gate/up, swiglu, the group's H to int8, down
@@ -2050,7 +2104,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         } else {
                             blob_dequant_f16(blob_dev, gu16, d16, m.cs);
                         }
-                        if (slot >= 0) strata::gpu::event_record(m.used[slot], m.cs);
+                        if (slot >= 0) { strata::gpu::event_record(m.used[slot], m.cs); m.used_of[slot] = slot; }
                         if (q + 1 < G && j + 1 < order.size()) return true;
                         const size_t j0 = j - (size_t) q;
                         int64_t maxr = 0;
@@ -2091,8 +2145,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         size_t k = seq_start[(size_t) l];
                         const size_t kend = seq_start[(size_t) l + 1];
                         auto release_to = [&](int32_t e_stop) {
+                            if (group_gather && k < kend && seq[k].e < e_stop) flush();
                             while (k < kend && seq[k].e < e_stop) {
                                 strata::gpu::event_record(m.used[k % (size_t) m.ring], m.cs);
+                                m.used_of[k % (size_t) m.ring] = (int) (k % (size_t) m.ring);
                                 consumed = ++k;
                                 give_back(consumed);
                             }
@@ -2104,10 +2160,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                                 const int sl = (int) (k % (size_t) m.ring);
                                 pt.mark(kPfWaitCopy, cs);
                                 wait_issued(k);
-                                strata::gpu::stream_wait_event(m.cs, m.copied[sl]);
+                                if (group_gather) {
+                                    gg_consumed = k + 1;   // given back by the flush that gathers it
+                                } else {
+                                    strata::gpu::stream_wait_event(m.cs, m.copied[sl]);
+                                }
                                 if (!compute(j, m.stage_dev[sl], sl)) return false;
-                                consumed = ++k;
-                                give_back(consumed);
+                                ++k;
+                                if (!group_gather) {
+                                    consumed = k;
+                                    give_back(consumed);
+                                }
                             } else {
                                 ++stats_.experts_resident;
                                 if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
