@@ -138,6 +138,8 @@ python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit
 ```
 
 `bench.sh` alternates the engines, two rounds per tier, after a warm-up each.
+Both engines write one text a tier (the user's decision of 2026-10-10): upstream runs first in the tier and writes its own answer, and every later run of both engines follows it with `--spec-follow` (upstream's own tool, ac131a3a).
+The rounds and the drafts accepted are then the same, so the output speeds compare the engines and not which text each happened to write: the two engines round differently, their answers part after a few dozen tokens, and on UD-Q4_K_XL that alone moved the output by 5%.
 It stops upstream mid-run once its progress shows it at 10 tok/s or less (the prompt, from its `PP` lines after 30 s; the output, when 256 tokens at 10 tok/s and a minute have passed since the prompt) and does not run it again in that tier.
 
 ## 7. The check

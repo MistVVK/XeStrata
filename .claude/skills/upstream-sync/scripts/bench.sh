@@ -15,6 +15,10 @@
 # (options both engines take besides, e.g. UD-Q4_K_XL's --resident-budget-gib).  TIERS (default all seven, the longest first): a subset.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  sync_collect.py OUT reads them.
+# Both engines write one text a tier: upstream runs first in the tier and writes its own answer (its output ids go to
+# OUT/runs/GPU-TIER-follow.csv), and every later run of the tier, both engines', follows it (--spec-follow, upstream's
+# own tool): the rounds and the drafts accepted are then the same, and the output speeds differ by the engines alone,
+# not by which text each happened to write.  FOLLOW=0: each engine writes its own text, as before.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
 # when the PP progress line says so after 30 s, its output when 256 tokens at SLOW tok/s and a minute have passed
 # since the prompt was read.  The log ends with "bench: stopped, upstream's prompt|output ...".  SLOW=0: never.
@@ -23,6 +27,8 @@ set -u
 out=$1; gpu=$2
 : "${XE:?}" "${UP:?}" "${DATA:?}" "${IDS:?}" "${XE_PROFILE:?}" "${UP_PROFILE:?}"
 rounds=${ROUNDS:-2}
+follow_on=${FOLLOW:-1}
+follow=
 slow=${SLOW:-10}
 G=$DATA/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS
 P=${PACK:-$DATA/packs/qwen-iq3_xxs}
@@ -74,7 +80,7 @@ run() {
   esac
   timeout 2400 "${cmd[@]}" --pack "$P" --native "$N" --ple-gguf "$L" "${X[@]}" \
     --expert-profile "$prof" --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp "$DATA/mtp/rt" \
-    "${C[@]}" --tokens-file "$IDS/$2.ids" --max-new 256 > "$3" 2>&1 &
+    "${C[@]}" --tokens-file "$IDS/$2.ids" --max-new 256 ${follow:+--spec-follow "$follow"} > "$3" 2>&1 &
   local pid=$! rc w=
   if [ "$1" = up ] && [ "$slow" -gt 0 ]; then watch_slow "$pid" "$3" & w=$!; fi
   wait "$pid"; rc=$?
@@ -86,12 +92,22 @@ run() {
 for a in xe up; do run "$a" 1k "$out/runs/$gpu-$a-warmup.txt"; done
 for t in ${TIERS:-262k 192k 128k 64k 32k 4k 1k}; do
   up_slow=
+  follow=
+  ftext=$out/runs/$gpu-$t-follow.csv
+  rm -f "$ftext"
   for r in $(seq 1 "$rounds"); do
-    if [ $((r % 2)) -eq 1 ]; then arms="xe up"; else arms="up xe"; fi
+    # with FOLLOW, upstream first in the first round: its answer is the tier's text
+    if [ $(((r + follow_on) % 2)) -eq 1 ]; then arms="xe up"; else arms="up xe"; fi
     for a in $arms; do
       [ "$a" = up ] && [ -n "$up_slow" ] && continue
       run "$a" "$t" "$out/runs/$gpu-$a-$t-$r.txt"
       if [ "$a" = up ] && grep -q '^bench: stopped' "$out/runs/$gpu-$a-$t-$r.txt"; then up_slow=1; fi
+      if [ "$follow_on" != 0 ] && [ "$a" = up ] && [ -z "$follow" ]; then
+        grep -m 1 '^output  *:' "$out/runs/$gpu-$a-$t-$r.txt" | sed 's/^output  *: *//' | tr -s ' ' ',' | sed 's/,$//' \
+          > "$ftext"
+        if [ -s "$ftext" ]; then follow=$ftext; echo "$gpu $t: the text of upstream's first run, $(tr ',' '\n' < "$ftext" | wc -l) tokens"
+        else rm -f "$ftext"; fi
+      fi
     done
   done
 done
