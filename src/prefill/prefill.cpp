@@ -24,6 +24,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
@@ -72,6 +73,50 @@ inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
+// A host table the GPU reads or writes every layer (the routing ids, the row maps, the group bounds): USM host
+// memory that a kernel reads and writes in place (to_device / from_device: copy_i32_from_mapped), so these small copies
+// never queue behind the streamed experts on the copy engine (upstream 1b3bb8f8).  A copy from or to pageable memory
+// went through that engine: on the RTX 4070 the GPU waited 1.25 s of a 4K prompt at the routing syncs.  The host
+// rewrites a table only after the next layer's sync, when the kernel that read it is done.  Pageable, with copies, when
+// the allocation fails or STRATA_TEST_PAGEABLE=1.  resize keeps no contents.
+template <class T> class HostVec {
+public:
+    HostVec() = default;
+    HostVec(const HostVec&) = delete;
+    HostVec& operator=(const HostVec&) = delete;
+    ~HostVec() { release(); }
+    void resize(size_t n) {
+        if (n > cap_) {
+            release();
+            if (!force_pageable() && strata::gpu::alloc_host(&pinned_, n * sizeof(T))) cap_ = n;
+            else { pinned_ = nullptr; fallback_.resize(n); cap_ = n; }
+        }
+        n_ = n;
+    }
+    T* data() { return pinned_ != nullptr ? pinned_ : fallback_.data(); }
+    size_t size() const { return n_; }
+    T& operator[](size_t i) { return data()[i]; }
+    void from_device(const T* src, strata::gpu::Stream s) {   // the first size() values, queued on `s`
+        if (pinned_ != nullptr) strata::kernels::copy_i32_from_mapped(pinned_, src, (int64_t) n_, s);
+        else strata::gpu::copy_async(fallback_.data(), src, n_ * sizeof(T), s);
+    }
+    void to_device(T* dst, strata::gpu::Stream s) {
+        if (pinned_ != nullptr) strata::kernels::copy_i32_from_mapped(dst, pinned_, (int64_t) n_, s);
+        else strata::gpu::copy_async(dst, fallback_.data(), n_ * sizeof(T), s);
+    }
+private:
+    static_assert(sizeof(T) == 4, "copied as int32");
+    void release() {
+        if (pinned_ != nullptr) strata::gpu::free(pinned_);
+        pinned_ = nullptr;
+        fallback_.clear();
+        cap_ = n_ = 0;
+    }
+    T* pinned_ = nullptr;
+    std::vector<T> fallback_;
+    size_t cap_ = 0, n_ = 0;
+};
+
 constexpr int64_t STREAM_ALL_MIN = 2048;
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
@@ -361,13 +406,14 @@ struct Prefill::Impl {
     uint8_t* mring = nullptr;                 // MMQ_RING slots of MMQ_SLOT() bytes (chunks below STREAM_ALL_MIN)
     strata::gpu::Event* mgrp_used[2] = {};    // a group of ring slots read by its products, by the group's parity
     bool mgrp_live[2] = {};
-    std::vector<int32_t> bounds_host;
+    HostVec<int32_t> bounds_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
-    std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
+    HostVec<int32_t> ids_host, slot_host, src_host;
+    std::vector<int32_t> cnt, off;
     uint16_t* dq_gu = nullptr;               // G experts' gate/up, GU_ELEMS apart, and down, D_ELEMS apart
     uint16_t* dq_d = nullptr;
     int32_t* xb_dev = nullptr;               // the experts' first rows in `order`, and the total (grouped products)
-    std::vector<int32_t> xb_host;
+    HostVec<int32_t> xb_host;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
@@ -1648,7 +1694,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (m.mixed_bf_lo) m.gemm.bf16(m.mixed_bf_lo, (const uint16_t*) wgi->data, m.sg, T, 1, N, 0, true);
                     // group the (token, k) pairs by expert on the host
                     pt.mark(kPfHostGroup, cs);
-                    strata::gpu::copy_async(m.ids_host.data(), m.ids, (size_t) T * K * 4, m.cs);
+                    m.ids_host.resize((size_t) T * K);
+                    m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     const bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr &&
                                            lay_c.native && !lay_c.fmt.empty();
@@ -1752,8 +1799,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         m.slot_host[(size_t) i] = p;
                         m.src_host[(size_t) p] = (int32_t) (i / K);
                     }
-                    strata::gpu::copy_async(m.slot_dev, m.slot_host.data(), (size_t) T * K * 4, m.cs);
-                    strata::gpu::copy_async(m.src_dev, m.src_host.data(), (size_t) T * K * 4, m.cs);
+                    m.slot_host.to_device(m.slot_dev, m.cs);
+                    m.src_host.to_device(m.src_dev, m.cs);
                     // set_cpu_pool: the CPU's experts on a thread while this one streams and runs the GPU's; their
                     // unweighted rows land in Dm's row order, so the combine weights them as any other row.  The
                     // blobs are taken here: the thread calls no ExpertSource (upstream 667f2eca)
@@ -1838,14 +1885,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             for (size_t i = 0; i <= MMQ_GROUP; ++i)
                                 m.bounds_host[n + 1 + g * (MMQ_GROUP + 1) + i] =
                                     m.bounds_host[std::min(n, g * MMQ_GROUP + i)] - m.bounds_host[g * MMQ_GROUP];
-                        strata::gpu::copy_async(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4, m.cs);
+                        m.bounds_host.to_device(m.bounds_dev, m.cs);
                     } else {
                         gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                         // the grouped products' row bounds, `order`'s first rows and the total
                         m.xb_host.resize(order.size() + 1);
                         for (size_t j = 0; j < order.size(); ++j) m.xb_host[j] = m.off[(size_t) order[j]];
                         m.xb_host[order.size()] = (int32_t) rows_gpu;
-                        strata::gpu::copy_async(m.xb_dev, m.xb_host.data(), m.xb_host.size() * 4, m.cs);
+                        m.xb_host.to_device(m.xb_dev, m.cs);
                         // F8: the fusable resident experts, kIqGemmGroup a launch
                         std::vector<const void*> fgu, fd;
                         for (size_t j0 = 0; j0 < nf; j0 += (size_t) strata::kernels::kIqGemmGroup) {
