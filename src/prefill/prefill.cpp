@@ -1025,7 +1025,7 @@ struct PfTimer {
         if (!on) return;
         if (used == ev.size()) {
             strata::gpu::Event* e = nullptr;
-            strata::gpu::event_create(&e);
+            strata::gpu::event_create(&e, true);
             ev.push_back(e);
             ph.push_back(0);
         }
@@ -1787,7 +1787,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                         if (cpu_share_env() < 0.0) {
                             if (m.cpu_ev[0] == nullptr &&
-                                (!strata::gpu::event_create(&m.cpu_ev[0]) || !strata::gpu::event_create(&m.cpu_ev[1]))) {
+                                (!strata::gpu::event_create(&m.cpu_ev[0], true) || !strata::gpu::event_create(&m.cpu_ev[1], true))) {
                                 err = "prefill: CPU share events";
                                 return false;
                             }

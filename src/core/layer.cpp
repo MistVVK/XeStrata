@@ -933,8 +933,8 @@ bool stage_timing_enable() {
     if (g_st.on) return true;
     for (int l = 0; l < 64; ++l) {
         for (int s = 0; s < STAGE_SLOTS; ++s) {
-            if (!strata::gpu::event_create(&g_st.a[l][s])) return false;
-            if (!strata::gpu::event_create(&g_st.b[l][s])) return false;
+            if (!strata::gpu::event_create(&g_st.a[l][s], true)) return false;
+            if (!strata::gpu::event_create(&g_st.b[l][s], true)) return false;
         }
     }
     g_st.on = true;

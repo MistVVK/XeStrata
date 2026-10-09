@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -183,7 +184,41 @@ sycl::async_handler Runtime::handler() {
 
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
-    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {}
+    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    marks_by_barrier_ = measure_marks();
+}
+
+// A timestamp (submit_profiling_tag, the timing event's record) whose event is still held costs the next wait about
+// 65 us on the B70 with Level Zero (the prompt path holds 384, its streamed ring's: 25 ms on each layer's sync, the
+// prompt at 1,248 against 1,594 tok/s with barriers) and about 2 us on the RTX 4070 with CUDA, where the prompt reads
+// 1% faster with timestamps than with barriers (bench/results/2026-10-09-xe-event-record).  So the wait after 64 held
+// timestamps is timed on a queue of its own, and events without timing are barriers where it is above 20 us each.
+// STRATA_EVENT_MARK=tag or barrier chooses instead.
+bool Runtime::measure_marks() {
+    if (const char* v = std::getenv("STRATA_EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
+    constexpr int kMarks = 64;
+    constexpr double kCostUs = 20.0;
+    try {
+        sycl::queue q(context_, device_, sycl::property::queue::in_order{});
+        std::vector<sycl::event> held(kMarks);
+        auto wait_us = [&q, &held](bool tag) {
+            q.wait();
+            for (auto& e : held)
+                e = tag ? sycl::ext::oneapi::experimental::submit_profiling_tag(q) : q.ext_oneapi_submit_barrier();
+            const auto t0 = std::chrono::steady_clock::now();
+            q.ext_oneapi_submit_barrier().wait();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        };
+        double tag = 1e30, barrier = 1e30;
+        for (int round = 0; round < 2; ++round) {
+            tag = std::min(tag, wait_us(true));
+            barrier = std::min(barrier, wait_us(false));
+        }
+        return tag - barrier > kMarks * kCostUs;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 sycl::queue* Runtime::create_stream() {
     std::lock_guard<std::mutex> lock(streams_mutex_);

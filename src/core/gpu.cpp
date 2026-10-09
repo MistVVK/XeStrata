@@ -22,6 +22,7 @@ namespace sx = sycl::ext::oneapi::experimental;
 
 struct Event {
     std::optional<sycl::event> ev;
+    bool timing = false;
 };
 
 struct Graph {
@@ -315,15 +316,22 @@ bool launch_host(Stream s, std::function<void()> fn) {
     } catch (const std::exception& e) { return fail("launch_host", e); }
 }
 
-bool event_create(Event** e) {
+bool event_create(Event** e, bool timing) {
     *e = new Event();
+    (*e)->timing = timing;
     return true;
 }
 
 void event_destroy(Event* e) { delete e; }
 
 bool event_record(Event* e, Stream s) {
-    try { e->ev = sx::submit_profiling_tag(q(s)); return true; }
+    // an event without timing is a barrier where the runtime measured timestamps to slow the waits (measure_marks)
+    try {
+        auto& queue = q(s);
+        e->ev = e->timing || !rt_of(s).marks_by_barrier() ? sx::submit_profiling_tag(queue)
+                                                          : queue.ext_oneapi_submit_barrier();
+        return true;
+    }
     catch (const std::exception& ex) { return fail("event_record", ex); }
 }
 
@@ -349,6 +357,7 @@ bool stream_wait_event(Stream s, const Event* e) {
 
 bool event_elapsed_ms(float* ms, const Event* from, const Event* to) {
     if (!from->ev || !to->ev) { g_error = "event_elapsed_ms: an event was not recorded"; return false; }
+    if (!from->timing || !to->timing) { g_error = "event_elapsed_ms: an event was not created for timing"; return false; }
     try {
         const auto a = from->ev->get_profiling_info<sycl::info::event_profiling::command_end>();
         const auto b = to->ev->get_profiling_info<sycl::info::event_profiling::command_end>();

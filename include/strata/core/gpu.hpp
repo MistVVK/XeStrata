@@ -94,7 +94,9 @@ void host_unregister(void* p);
 /// Runs `fn` on a host thread after the work already on `s`; later work on `s` waits for it (cudaLaunchHostFunc).
 bool launch_host(Stream s, std::function<void()> fn);
 
-bool event_create(Event** e);
+/// `timing`: the event can be measured with event_elapsed_ms (cudaEventCreate); without it only ordered and waited on,
+/// which is cheaper to record (cudaEventDisableTiming).
+bool event_create(Event** e, bool timing = false);
 void event_destroy(Event* e);
 /// Marks the current end of `s`.
 bool event_record(Event* e, Stream s);

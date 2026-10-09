@@ -1199,7 +1199,7 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     // the bursts run back to back on the stream, an event between each two
     strata::gpu::Event* ev[kBursts + 1] = {};
     int n_ev = 0;
-    while (n_ev <= kBursts && strata::gpu::event_create(&ev[n_ev])) ++n_ev;
+    while (n_ev <= kBursts && strata::gpu::event_create(&ev[n_ev], true)) ++n_ev;
     bool ok = n_ev == kBursts + 1;
     float ms[kBursts] = {};
     if (ok) {

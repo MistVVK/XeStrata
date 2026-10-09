@@ -61,6 +61,9 @@ public:
     // verify window took 22 module loads, 30 ms of its first token, on the RTX 4070.  A kernel the device cannot run
     // (another GPU's matrix shape) is skipped.  Once.
     void preload_kernels();
+    // Whether an event only ordered or waited on (gpu::event_record without timing) is recorded as an in-order
+    // barrier rather than a timestamp (submit_profiling_tag): measured when the runtime is made (measure_marks).
+    bool marks_by_barrier() const { return marks_by_barrier_; }
 
 private:
     struct Waiter {
@@ -72,6 +75,7 @@ private:
     sycl::async_handler handler();
     bool owns(const sycl::queue* queue);
     void watch();
+    bool measure_marks();
     int ordinal_;
     std::mutex error_mutex_;
     std::exception_ptr error_;
@@ -87,6 +91,7 @@ private:
     std::thread watchdog_;
     std::atomic<bool> preload_stop_{false};
     std::thread preload_;
+    bool marks_by_barrier_ = false;
 };
 
 }  // namespace strata::core
