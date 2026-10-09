@@ -15,7 +15,7 @@ import sys
 
 out = pathlib.Path(sys.argv[1])
 NAMES = {"xe": sys.argv[2], "up": sys.argv[3]}
-TIERS = ["1k", "4k", "32k", "64k", "128k", "262k"]
+TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 
 
 def grab(pat, text, cast=float):

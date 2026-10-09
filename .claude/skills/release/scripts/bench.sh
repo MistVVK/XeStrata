@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/bench.sh - a release's speed table on one GPU: the release and upstream's latest
-# release, IQ3_XXS, the six tiers of bench/results/2026-10-04-speed-matrix (1K to 262K) with what setup writes for
+# release, IQ3_XXS, the tiers of bench/results/2026-10-04-speed-matrix and 192K (1K to 262K) with what setup writes for
 # each context (images off), 256 greedy tokens, each run a new process.
 #
 #   XE="CMD..." UP="CMD..." DATA=DIR IDS=DIR .claude/skills/release/scripts/bench.sh OUT GPU
@@ -10,9 +10,9 @@
 # XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
 # the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
-# mtp/rt).  IDS: the prompts of the speed-matrix record's prompts.py.  ROUNDS (default 2): runs per arm and tier.
+# mtp/rt).  IDS: the prompts of prompts.py beside this script.  ROUNDS (default 2): runs per arm and tier.
 # Another model file than IQ3_XXS: PACK, NATIVE (its first shard), PLE (the shard with per_layer_token_embd) and EXTRA
-# (options both engines take besides, e.g. UD-Q4_K_XL's --resident-budget-gib).  TIERS (default all six): a subset.
+# (options both engines take besides, e.g. UD-Q4_K_XL's --resident-budget-gib).  TIERS (default all seven, the longest first): a subset.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
@@ -65,6 +65,7 @@ run() {
     32k)   C=(--max-context 32768 --kv int8) ;;
     64k)   C=(--max-context 65536 --kv int8 --kv-resident 32768) ;;
     128k)  C=(--max-context 131072 --kv int8 --kv-resident 32768) ;;
+    192k)  C=(--max-context 204800 --kv int8 --kv-resident 32768) ;;
     262k)  C=(--max-context 262144 --kv int8 --kv-resident 32768) ;;
   esac
   timeout 2400 "${cmd[@]}" --pack "$P" --native "$N" --ple-gguf "$L" "${X[@]}" \
@@ -79,7 +80,7 @@ run() {
 }
 
 for a in xe up; do run "$a" 1k "$out/runs/$gpu-$a-warmup.txt"; done
-for t in ${TIERS:-1k 4k 32k 64k 128k 262k}; do
+for t in ${TIERS:-262k 192k 128k 64k 32k 4k 1k}; do
   up_slow=
   for r in $(seq 1 "$rounds"); do
     if [ $((r % 2)) -eq 1 ]; then arms="xe up"; else arms="up xe"; fi

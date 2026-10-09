@@ -126,7 +126,7 @@ A wrong asset or note is fixed with `gh release upload --clobber`, `gh release d
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The six tiers and the settings of `bench/results/2026-10-04-speed-matrix` (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py` writes the prompts (`python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids folder>`).
+The tiers and the settings of `bench/results/2026-10-04-speed-matrix` and a 192K tier (1K to 262K, what setup writes for each context, 256 greedy tokens); `scripts/prompts.py` writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
