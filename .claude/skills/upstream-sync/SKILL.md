@@ -41,12 +41,12 @@ Write `.upstream-<version>.md` (add it to `.git/info/exclude`, as `.upstream-014
 
 | Group | What | Taken |
 | --- | --- | --- |
-| A | AMD, HIP | ported to the SYCL paths and measured on the RX 9060 XT; one only for a GPU there is none of (gfx11, gfx103x) is not ported, and the record says so |
+| A | AMD, HIP | ported to the SYCL paths and measured on the RX 9060 XT; one only for a GPU there is no machine for (gfx11, gfx103x): step 4's last part |
 | B | bench records | the records as they are |
 | D | documents | what is true of XeStrata, into its documents (Japanese first) |
 | E | engine features and fixes | all |
 | M | several GPUs | all |
-| N | NVIDIA, every generation (Pascal, Volta, Turing included) | ported to the SYCL kernels |
+| N | NVIDIA, every generation (Pascal, Volta, Turing included) | ported to the SYCL kernels; one only for a generation there is no machine for: step 4's last part |
 | P | speed paths | step 4 |
 | S | upstream's `sycl/` | not taken: it stays deleted in the merge and is measured as a competitor (step 6) |
 | T | serve, setup, tools | the merge |
@@ -74,6 +74,25 @@ While porting, build and measure with the contrib-llvm build (`build/contrib`) o
 - A speed path is measured on all three GPUs and on each with its matrix units off (`STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA`): probes on the B70 and the RTX 4070 may run together, whole-engine A/B runs one card at a time.
 - Kept when it is faster on one GPU and slower on none (chosen at run time from what the device reports where it helps only some); removed when it is faster nowhere. The numbers go into the commit and the record.
 - Only when a group is not faster, split it with its switches.
+
+### GPUs there is no machine for
+
+A speed path only for GPUs there is no machine for (NVIDIA Pascal, Volta and Turing; AMD gfx103x and gfx11) is ported too (the user's decision of 2026-10-09), on upstream's measurements:
+
+- one upstream turns on by default there, with a measurement on such a GPU (its commit or its records): on by default on the same GPUs;
+- one upstream keeps opt-in: opt-in, behind the same kind of switch.
+
+It is chosen from what the device reports or from the compiled target (`__CUDA_ARCH__`, `__GFX11__`), never from a GPU's name, and it must not change the path of a GPU there is a machine for.
+Its correctness is checked on what there is:
+
+| GPUs | Check |
+| --- | --- |
+| NVIDIA Pascal, Volta, Turing | a contrib-llvm build with only that generation's code (`STRATA_CUDA_ARCHS=sm_60`, `sm_70`, `sm_75`) run on the RTX 4070 (its driver compiles the PTX; docs/BUILD.md did so for Pascal): CTest and the bitwise probes |
+| AMD gfx103x, gfx11 | a build for them (`STRATA_HIP_ARCHS=gfx1030;gfx1100`) in the AMD container; a path without their own instructions forced on the RX 9060 XT by its switch; code with their own instructions (gfx11's WMMA) is checked by the build alone |
+| GPUs without matrix units (Pascal, RDNA2, Intel without XMX) | the fallback paths with `STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA` on the three GPUs |
+
+What could not run is `unverified`. These GPUs are not part of step 7's check: the record and the report list each such path with upstream's measurement and `unverified` on XeStrata's speed.
+Paths an earlier merge left out for want of a machine (the `移さない` lines of `.upstream-0140.md`'s group A) are taken up the same way.
 
 ## 5. The three modes
 
@@ -141,4 +160,4 @@ On `dev`:
 - `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output, what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. Step 4's measurements of kept and removed paths go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, linking the record.
 
-Lint and commit. Report: the tag, what was taken and left out by group, the check's table, the GPUs skipped (`unverified`), and anything that needs the user.
+Lint and commit. Report: the tag, what was taken and left out by group, the check's table, the GPUs skipped (`unverified`), the paths ported for GPUs there is no machine for, and anything that needs the user.
