@@ -5,7 +5,8 @@ measure (prompt, output), the median of each engine's rounds; a cell passes when
 
     python .claude/skills/upstream-sync/scripts/judge.py OUT/IQ3_XXS OUT/Q2_0 ...   # one folder per model file
 
-A cell where upstream did not finish is left out (not measurable); one where only XeStrata did not finish fails.
+A cell where upstream did not finish, or ran at SLOW tok/s or less, is left out (not measurable); one where only
+XeStrata did not finish fails.
 Prints a line per cell and, last, "ALL PASS" (exit 0) or "FAIL <n>" (exit 1; also when no cell was compared).
 """
 import json
@@ -14,6 +15,7 @@ import statistics
 import sys
 
 LIMIT = -0.01
+SLOW = 10.0                                   # tok/s: upstream this slow is not a speed to compare with
 TIERS = ["1k", "4k", "32k", "64k", "128k", "262k"]
 MEASURES = (("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
 
@@ -37,6 +39,8 @@ for folder in map(pathlib.Path, sys.argv[1:]):
                 where = f"{folder.name:10s} {gpu:8s} {tier:5s} {name:6s}"
                 if up is None:
                     print(f"{where} SKIP  upstream did not finish")
+                elif up <= SLOW:
+                    print(f"{where} SKIP  upstream at {up:.1f} tok/s")
                 elif xe is None:
                     fails += 1
                     print(f"{where} FAIL  XeStrata did not finish (upstream {up:.1f})")

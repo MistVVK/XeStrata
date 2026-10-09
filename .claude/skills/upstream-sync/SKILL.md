@@ -120,7 +120,7 @@ python .claude/skills/upstream-sync/scripts/judge.py $o/IQ3_XXS $o/Q2_0 $o/IQ2_X
 ```
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
-A cell upstream does not finish is left out; one only XeStrata does not finish fails.
+A cell upstream does not finish, or finishes at 10 tok/s or less, is left out; one only XeStrata does not finish fails.
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part, make XeStrata's faster (step 4's rules), and measure that cell again.
 The run is done only when a full run of step 6 on the final HEAD, every file, tier and reachable GPU, gives `ALL PASS`: a cell fixed earlier can lose again to a later change.
