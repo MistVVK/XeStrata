@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs, five model files at 1K to 262K. Only when the user asks (/upstream-sync).
+description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs: IQ3_XXS at 1K, 32K and 262K, and the other weight types at 4K. Only when the user asks (/upstream-sync).
 disable-model-invocation: true
 argument-hint: "[upstream TAG, e.g. v0.1.41]"
 ---
@@ -95,15 +95,24 @@ The engines, each built in a worktree of its own under `.claude/worktrees/` (or 
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
-The model files: IQ3_XXS, Q2_0, IQ2_XS, IQ3_S and UD-Q4_K_XL (their paths on each machine: `LOCAL.md`), each at all seven tiers (1K, 4K, 32K, 64K, 128K, 192K, 262K; bench.sh's default).
-The long contexts (192K, 262K) are what the engine is used at most: bench.sh runs the longest first, and a loss there comes first in step 7.
+Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060 XT WMMA), and every GPU runs the same model files (their paths on each machine: `LOCAL.md`):
+
+| File | Tiers (`TIERS`) | What it covers |
+| --- | --- | --- |
+| IQ3_XXS | `262k 32k 1k` | the experts' Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_NL; the three kinds of prompt |
+| IQ2_XS | `4k` | IQ1_M |
+| IQ3_S | `4k` | IQ4_XS |
+| UD-Q4_K_XL | `4k` | the K-quants (Q4_K, Q5_K) and Q5_1, Q8_0 |
+
+Each tier stands for a kind of prompt: 1K the chunks below 1,024 tokens (the CPU takes a share of the experts), 32K a long context whose K/V is all in VRAM, 262K the K/V streamed from RAM (as from 64K; the longest is what the engine is used at most).
+A weight type's kernels do not depend on the context, so the other files need one tier.
 
 ```sh
 o=bench/results/<date>-upstream-<version>
 python .claude/skills/upstream-sync/scripts/sync_prompts.py <pack> <ids>               # the prompts, once
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
   [PACK=... NATIVE=... PLE=... EXTRA="..."] [TIERS="..."] \
-  .claude/skills/upstream-sync/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU
+  .claude/skills/upstream-sync/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU: B70, RTX4070, RX9060XT
 python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit> <tag>
 ```
 
@@ -113,14 +122,15 @@ It stops upstream mid-run once its progress shows it at 10 tok/s or less (the pr
 ## 7. The check
 
 ```sh
-python .claude/skills/upstream-sync/scripts/judge.py $o/IQ3_XXS $o/Q2_0 $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL
+python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 $o/IQ3_XXS $o/IQ2_XS $o/IQ3_S $o/UD-Q4_K_XL
 ```
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
+The B70's output cells are left out (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part, make XeStrata's faster (step 4's rules), and measure that cell again.
-The run is done only when a full run of step 6 on the final HEAD, every file, tier and reachable GPU, gives `ALL PASS`: a cell fixed earlier can lose again to a later change.
+The run is done only when a full run of step 6 on the final HEAD, every file and tier of the table and every reachable GPU, gives `ALL PASS`: a cell fixed earlier can lose again to a later change.
 
 ## 8. The record and the report
 
