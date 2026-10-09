@@ -7,8 +7,7 @@ One folder per model file.
     python .claude/skills/upstream-sync/scripts/judge.py [--prompt-only GPU]... OUT/IQ3_XXS OUT/IQ2_XS ...
 
 A cell where upstream did not finish, ran at SLOW tok/s or less, or was stopped by bench.sh as that slow, is left
-out (not measurable), unless it is an SSD-offload cell (bench.sh SSD=1: it is compared however slow); one where only
-XeStrata did not finish fails.  --prompt-only GPU: that GPU's output cells are
+out (not measurable); one where only XeStrata did not finish fails.  --prompt-only GPU: that GPU's output cells are
 left out too (a GPU no matrix.json names is an error: bench.sh's GPU argument, spelled the same).
 Prints a line per cell and, last, "ALL PASS" (exit 0) or "FAIL <n>" (exit 1; also when no cell was compared).
 """
@@ -56,7 +55,7 @@ for folder, rows in matrices:
                     print(f"{where} SKIP  upstream stopped at {SLOW:g} tok/s or less ({', '.join(sorted(stopped))})")
                 elif up is None:
                     print(f"{where} SKIP  upstream did not finish")
-                elif up <= SLOW and not all(r.get("ssd") for r in cell):
+                elif up <= SLOW:
                     print(f"{where} SKIP  upstream at {up:.1f} tok/s")
                 elif xe is None:
                     fails += 1

@@ -18,22 +18,18 @@
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
 # when the PP progress line says so after 30 s, its output when 256 tokens at SLOW tok/s and a minute have passed
 # since the prompt was read.  The log ends with "bench: stopped, upstream's prompt|output ...".  SLOW=0: never.
-# SSD=1: the file's experts do not fit in this machine's RAM budget and are read from the SSD (SSD offload): no run is
-# stopped for being slow, and OUT/runs/GPU.ssd tells sync_collect.py and judge.py to compare such cells too.
 set -u
 [ $# -eq 2 ] || { echo "usage: $0 OUT GPU" >&2; exit 2; }
 out=$1; gpu=$2
 : "${XE:?}" "${UP:?}" "${DATA:?}" "${IDS:?}" "${XE_PROFILE:?}" "${UP_PROFILE:?}"
 rounds=${ROUNDS:-2}
 slow=${SLOW:-10}
-[ "${SSD:-0}" = 1 ] && slow=0
 G=$DATA/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS
 P=${PACK:-$DATA/packs/qwen-iq3_xxs}
 N=${NATIVE:-$G-00001-of-00002.gguf}
 L=${PLE:-$G-00002-of-00002.gguf}
 read -r -a X <<< "${EXTRA:-}"
 mkdir -p "$out/runs"
-if [ "${SSD:-0}" = 1 ]; then : > "$out/runs/$gpu.ssd"; fi
 
 # PID LOG: writes LOG.stop and stops PID once the run is plainly at $slow tok/s or less
 watch_slow() {

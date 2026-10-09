@@ -39,7 +39,6 @@ for f in sorted((out / "runs").glob("*.txt")):
         "decode_tok_s": grab(r"^decode\s+.*->\s+([\d.]+) tok/s", s),
         "spec_accept": grab(r"^speculation\s+.*\(([\d.]+)\)", s),
         "stopped": stopped,
-        "ssd": (out / "runs" / f"{m.group(1)}.ssd").exists(),   # bench.sh SSD=1: an SSD-offload cell
     })
     if stopped == "output" and pp and pp[-1][0] == pp[-1][1]:   # stopped after the prompt: its rate from PP
         rows[-1]["prefill_tok_s"] = float(pp[-1][2])
