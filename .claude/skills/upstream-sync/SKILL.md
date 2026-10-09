@@ -15,7 +15,7 @@ Rules for the whole run:
 - The tag is `$ARGUMENTS` when given, else the newest: `git fetch upstream --tags; git tag -l 'v*' --sort=-v:refname | head -n 1`.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). Nothing is pushed; a release is /release, not this.
 - Only merged commits: upstream's open pull requests wait until upstream merges them.
-- The GPUs: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container. Where they are and how to run there: `.claude/skills/release/local.md` (kept out of git; when it is missing, ask the user and write it there).
+- The GPUs: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container. Where they are and how to run there: `LOCAL.md` in the repository root (kept out of git; when it is missing, ask the user and write it there).
   A GPU that cannot be reached (the container's host down, the card missing) is skipped: go on with the others, and report it and its cells as `unverified`.
 - AMD work (builds, tests, runs) happens in the AMD container only, never on the development machine; the source goes in as a `git bundle` or a diff.
 - A build that fails (any mode, any machine, XeStrata's or upstream's), and a fix that is not plain: stop and report it with the end of the log.
@@ -95,7 +95,7 @@ The engines, each built in a worktree of its own under `.claude/worktrees/` (or 
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
-The model files (their paths on each machine: `local.md`):
+The model files (their paths on each machine: `LOCAL.md`):
 
 | File | Tiers |
 | --- | --- |
