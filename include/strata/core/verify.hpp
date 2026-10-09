@@ -354,6 +354,8 @@ private:
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
     bool df_branch_ = false;
+    strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
+    bool fetch_branch_ = false;
     strata::gpu::Graph* exec_[9] = {};
     strata::gpu::Graph* commit_exec_ = nullptr;
     // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as

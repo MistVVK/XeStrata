@@ -170,6 +170,7 @@ Verifier::~Verifier() {
     if (prof_pin_) strata::gpu::free(prof_pin_);
     for (strata::gpu::Stream s : df_side_)
         if (s) strata::gpu::stream_destroy(s);
+    if (fetch_side_) strata::gpu::stream_destroy(fetch_side_);
     if (copy_) { strata::gpu::stream_sync(copy_); strata::gpu::stream_destroy(copy_); }
     if (commit_done_) strata::gpu::event_destroy(commit_done_);
     if (arena_) strata::gpu::free(arena_);
@@ -387,6 +388,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 df_branch_ = false;   // a device that cannot record such a graph keeps one queue
             }
         }
+        // the PCIe share's fetch on a side branch of the window graph, beside the VRAM hits (post()): the fetch waits
+        // on the link, the hits on the GPU, so side by side the hits' time hides under the fetch.  Where the graph's
+        // branches pay (df_branch_) unless STRATA_FETCH_BRANCH=0|1 fixes it.
+        if (!fetch_side_) fetch_side_ = strata::gpu::stream_create();
+        const char* fv = std::getenv("STRATA_FETCH_BRANCH");
+        fetch_branch_ = fetch_side_ != nullptr && (fv != nullptr ? std::strtol(fv, nullptr, 10) != 0 : df_branch_);
     }
     if (!strata::gpu::event_create(&commit_done_)) {
         err = "verify: event create failed";
@@ -1079,20 +1086,35 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
             }
         };
+        // the PCIe share: its flag, and in the kernel mode the copy into staging.  On a side branch beside the VRAM
+        // hits (fetch_branch_: the fetch waits on the link, the hits on the GPU; the fetch kernel leaves the hits their
+        // work-groups), else on cs after them.
+        auto pcie_share = [&](strata::gpu::Stream on) {
+            if (segmented_) {}                                   // landed before the host launched this segment
+            else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, on);
+            else wait_flag_ge(m_flagB_, ring, on);                 // the PCIe share is in staging (DMA) or mapped
+            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
+                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, on);
+                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), on);
+            }
+        };
+        const bool fb = fetch_branch_ && !recording_res_;
+        if (fb) {
+            if (!strata::gpu::stream_fork(cs, fetch_side_)) { err = std::string("verify fetch branch: ") + strata::gpu::last_error(); return false; }
+            pcie_share(fetch_side_);
+        }
         grouped(p_ptr, p_start, p_counts, cap);
         stamp(l, 20, grp);
         if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
-            if (segmented_) {}                                   // landed before the host launched this segment
-            else if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
-            if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-                uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs);
-                rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs);
+            if (fb) {
+                if (!strata::gpu::stream_join(cs, fetch_side_)) { err = std::string("verify fetch branch: ") + strata::gpu::last_error(); return false; }
+            } else {
+                pcie_share(cs);
             }
             stamp(l, 21, grp);
             grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
