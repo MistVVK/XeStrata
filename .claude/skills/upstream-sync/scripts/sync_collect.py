@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Reads bench.sh's OUT/runs/*.txt and writes OUT/matrix.json (every run) and, per GPU, the prompt and output tables
 (the median of the rounds; a cell no run finished is "-", one bench.sh stopped as too slow "too slow") as Markdown to
-stdout.  An upstream run bench.sh stopped
-as too slow has "stopped" (prompt or output); one stopped in its output takes its prompt rate from the last PP line.
+stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or output); one stopped in its output
+takes its prompt rate from the last PP line.
 
     python .claude/skills/upstream-sync/scripts/sync_collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
 """
