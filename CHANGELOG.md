@@ -4,6 +4,16 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.0.23 - 2026-10-09
+
+- **The AMD build can no longer break unseen.** `tools/check_hip_compat.py` lists every CUDA runtime and cuBLAS
+  name the AMD (HIP) build compiles, and fails on one without a mapping in `include/strata/hip_compat/`. It
+  flags v1.0.21's three.
+- **Checks on every push and pull request:** a GitHub Actions workflow runs that check, the server tests and the
+  installer and tools tests. No GPU is needed.
+- **Every AMD target builds:** the debug tool `peer_probe` gets its three peer-copy mappings. The installer never
+  built it.
+
 ## v1.0.22 - 2026-10-09
 
 - **AMD builds again (#52 by @boxwrench):** v1.0.21 did not compile with HIP: #44's split search and CPU pinning use
