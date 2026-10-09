@@ -899,8 +899,10 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
         if (id[0] == 0) {
             const int32_t tok = ids[row];
             *tok_dst = tok;
-            if (out != nullptr) reinterpret_cast<volatile int32_t*>(out)[j] = tok;
+            // the token last: the drafter reads the probability once the token is there (MtpDrafter::draft)
             if (probs != nullptr && out_p != nullptr) reinterpret_cast<volatile float*>(out_p)[j] = probs[row];
+            sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+            if (out != nullptr) reinterpret_cast<volatile int32_t*>(out)[j] = tok;
         }
     });
     done(stream, e, "mtp_select");

@@ -20,6 +20,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -38,6 +39,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <immintrin.h>
 #include <sstream>
 #include <vector>
 
@@ -1032,6 +1034,9 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!mtp_catchup_all()) T = a + 1;
     const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
+    const int max_steps = std::min(max_t_ - 1, max_drafts_);
+    for (int j = 1; j < max_steps; ++j)
+        if (!capture_step(j, cp, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -1046,34 +1051,65 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         put(t, p + t);
     }
     put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // p + a: draft 0's cell
+    for (int j = 1; j < max_steps; ++j) put(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j
+    for (int j = 0; j < max_t_ - 1; ++j) ((volatile int32_t*) h_out_)[j] = -1;   // mtp_select writes each token last
     h_row_[0] = a;
     h_row_[1] = 0;
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;   // the forcing kernels: no-ops here
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
-    if (!strata::gpu::graph_launch(cp ? round_exec_c_[T] : round_exec_[T], cs_) || !strata::gpu::stream_sync(cs_)) {
+    // The next verify window's PLE rows are read while the GPU drafts (upstream a36be1db): its first token is tokens[a],
+    // the drafts follow; the window's gather_batch takes them when they are its rows.
+    const bool do_ple = ss_ != nullptr && ss_->ple.ready() && ss_->ple.table != nullptr;
+    int32_t ple_prev[2] = {do_ple ? ss_->ple_prev[0] : 0, do_ple ? ss_->ple_prev[1] : 0};
+    auto prefetch_ple = [&](int32_t tok) {
+        if (!do_ple || tok < 0) return;
+        uint32_t rows16[strata::kernels::PLE_N_HEADS];
+        strata::kernels::ngram_rows(&tok, ple_prev, 1, ss_->ple.consts, rows16);
+        ple_prev[0] = ple_prev[1];
+        ple_prev[1] = tok;
+        ss_->ple.table->prefetch_rows(rows16);
+    };
+    // each draft is read once its token reaches the mapped row (written after its probability), not after a stream
+    // sync: the next step starts sooner
+    auto wait_step = [&](int j) {
+        uint32_t spins = 0;
+        while (((volatile int32_t*) h_out_)[j] < 0) {
+            _mm_pause();
+            if ((++spins & 1023u) == 0 && strata::gpu::stream_idle(cs_)) break;
+        }
+    };
+    if (!strata::gpu::graph_launch(cp ? round_exec_c_[T] : round_exec_[T], cs_)) {
         err = std::string("mtp draft: ") + strata::gpu::last_error();
         return false;
     }
+    (void) strata::gpu::stream_idle(cs_);
+    prefetch_ple(tokens[a]);
+    wait_step(0);
     drafts[0] = ((volatile int32_t*) h_out_)[0];
-    if (top2_env()) record_top2(0);
+    if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
     float pj = ((volatile float*) h_prob_)[0];
     if (probs) probs[0] = pj;
     int n = 1;
     // the chain continues while the last draft is likely enough to be verified
-    for (int j = 1; j < std::min(max_t_ - 1, max_drafts_) && pj >= min_p; ++j) {
-        if (!capture_step(j, cp, err)) return false;
-        put(max_t_ + j - 1, coupled_draft_cell(p, a, j));   // p + a + j; coupled: drawn at counter cell + 1
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_) || !strata::gpu::stream_sync(cs_)) {
+    for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        if (!strata::gpu::graph_launch(cp ? step_exec_c_[j] : step_exec_[j], cs_)) {
             err = std::string("mtp draft step: ") + strata::gpu::last_error();
             return false;
         }
+        (void) strata::gpu::stream_idle(cs_);
+        prefetch_ple(drafts[j - 1]);
+        wait_step(j);
         drafts[j] = ((volatile int32_t*) h_out_)[j];
-        if (top2_env()) record_top2(j);
+        if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(j); }
         pj = ((volatile float*) h_prob_)[j];
         if (probs) probs[j] = pj;
         ++n;
+    }
+    prefetch_ple(drafts[n - 1]);
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("mtp draft: ") + strata::gpu::last_error();
+        return false;
     }
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;

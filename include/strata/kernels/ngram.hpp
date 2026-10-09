@@ -186,6 +186,10 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// Direct mode: one token's 16 rows read ahead while the GPU is busy (the MTP drafts the next window's tokens);
+    /// `gather_batch` takes them when its rows are the ones read ahead, in order.  Elsewhere a no-op.
+    void prefetch_rows(const uint32_t* rows16);
+    void wait_prefetches();
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

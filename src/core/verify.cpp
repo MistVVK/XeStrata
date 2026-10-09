@@ -1432,6 +1432,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             ngram_rows(&tokens[t], prev, 1, ss.ple.consts, ple_rows + (size_t) t * PLE_N_HEADS);
             prev[0] = prev[1];
             prev[1] = tokens[t];
+            ss.ple.table->prefetch_rows(ple_rows + (size_t) t * PLE_N_HEADS);   // the rows the drafter did not read ahead
         }
         if (!ple_late && !ss.ple.table->gather_batch(ple_rows, (size_t) T, h_ple_, err)) return false;
     }
