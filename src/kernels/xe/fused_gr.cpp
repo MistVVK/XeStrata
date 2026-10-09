@@ -11,6 +11,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
+#include "sm70_table.hpp"
 
 #include <cstdlib>
 #include <string>
@@ -57,6 +58,17 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
     return v;
 }
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
+
+// Upstream's latency-hidden norm and up kernels (aaa323fe: gfx906's, which upstream runs on sm_70 too; V100-SXM2: 50.9
+// -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise): STRATA_GR_FAST=1 or 0 on any GPU, else
+// Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp).
+bool gr_fast(sycl::queue& q) {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_GR_FAST");
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    return env >= 0 ? env != 0 : xe::sm70_table(q);
+}
 
 // 8 bf16 packed in a uint4 against 8 floats.
 inline float dot8(const uint4 w, const float* x) {
@@ -359,6 +371,91 @@ sycl::event gr_read_q8(sycl::queue& q, const GrMulti& m, float* part, unsigned l
     });
 }
 
+// Upstream's latency-hidden up projection (gr_fast): 8 lanes a row instead of a sub-group.  Lane j holds the default
+// kernel's lanes j, j + 8, j + 16 and j + 24 (and chunk 32 + j, lane j's second): the xor tree's stages 16 and 8 are
+// its own adds in the tree's order, stages 4, 2 and 1 are shuffles inside the 8 - bitwise the same sum.  A
+// work-group's 64 rows are 2 passes of 32 groups of 8, their weights and epilogue inputs loaded before the dots.
+sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
+    static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "the kernel's geometry");
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        const TokArgs tok(h);
+        h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            tok.stage(m, it);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int t = (int) it.get_local_id(0), j = t & 7, grp = t >> 3;
+            const int T = m.T;
+            const int d0 = (int) it.get_group(0) * UPM_COLS;
+            const auto& my = tok(m, j < T ? j : 0);   // this lane's token, for its epilogue
+            const bool apply = j < T && my.apply;
+            uint4 w[2][5];
+            float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f};
+            float ip[2] = {0.0f, 0.0f};
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+                const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
+#pragma unroll
+                for (int qq = 0; qq < 4; ++qq) w[p][qq] = load_u4(wrow, (size_t) (j + 8 * qq));
+                w[p][4] = load_u4(wrow, (size_t) (32 + j));
+                if (j < T) {
+                    rv[p] = my.R[i];
+                    wn[p] = my.w_norm[i];
+                    rsc[p] = my.rs[c];
+                    if (apply) { bo[p] = my.bo_prev[d0 + dd]; ip[p] = my.inj_prev[c]; }
+                }
+            }
+            for (int k = 0; k < T; ++k) {   // one choice of m.a[k] a token, as the default kernel
+                const float* src = tok(m, k).lo;
+                for (int jj = t; jj < LR / 4; jj += THREADS) {
+                    const float* p = src + (size_t) jj * 4;
+                    lo[k * LR / 4 + jj] = sycl::float4(p[0], p[1], p[2], p[3]);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            // the default kernel's lane `ln` chunk against token k's activations
+            const auto dot = [&](const uint4& wv, int k, int ln) {
+                const sycl::float4 a0 = lo[k * LR / 4 + ln * 2], a1 = lo[k * LR / 4 + ln * 2 + 1];
+                const float xa[8] = {a0.x(), a0.y(), a0.z(), a0.w(), a1.x(), a1.y(), a1.z(), a1.w()};
+                return dot8(wv, xa);
+            };
+#pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+                float mine = 0.0f;
+#pragma unroll
+                for (int k = 0; k < kFusedGrMaxT; ++k) {
+                    if (k >= T) break;
+                    const float p0 = dot(w[p][0], k, j) + dot(w[p][4], k, 32 + j);
+                    const float p1 = dot(w[p][1], k, j + 8);
+                    const float p2 = dot(w[p][2], k, j + 16);
+                    const float p3 = dot(w[p][3], k, j + 24);
+                    float s = (p0 + p2) + (p1 + p3);
+                    for (int o = 4; o > 0; o >>= 1) s += sycl::permute_group_by_xor(sg, s, o);
+                    if (j == k) mine = s;
+                }
+                if (j < T) {
+                    float x0 = rv[p];
+                    if (apply) {
+                        x0 = sycl::fma(bo[p], 2.0f * sigmoidf_(ip[p] / (float) HC), x0);
+                        my.R_out[i] = x0;
+                    }
+                    const float x = x0 * wn[p] * rsc[p];
+                    g[(j * HC + c) * UPM_COLS + dd] = x * sigmoidf_(mine);
+                }
+            }
+            sycl::group_barrier(it.get_group());
+            for (int i = t; i < T * UPM_COLS; i += THREADS) {
+                const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+                float s = 0.0f;
+                for (int c = 0; c < HC; ++c) s += g[(k * HC + c) * UPM_COLS + col];
+                tok(m, k).mixed[d0 + col] = s / (float) HC;
+            }
+        });
+    });
+}
+
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
@@ -394,7 +491,8 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // Step 1 of the single-token down kernel, one group per token and stream (upstream dbb1c23's split: T groups
     // left most of the GPU idle).  A work-item visits its stream's elements in the order norm_step does and the
     // eight sub-group partials are added in the same order, so rs and xn (the product, then the scale) are its bits.
-    // STRATA_HC_SPLIT=0: one group per token (norm_step).
+    // STRATA_HC_SPLIT=0: one group per token (norm_step, or its latency-hidden form with gr_fast).
+    const bool fast = gr_fast(q);
     static const bool split = [] {
         const char* v = std::getenv("STRATA_HC_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
@@ -439,6 +537,70 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 sycl::group_barrier(it.get_group());
                 const float rs = s_rs[0];
                 for (int i = c * N + t; i < (c + 1) * N; i += THREADS) xn[i] *= rs;
+            });
+        });
+    } else if (fast) {
+        // upstream's latency-hidden norm (gr_fast): norm_step with a work-item's NQ float4 of R, w_norm and bo_prev
+        // loaded before any is used and R' * w_norm kept in registers until rs is known - the same values in the same
+        // order
+        constexpr int NQ = D / (THREADS * 4);
+        static_assert(D % (THREADS * 4) == 0, "whole float4 a work-item");
+        q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) WARPS * HC), h);
+            sycl::local_accessor<float, 1> s_rs(sycl::range<1>(HC), h);
+            const TokArgs tok(h);
+            h.parallel_for(sycl::nd_range<1>((size_t) n_tok * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                tok.stage(m, it);
+                const sycl::sub_group sg = it.get_sub_group();
+                const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id();
+                const int warp = (int) sg.get_group_linear_id();
+                const size_t k = it.get_group(0);
+                const auto& a = tok(m, (int) k);
+                float* xn = m.xn + k * D;
+                float gw[HC];
+                for (int c = 0; c < HC; ++c) gw[c] = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+                float4 r[NQ], g[NQ];
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    const int i = t * 4 + j * THREADS * 4;
+                    r[j] = load4(a.R + i);
+                    g[j] = load4(a.w_norm + i);
+                }
+                if (a.apply) {
+#pragma unroll
+                    for (int j = 0; j < NQ; ++j) {
+                        const int i = t * 4 + j * THREADS * 4, c = i / N, d = i - c * N;
+                        const float4 b = load4(a.bo_prev + d);
+                        r[j].x() = sycl::fma(b.x(), gw[c], r[j].x()); r[j].y() = sycl::fma(b.y(), gw[c], r[j].y());
+                        r[j].z() = sycl::fma(b.z(), gw[c], r[j].z()); r[j].w() = sycl::fma(b.w(), gw[c], r[j].w());
+                    }
+                }
+                float ss[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    const int c = (t * 4 + j * THREADS * 4) / N;
+                    const float sq = r[j].x() * r[j].x() + r[j].y() * r[j].y() + r[j].z() * r[j].z() + r[j].w() * r[j].w();
+                    for (int cc = 0; cc < HC; ++cc) if (cc == c) ss[cc] += sq;
+                    r[j] = float4(r[j].x() * g[j].x(), r[j].y() * g[j].y(), r[j].z() * g[j].z(), r[j].w() * g[j].w());
+                }
+                for (int c = 0; c < HC; ++c) {
+                    const float v = warp_sum(sg, ss[c]);
+                    if (lane == 0) part[warp * HC + c] = v;
+                }
+                sycl::group_barrier(it.get_group());
+                if (t < HC) {
+                    float s = 0.0f;
+                    for (int w = 0; w < WARPS; ++w) s += part[w * HC + t];
+                    s_rs[t] = sycl::rsqrt(s / (float) N + a.eps);
+                    a.rs[t] = s_rs[t];
+                }
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int j = 0; j < NQ; ++j) {
+                    const int i = t * 4 + j * THREADS * 4;
+                    const float sr = s_rs[i / N];
+                    xn[i] = r[j].x() * sr; xn[i + 1] = r[j].y() * sr; xn[i + 2] = r[j].z() * sr; xn[i + 3] = r[j].w() * sr;
+                }
             });
         });
     } else {
@@ -496,7 +658,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
 
     // The up projection for T tokens: each row of w_up read once, lane k runs token k's epilogue.
-    const auto e = q.submit([&](sycl::handler& h) {
+    const auto e = fast ? gr_up_fast(q, m) : q.submit([&](sycl::handler& h) {
         // float4: a lane reads its 8 values as two 16-byte loads; one float at a time, the lanes' 32-byte stride put 8 of
         // them on each local-memory bank (RTX 4070: this kernel 53 us -> 40 us)
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
