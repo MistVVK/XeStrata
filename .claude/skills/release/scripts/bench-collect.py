@@ -28,7 +28,7 @@ for f in sorted((out / "runs").glob("*.txt")):
         continue
     s = f.read_text(errors="replace")
     rows.append({
-        "gpu": m.group(1), "engine": NAMES[m.group(2)], "tier": m.group(3), "round": int(m.group(4)),
+        "gpu": m.group(1), "arm": m.group(2), "engine": NAMES[m.group(2)], "tier": m.group(3), "round": int(m.group(4)),
         "prompt_tokens": grab(r"^prefill\s+(\d+) tokens", s, int),
         "prefill_tok_s": grab(r"^prefill\s+.*->\s+([\d.]+) tok/s", s),
         "decoded": grab(r"^decode\s+(\d+) tokens", s, int),
