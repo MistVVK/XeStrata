@@ -6,7 +6,8 @@
 Three settings depend on the machine more than on the model, and the defaults are right for the PC they were
 measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
   --pcie-frac     the share of the experts missing from VRAM that are copied over PCIe and run on the GPU instead of
-                  on the CPU.  A fast PCIe link and a slow CPU want more; a laptop's x8 link or a fast CPU want less.
+                  on the CPU.  Without it the engine splits them by an expert's time on each side, measured at start
+                  (after Project Maya); a fixed share is kept only when it beats that.
   --spec-min-p    how sure the draft layer must be to extend a verify window by another guess.  A slower CPU pays more
                   per extra window row (more experts per window), so it wants a higher floor.
   --pool-workers  the CPU threads that compute experts.  Every physical core is not always best: on hybrid CPUs the
@@ -199,6 +200,18 @@ def engine_error(log: str | None, since: int = 0) -> str | None:
     return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
 
 
+def tune_of(pcie, min_p) -> dict:
+    """A request's tuning keys: the draft floor, and the PCIe share unless `pcie` is None (the engine's own split)."""
+    tune = {"spec_min_p": min_p}
+    if pcie is not None:
+        tune["pcie_frac"] = pcie
+    return tune
+
+
+def share_name(pcie) -> str:
+    return "split (the engine's own)" if pcie is None else f"share {pcie:.2f}"
+
+
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=()) -> dict:
     t0 = time.time()
     report: dict = {}
@@ -207,45 +220,47 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     eng = start_engine(base_args)
     try:
         info = dict(getattr(eng, "info", {}) or {})
-        d_pcie = float(info.get("pcie_frac", 0.55))
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
         s.warm_up()
-        # 1. the PCIe share, at the default draft floor
+        # 1. the PCIe share, at the default draft floor, against the engine's own split of the missed experts (None:
+        #    no share given - the split it measured at start, or its link's share where it measures none)
         by_pcie = {}
-        for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
-            by_pcie[f] = [s.rate({"pcie_frac": f, "spec_min_p": d_minp})]
-            say(f"    PCIe share {f:.2f}: {by_pcie[f][0]:.1f} tok/s")
+        for f in [None] + sorted(PCIE_FRACS):
+            by_pcie[f] = [s.rate(tune_of(f, d_minp))]
+            say(f"    PCIe {share_name(f)}: {by_pcie[f][0]:.1f} tok/s")
         best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
         # 2. the draft floor, at that share
         by_minp = {}
         for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate({"pcie_frac": best_pcie, "spec_min_p": p})]
+            by_minp[p] = [s.rate(tune_of(best_pcie, p))]
             say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
         best_minp = max(by_minp, key=lambda k: by_minp[k][0])
         # 3. the winner against the default, interleaved, three times each
-        dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
-        confirm = {dflt: [], cand: []}
+        dflt, cand = (None, round(d_minp, 2)), (best_pcie, best_minp)
+        confirm: dict[tuple, list[float]] = {dflt: [], cand: []}
         if cand != dflt:
             for _ in range(3):
                 for k in (dflt, cand):
-                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                    confirm[k].append(s.rate(tune_of(k[0], k[1])))
         chosen = pick(confirm, dflt) if cand != dflt else dflt
-        report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
-                      pcie_sweep={str(k): v for k, v in by_pcie.items()},
+        report.update(default={"pcie_frac": share_name(None), "spec_min_p": dflt[1], "pool_workers": d_workers},
+                      pcie_sweep={share_name(k): v for k, v in by_pcie.items()},
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
-                      confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
+                      confirm={f"{share_name(k[0])}/{k[1]}": v for k, v in confirm.items()})
     finally:
         close(eng)
     settings = {}
     if chosen != dflt:
-        settings["--pcie-frac"] = f"{chosen[0]:.2f}"
+        if chosen[0] is not None:
+            settings["--pcie-frac"] = f"{chosen[0]:.2f}"
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
-        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
+        tuned = with_arg(with_arg(base_args, "--pcie-frac", None if chosen[0] is None else f"{chosen[0]:.2f}"),
+                         "--spec-min-p", f"{chosen[1]:.2f}")
         by_workers = {}
         for w in worker_candidates(d_workers, extra_workers):
             say(f"  Measuring with {w} CPU workers (restarts the engine) ...")
