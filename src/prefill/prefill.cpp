@@ -1244,16 +1244,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                if (m.stage_live[sl]) strata::gpu::stream_wait_event(m.copy, m.used[sl]);
+                // the slot's last reader, the copy and its mark in one submission (copy_async_after)
+                const strata::gpu::Event* after = m.stage_live[sl] ? m.used[sl] : nullptr;
                 if (en.job < 0) {
-                    strata::gpu::copy_async(m.stage_dev[sl], en.blob, bytes, m.copy);
+                    strata::gpu::copy_async_after(m.stage_dev[sl], en.blob, bytes, m.copy, after, m.copied[sl]);
                     ++stats_.experts_dma;
                 } else {
                     const uint8_t* hb = m.stager->wait(en.job);
-                    strata::gpu::copy_async(m.stage_dev[sl], hb, bytes, m.copy);
+                    strata::gpu::copy_async_after(m.stage_dev[sl], hb, bytes, m.copy, after, m.copied[sl]);
                     m.stager->issued_one(en.job, m.copy);
                 }
-                strata::gpu::event_record(m.copied[sl], m.copy);
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
@@ -1291,16 +1291,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                    if (m.stage_live[sl]) strata::gpu::stream_wait_event(m.copy, m.used[sl]);
+                    // the slot's last reader, the copy and its mark in one submission (copy_async_after)
+                    const strata::gpu::Event* after = m.stage_live[sl] ? m.used[sl] : nullptr;
                     if (en.job < 0) {
-                        strata::gpu::copy_async(m.stage_dev[sl], en.blob, bytes, m.copy);
+                        strata::gpu::copy_async_after(m.stage_dev[sl], en.blob, bytes, m.copy, after, m.copied[sl]);
                         ++iss_dma;
                     } else {
                         const uint8_t* hb = m.stager->wait(en.job);
-                        strata::gpu::copy_async(m.stage_dev[sl], hb, bytes, m.copy);
+                        strata::gpu::copy_async_after(m.stage_dev[sl], hb, bytes, m.copy, after, m.copied[sl]);
                         m.stager->issued_one(en.job, m.copy);
                     }
-                    strata::gpu::event_record(m.copied[sl], m.copy);
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
                     ++iss_streamed;

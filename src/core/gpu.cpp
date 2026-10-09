@@ -239,6 +239,18 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     catch (const std::exception& e) { return fail("copy_async", e); }
 }
 
+bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
+    try {
+        auto& queue = q(s);
+        const sycl::event e = queue.submit([&](sycl::handler& h) {
+            if (after != nullptr && after->ev) h.depends_on(*after->ev);
+            if (bytes > 0) h.memcpy(dst, src, bytes);
+        });
+        if (done != nullptr) done->ev = e;
+        return true;
+    } catch (const std::exception& e) { return fail("copy_async_after", e); }
+}
+
 bool copy2d_async(void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Stream s) {
     if (width == 0 || height == 0) return true;
     // a kernel rather than ext_oneapi_memcpy2d, which a SYCL graph recording does not accept: the verify window and
