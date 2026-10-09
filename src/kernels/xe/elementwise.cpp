@@ -18,6 +18,7 @@ sycl::queue& queue_for(void* stream) {
 }
 // 16 bytes in one read across PCIe from mapped host memory: through sycl::float4 NVPTX splits the read in two
 using f32x4 = float __attribute__((ext_vector_type(4)));
+using i32x4 = int32_t __attribute__((ext_vector_type(4)));
 void sync_if_needed(void* stream, const sycl::event& event) {
     if (!stream) core::Runtime::get().wait(event, "synchronous elementwise kernel");
 }
@@ -205,8 +206,21 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 
 void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
     if (n <= 0) return;
-    queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        dst[i] = reinterpret_cast<const volatile int32_t*>(src)[i];
+    if (((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+            dst[i] = reinterpret_cast<const volatile int32_t*>(src)[i];
+        });
+        return;
+    }
+    // 16 bytes a read, as copy_from_mapped, and the last n % 4 values one by one: the prompt path's routing tables
+    // cross PCIe beside the streamed experts
+    const int64_t n4 = n / 4;
+    const size_t groups = (size_t) std::clamp<int64_t>((n4 + 255) / 256, 1, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t step = (int64_t) it.get_global_range(0), g = (int64_t) it.get_global_id(0);
+        for (int64_t i = g; i < n4; i += step)
+            reinterpret_cast<i32x4*>(dst)[i] = reinterpret_cast<const volatile i32x4*>(src)[i];
+        if (g < n - n4 * 4) dst[n4 * 4 + g] = reinterpret_cast<const volatile int32_t*>(src)[n4 * 4 + g];
     });
 }
 
