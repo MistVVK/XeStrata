@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -894,23 +895,96 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
     done(stream, e, "copy_indexed");
 }
 
-void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
-    if (cap <= 0) return;
-    if (blob_bytes % 16 != 0) fail("fetch_blobs: blob size must be a multiple of 16");
-    const long long per = (long long) (blob_bytes / 16);
+namespace {
+// fetch_blobs' work-groups (of 256): the loads wait on the link, not the GPU, so a few work-groups keep enough of them
+// in flight (the RTX 4070's PCIe 4.0 x4 is full at 6 of them, the B70's Gen5 x16 at 20), and the rest of the GPU is
+// left to the VRAM hits that run beside this kernel (verify.cpp's fetch branch): with upstream's fixed 384 the hits
+// took half again as long beside it (RTX 4070, IQ3_XXS 32K: the window 58.6 ms either way, 56.4 with 6).
+// fetch_blobs_tune measures the device once; until then two a compute unit.  STRATA_FETCH_GROUPS=N fixes the count.
+core::PerDevice<int>& fetch_groups() {
+    static core::PerDevice<int> groups;
+    return groups;
+}
+int fetch_groups_fixed() {
+    static const int fixed = [] {
+        const char* v = std::getenv("STRATA_FETCH_GROUPS");
+        const long f = v == nullptr ? 0 : std::strtol(v, nullptr, 10);
+        return f > 0 ? (int) f : 0;
+    }();
+    return fixed;
+}
+int fetch_groups_default(sycl::queue& q) {
+    return std::max(16, 2 * (int) q.get_device().get_info<sycl::info::device::max_compute_units>());
+}
+sycl::event fetch_blobs_on(sycl::queue& q, const unsigned long long* src, const int32_t* n, uint8_t* dst, long long per,
+                           size_t groups) {
     // a 16-byte clang vector: through sycl::uint4, NVPTX moved each 16 bytes as two 8-byte loads, and these loads
     // cross PCIe (RTX 4070: 858 us a call against upstream's 801)
     using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
     auto* d = reinterpret_cast<u32x4*>(dst);
-    const size_t items = 48 * 8 * 256;
-    const auto e = Q(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
+    const size_t items = groups * 256;
+    return q.parallel_for(sycl::nd_range<1>(items, 256), [=](sycl::nd_item<1> it) {
         const long long total = (long long) *n * per;
-        for (long long i = (long long) id[0]; i < total; i += (long long) items) {
+        for (long long i = (long long) it.get_global_id(0); i < total; i += (long long) items) {
             const long long k = i / per, off = i - k * per;
             d[i] = reinterpret_cast<const u32x4*>(src[k])[off];
         }
     });
-    done(stream, e, "fetch_blobs");
+}
+}  // namespace
+
+void fetch_blobs_tune(void* stream) {
+    auto& q = Q(stream);
+    fetch_groups().get(q.get_device(), [&] {
+        if (const int fixed = fetch_groups_fixed(); fixed > 0) return fixed;
+        // two blobs of 2 MiB from host memory, as a layer's PCIe share; each count 8 launches in a row, the best of
+        // 4 rounds after a warm-up; the smallest count within 2% of the fastest is kept
+        constexpr long long blob = 2ll << 20, per = blob / 16;
+        constexpr int nb = 2;
+        const int most = fetch_groups_default(q);
+        auto* host = static_cast<uint8_t*>(sycl::malloc_host((size_t) nb * blob, q.get_context()));
+        auto* dst = sycl::malloc_device<uint8_t>((size_t) nb * blob, q);
+        auto* src = sycl::malloc_device<unsigned long long>(nb, q);
+        auto* n = sycl::malloc_device<int32_t>(1, q);
+        if (host == nullptr || dst == nullptr || src == nullptr || n == nullptr) {
+            sycl::free(host, q); sycl::free(dst, q); sycl::free(src, q); sycl::free(n, q);
+            return most;
+        }
+        std::memset(host, 1, (size_t) nb * blob);
+        unsigned long long tab[nb];
+        for (int k = 0; k < nb; ++k) tab[k] = (unsigned long long) (host + (size_t) k * blob);
+        q.memcpy(src, tab, sizeof tab);
+        q.memcpy(n, &nb, sizeof nb).wait();
+        std::vector<int> counts;
+        for (int g = 4; g < most; g = g < 8 ? g + 2 : g + g / 2) counts.push_back(g);
+        counts.push_back(most);
+        std::vector<double> t_min(counts.size(), 0.0);
+        for (int round = 0; round < 5; ++round)
+            for (size_t c = 0; c < counts.size(); ++c) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int i = 0; i < 8; ++i) fetch_blobs_on(q, src, n, dst, per, (size_t) counts[c]);
+                q.wait();
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+                if (round > 0 && (t_min[c] == 0.0 || us < t_min[c])) t_min[c] = us;
+            }
+        sycl::free(host, q); sycl::free(dst, q); sycl::free(src, q); sycl::free(n, q);
+        const double best = *std::min_element(t_min.begin(), t_min.end());
+        size_t pick = counts.size() - 1;
+        for (size_t c = 0; c < counts.size(); ++c)
+            if (t_min[c] <= best * 1.02) { pick = c; break; }
+        std::fprintf(stderr, "strata: the PCIe share's fetch runs %d work-groups (%.1f GB/s; %d: %.1f GB/s)\n", counts[pick],
+                     (double) nb * blob * 8 / t_min[pick] / 1e3, most, (double) nb * blob * 8 / t_min.back() / 1e3);
+        return counts[pick];
+    });
+}
+
+void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
+    if (cap <= 0) return;
+    if (blob_bytes % 16 != 0) fail("fetch_blobs: blob size must be a multiple of 16");
+    auto& q = Q(stream);
+    const int fixed = fetch_groups_fixed();
+    const int groups = fixed > 0 ? fixed : fetch_groups().get(q.get_device(), [&] { return fetch_groups_default(q); });
+    done(stream, fetch_blobs_on(q, src, n, dst, (long long) (blob_bytes / 16), (size_t) groups), "fetch_blobs");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {

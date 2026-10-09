@@ -183,6 +183,8 @@ void Verifier::tune_device(const ModelGeometry& g, void* stream) {
     // the GDN step's fastest form on this device for each window size
     if (g.ssm_v_heads > 0 && g.ssm_k_heads > 0)
         strata::kernels::gdn_step_tune((int) g.ssm_conv_channels, (int) g.ssm_k_heads, (int) g.ssm_v_heads, stream);
+    // and the PCIe share's fetch: the work-groups that fill this device's link
+    strata::kernels::fetch_blobs_tune(stream);
     // and the multi-row BF16 GEMV's form for the window's shapes: the router, the indexer's key and query, the PLE
     // block's key and value
     for (const int64_t n_out : {(int64_t) g.n_expert, (int64_t) g.idx_key_dim, (int64_t) g.idx_q_heads * g.idx_key_dim,
