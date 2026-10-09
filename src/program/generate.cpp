@@ -9812,6 +9812,8 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (hashes != nullptr) std::fclose(hashes);
+        if (const std::string pr = ver.profile_report(); !pr.empty())   // STRATA_VERIFY_PROFILE=1: the stages' device time
+            std::printf("%-24s%s\n", "verify profile", pr.c_str());
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,
