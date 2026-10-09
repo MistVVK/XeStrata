@@ -148,6 +148,7 @@ python .claude/skills/upstream-sync/scripts/judge.py --prompt-only B70 $o/IQ3_XX
 
 A cell (file, GPU, tier, prompt or output) passes when XeStrata's median is at most 1% below upstream's.
 A cell upstream does not finish, finishes at 10 tok/s or less, or is stopped as that slow, is left out; one only XeStrata does not finish fails.
+An SSD-offload cell (the file's experts do not fit in the machine's RAM budget and are read from the SSD while it answers: UD-Q4_K_XL on the AMD container's 62 GB) is not cut for speed: bench.sh runs with `SSD=1`, no run is stopped, and the cell is compared however slow (the user's decision of 2026-10-09).
 The B70's output cells are left out (`--prompt-only B70`, the user's decision of 2026-10-09): upstream's `sycl/` port reads the experts that do not fit in VRAM over PCIe from its kernels, a few tok/s, which says nothing about XeStrata's speed.
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part, make XeStrata's faster (step 4's rules), and measure that cell again.
