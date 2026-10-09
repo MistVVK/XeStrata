@@ -500,7 +500,12 @@ struct ElasticPool {
     std::vector<uint64_t> off, per_slot;   // each array's offset in the range (whole chunks) and bytes per page slot
     int64_t n_slots = 0, page_size = 0;
 };
-std::vector<std::unique_ptr<ElasticPool>> g_pools;
+// Never destroyed: a destructor at exit would unmap the ranges after the device's Runtime (made later, so gone
+// first) and with it the context (an assertion in libsycl on the RTX 4070); the process's end frees them.
+std::vector<std::unique_ptr<ElasticPool>>& pools() {
+    static auto* p = new std::vector<std::unique_ptr<ElasticPool>>;
+    return *p;
+}
 
 int64_t pool_chunks(const ElasticPool& p, size_t a, int64_t slots) {
     const uint64_t G = strata::core::vmm_granularity();
@@ -555,13 +560,13 @@ void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
 bool qsa_kv_elastic() { return g_kv_elastic; }
 int64_t qsa_kv_elastic_cells() {
     int64_t cells = std::numeric_limits<int64_t>::max();
-    for (const auto& p : g_pools) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
+    for (const auto& p : pools()) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
     return cells;
 }
 int64_t qsa_kv_elastic_need(int64_t cells) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
-    for (const auto& p : g_pools) {
+    for (const auto& p : pools()) {
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -571,14 +576,14 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
     return n;
 }
 bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
-    for (auto& p : g_pools)
+    for (auto& p : pools())
         if (!pool_grow(*p, cells, take)) return false;
     return strata::gpu::device_sync();
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
-    for (auto& p : g_pools) {
+    for (auto& p : pools()) {
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -591,12 +596,12 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::co
 }
 uint64_t qsa_kv_elastic_mapped_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
+    for (const auto& p : pools()) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
     return n;
 }
 uint64_t qsa_kv_elastic_full_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
+    for (const auto& p : pools()) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
 }
 namespace {
@@ -723,8 +728,8 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
             st.k_pool = reinterpret_cast<uint16_t*>(b + o[0]);
             st.v_pool = reinterpret_cast<uint16_t*>(b + o[1]);
         }
-        st.kv_elastic = (int32_t) g_pools.size();
-        g_pools.push_back(std::move(pool));
+        st.kv_elastic = (int32_t) pools().size();
+        pools().push_back(std::move(pool));
     } else if (st.kv_hybrid) {
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.k_scale = c.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
@@ -843,7 +848,7 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     strata::gpu::Stream cs = stream;
     // an elastic state zeroes what is mapped (the rest is zeroed when it is mapped)
-    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*g_pools[(size_t) st.kv_elastic]) : st.n_slots;
+    const int64_t live_slots = st.kv_elastic >= 0 ? pool_slots_mapped(*pools()[(size_t) st.kv_elastic]) : st.n_slots;
     const size_t rows = (size_t) live_slots * s.n_head_kv * s.page_size;
     if (st.kv_hybrid) {
         strata::gpu::memset_async(st.k_q, 0, rows * s.head_dim, cs);
