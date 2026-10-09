@@ -26,11 +26,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # a venv, as installs run: maya.py started from a system Python hands itself to ./maya.sh (os.execve)
       - name: Python packages
-        run: python -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
-        run: python tools/check_hip_compat.py
+        run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Server tests
-        run: python -m unittest discover -s serve -p "test_*.py" -t .
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
-        run: python -m unittest discover -s tools -p "test_*.py"
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
