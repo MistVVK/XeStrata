@@ -37,7 +37,11 @@ watch_slow() {
   while kill -0 "$1" 2>/dev/null; do
     sleep 5
     pp=$(grep '^PP ' "$2" | tail -n 1)
-    [ -n "$pp" ] || continue
+    # an engine without the PP lines (upstream's sycl/ port): the prompt is read once its prefill line is out
+    if [ -z "$pp" ]; then
+      grep -q '^strata generate: prefill [0-9]* tokens in' "$2" || continue
+      pp="PP 1 1 0 0"
+    fi
     read -r _ p_done p_total ms rate <<< "$pp"
     if [ "$p_done" -lt "$p_total" ]; then
       if [ "$ms" -ge 30000 ] && awk -v r="$rate" -v s="$slow" 'BEGIN { exit !(r <= s) }'; then

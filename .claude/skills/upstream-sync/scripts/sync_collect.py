@@ -3,7 +3,7 @@
 """Reads bench.sh's OUT/runs/*.txt and writes OUT/matrix.json (every run) and, per GPU, the prompt and output tables
 (the median of the rounds; a cell no run finished is "-", one bench.sh stopped as too slow "too slow") as Markdown to
 stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or output); one stopped in its output
-takes its prompt rate from the last PP line.
+takes its prompt rate from the last PP line (or, without PP lines, from its "strata generate: prefill" line).
 
     python .claude/skills/upstream-sync/scripts/sync_collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
 """
@@ -42,6 +42,8 @@ for f in sorted((out / "runs").glob("*.txt")):
     })
     if stopped == "output" and pp and pp[-1][0] == pp[-1][1]:   # stopped after the prompt: its rate from PP
         rows[-1]["prefill_tok_s"] = float(pp[-1][2])
+    elif stopped == "output" and not pp:   # no PP lines (upstream's sycl/ port): from its prefill line
+        rows[-1]["prefill_tok_s"] = grab(r"^strata generate: prefill \d+ tokens in .*?\(([\d.]+) tok/s\)", s)
 (out / "matrix.json").write_text(json.dumps(rows, indent=1) + "\n")
 
 for gpu in sorted({r["gpu"] for r in rows}):
