@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs: IQ3_XXS at 1K, 32K and 262K, and the other weight types at 32K. Only when the user asks (/upstream-sync).
+description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs: IQ3_XXS at 1K, 32K and 64K, and the other weight types at 32K. Only when the user asks (/upstream-sync).
 disable-model-invocation: true
 argument-hint: "[upstream TAG, e.g. v0.1.41]"
 ---
@@ -99,13 +99,13 @@ Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060
 
 | File | Tiers (`TIERS`) | What it covers |
 | --- | --- | --- |
-| IQ3_XXS | `262k 32k 1k` | the experts' Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_NL; the three kinds of prompt |
+| IQ3_XXS | `64k 32k 1k` | the experts' Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_NL; the three kinds of prompt |
 | Q2_0 | `32k` | the dense projections' Q3_K, Q4_0 and Q5_0 (no other file has them) |
 | IQ2_XS | `32k` | the experts' IQ1_M |
 | IQ3_S | `32k` | the experts' IQ4_XS |
 | UD-Q4_K_XL | `32k` | the experts' K-quants (Q4_K, Q5_K), Q5_1 and Q8_0 |
 
-Each tier stands for a kind of prompt: 1K the chunks below 1,024 tokens (the CPU takes a share of the experts), 32K a long context whose K/V is all in VRAM, 262K the K/V streamed from RAM (as from 64K; the longest is what the engine is used at most).
+Each tier stands for a kind of prompt: 1K the chunks below 1,024 tokens (the CPU takes a share of the experts), 32K a long context whose K/V is all in VRAM, 64K the K/V streamed from RAM (the path of every tier from 64K to 262K).
 The other files run at 32K: the products' shapes follow the chunk (from 32K a prompt is read in chunks of thousands of tokens, so each expert gets many rows), and the long contexts are what the engine is used at most.
 
 ```sh
