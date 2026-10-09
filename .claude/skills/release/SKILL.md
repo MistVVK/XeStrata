@@ -1,16 +1,15 @@
 ---
 name: release
-description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (Japanese then English), then the two free packages, then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
+description: Make a GitHub release of XeStrata in stages - the version, main fast-forwarded to dev, the tag (xe and the version, e.g. xe0.1.39); first the three contrib-llvm packages published with the notes (Japanese then English), then a speed table against upstream on Intel, NVIDIA and AMD GPUs. Only when the user asks for a release (/release).
 disable-model-invocation: true
 argument-hint: "[VERSION, e.g. 0.1.39 or 0.1.39.1]"
 ---
 
 # Releasing XeStrata
 
-A release is the annotated tag `xe<VERSION>` on `main`, pushed to origin, and a published GitHub release on it, made in three stages:
+A release is the annotated tag `xe<VERSION>` on `main`, pushed to origin, and a published GitHub release on it, made in two stages:
 
 - the preliminary release (先行報): the three contrib-llvm packages, `SHA256SUMS` and the notes;
-- the second preliminary release (先行2): the two free packages added;
 - the final release (確定報): the speed table against upstream on an Intel, an NVIDIA and an AMD GPU added to the notes.
 
 Rules for the whole run:
@@ -20,6 +19,7 @@ Rules for the whole run:
 - `gh` only as `gh release ...` (the one exception to "git commands only" in the user's global instructions); everything else with git.
   Every `gh release` names `--repo MistVVK/XeStrata`: without it gh takes the `upstream` remote (Niko1221/Strata).
   Never print or read gh's token (`gh auth status` shows the account; leave its token lines out).
+- A release ships the contrib-llvm packages only (the user's decision, 2026-10-09). The free packages are treated like contrib-icpx: built only when the user asks (`build-packages.sh xe<VERSION> free`), and not attached otherwise.
 - The check of the packages is their build alone (the user's decision, 2026-10-07): no CTest, no incus run, unless the user asks for them.
 - Work and commits are on `dev` (Japanese commit messages, one logical change per commit, `git add` and `git commit` joined with `&&`). `dev` itself is never pushed; `main` is.
 - A tag that has been pushed is never moved or deleted. A mistake after the push is fixed by a new version (the fourth number).
@@ -75,22 +75,24 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- Which package to install: the table in README's install section (`xestrata-free`; `xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that a contrib-llvm package only suggests the GPU makers' runtimes (Intel's Level Zero, with `libigc2 libigdfcl2` on Ubuntu, is installed by hand for an Intel GPU).
+- Which package to install: the table in README's install section (`xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that a contrib-llvm package only suggests the GPU makers' runtimes (Intel's Level Zero, with `libigc2 libigdfcl2` on Ubuntu, is installed by hand for an Intel GPU).
 - When the version changed: saved conversations from another version are not read.
 - How to check a download: `sha256sum -c SHA256SUMS`.
 
-Each section starts with a line of the stage: 先行報: contrib-llvm のパッケージだけ。free のパッケージは数時間後に、upstream との速さの比較はその後に足す / Preliminary: the contrib-llvm packages only; the free packages follow in a few hours, the speed comparison with upstream after them.
+- That the release has no free packages: a free build is made from the source (docs/BUILD.md).
+
+Each section starts with a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
 Facts only, no plans or alternatives (the stage line excepted). Show the notes to the user.
 
 ## 6. The AMD engines
 
-The AMD GPU is in another machine, so its part of the speed table (step 11) is prepared now and can run while the packages build.
+The AMD GPU is in another machine, so its part of the speed table (step 9) is prepared now and can run while the packages build.
 Prepare the two engines in the AMD development container (where it is and how to run in it: `LOCAL.md` in the repository root, kept out of git; when it is missing, ask the user and write the answer there):
 
 - XeStrata: bring the tag into the container's clone (it has no access to origin: a `git bundle` of `xe<VERSION>` copied in) and build the contrib-llvm mode with HIP for its GPU (`STRATA_HIP_ARCHS`, docs/BUILD.md) in a folder of the tag's own.
 - upstream: its newest release tag (`git fetch upstream --tags; git tag -l 'v*' --sort=-v:refname | head -n 1`), built with HIP as its own documents say.
 
-Run step 11's script there as soon as both are built; the development machine's GPUs wait for step 9.
+Run step 9's script there as soon as both are built; the development machine's GPUs wait until the packages are built (step 8).
 
 ## 7. Scan what the push would publish
 
@@ -118,30 +120,10 @@ gh release view xe<VERSION> --repo MistVVK/XeStrata --json url,isDraft
 
 Retry a push only for a network failure (up to four times, waiting 2, 4, 8, 16 s).
 `--verify-tag` makes gh refuse rather than create a tag of its own.
-Report the release's URL.
+Report the release's URL, then prepare the development machine's engines for step 9.
 A wrong asset or note is fixed with `gh release upload --clobber`, `gh release delete-asset` or `gh release edit --notes-file`.
 
-## 9. The free packages
-
-```sh
-setsid nohup .claude/skills/release/scripts/build-packages.sh xe<VERSION> free >/dev/null 2>&1 </dev/null &
-```
-
-The two free variants (ubuntu26.04 free, fedora44 free, about an hour), waited on as in step 4 (`build-free.pid`, `summary-free.txt`).
-It keeps the contrib-llvm packages and writes `SHA256SUMS` over all five.
-Meanwhile prepare the development machine's engines for step 11.
-
-## 10. The second preliminary release (先行2)
-
-When `summary-free.txt` ends with `ALLDONE` and `sha256sum -c SHA256SUMS` passes over the five packages, change the stage line of both sections of the notes to 先行2: 全パッケージ。upstream との速さの比較は後で足す / Second preliminary: all packages; the speed comparison with upstream follows, and:
-
-```sh
-d=build/release/xe<VERSION>
-gh release upload xe<VERSION> --repo MistVVK/XeStrata --clobber "$d"/xestrata-free* "$d/SHA256SUMS"
-gh release edit xe<VERSION> --repo MistVVK/XeStrata --notes-file "$d/NOTES.md"
-```
-
-## 11. The speed table
+## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
 The six tiers and the settings of `bench/results/2026-10-04-speed-matrix` (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py` writes the prompts (`python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids folder>`).
@@ -168,7 +150,7 @@ A cell that does not fit the GPU's or the machine's memory stays `-` with the re
 The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 Lint and commit it on `dev` (it is not in the tag).
 
-## 12. The final release (確定報)
+## 10. The final release (確定報)
 
 Take the stage lines out of the notes, add the tables (Japanese and English sections) with the engines' versions, the GPUs and the model, and:
 
