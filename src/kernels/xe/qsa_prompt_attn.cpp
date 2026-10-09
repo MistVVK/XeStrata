@@ -455,7 +455,7 @@ struct PromptAttnMma {
     sycl::local_accessor<float, 1> ks, vs;  // [CH][NG], [CH][VS]: INT8 K's scales, V's
     sycl::local_accessor<float, 1> part;    // [NG][R][CH]: q.k per 64-dim group; part[0] then holds p
     sycl::local_accessor<half, 1> pp;       // [2 VS][R][CH]: p' hi (2v) / lo (2v + 1) per V scale group
-    sycl::local_accessor<float, 1> st;      // [NG][R][64]: a sub-group's chunk of p.v on its way to the registers
+    sycl::local_accessor<float, 1> st;      // [NG][R][16]: a sub-group's tile of p.v on its way to the registers
     sycl::local_accessor<float, 1> mrow, lsum, alpha;
 
     void operator()(sycl::nd_item<2> it) const {
@@ -477,7 +477,7 @@ struct PromptAttnMma {
         const int32_t* sel = ids + qi * cap;
         const int n = steps[qi * kStepCount + kStepWidth];
         const size_t KH = 0, VH = (size_t) CH * KR, QH = 0, QL = (size_t) R * QS;
-        const size_t SG0 = (size_t) g * R * 64;   // this sub-group's output staging
+        const size_t SG0 = (size_t) g * R * T16;   // this sub-group's output staging, a tile at a time
 
         // q as in PromptAttn: 12 heads + 4 zero rows, times 2^(14 - e), FP16 hi + lo
         float qm = 0.0f;
@@ -501,7 +501,9 @@ struct PromptAttnMma {
             mx::joint_matrix_load(sg, qa[kk], at(kvq, QH + off), QS);
             mx::joint_matrix_load(sg, qb[kk], at(kvq, QL + off), QS);
         }
-        constexpr int OPL = R * 64 / pm::SG;   // output values a lane: element lane + SG * i of the sub-group's 16 x 64
+        // output values a lane: element lane + SG * i (i < TPL) of each of the sub-group's four 16 x 16 tiles, in
+        // o[nt * TPL + i]
+        constexpr int TPL = R * T16 / pm::SG, OPL = 4 * TPL;
         float o[OPL];
         for (int i = 0; i < OPL; ++i) o[i] = 0.0f;
 
@@ -645,17 +647,20 @@ struct PromptAttnMma {
                     mx::joint_matrix_load(sg, b, at(kvq, VH + (size_t) g * 64 + (size_t) nt * T16), KR);
                     mx::joint_matrix_mad(sg, acc, ph, b, acc);
                     mx::joint_matrix_mad(sg, acc, pl, b, acc);
-                    mx::joint_matrix_store(sg, acc, at(st, SG0 + (size_t) nt * T16), 64, mx::layout::row_major);
-                }
-                sycl::group_barrier(sg);
-                for (int i = 0; i < OPL; ++i) {
-                    const int e = lane + pm::SG * i;
-                    o[i] = sycl::fma(o[i], alpha[e / 64], st[SG0 + e] * unit);
+                    // through local memory a tile at a time (a quarter of the 16 x 64 staging: the work-group's local
+                    // memory, and so how many fit on a compute unit, set this kernel's speed on the RTX 4070)
+                    sycl::group_barrier(sg);   // the previous tile's values are read
+                    mx::joint_matrix_store(sg, acc, at(st, SG0), T16, mx::layout::row_major);
+                    sycl::group_barrier(sg);
+                    for (int i = 0; i < TPL; ++i) {
+                        const int e = lane + pm::SG * i;
+                        o[nt * TPL + i] = sycl::fma(o[nt * TPL + i], alpha[e / T16], st[SG0 + e] * unit);
+                    }
                 }
             }
         }
         for (int i = 0; i < OPL; ++i) {
-            const int e = lane + pm::SG * i, r = e / 64, col = e % 64;
+            const int e = lane + pm::SG * (i % TPL), r = e / T16, col = (i / TPL) * T16 + e % T16;
             if (r < G) {
                 const float l = lsum[r];
                 out[r * HD + g * 64 + col] = l > 0.0f ? o[i] / l : 0.0f;
@@ -670,7 +675,7 @@ struct PromptAttnMma {
 constexpr size_t mma_local_bytes() {
     constexpr size_t VS = PromptAttnMma<kI8, kQ4>::VS;
     return (size_t) PromptAttnMma<kF16, kF16>::KV_HALVES * 2 + (size_t) pm::CH * 8 + (size_t) pm::CH * (NG + VS) * 4 +
-           (size_t) NG * R * pm::CH * 4 + (size_t) 2 * VS * R * pm::CH * 2 + (size_t) NG * R * 64 * 4 +
+           (size_t) NG * R * pm::CH * 4 + (size_t) 2 * VS * R * pm::CH * 2 + (size_t) NG * R * pm::T16 * 4 +
            (size_t) 3 * R * 4;
 }
 
@@ -687,7 +692,7 @@ sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const in
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) pm::CH * K::VS), h),
             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::CH), h),
             sycl::local_accessor<half, 1>(sycl::range<1>((size_t) 2 * K::VS * R * pm::CH), h),
-            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * 64), h),
+            sycl::local_accessor<float, 1>(sycl::range<1>((size_t) NG * R * pm::T16), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h),
             sycl::local_accessor<float, 1>(sycl::range<1>(R), h)};
