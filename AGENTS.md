@@ -1,5 +1,7 @@
 # Notes for coding agents
 
+Read `LOCAL.md` in the repository root when it is there: this machine's hosts, containers and paths, kept out of git.
+
 ## Hardware independence (the first rule)
 
 XeStrata runs on any Intel Arc GPU and any x86-64 CPU with AVX2, not on the development machine's B70 and i7-14700.
