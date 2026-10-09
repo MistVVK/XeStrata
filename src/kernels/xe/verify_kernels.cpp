@@ -290,6 +290,50 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
 }  // namespace
 
 namespace {
+// upstream's gdn_step_commit_kernel: the commit's state only, without the outputs the window's forms also compute (the
+// queries, the second reduction and its two barriers a token).  The split's work-items and the same state arithmetic in
+// the same order, so the state is every form's bit for bit.
+sycl::event gdn_state_commit(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
+                             int h_k, int h_v, const int32_t* n_keep) {
+    return q.submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), red(sycl::range<1>((size_t) RG * GS_COLS), hd);
+        hd.parallel_for(sycl::nd_range<1>((size_t) h_v * (S / GS_COLS) * GS_COLS * RG, (size_t) GS_COLS * RG),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int n = *n_keep;
+            if (n <= 0) return;   // the whole launch
+            const int grp = (int) it.get_group(0), head = grp / (S / GS_COLS), c0 = (grp % (S / GS_COLS)) * GS_COLS;
+            const int tid = (int) it.get_local_id(0), lc = tid % GS_COLS, rg = tid / GS_COLS, col = c0 + lc;
+            const int qh = head % h_k;
+            const int qk = S * h_k;
+            float s[RPG];
+            float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+            const size_t row_stride = (size_t) h_v * S;
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+            for (int t = 0; t < n; ++t) {
+                const float* ht = hbuf + (size_t) t * C;
+                sycl::group_barrier(it.get_group());
+                if (tid < S) sk[tid] = ht[qk + qh * S + tid];
+                sycl::group_barrier(it.get_group());
+                const float g = sycl::exp(gate[(size_t) t * h_v + head]);
+                float kv = 0.0f;
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
+                red[rg * GS_COLS + lc] = kv;
+                sycl::group_barrier(it.get_group());
+                const float kv_col = red[lc] + red[GS_COLS + lc] + red[2 * GS_COLS + lc] + red[3 * GS_COLS + lc];
+                const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) t * h_v + head];
+                #pragma unroll
+                for (int r = 0; r < RPG; ++r) s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
+            }
+            #pragma unroll
+            for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        });
+    });
+}
+}  // namespace
+
+namespace {
 // One work-group a head (512 work-items: (column, row group)).
 template <bool Q8>
 sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
@@ -588,6 +632,14 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
     const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];
     if (y_q8_1 != nullptr && (S * h_v) % 32 != 0) fail("gdn_step_norm_multi: q8_1 blocks need 32 | value_dim");
     if (n_keep != nullptr && t_out_begin >= n_tok) n_keep = gdn_dbg_keep(q, n_keep, n_tok);
+    static const bool commit_state = [] {   // STRATA_GDN_COMMIT_SPLIT=0: the commit runs the window's form
+        const char* v = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (commit_state && n_keep != nullptr && t_out_begin >= n_tok) {   // the commit: no outputs
+        done(stream, gdn_state_commit(q, state, hbuf, C, gate, beta, h_k, h_v, n_keep), "gdn_step_norm_multi");
+        return;
+    }
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
                                static_cast<uint8_t*>(y_q8_1)),
          "gdn_step_norm_multi");
