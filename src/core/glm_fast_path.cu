@@ -3039,11 +3039,13 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
 // The NextN draft block leaves its experts that are not in VRAM out (no RAM pull, no disk wait): its draft only has
 // to be a good guess - every token is the trunk's own - and its misses sat on the tail's critical path.
 // STRATA_GLM_MTP_MISS=1 fetches them like the trunk; STRATA_GLM_MTP_KEEP=<n> fetches the missing ones among the
-// route's n best-scored experts only (the route lists them in selection order) and leaves the rest out.
+// route's n best-scored experts only (the route lists them in selection order) and leaves the rest out.  The default
+// keeps 2: never slower than skipping all and drafts better (2x V100: 82-83% accepted against 76-81%, decode 28.0-28.2
+// against 27.0-28.1 tok/s; RTX 3090 + 3060: 19.5 -> 20.6); KEEP=0 skips every missing one.
 static int mtp_skip_from() {
     static const int v = [] {
         if (const char* k = getenv("STRATA_GLM_MTP_KEEP")) return std::max(0, std::min(8, std::atoi(k)));
-        return getenv("STRATA_GLM_MTP_MISS") != nullptr ? 8 : 0;
+        return getenv("STRATA_GLM_MTP_MISS") != nullptr ? 8 : 2;
     }();
     return v;
 }
