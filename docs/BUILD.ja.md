@@ -138,6 +138,13 @@ sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバー�
 `STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、出力の速さは 3〜5% 遅い）。
 Pascal の実機では確かめていません（`unverified`）。
 
+Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
+ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
+もうひとつはハイパーコネクションの読み出しの norm と up の積で、重みを先に読んで遅延を隠します（`src/kernels/xe/fused_gr.cpp`、upstream の aaa323fe: V100 で 1 回 50.9 → 46.7 µs）。
+どちらも出力は既定のカーネルとビット単位で同じで、`STRATA_EXP_MODE=8`、`STRATA_GR_FAST=1` でほかの GPU でも使えます。
+sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両方を使っても CTest 71 件が通り、エキスパートと読み出しの出力は既定とビット単位で同じでした（RX 9060 XT でも同じ）。
+Volta の実機と、Volta での速さは確かめていません（`unverified`）。
+
 ### エンジンの部品とテスト
 
 モデルを使わない部品とテストは、llama.cpp なしでビルドできます（`STRATA_NATIVE_EXPERTS=OFF`）。
