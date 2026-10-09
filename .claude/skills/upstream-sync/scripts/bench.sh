@@ -87,7 +87,7 @@ for t in ${TIERS:-262k 192k 128k 64k 32k 4k 1k}; do
     for a in $arms; do
       [ "$a" = up ] && [ -n "$up_slow" ] && continue
       run "$a" "$t" "$out/runs/$gpu-$a-$t-$r.txt"
-      [ "$a" = up ] && grep -q '^bench: stopped' "$out/runs/$gpu-$a-$t-$r.txt" && up_slow=1
+      if [ "$a" = up ] && grep -q '^bench: stopped' "$out/runs/$gpu-$a-$t-$r.txt"; then up_slow=1; fi
     done
   done
 done
