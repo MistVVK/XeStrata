@@ -20,6 +20,9 @@
 #define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
+#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
+#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaDeviceProp hipDeviceProp_t
 #define cudaDeviceSynchronize hipDeviceSynchronize

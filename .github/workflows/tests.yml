@@ -1,0 +1,36 @@
+# Every push and pull request: the Python tests (server, installer, tools) and the AMD build's CUDA-name check - no GPU
+# needed. The engine's CUDA build and its GPU tests run on the maintainers' V100s before a merge (CONTRIBUTING.md).
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # llama.cpp's gguf-py at the commit the installer pins (setup.py LLAMA_CPP_COMMIT), where tools/_paths.py looks
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: third_party/llama.cpp
+          sparse-checkout: gguf-py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: python -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil
+      - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
+        run: python tools/check_hip_compat.py
+      - name: Server tests
+        run: python -m unittest discover -s serve -p "test_*.py" -t .
+      - name: Installer and tools tests
+        run: python -m unittest discover -s tools -p "test_*.py"
