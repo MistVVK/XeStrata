@@ -1,41 +1,54 @@
 #!/bin/sh
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-# .claude/skills/release/scripts/build-packages.sh - a release's packages: the five deb and rpm variants built from
-# TAG one after another (tools/package/build.sh, a clean container each), gathered with SHA256SUMS into
-# build/release/TAG/.
+# .claude/skills/release/scripts/build-packages.sh - a release's packages: one set of the deb and rpm variants built
+# from TAG one after another (tools/package/build.sh, a clean container each), gathered into build/release/TAG/ with
+# SHA256SUMS over every package there (the other set's included).
 #
-#   .claude/skills/release/scripts/build-packages.sh TAG      # from the repository root
+#   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4
+#   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free
 #
-# It takes about two and a half hours.  It writes its own PID to build/release/TAG/build.pid (wait on that PID, not
-# on a pattern: pgrep -f matches the waiting shell itself) and a line per variant to build/release/TAG/summary.txt,
-# then ALLDONE, or FAILED at the first variant that fails (its log is in build/release/TAG/logs/).
+# Run from the repository root.  The contrib set takes about an hour and a half, the free one about an hour.  It
+# writes its own PID to build/release/TAG/build-SET.pid (wait on that PID, not on a pattern: pgrep -f matches the
+# waiting shell itself) and a line per variant to build/release/TAG/summary-SET.txt, then ALLDONE, or FAILED at the
+# first variant that fails (its log is in build/release/TAG/logs/).
 set -u
 
-[ $# -eq 1 ] || { echo "usage: $0 TAG" >&2; exit 2; }
+usage() { echo "usage: $0 TAG contrib|free" >&2; exit 2; }
+[ $# -eq 2 ] || usage
 tag=$1
+set_=$2
+case $set_ in
+  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4" ;;
+  free) variants="ubuntu26.04 free|fedora44 free" ;;
+  *) usage ;;
+esac
 cd "$(git rev-parse --show-toplevel)" || exit 1
 git rev-parse --verify -q "$tag^{commit}" >/dev/null || { echo "no tag $tag" >&2; exit 1; }
 out=build/release/$tag
 mkdir -p "$out/logs"
-rm -f "$out"/*.deb "$out"/*.rpm "$out/SHA256SUMS"
-echo $$ > "$out/build.pid"
-: > "$out/summary.txt"
+summary=$out/summary-$set_.txt
+echo $$ > "$out/build-$set_.pid"
+: > "$summary"
 
-for t in "ubuntu26.04 free" "ubuntu26.04 cuda13.1" "ubuntu26.04 cuda12.4" "fedora44 free" "fedora44 cuda13.4"; do
+IFS='|'
+# shellcheck disable=SC2086
+set -- $variants
+unset IFS
+for t; do
   # shellcheck disable=SC2086
   set -- $t
   n=$1-$2
   start=$(date +%s)
   if ! tools/package/build.sh "$1" "$2" "$tag" > "$out/logs/$n.log" 2>&1; then
-    echo "$n FAILED after $(( ($(date +%s) - start) / 60 )) min (logs/$n.log)" >> "$out/summary.txt"
-    echo FAILED >> "$out/summary.txt"
+    echo "$n FAILED after $(( ($(date +%s) - start) / 60 )) min (logs/$n.log)" >> "$summary"
+    echo FAILED >> "$summary"
     exit 1
   fi
   find "build/pkg/$n" -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} "$out/" \;
   cp "build/pkg/$n/BUILDINFO" "$out/logs/$n.BUILDINFO"
-  echo "$n ok in $(( ($(date +%s) - start) / 60 )) min" >> "$out/summary.txt"
+  echo "$n ok in $(( ($(date +%s) - start) / 60 )) min" >> "$summary"
 done
 
-(cd "$out" && sha256sum -- *.deb *.rpm > SHA256SUMS) || { echo FAILED >> "$out/summary.txt"; exit 1; }
-echo ALLDONE >> "$out/summary.txt"
+(cd "$out" && find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -printf '%f\n' | sort | xargs sha256sum -- > SHA256SUMS) || { echo FAILED >> "$summary"; exit 1; }
+echo ALLDONE >> "$summary"
