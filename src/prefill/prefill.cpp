@@ -141,12 +141,15 @@ int g_ring_override = 0;
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
 // On a card with little memory the ring takes at most an eighth of it (384 of IQ3_S's 2.7 MB blobs is 1 GiB, 3% of
-// a 32 GB card), so the prompt path's buffers do not crowd out the chunk.  From 8192-token chunks on, 512 (RTX 4070,
-// IQ2_XS, a 32K prompt in 8192-token chunks: 384 slots 1296 tok/s, 512 1364, 768 1376; 1024 no longer let the chunk
-// fit).
+// a 32 GB card), so the prompt path's buffers do not crowd out the chunk.  From 8192-token chunks on, up to 512 as
+// long as the ring stays within kRingBigBytes (RTX 4070, IQ2_XS's 1.5 MB blobs, a 32K prompt in 8192-token chunks: 384
+// slots 1296 tok/s, 512 1364, 768 1376; IQ3_XXS's 2.3 MB blobs, 64K: 384 1043, 512 1034, the ring's slots taken from
+// the cache's resident experts).
+constexpr uint64_t kRingBigBytes = 800ull << 20;
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
-    const int pinned = (int64_t) T >= 8192 ? 512 : 384;
+    const uint64_t blob_b = (uint64_t) std::max<int64_t>(MAXBLOB(), 1);
+    const int pinned = (int64_t) T >= 8192 ? (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512) : 384;
     int r = v ? (int) std::strtol(v, nullptr, 10)
               : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? pinned : 96);
     if (!v) {
