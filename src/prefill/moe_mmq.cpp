@@ -83,7 +83,11 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     const size_t ne = (size_t) (g.n - g.first), groups = (size_t) std::min<int64_t>((total + 255) / 256, 256);
     Q(stream).parallel_for(sycl::nd_range<2>({ne, groups * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
         const int q = first + (int) it.get_group(0);
-        const u32x4* src = blobs.p[q];
+        // the expert's blob by constant indices: indexed by q, the NVPTX compile copied the 16 pointers to each
+        // work-item's stack (the kernel ran at a quarter of the speed of upstream's copy16_group_kernel)
+        const u32x4* src = nullptr;
+        for (int k = 0; k < kGatherGroupMax; ++k)
+            if (k == q) src = blobs.p[k];
         u32x4* ab = gu + q * gs;
         u32x4* cd = dd + q * ds;
         const int64_t step = (int64_t) it.get_global_range(1);
