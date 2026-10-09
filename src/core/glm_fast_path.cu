@@ -3038,9 +3038,13 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
 // ---- one MoE FFN: F->x / F->xq -> F->ffn (routes, tiers, routed + shared experts)
 // The NextN draft block leaves its experts that are not in VRAM out (no RAM pull, no disk wait): its draft only has
 // to be a good guess - every token is the trunk's own - and its misses sat on the tail's critical path.
-// STRATA_GLM_MTP_MISS=1 fetches them like the trunk.
-static bool mtp_skip_miss() {
-    static const bool v = getenv("STRATA_GLM_MTP_MISS") == nullptr;
+// STRATA_GLM_MTP_MISS=1 fetches them like the trunk; STRATA_GLM_MTP_KEEP=<n> fetches the missing ones among the
+// route's n best-scored experts only (the route lists them in selection order) and leaves the rest out.
+static int mtp_skip_from() {
+    static const int v = [] {
+        if (const char* k = getenv("STRATA_GLM_MTP_KEEP")) return std::max(0, std::min(8, std::atoi(k)));
+        return getenv("STRATA_GLM_MTP_MISS") != nullptr ? 8 : 0;
+    }();
     return v;
 }
 
@@ -3090,7 +3094,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
-                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ && mtp_skip_miss(),
+                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ ? mtp_skip_from() : 8,
                   lane ? F->cpu_plan : 0ull, promote_min);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
