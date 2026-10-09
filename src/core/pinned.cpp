@@ -271,6 +271,78 @@ void PinnedArena::publish_shared() {
     flock(shared_fd_, LOCK_UN); shared_locked_ = false;
 }
 
+bool PinnedArena::to_host_usm(uint64_t pad, std::string& err) {
+    if (!layer_base.empty()) return true;
+    if (base == nullptr || map_ == nullptr || shared_fd_ >= 0 || bounds_.size() < 2) {
+        err = "only a private mapping with layer bounds moves into host USM";
+        return false;
+    }
+    auto& runtime = Runtime::get();
+    namespace sx = sycl::ext::oneapi::experimental;
+    try {   // no copy may read the mapping while it moves, and its registrations go
+        runtime.finish();
+        for (auto& o : other_reg_) {
+            auto& r = Runtime::at(o.first);
+            r.finish();
+            for (void* q : o.second) sx::release_from_device_copy(q, r.context());
+        }
+        other_reg_.clear();
+        for (void* r : reg_) sx::release_from_device_copy(r, runtime.context());
+        reg_.clear();
+    } catch (const std::exception& e) {
+        err = std::string("releasing the arena's registrations: ") + e.what();
+        return false;
+    }
+    std::vector<uint8_t*> blocks;
+    const size_t layers = bounds_.size() - 1;
+    for (size_t l = 0; l < layers; ++l) {
+        const uint64_t n = bounds_[l + 1] - bounds_[l];
+        void* q = sycl::malloc_host((size_t) (n + pad), runtime.context());
+        if (q == nullptr) {   // back as it was: the moved layers into the mapping, then its registrations
+            for (size_t k = 0; k < blocks.size(); ++k) {
+                std::memcpy((uint8_t*) base + bounds_[k], blocks[k], (size_t) (bounds_[k + 1] - bounds_[k]));
+                runtime.free(blocks[k]);
+            }
+            try {
+                for (const auto& pc : pieces_) {
+                    sx::prepare_for_device_copy(pc.first, pc.second, runtime.context());
+                    reg_.push_back(pc.first);
+                }
+            } catch (const std::exception& e) {
+                err = std::string("host USM refused at layer ") + std::to_string(l) + ", and the mapping's registration " +
+                      "again failed (" + e.what() + "): its copies are slower";
+                return false;
+            }
+            err = "host USM refused at layer " + std::to_string(l) + " (" + std::to_string(n + pad) + " B)";
+            return false;
+        }
+        std::memcpy(q, (uint8_t*) base + bounds_[l], (size_t) n);
+        if (pad > 0) std::memset((uint8_t*) q + n, 0, (size_t) pad);
+        blocks.push_back((uint8_t*) q);
+        // the moved layer's whole pages back to the system (MADV_DONTNEED on a private mapping drops them)
+        const uintptr_t a = ((uintptr_t) base + bounds_[l] + 4095) & ~(uintptr_t) 4095;
+        const uintptr_t b = ((uintptr_t) base + bounds_[l + 1]) & ~(uintptr_t) 4095;
+        if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
+    }
+    munmap(map_, map_bytes_);
+    map_ = nullptr;
+    map_bytes_ = 0;
+    layer_base = std::move(blocks);
+    pieces_.clear();
+    slice_starts.clear();
+    for (size_t l = 0; l < layers; ++l) {
+        pieces_.emplace_back(layer_base[l], (size_t) (bounds_[l + 1] - bounds_[l] + pad));
+        slice_starts.push_back(bounds_[l]);
+    }
+    base = layer_base[0];
+    backing = PageBacking::NormalPages;
+    slice_bytes = 1;
+    registered_slices = (int) layers;
+    note = "host USM, one block per layer (" + std::to_string(layers) +
+           "), moved from the registered mapping: readable by GPU kernels for the PCIe share";
+    return true;
+}
+
 uint8_t* PinnedArena::at(uint64_t off) const {
     if (layer_base.empty()) return (uint8_t*) base + off;
     size_t l = (size_t) (std::upper_bound(bounds_.begin(), bounds_.end() - 1, off) - bounds_.begin());

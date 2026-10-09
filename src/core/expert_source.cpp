@@ -2272,7 +2272,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     }
     bounds.push_back(want);
     cuts.push_back(want);
-    // STRATA_ARENA_HOST_USM=1: every layer in its own host USM block, which GPU kernels can read (the PCIe share)
+    // STRATA_ARENA_HOST_USM=1: every layer in its own host USM block, which GPU kernels can read (the PCIe share).
+    // Without it the one registered mapping, moved into host USM later only when the measured split reads experts
+    // over PCIe and the runtime's registration is for copies only (Level Zero's): make_kernel_readable.
     static const bool host_usm = [] { const char* e = std::getenv("STRATA_ARENA_HOST_USM"); return e && *e == '1'; }();
     if (!shared_arena_file.empty() && host_usm) {
         err = "shared arena cannot use layer-separated host USM"; return false;
@@ -2432,6 +2434,27 @@ bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
     return lay.blob_offset(layer, expert) + lay.blob_bytes(layer) <= pinned_bytes_;
+}
+
+bool ArenaExpertSource::make_kernel_readable(std::string& err) {
+    if (!dev_slice_.empty()) return true;
+    if (arena_ == nullptr) { err = "the arena is a file mapping"; return false; }
+    auto* a = static_cast<PinnedArena*>(arena_);
+    if (!a->to_host_usm(strata::kernels::cpu::expert_layout().max_blob, err)) return false;
+    base_ = a->data();
+    pinned_bytes_ = a->registered_bytes;
+    slice_bytes_ = a->slice_bytes;
+    for (uint64_t off : a->slice_starts) {
+        void* d = nullptr;
+        if (!strata::gpu::device_pointer(&d, (void*) a->at(off))) {
+            dev_slice_.clear();
+            err = "the host USM blocks have no device address";
+            return false;
+        }
+        dev_slice_.push_back((const uint8_t*) d);
+    }
+    note_ = a->note;
+    return true;
 }
 
 const uint8_t* ArenaExpertSource::device_alias(int64_t layer, int64_t expert) const {

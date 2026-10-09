@@ -140,6 +140,9 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+    /// Make `device_alias` work where the source's memory is registered for copies only: false (and `err`) when it
+    /// cannot.  True at once when it already works.
+    virtual bool make_kernel_readable(std::string& err) { err = "this expert source has no such memory"; return false; }
     /// A file-backed source: start reading this expert's pages now (it will be needed by the CPU); no-op elsewhere.
     virtual void prefetch(int64_t layer, int64_t expert) { (void) layer; (void) expert; }
     /// A file-backed source: this expert lives in VRAM, so its pages need not stay in RAM - hand them back to the
@@ -639,6 +642,7 @@ public:
     int64_t reads() const override { return reads_; }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    bool make_kernel_readable(std::string& err) override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
 

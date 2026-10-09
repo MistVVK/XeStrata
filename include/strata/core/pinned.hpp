@@ -63,6 +63,11 @@ struct PinnedArena {
     /// copies are then correct, only slower.
     bool register_on(int device, std::string& err);
 
+    /// The one registered mapping (a private one with layer bounds) moved into host USM blocks, one per layer of its
+    /// bytes plus `pad`, as the `host_usm` constructor makes them: GPU kernels can then read it (a registration for
+    /// copies does not give that on every runtime).  A layer at a time, each layer's pages given back once copied, so
+    /// the arena is never held twice.  False (and `err`) with the mapping and its registrations as they were.
+    bool to_host_usm(uint64_t pad, std::string& err);
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).
