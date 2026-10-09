@@ -20,6 +20,7 @@
 #include <sycl/ext/oneapi/experimental/clock.hpp>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -788,10 +789,18 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream) {
     if (n <= 0) return;
+    // 16-byte reads, and `skip` read once a group: read by every item it crossed PCIe for each, and the RTX 4070
+    // took 824 us for 10 rows of 2560 against 37
+    using f32x4 = float __attribute__((ext_vector_type(4)));
     const long long n4 = n / 4;   // the CUDA kernel moved whole float4s: n is a multiple of 4
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n4 * 4)), [=](sycl::id<1> id) {
-        const bool zero = *reinterpret_cast<const volatile uint32_t*>(skip) == value;
-        dst[id] = zero ? 0.0f : reinterpret_cast<const volatile float*>(src)[id];
+    const size_t groups = (size_t) std::min<long long>((n4 + 255) / 256, 64);
+    Q(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        uint32_t flag = 0;
+        if (it.get_local_id(0) == 0) flag = *reinterpret_cast<const volatile uint32_t*>(skip);
+        const bool zero = sycl::group_broadcast(it.get_group(), flag) == value;
+        const long long step = (long long) it.get_global_range(0);
+        for (long long i = (long long) it.get_global_id(0); i < n4; i += step)
+            reinterpret_cast<f32x4*>(dst)[i] = zero ? f32x4(0.0f) : reinterpret_cast<const volatile f32x4*>(src)[i];
     });
 }
 

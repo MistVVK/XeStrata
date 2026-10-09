@@ -16,6 +16,8 @@ sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
     return queue;
 }
+// 16 bytes in one read across PCIe from mapped host memory: through sycl::float4 NVPTX splits the read in two
+using f32x4 = float __attribute__((ext_vector_type(4)));
 void sync_if_needed(void* stream, const sycl::event& event) {
     if (!stream) core::Runtime::get().wait(event, "synchronous elementwise kernel");
 }
@@ -152,8 +154,12 @@ void copy_from_mapped(float* dst, const float* src, int64_t n, void* stream) {
     if (n <= 0) return;
     if ((n & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0)
         throw core::DeviceError("copy_from_mapped: n must be a multiple of 4 and both pointers 16-byte aligned");
-    queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        dst[i] = reinterpret_cast<const volatile float*>(src)[i];
+    const int64_t n4 = n / 4;
+    const size_t groups = (size_t) std::min<int64_t>((n4 + 255) / 256, 64);
+    queue_for(stream).parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) {
+        const int64_t step = (int64_t) it.get_global_range(0);
+        for (int64_t i = (int64_t) it.get_global_id(0); i < n4; i += step)
+            reinterpret_cast<f32x4*>(dst)[i] = reinterpret_cast<const volatile f32x4*>(src)[i];
     });
 }
 
@@ -163,14 +169,17 @@ void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t w
     if (rows <= 0) return;
     if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0)
         throw core::DeviceError("copy_rows_from_mapped: width must be a multiple of 4 and both pointers 16-byte aligned");
+    // 16-byte reads and the hit test shared by the group: the RTX 4070 took 33.8 us for 10 rows against 20.5
+    const int64_t w4 = width / 4;
     queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) rows * 128, 128), [=](sycl::nd_item<1> it) {
         const int64_t row = (int64_t) it.get_group(0);
         const int c = *count;
-        bool hit = false;
-        for (int i = 0; i < c; ++i) hit |= hit_rows[i] == row;
-        float* d = dst + row * width;
-        const volatile float* sr = reinterpret_cast<const volatile float*>(src) + row * width;
-        for (int64_t i = it.get_local_id(0); i < width; i += 128) d[i] = hit ? 0.0f : sr[i];
+        bool h = false;
+        for (int i = (int) it.get_local_id(0); i < c; i += 128) h |= hit_rows[i] == row;
+        const bool hit = sycl::any_of_group(it.get_group(), h);
+        f32x4* d = reinterpret_cast<f32x4*>(dst + row * width);
+        const volatile f32x4* sr = reinterpret_cast<const volatile f32x4*>(src + row * width);
+        for (int64_t i = (int64_t) it.get_local_id(0); i < w4; i += 128) d[i] = hit ? f32x4(0.0f) : sr[i];
     });
 }
 
