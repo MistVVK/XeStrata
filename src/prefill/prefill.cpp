@@ -65,7 +65,7 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // Step 3: from this chunk size on, every non-resident expert of every layer streams in a fixed order through a
 // RING_MAX-slot ring (nearly all 512 are routed at such a chunk), so the copy engine keeps working through the
 // attention halves instead of waiting for each layer's routing.
-constexpr int RING_MAX = 512;           // the arrays; the ring itself is ring_slots()
+constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_slots()
 // STRATA_TEST_PAGEABLE=1 (upstream cfe09ab5) makes every pinned host allocation with a pageable fallback in
 // Prefill::init fail, so the fallbacks (what a container's memlock limit forces) run on a PC that can pin - for ASan /
 // MALLOC_CHECK_=3 runs.
@@ -141,10 +141,14 @@ int g_ring_override = 0;
 // and 96 when a large share goes through host copies (IQ3_S on 64 GB, a third unpinned: 96 slots 1216, 256 1070 -
 // the host copies are the limit and the bigger ring only takes cache slots).  STRATA_PREFILL_RING overrides.
 // On a card with little memory the ring takes at most an eighth of it (384 of IQ3_S's 2.7 MB blobs is 1 GiB, 3% of
-// a 32 GB card), so the prompt path's buffers do not crowd out the chunk.
+// a 32 GB card), so the prompt path's buffers do not crowd out the chunk.  From 8192-token chunks on, 512 (RTX 4070,
+// IQ2_XS, a 32K prompt in 8192-token chunks: 384 slots 1296 tok/s, 512 1364, 768 1376; 1024 no longer let the chunk
+// fit).
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
-    int r = v ? (int) std::strtol(v, nullptr, 10) : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? 384 : 96);
+    const int pinned = (int64_t) T >= 8192 ? 512 : 384;
+    int r = v ? (int) std::strtol(v, nullptr, 10)
+              : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? pinned : 96);
     if (!v) {
         static strata::core::PerDevice<uint64_t> per_device;   // the current device's memory, read once for each GPU
         const int dev = strata::core::current_device();
