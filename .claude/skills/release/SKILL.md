@@ -132,7 +132,8 @@ A wrong asset or note is fixed with `gh release upload --clobber`, `gh release d
 ## 9. The speed table
 
 The release against upstream's newest release tag, IQ3_XXS, on each maker's GPU: the Intel Arc Pro B70 and the RTX 4070 in the development machine, the RX 9060 XT in the AMD container (step 6).
-The tiers and the settings of `bench/results/2026-10-04-speed-matrix` and a 192K tier (1K to 262K, what setup writes for each context, 256 greedy tokens); `scripts/prompts.py` writes the prompts (`python .claude/skills/release/scripts/prompts.py <pack> <ids folder>`).
+The six tiers and the settings of `bench/results/2026-10-04-speed-matrix` (1K to 262K, what setup writes for each context, 256 greedy tokens); its `prompts.py` writes the prompts (`python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids folder>`).
+The table's method stays fixed from release to release so the releases compare: the upstream merge's measurements (/upstream-sync) have scripts of their own, and a change to them does not change this table.
 
 The engines, built from the tags (no package installed), each in a worktree of its own under `.claude/worktrees/`:
 
@@ -151,7 +152,6 @@ python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream 
 
 `bench.sh` runs a warm-up per engine, then each tier twice per engine with the engines alternating; `bench-collect.py` writes `matrix.json` and the tables (the medians), one pair per GPU.
 A cell that does not fit the GPU's or the machine's memory stays `-` with the reason in the record; an engine that does not start at all stops the run (report it).
-`bench.sh` stops upstream once it is plainly at 10 tok/s or less; such a cell is `too slow`: not measurable, written 計測不能（低速）/ not measurable (too slow) in the notes, with a line saying upstream was stopped at 10 tok/s or less.
 
 The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 Lint and commit it on `dev` (it is not in the tag).
