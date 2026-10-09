@@ -129,12 +129,13 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
            "; no mlock";
 }
 
-PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm)
+PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad, bool host_usm,
+                         const std::vector<uint64_t>& cuts)
     : capacity(bytes), bounds_(bounds) {
     if (!host_usm) {
         // one mapping, registered in pieces that end at layer starts: the other constructor's work, then keep the
         // bounds for `at`
-        PinnedArena one(bytes, 0, std::vector<uint64_t>(bounds.begin() + 1, bounds.end()));
+        PinnedArena one(bytes, 0, cuts.empty() ? std::vector<uint64_t>(bounds.begin() + 1, bounds.end()) : cuts);
         std::swap(base, one.base); std::swap(map_, one.map_); std::swap(map_bytes_, one.map_bytes_);
         std::swap(reg_, one.reg_);
         std::swap(pieces_, one.pieces_);
@@ -185,7 +186,8 @@ void arena_lock(int fd) {
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
-                         const std::string& file, uint64_t pack_hash) : capacity(bytes), bounds_(bounds) {
+                         const std::string& file, uint64_t pack_hash, const std::vector<uint64_t>& cuts)
+    : capacity(bytes), bounds_(bounds) {
     (void) max_pinned_bytes;   // Xe registers every slice, bounded by the device's largest allocation.
     if (!bytes || bytes > (uint64_t) std::numeric_limits<off_t>::max() - kArenaHeaderBytes - kHugePage)
         throw DeviceError("shared arena: invalid size");
@@ -228,7 +230,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
             base = nullptr; throw DeviceError("shared arena: mapping failed");
         }
         const bool huge = thp_request_skipped().empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
-        register_pieces((uint8_t*) base, bytes, bounds, reg_, pieces_);
+        register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_);
         registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
         note = "shared file mapping registered in device-sized slices; no mlock";

@@ -2265,15 +2265,19 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         }
     }
 
-    // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
-    // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
-    std::vector<uint64_t> bounds, loff, lbytes;
+    // The registrations for device copies end at expert starts, so no expert straddles two: a layer larger than the
+    // device's largest allocation is cut inside (IQ3_XXS's on the RX 9060 XT; a copy across two registrations failed
+    // there with an invalid value).  The arena is one blob longer than the file: a copy of a whole VRAM slot (the
+    // largest blob) may then start at any expert.
+    std::vector<uint64_t> bounds, loff, lbytes, cuts;
     for (int64_t l = 0; l < n_layers; ++l) {
         bounds.push_back(lay.layer_offset(l));
         loff.push_back(lay.layer_offset(l));
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) cuts.push_back(lay.blob_offset(l, e));
     }
     bounds.push_back(want);
+    cuts.push_back(want);
     // STRATA_ARENA_HOST_USM=1: every layer in its own host USM block, which GPU kernels can read (the PCIe share)
     static const bool host_usm = [] { const char* e = std::getenv("STRATA_ARENA_HOST_USM"); return e && *e == '1'; }();
     if (!shared_arena_file.empty() && host_usm) {
@@ -2284,8 +2288,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     PinnedArena* a = nullptr;
     try {
         a = shared_arena_file.empty()
-            ? new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, host_usm)
-            : new PinnedArena(want + (uint64_t) blob, bounds, 0, shared_arena_file, pack_hash);
+            ? new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, host_usm, cuts)
+            : new PinnedArena(want + (uint64_t) blob, bounds, 0, shared_arena_file, pack_hash, cuts);
     } catch (const std::exception& e) {
         // a runtime without the registration (intel/llvm's CUDA adapter has no urUSMImportExp) takes host USM
         if (!shared_arena_file.empty() || host_usm) {

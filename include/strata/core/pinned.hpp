@@ -41,12 +41,14 @@ struct PinnedArena {
     /// The same, its registrations for device copies ending only at `cuts` (offsets) where it must be split.
     PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint64_t>& cuts);
     // The native pack loader's layer boundaries (`bounds`: each layer's start, then the end).  The mapping is
-    // registered in pieces that end at layer starts when it is larger than the device's largest allocation, or, with `host_usm`, every layer is its own host USM block of its bytes plus `pad`: pinned
+    // registered in pieces that end at `cuts` (the layer starts when empty) when it is larger than the device's
+    // largest allocation, or, with `host_usm`, every layer is its own host USM block of its bytes plus `pad`: pinned
     // and readable by GPU kernels at the same address (a registered mapping is for copies only, and one host USM
     // block may not exceed max_mem_alloc_size).  The layers are then not adjacent: address them with `at`.
-    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad = 0, bool host_usm = false);
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t pad = 0, bool host_usm = false,
+                const std::vector<uint64_t>& cuts = {});
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
-                const std::string& shared_file, uint64_t pack_hash);
+                const std::string& shared_file, uint64_t pack_hash, const std::vector<uint64_t>& cuts = {});
     /// Holds the shared file's population lock until publish_shared() or destruction. False: already complete.
     bool begin_shared_population();
     void publish_shared();
