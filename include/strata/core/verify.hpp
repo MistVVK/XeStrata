@@ -67,6 +67,11 @@ public:
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
 
+    /// The device's measured kernel forms for a window (the GDN step's, the multi-row BF16 GEMV's for the window's
+    /// shapes), each measured once per device; `init` asks for them too.  Called before the first prompt, so their
+    /// measurement (about 1 s on an RTX 4070) is not in its time to the first token.  Throws on a device error.
+    static void tune_device(const ModelGeometry& g, void* stream);
+
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);

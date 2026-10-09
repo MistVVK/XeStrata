@@ -3854,6 +3854,17 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
+    if (o.spec > 0) {   // the verify windows' kernel forms, measured now rather than after the first prompt
+        void* ts = strata::gpu::stream_create();
+        try {
+            if (ts != nullptr) strata::core::Verifier::tune_device(g, ts);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: verify window tuning: %s\n", e.what());
+            strata::gpu::stream_destroy(ts);
+            return 1;
+        }
+        if (ts != nullptr) strata::gpu::stream_destroy(ts);
+    }
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
