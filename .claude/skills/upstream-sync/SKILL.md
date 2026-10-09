@@ -1,6 +1,6 @@
 ---
 name: upstream-sync
-description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs, IQ3_XXS and four other model files. Only when the user asks (/upstream-sync).
+description: Bring upstream Strata's newest release tag into XeStrata on dev - sort its commits, merge, port the CUDA and HIP changes to the SYCL kernels, build the three modes - and make XeStrata at least as fast as that tag (at most 1% slower) on the Intel, NVIDIA and AMD GPUs, five model files at 1K to 262K. Only when the user asks (/upstream-sync).
 disable-model-invocation: true
 argument-hint: "[upstream TAG, e.g. v0.1.41]"
 ---
@@ -95,18 +95,14 @@ The engines, each built in a worktree of its own under `.claude/worktrees/` (or 
 
 Each engine's own shipped expert profile. No other work on a machine while it measures.
 
-The model files (their paths on each machine: `LOCAL.md`):
-
-| File | Tiers |
-| --- | --- |
-| IQ3_XXS | `1k 4k 32k 64k 128k 262k` |
-| Q2_0, IQ2_XS, IQ3_S, UD-Q4_K_XL | `1k 4k 32k` |
+The model files: IQ3_XXS, Q2_0, IQ2_XS, IQ3_S and UD-Q4_K_XL (their paths on each machine: `LOCAL.md`), each at all seven tiers (1K, 4K, 32K, 64K, 128K, 192K, 262K; bench.sh's default).
+The long contexts (192K, 262K) are what the engine is used at most: bench.sh runs the longest first, and a loss there comes first in step 7.
 
 ```sh
 o=bench/results/<date>-upstream-<version>
-python bench/results/2026-10-04-speed-matrix/prompts.py <pack> <ids>        # the prompts, once
+python .claude/skills/release/scripts/prompts.py <pack> <ids>               # the prompts, once
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
-  [PACK=... NATIVE=... PLE=... EXTRA="..."] TIERS="..." \
+  [PACK=... NATIVE=... PLE=... EXTRA="..."] [TIERS="..."] \
   .claude/skills/release/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU
 python .claude/skills/release/scripts/bench-collect.py $o/<file> xe-<commit> <tag>
 ```

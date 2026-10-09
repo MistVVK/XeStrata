@@ -16,7 +16,7 @@ import sys
 
 LIMIT = -0.01
 SLOW = 10.0                                   # tok/s: upstream this slow is not a speed to compare with
-TIERS = ["1k", "4k", "32k", "64k", "128k", "262k"]
+TIERS = ["1k", "4k", "32k", "64k", "128k", "192k", "262k"]
 MEASURES = (("prefill_tok_s", "prompt"), ("decode_tok_s", "output"))
 
 
