@@ -78,11 +78,17 @@ Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the
 - Which package to install: the table in README's install section (`xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that a contrib-llvm package only suggests the GPU makers' runtimes (Intel's Level Zero, with `libigc2 libigdfcl2` on Ubuntu, is installed by hand for an Intel GPU).
 - When the version changed: saved conversations from another version are not read.
 - How to check a download: `sha256sum -c SHA256SUMS`.
-
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
 
+Shape the notes with the user's `i-have-adhd` skill (the user's decision, 2026-10-09): read its `SKILL.md` in the user's skills folder (`~/.claude/skills/i-have-adhd/` or `~/.codex/skills/i-have-adhd/`; it cannot be invoked as a tool) and follow its rules for the reader of the notes.
+In short, for when it is not there:
+
+- The first lines are what to do: which package to download for which GPU, and the install commands, as a numbered list.
+- What changed, as what now works or is faster, in concrete terms (numbers where measured), ranked, at most five items a group.
+- No preamble, recap or closing, no tangents; facts only, no plans or alternatives (the stage line excepted).
+
 Each section starts with a line of the stage: 先行報: upstream との速さの比較は後で足す / Preliminary: the speed comparison with upstream follows.
-Facts only, no plans or alternatives (the stage line excepted). Show the notes to the user.
+Show the notes to the user.
 
 ## 6. The AMD engines
 
