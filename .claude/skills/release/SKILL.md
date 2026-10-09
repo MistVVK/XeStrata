@@ -152,6 +152,7 @@ python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream 
 
 `bench.sh` runs a warm-up per engine, then each tier twice per engine with the engines alternating; `bench-collect.py` writes `matrix.json` and the tables (the medians), one pair per GPU.
 A cell that does not fit the GPU's or the machine's memory stays `-` with the reason in the record; an engine that does not start at all stops the run (report it).
+`bench.sh` stops upstream once it is plainly at 10 tok/s or less; such a cell is `too slow`: not measurable, written 計測不能（低速）/ not measurable (too slow) in the notes, with a line saying upstream was stopped at 10 tok/s or less.
 
 The record goes into `$o/` on `dev`: a README (the machines, the two engines' commits and builds, the method, the tables and what the numbers say), `matrix.json`, and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>` (as the speed-matrix record does).
 Lint and commit it on `dev` (it is not in the tag).
