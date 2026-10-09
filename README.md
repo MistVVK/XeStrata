@@ -306,8 +306,9 @@ what has been checked in [docs/XE.md](docs/XE.md).
      modes' compiler, built with XeStrata's fixes (`third_party/main/intel-llvm/patches/`, under the same license);
      the packages carry its SYCL runtime;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
-- **Ideas from:** [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
-  [HyperQwen](https://github.com/syv-ai/HyperQwen).
+- **Ideas from:** [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer),
+  [HyperQwen](https://github.com/syv-ai/HyperQwen) and [Project Maya](https://github.com/mw00/project-maya) (how many of the experts missing from VRAM
+  the CPU computes and how many are read over PCIe).
 - More in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License

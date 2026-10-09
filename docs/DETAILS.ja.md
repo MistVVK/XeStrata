@@ -408,7 +408,8 @@ setup は、選んだときにそう言います。
 エンジンの 4 つの設定は、モデルよりも PC によって変わります。
 
 - VRAM にないエキスパートのうち、CPU で計算せずに GPU にコピーする割合（`--pcie-frac`）。
-  速い PCIe と遅い CPU なら大きく、ノート PC の細いリンクなら小さくします。
+  指定がなければ、エンジンが起動時に、CPU と PCIe でエキスパート 1 個にかかる時間を測って分けます（[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
+  決まった割合は、その分け方より 3% を超えて速いときだけ使います。
 - 推測の層がどれだけ確かなら、確かめる候補をもう 1 つ足すか（`--spec-min-p`）。
 - エキスパートを計算する CPU のスレッドの数（`--pool-workers`）。高効率コアのある CPU では、少ない方が速いことがあります。
   P コアの数より 1 つ少ない数と、2 ソケットの PC では 1 ソケットのコアの数より 1 つ少ない数も試します。
@@ -1219,7 +1220,8 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
 - **[intel/llvm](https://github.com/intel/llvm)** の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラと SYCL のランタイム。
   リポジトリには含めず、`tools/intel_llvm_build.py` がリリースを取ってきてビルドします。
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
-- **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)。
+- **参考にした考え方**: [Splash](https://github.com/incoai/splash)、[ninfer](https://github.com/Neroued/ninfer)、[HyperQwen](https://github.com/syv-ai/HyperQwen)、
+  [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
   文献は論文にあります。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。

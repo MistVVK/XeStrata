@@ -298,6 +298,28 @@ Checked with `STRATA_VRAM_LIMIT_MIB`:
 at 4,608 MiB (IQ2_XS, 32K, MTP) the reserve became 482 MiB, leaving the 368 slots it needs;
 at 4,096 MiB the start stopped 330 MiB short.
 
+## Splitting the missed experts between the CPU and PCIe
+
+In a verify window the experts missing from VRAM are computed by the CPU or read over PCIe and computed by the GPU.
+How many go each way is chosen from times measured at start (after [Project Maya](https://github.com/mw00/project-maya)'s CPU lane; the code is written anew).
+Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below that in proportion).
+
+- **Measured**: the CPU pool's time for an expert (64 taken in turn, past the CPU's cache), the window's copy kernel (`fetch_blobs`) reading one over PCIe,
+  the window's expert kernel computing one from VRAM, and the memory's rate as the CPU reads experts.
+- **Sharing the memory**: the CPU and PCIe read the same memory; when their rates together pass the memory's, both are taken as slowed by that factor.
+  On the B70 that gives 0.13 ms an expert over PCIe (0.066 alone), as the decode's waits work out.
+- **The split**: for each group of a window, the GPU computes its VRAM hits, then (beside them where the window's fetch branch runs) reads and computes the PCIe experts,
+  and the CPU computes the rest; the number read over PCIe makes the later side earliest.
+  Experts go over PCIe only when that is at least 10% earlier than the CPU taking them all.
+- **The arena**: on Level Zero, GPU kernels cannot read the arena registered for device copies.
+  Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `STRATA_ARENA_HOST_USM=1` puts it in host USM from the start.
+- **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
+
+The RTX 4070 (PCIe 4.0 x4) now computes every miss on the CPU: IQ3_XXS 32K 49.9 -> 57-58.6 tok/s, UD-Q4_K_XL 32K 22.0 -> 25.7.
+The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead of 4.7 experts a layer over PCIe; neither changes speed
+([record](../bench/results/2026-10-10-maya-split/README.md)).
+A GPU that gains from reading over PCIe (a fast link beside a slow CPU) was not at hand: `unverified`.
+
 ## Images
 
 The image encoder (`tools/vision`: llama.cpp's mtmd with the model's mmproj) runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).

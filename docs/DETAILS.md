@@ -403,8 +403,9 @@ Setup says so when you choose it.
 
 Four engine settings depend on the PC more than on the model:
 
-- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`):
-  a fast PCIe link and a slower CPU want more, a laptop's narrower link less;
+- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU (`--pcie-frac`).
+  Without it the engine splits them by an expert's time on each side, measured at start
+  ([XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie)); a fixed share is kept only when it is more than 3% faster;
 - how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
 - how many CPU threads compute experts (`--pool-workers`): on CPUs with efficiency cores, fewer can be faster;
   it also tries one fewer than the P-cores, and one fewer than one socket's cores on a 2-socket PC;
@@ -1218,7 +1219,9 @@ The model files are not part of it; their licenses apply to them (below).
 - **[intel/llvm](https://github.com/intel/llvm)**'s DPC++ (Apache-2.0 WITH LLVM-exception): the free and contrib-llvm modes' compiler and SYCL runtime.
   It is not in the repository: `tools/intel_llvm_build.py` fetches the release and builds it,
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
-- **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and [HyperQwen](https://github.com/syv-ai/HyperQwen);
+- **Ideas** from [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer), [HyperQwen](https://github.com/syv-ai/HyperQwen) and
+  [Project Maya](https://github.com/mw00/project-maya) (how many of the experts missing from VRAM the CPU computes and how many are read over PCIe,
+  [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
   references in the paper.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
