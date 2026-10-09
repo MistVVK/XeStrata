@@ -433,6 +433,21 @@ sycl::event launch(sycl::queue& q, const float* qv, QsaAttnPools p, const int32_
 namespace pm {
 constexpr int SG = 32, NSG = NG, WG = NSG * SG, T16 = 16, CH = 16;
 }
+using u32x2 = uint32_t __attribute__((ext_vector_type(2)));   // one 8- or 16-byte access (sycl::vec is split on NVPTX)
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+// 8 int8 codes (two words) as 8 FP16 halves (four words of two), two at a time: code + 128 in the low mantissa bits
+// of 1024 (0x6400) is exactly 1152 + code, and 1152 comes off in one two-half subtraction.  [[maybe_unused]]: only
+// the device code calls it.
+[[maybe_unused]] inline u32x4 i8x8_to_h8(u32x2 w) {
+    u32x4 r = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t x = w[k / 2] >> (16 * (k % 2));
+        const uint32_t b = (((x & 0xFFu) | ((x & 0xFF00u) << 8)) ^ 0x00800080u) | 0x64006400u;
+        const sycl::vec<half, 2> h = sycl::bit_cast<sycl::vec<half, 2>>(b) - sycl::vec<half, 2>(half(1152.0f));
+        r[k] = sycl::bit_cast<uint32_t>(h);
+    }
+    return r;
+}
 template<int KF, int VF>   // K's KvFmt (kF16, kI8), V's (kF16, kI8, kQ4)
 struct PromptAttnMma {
     static_assert(KF != kQ4, "Q4_0 K takes the FP32 kernel");
@@ -519,25 +534,27 @@ struct PromptAttnMma {
                 rows[t] = r;
             }
             sycl::group_barrier(grp);   // rows ready; the previous chunk (and q's staging) is done with kvq, part, pp
-            // K and V as FP16: int8 codes are exact in FP16
+            // K and V as FP16: int8 codes are exact in FP16.  8 codes or halves a work-item in one access each way:
+            // through sycl::vec the NVPTX compile split the int8 loads into a byte each (LDG.E.S8; Nsight Compute,
+            // RTX 4070: 87% of the kernel's global sectors excessive)
             for (int i = t; i < CH * (HD / 8); i += pm::WG) {
                 const int c = i / (HD / 8), pc = i % (HD / 8);
                 const long long r = rows[c];
-                sycl::vec<half, 8> kx(half(0.0f)), vx(half(0.0f));
+                u32x4 kx = {0, 0, 0, 0}, vx = {0, 0, 0, 0};
                 if (r >= 0) {
                     const int64_t off = r * HD + (int64_t) pc * 8;
                     if constexpr (KF == kI8)
-                        kx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.k_q + off)->template convert<half>();
+                        kx = i8x8_to_h8(*reinterpret_cast<const u32x2*>(p.k_q + off));
                     else
-                        kx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.k_pool + off);
+                        kx = *reinterpret_cast<const u32x4*>(p.k_pool + off);
                     if constexpr (VF == kI8)
-                        vx = reinterpret_cast<const sycl::vec<int8_t, 8>*>(p.v_q + off)->template convert<half>();
+                        vx = i8x8_to_h8(*reinterpret_cast<const u32x2*>(p.v_q + off));
                     else if constexpr (VF == kF16)
-                        vx = *reinterpret_cast<const sycl::vec<half, 8>*>(p.v_pool + off);
+                        vx = *reinterpret_cast<const u32x4*>(p.v_pool + off);
                 }
-                *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[KH + (size_t) c * KR + (size_t) pc * 8]) = kx;
+                *reinterpret_cast<u32x4*>(&kvq[KH + (size_t) c * KR + (size_t) pc * 8]) = kx;
                 if constexpr (VF != kQ4)
-                    *reinterpret_cast<sycl::vec<half, 8>*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
+                    *reinterpret_cast<u32x4*>(&kvq[VH + (size_t) c * KR + (size_t) pc * 8]) = vx;
             }
             // Q4_0 V: one work-item a block, its codes and its scale
             if constexpr (VF == kQ4) {
