@@ -4,6 +4,12 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.0.22 - 2026-10-09
+
+- **AMD builds again (#52 by @boxwrench):** v1.0.21 did not compile with HIP: #44's split search and CPU pinning use
+  three device queries (`cudaDeviceGetPCIBusId`, the memory clock and the memory bus width) that had no HIP mapping.
+  NVIDIA builds are unchanged. Built for gfx1100, gfx1201 and gfx1151 (ROCm 7.2.1) and run end to end on a Strix Halo.
+
 ## v1.0.21 - 2026-10-09
 
 Eight community pull requests, with every default fitted to the machine it runs on:
