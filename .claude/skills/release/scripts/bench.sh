@@ -17,7 +17,7 @@
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
 # when the PP progress line says so after 30 s, its output when 256 tokens at SLOW tok/s and a minute have passed
-# since the prompt was read.  The log ends with "bench: stopped, upstream's prompt|output ...".
+# since the prompt was read.  The log ends with "bench: stopped, upstream's prompt|output ...".  SLOW=0: never.
 set -u
 [ $# -eq 2 ] || { echo "usage: $0 OUT GPU" >&2; exit 2; }
 out=$1; gpu=$2
@@ -71,7 +71,7 @@ run() {
     --expert-profile "$prof" --expert-cache auto --prefill auto --spec 4 --spec-min-p 0.5 --mtp "$DATA/mtp/rt" \
     "${C[@]}" --tokens-file "$IDS/$2.ids" --max-new 256 > "$3" 2>&1 &
   local pid=$! rc w=
-  if [ "$1" = up ]; then watch_slow "$pid" "$3" & w=$!; fi
+  if [ "$1" = up ] && [ "$slow" -gt 0 ]; then watch_slow "$pid" "$3" & w=$!; fi
   wait "$pid"; rc=$?
   [ -z "$w" ] || wait "$w"
   if [ -f "$3.stop" ]; then cat "$3.stop" >> "$3"; rm -f "$3.stop"; fi
