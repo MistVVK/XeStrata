@@ -1530,6 +1530,106 @@ constexpr int64_t kMaxWindowEntries = 128;
 static_assert((int64_t) strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
+namespace {
+// The CPU side's calibration calls: up to 8 experts a call, taken in turn from 64 of one layer that are in RAM
+// (pinned: blob() reads no file) and not in VRAM, one token each, in the layer's native format.  64 experts are past
+// any CPU cache (8 were not: their calls ran 3x faster than a decode's), so the calls read memory as a decode does.
+// `layer` < 0 picks the first such layer.
+struct CpuCalJobs {
+    static constexpr int kCall = 8, kRing = 64;
+    strata::kernels::cpu::NativeFmt f{};
+    std::vector<float> x, out;
+    std::vector<uint8_t> act;
+    const uint8_t* ring[kRing] = {};
+    int cursor = 0;
+    strata::kernels::cpu::ExpertJobMulti jobs[kCall];
+    void next(int k) {   // the next k experts of the ring into jobs[0, k)
+        for (int j = 0; j < k; ++j) {
+            jobs[j].blob = ring[cursor];
+            cursor = (cursor + 1) % kRing;
+        }
+    }
+};
+bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJobs& cj, std::string& why) {
+    using namespace strata::kernels::cpu;
+    const ExpertLayout& lay = expert_layout();
+    if (!lay.native) { why = "not a native pack"; return false; }
+    if (d.pool == nullptr || d.src == nullptr || d.host_res == nullptr) { why = "no CPU pool or residency table"; return false; }
+    const int64_t l0 = layer >= 0 ? layer : 0, l1 = layer >= 0 ? layer + 1 : n_layers;
+    layer = -1;
+    for (int64_t l = l0; l < l1 && layer < 0; ++l) {
+        int n = 0;
+        for (int64_t e = 0; e < d.n_expert && n < CpuCalJobs::kRing; ++e)
+            if (d.host_res[(size_t) l * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(l, e)) {
+                const uint8_t* b = d.src->blob(l, e);
+                if (b != nullptr) cj.ring[n++] = b;
+            }
+        if (n == CpuCalJobs::kRing) layer = l;
+    }
+    if (layer < 0) { why = "no layer has 64 experts in RAM outside VRAM"; return false; }
+    cj.f = lay.fmt[(size_t) layer];
+    const int64_t H = cj.f.n_embd;
+    cj.x.assign((size_t) H, 0.0f);
+    cj.out.assign((size_t) CpuCalJobs::kCall * (size_t) H, 0.0f);
+    for (int64_t i = 0; i < H; ++i) cj.x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
+    cj.act.assign(kNativeActBytes, 0);
+    native_quant_act(cj.f, cj.x.data(), cj.act.data());
+    for (int j = 0; j < CpuCalJobs::kCall; ++j) {
+        cj.jobs[j] = ExpertJobMulti{};
+        cj.jobs[j].nt = 1;
+        cj.jobs[j].nact[0] = cj.act.data();
+        cj.jobs[j].out[0] = cj.out.data() + (size_t) j * (size_t) H;
+    }
+    return true;
+}
+}  // namespace
+
+bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why) {
+    CpuCalJobs cj;
+    if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
+    constexpr int kCall = CpuCalJobs::kCall;
+    // the clocks up first (an idle CPU takes tens of ms to raise them; a decode keeps them up), then 1 and 8 experts
+    // a call in turns, 32 calls each, the mean
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(100);) {
+        cj.next(kCall);
+        d.pool->run_split_multi_native(cj.f, cj.jobs, kCall);
+    }
+    double ms[2] = {};
+    for (int rep = 0; rep < 32; ++rep)
+        for (int w = 0; w < 2; ++w) {
+            const int k = w == 0 ? 1 : kCall;
+            cj.next(k);
+            const auto t0 = now();
+            d.pool->run_split_multi_native(cj.f, cj.jobs, k);
+            ms[w] += std::chrono::duration<double, std::milli>(now() - t0).count() / 32.0;
+        }
+    c = (ms[1] - ms[0]) / (kCall - 1);
+    c0 = std::max(0.0, ms[0] - c);
+    if (!(c > 0.0)) { why = "the CPU times did not grow with the experts"; return false; }
+    return true;
+}
+
+int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
+    if (f <= 0) return 0;
+    const double hits = h > 0 ? t.q0 + t.q * h : 0.0;
+    auto cost = [&](int m) {
+        const int k = f - m;
+        const bool both = m > 0 && k > 0;
+        const double fetch = m > 0 ? (both ? t.pb0 + t.pb * m : t.p0 + t.p * m) : 0.0;
+        const double after = m > 0 ? (h > 0 ? t.q * m : t.q0 + t.q * m) : 0.0;   // the fetched experts' compute
+        const double gpu = (overlap ? std::max(hits, fetch) : hits + fetch) + after;
+        const double cpu = k > 0 ? (both ? t.cb0 + t.cb * k : t.c0 + t.c * k) : 0.0;
+        return std::max(gpu, cpu);
+    };
+    const double all_cpu = cost(0);
+    double best = all_cpu;
+    int pick = 0;
+    for (int m = 1; m <= f; ++m)
+        if (const double c = cost(m); c < best) { best = c; pick = m; }
+    return best <= 0.9 * all_cpu ? pick : 0;
+}
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out) {
     using namespace strata::kernels::cpu;
@@ -1592,7 +1692,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->device_alias(d.layers, 0) != nullptr;
-        const int m = pcie_ok ? (nmiss * d.pcie_num) >> 8 : 0;
+        // from the times measured at start (pcie_split_m); else the share pcie_num/256
+        const int m = !pcie_ok ? 0
+                      : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
+                                                : (nmiss * d.pcie_num) >> 8;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
         const uint8_t* dma_src[64];

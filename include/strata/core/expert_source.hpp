@@ -209,6 +209,8 @@ struct GpuPlanSink {
     int pcie_mode = 0;
 };
 
+struct PcieSplitTimes;
+
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
@@ -328,6 +330,11 @@ struct ExpertDispatch {
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.
     GpuPlanSink* plan = nullptr;
     int pcie_num = 0;
+    /// The measured split (after Project Maya's CPU lane): the times taken at start, from which `pcie_split_m` gives
+    /// the number of a group's missed experts read over PCIe; `pcie_overlap`: the GPU reads them beside its VRAM hits
+    /// (the verify window's fetch branch).  Null: the share `pcie_num`/256.
+    const PcieSplitTimes* pcie_split = nullptr;
+    bool pcie_overlap = false;
     int64_t pcie_experts = 0;      ///< distinct experts the GPU read over PCIe in verify windows
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
@@ -359,6 +366,27 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
+/// An expert's time on each side of the split of the missed experts, measured once at start (after Project Maya's CPU
+/// lane, https://github.com/mw00/project-maya), in ms: the CPU pool's `c0 + c x k` for `k` experts of a layer (one token
+/// each, the decode's common case), the GPU's PCIe fetch `p0 + p x m` for `m` of them, and the GPU computing `n`
+/// experts from its memory `q0 + q x n` (the VRAM hits, and the fetched ones after them); `cb0`, `cb`, `pb0`, `pb` the
+/// CPU and the fetch measured while the other runs (the CPU and the link read the same memory).
+struct PcieSplitTimes {
+    double c0 = 0.0, c = 0.0, p0 = 0.0, p = 0.0, q0 = 0.0, q = 0.0;
+    double cb0 = 0.0, cb = 0.0, pb0 = 0.0, pb = 0.0;
+    int64_t layer = -1;   ///< the layer every side was measured on (its experts' size and format)
+};
+/// The CPU side: `d`'s pool on 1 and 8 experts of one layer that are in RAM and not in VRAM (`d.host_res`), the layer's
+/// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
+/// experts or the pack is not native.
+bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
+/// Of `f` missed experts of a group with `h` VRAM hits: the number read over PCIe.  The GPU computes its hits, then
+/// (`overlap`: beside them) fetches the `m` and computes them; the CPU computes the other `f - m`; both at their times
+/// beside each other when both work.  The `m` that makes the later side earliest, taken only when that is at least 10%
+/// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
+/// lost on the B70 with the VRAM of a small card); else 0.
+int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
 

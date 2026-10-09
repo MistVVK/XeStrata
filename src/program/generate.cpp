@@ -82,6 +82,8 @@
 #include <functional>
 #include <future>
 #include <thread>
+#include <pthread.h>
+#include <sched.h>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -1239,6 +1241,261 @@ double pcie_frac_for_gbps(double gbps, double base) {
     return gbps <= 0.0 ? base : base * std::min(1.0, gbps / 20.0);
 }
 
+// The PCIe side of the split of the missed experts (after Project Maya's CPU lane, https://github.com/mw00/project-maya),
+// timed as the verify window reads it: fetch_blobs (the copy kernel) on 1 and 2 experts a launch, taken in turn from 32
+// of the layer the CPU side was measured on (75 MB: past the GPU's cache, as a decode's misses are), 8 launches in a
+// row (no host call between them, as in the window's graph), the best of 3 rounds after a warm-up.  Where the arena is
+// registered for copies only, the 32 experts are copied into host USM for the timing (the arena moves there only if
+// the split sends experts over PCIe).
+struct PcieFetchProbe {
+    static constexpr int kRing = 32;
+    uint8_t* buf = nullptr;
+    uint8_t* host = nullptr;
+    unsigned long long* d_src = nullptr;
+    int32_t* d_n = nullptr;
+    uint8_t* d_dst = nullptr;
+    int64_t bytes = 0;
+    int turn = 0;
+    strata::gpu::Stream s = nullptr;
+    bool open(const strata::core::ExpertDispatch& d, int64_t layer, std::string& why) {
+        bytes = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+        unsigned long long src[kRing] = {};
+        int n = 0, aliased = 0;
+        for (int64_t e = 0; e < d.n_expert && n < kRing; ++e) {
+            if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0 || !d.src->pinned(layer, e)) continue;
+            const uint8_t* a = d.src->device_alias(layer, e);
+            if (a == nullptr) {
+                const uint8_t* b = d.src->blob(layer, e);
+                if (b == nullptr) continue;
+                if (host == nullptr && !strata::gpu::alloc_host(&host, (size_t) (kRing * bytes))) {
+                    why = "no host USM for the timing";
+                    return false;
+                }
+                std::memcpy(host + (size_t) n * (size_t) bytes, b, (size_t) bytes);
+                a = host + (size_t) n * (size_t) bytes;
+            } else {
+                ++aliased;
+            }
+            src[n++] = (unsigned long long) a;
+        }
+        if (n < kRing || (aliased > 0 && aliased < n)) { why = "no layer part with 32 experts to time over PCIe"; return false; }
+        if (!strata::gpu::alloc_device(&buf, (size_t) (16 + 8 * kRing + 2 * bytes + 256))) { why = "no device memory for the timing"; return false; }
+        d_n = reinterpret_cast<int32_t*>(buf);
+        d_src = reinterpret_cast<unsigned long long*>(buf + 16);
+        d_dst = buf + (size_t) ((16 + 8 * kRing + 255) / 256) * 256;
+        s = strata::gpu::stream_create();
+        if (s == nullptr || !strata::gpu::copy(d_src, src, sizeof src)) { why = std::string("the timing failed: ") + strata::gpu::last_error(); return false; }
+        return true;
+    }
+    bool launch(int count, int times) {
+        if (!strata::gpu::copy(d_n, &count, sizeof count)) return false;
+        for (int i = 0; i < times; ++i, ++turn)
+            strata::kernels::fetch_blobs(d_src + (size_t) ((2 * turn) % kRing), d_n, d_dst, bytes, 2, s);
+        return strata::gpu::stream_sync(s);
+    }
+    // `mean`: the mean of 6 rounds instead of the best of 3 - beside a load that comes and goes the best round is one
+    // the load left alone
+    bool time(double& p0, double& p, std::string& why, bool mean = false) {
+        double ms[2] = {};
+        const int rounds = mean ? 6 : 3;
+        for (int w = 0; w < 2; ++w) {
+            if (!launch(w + 1, 4)) { why = std::string("the timing failed: ") + strata::gpu::last_error(); return false; }
+            for (int round = 0; round < rounds; ++round) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!launch(w + 1, 8)) { why = std::string("the timing failed: ") + strata::gpu::last_error(); return false; }
+                const double one = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 8.0;
+                if (mean) ms[w] += one / rounds;
+                else if (round == 0 || one < ms[w]) ms[w] = one;
+            }
+        }
+        p = ms[1] - ms[0];
+        p0 = std::max(0.0, ms[0] - p);
+        if (!(p > 0.0)) { why = "the PCIe times did not grow with the experts"; return false; }
+        return true;
+    }
+    ~PcieFetchProbe() {
+        if (s != nullptr) strata::gpu::stream_destroy(s);
+        if (buf != nullptr) strata::gpu::free(buf);
+        if (host != nullptr) strata::gpu::free(host);
+    }
+};
+
+// The GPU computing experts from its own memory, timed with the window's kernel (native_expert_grouped): 1 and 8
+// groups of one token, taken in turn from 16 experts of the layer copied into device memory, 8 launches in a row, the
+// best of 3 rounds after a warm-up.
+bool measure_gpu_expert_ms(const strata::core::ExpertDispatch& d, int64_t layer, double& q0, double& q, std::string& why) {
+    namespace sk = strata::kernels;
+    const auto& f = sk::cpu::expert_layout().fmt[(size_t) layer];
+    const sk::NativeExpertLayout L = sk::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+    constexpr int kRing = 16, kCap = 8;
+    const int64_t bytes = (int64_t) sk::cpu::expert_layout().blob_bytes(layer);
+    const size_t scratch = sk::native_expert_scratch_bytes(kCap, f.n_ff);
+    const size_t xq = (size_t) (f.n_embd / 32) * 36, out = (size_t) kCap * (size_t) f.n_embd * 4;
+    const size_t off_ptr = 0, off_i32 = 256, off_x = 1024, off_out = off_x + ((xq + 255) / 256) * 256;
+    const size_t off_scr = off_out + ((out + 255) / 256) * 256, off_blob = off_scr + ((scratch + 255) / 256) * 256;
+    uint8_t* buf = nullptr;
+    if (!strata::gpu::alloc_device(&buf, off_blob + (size_t) kRing * (size_t) bytes)) { why = "no device memory for the GPU timing"; return false; }
+    bool ok = strata::gpu::memset_async(buf, 0, off_blob, nullptr) && strata::gpu::stream_sync(nullptr);
+    unsigned long long ptr[2 * kRing] = {};
+    int n = 0;
+    for (int64_t e = 0; ok && e < d.n_expert && n < kRing; ++e) {
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] >= 0 || !d.src->pinned(layer, e)) continue;
+        const uint8_t* b = d.src->blob(layer, e);
+        if (b == nullptr) continue;
+        uint8_t* dst = buf + off_blob + (size_t) n * (size_t) bytes;
+        ok = strata::gpu::copy(dst, b, (size_t) bytes);
+        ptr[n] = ptr[n + kRing] = (unsigned long long) dst;   // twice: a launch's 8 groups read on from any start
+        ++n;
+    }
+    if (ok && n < kRing) { strata::gpu::free(buf); why = "too few experts in RAM to time the GPU"; return false; }
+    // groups g of one entry each: start[g] = g, dst = g, tok = 0
+    int32_t i32[1 + (kCap + 1) + 2 * kCap] = {};
+    int32_t* cnt = i32;
+    int32_t* start = i32 + 1;
+    int32_t* dst = start + kCap + 1;   // then kCap entries' tokens, all 0 (one token)
+    for (int g = 0; g <= kCap; ++g) start[g] = g;
+    for (int g = 0; g < kCap; ++g) dst[g] = g;
+    ok = ok && strata::gpu::copy(buf + off_ptr, ptr, sizeof ptr);
+    strata::gpu::Stream s = ok ? strata::gpu::stream_create() : nullptr;
+    ok = ok && s != nullptr;
+    auto* d_ptr = reinterpret_cast<unsigned long long*>(buf + off_ptr);
+    auto* d_i32 = reinterpret_cast<int32_t*>(buf + off_i32);
+    double ms[2] = {};
+    int turn = 0;
+    try {
+        for (int w = 0; ok && w < 2; ++w) {
+            cnt[0] = w == 0 ? 1 : kCap;
+            ok = strata::gpu::copy(d_i32, i32, sizeof i32);
+            auto run = [&](int times) {
+                for (int i = 0; i < times; ++i, turn = (turn + kCap) % kRing)
+                    sk::native_expert_grouped(L, d_ptr + turn, d_i32 + 1, d_i32, d_i32 + 1 + kCap + 1, d_i32 + 1 + kCap + 1 + kCap,
+                                              kCap, kCap, buf + off_x, buf + off_scr, reinterpret_cast<float*>(buf + off_out), s);
+                return strata::gpu::stream_sync(s);
+            };
+            ok = ok && run(4);
+            for (int round = 0; ok && round < 3; ++round) {
+                const auto t0 = std::chrono::steady_clock::now();
+                ok = run(8);
+                const double one = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 8.0;
+                if (round == 0 || one < ms[w]) ms[w] = one;
+            }
+        }
+    } catch (const std::exception& e) {
+        why = std::string("the GPU timing failed: ") + e.what();
+        ok = false;
+    }
+    if (s != nullptr) strata::gpu::stream_destroy(s);
+    strata::gpu::free(buf);
+    if (!ok) { if (why.empty()) why = std::string("the GPU timing failed: ") + strata::gpu::last_error(); return false; }
+    q = (ms[1] - ms[0]) / (kCap - 1);
+    q0 = std::max(0.0, ms[0] - q);
+    if (!(q > 0.0)) { why = "the GPU times did not grow with the experts"; return false; }
+    return true;
+}
+
+// The rate (bytes a ms) at which the CPU reads `blobs` (`bytes` each, past any CPU cache together) on `threads` of
+// the pool's cores, one word a cache line, for 200 ms after 50 ms to get going; the host core is left to its thread,
+// as in a decode (a thread inherits its creator's affinity, the host core alone).
+double memory_read_rate(const std::vector<const uint8_t*>& blobs, size_t bytes, int threads) {
+    const std::vector<int> cores = strata::kernels::cpu::physical_cores(/*skip_first=*/true);
+    threads = std::max(1, std::min<int>(threads, cores.empty() ? 1 : (int) cores.size()));
+    std::atomic<int> phase{0};   // 0 warming, 1 counting, 2 done
+    std::atomic<uint64_t> read{0}, sink{0};
+    std::vector<std::thread> pool;
+    pool.reserve((size_t) threads);
+    for (int w = 0; w < threads; ++w)
+        pool.emplace_back([&, w] {
+            if (!cores.empty()) {
+                cpu_set_t one;
+                CPU_ZERO(&one);
+                CPU_SET(cores[(size_t) w % cores.size()], &one);
+                pthread_setaffinity_np(pthread_self(), sizeof one, &one);
+            }
+            uint64_t x = 0, counted = 0;
+            for (size_t i = (size_t) w; phase.load(std::memory_order_relaxed) < 2; i += (size_t) threads) {
+                const bool counting = phase.load(std::memory_order_relaxed) == 1;
+                const auto* q = reinterpret_cast<const uint64_t*>(blobs[i % blobs.size()]);
+                for (size_t j = 0; j < bytes / 8; j += 8) x += q[j];
+                if (counting) counted += bytes;
+            }
+            read += counted;
+            sink += x;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    phase = 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    phase = 2;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    for (auto& th : pool) th.join();
+    return ms > 0.0 ? (double) read.load() / ms : 0.0;
+}
+
+bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strata::core::PcieSplitTimes& t, std::string& why) {
+    int64_t layer = -1;
+    if (!strata::core::measure_cpu_expert_ms(d, n_layers, t.c0, t.c, layer, why)) return false;
+    t.layer = layer;
+    if (!measure_gpu_expert_ms(d, layer, t.q0, t.q, why)) return false;
+    PcieFetchProbe probe;
+    if (!probe.open(d, layer, why) || !probe.time(t.p0, t.p, why)) return false;
+    // Both sides at once read the same memory.  Measured beside each other the times did not hold still (the B70's
+    // fetch read as fast as alone in some starts and 8x slower in others, where the decode's took twice as long), so
+    // the slowdown is the arithmetic of the memory's rate instead: the CPU reading the layer's experts on the pool's
+    // cores, alone, gives the rate the memory serves (the decode's CPU experts come close to it); when the CPU's and
+    // the link's rates together pass it, both slow down by the same factor.
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const double bytes = (double) lay.blob_bytes(layer);
+    std::vector<const uint8_t*> blobs;
+    for (int64_t e = 0; e < d.n_expert && blobs.size() < 64; ++e)
+        if (d.host_res[(size_t) layer * (size_t) d.n_expert + (size_t) e] < 0 && d.src->pinned(layer, e))
+            if (const uint8_t* b = d.src->blob(layer, e)) blobs.push_back(b);
+    const double mem = blobs.empty() ? 0.0 : memory_read_rate(blobs, (size_t) bytes, d.pool != nullptr ? d.pool->workers() : 1);
+    const double cpu_rate = bytes / t.c, link_rate = bytes / t.p;   // bytes a ms
+    const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
+    t.cb0 = t.c0; t.cb = t.c * factor;
+    t.pb0 = t.p0; t.pb = t.p * factor;
+    return true;
+}
+
+void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const Options& o, bool pcie_given,
+                      bool layer_split, bool overlap, strata::core::PcieSplitTimes& t) {
+    const char* keep = pcie_given ? "--pcie-frac is given"
+                       : layer_split ? "a layer split (each GPU's link)"
+                       : (o.pcie_mode == "dma" || o.pcie_mode == "direct") ? "--pcie-mode is not the copy kernel"
+                                                                            : nullptr;
+    std::string why;
+    if (keep == nullptr && !measure_pcie_split(d, n_layers, t, why)) keep = why.c_str();
+    if (keep != nullptr) {
+        std::fprintf(stderr, "strata generate: PCIe split: the share %.2f of the missed experts (%s)\n", o.pcie_frac, keep);
+        return;
+    }
+    d.pcie_split = &t;
+    d.pcie_overlap = overlap;
+    // a row of the split: of f = 1..16 missed experts with as many VRAM hits, the number read over PCIe
+    std::string row;
+    bool any_pcie = false;
+    for (int f = 1; f <= 16; ++f) {
+        const int m = strata::core::pcie_split_m(t, overlap, f, f);
+        any_pcie = any_pcie || m > 0;
+        row += " " + std::to_string(m);
+    }
+    // the arena moves into host USM only when the split reads experts over PCIe and the GPU cannot read it as it is
+    // (a registration for copies only, Level Zero's): the move takes seconds and gains nothing where nothing is read
+    if (any_pcie && d.src->device_alias(t.layer, 0) == nullptr) {
+        std::string err;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (d.src->make_kernel_readable(err))
+            std::fprintf(stderr, "strata generate: the expert arena moved into host USM for the PCIe share (%.1f s)\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        else
+            std::fprintf(stderr, "strata generate: the expert arena stays registered for copies (%s): the CPU takes every "
+                                 "missed expert\n", err.c_str());
+    }
+    std::fprintf(stderr, "strata generate: PCIe split, measured: an expert %.3f ms on the CPU (%.3f beside the link), "
+                         "%.3f ms over PCIe (%.3f beside the CPU), %.3f ms on the GPU, layer %lld -> of 1..16 missed "
+                         "experts (as many hits) PCIe takes%s%s\n",
+                 t.c, t.cb, t.p, t.pb, t.q, (long long) t.layer, row.c_str(), overlap ? " (beside the hits)" : "");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -5551,6 +5808,9 @@ int main(int argc, char** argv) {
         }
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = std::max(0, std::min(256, (int) (o.pcie_frac * 256.0 + 0.5)));
+        strata::core::PcieSplitTimes pcie_split;   // the measured split, kept for the requests that set no share
+        setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
+        const strata::core::PcieSplitTimes* const pcie_split_ptr = drive.d.pcie_split;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
         // empty and nothing below runs).  It needs the adaptive tier's counts and the residency table.
@@ -7036,6 +7296,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            bool req_pcie_set = false;   // the request set pcie_frac: its share, not the measured split
             // logprobs=K (0..20; upstream's Intel port 4ba35fd): after each "T id" an "LP logprob id:logprob ..." line
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
             // (before sampling, penalties and temperature).  -1 (absent): no LP lines
@@ -7065,7 +7326,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
@@ -7867,6 +8128,7 @@ int main(int argc, char** argv) {
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);
             drive.d.pcie_num = std::max(0, std::min(256, (int) (req_pcie_frac * 256.0 + 0.5)));
+            drive.d.pcie_split = req_pcie_set ? nullptr : pcie_split_ptr;
             // a layer split: CUDA0's share as asked; a later GPU keeps its own (its link) unless the request sets one
             for (int st = 0; st < split_drive.n; ++st)
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
@@ -9487,6 +9749,8 @@ int main(int argc, char** argv) {
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
+        strata::core::PcieSplitTimes pcie_split;   // the measured split
+        setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
