@@ -85,7 +85,7 @@ Facts only, no plans or alternatives (the stage line excepted). Show the notes t
 ## 6. The AMD engines
 
 The AMD GPU is in another machine, so its part of the speed table (step 11) is prepared now and can run while the packages build.
-Prepare the two engines in the AMD development container (where it is and how to run in it: the memory `amd-container`):
+Prepare the two engines in the AMD development container (where it is and how to run in it: `.claude/skills/release/local.md`, kept out of git; when it is missing, ask the user for those settings and write them there):
 
 - XeStrata: bring the tag into the container's clone (it has no access to origin: a `git bundle` of `xe<VERSION>` copied in) and build the contrib-llvm mode with HIP for its GPU (`STRATA_HIP_ARCHS`, docs/BUILD.md) in a folder of the tag's own.
 - upstream: its newest release tag (`git fetch upstream --tags; git tag -l 'v*' --sort=-v:refname | head -n 1`), built with HIP as its own documents say.
@@ -157,7 +157,7 @@ No other work on a machine while it measures (no build, no other engine).
 
 ```sh
 o=bench/results/<date>-release-xe<VERSION>
-XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> .claude/skills/release/scripts/bench.sh $o B70
+XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> .claude/skills/release/scripts/bench.sh $o B70   # <data>: local.md
 python .claude/skills/release/scripts/bench-collect.py $o xe<VERSION> <upstream tag>
 ```
 
