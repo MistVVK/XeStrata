@@ -4,9 +4,9 @@
 // src/kernels/xe/iq_mmq.cpp - see include/strata/kernels/iq_mmq.hpp.
 //
 // The weights' values and scales follow llama.cpp's dequantizers (ggml/src/ggml-quants.c, dequantize_row_*; MIT
-// license, third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp): a block of 32 values (16 for IQ2_XS and IQ2_S) is
-// its grid or table bytes, signed, times d and the block's scale.  The activations are rounded as its q8_1 (amax / 127
-// a block of 32).
+// license, third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp): a block of 32 values (16 for IQ2_XS, IQ2_S and
+// IQ1_M) is its grid or table bytes, signed, times d and the block's scale (IQ1_M's values times 8, its scales over 8).
+// The activations are rounded as its q8_1 (amax / 127 a block of 32).
 //
 // A work-group takes a tile of one expert's rows (16, 32 or 64, by the group's largest) and 128 of its outputs, K 128
 // values a step: the step's activation rows copied to local memory, the weight rows decoded there (a work-item a block
@@ -227,8 +227,33 @@ template<> struct Dec<42> {   // Q2_0: d (code - 1), 64 values a block
     }
 };
 
+template<> struct Dec<29> {   // IQ1_M: d (2 ls + 1) (grid +- 1/8), a scale per 16
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_iq1_m);
+    static Sub get(const uint8_t* row, int sb) {
+        const block_iq1_m* b = reinterpret_cast<const block_iq1_m*>(row) + sb / 8;
+        const int ib = sb % 8;
+        Sub r;
+        for (int k = 0; k < 8; k += 2) {
+            const int l = k / 2;
+            const int qh = b->qh[2 * ib + l / 2] >> (4 * (l % 2));
+            const uint32_t g = iq1s_grid_gpu[b->qs[4 * ib + l] | ((qh & 0x07) << 8)];
+            // the grid's nibbles (0 .. 2, the value + 1) as 8 (value +- 1/8): 8 nibble + 9 or 7, then 16 off each
+            // byte without a borrow crossing bytes (as q2_0_bytes)
+            const uint32_t c = qh & 0x08 ? 0x07070707u : 0x09090909u;
+            r.v[k] = (((((g & 0x0F0F0F0Fu) << 3) + c) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
+            r.v[k + 1] = ((((((g >> 4) & 0x0F0F0F0Fu) << 3) + c) | 0x80808080u) - 0x10101010u) ^ 0x80808080u;
+        }
+        const uint16_t* sc = reinterpret_cast<const uint16_t*>(b->scales);
+        const float d = iq1m_scale(sc) * 0.125f;
+        const int ls = sc[ib / 2] >> (6 * (ib % 2));
+        r.s0 = d * (float) (2 * (ls & 0x07) + 1);
+        r.s1 = d * (float) (2 * ((ls >> 3) & 0x07) + 1);
+        return r;
+    }
+};
+
 template<int TY>
-constexpr bool half_scales() { return TY == 17 || TY == 22; }
+constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29; }
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -597,7 +622,7 @@ bool iq_mmq_usable(sycl::queue& q) {
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 42: return true;
+        case 16: case 17: case 18: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
 }
@@ -611,6 +636,7 @@ size_t iq_mmq_row_bytes(int t, int64_t cols) {
         case 21: return (size_t) (cols / Dec<21>::QK) * Dec<21>::BSZ;
         case 22: return (size_t) (cols / Dec<22>::QK) * Dec<22>::BSZ;
         case 23: return (size_t) (cols / Dec<23>::QK) * Dec<23>::BSZ;
+        case 29: return (size_t) (cols / Dec<29>::QK) * Dec<29>::BSZ;
         case 42: return (size_t) (cols / Dec<42>::QK) * Dec<42>::BSZ;
         default: return 0;
     }
@@ -655,6 +681,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         STRATA_MMQ_CASE(21);
         STRATA_MMQ_CASE(22);
         STRATA_MMQ_CASE(23);
+        STRATA_MMQ_CASE(29);
         STRATA_MMQ_CASE(42);
         default: return {};
     }

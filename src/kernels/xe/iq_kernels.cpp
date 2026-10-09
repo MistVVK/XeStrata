@@ -250,11 +250,6 @@ template<> struct Split<22> {   // IQ2_S
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) { return apply_ls2(r, bq8_1, iqs); }
 };
 
-inline float iq1m_scale(const uint16_t* sc) {
-    const uint16_t u16 = (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
-    return (float) sycl::bit_cast<sycl::half>(u16);
-}
-
 template<> struct Split<29> {   // IQ1_M
     struct W { int g[8]; float delta[4]; int sc0, sc1; float d; };
     static W load(const void* vbq, int kbx, int iqs) {

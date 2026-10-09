@@ -17,7 +17,7 @@ namespace strata::kernels {
 /// accumulators) at its sub-group size, and its accumulators of int32 and of FP32 hold their elements in the same
 /// places (checked on the device once).  STRATA_NO_XMX=1 says no.
 bool iq_mmq_usable(sycl::queue& q);
-/// The ggml types whose weights these products decode (the i-quants but IQ1_M, and Q2_0).
+/// The ggml types whose weights these products decode (the i-quants but IQ1_S, and Q2_0).
 bool iq_mmq_type_ok(int ggml_type);
 /// Bytes of a weight row of `cols` values in ggml_type (iq_mmq_type_ok).
 size_t iq_mmq_row_bytes(int ggml_type, int64_t cols);

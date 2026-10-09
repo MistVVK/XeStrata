@@ -549,8 +549,8 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
     return a.used;
 }
 // Step 2b: which layers' experts go through MMQ (a native pack's layer whose two weight types it covers; a Strata
-// pack's experts keep the FP16 path), whether any layer keeps the FP16 path (IQ1_M), and the largest gate/up and down
-// matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
+// pack's experts keep the FP16 path), whether any layer keeps the FP16 path (a type MMQ lacks), and the largest
+// gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch
 // Below STREAM_ALL_MIN the MMQ layers' experts are multiplied where their blobs land: a ring of two groups' slots in
 // one allocation (a group's slots MMQ_SLOT apart), the streamed ones copied there from the host and the resident ones

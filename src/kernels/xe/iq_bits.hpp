@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/iq_bits.hpp - the i-quant decoders' word handling, shared by the dot products (iq_kernels.cpp) and
 // the int8 matrix products (iq_mmq.cpp): unaligned words of a block, the grids' value pairs, the sign bytes, IQ4's
-// 16-entry tables and Q2_0's codes.  Transcribed from llama.cpp (ggml/src/ggml-cuda/vecdotq.cuh; MIT license,
-// third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp) through Strata's CUDA version.
+// 16-entry tables, Q2_0's codes and IQ1_M's block scale.  Transcribed from llama.cpp
+// (ggml/src/ggml-cuda/vecdotq.cuh; MIT license, third_party/main/ggml/LICENSE, quoted in iq_kernels.cpp) through
+// Strata's CUDA version.
 #pragma once
 
 #include "cuda_intrinsics.hpp"
@@ -68,6 +69,13 @@ inline uint32_t q2_0_bytes(uint32_t b) {
     uint32_t t = (b | (b << 12)) & 0x000F000Fu;
     t = (t | (t << 6)) & 0x03030303u;
     return ((t | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
+}
+
+// IQ1_M's FP16 block scale, its four nibbles spread over the tops of the four scale words.
+inline float iq1m_scale(const uint16_t* sc) {
+    const uint16_t u16 =
+        (uint16_t) ((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
+    return (float) sycl::bit_cast<sycl::half>(u16);
 }
 
 }  // namespace strata::kernels::iq_bits
