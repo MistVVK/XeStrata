@@ -1088,26 +1088,33 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     done(stream, e, "dense_steps");
 }
 
-// CUDA wrote %globaltimer (nanoseconds).  The Xe device clock counts device ticks; stamps are compared with one another,
-// and converting them to time needs the tick rate, which is not established here.
-#ifdef SYCL_EXT_ONEAPI_CLOCK
+// The stage stamps: %globaltimer (nanoseconds) where the kernel is compiled for NVPTX, whose devices report no
+// device-scope clock; elsewhere the device-scope clock, which counts device ticks (stamps are compared with one
+// another, and converting them to time needs the tick rate, which is not established here).
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
-    auto& queue = Q(stream);
-    if (!queue.get_device().has(sycl::aspect::ext_oneapi_clock_device))
-        fail("gpu_stamp: the device has no device-scope clock");
-    queue.single_task([=] {
+    if (!gpu_stamp_available()) fail("gpu_stamp: the device has no clock a kernel reads");
+    Q(stream).single_task([=] {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+        unsigned long long t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        buf[i] = t;
+#elif defined(SYCL_EXT_ONEAPI_CLOCK)
         buf[i] = (unsigned long long) sycl::ext::oneapi::experimental::clock<
             sycl::ext::oneapi::experimental::clock_scope::device>();
+#else
+        buf[i] = 0;
+#endif
     });
 }
 
 bool gpu_stamp_available() {
-    return core::Runtime::get().compute().get_device().has(sycl::aspect::ext_oneapi_clock_device);
-}
+    const sycl::device d = core::Runtime::get().compute().get_device();
+    if (d.get_backend() == sycl::backend::ext_oneapi_cuda) return true;   // %globaltimer
+#ifdef SYCL_EXT_ONEAPI_CLOCK
+    return d.has(sycl::aspect::ext_oneapi_clock_device);
 #else
-void gpu_stamp(unsigned long long*, int, void*) { fail("gpu_stamp: this SYCL compiler has no device clock"); }
-
-bool gpu_stamp_available() { return false; }
+    return false;
 #endif
+}
 
 }  // namespace strata::kernels
