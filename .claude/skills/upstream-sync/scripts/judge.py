@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Judges XeStrata against upstream from bench-collect.py's matrix.json files: per model file, GPU, tier and
+"""Judges XeStrata against upstream from sync_collect.py's matrix.json files: per model file, GPU, tier and
 measure (prompt, output), the median of each engine's rounds; a cell passes when XeStrata is at most 1% slower.
 
     python .claude/skills/upstream-sync/scripts/judge.py OUT/IQ3_XXS OUT/Q2_0 ...   # one folder per model file

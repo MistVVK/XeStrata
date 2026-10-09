@@ -100,11 +100,11 @@ The long contexts (192K, 262K) are what the engine is used at most: bench.sh run
 
 ```sh
 o=bench/results/<date>-upstream-<version>
-python .claude/skills/release/scripts/prompts.py <pack> <ids>               # the prompts, once
+python .claude/skills/upstream-sync/scripts/sync_prompts.py <pack> <ids>               # the prompts, once
 XE="..." UP="..." XE_PROFILE=... UP_PROFILE=... DATA=<data> IDS=<ids> \
   [PACK=... NATIVE=... PLE=... EXTRA="..."] [TIERS="..."] \
-  .claude/skills/release/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU
-python .claude/skills/release/scripts/bench-collect.py $o/<file> xe-<commit> <tag>
+  .claude/skills/upstream-sync/scripts/bench.sh $o/<file> <GPU>                    # per file and GPU
+python .claude/skills/upstream-sync/scripts/sync_collect.py $o/<file> xe-<commit> <tag>
 ```
 
 `bench.sh` alternates the engines, two rounds per tier, after a warm-up each.
@@ -126,7 +126,7 @@ The run is done only when a full run of step 6 on the final HEAD, every file, ti
 
 On `dev`:
 
-- `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`bench-collect.py`), the check's output, what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. Step 4's measurements of kept and removed paths go into the same record.
+- `$o/README.md`: the machines, both engines' commits and builds, the method, the tables (`sync_collect.py`), the check's output, what the numbers say, and the GPUs skipped; `matrix.json` and the logs in `runs/` with this PC's paths written as `<repo>` and `<data>`. Step 4's measurements of kept and removed paths go into the same record.
 - docs/XE.ja.md, then docs/XE.md: the upstream version and range brought in, what was not taken and why, linking the record.
 
 Lint and commit. Report: the tag, what was taken and left out by group, the check's table, the GPUs skipped (`unverified`), and anything that needs the user.

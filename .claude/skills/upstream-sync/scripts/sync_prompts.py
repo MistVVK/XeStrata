@@ -4,7 +4,7 @@
 58dbbe5 as the files it has read, and a task about them; one prompt per length.  The prompts.py of
 bench/results/2026-10-04-speed-matrix with a 192K tier added (the same tokens up to each length).
 
-    python .claude/skills/release/scripts/prompts.py PACK_DIR OUT_DIR
+    python .claude/skills/upstream-sync/scripts/sync_prompts.py PACK_DIR OUT_DIR
 
 Run from the repository root.  PACK_DIR is any pack (its `tokenizer/` is read).  Writes OUT_DIR/<tier>.ids,
 comma-separated, for `strata generate --tokens-file`.
