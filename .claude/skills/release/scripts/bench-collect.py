@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Reads bench.sh's OUT/runs/*.txt and writes OUT/matrix.json (every run) and, per GPU, the prompt and output tables
-(the median of the rounds; a cell no run finished is "-") as Markdown to stdout.  An upstream run bench.sh stopped
+(the median of the rounds; a cell no run finished is "-", one bench.sh stopped as too slow "too slow") as Markdown to
+stdout.  An upstream run bench.sh stopped
 as too slow has "stopped" (prompt or output); one stopped in its output takes its prompt rate from the last PP line.
 
     python .claude/skills/release/scripts/bench-collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
@@ -52,5 +53,6 @@ for gpu in sorted({r["gpu"] for r in rows}):
             cells = []
             for t in TIERS:
                 v = [r[key] for r in rows if (r["gpu"], r["engine"], r["tier"]) == (gpu, name, t) and r[key]]
-                cells.append(fmt.format(statistics.median(v)) if v else "-")
+                slow = [r for r in rows if (r["gpu"], r["engine"], r["tier"]) == (gpu, name, t) and r["stopped"]]
+                cells.append(fmt.format(statistics.median(v)) if v else "too slow" if slow else "-")
             print(f"| {name} | " + " | ".join(cells) + " |")
