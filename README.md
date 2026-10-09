@@ -30,7 +30,7 @@ How it differs from Strata:
 - **For Intel Arc,** and it runs on AMD and NVIDIA GPUs too.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC ([MULTIGPU](docs/MULTIGPU.md)).
 - **Linux only.** Windows and WSL are not supported.
-- **Runs with free software only, too** (`xestrata-free`, free enough for Debian main). The contrib-llvm packages use
+- **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)). The contrib-llvm packages use
   Intel's oneMKL and NVIDIA's cuBLAS, which are not free software, when they are installed ([Install](#install)).
 
 ## What you need
@@ -122,7 +122,6 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel, AMD (RDNA2 or later, [the GPUs it runs on](#amd-gpus)), or both (with free software only) | `xestrata-free` | `xestrata-free` |
 | **Recommended**: Intel (for speed), AMD (RDNA2 or later), NVIDIA (Turing or later), or any of them together | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA's Pascal and Volta (a P100, P40 or V100, for example), with Intel or AMD or not | `xestrata-contrib-cuda12.4` | none ([from the source](docs/BUILD.md#installing-from-the-source)) |
 
@@ -131,12 +130,14 @@ How to convert it is in [docs/ORCA.md](docs/ORCA.md).
 - The package files are on [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases).
   The `SHA256SUMS` beside them checks a downloaded file (`sha256sum -c SHA256SUMS --ignore-missing`).
   To make them yourself, follow [docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages).
+- **The package with free software only** (`xestrata-free`, Intel and AMD GPUs) is not on Releases.
+  Make it yourself the same way (`tools/package/build.sh ubuntu26.04 free`, for example).
 
 **2. Install it.** apt or dnf installs what it needs.
 
 ```bash
-sudo apt install ./xestrata-free_*.deb      # Ubuntu
-sudo dnf install ./xestrata-free-*.rpm      # Fedora
+sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
+sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
 ```
 
 The GPU's drivers and the like are installed separately: `xestrata` shows what is missing and the command to install it
@@ -173,15 +174,15 @@ Also run `sudo usermod -aG render $USER` and log in again.
 fastest (about 5-10 minutes).
 
 **Changing the package:** on Ubuntu, `sudo apt install` the other one and it replaces the first.
-On Fedora, swap them, for example `sudo dnf swap xestrata-free xestrata-contrib-cuda13.4`.
+On Fedora, name the installed one and the new one, for example `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm`.
 
 **Removing it:** delete the model files, settings and logs with `xestrata --remove-data` (it shows their sizes and asks),
 then remove the packages.
 
 ```bash
 xestrata --remove-data
-sudo apt purge xestrata-free     # Ubuntu (the package you installed)
-sudo dnf remove xestrata-free    # Fedora (the same)
+sudo apt purge xestrata-contrib-cuda13.1     # Ubuntu (the package you installed)
+sudo dnf remove xestrata-contrib-cuda13.4    # Fedora (the same)
 ```
 
 Removed without `xestrata --remove-data`, the packages leave the model files and settings in your home folder.

@@ -30,8 +30,8 @@ Strata との主な違い:
 - **Intel Arc 向け**で、AMD と NVIDIA の GPU でも動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもできます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **Linux だけ**です。Windows と WSL には対応しません。
-- **自由ソフトウェアだけでも動きます**（`xestrata-free`、Debian main に入れられる程度に自由な構成）。
-  contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
+- **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
+  配っている contrib-llvm の版は、自由ソフトウェアでない Intel の oneMKL と NVIDIA の cuBLAS を、入っていれば使います（[インストール](#インストール)）。
 
 ## 必要なもの
 
@@ -118,7 +118,6 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 
 | GPU | Ubuntu 26.04 | Fedora 44 |
 | --- | --- | --- |
-| Intel、AMD（RDNA2 以降、[対応する GPU](#amd-の-gpu)）、その両方（自由ソフトウェアだけで動かす） | `xestrata-free` | `xestrata-free` |
 | **おすすめ**: Intel（速さを重視する）、AMD（RDNA2 以降）、NVIDIA（Turing 以降）、そのいくつか | `xestrata-contrib-cuda13.1` | `xestrata-contrib-cuda13.4` |
 | NVIDIA の Pascal と Volta（P100、P40、V100 など）、それと Intel や AMD | `xestrata-contrib-cuda12.4` | なし（[ソースから](docs/BUILD.ja.md#ソースから入れる)） |
 
@@ -127,12 +126,14 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は、setup のメニューには�
 - パッケージのファイルは [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) にあります。
   一緒にある `SHA256SUMS` で、取ってきたファイルを確かめられます（`sha256sum -c SHA256SUMS --ignore-missing`）。
   自分で作るときは、[docs/BUILD.ja.md](docs/BUILD.ja.md#deb-と-rpm-のパッケージ) の手順で作れます。
+- **自由ソフトウェアだけで動かす版**（`xestrata-free`、Intel と AMD の GPU）は Releases にはありません。
+  同じ手順で自分で作ります（`tools/package/build.sh ubuntu26.04 free` など）。
 
 **2. 入れます。** 足りない依存は apt や dnf が入れます。
 
 ```bash
-sudo apt install ./xestrata-free_*.deb      # Ubuntu
-sudo dnf install ./xestrata-free-*.rpm      # Fedora
+sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
+sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
 ```
 
 GPU のドライバーなどは別に入れます。`xestrata` を実行すると、足りないものと入れるコマンドを表示します（あとで確かめ直すときは `xestrata --setup`）。
@@ -167,14 +168,14 @@ GPU のドライバーなどは別に入れます。`xestrata` を実行する�
 （5〜10 分ほど）。
 
 **別のパッケージに替える**: Ubuntu では入れたい方を `sudo apt install` すると入れ替わります。
-Fedora では `sudo dnf swap xestrata-free xestrata-contrib-cuda13.4` のようにします。
+Fedora では `sudo dnf swap xestrata-contrib-cuda13.4 ./xestrata-free-*.rpm` のように、入っているものと入れたいものを指定します。
 
 **消す**: `xestrata --remove-data` でモデルのファイル・設定・ログを消してから（大きさを見せて確かめます）、パッケージを消します。
 
 ```bash
 xestrata --remove-data
-sudo apt purge xestrata-free     # Ubuntu（入れたパッケージの名前）
-sudo dnf remove xestrata-free    # Fedora（同じ）
+sudo apt purge xestrata-contrib-cuda13.1     # Ubuntu（入れたパッケージの名前）
+sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ```
 
 `xestrata --remove-data` をせずにパッケージを消すと、ホームのモデルのファイルと設定は残ります。
