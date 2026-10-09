@@ -300,6 +300,9 @@ struct Options {
     /// --resident-experts: as much as the free RAM allows)
     double resident_gib = 0;
     bool resident_cpu_experts = false;
+    /// the RAM tier page-locked and mapped, so the prompt path copies its experts by DMA (--resident-experts and
+    /// --resident-budget-gib, as upstream: pageable, the RTX 4070 read UD-Q4_K_XL's 32K prompt with every expert
+    /// staged by the CPU); STRATA_RESIDENT_PIN=0 keeps it pageable
     bool resident_pin = false;
     std::string shared_expert_arena;
     bool coupled_draft = strata::core::coupled_draft_env();
@@ -1518,9 +1521,9 @@ int main(int argc, char** argv) {
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") { o.mmap_experts = o.resident_cpu_experts = true; o.resident_gib = -1; }
         else if (a == "--mmap-experts") o.mmap_experts = true;
-        else if (a == "--resident-experts") { o.mmap_experts = true; o.resident_gib = -1; }
+        else if (a == "--resident-experts") { o.mmap_experts = o.resident_pin = true; o.resident_gib = -1; }
         else if (a == "--resident-budget-gib") {
-            o.mmap_experts = true;
+            o.mmap_experts = o.resident_pin = true;
             o.resident_gib = std::strtod(next("--resident-budget-gib"), nullptr);
             if (!(o.resident_gib > 0)) {
                 std::fprintf(stderr, "strata generate: --resident-budget-gib takes a positive number of GiB\n");
@@ -4703,7 +4706,9 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> other_gpus;
         for (const auto& st : stages)
             other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
-        if (!src.pin_cache_complement(xcache, err, o.resident_pin, other_gpus, lend_from, 8ull << 30, budget,
+        const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
+        const bool pin = o.resident_pin && !(pin_env != nullptr && std::strcmp(pin_env, "0") == 0);
+        if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
                                       stages.empty() ? &profile : &profile_all) ||
             (o.adapt_every > 0 && o.adapt_swaps > 0 && !src.reserve_exchanges(o.adapt_swaps, err))) {
             std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str()); return 1;

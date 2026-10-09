@@ -1021,8 +1021,9 @@ bool FileExpertSource::pin_cache_complement(
                     arena = nullptr;
                 }
             } else {
-                // Refused (the driver's page-locked limit): the same bytes in ordinary memory, locked in the working
-                // set instead, as the arena does - resident either way, only copied by the CPU instead of by DMA.
+                // Refused (the driver's page-locked limit): the same bytes in ordinary memory, copied by the CPU
+                // instead of by DMA.  Not locked in the working set: on the B70 (Level Zero refused 48 GiB of
+                // UD-Q4_K_XL) the locked copy read a 32K prompt 1.6% slower than the plain one.
                 note = std::string("page-locking refused (") + strata::gpu::last_error() + ")";
 
                 arena = nullptr;
@@ -1033,13 +1034,6 @@ bool FileExpertSource::pin_cache_complement(
             if (arena == nullptr) {
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
-            }
-            if (pin) {
-                lock_off = partial_pin;
-                const strata::platform::LockResult lr =
-                    strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
-                locked = lr.locked_bytes;
-                note += (note.empty() ? "" : "; ") + lr.note;
             }
         }
         host = (const uint8_t*) arena;
@@ -1165,7 +1159,7 @@ bool FileExpertSource::pin_cache_complement(
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
-                 complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
+                 complement_pinned_ ? "mapped pinned" : "pageable resident",
                  (double) resident_bytes() / 1073741824.0, (double) pinned_bytes() / 1073741824.0,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - pin_t0).count(),
                  note.empty() ? "" : "; ", note.c_str());
