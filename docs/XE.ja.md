@@ -10,7 +10,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 エンジンが GPU に求めること、移植した計算と検証の一覧をまとめます。
 使い方は [README](../README.ja.md) と [詳しい説明](DETAILS.ja.md)、ビルドの方法、setup の振る舞い、要るパッケージは [BUILD](BUILD.ja.md) にあります。
 
-XeStrata xe0.1.40.2 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
+XeStrata xe0.1.40.2.1 は、Strata のエンジンを Level Zero と SYCL で Intel の GPU に移したものです。版の数字は、取り込んだ upstream の版に合わせています。同じ upstream の版での 2 回目からのリリースは、末尾に番号を足します（xe0.1.40.2.1）。
 移植の元は Strata 0.1.24（`3ce2523c2823687de5372be3af58534f56cbf286`）で、その後 0.1.39（`6f32ec07`）までの変更の一部を取り込んでいます
 （[Strata 0.1.38 の取り込み](#strata-0138-の取り込み)）。
 同じ SYCL のコードを、intel/llvm で NVIDIA の GPU 向けにもコンパイルします（contrib-llvm のビルド、[ビルド](BUILD.ja.md#ビルド)）。
