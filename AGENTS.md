@@ -104,6 +104,15 @@ Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (a
 Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
 A lower value applies to every build in the container, intel/llvm's included, and makes a package take much longer.
 
+## Versions
+
+XeStrata's version is the upstream version it has integrated (`STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`) and `XESTRATA_REVISION`, the count of XeStrata's releases on that upstream version from 1, as a Debian revision counts:
+
+- the packages are `<upstream>-<revision>` (rpm: Version and Release);
+- the version name (the tag and `STRATA_VERSION_NAME`) is `xe<upstream>` for the first release and `xe<upstream>.<revision - 1>` for a later one: xe0.1.40.2.1 is the package `0.1.40.2-2`.
+
+Integrating a new upstream version sets `XESTRATA_REVISION` back to 1; another release on the same upstream version raises it by one.
+
 ## AVX-512 code
 
 The development machine has no AVX-512, so the AVX-512 paths never run natively here.

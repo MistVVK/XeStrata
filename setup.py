@@ -2200,11 +2200,16 @@ def installed_configs():
 
 
 def source_version() -> str:
-    """The engine version the source tree builds (CMakeLists.txt's project version)."""
+    """The engine version the source tree builds (CMakeLists.txt's XESTRATA_VERSION: the upstream version, and the
+    release on it after the first)."""
     if PACKAGED:
         return str(PACKAGED.get("version", "0"))
-    m = re.search(r"project\(XeStrata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
-    return m.group(1) if m else "0"
+    text = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+    m = re.search(r'set\(STRATA_UPSTREAM_VERSION "([\d.]+)"\)', text)
+    r = re.search(r"set\(XESTRATA_REVISION (\d+)\)", text)
+    if not m:
+        return "0"
+    return m.group(1) + (f".{int(r.group(1)) - 1}" if r and int(r.group(1)) > 1 else "")
 
 
 def engine_version(exe: Path) -> tuple:
@@ -2218,8 +2223,9 @@ def engine_version(exe: Path) -> tuple:
     v = str(meta.get("version") or "")
     if not v:                                          # the version compiled into the binary: 0.1.13 and newer
         try:                                           # carry it, so a binary without it is older
-            # XeStrata's binaries say engine=xe<version>; a hotfix version has a fourth number (upstream 511b6467)
-            m = re.search(rb"engine=(?:xe)?(\d+\.\d+\.\d+)(?:\.\d+)?\n", Path(exe).read_bytes())
+            # XeStrata's binaries say engine=xe<version>; a hotfix version has a fourth number (upstream 511b6467),
+            # another XeStrata release on the same upstream version a fifth
+            m = re.search(rb"engine=(?:xe)?(\d+\.\d+\.\d+)(?:\.\d+)*\n", Path(exe).read_bytes())
             v = m.group(1).decode() if m else "0.1.12"
         except OSError:
             v = "0"

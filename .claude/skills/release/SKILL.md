@@ -40,13 +40,13 @@ The newest `xe*` tag is the previous release (none before the first one).
 
 ## 2. The version
 
-The version is `$ARGUMENTS` when given, else `project(XeStrata VERSION ...)` in `CMakeLists.txt`; the tag is `xe<VERSION>` (the name the program shows, `STRATA_VERSION_NAME`).
+The version is `$ARGUMENTS` when given, else the one `CMakeLists.txt` makes from `STRATA_UPSTREAM_VERSION` and `XESTRATA_REVISION` (AGENTS.md, "Versions"); the tag is `xe<VERSION>` (the name the program shows, `STRATA_VERSION_NAME`).
 It must not exist yet, locally or on origin.
 
-- A release after integrating a new upstream version takes that version (`STRATA_UPSTREAM_VERSION` changes with the integration, not here).
-- Another release on the same upstream version adds a fourth number: `0.1.39` then `0.1.39.1`, `0.1.39.2`.
+- A release after integrating a new upstream version takes that version: the integration changes `STRATA_UPSTREAM_VERSION` and sets `XESTRATA_REVISION` back to 1 (`xe0.1.41`, the packages `0.1.41-1`).
+- Another release on the same upstream version raises `XESTRATA_REVISION` by one, and the version name gets a number: `xe0.1.40.2` (revision 1) then `xe0.1.40.2.1` (packages `0.1.40.2-2`), `xe0.1.40.2.2`.
 
-When the version changes, change `project(XeStrata VERSION ...)` and every place that shows the version name (`git grep -n 'xe<OLD>'`; commit `1ae5e9f7` lists them: README, docs/XE, setup.py, cmake/BUILD.json.in), Japanese and English files in the same commit, and commit on `dev` (`版を xe<VERSION> にする`).
+When the version changes, change `XESTRATA_REVISION` and every place that shows the version name (`git grep -n 'xe<OLD>'`: docs/XE), Japanese and English files in the same commit, and commit on `dev` (`版を xe<VERSION> にする`).
 A new version makes conversations saved by `--conversation-save` under the old one unreadable (the engine version is part of their identity): the notes say so.
 
 ## 3. main and the tag

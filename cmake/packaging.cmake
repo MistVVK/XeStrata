@@ -111,7 +111,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
  \"source\": \"package\",
  \"backend\": \"xe\",
  \"package\": \"${STRATA_PACKAGE_NAME}\",
- \"version\": \"${PROJECT_VERSION}\",
+ \"version\": \"${XESTRATA_VERSION}\",
  \"license\": \"${STRATA_LICENSE}\",
  \"cuda_archs\": [${_pkg_archs}],
  \"hip_archs\": [${_pkg_hip_archs}],
@@ -142,7 +142,7 @@ install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_par
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)
 install(FILES ${STRATA_GGML_DIR}/LICENSE DESTINATION ${_pkg_share}/third_party/main/llama.cpp)
 file(WRITE ${CMAKE_BINARY_DIR}/package/PACKAGED
-     "{\"engine\": \"${_pkg_engine_abs}\", \"version\": \"${PROJECT_VERSION}\"}\n")
+     "{\"engine\": \"${_pkg_engine_abs}\", \"version\": \"${XESTRATA_VERSION}\"}\n")
 install(FILES ${CMAKE_BINARY_DIR}/package/PACKAGED DESTINATION ${_pkg_share})
 configure_file(tools/package/xestrata.in ${CMAKE_BINARY_DIR}/package/xestrata @ONLY)
 install(PROGRAMS ${CMAKE_BINARY_DIR}/package/xestrata DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -162,6 +162,7 @@ install(CODE "
 
 # ---- CPack
 set(CPACK_PACKAGE_NAME xestrata)
+set(CPACK_PACKAGE_VERSION ${STRATA_UPSTREAM_VERSION})
 set(CPACK_PACKAGE_VENDOR "MistVVK and the XeStrata contributors")
 set(CPACK_PACKAGE_CONTACT "MistVVK <jffyc82pzv@privaterelay.appleid.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Qwen3.8-Flash-Next on a PC: a GPU, system RAM and the CPU")
@@ -171,6 +172,7 @@ set(CPACK_STRIP_FILES ON)
 
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
+set(CPACK_DEBIAN_PACKAGE_RELEASE ${XESTRATA_REVISION})
 set(CPACK_DEBIAN_PACKAGE_SECTION science)
 # the dependencies: tools/package/build.sh runs dpkg-shlibdeps on what links the distribution's libraries (not on
 # oneMath's backends and the CUDA adapter, which would make oneMKL, cuBLAS and NVIDIA's driver hard dependencies) and
@@ -185,6 +187,7 @@ set(CPACK_DEBIAN_PACKAGE_REPLACES xestrata-engine)
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
+set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION})
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later AND MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND OFL-1.1")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
 set(CPACK_RPM_PACKAGE_REQUIRES "${STRATA_PACKAGE_DEPENDS}")

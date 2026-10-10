@@ -62,7 +62,7 @@ git commit-tree -p dev -p <tag> -m "upstream の Strata <version> を Xe に統�
 ```
 
 `sycl/` and the CUDA and HIP sources stay deleted (modify/delete conflicts are taken as deletes); their changes are ported by hand in steps 2 and 4.
-Set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`, and replace any old upstream hash a document names with the rewritten one.
+Set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
 
 ## 4. Port and measure
 
