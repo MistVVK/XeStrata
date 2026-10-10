@@ -1,0 +1,13 @@
+engine,test,runs,decode_tok_s,ttft_ms,prefill_tok_s
+upstream,japanese,3,74.1,317.51,137.13
+upstream,code,3,107.87,431.49,142.8
+upstream,long,3,79.9,2235.39,699.7
+xestrata-auto,japanese,3,62.03,337.58,130.6
+xestrata-auto,code,3,92.63,457.88,135.73
+xestrata-auto,long,3,71.47,2056.72,766.77
+xestrata-split24,japanese,3,63.53,331.28,132.63
+xestrata-split24,code,3,97.47,450.06,137.87
+xestrata-split24,long,3,71.57,2340.81,671.57
+xestrata-sm70,japanese,3,65.1,323.22,136.17
+xestrata-sm70,code,3,100.1,432.89,143.47
+xestrata-sm70,long,3,73.53,2333.52,673.73
