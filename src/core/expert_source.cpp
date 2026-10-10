@@ -1540,6 +1540,7 @@ struct CpuCalJobs {
     strata::kernels::cpu::NativeFmt f{};
     std::vector<float> x, out;
     std::vector<uint8_t> act;
+    strata::kernels::cpu::ActQ qact{};   // a Q2_0 layer's gate/up activation: its rows read `act`, not `nact`
     const uint8_t* ring[kRing] = {};
     int cursor = 0;
     strata::kernels::cpu::ExpertJobMulti jobs[kCall];
@@ -1574,10 +1575,16 @@ bool cpu_cal_jobs(ExpertDispatch& d, int64_t n_layers, int64_t& layer, CpuCalJob
     for (int64_t i = 0; i < H; ++i) cj.x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
     cj.act.assign(kNativeActBytes, 0);
     native_quant_act(cj.f, cj.x.data(), cj.act.data());
+    // A Q2_0 layer's gate/up rows are computed on Strata's ActQ activation, not the native one: pool.cpp's mode-5
+    // branch reads `act` when the layer's gate/up type is Q2_0.  Filling only `nact` left act[0] null and the Q2_0
+    // kernel dereferenced it (issue #1: SIGSEGV at the first request on a Q2_0 pack with experts outside VRAM).
+    const bool q2_rows = cj.f.gu_type == 42;
+    if (q2_rows) act_quant_any(cj.x.data(), (int) H, cj.qact);
     for (int j = 0; j < CpuCalJobs::kCall; ++j) {
         cj.jobs[j] = ExpertJobMulti{};
         cj.jobs[j].nt = 1;
         cj.jobs[j].nact[0] = cj.act.data();
+        cj.jobs[j].act[0] = q2_rows ? &cj.qact : nullptr;
         cj.jobs[j].out[0] = cj.out.data() + (size_t) j * (size_t) H;
     }
     return true;

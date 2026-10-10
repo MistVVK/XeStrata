@@ -136,6 +136,13 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+
+    /// Why a native multi-token batch cannot run, or `nullptr` when it can: `run_split_multi_native` reads a Q2_0
+    /// layer's gate/up rows from `act` (Strata's ActQ) and every other layer's from `nact` (the layer's native
+    /// activation), so a job whose rows are missing the one its layer reads is a fault in a worker thread, not a
+    /// result.  `job` names the offending job.  Checked at the top of the call: a few pointer reads against a
+    /// batch that moves megabytes.
+    static const char* check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;

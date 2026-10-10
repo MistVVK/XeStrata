@@ -449,8 +449,34 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+const char* ExpertPool::check_multi_jobs(const NativeFmt& f, const ExpertJobMulti* jobs, int n, int& job) {
+    const bool q2_rows = f.gu_type == 42;   // drain's mode 5: the gate/up rows read the ActQ, not the native image
+    for (int e = 0; e < n; ++e) {
+        const ExpertJobMulti& j = jobs[e];
+        if (j.blob == nullptr) { job = e; return "has no blob"; }
+        if (j.nt < 1 || j.nt > MAXT) { job = e; return "has a token count outside 1..MAXT"; }
+        for (int t = 0; t < j.nt; ++t) {
+            if (j.out[t] == nullptr) { job = e; return "has a token with no output row"; }
+            if (q2_rows ? j.act[t] == nullptr : j.nact[t] == nullptr) {
+                job = e;
+                return q2_rows ? "has a token with no ActQ activation (a Q2_0 layer's gate/up rows read act, not nact)"
+                               : "has a token with no native activation";
+            }
+        }
+    }
+    return nullptr;
+}
+
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    int bad = -1;
+    if (const char* why = check_multi_jobs(f, jobs, n, bad)) {
+        std::fprintf(stderr, "strata: the CPU expert pool refused a native batch: job %d of %d %s (the layer's gate/up "
+                             "type %d) - stopping the engine so the server can start it again\n",
+                     bad, n, why, f.gu_type);
+        std::fflush(stderr);
+        std::abort();
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
