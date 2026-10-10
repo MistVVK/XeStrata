@@ -35,6 +35,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/ep_kernels.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -84,6 +85,9 @@ bool no_batch_kv() {
     }();
     return on;
 }
+// --expert-parallel-device: reads before ep_wait gives up.  An endless spin makes the xe driver reset the GPU
+// (upstream Strata); 2^22 reads took 0.72 s on the B70, far more than a layer's work on the other GPU.
+constexpr uint32_t kEpSpinMax = 1u << 22;
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
@@ -151,6 +155,7 @@ Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
     if (cs_) strata::gpu::stream_sync(cs_);
+    ep_free();
     for (auto& e : exec_)
         if (e) strata::gpu::graph_destroy(e);
     for (auto& e : exec_res_)
@@ -426,6 +431,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         if (!ok2) { device_plan_ = false; res_graph_ = false; }
     }
+    if (ep_on() && !ep_init(err)) return false;
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -476,6 +482,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session (upstream PR #559)
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
+    // --expert-parallel-device: both devices' first node advances their window epoch (this window's flags carry it)
+    const bool ep = recording_res_ && ep_on();
+    if (ep) {
+        ep_bump(ep_ctr0_, cs);
+        ep_bump(ep_ctr1_, ep_q_);
+    }
 
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
@@ -984,7 +996,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
+        if (ep)   // this device's entries only; the peer plans its own (below)
+            resident_plan_ep(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * NE, ep_.res_on0 + l * NE, 1, (int) NE,
+                             hits_.cache_base, slot_off_d_, (long long) hits_.blob,
+                             plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, ep_err0_ + 1, cs);
+        else if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -1035,6 +1051,31 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             if (!qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        if (ep) {
+            // to the peer's inbox; the peer computes its entries and returns the rows with this ring's flag (post())
+            const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
+            const size_t xq_bytes = (size_t) n * (N / 32) * 36;
+            uint8_t* slot_on0 = static_cast<uint8_t*>(ep_inbox_.remote) + (size_t) grp * ep_slot_bytes_;
+            ep_push(ids_ + tb * K, n * (int) K, nat_xq_ + (size_t) tb * (N / 32) * 36, xq_bytes, reinterpret_cast<int32_t*>(slot_on0),
+                    slot_on0 + ep_xq_off_, static_cast<uint32_t*>(ep_inflag_.remote) + (size_t) ring * 16, ep_ctr0_, cs);
+            uint8_t* in1 = ep_in1_ + (size_t) grp * ep_slot_bytes_;
+            ep_wait(static_cast<const uint32_t*>(ep_inflag_.local) + (size_t) ring * 16, ep_ctr1_, kEpSpinMax, ep_err1_, ring, ep_q_);
+            ep_copy_peer(in1, static_cast<const uint8_t*>(ep_inbox_.local) + (size_t) grp * ep_slot_bytes_, ep_xq_off_ + xq_bytes, ep_q_);
+            const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
+            int32_t* pl1 = ep_plan1_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+            resident_plan_ep(reinterpret_cast<const int32_t*>(in1), (int) cap, (int) K, ep_.res + l * NE, ep_.res0_on_peer + l * NE, 2,
+                             (int) NE, ep_.cache_base, ep_.slot_off, (long long) ep_.blob, pl1, (long long) capx,
+                             ep_err1_ + 1, ep_q_);
+            const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+            const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            // the group's rows only are in the inbox, so the plan's token and row numbers index it from 0
+            native_expert_grouped(L, reinterpret_cast<const unsigned long long*>(pl1 + ptr_off), pl1 + 4, pl1, pl1 + 4 + capx + 1,
+                                  pl1 + 4 + capx + 1 + capx, cap, cap, in1 + ep_xq_off_, ep_scratch1_, ep_out1_, ep_q_);
+            ep_send_rows(static_cast<float*>(ep_rows_.remote) + (size_t) tb * K * N, ep_out1_, reinterpret_cast<const int32_t*>(in1),
+                         ep_.res0_on_peer + l * NE, (int) cap, N, ep_done1_,
+                         static_cast<uint32_t*>(ep_ret_.remote) + (size_t) ring * 16, ep_ctr1_, ep_q_);
+        }
         stamp(l, 18, grp);
         return true;
     };
@@ -1107,7 +1148,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         grouped(p_ptr, p_start, p_counts, cap);
         stamp(l, 20, grp);
-        if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
+        if (ep) {   // the peer's rows, once its flag is up, and this device's own: the rows the combine reads
+            ep_wait(static_cast<const uint32_t*>(ep_ret_.local) + (size_t) ring * 16, ep_ctr0_, kEpSpinMax, ep_err0_, ring, cs);
+            ep_merge_rows(parts_ + (size_t) tb * K * N, static_cast<const float*>(ep_rows_.local) + (size_t) tb * K * N, hit_out,
+                          ids_ + tb * K, hits_.d_res + l * g.n_expert, (int) cap, N, cs);
+        } else if (recording_res_) {   // no PCIe share and no CPU share: the CPU's rows are zeros
             copy_or_zero_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                      skip_ + grp, ring, cs);
         } else {
@@ -1133,7 +1178,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
         }
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        if (!ep) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);   // ep: merged
         if (dec_batch && n > 1 && native_moe_combine_enabled()) {   // one launch for the window's rows
             try {
                 native_moe_combine_multi(parts_ + (size_t) tb * K * N, w_ + tb * K, shared_ + tb * N, bo_ + tb * N, N, K, n, cs,
@@ -1318,15 +1363,117 @@ bool Verifier::capture(int T, std::string& err) {
 
 bool Verifier::all_resident() const {
     const int64_t ne = g_->n_expert;
-    for (int64_t i = lb_ * ne; i < le_ * ne; ++i)
-        if (hits_.h_res[i] < 0) return false;
+    for (int64_t i = lb_ * ne; i < le_ * ne; ++i)   // --expert-parallel-device: or in the peer's VRAM
+        if (hits_.h_res[i] < 0 && !(ep_on() && ep_.h_res[i] >= 0)) return false;
     return true;
+}
+
+// ---- --expert-parallel-device (ep_kernels.hpp) ---------------------------------------------------------------------
+bool Verifier::ep_init(std::string& err) {
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, K = ss_->k, MT = max_t_;
+    const int d0 = device_, d1 = ep_.device;
+    const char* why = !strata::kernels::cpu::expert_layout().native ? "it needs a native expert pack"
+                    : !res_graph_ || ep_.h_res == nullptr || ep_.res == nullptr || ep_.res_on0 == nullptr ||
+                              ep_.res0_on_peer == nullptr || ep_.cache_base == nullptr
+                        ? "it needs the window graph with every expert resident"
+                    : segmented_ ? "this GPU runs windows as segments"
+                    : ext_stream_ != nullptr ? "not with pipelined windows"
+                    : lb_ != 0 || le_ != g.n_layers ? "not with a layer split"
+                    : !all_resident() ? "an expert is in neither GPU's VRAM"
+                    : nullptr;
+    if (why != nullptr) { err = std::string("verify: --expert-parallel-device: ") + why; return false; }
+    if (!strata::gpu::peer_supported(d0, d1)) {
+        err = std::string("verify: --expert-parallel-device: the two GPUs cannot open each other's memory (") +
+              strata::gpu::last_error() + ")";
+        return false;
+    }
+    auto align = [](size_t b) { return (b + 255) / 256 * 256; };
+    ep_xq_off_ = align((size_t) MT * K * 4);
+    ep_slot_bytes_ = ep_xq_off_ + align((size_t) MT * (N / 32) * 36);
+    const size_t flag_bytes = (size_t) (g.n_layers * 2 + 2) * 64;   // a 64-byte line per ring (two groups at most)
+    if (!strata::gpu::peer_alloc(d1, d0, 2 * ep_slot_bytes_, &ep_inbox_) ||
+        !strata::gpu::peer_alloc(d1, d0, flag_bytes, &ep_inflag_) ||
+        !strata::gpu::peer_alloc(d0, d1, (size_t) MT * K * N * 4, &ep_rows_) ||
+        !strata::gpu::peer_alloc(d0, d1, flag_bytes, &ep_ret_)) {
+        err = std::string("verify: --expert-parallel-device: ") + strata::gpu::last_error();
+        return false;
+    }
+    bool ok = strata::gpu::alloc_device(&ep_ctr0_, 64) && strata::gpu::memset(ep_ctr0_, 0, 64) &&
+              strata::gpu::alloc_host(&ep_err0_, 64);
+    if (ok) std::memset(ep_err0_, 0, 64);
+    if (ok) {
+        const OnDevice on(d1);
+        ok = (ep_q_ = strata::gpu::stream_create()) != nullptr && strata::gpu::alloc_device(&ep_ctr1_, 64) &&
+             strata::gpu::alloc_device(&ep_done1_, 64) && strata::gpu::alloc_device(&ep_in1_, 2 * ep_slot_bytes_) &&
+             strata::gpu::alloc_device(&ep_plan1_, (size_t) 2 * (plan_i32_ + 16) * 4) &&
+             strata::gpu::alloc_device(&ep_out1_, (size_t) MT * K * N * 4) &&
+             strata::gpu::alloc_device(&ep_scratch1_, strata::kernels::native_expert_scratch_bytes(MT * K, g.n_ff)) &&
+             strata::gpu::memset(ep_ctr1_, 0, 64) && strata::gpu::memset(ep_done1_, 0, 64) &&
+             strata::gpu::alloc_host(&ep_err1_, 64);
+        if (ok) std::memset(ep_err1_, 0, 64);
+    }
+    if (!ok) {
+        err = std::string("verify: --expert-parallel-device: buffers: ") + strata::gpu::last_error();
+        return false;
+    }
+    std::fprintf(stderr, "strata verify: expert parallel with CUDA%d: it computes the experts this GPU does not hold "
+                         "(inbox %.1f KiB per group)\n", d1, (double) ep_slot_bytes_ / 1024.0);
+    return true;
+}
+
+void Verifier::ep_free() {
+    if (!ep_on()) return;
+    if (ep_q_) strata::gpu::stream_sync(ep_q_);
+    {
+        const OnDevice on(ep_.device);
+        for (auto& e : ep_exec_) { strata::gpu::graph_destroy(e); e = nullptr; }
+        for (void* p : {(void*) ep_ctr1_, (void*) ep_done1_, (void*) ep_in1_, (void*) ep_plan1_, (void*) ep_out1_,
+                        (void*) ep_scratch1_, (void*) ep_err1_})
+            strata::gpu::free(p);
+        if (ep_q_) strata::gpu::stream_destroy(ep_q_);
+    }
+    for (strata::gpu::PeerRegion* r : {&ep_inbox_, &ep_inflag_, &ep_rows_, &ep_ret_}) strata::gpu::peer_free(r);
+    strata::gpu::free(ep_ctr0_);
+    strata::gpu::free(ep_err0_);
+    ep_q_ = nullptr;
+    ep_ctr0_ = ep_ctr1_ = ep_done1_ = ep_err0_ = ep_err1_ = nullptr;
+    ep_in1_ = ep_scratch1_ = nullptr;
+    ep_plan1_ = nullptr;
+    ep_out1_ = nullptr;
+}
+
+bool Verifier::ep_check(std::string& err) {
+    // the peer's last node (the last layer's return flag) can still be finishing when this device's window is done
+    if (!strata::gpu::stream_sync(ep_q_)) {
+        err = std::string("verify: the peer: ") + strata::gpu::last_error();
+        return false;
+    }
+    volatile uint32_t* a = ep_err0_;
+    volatile uint32_t* b = ep_err1_;
+    if ((a[0] | a[1] | b[0] | b[1]) == 0) return true;
+    char m[256];
+    std::snprintf(m, sizeof m, "verify: expert parallel: %s (ring %u here, %u on the peer; plan errors %u / %u)",
+                  (a[1] | b[1]) != 0 ? "an expert was in neither GPU's VRAM" : "a wait for the other GPU ran to its bound",
+                  a[0], b[0], a[1], b[1]);
+    a[0] = 0;
+    a[1] = 0;
+    b[0] = 0;
+    b[1] = 0;
+    err = m;
+    return false;
 }
 
 bool Verifier::capture_res(int T, std::string& err) {
     if (exec_res_[T] != nullptr) return true;
     if (!strata::gpu::begin_capture(cs_)) {
         err = "verify: begin capture failed";
+        return false;
+    }
+    // --expert-parallel-device: the peer's half of the window records into a graph of its own
+    if (ep_on() && !strata::gpu::begin_capture(ep_q_)) {
+        strata::gpu::abandon_capture(cs_);
+        err = std::string("verify: begin capture on the peer: ") + strata::gpu::last_error();
         return false;
     }
     std::string rerr;
@@ -1340,13 +1487,22 @@ bool Verifier::capture_res(int T, std::string& err) {
     recording_res_ = false;
     if (!ok) {
         strata::gpu::abandon_capture(cs_);
+        if (ep_on()) strata::gpu::abandon_capture(ep_q_);
         err = rerr;
         return false;
     }
     if (!strata::gpu::end_capture(cs_, &exec_res_[T])) {
+        if (ep_on()) strata::gpu::abandon_capture(ep_q_);
         err = std::string("verify: end capture: ") + strata::gpu::last_error();
         return false;
     }
+    if (ep_on() && !strata::gpu::end_capture(ep_q_, &ep_exec_[T])) {
+        err = std::string("verify: end capture on the peer: ") + strata::gpu::last_error();
+        strata::gpu::graph_destroy(exec_res_[T]);   // the two halves exist together or not at all
+        exec_res_[T] = nullptr;
+        return false;
+    }
+    if (ep_on()) strata::gpu::stream_sync(ep_q_);
     const bool synced = strata::gpu::stream_sync(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window with every expert resident (sync %s)\n", T,
                  synced ? "ok" : strata::gpu::last_error());
@@ -1470,6 +1626,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) last_tokens_[t] = tokens[t];
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
+    // --expert-parallel-device: the peer's half first (its first node waits for this device's first layer)
+    if (res && ep_on() && !strata::gpu::graph_launch(ep_exec_[T], ep_q_)) {
+        err = std::string("verify: launch on the peer: ") + strata::gpu::last_error();
+        return false;
+    }
     const bool le = strata::gpu::graph_launch(res ? exec_res_[T] : segmented_ ? segs_[T][0] : exec_[T], cs_);
     if (!le) { err = std::string("verify: launch: ") + strata::gpu::last_error(); return false; }
     (void) strata::gpu::stream_idle(cs_);
@@ -1560,6 +1721,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     progress_at("verify window: waiting for the GPU to finish the window (flags A/B/M raised)", (int64_t) T);
     const bool se = strata::gpu::stream_sync(cs_);
     if (!se) { err = std::string("verify: ") + strata::gpu::last_error(); return false; }
+    if (res && ep_on() && !ep_check(err)) return false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     strata::gpu::stream_sync(copy_);   // no host function of this window may raise flag B in the next one
     if (prof_on_ && G == 1) {       // the window's GPU stage stamps

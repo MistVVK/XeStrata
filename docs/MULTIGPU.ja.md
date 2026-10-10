@@ -116,6 +116,38 @@ GPU 2 枚、ちょうど 2 段、`--serve` のときに使えます。
   `--adapt-async 1` では、各カードのコピーを、そのカードに窓がないときにデコードのループが積みます（upstream 13eee452）。
 - `STRATA_PIPELINE_*` の調整・試験の変数（THETA、FORCE_MISS、SWITCH、LOG、TRACE など）は、`STRATA_PIPELINE_DEBUG=1` のときだけ読みます（upstream 2bfac510）。
 
+## 2 枚で各層の expert を分けて計算する（`--expert-parallel-device`、opt-in）
+
+`--expert-parallel-device D` では、GPU 0 がすべての層を計算し、GPU D は GPU 0 に入らない expert を持つ。
+検証の window の各層では、2 枚がそれぞれ自分の expert を同時に計算し、GPU D は計算した行を GPU 0 のメモリに書き込む（upstream #1798 の移植）。
+各層の expert は、`--expert-profile` の順位で 2 枚へ交互に配置し、GPU 0 のキャッシュが埋まると残りを GPU D に置く。
+どの expert をどちらの GPU が持つかは起動時に決まり、以降は変わらない。
+
+条件は、次のとおりである。
+
+- `--expert-profile`、および検証の window（`--serve` または `--spec`）。
+- すべての expert が、どちらかの GPU の VRAM に入ること。
+- 2 枚が互いのメモリへアクセスできること（SYCL の `aspect::ext_oneapi_ipc_memory`）。
+
+`--layer-split`、`--batch`、`--pipeline-windows`、`--vram-elastic`、および補助のキャッシュ（`--expert-cache-device1..3`）とは併用できない。
+expert の入れ替え（`--adapt-every`）は行わない。
+伸びる KV（`--kv-grow`）は無効である。
+
+プロンプトの読み込みは GPU 0 のみが行い、GPU D の expert は RAM から読む。
+プロンプトの処理は GPU 1 枚のときと同じであり、expert のキャッシュから領域を借り、借りた領域は検証の window の前に元の expert で書き戻す。
+
+確認した環境は、Arc Pro B70 が 2 枚の contrib-icpx と free のビルドのみである。
+
+測定（Arc Pro B70 2 枚、IQ3_XXS、コンテキスト 131,072、INT8 KV、MTP、`bench/results/2026-10-09-upstream-0140/perf.py`、各値は perf.py 1 回の中央値、3 つの構成を交互に 2 回ずつ）:
+
+| | 1 枚 | `--layer-split auto` | `--expert-parallel-device 1` |
+| --- | --- | --- | --- |
+| プロンプト 627 トークン | 673、678 tok/s | 549、532 tok/s | 638、641 tok/s |
+| プロンプト 2,441 トークン | 1,261、1,276 tok/s | 1,200、978 tok/s | 1,239、1,246 tok/s |
+| 627 トークンのあとのデコード | 96.0、98.5 tok/s | 95.5、89.2 tok/s | 103.1、104.3 tok/s |
+| 2,441 トークンのあとのデコード | 87.1、91.5 tok/s | 89.2、83.7 tok/s | 105.1、102.3 tok/s |
+| 短い会話 | 70.2〜74.0 tok/s | 62.2〜70.8 tok/s | 77.0〜77.5 tok/s |
+
 ## 測定
 
 Arc Pro B70（32 GB）と RTX 4070（12 GB、PCIe x4）、Core i7-14700、128 トークンのデコード:

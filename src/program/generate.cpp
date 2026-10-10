@@ -481,6 +481,9 @@ struct Options {
     /// reads window K); 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies
     /// window K (rolled back when K is not accepted as guessed).  0 = off (the stages take turns).
     int pipeline_windows = 0;
+    /// --expert-parallel-device D (opt-in): GPU D (an engine number) holds the experts this GPU does not and computes
+    /// their rows of each verify window beside it (docs/MULTIGPU.md); -1 = off
+    int ep_device = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -684,6 +687,9 @@ void usage() {
                  "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTIGPU.md\n"
+                 "  --expert-parallel-device D  opt-in: GPU D holds the experts this GPU does not and computes their\n"
+                 "                       rows of each window beside it (every expert in one of the two GPUs' VRAM;\n"
+                 "                       needs --expert-profile; not with --layer-split or --batch); docs/MULTIGPU.md\n"
                  "  --batch-cpu-split N0,N1  EXPERIMENTAL, with --batch-groups over two GPUs: the CPU expert workers\n"
                  "                       in two pools (N0 + N1) so both stages' CPU experts run at once (slower where\n"
                  "                       the RAM bandwidth is the limit, as on a DDR PC; for PCs with more of it)\n"
@@ -1714,6 +1720,7 @@ int main(int argc, char** argv) {
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, (int) std::strtol(next("--pipeline-windows"), nullptr, 10)));
+        else if (a == "--expert-parallel-device") o.ep_device = (int) std::strtol(next("--expert-parallel-device"), nullptr, 10);
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-chain") o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
@@ -1947,6 +1954,31 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --pipeline-windows %d is off: %s\n", o.pipeline_windows, off);
             o.pipeline_windows = 0;
         }
+    }
+    // --expert-parallel-device (opt-in): each GPU's experts are fixed at the start; adaptive swaps, elastic K/V and
+    // --vram-elastic would leave an expert on neither GPU.  The prompt loan is fine: its slots are refilled, each expert
+    // into its own slot, before any verify window runs.
+    if (o.ep_device >= 0) {
+        const int n_dev = strata::core::Runtime::count();
+        bool remote = false;
+        for (const int r : o.expert_cache_remote) remote = remote || r > 0;
+        const char* why = n_dev < 2 ? "it needs a second GPU (one is visible)"
+                        : o.ep_device == 0 || o.ep_device >= n_dev ? "D is the other GPU's engine number"
+                        : !o.serve && o.spec < 2 ? "it needs the verify window (--serve or --spec)"
+                        : o.expert_profile.empty() ? "it needs --expert-profile"
+                        : !o.layer_split.empty() ? "not with --layer-split"
+                        : o.pipeline_windows > 0 ? "not with --pipeline-windows"
+                        : o.batch != 0 ? "not with --batch slots"
+                        : remote ? "not with the helper caches (--expert-cache-device1..3)"
+                        : o.vram_elastic ? "not with --vram-elastic"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device %d: %s (%d GPUs visible)\n", o.ep_device, why,
+                         n_dev);
+            return 2;
+        }
+        o.expert_cache_per_layer = true;
+        o.adapt_every = 0;
     }
     // --pipeline-windows: a second verifier on every stage (its arena alone is 70-75 MiB and its graphs come on top) and,
     // with the decode pipelined, two copies of the first stage's GDN state (~3 MiB per GDN layer, twice, ~15 layers:
@@ -2799,7 +2831,7 @@ int main(int argc, char** argv) {
         const bool on = asked && !multi_gpu && o.kv_resident <= 0 && !o.expert_profile.empty() &&
                         !o.resident_cpu_experts && o.expert_cache != 0 && !remote && strata::core::vmm_available() &&
                         // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                        o.batch == 0 && !o.vram_elastic;
+                        o.batch == 0 && !o.vram_elastic && o.ep_device < 0;
         if (want > 0 && !on)
             std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU with virtual memory, a profile, the whole "
                                  "K/V in VRAM, every expert in RAM, no --batch or --vram-elastic)\n");
@@ -3728,6 +3760,52 @@ int main(int argc, char** argv) {
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
+    //
+    // --expert-parallel-device: the slower GPU sets each layer's pace, so a layer's experts, hottest first, are dealt
+    // 0,1 / 1,0 .. (even routing, not by quota) until one GPU is full.  The profile keeps this GPU's pairs only.
+    std::vector<std::pair<int32_t, int32_t>> ep_set1;
+    strata::core::ExpertCache ep_cache;
+    if (o.ep_device >= 0) {
+        int64_t lo = 0, hi = 0;
+        if (o.expert_cache > 0 && xcache.per_layer_admission()) xcache.layer_slot_range(0, lo, hi);
+        const int64_t q0 = hi - lo, q1 = g.n_expert - q0;
+        if (q0 <= 0 || profile.empty() || srcp == nullptr || !native_pack) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: it needs a native pack, its profile and an "
+                                 "expert cache on this GPU\n");
+            return 2;
+        }
+        if (q1 <= 0) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: this GPU holds every expert (%lld a layer); "
+                                 "it runs alone\n", (long long) q0);
+            o.ep_device = -1;
+        } else {
+            std::vector<std::vector<int32_t>> ranked((size_t) g.n_layers);
+            std::vector<uint8_t> seen((size_t) (g.n_layers * g.n_expert), 0);
+            for (const auto& pr : profile) {
+                const size_t i = (size_t) (pr.first * g.n_expert + pr.second);
+                if (!seen[i]) { seen[i] = 1; ranked[(size_t) pr.first].push_back(pr.second); }
+            }
+            for (int64_t l = 0; l < g.n_layers; ++l)   // pairs the profile does not list, coldest
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (!seen[(size_t) (l * g.n_expert + e)]) ranked[(size_t) l].push_back((int32_t) e);
+            std::vector<std::pair<int32_t, int32_t>> set0;
+            for (int64_t l = 0; l < g.n_layers; ++l) {
+                int64_t n0 = 0, n1 = 0;
+                const auto& r = ranked[(size_t) l];
+                for (size_t i = 0; i < r.size(); ++i) {
+                    int gpu = ((i & 1) != 0) != (((i / 2) & 1) != 0) ? 1 : 0;
+                    if (gpu == 0 && n0 >= q0) gpu = 1;
+                    if (gpu == 1 && n1 >= q1) gpu = 0;
+                    if (gpu == 0) { set0.push_back({(int32_t) l, r[i]}); ++n0; }
+                    else { ep_set1.push_back({(int32_t) l, r[i]}); ++n1; }
+                }
+            }
+            profile = set0;
+            std::fprintf(stderr, "strata generate: expert parallel: this GPU holds %lld experts a layer, CUDA%d the other "
+                                 "%lld (each layer's routing dealt evenly between them)\n",
+                         (long long) q0, o.ep_device, (long long) q1);
+        }
+    }
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
@@ -3771,6 +3849,61 @@ int main(int argc, char** argv) {
                              "slot 0 verified\n",
                      (long long) prefilled, (long long) want, fill_s,
                      fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
+    }
+    // ---- --expert-parallel-device: the other GPU's cache, filled with ep_set1
+    if (o.ep_device >= 0) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        const strata::core::OnDevice on(o.ep_device);
+        if (!srcp->register_on(o.ep_device, err))
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: %s; its fill copies are slower\n", err.c_str());
+        int64_t q1 = 0;
+        {
+            std::vector<int64_t> per((size_t) g.n_layers, 0);
+            for (const auto& pr : ep_set1) q1 = std::max(q1, ++per[(size_t) pr.first]);
+        }
+        std::vector<int64_t> sized;
+        uint64_t bytes = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t k = 0; k < q1; ++k) {
+                sized.push_back((int64_t) lay.blob_bytes(l));
+                bytes += (lay.blob_bytes(l) + 255) / 256 * 256;
+            }
+        size_t free_b = 0, total_b = 0;
+        strata::gpu::mem_info(&free_b, &total_b);
+        const int reserve_mib = o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
+        if ((uint64_t) free_b < bytes + ((uint64_t) reserve_mib << 20)) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: CUDA%d cannot hold the other %.2f GiB of "
+                                 "experts (%.2f GiB free, %d MiB reserve): this GPU must hold more of them (a smaller "
+                                 "--max-context or --vram-reserve-mib)\n",
+                         o.ep_device, (double) bytes / 1073741824.0, (double) free_b / 1073741824.0, reserve_mib);
+            return 1;
+        }
+        ep_cache.set_per_layer_admission(true);
+        if (!ep_cache.open_sized(sized, g.n_layers, g.n_expert, err)) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: CUDA%d expert cache: %s\n", o.ep_device,
+                         err.c_str());
+            return 1;
+        }
+        const auto tf = std::chrono::steady_clock::now();
+        for (const auto& pr : ep_set1) {
+            const int32_t slot = ep_cache.admit(pr.first, pr.second);
+            const uint8_t* b = slot == strata::core::kNotResident ? nullptr : blob_to_copy(srcp, pr.first, pr.second, fill_tmp);
+            if (b == nullptr || !ep_cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
+                std::fprintf(stderr, "strata generate: --expert-parallel-device: CUDA%d fill failed at layer %d expert "
+                                     "%d: %s\n", o.ep_device, pr.first, pr.second,
+                             slot == strata::core::kNotResident ? "no slot" : err.c_str());
+                return 1;
+            }
+        }
+        if (!ep_cache.verify_slot(ep_cache.slot_of(ep_set1[0].first, ep_set1[0].second),
+                                  blob_to_copy(srcp, ep_set1[0].first, ep_set1[0].second, fill_tmp), err,
+                                  (int64_t) lay.blob_bytes(ep_set1[0].first))) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: CUDA%d: %s\n", o.ep_device, err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: expert parallel: CUDA%d holds %zu experts (%.2f GiB, filled in %.1f s); "
+                             "slot 0 verified\n", o.ep_device, ep_set1.size(), ep_cache.gib(),
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - tf).count());
     }
 
 
@@ -4785,6 +4918,46 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: token graph hit path: %lld resident experts, decided on the device\n",
                      (long long) resident);
     }
+    // ---- --expert-parallel-device: both residency tables on both GPUs (each plans its own entries from the pair)
+    strata::core::VerifyEp ep_cfg;
+    std::vector<int32_t> ep_h_res;
+    if (o.ep_device >= 0) {
+        if (host_res.empty()) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device needs the device residency table (graph "
+                                 "capture, the CPU pool and the token graph on)\n");
+            return 2;
+        }
+        ep_h_res.assign(host_res.size(), strata::core::kNotResident);
+        for (int64_t l = 0; l < g.n_layers; ++l)
+            for (int64_t e = 0; e < g.n_expert; ++e)
+                ep_h_res[(size_t) (l * g.n_expert + e)] = ep_cache.slot_of(l, e);
+        const size_t nb = host_res.size() * sizeof(int32_t);
+        int32_t *res_on0 = nullptr, *res = nullptr, *res0_on_peer = nullptr;
+        unsigned long long* off = nullptr;
+        bool ok = strata::gpu::alloc_device(&res_on0, nb) && strata::gpu::copy(res_on0, ep_h_res.data(), nb);
+        if (ok) {
+            const strata::core::OnDevice on(o.ep_device);
+            ok = strata::gpu::alloc_device(&res, nb) && strata::gpu::copy(res, ep_h_res.data(), nb) &&
+                 strata::gpu::alloc_device(&res0_on_peer, nb) && strata::gpu::copy(res0_on_peer, host_res.data(), nb);
+            if (ok && ep_cache.slot_offsets() != nullptr) {
+                const size_t ob = (size_t) ep_cache.slots() * sizeof(unsigned long long);
+                ok = strata::gpu::alloc_device(&off, ob) && strata::gpu::copy(off, ep_cache.slot_offsets(), ob);
+            }
+        }
+        if (!ok) {
+            std::fprintf(stderr, "strata generate: --expert-parallel-device: the residency tables: %s\n",
+                         strata::gpu::last_error());
+            return 1;
+        }
+        ep_cfg.device = o.ep_device;
+        ep_cfg.h_res = ep_h_res.data();
+        ep_cfg.res = res;
+        ep_cfg.res_on0 = res_on0;
+        ep_cfg.res0_on_peer = res0_on_peer;
+        ep_cfg.cache_base = ep_cache.device_slot(0);
+        ep_cfg.slot_off = off;
+        ep_cfg.blob = (int64_t) strata::kernels::cpu::expert_layout().max_blob;
+    }
     if (!o.no_capture && !o.no_token_graph && layer_dump == nullptr && half_dump == nullptr &&
         (hit_fn == nullptr || thits.on()) && !native_pack) {
         if (!strata::core::session_capture_token(wt, g, ss, d_parts, loop_scratch.y_miss, loop_scratch.parts_bytes,
@@ -5250,6 +5423,7 @@ int main(int argc, char** argv) {
             }
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
+        if (ep_cfg.device >= 0) ver.set_ep(ep_cfg);   // --expert-parallel-device
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
@@ -9727,6 +9901,7 @@ int main(int argc, char** argv) {
         vh.slot_off = xcache.slot_offsets();   // E-6: the device plan's pointers
         vh.n_slots = xcache.slots();
         vh.h_res = host_res.empty() ? nullptr : host_res.data();   // every expert resident: windows without the host
+        if (ep_cfg.device >= 0) ver.set_ep(ep_cfg);   // --expert-parallel-device
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;

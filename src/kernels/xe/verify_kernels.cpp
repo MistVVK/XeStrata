@@ -746,29 +746,47 @@ bool doorbell_visible(void* stream) {
     return ok;
 }
 
-void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
-                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream) {
+namespace {
+// Role 0: resident_plan.  Roles 1 and 2: resident_plan_ep, the owned entries only.  An expert's entries share its
+// owner, so the leaders, counts and places among the owned entries are those role 0 finds among all of them.
+template <int Role>
+sycl::event resident_plan_submit(sycl::queue& q, const int32_t* ids, int n, int k, const int32_t* res,
+                                 const int32_t* other, int n_expert, const uint8_t* cache_base,
+                                 const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx,
+                                 uint32_t* skip, uint32_t ring, uint32_t* plan_err) {
     // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
     // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
     // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
     // starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
     constexpr int WG = 128;
     if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
-    const auto e = Q(stream).submit([&](sycl::handler& h) {
+    return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
         sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG), h);
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
             const auto grp = it.get_group();
             const int t = (int) it.get_local_id(0);
-            bool bad = false;
+            bool bad = false, own = true;
             if (t < n) {
                 const int32_t ex = ids[t];
                 s_ids[t] = ex;
-                bad = ex < 0 || ex >= n_expert || res[ex] < 0;
+                if constexpr (Role == 0) {
+                    bad = ex < 0 || ex >= n_expert || res[ex] < 0;
+                } else {
+                    const bool valid = ex >= 0 && ex < n_expert;
+                    const bool here = valid && res[ex] >= 0, there = valid && other[ex] >= 0;
+                    bad = !here && !there;
+                    own = Role == 1 ? here : here && !there;
+                }
             }
             if (sycl::any_of_group(grp, bad)) {
-                if (t == 0) *skip = 0;
+                if constexpr (Role == 0) {
+                    if (t == 0) *skip = 0;
+                } else if (t == 0) {
+                    pl[0] = pl[1] = pl[2] = 0;
+                    pl[4] = 0;
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::system>(*plan_err).store(1u);
+                }
                 return;
             }
             // an entry's leader L (its expert's first index) and, for a leader, its entry count; then one scan of
@@ -783,7 +801,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
                     if (j < t) ++pos;
                 }
             }
-            const int pack = L == t && t < n ? (cnt << 16) | 1 : 0;
+            const int pack = L == t && t < n && own ? (cnt << 16) | 1 : 0;
             const int excl = sycl::exclusive_scan_over_group(grp, pack, sycl::plus<int>());
             s_excl[t] = excl;
             const int total = sycl::reduce_over_group(grp, pack, sycl::plus<int>());
@@ -795,7 +813,7 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             const long long ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
             unsigned long long* ptr = reinterpret_cast<unsigned long long*>(pl + ptr_off);
             int32_t* start2 = pl + ptr_off + 4 * capx;
-            if (t < n) {
+            if (t < n && own) {
                 const int le = s_excl[L];
                 const int g = le & 0xffff, gstart = le >> 16;
                 dst[gstart + pos] = t;
@@ -809,16 +827,40 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             sycl::group_barrier(grp);
             if (t != 0) return;
             const int groups = total & 0xffff;
-            start[groups] = n;
-            start2[0] = n;
+            const int ents = Role == 0 ? n : total >> 16;   // role 0: every entry is in a group
+            start[groups] = ents;
+            start2[0] = ents;
             counts[0] = groups;
-            counts[1] = n;
+            counts[1] = ents;
             counts[2] = 0;
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-            *skip = ring;
+            if constexpr (Role == 0) {
+                sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                *skip = ring;
+            }
         });
     });
-    done(stream, e, "resident_plan");
+}
+}  // namespace
+
+void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
+                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
+                   uint32_t ring, void* stream) {
+    done(stream, resident_plan_submit<0>(Q(stream), ids, n, k, res, nullptr, n_expert, cache_base, slot_off, blob, pl,
+                                         capx, skip, ring, nullptr),
+         "resident_plan");
+}
+
+void resident_plan_ep(const int32_t* ids, int n, int k, const int32_t* res, const int32_t* other, int role,
+                      int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                      int32_t* pl, long long capx, uint32_t* plan_err, void* stream) {
+    if (role != 1 && role != 2) throw std::invalid_argument("resident_plan_ep: role 1 or 2");
+    auto& q = Q(stream);
+    const sycl::event e =
+        role == 1 ? resident_plan_submit<1>(q, ids, n, k, res, other, n_expert, cache_base, slot_off, blob, pl, capx,
+                                            nullptr, 0, plan_err)
+                  : resident_plan_submit<2>(q, ids, n, k, res, other, n_expert, cache_base, slot_off, blob, pl, capx,
+                                            nullptr, 0, plan_err);
+    done(stream, e, "resident_plan_ep");
 }
 
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream) {

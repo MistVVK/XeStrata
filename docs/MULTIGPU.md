@@ -116,6 +116,38 @@ It works with two GPUs, exactly two stages and `--serve`.
   With `--adapt-async 1` the decode loop queues each card's copies while that card has no window in flight (upstream 13eee452).
 - The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with `STRATA_PIPELINE_DEBUG=1` (upstream 2bfac510).
 
+## Two GPUs computing each layer's experts together (`--expert-parallel-device`, opt-in)
+
+With `--expert-parallel-device D`, GPU 0 runs every layer and GPU D holds the experts that do not fit on GPU 0.
+In each layer of a verify window both GPUs compute their own experts at the same time, and GPU D writes the rows it computed into GPU 0's memory (a port of upstream #1798).
+Each layer's experts are dealt to the two GPUs in turn, in the order of `--expert-profile`, and once GPU 0's cache is full the rest go to GPU D.
+Which GPU holds which expert is decided at the start and does not change afterwards.
+
+It needs:
+
+- `--expert-profile`, and the verify window (`--serve` or `--spec`).
+- Every expert in one of the two GPUs' VRAM.
+- The two GPUs able to access each other's memory (SYCL's `aspect::ext_oneapi_ipc_memory`).
+
+It cannot be combined with `--layer-split`, `--batch`, `--pipeline-windows`, `--vram-elastic` or the helper caches (`--expert-cache-device1..3`).
+Experts are not swapped (`--adapt-every`).
+The growing K/V (`--kv-grow`) is off.
+
+Prompts are read on GPU 0 alone, which reads GPU D's experts from RAM.
+The prompt path is the same as on one GPU: it borrows room from the expert cache and writes the original experts back into it before the verify window.
+
+It was checked on two Arc Pro B70s with the contrib-icpx and free builds only.
+
+Measured on 2x Arc Pro B70, IQ3_XXS, 131,072 context, INT8 KV, MTP, with `bench/results/2026-10-09-upstream-0140/perf.py` (each value the median of one perf.py run; the three configurations in turn, twice each):
+
+| | One GPU | `--layer-split auto` | `--expert-parallel-device 1` |
+| --- | --- | --- | --- |
+| Prompt, 627 tokens | 673, 678 tok/s | 549, 532 tok/s | 638, 641 tok/s |
+| Prompt, 2,441 tokens | 1,261, 1,276 tok/s | 1,200, 978 tok/s | 1,239, 1,246 tok/s |
+| Decode after 627 tokens | 96.0, 98.5 tok/s | 95.5, 89.2 tok/s | 103.1, 104.3 tok/s |
+| Decode after 2,441 tokens | 87.1, 91.5 tok/s | 89.2, 83.7 tok/s | 105.1, 102.3 tok/s |
+| Short chats | 70.2-74.0 tok/s | 62.2-70.8 tok/s | 77.0-77.5 tok/s |
+
 ## Measurements
 
 Arc Pro B70 (32 GB) and RTX 4070 (12 GB, PCIe x4), Core i7-14700, 128 tokens of decode:

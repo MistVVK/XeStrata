@@ -57,12 +57,27 @@ struct VerifyHits {
                                           ///< expert resident runs without the host (null: never)
 };
 
+/// --expert-parallel-device (ep_kernels.hpp): a second GPU computes the experts this one does not hold, in the
+/// all-resident window graph (an expert counts as resident on either GPU).
+struct VerifyEp {
+    int device = -1;                                ///< the peer's engine device; -1: off
+    const int32_t* h_res = nullptr;                 ///< the peer's residency table, host [n_layers * n_expert]
+    const int32_t* res = nullptr;                   ///< ... on the peer
+    const int32_t* res_on0 = nullptr;               ///< ... a copy on this device
+    const int32_t* res0_on_peer = nullptr;          ///< this device's table (VerifyHits::d_res), a copy on the peer
+    const uint8_t* cache_base = nullptr;            ///< the peer's expert arena
+    const unsigned long long* slot_off = nullptr;   ///< its per-slot offsets, on the peer (null: slot * blob)
+    int64_t blob = 0;
+};
+
 class Verifier {
 public:
     Verifier() = default;
     ~Verifier();
     Verifier(const Verifier&) = delete;
     Verifier& operator=(const Verifier&) = delete;
+    /// Before `init`.
+    void set_ep(const VerifyEp& ep) { ep_ = ep; }
 
     /// The watchdog's view of the window in flight (issue #31): the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -315,6 +330,25 @@ private:
     strata::gpu::Graph* exec_res_[9] = {};
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
+    // ---- --expert-parallel-device (set_ep): the peer's half of a resident window is its own graph on ep_q_
+    VerifyEp ep_;
+    bool ep_on() const { return ep_.device >= 0; }
+    strata::gpu::Stream ep_q_ = nullptr;
+    strata::gpu::PeerRegion ep_inbox_, ep_inflag_, ep_rows_, ep_ret_;
+    uint32_t* ep_ctr0_ = nullptr;       ///< this device's window epoch
+    uint32_t* ep_ctr1_ = nullptr;       ///< the peer's
+    uint8_t* ep_in1_ = nullptr;         ///< the peer's copy of its inbox (per group: ids, then q8_1 rows)
+    int32_t* ep_plan1_ = nullptr;       ///< the peer's plans (per group)
+    float* ep_out1_ = nullptr;          ///< the peer's expert rows before ep_send_rows
+    uint32_t* ep_done1_ = nullptr;      ///< ep_send_rows' work-group count
+    uint8_t* ep_scratch1_ = nullptr;    ///< the peer's native_expert_grouped scratch
+    uint32_t* ep_err0_ = nullptr;       ///< host, this device: [0] a wait that ran to its bound, [1] a plan error
+    uint32_t* ep_err1_ = nullptr;       ///< host, the peer: the same
+    size_t ep_slot_bytes_ = 0, ep_xq_off_ = 0;
+    strata::gpu::Graph* ep_exec_[9] = {};
+    bool ep_init(std::string& err);
+    void ep_free();
+    bool ep_check(std::string& err);    ///< after a window: no wait ran to its bound, no expert was on neither device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;

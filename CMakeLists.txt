@@ -384,7 +384,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp
-                                    src/kernels/xe/matrix_report.cpp)
+                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/ep_kernels.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -652,6 +652,10 @@ if(STRATA_ENABLE_XE)
     add_executable(resident_plan_parity src/kernels/resident_plan_parity.cpp)
     target_link_libraries(resident_plan_parity PRIVATE strata_kernels)
     add_test(NAME resident_plan_parity COMMAND resident_plan_parity)
+    # --expert-parallel-device: the two GPUs' plans against a host replay of their contract
+    add_executable(resident_plan_ep_parity src/kernels/resident_plan_ep_parity.cpp)
+    target_link_libraries(resident_plan_ep_parity PRIVATE strata_kernels)
+    add_test(NAME resident_plan_ep_parity COMMAND resident_plan_ep_parity)
     # KV streaming: streamed vs resident attention, bitwise (synthetic, no model).
     add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
     target_link_libraries(kv_stream_parity PRIVATE strata_kernels)
