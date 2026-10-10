@@ -140,11 +140,11 @@ sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
 sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
 ```
 
-The GPU's drivers and the like are installed separately: `xestrata` shows what is missing and the command to install it
-(to check again later: `xestrata --setup`).
-Also run `sudo usermod -aG render $USER` and log in again.
+The GPU's drivers and the like are installed separately: `xestrata --setup`, the next step, checks the missing packages and
+the render group, and stops with the command that installs them.
+Run that command, then `xestrata --setup` again.
 
-**3. Run `xestrata` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
+**3. Run `xestrata --setup` in a terminal and answer its questions.** Pressing Enter takes the recommended choice.
 
 - **The model and its size:** see [Choosing a model](#choosing-a-model).
 - **The context:** how much text it can keep in mind at once. It suggests one for your GPU.

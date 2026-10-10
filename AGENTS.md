@@ -104,6 +104,9 @@ Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (a
 Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
 A lower value applies to every build in the container, intel/llvm's included, and makes a package take much longer.
 
+What a user installs besides the package (the GPU makers' drivers and runtimes, the render group) is checked by `xestrata --setup`, which stops with the command that installs it (`check_runtime` in `setup.py`).
+The README, the documents and the release notes send the user to `xestrata --setup` for these, and do not list the packages themselves.
+
 ## Versions
 
 XeStrata's version is the upstream version it has integrated (`STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`) and `XESTRATA_REVISION`, the count of XeStrata's releases on that upstream version from 1, as a Debian revision counts:

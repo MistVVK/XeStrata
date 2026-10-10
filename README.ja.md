@@ -136,10 +136,10 @@ sudo apt install ./xestrata-contrib-cuda13.1_*.deb      # Ubuntu
 sudo dnf install ./xestrata-contrib-cuda13.4-*.rpm      # Fedora
 ```
 
-GPU のドライバーなどは別に入れます。`xestrata` を実行すると、足りないものと入れるコマンドを表示します（あとで確かめ直すときは `xestrata --setup`）。
-また、`sudo usermod -aG render $USER` を実行して、ログインし直します。
+GPU のドライバーなどは別に入れます。次の `xestrata --setup` が、足りないパッケージと render グループを確かめ、入れるコマンドを表示して止まります。
+そのコマンドを実行してから、もう一度 `xestrata --setup` を実行します。
 
-**3. 端末で `xestrata` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
+**3. 端末で `xestrata --setup` を実行し、質問に答えます。** Enter を押せば、おすすめの選択になります。
 
 - **モデルと大きさ**: [モデルの選び方](#モデルの選び方)を見てください。
 - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。

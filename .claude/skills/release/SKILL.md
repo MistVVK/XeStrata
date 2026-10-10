@@ -75,7 +75,7 @@ Steps 5 and 6 are done while it builds.
 Write `build/release/xe<VERSION>/NOTES.md`: the Japanese section first, then the same content in English.
 
 - What changed for users since the previous release tag (`git log --no-merges <previous>..xe<VERSION>`; for the first release, since `origin/main`), grouped by what a user notices, not a list of commits.
-- Which package to install: the table in README's install section (`xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that a contrib-llvm package only suggests the GPU makers' runtimes (Intel's Level Zero, with `libigc2 libigdfcl2` on Ubuntu, is installed by hand for an Intel GPU).
+- Which package to install: the table in README's install section (`xestrata-contrib-cuda13.1` / `cuda13.4` on Fedora; `xestrata-contrib-cuda12.4` for Volta), and that `xestrata --setup` shows the GPU makers' packages that are missing and the command that installs them (AGENTS.md, "Packages": the notes do not list them).
 - When the version changed: saved conversations from another version are not read.
 - How to check a download: `sha256sum -c SHA256SUMS`.
 - That the release has no free packages: a free build is made from the source (docs/BUILD.md).
