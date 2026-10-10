@@ -4,6 +4,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
 
+#include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -402,9 +403,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     {
         const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
         segmented_ = v != nullptr ? std::strtol(v, nullptr, 10) != 0 : !strata::kernels::doorbell_visible(cs_);
-        if (segmented_)
+        if (segmented_) {
             std::fprintf(stderr, "strata verify: the GPU's running kernels do not see the host's writes: each window "
                                  "runs as segments the host launches (slower)\n");
+            // The publish kernel's whole job is writing mapped host memory from a RUNNING kernel (moe_route's
+            // doorbell, layer.cpp): on a device the probe just failed, those writes never land, and the engine faults
+            // the GPU as it reads them back (issue #2, an Arc Pro B60: a ccs page fault at a host VA).  Such a device
+            // takes the copy_async handoff.  STRATA_PUBLISH_KERNEL=1 keeps the kernel anyway, for A/B runs.
+            const char* pk = std::getenv("STRATA_PUBLISH_KERNEL");
+            if (pk == nullptr || std::strtol(pk, nullptr, 10) != 0) strata::core::layer_set_publish_kernel(false);
+        }
     }
     // E-6: a layer whose routed experts are all resident is planned on the device (STRATA_VERIFY_DEVICE_PLAN=1: on;
     // exact, but neutral on RIBPC 1-2 GPUs: off by default)

@@ -149,6 +149,7 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   That needs a running kernel to see the host's writes.
   The verifier checks that at start (`doorbell_visible`).
   Where it fails (the UHD 770), each window runs as segments the host launches one after another, with no waiting kernel: the same results, slower.
+  On a device where that check fails, the kernel that publishes the router's doorbell (`moe_route`) is turned off too: writing mapped host memory from a running kernel is that kernel's whole job, so where the writes never land, the engine faults the GPU reading them back (issue #2, an Arc Pro B60). `STRATA_PUBLISH_KERNEL=1` keeps it on such a device (for A/B runs).
   `STRATA_VERIFY_SEGMENTED=1` / `0` forces either.
   A window whose verifier layers have every expert in VRAM runs as another graph that plans the experts on the GPU and never waits for the host (upstream cfd3b72; no segments either).
   On the B70 the Coder IQ1_M went from 28.0 to 28.5 tok/s with the same logits.
