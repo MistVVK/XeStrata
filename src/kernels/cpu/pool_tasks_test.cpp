@@ -91,6 +91,56 @@ int main(int argc, char** argv) {
                 }
             }
     }
-    std::printf("pool tasks: %d bitwise comparisons passed\n", checks);
+
+    // A Q2_0 pack (issue #1): the pool reads a Q2_0 layer's gate/up rows from `act` (Strata's ActQ), not from the
+    // layer's native `nact`.  The dispatch calibration's shape - one token per expert, the ActQ quantized from the
+    // same x - has to run to finite output, and a batch missing the activation its layer reads has to be refused
+    // with a reason naming the job, not faulted inside a worker.
+    {
+        cpu::NativeFmt q2;
+        if (!cpu::native_fmt(GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, cpu::H, cpu::FF, q2, err)) {
+            std::fprintf(stderr, "q2_0: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<uint8_t> q2blob(q2.bytes);
+        std::vector<float> w((size_t) cpu::H * cpu::FF);
+        for (size_t i = 0; i < w.size(); ++i) w[i] = 0.02f * std::sin((float) i * 0.11f);
+        ggml_quantize_chunk(GGML_TYPE_Q2_0, w.data(), q2blob.data(), 0, cpu::FF, cpu::H, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q2_0, w.data(), q2blob.data() + q2.up_off, 0, cpu::FF, cpu::H, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q2_0, w.data(), q2blob.data() + q2.down_off, 0, cpu::H, cpu::FF, nullptr);
+        constexpr int nq = 8;
+        std::vector<cpu::ExpertJobMulti> q2jobs(nq);
+        std::vector<float> q2out((size_t) nq * cpu::H, 0.0f);
+        for (int e = 0; e < nq; ++e) {   // CpuCalJobs' shape: one token per expert
+            q2jobs[e].blob = q2blob.data();
+            q2jobs[e].nt = 1;
+            q2jobs[e].nact[0] = act[0].data();
+            q2jobs[e].act[0] = &qact[0];
+            q2jobs[e].out[0] = q2out.data() + (size_t) e * cpu::H;
+        }
+        int bad = -1;
+        if (cpu::ExpertPool::check_multi_jobs(q2, q2jobs.data(), nq, bad) != nullptr) {
+            std::fprintf(stderr, "q2_0: the calibration's batch was refused (job %d)\n", bad);
+            return 1;
+        }
+        {
+            cpu::ExpertPool pool(3, false);
+            pool.run_split_multi_native(q2, q2jobs.data(), nq);
+        }
+        for (float v : q2out)
+            if (!std::isfinite(v)) { std::fprintf(stderr, "q2_0: a CPU expert's row is not finite\n"); return 1; }
+
+        q2jobs[3].act[0] = nullptr;   // what the calibration built before issue #1: nact filled, act null
+        bad = -1;
+        if (cpu::ExpertPool::check_multi_jobs(q2, q2jobs.data(), nq, bad) == nullptr || bad != 3) {
+            std::fprintf(stderr, "q2_0: a Q2_0 batch with no ActQ was not refused (job %d)\n", bad);
+            return 1;
+        }
+        q2jobs[3].act[0] = &qact[0];
+        q2jobs[0].nt = 0;   // a job with no token is refused too
+        if (cpu::ExpertPool::check_multi_jobs(q2, q2jobs.data(), nq, bad) == nullptr || bad != 0) return 1;
+        ++checks;
+    }
+    std::printf("pool tasks: %d bitwise comparisons passed (the last is the Q2_0 batch shape)\n", checks);
     return 0;
 }
