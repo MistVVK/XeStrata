@@ -70,6 +70,12 @@ bool gpu_stamp_available();
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream);
+/// resident_plan over the entries one card of an expert-parallel pair owns (`res_layer` is its table, `other_layer` the
+/// other's): role 1 (card 0) those in its table, role 2 (the peer) those in its table and not card 0's.  An expert in
+/// neither leaves an empty plan and sets *plan_err (host memory) to 1.
+void resident_plan_ep(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, const int32_t* other_layer,
+                      int role, int n_expert, const uint8_t* cache_base, const unsigned long long* slot_off,
+                      long long blob, int32_t* plan, long long capx, uint32_t* plan_err, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.

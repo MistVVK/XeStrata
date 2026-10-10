@@ -91,6 +91,18 @@ void vmem_delete(VmemSegment* seg);
 /// The device's compute units and maximum clock in kHz (cudaDevAttrMultiProcessorCount / ClockRate); device 0 only.
 bool device_speed(int device, int* units, int* khz);
 
+/// Device memory of `owner` that kernels on `other` address too (`remote`), opened through an IPC handle since each
+/// device has its own context (sycl_ext_oneapi_inter_process_communication; peer_supported: both report the aspect).
+struct PeerRegion {
+    void* local = nullptr;
+    void* remote = nullptr;
+    int owner = -1, other = -1;
+};
+bool peer_supported(int a, int b);
+/// `bytes` zeroed on `owner`, opened on `other`.
+bool peer_alloc(int owner, int other, size_t bytes, PeerRegion* r);
+void peer_free(PeerRegion* r);
+
 /// Registers pageable memory for fast device copies (cudaHostRegister).  Registered memory is a copy source or
 /// destination only: kernels cannot address it (docs/XE.md, Runtime contract).
 bool host_register(void* p, size_t bytes);

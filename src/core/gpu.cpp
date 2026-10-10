@@ -7,6 +7,9 @@
 #include "strata/core/runtime.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
+#if __has_include(<sycl/ext/oneapi/experimental/ipc_memory.hpp>)
+#include <sycl/ext/oneapi/experimental/ipc_memory.hpp>
+#endif
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
 #include <sycl/ext/oneapi/virtual_mem/physical_mem.hpp>
 #include <sycl/ext/oneapi/virtual_mem/virtual_mem.hpp>
@@ -156,6 +159,53 @@ void free(const void* p) {
     // freed by the device that allocated it, whichever is current
     core::Runtime* owner = core::Runtime::owner(p);
     (owner ? *owner : rt()).free(const_cast<void*>(p));
+}
+
+bool peer_supported(int a, int b) {
+#ifdef SYCL_EXT_ONEAPI_INTER_PROCESS_COMMUNICATION
+    try {
+        return a != b && core::Runtime::at(a).device().has(sycl::aspect::ext_oneapi_ipc_memory) &&
+               core::Runtime::at(b).device().has(sycl::aspect::ext_oneapi_ipc_memory);
+    } catch (const std::exception& e) { return fail("peer_supported", e); }
+#else
+    (void) a; (void) b;
+    g_error = "peer_supported: this SYCL runtime has no sycl_ext_oneapi_inter_process_communication";
+    return false;
+#endif
+}
+
+bool peer_alloc(int owner, int other, size_t bytes, PeerRegion* r) {
+    *r = PeerRegion{};
+#ifdef SYCL_EXT_ONEAPI_INTER_PROCESS_COMMUNICATION
+    namespace ipc = sx::ipc_memory;
+    try {
+        core::Runtime& o = core::Runtime::at(owner);
+        core::Runtime& t = core::Runtime::at(other);
+        void* p = sycl::malloc_device(bytes, o.device(), o.context());
+        if (!p) { g_error = "peer_alloc: " + std::to_string(bytes) + " bytes refused"; return false; }
+        o.compute().memset(p, 0, bytes).wait();
+        ipc::handle h = ipc::get(p, o.context());
+        void* remote = ipc::open(h.data(), t.context(), t.device());
+        ipc::put(h, o.context());
+        if (!remote) { sycl::free(p, o.context()); g_error = "peer_alloc: the IPC handle did not open"; return false; }
+        *r = PeerRegion{p, remote, owner, other};
+        return true;
+    } catch (const std::exception& e) { return fail("peer_alloc", e); }
+#else
+    (void) owner; (void) other; (void) bytes;
+    g_error = "peer_alloc: this SYCL runtime has no sycl_ext_oneapi_inter_process_communication";
+    return false;
+#endif
+}
+
+void peer_free(PeerRegion* r) {
+#ifdef SYCL_EXT_ONEAPI_INTER_PROCESS_COMMUNICATION
+    try {
+        if (r->remote) sx::ipc_memory::close(r->remote, core::Runtime::at(r->other).context());
+        if (r->local) sycl::free(r->local, core::Runtime::at(r->owner).context());
+    } catch (const std::exception& e) { fail("peer_free", e); }
+#endif
+    *r = PeerRegion{};
 }
 
 bool vmem_supported() {
