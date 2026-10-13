@@ -980,6 +980,18 @@ def gpus():
         found.append({"index": len(found), "name": pci_name(0x8086, did), "vram_gb": vram, "device_id": did,
                       "driver": driver, "integrated": integrated, "supported": True, "pci": pci,
                       "bar_gb": visible, "link": host_link(dev), "render": node, "vendor": "intel"})
+    # WSL2 exposes the Windows NVIDIA driver through dxg, not a DRM card or nvidiactl.
+    # Keep native detection and ordering; append only devices not already found there.
+    if wsl_version() == 2 and Path("/dev/dxg").exists():
+        smi = nvidia_smi() if smi is None else smi
+        known = {g["pci"] for g in nvidia}
+        for pci, info in sorted(smi.items()):
+            if pci in known or info.get("mib", 0) <= 0 or not re.fullmatch(r"\d+\.\d+", info.get("cc") or ""):
+                continue
+            nvidia.append({"name": info["name"], "vram_gb": info["mib"] / 1024,
+                           "device_id": None, "driver": "dxg", "integrated": False, "supported": True,
+                           "pci": pci, "bar_gb": None, "link": None, "render": "/dev/dxg",
+                           "vendor": "nvidia", "cc": info["cc"]})
     return found + [{"index": len(found) + i, **g} for i, g in enumerate(nvidia + amd)]
 
 
@@ -3782,7 +3794,9 @@ def main() -> int:
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
-    if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
+    if gpu["bar_gb"] is None:
+        warn("the GPU's PCIe/BAR information is not available here; Resizable BAR status is unknown")
+    elif gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
         warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the "
              "CPU. "
              "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
