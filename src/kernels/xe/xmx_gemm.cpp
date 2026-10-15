@@ -207,6 +207,133 @@ sycl::event dispatch(sycl::queue& q, const E* X, const E* W, float* Y, int64_t T
     return launch<E, 256, 256, 2>(q, X, W, Y, T, N, K, ldy);
 }
 
+// One output per row: each lane streams aligned 32-byte BF16 vectors from X and W, then the subgroup reduces one row.
+struct NarrowBf16Dot1Kernel {
+    const uint16_t* X;
+    const uint16_t* W;
+    float* Y;
+    int64_t T, K, ldy;
+    int rows_per_group;
+    int vectors_per_lane;
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
+        const auto sg = it.get_sub_group();
+        const int lane = (int) sg.get_local_linear_id();
+        const int64_t row = (int64_t) it.get_group(0) * rows_per_group + (int64_t) it.get_local_id(0) / 16;
+        if (row >= T) return;
+        float sum = 0.0f;
+        const uint16_t* x = X + row * K;
+        const uint16_t* w = W;
+        const auto val = [](uint16_t b) { return sycl::bit_cast<float>((uint32_t) b << 16); };
+        using V = sycl::vec<uint16_t, 16>;
+        for (int64_t k = (int64_t) lane * 16 * vectors_per_lane; k < K;
+             k += 16 * 16ll * vectors_per_lane) {
+            for (int v = 0; v < vectors_per_lane && k + (int64_t) (v + 1) * 16 <= K; ++v) {
+                const V xv = *reinterpret_cast<const V*>(x + k + (int64_t) v * 16);
+                const V wv = *reinterpret_cast<const V*>(w + k + (int64_t) v * 16);
+                for (int j = 0; j < 16; ++j) sum = sycl::fma(val(xv[j]), val(wv[j]), sum);
+            }
+        }
+        const float total = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+        if (lane == 0) Y[row * ldy] = total;
+#endif
+    }
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{syclex::sub_group_size<16>};
+    }
+};
+
+// One matrix tile wide. This deliberately has its own kernel registration: the regular tile assigns four
+// 16-column matrices to each sub-group, even when the caller needs only a few columns.
+struct NarrowBf16Kernel {
+    const bf16_t* X;
+    const bf16_t* W;
+    float* Y;
+    int64_t T, K;
+    bool two_sg;
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_DEVICE_NOT_INTEL
+        (void) it;
+#else
+        const auto sg = it.get_sub_group();
+        const int64_t sgid = (int64_t) it.get_local_id(0) / 16;
+        const int64_t row0 = (int64_t) it.get_group(0) * (two_sg ? 64 : 32) + sgid * 32;
+        const auto gx = global(X);
+        const auto gw = global(W);
+        const auto gy = global(Y);
+        mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN> c[SGM];
+        for (int i = 0; i < SGM; ++i) mx::joint_matrix_fill(sg, c[i], 0.0f);
+        if (K % 64 == 0) {
+            for (int64_t k0 = 0; k0 < K; k0 += 64) {
+                mx::joint_matrix<sycl::sub_group, bf16_t, mx::use::b, TK, TN, mx::layout::col_major> b[4];
+                mx::joint_matrix<sycl::sub_group, bf16_t, mx::use::a, TM, TK, mx::layout::row_major> a[4][SGM];
+                for (int j = 0; j < 4; ++j) mx::joint_matrix_load(sg, b[j], gw + k0 + (int64_t) j * TK, K);
+                for (int i = 0; i < SGM; ++i) {
+                    const int64_t r = row0 + (int64_t) i * TM;
+                    for (int j = 0; j < 4; ++j) {
+                        const int64_t k = k0 + (int64_t) j * TK;
+                        if (r + TM <= T) mx::joint_matrix_load(sg, a[j][i], gx + r * K + k, K);
+                        else ix::joint_matrix_load_checked(sg, a[j][i], gx, K, T, K, r, k);
+                    }
+                }
+                for (int i = 0; i < SGM; ++i)
+                    for (int j = 0; j < 4; ++j) mx::joint_matrix_mad(sg, c[i], a[j][i], b[j], c[i]);
+            }
+        } else {
+            for (int64_t k0 = 0; k0 < K; k0 += 32) {
+                mx::joint_matrix<sycl::sub_group, bf16_t, mx::use::b, TK, TN, mx::layout::col_major> b0, b1;
+                mx::joint_matrix<sycl::sub_group, bf16_t, mx::use::a, TM, TK, mx::layout::row_major> a0[SGM], a1[SGM];
+                mx::joint_matrix_load(sg, b0, gw + k0, K);
+                mx::joint_matrix_load(sg, b1, gw + k0 + TK, K);
+                for (int i = 0; i < SGM; ++i) {
+                    const int64_t r = row0 + (int64_t) i * TM;
+                    if (r + TM <= T) {
+                        mx::joint_matrix_load(sg, a0[i], gx + r * K + k0, K);
+                        mx::joint_matrix_load(sg, a1[i], gx + r * K + k0 + TK, K);
+                    } else {
+                        ix::joint_matrix_load_checked(sg, a0[i], gx, K, T, K, r, k0);
+                        ix::joint_matrix_load_checked(sg, a1[i], gx, K, T, K, r, k0 + TK);
+                    }
+                }
+                for (int i = 0; i < SGM; ++i) {
+                    mx::joint_matrix_mad(sg, c[i], a0[i], b0, c[i]);
+                    mx::joint_matrix_mad(sg, c[i], a1[i], b1, c[i]);
+                }
+            }
+        }
+        for (int i = 0; i < SGM; ++i)
+            mx::joint_matrix_store(sg, c[i], gy + (row0 + (int64_t) i * TM) * 16, 16,
+                                   mx::layout::row_major);
+#endif
+    }
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{sycl::ext::intel::experimental::grf_size<256>, syclex::sub_group_size<16>};
+    }
+};
+
+struct NarrowPackKernel {
+    const uint16_t* W;
+    uint16_t* W16;
+    int64_t N, K;
+    void operator()(sycl::id<1> id) const {
+        const int64_t i = (int64_t) id[0], n = i / K, k = i % K;
+        W16[i] = n < N ? W[n * K + k] : 0;
+    }
+};
+
+struct NarrowCopyKernel {
+    const float* Y16;
+    float* Y;
+    int64_t T, N, ldy;
+    void operator()(sycl::id<1> id) const {
+        const int64_t i = (int64_t) id[0], r = i / N, n = i % N;
+        Y[r * ldy + n] = Y16[r * 16 + n];
+    }
+};
+
+
 // Whether the device runs these kernels: a joint_matrix combination of 8 x 16 x 16 for the input type with FP32
 // accumulators, and 16-wide sub-groups, as the device (and the SYCL runtime) reports them.  Otherwise the products go
 // to dp4a_gemm.  STRATA_NO_XMX=1 forces that path, to compare the two.
@@ -226,13 +353,14 @@ bool device_has_xmx(const sycl::device& d, mx::matrix_type in) {
 }
 
 // Whether the device builds the kernels' large register file (grf_size<256>): XMX devices that list the matrix
-// combinations may still lack the mode, and a kernel that asks for it then fails to build at its first launch.  One
-// kernel is built here, once, before any is launched.
+// combinations may still lack the mode, and a kernel that asks for it then fails to build at its first launch.  The
+// regular and narrow kernels are built here, once, before any is launched.
 bool large_grf_ok(const sycl::device& d) {
     try {
         const auto ctx = core::Runtime::get().compute().get_context();
         (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
-            ctx, {d}, {sycl::get_kernel_id<GemmKernel<sycl::half, 128, 256, 3>>()});
+            ctx, {d}, {sycl::get_kernel_id<GemmKernel<sycl::half, 128, 256, 3>>(),
+                       sycl::get_kernel_id<NarrowBf16Kernel>(), sycl::get_kernel_id<NarrowBf16Dot1Kernel>()});
         return true;
     } catch (const sycl::exception& e) {
         std::fprintf(stderr, "strata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
@@ -319,6 +447,59 @@ void xmx_gemm(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t
         ? dispatch(q, reinterpret_cast<const sycl::half*>(X), reinterpret_cast<const sycl::half*>(W), Y, T, N, K, ldy)
         : dispatch(q, reinterpret_cast<const bf16_t*>(X), reinterpret_cast<const bf16_t*>(W), Y, T, N, K, ldy);
     finish(stream, e, "xmx_gemm");
+}
+
+void xmx_gemm_bf16_narrow(const uint16_t* X, const uint16_t* W16, float* Y16, int64_t T, int64_t K, void* stream) {
+    if (!xmx_available(XmxType::bf16)) {
+        gemm_rows(XmxType::bf16, X, W16, Y16, T, 16, K, 16, stream);
+        return;
+    }
+    auto& q = core::Runtime::get().stream(stream);
+    const auto& dev = q.get_device();
+    const auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+    const bool two_sg = dev.get_info<sycl::info::device::max_work_group_size>() >= 32 &&
+                        std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) 16) != sg_sizes.end();
+    const size_t local = two_sg ? 32 : 16;
+    const size_t rows_per_group = two_sg ? 64 : 32;
+    const size_t groups = (size_t) ((T + (int64_t) rows_per_group - 1) / (int64_t) rows_per_group);
+    const auto e = q.parallel_for(sycl::nd_range<1>(groups * local, local), NarrowBf16Kernel{
+        reinterpret_cast<const bf16_t*>(X), reinterpret_cast<const bf16_t*>(W16), Y16, T, K, two_sg});
+    finish(stream, e, "xmx_gemm_bf16_narrow");
+}
+
+void xmx_gemm_bf16_dot1(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t K, int64_t ldy,
+                        void* stream) {
+    if (!xmx_available(XmxType::bf16)) {
+        gemm_rows(XmxType::bf16, X, W, Y, T, 1, K, ldy, stream);
+        return;
+    }
+    auto& q = core::Runtime::get().stream(stream);
+    const auto& dev = q.get_device();
+    const size_t max_wg = dev.get_info<sycl::info::device::max_work_group_size>();
+    // Two rows per 16-lane subgroup gave the best balance on the B70; retain one subgroup as the smaller-device fallback.
+    const int rows_per_group = max_wg >= 32 ? 2 : 1;
+    const size_t local = (size_t) rows_per_group * 16;
+    // Eight vectors per lane won on the B70 at K=2560/10240; this depends on aligned K and the device memory system.
+    // Reduce the per-lane working set on devices reporting smaller work-groups (the thresholds use device limits).
+    const int vectors_per_lane = max_wg >= 64 ? 8 : max_wg >= 32 ? 4 : 2;
+    const size_t groups = (size_t) ((T + rows_per_group - 1) / rows_per_group);
+    const auto e = q.parallel_for(sycl::nd_range<1>(groups * (size_t) local, (size_t) local), NarrowBf16Dot1Kernel{
+        X, W, Y, T, K, ldy, rows_per_group, vectors_per_lane});
+    finish(stream, e, "xmx_gemm_bf16_dot1");
+}
+
+
+void xmx_pack_bf16_narrow(const uint16_t* W, uint16_t* W16, int64_t N, int64_t K, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const size_t elems = (size_t) 16 * (size_t) K;
+    const auto e = q.parallel_for(sycl::range<1>(elems), NarrowPackKernel{W, W16, N, K});
+    finish(stream, e, "xmx_pack_bf16_narrow");
+}
+
+void xmx_copy_bf16_narrow(const float* Y16, float* Y, int64_t T, int64_t N, int64_t ldy, void* stream) {
+    auto& q = core::Runtime::get().stream(stream);
+    const auto e = q.parallel_for(sycl::range<1>((size_t) T * (size_t) N), NarrowCopyKernel{Y16, Y, T, N, ldy});
+    finish(stream, e, "xmx_copy_bf16_narrow");
 }
 
 void xmx_gemm_grouped(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds, int G,

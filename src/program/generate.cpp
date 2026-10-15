@@ -714,6 +714,10 @@ void usage() {
                  "                       --native: the SSD under it), `HW key value` lines; nothing else runs\n"
                  "  --kernel-bench       MEASURE (setup's --bench): the prompt path's products on synthetic data of\n"
                  "                       --pack's shapes, `KB kernel path shape us` lines; nothing else runs\n"
+                 "  --thin-shapes        with --kernel-bench, also compare BF16 thin and oneMath on T=32768/31393,\n"
+                 "                       N=1/4, K=2560/10240 and print TFLOPS\n"
+                 "                       The BF16 thin route itself is opt-in for the engine too:\n"
+                 "                       STRATA_BF16_THIN_XMX=1 (off by default; the regular path is unchanged)\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the argmax and\n"
                  "                       accept the drafts that match it, so speculation settings compare on the\n"
                  "                       same text (with --spec; not --serve)\n"
@@ -1918,7 +1922,7 @@ template <class F> double bench_us(void* stream, F&& run) {
 // paths this device takes now (the caller runs it again with STRATA_NO_XMX=1 and the like to compare them): a dense
 // projection (prefill::Gemm, a 4096-token chunk) and the experts' gate/up and down products of one MMQ launch (16
 // experts of 64 rows, in the type of the native pack's first layer) when the int8 matrix path is built.
-int kernel_bench(const std::string& pack) {
+int kernel_bench(const std::string& pack, bool thin_shapes = false) {
     const int64_t K = bench_hidden(pack);
     const int expert_type = bench_expert_type(pack);
     if (K <= 0 || K % 128 != 0) {
@@ -1948,6 +1952,74 @@ int kernel_bench(const std::string& pack) {
         strata::gpu::free(X);
         strata::gpu::free(W);
         strata::gpu::free(Y);
+    }
+    if (thin_shapes) {
+        // Instrument-only cases for the opt-in narrow BF16 route; ordinary --kernel-bench behavior is unchanged.
+        for (const int64_t T : {32768, 31393}) for (const int64_t N : {1, 4}) for (const int64_t k : {2560, 10240}) {
+            uint16_t *X = nullptr, *W = nullptr;
+            float* Y = nullptr;
+            if (!strata::gpu::alloc_device(&X, (size_t) T * (size_t) k * sizeof(uint16_t)) ||
+                !strata::gpu::alloc_device(&W, (size_t) N * (size_t) k * sizeof(uint16_t)) ||
+                !strata::gpu::alloc_device(&Y, (size_t) T * (size_t) N * sizeof(float))) {
+                std::printf("KB thin-bf16 allocation-failed %lldx%lldx%lld\n", (long long) T, (long long) N,
+                            (long long) k);
+                strata::gpu::free(X);
+                strata::gpu::free(W);
+                strata::gpu::free(Y);
+                continue;
+            }
+            strata::gpu::memset(X, 0x3c, (size_t) T * (size_t) k * sizeof(uint16_t));
+            strata::gpu::memset(W, 0x3c, (size_t) N * (size_t) k * sizeof(uint16_t));
+            strata::gpu::memset(Y, 0, (size_t) T * (size_t) N * sizeof(float));
+            strata::prefill::Gemm g;
+            std::string err;
+            if (!g.init(cs, 0, err)) {
+                std::fprintf(stderr, "strata --kernel-bench --thin-shapes: %s\n", err.c_str());
+                strata::gpu::free(X);
+                strata::gpu::free(W);
+                strata::gpu::free(Y);
+                continue;
+            }
+            std::vector<double> thin, onemkl;
+            auto set_thin_xmx = [](bool enabled) {
+#if defined(_WIN32)
+                _putenv_s("STRATA_BF16_THIN_XMX", enabled ? "1" : "");
+#else
+                if (enabled) setenv("STRATA_BF16_THIN_XMX", "1", 1);
+                else unsetenv("STRATA_BF16_THIN_XMX");
+#endif
+            };
+            auto time = [&](bool use_thin) {
+                set_thin_xmx(use_thin);
+                const auto start = Clock::now();
+                g.bf16(X, W, Y, T, N, k);
+                strata::gpu::stream_sync(cs);
+                return std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+            };
+            (void) time(false);
+            (void) time(true);
+            for (int i = 0; i < 5; ++i) {
+                thin.push_back(time(true));
+                onemkl.push_back(time(false));
+            }
+            std::sort(thin.begin(), thin.end());
+            std::sort(onemkl.begin(), onemkl.end());
+            const double tm = thin[2], om = onemkl[2];
+            const double ops = 2.0 * (double) T * (double) N * (double) k;
+            std::printf("KB thin-bf16 T=%lld N=%lld K=%lld thin_us=", (long long) T, (long long) N, (long long) k);
+            for (size_t i = 0; i < thin.size(); ++i) std::printf("%s%.2f", i ? "," : "", thin[i]);
+            std::printf(" thin_median=%.2f thin_tflops=%.3f onemkl_us=", tm, ops / tm / 1.0e6);
+            for (size_t i = 0; i < onemkl.size(); ++i) std::printf("%s%.2f", i ? "," : "", onemkl[i]);
+            std::printf(" onemkl_median=%.2f onemkl_tflops=%.3f\n", om, ops / om / 1.0e6);
+            strata::gpu::free(X);
+            strata::gpu::free(W);
+            strata::gpu::free(Y);
+        }
+#if defined(_WIN32)
+        _putenv_s("STRATA_BF16_THIN_XMX", "");
+#else
+        unsetenv("STRATA_BF16_THIN_XMX");
+#endif
     }
     namespace mmq = strata::prefill::mmq;
     if (!mmq::built() || !mmq::supported(expert_type)) {
@@ -2269,11 +2341,13 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a != "--hw-bench" && a != "--kernel-bench") continue;
         std::string pack, native;
+        bool thin_shapes = false;
         for (int j = 1; j + 1 < argc; ++j) {
             if (std::string(argv[j]) == "--pack") pack = argv[j + 1];
             if (std::string(argv[j]) == "--native") native = argv[j + 1];
         }
-        return a == "--hw-bench" ? hw_bench(pack, native) : kernel_bench(pack);
+        for (int j = 1; j < argc; ++j) if (std::string(argv[j]) == "--thin-shapes") thin_shapes = true;
+        return a == "--hw-bench" ? hw_bench(pack, native) : kernel_bench(pack, thin_shapes);
     }
     // a model with one residual stream (Ornith-1.5): plain_generate.cpp runs it
     if (const int r = strata::program::plain_main(argc, argv); r >= 0) return r;

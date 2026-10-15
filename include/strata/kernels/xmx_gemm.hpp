@@ -36,6 +36,14 @@ bool xmx_gemm_ok(const void* X, const void* W, const float* Y, int64_t N, int64_
 void xmx_gemm(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
               void* stream, bool accumulate = false);
 
+/// BF16 narrow output tile (16 columns per sub-group, instead of the regular 64).
+void xmx_pack_bf16_narrow(const uint16_t* W, uint16_t* W16, int64_t N, int64_t K, void* stream);
+void xmx_gemm_bf16_narrow(const uint16_t* X, const uint16_t* W16, float* Y16, int64_t T, int64_t K, void* stream);
+void xmx_gemm_bf16_dot1(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t K, int64_t ldy,
+                        void* stream);
+void xmx_copy_bf16_narrow(const float* Y16, float* Y, int64_t T, int64_t N, int64_t ldy, void* stream);
+
+/// Narrow BF16 products: W is a padded 16-column image and Y16 is an aligned T x 16 scratch.
 /// The products of G experts in one launch (FP16): expert e multiplies rows bounds[e] .. bounds[e + 1] of X (and
 /// writes them in Y, ldy = N) by its weights at W + e * w_stride.  `bounds` is on the device; `max_rows` bounds every
 /// expert's row count (it sizes the launch).
