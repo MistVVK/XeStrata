@@ -3515,6 +3515,12 @@ def warm_up(cfg_path: Path) -> None:
         port = sk.getsockname()[1]
     log = STATE / (cfg_path.stem + "-warmup.log")
     base = f"http://127.0.0.1:{port}"
+    # #19: a server with an API key answers /v1/* only with it - the key it takes (STRATA_API_KEY, else
+    # the config's "api_key": several keys separated by commas, or a list), the first one
+    keys = os.environ.get("STRATA_API_KEY") or cfg.get("api_key") or ""
+    keys = [str(k).strip() for k in keys] if isinstance(keys, list) else [k.strip() for k in str(keys).split(",")]
+    key = next((k for k in keys if k), "")
+    auth = {"Authorization": f"Bearer {key}"} if key else {}
     say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes) ...")
     t0 = time.time()
     with open(log, "w", encoding="utf-8") as out:
@@ -3527,8 +3533,10 @@ def warm_up(cfg_path: Path) -> None:
                 if proc.poll() is not None:
                     raise RuntimeError(f"the model stopped while starting (see {log.name})")
                 try:
-                    urllib.request.urlopen(base + "/v1/models", timeout=5).read()
+                    urllib.request.urlopen(urllib.request.Request(base + "/v1/models", headers=auth), timeout=5).read()
                     break
+                except urllib.error.HTTPError as e:    # it answers: started, but refuses the request
+                    raise RuntimeError(f"the model answered {e.code} {e.reason} (see {log.name})")
                 except (urllib.error.URLError, OSError):
                     if time.time() > deadline:
                         raise RuntimeError(f"the model did not start within 15 minutes (see {log.name})")
@@ -3543,7 +3551,7 @@ def warm_up(cfg_path: Path) -> None:
                                                           {"type": "image_url", "image_url": {"url": url}}]}])
             for messages in asks:
                 req = urllib.request.Request(base + "/v1/chat/completions",
-                                             headers={"Content-Type": "application/json"},
+                                             headers={"Content-Type": "application/json", **auth},
                                              data=json.dumps({"messages": messages, "max_tokens": 32,
                                                               "temperature": 0}).encode())
                 json.loads(urllib.request.urlopen(req, timeout=900).read())
