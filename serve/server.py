@@ -7152,6 +7152,17 @@ def main() -> int:
     svc.reasoning_loop_recovery = recovery
     svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
+    if not svc.gpu_pci and gpu_list(cfg):
+        try:
+            from serve.telemetry import pci_for_gpu_index
+            gpus = gpu_list(cfg)
+            resolved = [pci_for_gpu_index(idx) for idx in gpus]
+            if resolved and resolved[0]:
+                svc.gpu_pci = resolved[0]
+            if len(resolved) > 1 and all(x is not None for x in resolved[1:]):
+                svc.split_pci = [x for x in resolved[1:] if x is not None]
+        except Exception:
+            pass
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
