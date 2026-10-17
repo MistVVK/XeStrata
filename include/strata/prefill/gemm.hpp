@@ -71,6 +71,11 @@ private:
     uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
     uint16_t* tc_x_ = nullptr;
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
+    uint16_t* thin_w_ = nullptr;
+    float* thin_y_ = nullptr;
+    int64_t thin_w_elems_ = 0, thin_y_elems_ = 0;
+    const uint16_t* thin_w_source_ = nullptr;
+    int64_t thin_w_n_ = 0, thin_w_k_ = 0;
 };
 
 }  // namespace strata::prefill
