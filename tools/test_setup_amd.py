@@ -78,6 +78,9 @@ class KfdDetection(unittest.TestCase):
         # #524: the RX 6700 XT (gfx1031) takes the RDNA2 wheels, as the RX 6800 / 6900 (gfx1030)
         self.assertEqual(setup.ROCM_INDEXES["gfx1031"], setup.ROCM_INDEXES["gfx1030"])
         self.assertIsNone(setup.amd_problem({"arch": "gfx1031"}))
+        # #1375: the RX 6600 / 6650 XT (gfx1032) takes the same RDNA2 wheels and dp4a path as gfx1030/gfx1031
+        self.assertEqual(setup.ROCM_INDEXES["gfx1032"], setup.ROCM_INDEXES["gfx1030"])
+        self.assertIsNone(setup.amd_problem({"arch": "gfx1032"}))
 
 
 class Rx6000Detection(KfdDetection):
