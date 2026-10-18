@@ -10,9 +10,9 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
 
 #if STRATA_ONEMATH
-#include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
 #include <future>
@@ -228,6 +228,8 @@ Gemm::~Gemm() {
     if (!external_ && scratch_) strata::gpu::free(scratch_);
     if (tc_w_) strata::gpu::free(tc_w_);
     if (tc_x_) strata::gpu::free(tc_x_);
+    if (thin_w_) strata::gpu::free(thin_w_);
+    if (thin_y_) strata::gpu::free(thin_y_);
 }
 
 void Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems) {
@@ -292,6 +294,46 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                 bool accumulate) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
+    const char* thin = std::getenv("STRATA_BF16_THIN_XMX");
+    if (!accumulate && thin && std::strtol(thin, nullptr, 10) != 0 && N < 16 && K >= 32 && K % 32 == 0 &&
+        (reinterpret_cast<uintptr_t>(X) & 63) == 0 && strata::kernels::xmx_available(XmxType::bf16) &&
+        (uint64_t) K <= (uint64_t) INT64_MAX / 32 && (uint64_t) T <= (uint64_t) INT64_MAX / 64) {
+        if (N == 1 && (reinterpret_cast<uintptr_t>(W) & 31) == 0) {
+            strata::kernels::xmx_gemm_bf16_dot1(X, W, Y, T, K, ldy, stream_);
+            return;
+        }
+        const int64_t w_need = 16 * K;
+        // NarrowBf16Kernel may schedule two sub-groups (64 rows) per work-group; reserve every row its stores can touch.
+        const int64_t y_rows = ((T + 63) / 64) * 64;
+        const int64_t y_need = 16 * y_rows;
+        if (thin_w_elems_ < w_need) {
+            if (thin_w_) strata::gpu::free(thin_w_);
+            thin_w_ = nullptr;
+            thin_w_elems_ = 0;
+            if (strata::gpu::alloc_device(&thin_w_, (size_t) w_need * sizeof(uint16_t))) thin_w_elems_ = w_need;
+        }
+        if (thin_y_elems_ < y_need) {
+            if (thin_y_) strata::gpu::free(thin_y_);
+            thin_y_ = nullptr;
+            thin_y_elems_ = 0;
+            if (strata::gpu::alloc_device(&thin_y_, (size_t) y_need * sizeof(float))) thin_y_elems_ = y_need;
+        }
+        if (thin_w_ && thin_y_ && (reinterpret_cast<uintptr_t>(thin_w_) & 63) == 0 &&
+            (reinterpret_cast<uintptr_t>(thin_y_) & 63) == 0) {
+            // Reuse the packed image only while this Gemm sees the same immutable device weights at the same shape.
+            // Callers that mutate a weight allocation must use a new Gemm instance.
+            if (thin_w_source_ != W || thin_w_n_ != N || thin_w_k_ != K) {
+                strata::kernels::xmx_pack_bf16_narrow(W, thin_w_, N, K, stream_);
+                thin_w_source_ = W;
+                thin_w_n_ = N;
+                thin_w_k_ = K;
+            }
+            strata::kernels::xmx_gemm_bf16_narrow(X, thin_w_, thin_y_, T, K, stream_);
+            strata::kernels::xmx_copy_bf16_narrow(thin_y_, Y, T, N, ldy, stream_);
+            return;
+        }
+    }
+    // Keep products outside the opt-in narrow BF16 XMX case on the existing hardware-compatible paths.
     if (!accumulate && bf16_through_f16(X, W, Y, T, N, K, ldy)) return;
 #if STRATA_ONEMATH
     if (blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;

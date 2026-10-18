@@ -623,6 +623,10 @@ if(STRATA_ENABLE_XE)
   add_executable(strata-image src/image/strata_image.cpp)
   target_link_libraries(strata-image PRIVATE strata_image)
 
+  add_executable(bf16_thin_gemm_tool tools/bf16_thin_gemm_tool.cpp)
+  target_link_libraries(bf16_thin_gemm_tool PRIVATE strata_prefill)
+  target_link_options(bf16_thin_gemm_tool PRIVATE -fsycl-device-code-split=per_kernel)
+
   if(STRATA_BUILD_TESTS)
     add_executable(elementwise_parity src/kernels/elementwise_parity.cpp)
     target_link_libraries(elementwise_parity PRIVATE strata_kernels)
