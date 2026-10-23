@@ -49,6 +49,9 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 #define T_TQ2T 144    // agentionai's trellis types (Gyro): 128 values a block, 34 / 26 / 30 bytes, Hadamard-folded experts
 #define T_TQK6 145
 #define T_TQK7 146
+#define T_TQP5 147    // pair trellis (V=2): 128 values = fp16 d + 64 steps of K = 5 / 6 / 7 bits, 42 / 50 / 58 bytes
+#define T_TQP6 148
+#define T_TQP7 149
 
 template <int F> struct fmt;
 // QK block elements, BB block bytes, UNIT weights per unit, TAB words of threadgroup table
@@ -77,6 +80,10 @@ template <> struct fmt<T_Q5_1>    { enum { QK = 32,  BB = 24,  UNIT = 32, TAB = 
 template <> struct fmt<T_TQ2T>    { enum { QK = 128, BB = 34,  UNIT = 16, TAB = 2048 }; };
 template <> struct fmt<T_TQK6>    { enum { QK = 128, BB = 26,  UNIT = 16, TAB = 2048 }; };
 template <> struct fmt<T_TQK7>    { enum { QK = 128, BB = 30,  UNIT = 16, TAB = 2048 }; };
+// pair trellis: a unit is 8 steps of 2 weights = 16 weights
+template <> struct fmt<T_TQP5>    { enum { QK = 128, BB = 42,  UNIT = 16, TAB = 2048 }; };
+template <> struct fmt<T_TQP6>    { enum { QK = 128, BB = 50,  UNIT = 16, TAB = 2048 }; };
+template <> struct fmt<T_TQP7>    { enum { QK = 128, BB = 58,  UNIT = 16, TAB = 2048 }; };
 
 static inline uint rd32(device const uchar* p) {
     device const ushort* s = (device const ushort*)p;
@@ -372,6 +379,9 @@ template <int F> static inline void load_tab_tq(threadgroup uint* tab, ushort ti
 template <> inline void load_tab<T_TQ2T>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQ2T>(tab, tid, nth); }
 template <> inline void load_tab<T_TQK6>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQK6>(tab, tid, nth); }
 template <> inline void load_tab<T_TQK7>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQK7>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP5>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP5>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP6>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP6>(tab, tid, nth); }
+template <> inline void load_tab<T_TQP7>(threadgroup uint* tab, ushort tid, ushort nth) { load_tab_tq<T_TQP7>(tab, tid, nth); }
 template <> inline void load_tab<T_Q2_0R>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q8_0>(threadgroup uint*, ushort, ushort) {}
 template <> inline void load_tab<T_Q4_0>(threadgroup uint*, ushort, ushort) {}
@@ -643,6 +653,30 @@ static inline float deq_tq(device const uchar* b, int ui, thread float* q, threa
 template <> inline float deq<T_TQ2T>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<8>(b, ui, q, tab); }
 template <> inline float deq<T_TQK6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<6>(b, ui, q, tab); }
 template <> inline float deq<T_TQK7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<7>(b, ui, q, tab); }
+
+// TQP5 / TQP6 / TQP7 (ggml 147-149, the fork's block_tqp*): 128 values = fp16 d + a circular 64 * K bit stream; step t
+// (weights 2t, 2t+1) has the 16 stream bits from bit (63 - t) * K (LSB first, wrapping mod 64 * K) as its state, and its
+// pair is the first codebook point of that state: lut[(state & 0x7FFF) * 0x9e3779b1 >> 21], times d.  A unit is
+// lane ui = steps 8ui..8ui+7, 16 weights.
+template <int KB>
+static inline float deq_tqp(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {
+    constexpr int NB = 8 * KB;
+    device const uchar* qs = b + 2;
+    for (int i = 0; i < 8; ++i) {
+        const int off = (63 - 8 * ui - i) * KB, i0 = off >> 3;
+        const int i1 = i0 + 1 >= NB ? i0 + 1 - NB : i0 + 1;
+        const int i2 = i0 + 2 >= NB ? i0 + 2 - NB : i0 + 2;
+        const uint w = uint(qs[i0]) | (uint(qs[i1]) << 8) | (uint(qs[i2]) << 16);
+        const uint x = ((w >> (off & 7)) & 0x7FFFu) * 0x9e3779b1u;
+        const float2 a = float2(as_type<half2>(g_tq(tab, x >> 21)));
+        q[2 * i] = a.x;
+        q[2 * i + 1] = a.y;
+    }
+    return rdh(b);
+}
+template <> inline float deq<T_TQP5>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<5>(b, ui, q, tab); }
+template <> inline float deq<T_TQP6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<6>(b, ui, q, tab); }
+template <> inline float deq<T_TQP7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tqp<7>(b, ui, q, tab); }
 
 // sum over groups of LPR consecutive lanes (LPR = 1, 2, 4, 8, 16 or 32); the result is valid in every lane
 template <int LPR>
