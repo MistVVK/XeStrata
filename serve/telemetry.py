@@ -322,7 +322,7 @@ class _AmdGpu:
             dev = os.path.realpath(os.path.join(card, "device"))
             if os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) != "amdgpu":
                 continue
-            if pci is None or os.path.basename(dev) == pci:
+            if pci is None or os.path.basename(dev).lower() == pci.lower():
                 self.dev = dev
                 break
         self.hwmon = None
@@ -460,6 +460,30 @@ class _NvGpu:
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
         return out
+
+
+def pci_for_gpu_index(index: int) -> str | None:
+    """The PCI address (e.g. "0000:0e:00.0") for a 0-based GPU index under CUDA_DEVICE_ORDER=PCI_BUS_ID,
+    or None if the index cannot be resolved."""
+    if index < 0:
+        return None
+    cards, seen = [], set()
+    for card in sorted(glob.glob(os.path.join(SYSFS, "class", "drm", "card[0-9]*"))):
+        name = os.path.basename(card)
+        if "-" in name:
+            continue
+        dev = os.path.realpath(os.path.join(card, "device"))
+        driver_path = os.path.join(dev, "driver")
+        if not os.path.exists(driver_path):
+            continue
+        driver = os.path.basename(os.path.realpath(driver_path))
+        if driver in ("amdgpu", "xe", "i915", "nvidia"):
+            pci = os.path.basename(dev).lower()
+            if pci not in seen:
+                seen.add(pci)
+                cards.append(pci)
+    cards.sort()
+    return cards[index] if 0 <= index < len(cards) else None
 
 
 def _gpu(pci=None):
