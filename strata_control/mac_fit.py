@@ -78,8 +78,11 @@ def spec_args(model: str, stream: bool, mtp: bool) -> list[str]:
         return ["--spec", "3", "--spec-min-p", SPEC3_MIN_P]
     return ["--spec", "2"]
 # beside the mapped file: the prompt kernels' buffers (chunks of 2,048 rows), the KV cache, the draft layer, the
-# Q8_0 copies of the hyper-connection matrices and the macOS desktop
-OVERHEAD_GB = 8.0
+# Q8_0 copies of the hyper-connection matrices and the macOS desktop.  12 GiB, the engine's own figure
+# (metal/src/engine/stream.cpp, ExpertStream::wanted): with 8 GB setup kept Gyro-S resident on a 48 GB M4 Pro where the
+# engine streams, and the forced resident run paged its weights in and out until the watchdog stopped it (engine 0.1.48;
+# the process held 10.8 GB beside the weights there, without the draft layer)
+OVERHEAD_GB = 12.0 * 1.073741824
 # the share of the unified memory Metal lets one process keep resident (recommendedMaxWorkingSetSize): 107.5 of 128 GB
 # measured on the M5 Max; 3/4 is the conservative rule for the other sizes
 GPU_SHARE = 0.75
@@ -165,12 +168,13 @@ def mac_problems(info: dict, need_compiler: bool = True) -> list[str]:
 
 
 def gpu_budget_gb(ram_gb: float) -> float:
-    """The most a resident pack may hold, in GB: Metal's working set, and on a big Mac the RAM less what macOS and the file
-    cache keep (the engine's resident_cap: min of the two)."""
-    ws = ram_gb * GPU_SHARE * GIB_GB
+    """The most a resident pack may hold, in GB: Metal's working set, and the RAM less what macOS keeps (7 GB or 15%, on a
+    big Mac 30%) - the engine's resident_cap in arena_budget.h: min of the two."""
+    phys = ram_gb * GIB_GB
+    leave = max(7.0, 0.15 * phys)
     if ram_gb >= BIG_MAC_GB:
-        return min(ws, ram_gb * GIB_GB * (1.0 - RESIDENT_LEAVE_SHARE))
-    return ws
+        leave = max(leave, RESIDENT_LEAVE_SHARE * phys)
+    return min(phys * GPU_SHARE, phys - leave)
 
 
 # The families the Mac app (setup.py's mac_control_setup and the app's model list) installs: the GSQ-RCO Qwen files, Unsloth's sets (several shards:
