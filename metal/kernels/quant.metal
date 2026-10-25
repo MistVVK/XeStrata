@@ -49,9 +49,11 @@ static inline void put_x16(device float* xp, uint plane, uint idx, uint jj, floa
 #define T_TQ2T 144    // agentionai's trellis types (Gyro): 128 values a block, 34 / 26 / 30 bytes, Hadamard-folded experts
 #define T_TQK6 145
 #define T_TQK7 146
-#define T_TQP5 147    // pair trellis (V=2): 128 values = fp16 d + 64 steps of K = 5 / 6 / 7 bits, 42 / 50 / 58 bytes
+#define T_TQP5 147    // the pair trellis (V = 2): 64 steps of 2 weights, K = 5 / 6 / 7 bits a step, 42 / 50 / 58 bytes
 #define T_TQP6 148
 #define T_TQP7 149
+#define TQ_STATE_BITS 15    // the pair trellis state: the low 15 of the 16 stream bits
+#define TQ_STATE_MASK 0x7fffu
 
 template <int F> struct fmt;
 // QK block elements, BB block bytes, UNIT weights per unit, TAB words of threadgroup table
@@ -654,23 +656,33 @@ template <> inline float deq<T_TQ2T>(device const uchar* b, int ui, thread float
 template <> inline float deq<T_TQK6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<6>(b, ui, q, tab); }
 template <> inline float deq<T_TQK7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<7>(b, ui, q, tab); }
 
-// TQP5 / TQP6 / TQP7 (ggml 147-149, the fork's block_tqp*): 128 values = fp16 d + a circular 64 * K bit stream; step t
-// (weights 2t, 2t+1) has the 16 stream bits from bit (63 - t) * K (LSB first, wrapping mod 64 * K) as its state, and its
-// pair is the first codebook point of that state: lut[(state & 0x7FFF) * 0x9e3779b1 >> 21], times d.  A unit is
-// lane ui = steps 8ui..8ui+7, 16 weights.
+// Pair trellis (ggml 147 TQP5, 148 TQP6, 149 TQP7): a 128-value block is {fp16 d; qs}, 64 steps of 2 weights; a unit
+// is lane ui = steps 8ui..8ui+7, 16 weights.  Step t's 15-bit state: the 16 stream bits from bit (63 - t)*K, LSB
+// first, circular over 64*K bits (the fork's tqp_state).  The lane's steps lie in the bits from S = (56 - 8ui)*K =
+// 8*(7 - ui)*K, so r = S & 15 is 0 or 8; step 8ui + j is at S + (7 - j)*K and r + 7*K + 15 <= 72: five u16 words of
+// the 4*K-word stream cover the lane's window (the fifth only when r + 7K + 15 > 64, never for K = 5).  Weight pair
+// j = the FIRST codebook point of the hash: lut[x >> 21] as an fp16 pair, times d.  Same arithmetic as the fork's
+// ggml-cuda/tq.cuh (tqp_states8) and ggml-quants.c (dequantize_row_tqp_impl).
 template <int KB>
 static inline float deq_tqp(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {
-    constexpr int NB = 8 * KB;
-    device const uchar* qs = b + 2;
-    for (int i = 0; i < 8; ++i) {
-        const int off = (63 - 8 * ui - i) * KB, i0 = off >> 3;
-        const int i1 = i0 + 1 >= NB ? i0 + 1 - NB : i0 + 1;
-        const int i2 = i0 + 2 >= NB ? i0 + 2 - NB : i0 + 2;
-        const uint w = uint(qs[i0]) | (uint(qs[i1]) << 8) | (uint(qs[i2]) << 16);
-        const uint x = ((w >> (off & 7)) & 0x7FFFu) * 0x9e3779b1u;
+    device const ushort* qs16 = (device const ushort*)(b + 2);
+    constexpr int NW = 4 * KB;
+    const int S = (56 - 8 * ui) * KB, wb = S >> 4, r = S & 15;
+    const int wi1 = wb + 1 >= NW ? wb + 1 - NW : wb + 1;
+    const int wi2 = wb + 2 >= NW ? wb + 2 - NW : wb + 2;
+    const int wi3 = wb + 3 >= NW ? wb + 3 - NW : wb + 3;
+    ulong v = ulong(qs16[wb]) | (ulong(qs16[wi1]) << 16) | (ulong(qs16[wi2]) << 32) | (ulong(qs16[wi3]) << 48);
+    v >>= r;
+    if (8 + 7 * KB + TQ_STATE_BITS > 64 && r) {   // r is 0 or 8; for r = 0 the fifth word is not needed
+        const int wi4 = wb + 4 >= NW ? wb + 4 - NW : wb + 4;
+        v |= ulong(qs16[wi4]) << (64 - r);
+    }
+    for (int j = 0; j < 8; ++j) {
+        const uint s = uint(v >> ((7 - j) * KB)) & TQ_STATE_MASK;
+        const uint x = s * 0x9e3779b1u;
         const float2 a = float2(as_type<half2>(g_tq(tab, x >> 21)));
-        q[2 * i] = a.x;
-        q[2 * i + 1] = a.y;
+        q[2 * j] = a.x;
+        q[2 * j + 1] = a.y;
     }
     return rdh(b);
 }
