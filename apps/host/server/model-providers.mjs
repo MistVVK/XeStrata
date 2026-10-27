@@ -1,6 +1,7 @@
 /** Saved API connections. Secrets never leave the host's private credentials file. */
 import { modelReadsPictures, modelSupportsReasoning } from './vision-probe.mjs';
 import { isOpenRouter, OPENROUTER_EFFORTS } from './agent/profile.mjs';
+import { validateChatImages } from './chat-images.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -49,6 +50,33 @@ export function normalizeBaseUrl(value) {
 }
 const publicConnection = ({ apiKey, ...connection }) => ({ ...connection, apiKeySet: !!apiKey });
 const numeric = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+/** The UI replays earlier pictures as OpenAI content blocks. Keep their question
+ * and pixels together so another model (or a restarted engine) can read them.
+ * Text-only history keeps its original representation and 40-message limit. */
+function providerHistory(history, protocol, vision, currentPictures) {
+  const picturesAllowed = protocol === 'openai-chat' && vision !== false;
+  const messages = history.filter(m => m && ['user', 'assistant'].includes(m.role)).map(m => {
+    if (typeof m.content === 'string') return { role: m.role, content: m.content };
+    if (!Array.isArray(m.content)) return null;
+    const parts = [];
+    for (const part of m.content) {
+      if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
+      if (part.type === 'text' && typeof part.text === 'string') {
+        parts.push({ type: 'text', text: part.text });
+      } else if (part.type === 'image_url' && picturesAllowed && m.role === 'user') {
+        const image = validateChatImages([{ url: part.image_url?.url }])[0];
+        parts.push({ type: 'image_url', image_url: { url: image.url } });
+      }
+    }
+    if (!parts.length) return null;
+    const content = parts.some(p => p.type === 'image_url') ? parts : parts.map(p => p.text).join('\n');
+    return { role: m.role, content };
+  }).filter(Boolean).slice(-40);
+  const pictureCount = messages.reduce((n, m) => n + (Array.isArray(m.content) ? m.content.filter(p => p.type === 'image_url').length : 0), 0);
+  if (pictureCount + currentPictures > 4) fail('Attach up to four pictures per message, including earlier pictures.');
+  return messages;
+}
 
 export function createModelProviders({ directory, changed = () => {}, fetchImpl = fetch, knownThinks = () => null }) {
   mkdirSync(directory, { recursive: true });
@@ -146,9 +174,9 @@ export function createModelProviders({ directory, changed = () => {}, fetchImpl 
   async function stream({ selection, message, history = [], systemPrompt = '', images = [], thinking, signal, onFrame }) {
     const { connection, model } = resolve(selection);
     const started = Date.now();
-    const messages = history.filter(m => ['user', 'assistant'].includes(m.role) && typeof m.content === 'string').slice(-40).map(m => ({ role: m.role, content: m.content }));
     // Pictures only go to OpenAI-style servers (the one protocol every local server shares); other protocols keep the text.
     const pics = connection.protocol === 'openai-chat' ? images : [];
+    const messages = providerHistory(history, connection.protocol, model.vision, pics.length);
     messages.push({ role: 'user', content: pics.length ? [{ type: 'text', text: message }, ...pics.map(i => ({ type: 'image_url', image_url: { url: i.url } }))] : message });
     const protocol = connection.protocol;
     const payload = protocol === 'anthropic'
