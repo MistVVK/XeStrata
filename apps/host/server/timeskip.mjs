@@ -480,7 +480,10 @@ export function createTimeSkip({ repoRoot, python, pythonArgs = [], timeoutMs = 
       }
       live.set(id, child);
       endedOf.set(id, ended);
-      void ended.then(() => live.delete(id));
+      // Both maps are keyed by the run id and nothing waits on them once the job has ended: `stop` took the promise
+      // before it settled (afterwards `?? Promise.resolve()` answers at once), so the ended run leaves both. The
+      // run's own record on disk is what stays, and `list` reads that.
+      void ended.then(() => { live.delete(id); endedOf.delete(id); });
       return { ok: true, run: withLive(summarise(readRun(root, id))) };
     },
 

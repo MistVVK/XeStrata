@@ -765,6 +765,10 @@ const TIMESKIP_REVISE = process.env.STRATA_TIMESKIP_REVISE
 const INTERNAL_SECRET = randomBytes(24).toString('hex');
 /** The model a trial runs on, by run id: the chat's saved API model when it uses one, else the loaded local model. */
 const timeskipChoices = new Map();
+/** How many of those to keep: a finished run never asks for its model again, and only the newest trials can still be
+ * revised. The same bound the request board and the Time-skip listing use (serving.mjs `MAX_REQUESTS`, timeskip.mjs
+ * `MAX_LISTED`). */
+const TIMESKIP_CHOICE_CAP = 60;
 /** Trials this host is driving: run id -> { chatId (the chat that asked), turnChat (the assistant's own chat id), controller, step (the assistant's current status), lastSent }. */
 const trials = new Map();
 const trialByChat = new Map();
@@ -779,17 +783,30 @@ function trialActivity(run) {
     default: return null;
   }
 }
+/** Forget a trial this host drives: its poll, its entry, the chat's pointer to it, and the model it ran on (a trial
+ * whose record on disk is gone can never ask for that model again). Every way out of `watchTrial` and `stopTrial`
+ * goes through here, so dropping one of the four can no longer leave the other three behind. */
+function dropTrial(id, timer) {
+  if (timer) clearInterval(timer);
+  const trial = trials.get(id);
+  trials.delete(id);
+  if (trial?.chatId) trialByChat.delete(trial.chatId);
+  timeskipChoices.delete(id);
+}
 /** Tell the page when the job's phase or the assistant's step changed (SSE `timeskip`), at most every 2 s. */
 function watchTrial(id) {
   const trial = trials.get(id);
   if (!trial) return;
   const timer = setInterval(() => {
     const run = timeskip.status(id);
-    if (!run) { clearInterval(timer); return; }
+    // The run's record is gone (its folder was deleted, or another program removed it): the trial is over, so it
+    // goes with everything keyed on its id - clearing only the timer left the entry, the chat's pointer and the
+    // model choice held until the host restarted.
+    if (!run) { dropTrial(id, timer); return; }
     const activity = trialActivity(run);
     const key = JSON.stringify([run.phase, activity]);
     if (key !== trial.lastSent) { trial.lastSent = key; hub.send('timeskip', { id, phase: run.phase, activity }); }
-    if (['completed', 'cancelled', 'failed', 'interrupted'].includes(run.phase)) { clearInterval(timer); trials.delete(id); if (trial.chatId) trialByChat.delete(trial.chatId); }
+    if (['completed', 'cancelled', 'failed', 'interrupted'].includes(run.phase)) dropTrial(id, timer);
   }, 2000);
   timer.unref?.();
   trial.timer = timer;
@@ -799,7 +816,7 @@ async function stopTrial(id) {
   const trial = trials.get(id);
   if (trial) { trial.controller?.abort(); if (trial.turnChat) void agent.stop(trial.turnChat).catch(() => {}); }
   const stopped = await timeskip.stop(id);
-  if (trial) { clearInterval(trial.timer); trials.delete(id); if (trial.chatId) trialByChat.delete(trial.chatId); }
+  dropTrial(id, trial?.timer);
   if (stopped) hub.send('timeskip', { id, phase: 'cancelled', activity: null });
   return stopped;
 }
@@ -1200,7 +1217,12 @@ async function api(req, res, path, method, url) {
     trials.set(result.run.id, { chatId, turnChat: null, controller: null, step: null, lastSent: '' });
     if (chatId) trialByChat.set(chatId, result.run.id);
     watchTrial(result.run.id);
-    if (body.remoteModel?.connectionId && body.remoteModel?.modelId) timeskipChoices.set(result.run.id, { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) });
+    if (body.remoteModel?.connectionId && body.remoteModel?.modelId) {
+      timeskipChoices.set(result.run.id, { connectionId: String(body.remoteModel.connectionId), modelId: String(body.remoteModel.modelId) });
+      // The revision step reads this while the job works. Without a bound the map kept one entry for every trial this
+      // app ever started - never read again, never dropped. A Map iterates in insertion order, so the oldest goes first.
+      if (timeskipChoices.size > TIMESKIP_CHOICE_CAP) timeskipChoices.delete(timeskipChoices.keys().next().value);
+    }
     return json(res, 200, { run: { ...result.run, activity: trialActivity(result.run) }, simulated: false });
   }
   if (path === '/api/timeskip/files' && method === 'GET') {
