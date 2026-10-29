@@ -5337,6 +5337,23 @@ class AmdTelemetry(unittest.TestCase):
                 self.assertFalse(telemetry.gpu_reader(0, amd=True).ok())
                 self.assertIsNone(telemetry.free_vram_mib(0, amd=True))
 
+    def test_each_card_has_its_own_link_in_gpus(self):
+        """The app reads each GPU tile from that card's record: "gpus" had no PCIe keys, so every PCIe tile in the
+        Monitor was empty on a two-card PC.  The machine's gpu_* link figures are its narrowest card's, not the
+        first card's (a Gen4 card in a Gen3 slot beside a x16 one used to make the whole machine read Gen4 x16)."""
+        from serve import telemetry
+        with tempfile.TemporaryDirectory() as d:
+            self.tree(d)
+            for minor, speed, width in (("129", "16.0 GT/s PCIe", "16"), ("128", "8.0 GT/s PCIe", "8")):
+                dev = Path(d) / f"class/drm/renderD{minor}/device"
+                (dev / "current_link_speed").write_text(speed + "\n")
+                (dev / "current_link_width").write_text(width + "\n")
+            with mock.patch.object(telemetry, "SYSFS", d):
+                s = telemetry.Telemetry(gpu_index=0, gpu_indices=[0, 1], amd=True).sample()
+            self.assertEqual([(g["index"], g["pcie_gen"], g["pcie_gen_max"], g["pcie_width"]) for g in s["gpus"]],
+                             [(0, 4, 4, 16), (1, 3, 3, 8)])
+            self.assertEqual((s["gpu_pcie_gen"], s["gpu_pcie_gen_max"], s["gpu_pcie_width"]), (3, 3, 8))
+
     def test_free_vram_on_hip(self):
         from serve import telemetry
         tok = ByteTokenizer()

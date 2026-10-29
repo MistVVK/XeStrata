@@ -537,7 +537,8 @@ class Telemetry:
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the AMD backend's
+        PCIe traffic), mean (load), narrowest (a card's PCIe link, which no machine can be faster than) or hottest
+        (temperature), and "gpus" has each card's own readings, its link included.  `amd`: the AMD backend's
         cards, numbered as HIP numbers them, read from sysfs (#301)."""
         self.extra = extra
         self.lock = threading.Lock()
@@ -619,8 +620,19 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+                # a link is not a sum: the machine is only as fast as its narrowest card, so the gpu_* link figures
+                # report the narrowest one (they used to be the first card's, which read high when a Gen4 card was
+                # put in a Gen3 slot, or a x8 card next to a x16 one)
+                for k in ("pcie_gen", "pcie_gen_max", "pcie_width"):
+                    v = vals(k)
+                    g[k] = min(v) if v else None
+                # each card's own link and traffic, the way the gpu_* totals have them: "gpus" carried util, VRAM,
+                # temperature and power only, so the app's per-GPU PCIe tiles had nothing to read on a two-card PC
                 s["gpus"] = [{"index": i, "name": reader.name(), "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power")}
+                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
+                              "pcie_gen": r.get("pcie_gen"), "pcie_gen_max": r.get("pcie_gen_max"),
+                              "pcie_width": r.get("pcie_width"), "pcie_rx_mb": r.get("pcie_rx_mb"),
+                              "pcie_tx_mb": r.get("pcie_tx_mb")}
                              for (i, r), (_, reader) in zip(reads, self.gpus)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
         if self.ps:
