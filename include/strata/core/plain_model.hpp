@@ -37,6 +37,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/moe_window.hpp"
+#include "strata/core/vmm.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -45,6 +46,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,6 +63,10 @@ struct PlainOptions {
     /// --kv int8: the attention layers' K and V as int8 codes with an FP16 scale per 64 values (kv_q8.hpp), half the
     /// FP16 cache's bytes; the answers differ slightly.  Not GLM-5.3-Flash's DSA caches.
     bool kv_int8 = false;
+    /// --kv q4_0 (1): K and V as Q4_0 after the 256-point Hadamard rotation (kv_q4.hpp, the query rotated the same way
+    /// and the output back); --kv k8v4 (2): K in INT8 (kv_int8's codes and scales), V rotated Q4_0.  head_dim 256 only;
+    /// not GLM-5.3-Flash's caches.
+    int kv_q4 = 0;
     /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
     /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
     /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
@@ -82,8 +88,20 @@ struct PlainOptions {
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
+    /// --batch N (--serve): conversations decoded together, one row each in a window (plain_serve's batch slots), each
+    /// slot its own copy of the per-sequence state; at most max_t, as many as take half the VRAM free before the
+    /// expert tier at most.  Not GLM-5.3-Flash's nor with --vision (one table of rotary positions) for now.
+    int batch_slots = 0;
+    /// --kv-grow (1) / --no-kv-grow (0) (--serve): the live session's K/V in virtual memory, physical memory only for
+    /// the cells the requests reach, the expert tier (in --vram-elastic's segments) giving VRAM up for them and taking
+    /// it back after a short request; -1: on where the device's virtual memory pages are 2 MiB or more, as
+    /// Qwen3.8-Flash-Next's.  One GPU, a model with experts, no --batch.
+    int kv_grow = -1;
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
+    int pool_tasks = 0;             ///< --pool-tasks: the pool's tasks a phase (0: 3 a participating thread)
+    bool pool_host_works = true;    ///< --no-host-worker: false, the host thread does not join the pool's drain
     int64_t reserve_mib = -1;       ///< VRAM left free after the expert slots (-1: from the device's memory)
+    int64_t reserve_later_mib = -1; ///< ... on a layer split's later GPUs (-1: reserve_mib)
     int64_t vram_free_mib = -1;     ///< the free VRAM the tier is sized from at most (-1: what the device reports)
     int64_t expert_slots = -1;      ///< the VRAM tier's slots at most, over all the layers (-1: what fits)
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
@@ -100,7 +118,19 @@ struct PlainOptions {
     /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
     bool mmap_experts = false;
+    /// generate.cpp's resident low-RAM mode: the experts read in place, and those no VRAM tier holds copied into RAM
+    /// in the profile's order (finish_experts) while they fit `resident_gib` GiB (< 0: --resident-experts, as many as
+    /// the RAM allows; 0: none beyond what the RAM's own shortage picks); `resident_pageable` (--resident-cpu-experts):
+    /// the copy in ordinary RAM, not page-locked
+    double resident_gib = 0;
+    bool resident_pageable = false;
+    /// --shared-expert-arena FILE (Linux): the experts' RAM shared with the other engines that name it (the arena's
+    /// first loader fills it, the rest map it), as Qwen3.8-Flash-Next's
+    std::string shared_arena;
     bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
+    /// --pcie-frac F: that share of the missed experts over PCIe in every window, instead of the measured split and the
+    /// decode's first windows' choice (< 0: measured)
+    double pcie_frac = -1.0;
     /// A ranking of (MoE layer, expert) pairs (expert_cache.hpp's profile format) the VRAM tier is filled from at load,
     /// each layer up to its slots; empty: the tier starts empty and the adaptive rule fills it.
     std::string profile;
@@ -113,6 +143,9 @@ struct PlainOptions {
     std::string rope_scaling;
     double rope_scale = 0;
     double yarn_orig_ctx = 0;
+    /// YaRN's other knobs, as llama.cpp's (generate.cpp's --yarn-*): the correction depth (< 0: 1 for yarn, else 0),
+    /// the magnitude scale and the two ramps' bounds
+    double yarn_ext_factor = -1.0, yarn_attn_factor = 1.0, yarn_beta_fast = 32.0, yarn_beta_slow = 1.0;
     /// The routed experts written here, a record a token and MoE layer as generate.cpp's --dump-routing writes them
     /// (int32 layer, int32 k, k int32 ids, k float weights, 0 here): tools/make_profile.py reads them.  Empty: none.
     std::string dump_routing;
@@ -183,6 +216,21 @@ public:
     };
     bool save_state(int64_t tokens, Snapshot& snap, std::string& err);
     bool restore_state(const Snapshot& snap, std::string& err);
+    /// The recurrent layers' part of it alone (plain_serve's mid-prompt checkpoints): every stage's recurrent states and
+    /// convolution histories as `tokens` tokens left them.  Restoring one is right only while the K/V cells below
+    /// `tokens` still hold the same tokens; nothing for a model without a recurrent state.
+    bool save_recurrent(int64_t tokens, Snapshot& snap, std::string& err);
+    bool restore_recurrent(const Snapshot& snap, std::string& err);
+    /// --batch: the slots the load gave (on every stage), and the state of the first `tokens` tokens copied on the
+    /// device from session `from` to session `to` (-1: the live one, else a slot), the recurrent parts alone with
+    /// `recurrent_only`; save_slot is save_state's for slot b.  Into the live session, the pending draft is dropped.
+    int batch_slot_count() const;
+    bool copy_session(int from, int to, int64_t tokens, bool recurrent_only, std::string& err);
+    bool save_slot(int b, int64_t tokens, Snapshot& snap, std::string& err);
+    /// A batch window: row t is token tokens[t] of slot slot[t] (ascending, each once) at its position pos[t],
+    /// out[t] the token after it, drawn with sp[t] (the row's position its counter).  T <= max_t.
+    bool forward_slots(const int32_t* tokens, const int* slot, const int64_t* pos,
+                       const strata::kernels::SamplerParams* sp, int T, int32_t* out, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
@@ -204,6 +252,18 @@ public:
     /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
     /// seed repeats a run.
     void set_sampler(const strata::kernels::SamplerParams& sp);
+    /// A request's constraints on the picks (serve's logit_bias, grammar and penalties, the sampler's chain): a bias
+    /// over the vocabulary (empty: none); the grammar's mask for the next pick, (n_vocab + 31) / 32 words (null:
+    /// any); the tokens the penalties count, the last ones before the next pick (the sampler's penalty_last_n of them;
+    /// none: no penalties).  A window's every row takes the same ones, so a request with them decodes a token a window.
+    /// On the last stage, which picks.
+    bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    bool set_allowed(const uint32_t* row, std::string& err);
+    bool set_history(const int32_t* tokens, int n, std::string& err);
+    /// --spec-window min-p's floor for this request (setup's calibration, spec_min_p=); < 0: the engine's own rule
+    void set_spec_min_p(double p) { for (PlainModel* st : chain()) st->req_spec_min_p_ = p; }
+    /// The PCIe share of the missed experts for this request (setup's calibration, pcie_frac=); < 0: the engine's own
+    void set_pcie_frac(double f);
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
@@ -260,6 +320,13 @@ public:
     /// GPU's, with a layer split).
     int64_t slots() const;
     int64_t resident() const;
+    /// For the engine's INFO line (generate.cpp's fields): the experts' RAM ("arena": all of them, "resident": the
+    /// copy of those no VRAM tier holds, "none": read in place) and its bytes, the tier's bytes
+    const char* experts_ram() const;
+    uint64_t experts_ram_bytes() const;
+    uint64_t tier_bytes() const { return (uint64_t) cache_.mapped_bytes(); }
+    /// The CPU pool's worker CPUs (--aux-cpus' plan places the other threads beside them); empty without a pool
+    std::vector<int> pool_worker_cpus() const;
     int64_t hits() const;
     int64_t misses() const;
     int64_t swaps() const;
@@ -274,6 +341,14 @@ public:
     /// `answer` gets the protocol line (VRAM reserve_mib=... expert_slots=...); false with `err` when not elastic.
     bool vram(int64_t reserve_mib, std::string& answer, std::string& err);
     bool vram_elastic() const { return cache_.segmented(); }
+    /// --kv-grow: the K/V holds at least `cells` cells (whole steps), the tier giving VRAM up for them; and, when it
+    /// holds far more than `cells`, it gives the rest back to the tier.  Between requests; true without --kv-grow.
+    bool kv_grow_to(int64_t cells, std::string& err);
+    bool kv_trim(int64_t cells, std::string& err);
+    bool kv_elastic() const { return kv_cells_ >= 0; }
+    /// --control-vector: the loaded vector's tables (kernels/cvec.hpp, cvec_upload) on every stage's GPU too, before
+    /// the first window; the blocks then apply it after their FFN (steer)
+    bool replicate_cvec(std::string& err);
     /// STRATA_RAM_ADAPT's moves into the RAM copy so far
     int64_t ram_adapts() const { return complement_ != nullptr ? complement_->ram_adapts() : 0; }
     /// ...of them, copied out of a stage buffer
@@ -375,11 +450,41 @@ private:
     /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
     bool open_dense(std::string& err);
     bool record(int T, bool mtp, std::string& err);
+    /// The window (record_window, or the MTP layer's) captured into `exec`, or its segments into `segs`
+    bool capture(int T, bool mtp, strata::gpu::Graph*& exec, std::vector<strata::gpu::Graph*>& segs, std::string& err);
     bool run_window(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
-    bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb = true);
-    bool record_window(int T, strata::gpu::Stream cs, std::string& err);
+    /// `rows_pos`: row t at rows_pos[t] instead (a batch window's rows)
+    bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb = true,
+               const int64_t* rows_pos = nullptr);
+    /// `segs`: where a segmented window's graphs go (null: segs_[T])
+    bool record_window(int T, strata::gpu::Stream cs, std::string& err, std::vector<strata::gpu::Graph*>* segs = nullptr);
+    /// The control vector after block b's FFN write, on T rows of x (kernels/cvec.hpp), where it covers the layer
+    void steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const;
+    /// One stage's part of forward_slots
+    bool stage_slots(const int32_t* tokens, const int* slot, const int64_t* pos, const strata::kernels::SamplerParams* sp,
+                     int T, const float* hand_in, std::string& err);
+    /// --batch: a slot's copy of the per-sequence state (the live session's in the members below), this stage's
+    struct SlotSession {
+        std::vector<float*> gdn_state, gdn_conv;
+        std::vector<uint16_t*> k_pool, v_pool, k_scale, v_scale;
+        std::vector<int8_t*> k_q, v_q;
+        std::vector<uint8_t*> k_q4, v_q4;
+    };
+    std::vector<SlotSession> bslots_;
+    /// --kv-grow: the live session's K/V planes in virtual memory, the bytes a page of cells takes in each, and the
+    /// cells mapped (-1: no --kv-grow, every cell allocated)
+    std::vector<std::unique_ptr<VmmRange>> kv_vmm_;
+    std::vector<uint64_t> kv_vmm_page_bytes_;
+    int64_t kv_cells_ = -1;
+    bool kv_map(int64_t cells, std::string& err);   // every range's chunks for `cells` cells mapped (zeroed)
+    bool alloc_batch_slots(std::string& err);
+    /// a batch window's row t is slot row_slot_[t]'s (empty: the live session's rows), while it is recorded or run
+    std::vector<int> row_slot_;
+    std::map<uint32_t, strata::gpu::Graph*> bexec_;                  ///< per set of slots: the batch window
+    std::map<uint32_t, std::vector<strata::gpu::Graph*>> bsegs_;     ///< ... or its segments
+    int64_t batch_rows_ = 0;   ///< the batch windows' rows so far (the adaptive rounds' clock in them)
     /// The head over T normed rows `x` into logits_.
     void head_logits(const float* x, int T, strata::gpu::Stream cs);
     /// The MTP layer's head for its last row (hn_ into logits_): the drafts' token subset or the whole head, at 2 bits
@@ -660,7 +765,26 @@ private:
     void dump_routes(int64_t layer, const int32_t* ids, int64_t n, int64_t k);
     struct StatePart { void* dev; size_t bytes; };
     /// The device buffers a snapshot of `tokens` tokens copies (state_bytes, save_state, restore_state)
-    std::vector<StatePart> state_parts(int64_t tokens) const;
+    /// `slot`: batch slot slot's copy (-1: the live session)
+    std::vector<StatePart> state_parts(int64_t tokens, bool recurrent_only = false, int slot = -1) const;
+    bool save_parts(int64_t tokens, bool recurrent_only, Snapshot& snap, std::string& err, int slot = -1);
+    /// One attention block's K/V buffers in a session (-1: the live one, else a batch slot), as the format has them
+    struct KvPtrs {
+        uint16_t *k_pool = nullptr, *v_pool = nullptr, *k_scale = nullptr, *v_scale = nullptr;
+        int8_t *k_q = nullptr, *v_q = nullptr;
+        uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
+    };
+    KvPtrs kv_ptrs(size_t a, int slot) const;
+    /// The buffers of attention block a in session `slot` for `cells` (cell, KV head) pairs and their bytes, in one
+    /// order: the state's parts (state_parts), what reset zeroes
+    std::vector<StatePart> kv_planes(size_t a, int slot, size_t cells) const;
+    /// Allocates them for `cells` pairs in the --kv format (the live session's or a slot's), into allocs_
+    bool alloc_kv(KvPtrs& p, size_t cells, bool vmm = false);
+    /// `n` cells' K and V (n rows of n_head_kv x head_dim, rotated as the format keeps them) at steps[t * kStepCount]
+    /// into session `slot`'s pools of attention block a
+    void kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
+                         strata::gpu::Stream cs);
+    bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
     int64_t windows_ = 0, swaps_total_ = 0;
@@ -726,10 +850,11 @@ private:
     double spec_ms_check_ = 0, spec_ms_draft_ = 0;
     std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block (FP16; null with kv_int8)
     std::vector<std::pair<int32_t, int32_t>> vram_evicted_;   ///< `vram`'s shrinks: (residency index, slot)
-    std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes
+    std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes (K8V4's K)
+    std::vector<uint8_t*> k_q4_, v_q4_;           ///< ...kv_q4's Q4_0 blocks (K8V4's V)
     std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
     /// The attention block a's pools, for the kernels
-    strata::kernels::QsaAttnPools kv_pools(size_t a) const;
+    strata::kernels::QsaAttnPools kv_pools(size_t a, int slot = -1) const;
     int32_t* page_table_ = nullptr;
     int64_t n_pages_ = 0;
 
@@ -749,6 +874,19 @@ private:
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens
     float *h_prob_ = nullptr, *m_prob_ = nullptr;                ///< mapped: the last draft's probability
+    // the picks' constraints (set_logit_bias, set_allowed, set_history) on the device, and whether each is set
+    float* bias_dev_ = nullptr;
+    uint32_t* allowed_dev_ = nullptr;   ///< max_t rows of the same mask
+    int32_t* hist_dev_ = nullptr;       ///< max_t rows of hist_len_ tokens
+    int hist_len_ = 0, hist_cap_ = 0;
+    bool bias_on_ = false, allowed_on_ = false;
+    double req_spec_min_p_ = -1.0;
+    /// the split as the load set it up, for set_pcie_frac to come back to
+    PcieSplitTimes* pcie_split_own_ = nullptr;
+    int pcie_num_own_ = 0, pcie_probe_own_ = -1;
+    bool pcie_req_ = false;
+    /// The picks of T rows of logits into out (device), the row t's draw at position pos + t, with the constraints
+    void pick(const float* logits, int T, int64_t pos, int32_t* out, strata::gpu::Stream cs) const;
     strata::kernels::SamplerParams sampler_ = [] {
         strata::kernels::SamplerParams p;
         p.greedy = true;

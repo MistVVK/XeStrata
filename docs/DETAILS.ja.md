@@ -388,7 +388,7 @@ API は、思考と答えの分離、ストリーミング、ツールの呼び�
 Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
 Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
-まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は `--kv int8` だけ。GLM-5.3-Flash ではまだ使えません）。
+まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は GLM-5.3-Flash ではまだ FP16 だけです）。
 RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
 そのとき、上の `STRATA_RAM_ADAPT=<n>` で RAM のコピーを会話に従わせられます（1 GPU のとき）。
 `STRATA_DISK_SKIP_FROM=R`（opt-in、答えが変わる、Project Maya の #109 から）にすると、VRAM にも RAM のコピーにもなくファイルから読むエキスパートを、順位 R 以下で選んだトークンでは寄与を 0 にし、窓のどのトークンもその順位でしか選ばないものは読みません（SSD を待ちません）。GLM-5.3-Flash UD-IQ3_XXS を RAM 56 GB に絞った B70 の decode は、R=6 で 4.33 → 5.11 トークン/秒（128 トークンが同じ）、R=4 で 5.93（13 トークン目から分かれる）でした。
@@ -399,7 +399,9 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | --- | --- |
 | `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
 | `--kv-ram on\|off` | GLM-5.3-Flash の DSA の層の潜在（1 位置 1 KB）を VRAM でなく RAM に持ち、空いた VRAM をエキスパートに回す（既定 on）。decode の窓は各トークンが選んだ位置だけを VRAM に写して読み、prompt の塊は層ごとにその時点までを写して読む。128K の文脈で B70 の VRAM のエキスパートが 2,150 から 2,322 枠に増え、RTX 4070 は 128K で起動できるようになり、64K で prompt が 3.3 から 7.1 トークン/秒になりました |
-| `--kv fp16\|int8` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります（GLM-5.3-Flash では使えません） |
+| `--kv fp16\|int8\|q4_0\|k8v4` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります。`q4_0` は K と V を Hadamard の回転の後に Q4_0 で（FP16 の約 28%）、`k8v4` は K を int8、V を回転した Q4_0 で持ちます（約 40%）。この 2 つはヘッドが 256 のモデル（Ornith、Qwen3.6、Qwen3.5-9B）だけです。B70 の Qwen3.5-9B の 32K の prefill は FP16 20.6 秒、`q4_0` 20.4 秒、`k8v4` 19.8 秒でした（GLM-5.3-Flash ではどれも使えません） |
+| `--kv-grow`、`--no-kv-grow` | `--serve` で 1 GPU のとき、KV キャッシュを仮想メモリに置き、要求が届く位置の分だけ VRAM を使う。エキスパートの VRAM の段（`--vram-elastic` の区切り）が長い要求の前にその分を譲り、短い要求の後に取り戻します。既定は Qwen3.8-Flash-Next と同じく、GPU の仮想メモリのページが 2 MiB 以上のとき有効です（RTX 4070 は有効、B70 は無効）。RTX 4070 の Qwen3.6-35B-A3B（128K の文脈）では、起動時の段が 2,870 から 4,182 枠になり、32K の prefill が 32.9 秒から 29.0 秒になりました（並列スロットとは一緒に使えません） |
+| `--control-vector-scaled FILE:SCALE[,...]`、`--control-vector FILE`、`--control-vector-layer-range A B`、`--cvec-mode`、`--cvec-dir` | llama.cpp の形式の制御ベクトルを、各層の FFN の後の残差に足す（Qwen3.8-Flash-Next と同じ意味）。`--serve` では要求ごとに切り替えられ（`experimental_speed_projection`）、切り替えたときは、それまでの会話の状態を読み直します（GLM-5.3-Flash ではまだ使えません） |
 | `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
 | `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
 | `--adapt-every N` | VRAM のエキスパートを入れ替える間隔。要求の 4N トークンごとに入れ替えます。CPU と GPU の丸めが違う層があれば窓をそこで切り、文章が推測の仕方で変わらないようにします。Qwen3.8 の 4 つのファイルは decode が CPU と GPU で同じビットなので切りませんが、serve の 2 ターン目からの prompt の読みは入れ替えの時期で丸めが変わり、文章が実行ごとに変わることがあります（`STRATA_ADAPT_CUT=1` で切ります）（バッチのスロット、`--pipeline-windows`、`--adapt-async` では N 窓ごと）（既定 4。0 で入れ替えない）。指定がなければ、出力の 32 トークン目に CPU のプールが検証の窓の時間の 30% 以上を使っていたとき、4 トークンごとにします。ただし、GPU が持たないエキスパートをファイルから読むとき（`--mmap-experts`。Qwen3.8-Flash-Next 以外のモデルでは、RAM がエキスパートの全体に足りず、その一部を読むときも）は縮めません |
@@ -407,10 +409,14 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
 | `--adapt-min-gain F` | 入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差。既定 1.5） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む（setup の `--low-ram on` か `mmap` で書かれます） |
+| `--shared-expert-arena FILE` | エキスパートの RAM の写しを、同じ FILE を名指すほかのエンジンと分け合う（Linux。最初に読んだエンジンが埋め、ほかは写すだけ。Qwen3.8-Flash-Next と同じ。`--mmap-experts` や RAM の段とは一緒に使えません） |
+| `--resident-experts`、`--resident-budget-gib N`、`--resident-cpu-experts` | エキスパートをファイルから読み、VRAM にないものを RAM の許す限り（`--resident-budget-gib` では N GiB まで）プロファイルの順に RAM に写す。`--resident-cpu-experts` はその写しを page-lock しない普通の RAM に置きます（Qwen3.8-Flash-Next と同じ名前） |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
+| `--pcie-frac F` | VRAM にないエキスパートのうち、どの窓でもこの割合を PCIe で GPU が読む（測った分け方の代わり。要求ごとの `strata_tune` の `pcie_frac` も効きます） |
 | `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
 | `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU） |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
+| `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8） |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
@@ -418,8 +424,12 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
+| `--vram-reserve-later-mib N` | 層を分けたとき、2 枚目以降の GPU に空けておく VRAM（既定は `--vram-reserve-mib` と同じ） |
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
-| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
+| `--batch N`（`"parallel": N`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |
+| `--prompt-cache N`、`--prompt-cache-every N`、`--prompt-cache-root N`、`--turn-token ID`、`--conversation-save-checkpoints N` | `--serve` で、再帰の状態を持つモデル（Ornith、Qwen3.6、Qwen3.5-9B）の会話のチェックポイント。再帰の状態は前の位置へ戻せないので、会話の途中から続く要求（描き方の違う返答の次のターン、書き換えた発言、同じシステムプロンプトの新しい会話）は、チェックポイントがなければ全部を読み直します。意味と既定は Qwen3.8-Flash-Next と同じで（[会話のキャッシュ](#会話のキャッシュ)）、要求の `pin` と `"strata_checkpoint": false` も効きます。チェックポイントは再帰の状態だけで（Qwen3.6 で約 60 MB）、その下の位置の K/V は会話のものを使います。`--turn-token` の既定は語彙の `<|im_start|>`、なければ `<|start|>` です。注意の層だけのモデル（llm-jp、GLM-5.3-Flash）は、どの位置までの K/V も使えるので要りません |
+| `--tail-role-token ID`、`--prompt-cache-tail`、`--prompt-cache-spread`、`--conversation-cache-min-tokens N`、`--conversation-cache-park-gain N`、`--short-read N`、`--session-save-reclaim` | `--serve` の会話のキャッシュとチェックポイントの方針（Qwen3.8-Flash-Next と同じ意味）。`--short-read` の既定は `--max-t` です |
+| `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N`、`--yarn-ext-factor F`、`--yarn-attn-factor F`、`--yarn-beta-fast F`、`--yarn-beta-slow F` | 文脈の延長（YaRN の値は llama.cpp と同じ意味） |
 
 ### RAM がモデルより少ないとき（省 RAM モード）
 
@@ -1264,7 +1274,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema に依存し、Windows の 7z には入っています）。
 なければ、`strict: true` の要求（`json_schema` の `strict: true`、Messages の `output_config.format`、`strict: true` の道具）は確かめられないので 400 で断り、ほかの `json_schema` は答えが 1 つの JSON のオブジェクトであることだけを確かめます。server はそのことを一度だけ伝え、入れ方は `xestrata --setup` が示します。
 
-エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
+エンジンが文法で縛れるとき（連続バッチを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
 思考は縛らず、思考の後の答えの JSON だけを縛ります。
 縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
 `strict` は true、false、null（書かないのと同じ）のどれかで、ほかの型は 400 です。

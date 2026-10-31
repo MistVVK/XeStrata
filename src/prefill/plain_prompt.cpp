@@ -30,6 +30,7 @@
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
@@ -995,9 +996,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     k::native_quantize_q8_1(P.hn, xq_, head_.n_in, 1, cs);
                     k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
                 }
-                k::SamplerParams sp = sampler_;
-                sp.counter = (uint64_t) (p0 + T - 1);   // the last token's position, as forward counts
-                k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+                pick(logits_, 1, p0 + T - 1, m_out_, cs);   // the last token's position, as forward counts
             };
             // the MTP layer after the trunk, its K/V a cell ahead: row t pairs the trunk's normed row t with the token
             // after it (the prompt's last row with a stand-in, rewritten by spec_start once the token is picked)
@@ -1088,13 +1087,15 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     };
                     norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
                     norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
-                    if (opt_.kv_int8)
-                        k::kv_append_q8_steps(k_q_[(size_t) a], v_q_[(size_t) a], k_scale_[(size_t) a],
-                                              v_scale_[(size_t) a], page_table_, P.steps, k::kStepCount, P.kcur, P.vcur,
-                                              (int) (NKV * HD), (int) T, qs, cs);
-                    else
-                        k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps,
-                                           k::kStepCount, P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
+                    // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; the output back below
+                    if (opt_.kv_q4 == 1) {
+                        k::fwht256_inplace_cuda(P.kcur, T * NKV, cs);
+                        k::fwht256_inplace_cuda(P.vcur, T * NKV, cs);
+                        k::fwht256_inplace_cuda(P.qcur, T * NH, cs);
+                    } else if (opt_.kv_q4 == 2) {
+                        k::fwht256_inplace_cuda(P.vcur, T * NKV, cs);
+                    }
+                    kv_append_cells((size_t) a, -1, P.steps, (int) T, P.kcur, P.vcur, cs);
                     const k::QsaAttnPools pools = kv_pools((size_t) a);
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
@@ -1108,6 +1109,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
                                                 attn_scratch_, P.attn + t * NH * HD, nq, cs);
                     }
+                    if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);
                     const float* ao = P.attn;
                     if (has_gate_) {
                         k::native_qsa_gate_apply(P.attn, P.qfull, P.attn32, (int) (T * NH), (int) HD, cs);
@@ -1138,6 +1140,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
                     }
                     k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    steer(b, T, P.x, cs);
                     mark(3, t_mark);
                     if (!is_mtp) unbind_block(l);
                     continue;
@@ -1169,6 +1172,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::native_moe_combine_multi(P.parts, P.w, has_shared_ ? P.shared : nullptr, P.moe_out, N, K, (int) T,
                                             cs, has_shared_ ? P.sh_g : nullptr);
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
+                steer(b, T, P.x, cs);
                 mark(3, t_mark);
             }
             if (enc_out_ != nullptr) {   // encode: every row through the final norm, to the host

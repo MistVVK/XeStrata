@@ -159,8 +159,8 @@ bool PlainModel::load_gblock(const GgufModel& m, int64_t l, GBlock& b, std::stri
 bool PlainModel::load_glm5(std::string& err) {
     const ModelSpec& s = spec_;
     glm_ = true;
-    if (opt_.kv_int8) {   // its MLA latent and indexer caches have no int8 kernels yet
-        err = "plain model: --kv int8 is not available for GLM-5.3-Flash yet";
+    if (opt_.kv_int8 || opt_.kv_q4 != 0) {   // its MLA latent and indexer caches have no such kernels yet
+        err = "plain model: --kv int8, q4_0 and k8v4 are not available for GLM-5.3-Flash yet";
         return false;
     }
     // the shapes the kernels are written for (glm5.hpp: four streams, KDA heads of 128, the MLA's 512-wide latent and

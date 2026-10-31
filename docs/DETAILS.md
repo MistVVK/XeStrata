@@ -421,7 +421,7 @@ the next the later ones, the head and the MTP layer; the points follow each GPU'
 experts in VRAM are all the GPUs' together.
 Qwen3.5-9B reads images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more,
 the CPU reader below that).
-Not yet: the other models' images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (of the KV cache's precisions only `--kv int8`, and not for GLM-5.3-Flash yet).
+Not yet: the other models' images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
@@ -434,7 +434,9 @@ The engine's options (added to the settings' `args`):
 | --- | --- |
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
 | `--kv-ram on\|off` | GLM-5.3-Flash: the DSA layers' latent cells (1 KB a position) in RAM instead of VRAM, which goes to the experts (on by default); a decode window copies the positions each token selected into VRAM, a prompt chunk each layer's cells up to it. With 128K positions the B70's VRAM tier went from 2,150 to 2,322 experts, the RTX 4070 could start at 128K at all, and at 64K its prompt went from 3.3 to 7.1 tokens/s |
-| `--kv fp16\|int8` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly (not for GLM-5.3-Flash) |
+| `--kv fp16\|int8\|q4_0\|k8v4` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly. `q4_0` keeps K and V as Q4_0 after the Hadamard rotation (about 28% of FP16), `k8v4` K in int8 and V as rotated Q4_0 (about 40%); these two for the models with heads of 256 (Ornith, Qwen3.6, Qwen3.5-9B). Qwen3.5-9B's 32K prefill on the B70: FP16 20.6 s, `q4_0` 20.4 s, `k8v4` 19.8 s (none of them for GLM-5.3-Flash) |
+| `--kv-grow`, `--no-kv-grow` | with `--serve` on one GPU, the KV cache in virtual memory, taking VRAM only for the cells the requests reach: the VRAM tier of experts (in `--vram-elastic`'s segments) gives it up before a long request and takes it back after a short one. On by default, as Qwen3.8-Flash-Next's, where the GPU's virtual memory pages are 2 MiB or more (the RTX 4070, not the B70). On the RTX 4070, Qwen3.6-35B-A3B at a 128K context started with 4,182 slots instead of 2,870 and its 32K prefill went from 32.9 s to 29.0 s (not with the batch slots) |
+| `--control-vector-scaled FILE:SCALE[,...]`, `--control-vector FILE`, `--control-vector-layer-range A B`, `--cvec-mode`, `--cvec-dir` | a control vector in llama.cpp's format on the residual stream after each layer's FFN (Qwen3.8-Flash-Next's meanings). With `--serve` a request switches it (`experimental_speed_projection`), and a switch reads the conversations again (not for GLM-5.3-Flash yet) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
 | `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request; where a layer rounds differently on the CPU and the GPU the windows are cut there, so the text does not depend on the drafting. Qwen3.8's four files decode to the same bits on the CPU and the GPU and are not cut, but serve's prompts from the second turn on round with the swaps' timing, so the text can differ from run to run (`STRATA_ADAPT_CUT=1` cuts them) (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps). Without it, when the CPU pool took 30% or more of the checks' time at the 32nd output token, the swaps come every 4 tokens; not when the experts the GPU does not hold are read from the files (`--mmap-experts`; with the models other than Qwen3.8-Flash-Next, also when the RAM is short of all the experts and some of them are read) |
@@ -442,10 +444,14 @@ The engine's options (added to the settings' `args`):
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--adapt-min-gain F` | the bar a swap must clear: the decayed routing count of the expert coming in against the one going out (default 1.5) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM (setup writes it with `--low-ram on` or `mmap`) |
+| `--shared-expert-arena FILE` | share the experts' RAM copy with the other engines that name the same FILE (Linux: the first to load fills it, the rest map it; Qwen3.8-Flash-Next's; not with `--mmap-experts` or the RAM tier) |
+| `--resident-experts`, `--resident-budget-gib N`, `--resident-cpu-experts` | read the experts in place and copy those no VRAM tier holds into RAM in the profile's order, as far as the RAM allows (`--resident-budget-gib`: up to N GiB); `--resident-cpu-experts` keeps that copy in ordinary RAM, not page-locked (Qwen3.8-Flash-Next's names) |
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
+| `--pcie-frac F` | that share of the experts VRAM does not hold read by the GPU over PCIe in every window, instead of the measured split (a request's `strata_tune` `pcie_frac` too) |
 | `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
 | `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; the default `auto` takes it from the times measured at start; 0: all on the GPU) |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
+| `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096, or a larger chunk the VRAM tier of experts lends, up to 32768, its buffers within 85% of the slots; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
@@ -453,8 +459,12 @@ The engine's options (added to the settings' `args`):
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
+| `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
-| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
+| `--batch N` (`"parallel": N`) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
+| `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
+| `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
+| `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
 
 ### Less RAM than the model: the low-RAM mode
 
@@ -1302,7 +1312,7 @@ Local `#` references work; remote references are refused.
 `json_schema` is checked with the Python package `jsonschema` (setup installs it into `.venv`, the deb and rpm packages depend on the distribution's python3-jsonschema, and the Windows 7z carries it).
 Without it a `strict: true` request (`json_schema`'s `strict: true`, Messages' `output_config.format`, a `strict: true` tool) cannot be checked and is a 400, and another `json_schema` answer is only checked to be one JSON object; the server says so once, and `xestrata --setup` says how to install it.
 
-When the engine can constrain its decoding (not with continuous batching, not the plain models' engine), **the answer is written under the schema's grammar** and checked after it as well.
+When the engine can constrain its decoding (not with continuous batching), **the answer is written under the schema's grammar** and checked after it as well.
 The thinking is not constrained: only the JSON answer after it.
 Otherwise the schema is in the prompt and the server checks the answer; `STRATA_GRAMMAR=0` in the environment turns the constraint off too.
 `strict` is true, false or null (as if not given); another type is a 400.

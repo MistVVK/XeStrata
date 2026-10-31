@@ -3571,7 +3571,7 @@ class Service:
 
     def attach_grammar(self, req: dict, grammar) -> bool:
         """`grammar` (structured.answer_grammar / tool_grammar) into the request, for an engine that constrains its
-        decoding (INFO grammar=1: not with continuous batching, not the plain models' engine).  STRATA_GRAMMAR=0 keeps
+        decoding (INFO grammar=1: not with continuous batching).  STRATA_GRAMMAR=0 keeps
         every reply unconstrained (checked after it, as before).  -> whether it was attached."""
         info = getattr(self.engine, "info", None) or {}
         if grammar is None or str(info.get("grammar")) != "1" or not self.tokenizer_dir or \

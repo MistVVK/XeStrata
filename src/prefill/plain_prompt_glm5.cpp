@@ -286,9 +286,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 const float* last = P.hn + (rows - 1) * N;
                 k::native_quantize_q8_1(last, xq_, head_.n_in, 1, cs);
                 k::native_mmvq(head_.type, head_.data, xq_, logits_, head_.n_in, head_.n_out, 1, cs);
-                k::SamplerParams sp = sampler_;
-                sp.counter = (uint64_t) (p0 + T - 1);
-                k::sample_tokens(logits_, 1, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+                pick(logits_, 1, p0 + T - 1, m_out_, cs);
                 if (mtp_chunk && !strata::gpu::copy_async(mtp_h_, last, (size_t) N * 4, cs)) {
                     err = std::string("plain prompt: the MTP layer's input: ") + strata::gpu::last_error();
                     return false;

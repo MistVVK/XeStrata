@@ -26,19 +26,21 @@ namespace strata::kernels {
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
                  int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream);
 
-/// The same over `pools` (qsa_decode_attn.hpp): FP16 ones, or INT8 codes with an FP16 scale per 64 values (--kv int8).
-/// On the matrix engines where the device has them: Intel's XMX and NVIDIA's tensor cores from sm_70 through
-/// joint_matrix (head_dim 128 or 256, any number of query heads a KV head), RDNA3's and RDNA4's WMMA for INT8 pools (the
-/// shapes of the kernel above); Q and the probabilities in FP16.  Else the kernels above (FP16 pools only).  False,
-/// nothing launched, when none takes the pools or the shape.
+/// The same over `pools` (qsa_decode_attn.hpp): FP16 ones, INT8 codes with an FP16 scale per 64 values (--kv int8),
+/// or Q4_0 (--kv q4_0) or INT8 K with Q4_0 V (--kv k8v4), rotated as kv_q4.hpp has them (the caller rotates the queries
+/// and the output).  On the matrix engines where the device has them: Intel's XMX and NVIDIA's tensor cores from sm_70
+/// through joint_matrix (head_dim 128 or 256, the Q4_0 forms 256; any number of query heads a KV head), RDNA3's and
+/// RDNA4's WMMA for INT8 pools (the shapes of the kernel above); Q and the probabilities in FP16.  Else the kernels
+/// above (FP16 pools only).  False, nothing launched, when none takes the pools or the shape.
 bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s, float* attn,
                  void* stream);
 
-/// Times the kernels the pools overload can take for shape `s` and the pool format (the matrix engines', the FP16
-/// kernel, and the caller's decode kernel, qsa_dense_attn_batch) on the stream's GPU, once a GPU, shape and format,
-/// over dummy chunks after 8K and up to 64K of `max_cells` cells, and keeps the fastest of each for prompt_attn, which
-/// takes the one nearer a chunk's length; a line to stderr says what it chose.  It allocates and synchronizes: call
-/// it before the cache takes its VRAM.  Untimed, prompt_attn takes the matrix engines' kernel where the GPU has one.
-void prompt_attn_tune(const QsaShapes& s, bool int8_pools, int64_t max_cells, void* stream);
+/// Times the kernels the pools overload can take for shape `s` and pool format `pool_format` (0 FP16, 1 INT8, 2 Q4_0,
+/// 3 K8V4: the matrix engines', the FP16 kernel, and the caller's decode kernel, qsa_dense_attn_batch) on the stream's
+/// GPU, once a GPU, shape and format, over dummy chunks after 8K and up to 64K of `max_cells` cells, and keeps the
+/// fastest of each for prompt_attn, which takes the one nearer a chunk's length; a line to stderr says what it chose.
+/// It allocates and synchronizes: call it before the cache takes its VRAM.  Untimed, prompt_attn takes the matrix
+/// engines' kernel where the GPU has one.
+void prompt_attn_tune(const QsaShapes& s, int pool_format, int64_t max_cells, void* stream);
 
 }  // namespace strata::kernels

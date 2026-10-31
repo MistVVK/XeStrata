@@ -144,6 +144,22 @@ Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row w
 - Admissions are one at a time: two new long prompts are read one after the other.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 
+## The other models (the plain engine)
+
+Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B and Qwen3.5-9B take the slots with the same `"parallel": N` (GLM-5.3-Flash and `--vision` not yet).
+How the server uses them (moving from the solo path into a slot, each slot's conversation cache, `prompt_cache_key`) is Qwen3.8-Flash-Next's.
+
+- At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
+- A slot grows with the context (Qwen3.6-35B-A3B: 414 MiB at a 16K context, 2,878 MiB at 128K; Qwen3.5-9B: 562 MiB at 16K).
+- The slots' windows carry no MTP drafts: one token a window (no `--batch-mtp` yet).
+- While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.
+- A batch window is recorded as a graph once for each set of slots in it.
+
+`tools/batch_test.py` (greedy) with 4 slots on the B70:
+
+- Qwen3.5-9B Q4_K_M: four 64-token answers, each the same tokens as alone, 111 tokens/s together (about 52 one at a time).
+- Qwen3.6-35B-A3B UD-Q4_K_XL: with `--no-pcie-split --adapt-every 0` all four were the same tokens as alone; with the default settings four 128-token answers ran at 186 tokens/s together (about 140 one at a time, with MTP drafts).
+
 ## Measured
 
 The B70 (32 GB), i7-14700, Qwen3.8-Flash-Next IQ2_XS, driving the engine directly, 3 conversations decoded greedily:
