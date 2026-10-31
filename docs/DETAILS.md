@@ -998,6 +998,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Claude Code refuses names it doesn't know; XeStrata ignores the name.
   Add any `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Codex CLI**: see [the Responses API](#the-responses-api-and-codex-cli) below.
+- **Mainplane**: see [Mainplane](#mainplane) below.
 - **Context.** Chosen in setup (8K–262K).
   Requests longer than that are refused, never silently cut.
   A request whose `max_tokens` would run past the context is answered with `max_tokens` shortened to the room left (agents such as Claude Code ask for 32,000 on every request); the thinking budget follows the shortened cap (upstream f31b6efd6).
@@ -1496,6 +1497,33 @@ stream_idle_timeout_ms = 600000         # a first, long prompt can take minutes 
 
 Then run `codex` (or `codex exec "..."`) as usual. Codex warns `Model metadata for ... not found` for a local model
 name; that is expected.
+
+### Mainplane
+
+[Mainplane](https://github.com/mainplane-ai/mainplane) is an agent harness that never summarizes a conversation (no compaction).
+The context grows up to `context_limit`, and a session past it is carried on in a new session, which reads what it needs from the old one.
+XeStrata takes it through the `openai-chat` shape: add it to the `providers` of the harness's config (`/var/lib/mainplane-server/config.json` on Linux).
+
+```json
+"providers": {"xestrata": {"shape": "openai-chat", "url": "http://127.0.0.1:8095/v1", "key": "local"}}
+```
+
+Mainplane wants a `key`, so write anything; XeStrata reads it only when the config has an `api_key` (then that value).
+Make a session like this:
+
+```sh
+echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"workers":[{"name":"admin"}],"params":{"max_tokens":16384}}' | mainplane new
+```
+
+- Anything goes after the `/` of `model`: XeStrata answers with its own model.
+- Keep `context_limit` at or under the context chosen in setup less the answer (`max_tokens`).
+  A prompt and `max_tokens` past the context get `max_tokens` cut down, but a prompt past the context alone is refused with a 400 (never truncated), and Mainplane fails that session.
+- Mainplane sends the thinking back (`reasoning_content`). XeStrata keeps the earlier turns' thinking in the prompt (it gives Qwen3.6-35B-A3B's template `preserve_thinking` by default, and adds the same switch to Qwen3.5-9B's template, which has none, as it loads it), so each step reads only what it added.
+  `"preserve_thinking": false` in a request's `chat_template_kwargs` drops the earlier turns' thinking as the template does.
+  llm-jp-4.1's template (the Harmony format) never writes the earlier turns' thinking, so each step reads from where that thinking was on (the earlier call and the tool's result).
+- Mainplane sends each session's `prompt_cache_key`. With [parallel requests](BATCHING.md) (`"parallel"`), when no slot holds the prompt's start, the slot the same session used last is taken first, and the other sessions' conversations stay.
+- Going back and forth between many long sessions pushes conversations out of the RAM cache; they are [on the disk as well](#keeping-parked-conversations-on-the-disk), so they come back without being read again.
+- Mainplane gives up on a response after 300 s without headers or bytes. While a long prompt is read, XeStrata sends an SSE comment every 10 s.
 
 ## Tools from MCP servers
 

@@ -24,6 +24,10 @@ Rules for the whole run:
 - Speed first: do not stop making XeStrata faster on your own judgement (a small expected gain, hard work, a compiler in the way). When every idea has been tried, report what was tried and the next ideas, and ask.
 - Correctness: an exact path keeps the FP64 references and the comparison with llama.cpp; an approximation that changes the output goes through step 5. No GPU gets slower to make another faster.
 - Choose a path from what the device reports (AGENTS.md, Hardware independence), never from a GPU's name.
+- Both engines: Qwen3.8-Flash-Next (and the Gyro packs) run on `src/program/generate.cpp`, the other models (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash) on `src/program/plain_generate.cpp` and `src/core/plain_model.cpp`, and the two do not differ in what they can do (the user's decision of 2026-10-31).
+  upstream's changes land in `generate.cpp`; whatever of them is taken (a feature, a fix, a speed idea, an engine option) is taken into the plain engine too, in the same run, as a shared part both engines call (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`), not as a second copy.
+  Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: what `kQwen38Only` in `src/program/option_scope.cpp` lists (PLE, QSA, the separate MTP pack and their kernels).
+  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`, never into `kNotYet`.
 
 ## 1. The starting point
 
@@ -69,7 +73,7 @@ For each idea:
 | Where it is on | upstream's condition (CUDA only, not HIP, single GPU, an architecture, a size) and why: measured only there, or true only there (an instruction, a library, a hardware limit); from the commit messages, the code and upstream's records |
 | Where it works | the setting it is for (a tier, the serve path's output, the follow-ups, a model file, experts that do not fit in VRAM) and upstream's measurement |
 | Output | exact, or changes the output (step 5) |
-| In XeStrata | to port (shared code, step 3; a speed path, step 4), or not applicable and why |
+| In XeStrata | to port (shared code, step 3; a speed path, step 4), or not applicable and why; for both engines, or for Qwen3.8-Flash-Next's alone and why (its architecture, `kQwen38Only`) |
 | Result | step 4's and 5's numbers and what was kept |
 
 A condition measured only on upstream's GPUs is not a reason to keep it: step 4 measures the idea on XeStrata's GPUs and puts its own condition, from what the device reports.
@@ -104,6 +108,7 @@ XeStrata's kernels are written from scratch (SYCL) and its prompt path and runti
 - Groups E, M and T, and the parts of A, N and P that are shared code, are ported here or in step 4; `sycl/`, the CUDA and HIP sources and the HIP tables are not taken.
 - Group W is ported as the group it would otherwise be, in `#if defined(_WIN32)` branches or `src/platform/` as AGENTS.md says; running it on Windows waits for a milestone (`unverified` until then).
 - Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
+  A line taken names the commit for each engine (`generate: <hash>, plain: <hash>`; one hash when one commit gives both the shared part), or `plain: N/A` and the architecture that keeps it from the plain engine.
 - The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
 - Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
 - Then bring the license classes (AGENTS.md, Licenses) to the new tag, in one commit (`ライセンスの表示を upstream <version> に合わせる`): `python tools/license_class.py --fix` rewrites the headers, so a file brought back to upstream's content loses XeStrata's line and goes back to MIT, and one XeStrata has changed for the first time gets XeStrata's line and `LGPL-3.0-or-later AND MIT`.
@@ -134,6 +139,7 @@ python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A 
   Slower: measured once on each of the two other GPUs; kept on where it is faster or equal there (chosen at run time from what the device reports, when it helps only some); opt-in where it is slower everywhere but upstream keeps it as an option; removed otherwise.
   The numbers go into the idea's line, the commit and the record.
 - Probes on the B70 and the RTX 4070 may run together; whole-engine A/B runs one card at a time.
+- An idea taken into the plain engine is measured there as well, by the same rule, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B), with `--no-pcie-split --adapt-every 0` where two outputs are compared (else the measured CPU/GPU split changes the output from run to run).
 
 ### GPUs there is no machine for
 

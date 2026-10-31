@@ -958,6 +958,7 @@ print(r.choices[0].message.content)
   知らない名前は Claude Code が断ります。XeStrata は名前を無視します。
   `ANTHROPIC_AUTH_TOKEN` は何でも構いません（`api_key` を設定していればそれ）。
 - **Codex CLI**: [下の Responses API](#responses-api-と-codex-cli) を参照してください。
+- **Mainplane**: [下の Mainplane](#mainplane) を参照してください。
 - **文脈**: setup で選びます（8K〜262K）。
   それより長い要求は断り、黙って切り詰めることはしません。
   `max_tokens` が文脈を超える要求は、`max_tokens` を残りの余地まで縮めて受け付けます（Claude Code などのエージェントは毎回 32,000 を求めます）。思考の上限も縮めた値に従います（upstream f31b6efd6）。
@@ -1449,6 +1450,33 @@ stream_idle_timeout_ms = 600000         # 最初の長いプロンプトは読�
 
 あとは、いつもどおり `codex`（または `codex exec "..."`）を動かします。
 ローカルのモデルの名前には Codex が `Model metadata for ... not found` と警告しますが、想定どおりです。
+
+### Mainplane
+
+[Mainplane](https://github.com/mainplane-ai/mainplane) は、会話を要約しない（compaction しない）エージェントのハーネスです。
+文脈は `context_limit` まで伸び、超えたセッションは新しいセッションに引き継いで、前のセッションから要るものを読み直させます。
+XeStrata には `openai-chat` の形でつなぎます。ハーネスの設定（Linux では `/var/lib/mainplane-server/config.json`）の `providers` に次を足します。
+
+```json
+"providers": {"xestrata": {"shape": "openai-chat", "url": "http://127.0.0.1:8095/v1", "key": "local"}}
+```
+
+`key` は Mainplane が求めるので何か書きます。XeStrata が見るのは、設定に `api_key` があるときだけです（そのときはその値）。
+セッションは、たとえば次のように作ります。
+
+```sh
+echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"workers":[{"name":"admin"}],"params":{"max_tokens":16384}}' | mainplane new
+```
+
+- `model` の `/` の後ろは何でも構いません。XeStrata は自分のモデルで答えます。
+- `context_limit` は、setup で選んだ文脈から答えの分（`max_tokens`）を引いた値以下にします。
+  プロンプトと `max_tokens` の和が文脈を超えると `max_tokens` を縮めて答えますが、プロンプトだけで文脈を超えると 400 で断り（切り詰めません）、Mainplane はそのセッションを失敗にします。
+- Mainplane は思考（`reasoning_content`）を送り返します。XeStrata は前の発言の思考を残してプロンプトを組む（Qwen3.6-35B-A3B のテンプレートには `preserve_thinking` を既定で渡し、切り替えのない Qwen3.5-9B のテンプレートには、読み込むときに同じ切り替えを足します）ので、ステップごとに増えた分だけを読みます。
+  要求の `chat_template_kwargs` に `"preserve_thinking": false` を書くと、テンプレートどおり前の発言の思考を消します。
+  llm-jp-4.1 のテンプレート（Harmony の形式）は前の発言の思考を描かないので、ステップごとに、その思考の場所から先（前の呼び出しとツールの結果）を読みます。
+- Mainplane はセッションごとの `prompt_cache_key` を送ります。[並列の要求](BATCHING.ja.md)（`"parallel"`）では、プロンプトの先頭を持つスロットがないとき、同じセッションが前に使ったスロットから使い直し、ほかのセッションの会話を残します。
+- 長いセッションをいくつも行き来すると、会話は RAM の置き場から追い出されます。[ディスクにも置く](#置いた会話をディスクにも置く)ので、読み直さずに戻ります。
+- Mainplane は、応答のヘッダーまでとバイトの間の待ちを 300 秒で切ります。長いプロンプトを読む間も、XeStrata は 10 秒ごとに SSE のコメントを送ります。
 
 ## MCP サーバーのツールを使う
 

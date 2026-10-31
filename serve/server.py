@@ -1063,6 +1063,9 @@ class StrataEngine:
         # the slot that has its start (the engine checks it again); when the slot was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
+        # the prompt_cache_key of the request each slot last took (OpenAI's field: an agent harness such as Mainplane
+        # sends one per session), so a session whose prompt no slot starts overwrites its own slot first (pick_slot)
+        self.slot_key: list[str | None] = [None] * self.batch
         self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
@@ -1729,6 +1732,8 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        cache_key = (sampling or {}).get("prompt_cache_key")
+        cache_key = cache_key if isinstance(cache_key, str) and cache_key else None
         # logprobs: only a request the server let through (max_tokens 1, see the handler) asks for them here; its LP
         # lines go to its own LPLines, made the engine's while it has the control lines (below)
         own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
@@ -1777,10 +1782,11 @@ class StrataEngine:
                         if (reserved is None and not out and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             with self.slot_cv:          # the slot the part read will wait in
-                                reserved = self.pick_slot(prompt)
+                                reserved = self.pick_slot(prompt, cache_key)
                                 if reserved is not None:
                                     self.slot_busy[reserved] = True
                                     self.slot_claims.add(reserved)
+                                    self.slot_key[reserved] = cache_key
                             if reserved is not None:
                                 self._send(f"BYIELD {reserved}")
                     for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
@@ -1827,10 +1833,11 @@ class StrataEngine:
                         # long, short at 0.25 s steps under parallel: 2 (ENGINE_REVIEW finding 1, reproduced in 0.1.41).
                         while True:
                             with self.slot_cv:
-                                slot = self.pick_slot(prompt)
+                                slot = self.pick_slot(prompt, cache_key)
                                 if slot is not None:
                                     self.slot_busy[slot] = True
                                     self.slot_claims.add(slot)
+                                    self.slot_key[slot] = cache_key
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -1842,7 +1849,7 @@ class StrataEngine:
                                 self.ctl.release()
                                 holding = False
                             with self.slot_cv:
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, cache_key) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
                                         # the stall check of #1317 only watches a request on the control lines; one
                                         # waiting here is covered by looking for a slot nobody owns, and by saying so
@@ -1854,7 +1861,7 @@ class StrataEngine:
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
-                                if self.pick_slot(prompt) is None:
+                                if self.pick_slot(prompt, cache_key) is None:
                                     self.slot_cv.wait(timeout=1.0)
                             if cancel.is_set():
                                 return
@@ -2059,10 +2066,12 @@ class StrataEngine:
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
 
-    def pick_slot(self, prompt: list[int]) -> int | None:
+    def pick_slot(self, prompt: list[int], key: str | None = None) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
-        prompt (the engine then reads only the rest), else an empty one, else the one used longest ago - so the
-        conversations other slots hold stay for their next turns.  None: every slot is busy."""
+        prompt (the engine then reads only the rest), else one the same session (`key`, the request's
+        prompt_cache_key) took last - what it holds is that session's own, which this prompt supersedes - else an
+        empty one, else the one used longest ago - so the conversations other slots hold stay for their next turns.
+        None: every slot is busy."""
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
@@ -2085,6 +2094,9 @@ class StrataEngine:
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
             return best
+        own = [b for b in free if key is not None and self.slot_key[b] == key]
+        if own:
+            return min(own, key=lambda b: self.slot_used[b])
         # pipelined groups: a group's window spans its slots up to its last busy one, so a free slot below a busy one
         # of its group costs no extra row: such a hole is filled first (upstream 2c7c02ab, #793: picks that left
         # leading holes, [_ B], cost a whole row each).  After a held prefix, as a pipelined slot is a cache again
