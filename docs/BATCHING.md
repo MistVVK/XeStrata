@@ -151,7 +151,7 @@ How the server uses them (moving from the solo path into a slot, each slot's con
 
 - At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
 - A slot grows with the context (Qwen3.6-35B-A3B: 414 MiB at a 16K context, 2,878 MiB at 128K; Qwen3.5-9B: 562 MiB at 16K).
-- The slots' windows carry no MTP drafts: one token a window (no `--batch-mtp` yet).
+- With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `STRATA_BATCH_MTP=0` turns it off). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
 - While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.
 - A batch window is recorded as a graph once for each set of slots in it.
 

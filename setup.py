@@ -5988,13 +5988,36 @@ def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
     return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
 
 
+def replicas_config(a, cfg: dict) -> None:
+    """--replicas N: data-parallel replicas (serve/replicas.py, upstream 8d276c19) over the chosen GPUs, in equal
+    groups"""
+    if a.replicas is None or a.replicas < 2:
+        return
+    cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
+    if not cards or len(cards) % a.replicas:
+        warn(f"--replicas {a.replicas}: needs the chosen GPUs ({len(cards) or 'one'}) to divide into {a.replicas} "
+             "equal groups; not set (choose the cards with --gpus, or write the groups into the config: "
+             '"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}])')
+        return
+    cfg["replicas"] = a.replicas
+    per = len(cards) // a.replicas
+    ok(f"{a.replicas} replicas of {per} GPU(s) each: "
+       f"{' | '.join(','.join(cards[i * per:(i + 1) * per]) for i in range(a.replicas))}")
+    if per > 1 and a.layer_split not in (None, "auto"):
+        warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
+    warn("each replica loads its own copy of the model's experts into RAM and runs its own host threads: "
+         "check that the RAM holds them")
+
+
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
     the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
-    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  The
-    Qwen3.8-Flash-Next options (KV precision, low-RAM modes, the speed projection) do not apply; --low-ram on|mmap reads
+    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  --kv,
+    --parallel and --replicas as for Qwen3.8-Flash-Next where the engine takes them (the speed projection's vector is
+    that model's); --low-ram on|mmap reads
     the experts from the model file instead of RAM (--mmap-experts), the engine's own choice when the RAM is short;
+    --resident-budget-gib N keeps N GiB of them in RAM and reads the rest from the file;
     --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
     by the GPU's memory, which holds all of its weights."""
     models = fam["models"]
@@ -6147,9 +6170,27 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
     elif vision != "none":
         args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    # --kv: the KV cache's precision, as far as the model's engine path takes it (the Hadamard-rotated Q4_0 forms for
+    # heads of 256; GLM-5.3-Flash's DSA caches in FP16 only)
+    if a.kv:
+        takes = ("fp16",) if family == "glm53" else ("fp16", "int8") if family == "llmjp" else \
+            ("fp16", "int8", "q4_0", "k8v4")
+        if a.kv not in takes:
+            warn(f"--kv {a.kv} is not available for {fam['title']} ({', '.join(takes)}): the KV cache stays FP16")
+        elif a.kv != "fp16":
+            args += ["--kv", a.kv]
+            ok(f"KV cache: {a.kv}")
     # --low-ram: the engine keeps in RAM what the VRAM does not hold as far as the RAM allows and reads the rest from
-    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file
-    if a.low_ram in ("on", "mmap"):
+    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file.
+    # --resident-budget-gib N: N GiB of them in RAM, the rest read from the file (the engine's RAM tier, as
+    # Qwen3.8-Flash-Next's)
+    if a.resident_budget_gib is not None and not dense:
+        args += ["--resident-budget-gib", f"{a.resident_budget_gib:g}"]
+        ok(f"RAM budget: {a.resident_budget_gib:g} GiB of the experts the GPU does not hold in RAM, the rest read from "
+           "the model file")
+        if a.low_ram in ("on", "mmap"):
+            warn(f"--low-ram {a.low_ram} is left out: --resident-budget-gib keeps part of the experts in RAM")
+    elif a.low_ram in ("on", "mmap"):
         args += ["--mmap-experts"]
         ok("low-RAM mode: the experts the GPU does not hold are read from the model file (--mmap-experts)")
     elif a.low_ram == "resident":
@@ -6170,8 +6211,16 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
-    if a.parallel is not None and a.parallel >= 2:
-        warn("--parallel is not available for this model yet: one request at a time")
+    if a.parallel is not None and a.parallel >= 2:   # the batch slots (docs/BATCHING.md, the plain engine's part)
+        if family == "glm53" or vision != "none":
+            warn(f"--parallel is not available {'for GLM-5.3-Flash' if family == 'glm53' else 'with images'} yet: "
+                 "one request at a time")
+        else:
+            cfg["parallel"] = a.parallel
+            ok(f"parallel requests: up to {a.parallel} decoded together (as many as half the free VRAM holds)")
+    elif a.parallel == 1:
+        cfg["parallel"] = 1
+    replicas_config(a, cfg)
     if vision != "none" and mmproj is not None:   # as Qwen3.8-Flash-Next's (setup's main path)
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
@@ -6193,13 +6242,14 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
         if not cfg["image_models"]:
             cfg["image_models"] = None
-    return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
                  notes: list[str] | tuple = ()) -> int:
     """The end of an install: the model's config written, its start script, the warm-up, what to do next, and the
-    start.  `tune`: Qwen3.8-Flash-Next's engine options, where an earlier calibration's settings for this PC apply.
+    start.  `tune`: the engine options an earlier calibration found for this PC and model, where there are some
+    (--pcie-frac, --pool-workers and the adaptive tier's, which both engines take).
     `notes`: the model's own tips, printed with the CPU's."""
     cfg_path = CONF / f"xestrata-{tag.lower()}.json"
     CONF.mkdir(parents=True, exist_ok=True)
@@ -6478,7 +6528,8 @@ def main() -> int:
                          "through the OS file cache (mmap); resident / mmap force one of the two")
     ap.add_argument("--resident-budget-gib", type=float, metavar="N",
                     help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
-                         "~38 on 64 GB; more is kept as you choose, with a note)")
+                         "~38 on 64 GB; more is kept as you choose, with a note); the other models' files: the GiB "
+                         "of the experts the GPU does not hold kept in RAM, the rest read from the file")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
@@ -7341,21 +7392,7 @@ def main() -> int:
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
         if a.layer_split:
             cfg["layer_split"] = str(a.layer_split)
-    if a.replicas is not None and a.replicas >= 2:      # data-parallel replicas (serve/replicas.py, upstream 8d276c19)
-        cards = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])] if cfg.get("gpu_pci") else []
-        if not cards or len(cards) % a.replicas:
-            warn(f"--replicas {a.replicas}: needs the chosen GPUs ({len(cards) or 'one'}) to divide into {a.replicas} "
-                 "equal groups; not set (choose the cards with --gpus, or write the groups into the config: "
-                 '"replicas": [{"gpus": ["0000:03:00.0"]}, {"gpus": ["0000:09:00.0"]}])')
-        else:
-            cfg["replicas"] = a.replicas
-            per = len(cards) // a.replicas
-            ok(f"{a.replicas} replicas of {per} GPU(s) each: "
-               f"{' | '.join(','.join(cards[i * per:(i + 1) * per]) for i in range(a.replicas))}")
-            if per > 1 and a.layer_split not in (None, "auto"):
-                warn("--layer-split is one engine's value; with replicas every group would get it: leave it at auto")
-            warn("each replica loads its own copy of the model's experts into RAM and runs its own host threads: "
-                 "check that the RAM holds them")
+    replicas_config(a, cfg)
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
     if a.host:

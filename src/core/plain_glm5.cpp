@@ -271,7 +271,7 @@ bool PlainModel::load_glm5(std::string& err) {
     // the KDA states after a window's rows but its last, for going back to the last accepted draft (every stage's)
     if (model_mtp_) {
         opt_.spec = std::min({opt_.spec, opt_.max_t, k::kGlm5MaxSnaps + 1});
-        n_snap_ = opt_.spec - 1;
+        n_snap_ = n_mtp_ = opt_.spec - 1;
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)

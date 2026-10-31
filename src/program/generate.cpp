@@ -461,6 +461,9 @@ struct Options {
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
     bool vision = false;
     int adapt_swaps = 96;
+    /// --adapt-mib-per-token N (the other models' engine's bound): a round copies at most N MiB of experts for each
+    /// token the windows read since the last round, counted as one a window (adapt_round_cap).  0: no bound, as before
+    int adapt_mib_per_token = 0;
     /// --serve: how many conversation checkpoints to keep between requests (0 = every request reads its whole
     /// prompt again, the v0.1.2 behaviour).  One is the GDN recurrence of the 36 layers, the QSA indexer tails and
     /// the PLE history (~118 MB of host RAM); the KV cache itself is positional and stays where it is.
@@ -797,6 +800,8 @@ void usage() {
                  "  --resident-cpu-experts  cache the static GPU cache's misses in ordinary RAM (with --mmap-experts)\n"
                  "  --shared-expert-arena FILE  share completed expert weights between Linux processes\n"
                  "  --coupled-draft / --no-coupled-draft  sample MTP drafts with the target's chain (default: off)\n"
+                 "  --adapt-mib-per-token N  a round copies at most N MiB of experts for each window since the last\n"
+                 "                       round (the copies share the RAM's bandwidth with the missed experts; 0 = off)\n"
                  "  --adapt-min-gain F   the adaptive tier swaps an expert in only when its decayed routing count\n"
                  "                       beats the one it replaces by more than F (default 1.5; higher = fewer swaps)\n"
                  "  --adapt-async 0|1    --serve with the resident RAM mode: the adaptive tier's swaps advance\n"
@@ -2086,6 +2091,11 @@ bool pcie_move_if_pays(strata::core::ExpertDispatch& d, bool overlap, const stra
 // share of the verify windows (the other models' engine gives it its own windows' share).
 using strata::core::kAdaptDecideAt;
 
+// --adapt-mib-per-token: the swaps a round may take, after `adapt_every` windows of a token or more since the last one
+int64_t adapt_round_cap(int64_t adapt_swaps, int64_t adapt_every, int64_t mib_per_token) {
+    return strata::core::adapt_swap_budget(adapt_swaps, mib_per_token, std::max<int64_t>(adapt_every, 1));
+}
+
 int64_t auto_adapt_period(const strata::core::Verifier& v, int64_t period, bool from_files, const char* who) {
     const double all = v.ms_wait + v.ms_pool + v.ms_host + v.ms_commit;
     return strata::core::auto_adapt_period(all > 0.0 ? v.ms_pool / all : 0.0, period, from_files, who);
@@ -2527,6 +2537,8 @@ int main(int argc, char** argv) {
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
+        else if (a == "--adapt-mib-per-token")
+            o.adapt_mib_per_token = std::max(0, (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10));
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -8339,7 +8351,9 @@ int main(int argc, char** argv) {
             std::vector<Swap> swaps = strata::core::choose_swaps(
                 drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
                 [&](int64_t l, int32_t e) { return helper_holds(drive.d, l, e); });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (const int64_t cap = adapt_round_cap(o.adapt_swaps, o.adapt_every, o.adapt_mib_per_token);
+                (int64_t) swaps.size() > cap)
+                swaps.resize((size_t) cap);
             bool main_live = false;
             auto swap_home = [&](int32_t layer) {   // the cache that owns the layer, on its card's stream
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -8460,7 +8474,8 @@ int main(int argc, char** argv) {
         // overwritten at once; anything that gives a slot away (a K/V growth, the VRAM command) calls adapt_quiesce.
         const bool a_arena = srcp == &arena_src;
         // as the blocking tier's exchange buffers; the arena has none, so its rounds are as large as the blocking tier's
-        const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96);
+        const int64_t a_cap = adapt_round_cap(a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96),
+                                              o.adapt_every, o.adapt_mib_per_token);
         const auto a_env = [](const char* name, int def) {
             const char* v = std::getenv(name);
             return v != nullptr && *v != 0 ? (int) std::strtol(v, nullptr, 10) : def;
@@ -13465,7 +13480,9 @@ int main(int argc, char** argv) {
             std::vector<Swap> swaps = strata::core::choose_swaps(
                 drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
                 [&](int64_t l, int32_t e) { return helper_holds(drive.d, l, e); });
-            if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (const int64_t cap = adapt_round_cap(o.adapt_swaps, o.adapt_every, o.adapt_mib_per_token);
+                (int64_t) swaps.size() > cap)
+                swaps.resize((size_t) cap);
             if (!resident_stage_swaps(src, host_res, g.n_expert, swaps,   // this loop refills the first card only
                                       [&](int32_t) { return SwapHome{&xcache, adapt_stream, -1}; }))
                 return false;

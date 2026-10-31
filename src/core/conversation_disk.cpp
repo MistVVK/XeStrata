@@ -144,6 +144,41 @@ struct Blosc2Context {
     Blosc2Context& operator=(const Blosc2Context&) = delete;
     ~Blosc2Context() { if (ctx != nullptr) blosc2_free_ctx(ctx); }
 };
+
+void blosc2_once() {
+    static const bool ready = (blosc2_init(), true);   // once per process; the contexts do the rest
+    (void) ready;
+}
+
+// One chunk of a compressed part, as both engines' files store it: ZSTD at level 1 after a byte shuffle by the
+// element size (`c` is that size's context).  The compressed size, or -1.
+int compress_chunk(Blosc2Context& c, const uint8_t* src, size_t len, int typesize, std::vector<uint8_t>& packed) {
+    if (c.ctx == nullptr) {
+        blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;   // its one filter is the byte shuffle
+        cp.compcode = BLOSC_ZSTD;
+        cp.clevel = 1;
+        cp.typesize = typesize;
+        cp.nthreads = blosc2_threads();
+        c.ctx = blosc2_create_cctx(cp);
+    }
+    packed.resize(len + BLOSC2_MAX_OVERHEAD);
+    return c.ctx == nullptr ? -1 : blosc2_compress_ctx(c.ctx, src, (int32_t) len, packed.data(), (int32_t) packed.size());
+}
+
+// The chunk of `bytes` at `packed` back into the `len` bytes at `dst`: its sizes are checked first, and c-blosc2
+// checks the rest itself.
+bool decompress_chunk(Blosc2Context& c, const uint8_t* packed, uint64_t bytes, uint8_t* dst, size_t len) {
+    if (bytes < BLOSC_MIN_HEADER_LENGTH || bytes > len + BLOSC2_MAX_OVERHEAD) return false;
+    int32_t raw = 0, stored = 0, block = 0;
+    if (blosc2_cbuffer_sizes(packed, &raw, &stored, &block) < 0 || (size_t) raw != len || (uint64_t) stored != bytes)
+        return false;
+    if (c.ctx == nullptr) {
+        blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
+        dp.nthreads = blosc2_threads();
+        c.ctx = blosc2_create_dctx(dp);
+    }
+    return c.ctx != nullptr && blosc2_decompress_ctx(c.ctx, packed, (int32_t) bytes, dst, (int32_t) len) == (int) len;
+}
 #endif
 
 // ---- the header, built in memory (little-endian, as every machine this engine runs on)
@@ -309,18 +344,7 @@ struct Writer {
     }
     void chunk(const uint8_t* src, size_t len, int typesize) {
 #ifdef STRATA_HAVE_BLOSC2
-        Blosc2Context& c = cctx[typesize];
-        if (c.ctx == nullptr) {
-            blosc2_cparams cp = BLOSC2_CPARAMS_DEFAULTS;   // its one filter is the byte shuffle
-            cp.compcode = BLOSC_ZSTD;
-            cp.clevel = 1;
-            cp.typesize = typesize;
-            cp.nthreads = blosc2_threads();
-            c.ctx = blosc2_create_cctx(cp);
-        }
-        packed.resize(len + BLOSC2_MAX_OVERHEAD);
-        const int n = c.ctx == nullptr ? -1 : blosc2_compress_ctx(c.ctx, src, (int32_t) len, packed.data(),
-                                                                   (int32_t) packed.size());
+        const int n = compress_chunk(cctx[typesize], src, len, typesize, packed);
         if (n <= 0) {
             ok = false;
             return;
@@ -408,17 +432,7 @@ struct FileReader {
         uint64_t bytes = 0;
         if (!value(bytes) || bytes < BLOSC_MIN_HEADER_LENGTH || bytes > len + BLOSC2_MAX_OVERHEAD) return false;
         packed.resize((size_t) bytes);
-        if (!read(packed.data(), packed.size())) return false;
-        int32_t raw = 0, stored = 0, block = 0;
-        if (blosc2_cbuffer_sizes(packed.data(), &raw, &stored, &block) < 0 || (size_t) raw != len ||
-            (uint64_t) stored != bytes) return false;
-        if (dctx.ctx == nullptr) {
-            blosc2_dparams dp = BLOSC2_DPARAMS_DEFAULTS;
-            dp.nthreads = blosc2_threads();
-            dctx.ctx = blosc2_create_dctx(dp);
-        }
-        return dctx.ctx != nullptr &&
-               blosc2_decompress_ctx(dctx.ctx, packed.data(), (int32_t) bytes, dst, (int32_t) len) == (int) len;
+        return read(packed.data(), packed.size()) && decompress_chunk(dctx, packed.data(), bytes, dst, len);
 #else
         (void) dst; (void) len;
         return false;
@@ -497,6 +511,53 @@ bool conversation_disk_can_compress() {
 #endif
 }
 
+bool conversation_compress(const void* src, size_t n, int typesize, std::vector<uint8_t>& out) {
+    out.clear();
+#ifdef STRATA_HAVE_BLOSC2
+    if (typesize != 1 && typesize != 2 && typesize != 4) return false;
+    blosc2_once();
+    const WideAffinity wide;
+    thread_local Blosc2Context cctx[5];   // by element size
+    std::vector<uint8_t> packed;
+    for (size_t at = 0; at < n; at += kChunk) {
+        const size_t len = std::min(kChunk, n - at);
+        const int k = compress_chunk(cctx[typesize], static_cast<const uint8_t*>(src) + at, len, typesize, packed);
+        if (k <= 0) return false;
+        const uint64_t bytes = (uint64_t) k;
+        const auto* b = reinterpret_cast<const uint8_t*>(&bytes);
+        out.insert(out.end(), b, b + sizeof bytes);
+        out.insert(out.end(), packed.begin(), packed.begin() + k);
+    }
+    return true;
+#else
+    (void) src; (void) n; (void) typesize;
+    return false;
+#endif
+}
+
+bool conversation_decompress(const uint8_t* src, size_t stored, void* dst, size_t n) {
+#ifdef STRATA_HAVE_BLOSC2
+    blosc2_once();
+    const WideAffinity wide;
+    thread_local Blosc2Context dctx;
+    size_t pos = 0;
+    for (size_t at = 0; at < n; at += kChunk) {
+        const size_t len = std::min(kChunk, n - at);
+        uint64_t bytes = 0;
+        if (stored - pos < sizeof bytes) return false;
+        std::memcpy(&bytes, src + pos, sizeof bytes);
+        pos += sizeof bytes;
+        if (bytes > stored - pos || !decompress_chunk(dctx, src + pos, bytes, static_cast<uint8_t*>(dst) + at, len))
+            return false;
+        pos += (size_t) bytes;
+    }
+    return pos == stored;
+#else
+    (void) src; (void) stored; (void) dst; (void) n;
+    return false;
+#endif
+}
+
 std::string conversation_file_identity(const std::string& path) {
     if (path.empty()) return "-";
     std::error_code ec;
@@ -549,8 +610,7 @@ bool ConversationDisk::open(ConversationDiskOptions options, std::string& error)
         }
     }
 #ifdef STRATA_HAVE_BLOSC2
-    static const bool blosc2_ready = (blosc2_init(), true);   // once per process; the contexts do the rest
-    (void) blosc2_ready;
+    blosc2_once();
 #endif
     if (options_.compress && !conversation_disk_can_compress()) {
         error = "compression needs c-blosc2, which this build lacks";

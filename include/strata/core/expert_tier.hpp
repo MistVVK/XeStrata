@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/core/expert_tier.hpp - the rules of the expert tiers that Qwen3.8-Flash-Next's engine
 // (generate.cpp) and the other models' (PlainModel) share: which experts an adaptive round swaps into the VRAM tier,
-// which ones STRATA_RAM_ADAPT moves into the RAM copy, and the copies back into the RAM copy's exchange buffers.
-// When a round runs, how many swaps it may take and how its copies are issued stay with each engine: those were
-// measured apart (plain_model.hpp's adapt_mib_per_token, generate.cpp's adapt_lag and --adapt-async).
+// which ones STRATA_RAM_ADAPT moves into the RAM copy, the copies back into the RAM copy's exchange buffers, and the
+// bound of a round's copies (--adapt-mib-per-token).  When a round runs and how its copies are issued stay with each
+// engine: those were measured apart (generate.cpp's adapt_lag and --adapt-async).
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
@@ -76,6 +76,16 @@ inline std::vector<TierSwap> choose_swaps(const float* usage, const int32_t* res
                                           float min_gain) {
     return choose_swaps(usage, res, layers, n_expert, min_gain, [](int64_t) { return 0; },
                         [](int64_t, int32_t) { return false; });
+}
+
+/// --adapt-mib-per-token: the swaps a round may take, `cap` (--adapt-swaps) at most and, with `mib_per_token` > 0, at
+/// most that many MiB of copies, at the largest expert's size, for each of the `tokens` read since the last round (at
+/// least one swap).  The copies share the RAM's bandwidth with the missed experts the CPU and PCIe read.
+inline int64_t adapt_swap_budget(int64_t cap, int64_t mib_per_token, int64_t tokens) {
+    const uint64_t blob = kernels::cpu::expert_layout().max_blob;
+    if (mib_per_token <= 0 || blob == 0) return cap;
+    const uint64_t n = ((uint64_t) mib_per_token << 20) * (uint64_t) std::max<int64_t>(tokens, 0) / blob;
+    return std::min<int64_t>(cap, std::max<int64_t>((int64_t) n, 1));
 }
 
 /// STRATA_RAM_ADAPT's rule (upstream d7298883, 2b13a4493): the RAM copy is chosen once, at start, so an expert it does

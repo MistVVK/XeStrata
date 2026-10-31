@@ -415,10 +415,12 @@ The others are made of the same tensor types, checked on those files and in the 
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding, greedy requests only; the GSQ-RCO versions and llm-jp have no MTP layer).
+Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding; the GSQ-RCO versions and llm-jp have no MTP layer).
+Requests with a temperature take it too: each row of a window draws from a random number its position fixes, and a draft is kept only where it equals that draw, so the text is the one without drafts (Qwen3.6-35B-A3B on the B70, 400 tokens at temperature 0.8: decode 92.9 -> 131.7 tokens/s).
 With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
+`setup`'s `--kv`, `--parallel`, `--replicas` and `--resident-budget-gib N` (N GiB of the experts the GPU does not hold in RAM, the rest read from the file) go into the config as for Qwen3.8-Flash-Next (`--kv`'s `q4_0` and `k8v4` for the models with heads of 256, `fp16` and `int8` for llm-jp, `fp16` alone for GLM-5.3-Flash; `--parallel` not for GLM-5.3-Flash nor with images).
 Qwen3.5-9B reads images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more,
 the CPU reader below that).
 Not yet: the other models' images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
@@ -443,6 +445,7 @@ The engine's options (added to the settings' `args`):
 | `--adapt-swaps N` | the most experts one swap moves (default 96; the one right after a prompt moves up to 2,048, those the prompt used most, and fills every free slot with any expert it used) |
 | `--adapt-mib-per-token N` | the swaps copy at most N MiB for each token read since the last one (default 48; 0: no bound) |
 | `--adapt-min-gain F` | the bar a swap must clear: the decayed routing count of the expert coming in against the one going out (default 1.5) |
+| `--adapt-async 0\|1` | 1 (the default): a swap's copies run beside the next windows, and the experts it brings in are used three windows on; 0: the swap waits for its copies (as Qwen3.8-Flash-Next's `--adapt-async 0`) |
 | `--mmap-experts` | read the experts from the model file instead of loading them into RAM (setup writes it with `--low-ram on` or `mmap`) |
 | `--shared-expert-arena FILE` | share the experts' RAM copy with the other engines that name the same FILE (Linux: the first to load fills it, the rest map it; Qwen3.8-Flash-Next's; not with `--mmap-experts` or the RAM tier) |
 | `--resident-experts`, `--resident-budget-gib N`, `--resident-cpu-experts` | read the experts in place and copy those no VRAM tier holds into RAM in the profile's order, as far as the RAM allows (`--resident-budget-gib`: up to N GiB); `--resident-cpu-experts` keeps that copy in ordinary RAM, not page-locked (Qwen3.8-Flash-Next's names) |
@@ -457,6 +460,8 @@ The engine's options (added to the settings' `args`):
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
 | `--spec-window all\|auto\|min-p` | how many of the drafts a window checks: `all` (the default) every draft made; `auto`, as Qwen3.8-Flash-Next does, while the drafts' probabilities and the measured window times say a draft raises the tokens per ms; `min-p` while a draft is at least `--spec-min-p P` likely |
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
+| `--coupled-draft`, `--no-coupled-draft` | under sampling, the MTP layer's drafts are drawn too, with the request's chain (temperature, top_k, top_p, min_p) and the random number of the window row that checks each (Qwen3.8-Flash-Next's; off by default) |
+| `--suffix-draft N`, `--lookup-chain K`, `--lookup-chain-min M` | with `--serve`, drafts from an earlier repeat of the conversation's text (a match of its last N tokens or more), checked in a window where they go past the MTP layer's drafts (also on a model without that layer); `--lookup-chain` adds up to K such tokens after the MTP's drafts (off by default) |
 | `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
@@ -791,6 +796,7 @@ They answer **409** while a request is running or queued and **404** for an unkn
 ### Keeping what the expert cache learned across restarts (opt-in)
 
 A start fills the GPU's expert cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use (upstream #477).
+`--adapt-mib-per-token N` caps a round's copies at N MiB for each window since the last round (Qwen3.8-Flash-Next: off by default; the other models' engine bounds them at 48 MiB a token).
 With `"expert_profile_save": "expert-profile-learned.bin"` in `xestrata-<model>.json` the engine saves that as a profile:
 the experts in VRAM first, then the routing it counted since the start, then the shipped order.
 It saves on a clean exit and every 10 minutes between requests (`"expert_profile_save_every": 5` for another interval, `0` for exit only).
@@ -1210,12 +1216,11 @@ A relative path is from the XeStrata folder.
   A damaged file is deleted and the prompt is read as before.
 - Only the owner can read the files (a folder the engine makes is 0700, the files 0600).
   They hold values computed from the conversations: keep them on this PC.
-- With Qwen3.8-Flash-Next, `"conversation_save_compress": true` writes the floating-point parts of a file (the DeltaNet states, the indexer rows, FP16 KV) compressed with c-blosc2's ZSTD at level 1 (off by default).
+- `"conversation_save_compress": true` writes the floating-point parts of a file (the DeltaNet states, the indexer rows, FP16 KV, GLM-5.3-Flash's latent rows) compressed with c-blosc2's ZSTD at level 1 (off by default).
   A file gets about 10% smaller with INT8 KV and about 15% with FP16 KV. KV of 1-byte codes (INT8, Q4_0, K8V4) hardly compresses and is written as it is.
   It is available only when the build found libblosc2-dev (Debian / Ubuntu); with the key and a build without it, the engine does not start.
   A compressed file is read by any engine built with libblosc2, with or without the key; an engine without it deletes the file and reads the prompt again.
-- As engine arguments: `--conversation-save DIR`, `--conversation-save-mib N`, `--conversation-save-hours N`, `--session-min-free-mib N`.
-  `--conversation-save-checkpoints N` and `--conversation-save-compress` are taken by Qwen3.8-Flash-Next's engine only.
+- As engine arguments: `--conversation-save DIR`, `--conversation-save-mib N`, `--conversation-save-hours N`, `--conversation-save-checkpoints N`, `--conversation-save-compress`, `--session-min-free-mib N`.
 
 Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two checkpoints) took 471 MiB.
 After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).

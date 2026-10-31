@@ -385,8 +385,10 @@ setup は GPU の VRAM に入る最も大きな版を勧め、入らない組み
 ```
 
 API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
-Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
+Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード。GSQ-RCO の版と llm-jp には MTP の層がありません）。
+温度つきの要求でも使います。窓の各行は位置で決まる乱数で引き、下書きはその引きと同じときだけ使うので、文は下書きがないときと同じです（B70 の Qwen3.6-35B-A3B、温度 0.8 の 400 トークンで decode 92.9 → 131.7 トークン/秒）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
+`setup` の `--kv`、`--parallel`、`--replicas`、`--resident-budget-gib N`（GPU が持たないエキスパートのうち N GiB を RAM に置き、残りをファイルから読む）は、Qwen3.8-Flash-Next と同じく設定に書かれます（`--kv` の `q4_0`・`k8v4` はヘッドが 256 のモデル、llm-jp は `fp16`・`int8`、GLM-5.3-Flash は `fp16` だけ。`--parallel` は GLM-5.3-Flash と画像では使えません）。
 Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
 まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は GLM-5.3-Flash ではまだ FP16 だけです）。
 RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
@@ -408,6 +410,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96。prompt の直後の 1 回は、その prompt が多く使ったものを 2,048 個まで。空いた枠には、1 回でも使ったものを数に関わらず入れます） |
 | `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
 | `--adapt-min-gain F` | 入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差。既定 1.5） |
+| `--adapt-async 0\|1` | 1（既定）は、入れ替えの写しを次の窓の横で進め、3 窓後に入れ替えたエキスパートを使う。0 は、写しが終わるまで入れ替えのところで待つ（Qwen3.8-Flash-Next の `--adapt-async 0` と同じ） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む（setup の `--low-ram on` か `mmap` で書かれます） |
 | `--shared-expert-arena FILE` | エキスパートの RAM の写しを、同じ FILE を名指すほかのエンジンと分け合う（Linux。最初に読んだエンジンが埋め、ほかは写すだけ。Qwen3.8-Flash-Next と同じ。`--mmap-experts` や RAM の段とは一緒に使えません） |
 | `--resident-experts`、`--resident-budget-gib N`、`--resident-cpu-experts` | エキスパートをファイルから読み、VRAM にないものを RAM の許す限り（`--resident-budget-gib` では N GiB まで）プロファイルの順に RAM に写す。`--resident-cpu-experts` はその写しを page-lock しない普通の RAM に置きます（Qwen3.8-Flash-Next と同じ名前） |
@@ -422,6 +425,8 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
 | `--spec-window all\|auto\|min-p` | 窓で確かめる下書きの数の決め方。`all`（既定）は作った下書きをすべて、`auto` は Qwen3.8-Flash-Next と同じく、下書きの確率と測った窓の時間から 1 ms あたりの出力が増える間だけ、`min-p` は下書きの確率が `--spec-min-p P` 以上の間だけ |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
+| `--coupled-draft`、`--no-coupled-draft` | 温度つきの要求で、MTP の層の下書きも要求の引き方（温度、top_k、top_p、min_p）で、それを確かめる窓の行と同じ乱数で引く（Qwen3.8-Flash-Next と同じ。既定はオフ） |
+| `--suffix-draft N`、`--lookup-chain K`、`--lookup-chain-min M` | `--serve` で、会話の文の前の繰り返し（直近の N トークン以上の一致）から下書きを作り、MTP の層の下書きより長いときはそれを窓で確かめる（MTP の層のないモデルでも）。`--lookup-chain` は MTP の下書きの後に K トークンまで続けます（既定は無効） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
 | `--vram-reserve-later-mib N` | 層を分けたとき、2 枚目以降の GPU に空けておく VRAM（既定は `--vram-reserve-mib` と同じ） |
@@ -750,6 +755,7 @@ API キーを設定していればそれが要り、`application/json` で、よ
 ### エキスパートのキャッシュが学んだことを再起動後も使う（任意）
 
 起動時は、同梱の順位で GPU のエキスパートのキャッシュを埋め、適応の段（`--adapt-every`）が要求で使われたエキスパートを入れていきます（upstream #477）。
+`--adapt-mib-per-token N` は、1 回の入れ替えで写す量を、前の回からの窓 1 つあたり N MiB までにします（Qwen3.8-Flash-Next では既定で無効。ほかのモデルのエンジンは既定でトークンあたり 48 MiB までです）。
 `xestrata-<model>.json` に `"expert_profile_save": "expert-profile-learned.bin"` を書くと、エンジンはその状態を順位として保存します。
 順は、VRAM にあるエキスパート、起動から数えたルーティング、同梱の順位です。
 保存するのは、正常に終わるときと、要求の合間に 10 分ごとです（`"expert_profile_save_every": 5` で別の間隔、`0` で終了時だけ）。
@@ -1170,12 +1176,11 @@ setup は、モデルごとの設定に `"conversation_save": "<モデルのフ�
   壊れたファイルは消して、これまでどおりプロンプトを読みます。
 - ファイルは所有者だけが読めます（エンジンが作ったフォルダーは 0700、ファイルは 0600）。
   会話の内容から計算した値なので、PC の外に出しません。
-- Qwen3.8-Flash-Next では、`"conversation_save_compress": true` で、ファイルの浮動小数点の部分（DeltaNet の状態、indexer の行、FP16 の KV）を c-blosc2 の ZSTD（レベル 1）で圧縮して書きます（既定はオフ）。
+- `"conversation_save_compress": true` で、ファイルの浮動小数点の部分（DeltaNet の状態、indexer の行、FP16 の KV、GLM-5.3-Flash の潜在の行）を c-blosc2 の ZSTD（レベル 1）で圧縮して書きます（既定はオフ）。
   INT8 の KV で 1 割前後、FP16 の KV で 1.5 割ほど小さくなります。1 バイト単位の KV（INT8、Q4_0、K8V4）はほとんど縮まないので、そのまま書きます。
   ビルドのときに libblosc2-dev（Debian / Ubuntu）が見つかった場合だけ使えます。ないビルドでこのキーを書くと、エンジンは起動を止めます。
   圧縮したファイルは、このキーがなくても、libblosc2 を組み込んだエンジンなら読めます。組み込んでいないエンジンでは消して、プロンプトを読み直します。
-- エンジンの引数では `--conversation-save DIR`、`--conversation-save-mib N`、`--conversation-save-hours N`、`--session-min-free-mib N` です。
-  `--conversation-save-checkpoints N` と `--conversation-save-compress` は Qwen3.8-Flash-Next のエンジンだけが取ります。
+- エンジンの引数では `--conversation-save DIR`、`--conversation-save-mib N`、`--conversation-save-hours N`、`--conversation-save-checkpoints N`、`--conversation-save-compress`、`--session-min-free-mib N` です。
 
 B70 の IQ2_XS で測ると、9,183 トークンの会話（INT8 の KV、チェックポイント 2 個）は 471 MiB でした。
 再起動のあと、CPU 直結の NVMe から 0.28 秒で読んで戻し、新しい 7 トークンだけを読みました（ファイルがないと 9,167 トークンを 7.9 秒で読み直します）。

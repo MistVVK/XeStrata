@@ -109,6 +109,11 @@ PlainModel::~PlainModel() {
     for (auto* g : mexec_) strata::gpu::graph_destroy(g);
     for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
+    for (auto* m : {&bexec_, &mbexec_})
+        for (auto& [key, g] : *m) strata::gpu::graph_destroy(g);
+    for (auto* m : {&bsegs_, &mbsegs_})
+        for (auto& [key, v] : *m)
+            for (auto* g : v) strata::gpu::graph_destroy(g);
     for (void* p : allocs_) strata::gpu::free(p);
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
                     (void*) hand_host_})
@@ -695,9 +700,12 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
-    if (model_mtp_) {
-        opt_.spec = std::min({opt_.spec, opt_.max_t, k::kNativeGdnMaxSnaps + 1});
-        n_snap_ = opt_.spec - 1;
+    // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
+    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kNativeGdnMaxSnaps + 1) - 1 : 0;
+    if (model_mtp_ || lookup > 0) {
+        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kNativeGdnMaxSnaps + 1});
+        n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
+        n_snap_ = std::max(n_mtp_, lookup);
         gdn_snap_.assign(gdn_state_.size(), {});
         conv_snap_.assign(gdn_state_.size(), {});
         for (size_t g = 0; g < gdn_state_.size(); ++g)
@@ -717,7 +725,7 @@ bool PlainModel::load_qwen(std::string& err) {
     // the drafts' head over a token subset (Qwen3.8's draft head, mtp.cpp): on the RX 9060 XT the whole Q8_0 head of
     // Qwen3.6's 248,320 tokens took 1.7 ms a draft, at the card's bandwidth, 2026-10-15.  The engine's row layouts
     // (upload) rewrite each row in place, so a row keeps its GGUF type's size.
-    if (has_mtp_ && n_snap_ > 0 && !opt_.draft_vocab.empty()) {
+    if (has_mtp_ && n_mtp_ > 0 && !opt_.draft_vocab.empty()) {
         const int gguf_type = head_.type == k::kNativeQ8Rows    ? kQ80
                               : head_.type == k::kNativeQ6KRows ? kQ6K
                                                                 : head_.type;
@@ -1310,17 +1318,35 @@ bool PlainModel::open_experts(std::string& err) {
         return false;
     }
     // the tier from a profile, after the split's timing (which needs experts in RAM outside the VRAM): its ranking,
-    // each of this stage's layers up to its slots
+    // each of this stage's layers up to its slots.  Without a profile each layer's tier takes its first experts (the
+    // adaptive tier moves them), so that the RAM copy below leaves out what VRAM holds; with the experts in RAM or read
+    // in place, the round after the first prompt fills the free slots with those it routed to instead - but not when
+    // no round comes (--adapt-every 0: the tier stayed empty and the CPU computed every expert, 59.1 tok/s against
+    // 143.5 for Qwen3.6 UD-Q4_K_XL wholly in the B70's VRAM, 2026-11-01), nor in a layer whose slots take all its
+    // experts: there is no choice to wait for, and the rounds would fill 10,496 slots 2,048 and then 96 at a time.
+    struct Fill { int64_t l; int32_t e, slot; };
+    std::vector<Fill> todo;
+    const bool rounds = opt_.adapt_every > 0 && opt_.adapt_swaps > 0;
     if (!opt_.profile.empty()) {   // prior_ read above, where it sized the layers' slots
-        // each layer up to its slots, the experts read on several threads, each through pinned memory of its own: one
-        // at a time, GLM-5.3-Flash's 2,646 (22.9 GB) took 19.5 s from the drive, 1.2 GB/s (B70, 990 Pro, 2026-10-19)
-        struct Fill { int64_t l; int32_t e, slot; };
-        std::vector<Fill> todo;
         for (const auto& [l, e] : prior_)
             if (!free_[(size_t) l].empty()) {
                 todo.push_back({l, e, free_[(size_t) l].back()});
                 free_[(size_t) l].pop_back();
             }
+    } else {
+        for (int64_t l : moe_local_) {
+            auto& f = free_[(size_t) l];
+            if ((in_ram_ || opt_.mmap_experts) && rounds && (int64_t) f.size() < E) continue;
+            for (int32_t e = 0; e < (int32_t) E && !f.empty(); ++e)
+                if (res_[(size_t) (l * E + e)] < 0) {
+                    todo.push_back({l, e, f.back()});
+                    f.pop_back();
+                }
+        }
+    }
+    if (!todo.empty()) {
+        // the experts read on several threads, each through pinned memory of its own: one at a time, GLM-5.3-Flash's
+        // 2,646 (22.9 GB) took 19.5 s from the drive, 1.2 GB/s (B70, 990 Pro, 2026-10-19)
         std::atomic<size_t> next{0};
         std::atomic<bool> bad{false};
         auto work = [&]() {
@@ -1347,16 +1373,10 @@ bool PlainModel::open_experts(std::string& err) {
             return false;
         }
         for (const Fill& f : todo) res_[(size_t) (f.l * E + f.e)] = f.slot;
-        const int64_t filled = (int64_t) todo.size();
-        std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
-                     (long long) filled);
+        if (!opt_.profile.empty())
+            std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
+                         (long long) todo.size());
     }
-    // without a profile each layer's tier takes its first experts (the adaptive tier moves them), so that the RAM copy
-    // below leaves out what VRAM holds
-    if (!in_ram_ && !opt_.mmap_experts && opt_.profile.empty())
-        for (int64_t l : moe_local_)
-            for (int32_t e = 0; e < (int32_t) E && !free_[(size_t) l].empty(); ++e)
-                if (res_[(size_t) (l * E + e)] < 0 && !fill_slot(l, e, err)) return false;
     // the slots the prompt path lends for its longest chunk (prompt_borrow): their experts are kept in RAM too
     lend_from_ = -1;
     if (opt_.prompt_chunk > 0 && prompt_dev_.at.empty() && n_slots_ > 1) {
@@ -1702,7 +1722,7 @@ std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, siz
     const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
                  q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
     std::vector<StatePart> v;
-    if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2}, {p.v_pool, codes * 2}};
+    if (p.k_pool != nullptr) v = {{p.k_pool, codes * 2, 2}, {p.v_pool, codes * 2, 2}};
     else if (p.k_q4 != nullptr) v = {{p.k_q4, q4}, {p.v_q4, q4}};
     else if (p.v_q4 != nullptr) v = {{p.k_q, codes}, {p.k_scale, scales}, {p.v_q4, q4}};
     else if (p.k_q != nullptr) v = {{p.k_q, codes}, {p.v_q, codes}, {p.k_scale, scales}, {p.v_scale, scales}};
@@ -2087,8 +2107,8 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
     const SlotSession* ss = slot >= 0 ? &bslots_[(size_t) slot] : nullptr;
     for (size_t g = 0; g < gdn_state_.size(); ++g) {   // the recurrent layers: whole (this stage's)
         if (gdn_state_[g] == nullptr) continue;
-        parts.push_back({ss ? ss->gdn_state[g] : gdn_state_[g], state_bytes_});
-        parts.push_back({ss ? ss->gdn_conv[g] : gdn_conv_[g], conv_bytes_});
+        parts.push_back({ss ? ss->gdn_state[g] : gdn_state_[g], state_bytes_, 4});
+        parts.push_back({ss ? ss->gdn_conv[g] : gdn_conv_[g], conv_bytes_, 4});
     }
     if (recurrent_only) return parts;
     if (glm_) {   // per DSA block: its latent and indexer rows a cell, the pools that the cells close
@@ -2096,9 +2116,9 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
         const int64_t pools = std::min<int64_t>(g_max_blocks_, tokens / s.idx_kpool + 1);
         for (size_t d = 0; d < g_latent_.size(); ++d) {
             if (g_latent_[d] == nullptr) continue;
-            parts.push_back({g_latent_[d], (size_t) (tokens * KVR) * 2});
-            parts.push_back({g_idx_cache_[d], (size_t) (tokens * 2 * ID) * 4});
-            parts.push_back({g_pooled_[d], (size_t) (pools * ID) * 4});
+            parts.push_back({g_latent_[d], (size_t) (tokens * KVR) * 2, 2});
+            parts.push_back({g_idx_cache_[d], (size_t) (tokens * 2 * ID) * 4, 4});
+            parts.push_back({g_pooled_[d], (size_t) (pools * ID) * 4, 4});
         }
         return parts;
     }
@@ -2181,8 +2201,13 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
     const ModelSpec& s = spec_;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     const int want = std::min(opt_.batch_slots, opt_.max_t);
+    // --batch-mtp: each slot's recurrent states after its first row as well (a draft that fails goes back to them)
+    const bool snaps = opt_.batch_mtp && model_mtp_;
     size_t one = 0;
     for (const StatePart& p : state_parts(opt_.max_cells)) one += p.bytes;
+    if (snaps)
+        for (const float* g : gdn_state_)
+            if (g != nullptr) one += state_bytes_ + conv_bytes_;
     size_t free_b = 0, total_b = 0;
     const size_t room = strata::gpu::mem_info(&free_b, &total_b) ? free_b / 2 : 0;
     const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
@@ -2190,6 +2215,8 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
         SlotSession ss;
         ss.gdn_state.assign(gdn_state_.size(), nullptr);
         ss.gdn_conv.assign(gdn_conv_.size(), nullptr);
+        ss.gdn_snap.assign(snaps ? gdn_state_.size() : 0, nullptr);
+        ss.conv_snap.assign(snaps ? gdn_conv_.size() : 0, nullptr);
         for (auto* v : {&ss.k_pool, &ss.v_pool, &ss.k_scale, &ss.v_scale}) v->assign(k_pool_.size(), nullptr);
         for (auto* v : {&ss.k_q, &ss.v_q}) v->assign(k_pool_.size(), nullptr);
         for (auto* v : {&ss.k_q4, &ss.v_q4}) v->assign(k_pool_.size(), nullptr);
@@ -2203,6 +2230,10 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
             if (gdn_state_[g] != nullptr) {
                 take(ss.gdn_state[g], state_bytes_);
                 take(ss.gdn_conv[g], conv_bytes_);
+                if (snaps) {
+                    take(ss.gdn_snap[g], state_bytes_);
+                    take(ss.conv_snap[g], conv_bytes_);
+                }
             }
         for (size_t a = 0; a < k_pool_.size(); ++a) {
             if (kv_planes(a, -1, 1).empty()) continue;   // another stage's block
@@ -2220,6 +2251,7 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
         if (!ok) break;   // what this slot took stays in allocs_ (freed with the model)
         bslots_.push_back(std::move(ss));
     }
+    bslot_snaps_ = snaps;
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
     std::fprintf(stderr, "strata plain: %d of %d batch slots (%zu MiB each%s)\n", (int) bslots_.size(),
                  opt_.batch_slots, one >> 20,
@@ -2233,6 +2265,7 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
 bool PlainModel::save_parts(int64_t tokens, bool recurrent_only, Snapshot& snap, std::string& err, int slot) {
     snap.tokens = tokens;
     snap.parts.clear();
+    snap.typesize.clear();
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
         if (!st->settle_swaps(true, err)) return false;
@@ -2242,6 +2275,7 @@ bool PlainModel::save_parts(int64_t tokens, bool recurrent_only, Snapshot& snap,
         }
         for (const StatePart& p : st->state_parts(tokens, recurrent_only, slot)) {
             snap.parts.emplace_back(p.bytes);
+            snap.typesize.push_back((uint8_t) p.typesize);
             if (p.bytes > 0 && !strata::gpu::copy(snap.parts.back().data(), p.dev, p.bytes)) {
                 err = std::string("plain model: saving the state: ") + strata::gpu::last_error();
                 return false;
@@ -2370,6 +2404,9 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
             if (t < n_snaps)
                 k::copy_from_mapped(conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1), cs);
+            else if (rows && first_of_two(t))   // --batch-mtp: the slot's history after its token, before its draft
+                k::copy_from_mapped(slot_of(t).conv_snap[(size_t) b.gdn], slot_of(t).gdn_conv[(size_t) b.gdn],
+                                    C * (s.ssm_d_conv - 1), cs);
         }
         k::native_gdn_beta_gate(beta_, HV * T, cs);
         // the recurrence over the window's rows in one launch (the state read and written once, the rows' states
@@ -2378,10 +2415,14 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         float* snaps[k::kNativeGdnMaxSnaps] = {};
         for (int t = 0; t < n_snaps; ++t) snaps[t] = gdn_snap_[(size_t) b.gdn][(size_t) t];
         if (rows)
-            for (int t = 0; t < T; ++t)
+            for (int t = 0; t < T;) {   // a slot's rows in one launch (--batch-mtp: two, the state after the first kept)
+                const int n = first_of_two(t) ? 2 : 1;
+                float* one[k::kNativeGdnMaxSnaps] = {n == 2 ? slot_of(t).gdn_snap[(size_t) b.gdn] : nullptr};
                 k::native_gdn_step_rows(slot_of(t).gdn_state[(size_t) b.gdn], hc_ + (size_t) t * C, C,
-                                        gate_ + (size_t) t * HV, beta_ + (size_t) t * HV, o_ + (size_t) t * ZV, ZV, 1,
-                                        snaps, 0, gs, cs);
+                                        gate_ + (size_t) t * HV, beta_ + (size_t) t * HV, o_ + (size_t) t * ZV, ZV, n,
+                                        one, n - 1, gs, cs);
+                t += n;
+            }
         else
             k::native_gdn_step_rows(state, hc_, C, gate_, beta_, o_, ZV, T, snaps, n_snaps, gs, cs);
         k::native_gdn_out_norm(o_, z_, b.ssm_norm, y_, HV * T, S, eps, cs);
@@ -2562,6 +2603,37 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     return true;
 }
 
+// record_mtp over the batch slots' rows (row_slot_): the block reads and writes each row's slot's cells, and each
+// slot's last row, normed, goes through the whole head (logits_ row j the j-th slot's); no chain after it
+bool PlainModel::record_mtp_slots(int T, strata::gpu::Stream cs, std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t N = s.n_embd, NH = s.n_head;
+    const float eps = (float) s.rms_eps;
+    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
+    k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
+    k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
+    k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
+    k::native_qsa_rms_norm_weighted(x_, mtp_enorm_, hn_, (int) N, T, eps, cs);
+    k::native_qsa_rms_norm_weighted(mtp_h_, mtp_hnorm_, mix_, (int) N, T, eps, cs);
+    k::concat_rows(qfull_, hn_, mix_, N, T, cs);
+    if (mtp_eh_.type == kBF16) {
+        k::bf16_gemv_fp32_mmvf_multi(qfull_, 2 * N, static_cast<const uint16_t*>(mtp_eh_.data), x_, N, 2 * N, N, T, cs);
+    } else {
+        k::native_quantize_q8_1(qfull_, xq_, (int) (2 * N), T, cs);
+        k::native_mmvq(mtp_eh_.type, mtp_eh_.data, xq_, x_, (int) (2 * N), (int) N, T, cs);
+    }
+    uint32_t ring = 0;
+    const uint64_t key = slots_key(row_slot_.data(), T) | (uint64_t{1} << 63);
+    if (!record_block(mtp_, n_moe_ - 1, T, ring, mbsegs_[key], cs, err)) return false;
+    int j = 0;
+    for (int t = 0; t < T; ++t)
+        if (!first_of_two(t))
+            k::native_qsa_rms_norm_weighted(x_ + (size_t) t * N, mtp_head_norm_, hn_ + (size_t) (j++) * N, (int) N, 1,
+                                            eps, cs);
+    head_logits(hn_, j, cs);
+    return true;
+}
+
 void PlainModel::draft_logits(const int32_t* pos, strata::gpu::Stream cs) {
     const int n_in = head_.n_in;
     // the head's own product of n rows in its form (the subset's, the whole head's, or int2_'s candidates)
@@ -2584,7 +2656,7 @@ void PlainModel::draft_logits(const int32_t* pos, strata::gpu::Stream cs) {
 
 void PlainModel::setup_int2() {
     const char* v = std::getenv("STRATA_DRAFT_INT2");
-    if (!has_mtp_ || n_snap_ < 1 || head_.n_in % k::kInt2Group != 0 ||
+    if (!has_mtp_ || n_mtp_ < 1 || head_.n_in % k::kInt2Group != 0 ||
         (v != nullptr && v[0] != 0 && std::strtol(v, nullptr, 10) == 0))
         return;
     size_t at = 0;
@@ -2634,7 +2706,8 @@ bool PlainModel::capture(int T, bool mtp, strata::gpu::Graph*& exec, std::vector
     }
     bool ok = false;
     try {
-        ok = mtp ? (glm_ ? record_mtp_glm5(T, cs_, err) : record_mtp(T, cs_, err)) : record_window(T, cs_, err, &segs);
+        ok = mtp ? (glm_ ? record_mtp_glm5(T, cs_, err) : !row_slot_.empty() ? record_mtp_slots(T, cs_, err) : record_mtp(T, cs_, err))
+                 : record_window(T, cs_, err, &segs);
     } catch (const std::exception& e) {
         err = std::string("plain model: recording the window: ") + e.what();
     }
@@ -2657,7 +2730,9 @@ bool PlainModel::capture(int T, bool mtp, strata::gpu::Graph*& exec, std::vector
 // STRATA_PLAIN_EAGER's window: what record() would have put in the graph, onto the stream as it is
 bool PlainModel::run_window(int T, bool mtp, std::string& err) {
     try {
-        return mtp ? (glm_ ? record_mtp_glm5(T, cs_, err) : record_mtp(T, cs_, err)) : record_window(T, cs_, err);
+        return mtp ? (glm_ ? record_mtp_glm5(T, cs_, err) : !row_slot_.empty() ? record_mtp_slots(T, cs_, err)
+                                                                              : record_mtp(T, cs_, err))
+                   : record_window(T, cs_, err);
     } catch (const std::exception& e) {
         err = std::string("plain model: the window: ") + e.what();
         return false;
@@ -2771,11 +2846,15 @@ bool PlainModel::forward_slots(const int32_t* tokens, const int* slot, const int
                                const k::SamplerParams* sp, int T, int32_t* out, std::string& err) {
     const int n = batch_slot_count();
     if (T < 1 || T > opt_.max_t) { err = "plain model: the batch window is out of range"; return false; }
-    for (int t = 0; t < T; ++t)
-        if (slot[t] < 0 || slot[t] >= n || (t > 0 && slot[t] <= slot[t - 1]) || pos[t] < 0 || pos[t] >= opt_.max_cells) {
+    for (int t = 0; t < T; ++t) {
+        // a slot's second row (--batch-mtp): its draft, at the position after its token
+        const bool second = t > 0 && slot[t] == slot[t - 1];
+        if (slot[t] < 0 || slot[t] >= n || (t > 0 && slot[t] < slot[t - 1]) || pos[t] < 0 || pos[t] >= opt_.max_cells ||
+            (second && (!batch_drafts() || pos[t] != pos[t - 1] + 1 || (t > 1 && slot[t - 2] == slot[t])))) {
             err = "plain model: a batch row's slot or position is out of range";
             return false;
         }
+    }
     const float* hand = nullptr;
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
@@ -2793,12 +2872,99 @@ bool PlainModel::forward_slots(const int32_t* tokens, const int* slot, const int
     return true;
 }
 
+uint64_t PlainModel::slots_key(const int* slot, int T) {
+    uint64_t set = 0;
+    for (int t = 0; t < T; ++t) {
+        set |= uint64_t{1} << slot[t];
+        if (t > 0 && slot[t] == slot[t - 1]) set |= uint64_t{1} << (32 + slot[t]);
+    }
+    return set;
+}
+
+bool PlainModel::batch_drafts() const {
+    const PlainModel& t = tail();
+    if (!opt_.batch_mtp || !t.has_mtp_ || t.n_mtp_ < 1 || t.glm_ || batch_slot_count() < 1) return false;
+    if (!root_->bslot_snaps_) return false;
+    for (const auto& st : root_->next_)
+        if (!st->bslot_snaps_) return false;
+    return true;
+}
+
+bool PlainModel::slot_rollback(int b, std::string& err) {
+    if (b < 0 || b >= batch_slot_count()) { err = "plain model: no such batch slot"; return false; }
+    for (PlainModel* st : chain()) {
+        const OnDevice on(st->dev_);
+        const SlotSession& ss = st->bslots_[(size_t) b];
+        for (size_t g = 0; g < ss.gdn_snap.size(); ++g)
+            if (ss.gdn_state[g] != nullptr &&
+                (!strata::gpu::copy_async(ss.gdn_state[g], ss.gdn_snap[g], st->state_bytes_, st->cs_) ||
+                 !strata::gpu::copy_async(ss.gdn_conv[g], ss.conv_snap[g], st->conv_bytes_, st->cs_))) {
+                err = std::string("plain model: restoring a slot's recurrent states: ") + strata::gpu::last_error();
+                return false;
+            }
+    }
+    return true;
+}
+
+bool PlainModel::mtp_slots(const int* slot, const int* rows, const int32_t* tokens, const int64_t* pos,
+                           const k::SamplerParams* sp, int T, int32_t* drafts, std::string& err) {
+    if (!next_.empty()) {   // the MTP layer is the last stage's, as the trunk rows it reads
+        const OnDevice on(tail().dev_);
+        return tail().mtp_slots(slot, rows, tokens, pos, sp, T, drafts, err);
+    }
+    if (T < 1 || T > opt_.max_t || !batch_drafts()) { err = "plain model: the slots' drafts are out of range"; return false; }
+    const int64_t N = spec_.n_embd;
+    for (int i = 0; i < T; ++i)   // each row's trunk row, normed, from the batch window just run
+        if (rows[i] < 0 || rows[i] >= opt_.max_t ||
+            !strata::gpu::copy_async(mtp_h_ + (size_t) i * (size_t) N, hn_ + (size_t) rows[i] * (size_t) N,
+                                     (size_t) N * 4, cs_)) {
+            err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();
+            return false;
+        }
+    const uint64_t key = slots_key(slot, T) | (uint64_t{1} << 63);   // (a key apart from a pattern of two rows a slot)
+    row_slot_.assign(slot, slot + T);
+    struct Clear {
+        std::vector<int>& v;
+        ~Clear() { v.clear(); }
+    } clear{row_slot_};
+    if ((eager_ != 1 && !capture(T, true, mbexec_[key], mbsegs_[key], err)) || !stage(tokens, T, 0, err, true, pos))
+        return false;
+    const int64_t ml = n_moe_ - 1;
+    if (!(eager_ == 1 ? run_window(T, true, err) : launch_serve(mbexec_[key], mbsegs_[key], 1, &ml, T, err))) return false;
+    // each slot's draft from its last row's logits (record_mtp_slots: row j of logits_ is the j-th slot's)
+    int j = 0;
+    for (int i = 0; i < T; ++i) {
+        if (i + 1 < T && slot[i + 1] == slot[i]) continue;
+        k::SamplerParams p;
+        p.greedy = true;
+        p.temperature = 0.0f;
+        if (opt_.coupled_draft && !sp[j].greedy) {   // as mtp_run's: the window row at this position checks it
+            p = sp[j];
+            p.counter = (uint64_t) pos[i];
+            p.logit_bias = nullptr;
+            p.allowed = nullptr;
+        }
+        k::sample_tokens(logits_ + (size_t) j * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, p, m_out_ + j, cs_);
+        ++j;
+    }
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("plain model: the slots' drafts: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (disp_.failed) {
+        err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
+        return false;
+    }
+    for (int i = 0; i < j; ++i) drafts[i] = ((volatile int32_t*) h_out_)[i];
+    mtp_h_set_ = false;
+    return true;
+}
+
 // A batch window is recorded once for each set of slots in it (their state's pointers are in the graph), the rows'
 // tokens and positions staged as a window's
 bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64_t* pos, const k::SamplerParams* sp,
                              int T, const float* hand_in, std::string& err) {
-    uint32_t set = 0;
-    for (int t = 0; t < T; ++t) set |= 1u << slot[t];
+    const uint64_t set = slots_key(slot, T);
     row_slot_.assign(slot, slot + T);
     struct Clear {
         std::vector<int>& v;
@@ -2957,9 +3123,18 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
     if (!(eager_ == 1 ? run_window(T, true, err)
                       : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
         return false;
-    k::SamplerParams sp;   // the drafts are greedy
+    // the drafts are greedy; --coupled-draft samples them as the window will (row t at position p + t draws with
+    // counter p + t): the draft from the row at pos + T - 1 is checked by the window row at that position, with the
+    // request's chain (a request with penalties, a bias or a grammar decodes without drafts)
+    k::SamplerParams sp;
     sp.greedy = true;
     sp.temperature = 0.0f;
+    if (opt_.coupled_draft && !sampler_.greedy) {
+        sp = sampler_;
+        sp.counter = (uint64_t) (pos + T - 1);
+        sp.logit_bias = nullptr;
+        sp.allowed = nullptr;
+    }
     const int nv = (int) (dhead_ != nullptr ? n_dvocab_ : n_vocab_);
     k::sample_tokens(logits_, 1, nv, nullptr, 0, sp, m_out_, cs_);
     if (opt_.spec_window != "all") k::row_top_prob(logits_, 1, nv, m_out_, m_prob_, cs_);   // for the window rule
@@ -2980,7 +3155,7 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
 bool PlainModel::draft_more(int n) const {
     if (n < 1 || n > (int) dprob_.size()) return true;
     if (req_spec_min_p_ >= 0.0) return dprob_[(size_t) n - 1] >= (float) req_spec_min_p_;   // the request's floor
-    if (opt_.spec_window == "auto") return policy_.mtp_extend(dprob_.data(), n, n_snap_ + 1);
+    if (opt_.spec_window == "auto") return policy_.mtp_extend(dprob_.data(), n, n_mtp_ + 1);
     if (opt_.spec_window == "min-p") return dprob_[(size_t) n - 1] >= (float) opt_.spec_min_p;
     return true;
 }
@@ -3006,7 +3181,7 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
     dprob_.clear();
     cur_ = first;
     cur_pos_ = pos;
-    if (!has_mtp_ || n_snap_ < 1) return true;
+    if (!has_mtp_ || n_mtp_ < 1) return true;
     // the trunk's row before `first`: prompt() leaves it in mtp_h_, a window in hn_
     if (!mtp_h_set_ &&
         !strata::gpu::copy(mtp_h_, hn_ + (size_t) (last_T_ - 1) * (size_t) spec_.n_embd, (size_t) spec_.n_embd * 4)) {
@@ -3017,14 +3192,14 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
     int32_t d = -1;
     if (!mtp_run(1, &first, pos, &d, err)) return false;
     drafts_.push_back(d);
-    return mtp_chain(n_snap_, pos + 1, err);
+    return mtp_chain(n_mtp_, pos + 1, err);
 }
 
 bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
-                           std::string& err, const int32_t* follow) {
+                           std::string& err, const int32_t* follow, const int32_t* ext, int n_ext, int match) {
     if (!next_.empty()) {   // the drafts are the last stage's; its window goes through every stage (root_->forward)
         const OnDevice on(tail().dev_);
-        return tail().spec_step(stop, limit, emitted, n_emit, logits, err, follow);
+        return tail().spec_step(stop, limit, emitted, n_emit, logits, err, follow, ext, n_ext, match);
     }
     n_emit = 0;
     if (cur_ < 0) { err = "plain model: spec_step before spec_start"; return false; }
@@ -3035,7 +3210,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     float probs[strata::spec::DraftPolicy::kMaxT + 1] = {};
     for (int j = 0; j < nd && j < (int) dprob_.size() && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = dprob_[(size_t) j];
     policy_.set_context(cur_pos_);   // STRATA_SPEC_COST: the round costs of this context length
-    if (opt_.spec_window == "auto") nd = std::min(nd, policy_.mtp_window(probs, n_snap_ + 1) - 1);
+    if (opt_.spec_window == "auto") nd = std::min(nd, policy_.mtp_window(probs, n_mtp_ + 1) - 1);
     else if (opt_.spec_window == "min-p") {
         int keep = 0;
         while (keep < nd && probs[keep] >= (float) opt_.spec_min_p) ++keep;
@@ -3045,6 +3220,18 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     int32_t out[k::cpu::MAXT];
     win[0] = cur_;
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
+    // --suffix-draft / --lookup-chain: the lookup's drafts where they are more and agree with the MTP's first
+    const int cap = (int) std::min<int64_t>({(int64_t) n_ext, (int64_t) window_drafts(), limit - 1,
+                                             opt_.max_cells - cur_pos_ - 1, (int64_t) k::cpu::MAXT - 1});
+    bool from_ext = ext != nullptr && cap > nd && (nd == 0 || drafts_.empty() || ext[0] == drafts_[0]);
+    if (from_ext) {
+        const strata::spec::DraftPolicy::Pick pk = policy_.choose(nd + 1, cap, match);
+        from_ext = pk.lookup && pk.t - 1 > nd;
+        if (from_ext) {
+            nd = std::min(cap, pk.t - 1);
+            for (int i = 0; i < nd; ++i) win[i + 1] = ext[i];
+        }
+    }
     const int T = nd + 1;
     const auto t0 = std::chrono::steady_clock::now();
     if (!root_->forward(win, T, cur_pos_, out, logits, err, true)) return false;
@@ -3064,7 +3251,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         const OnDevice on(st->dev_);
         if (!st->after_rows(n + 1, cur_pos_, err)) return false;
     }
-    if (opt_.spec_window == "auto") policy_.observe_mtp_drafts(probs, T, n);
+    if (opt_.spec_window == "auto" && !from_ext) policy_.observe_mtp_drafts(probs, T, n);
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
     // the recurrent states back to the last accepted row's (the attention's later cells are rewritten in turn)
@@ -3077,11 +3264,13 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     drafts_.clear();
     dprob_.clear();
     // the round's time (the window, the rollback, the drafts) for the window rule's costs, once the drafts are made
+    // (the lookup's rounds too: the rule needs their costs and their acceptance by match length)
     auto observe = [&] {
-        if (opt_.spec_window == "auto")
-            policy_.observe(false, T, n, 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (opt_.spec_window == "auto" || from_ext || ext != nullptr)
+            policy_.observe(from_ext, T, n, from_ext ? match : 0,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     };
-    if (cur_pos_ >= opt_.max_cells) { observe(); return true; }
+    if (cur_pos_ >= opt_.max_cells || !has_mtp_ || n_mtp_ < 1) { observe(); return true; }   // (no MTP layer)
     if (!strata::gpu::copy_async(mtp_h_, hn_, (size_t) (n + 1) * (size_t) spec_.n_embd * 4, cs_)) {
         err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();
         return false;
@@ -3089,7 +3278,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     int32_t d = -1;
     if (!mtp_run(n + 1, out, pos + 1, &d, err)) return false;
     drafts_.push_back(d);
-    const bool ok = mtp_chain(n_snap_, cur_pos_ + 1, err);
+    const bool ok = mtp_chain(n_mtp_, cur_pos_ + 1, err);
     spec_ms_draft_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     observe();
     return ok;
@@ -3171,14 +3360,10 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
                     }),
                     swaps.end());
     }
-    // and at most adapt_mib_per_token of copies for each token the windows read since the last round: the copies share
-    // the RAM's bandwidth with the missed experts the CPU and PCIe read
-    const uint64_t blob = k::cpu::expert_layout().max_blob;
-    const int64_t budget = blob > 0 && opt_.adapt_mib_per_token > 0
-                               ? (int64_t) (((uint64_t) opt_.adapt_mib_per_token << 20) * (uint64_t) tokens_since_adapt_ / blob)
-                               : opt_.adapt_swaps;
+    // and at most adapt_mib_per_token of copies for each token the windows read since the last round
+    const int64_t cap = max_swaps > 0 ? max_swaps
+                                      : adapt_swap_budget(opt_.adapt_swaps, opt_.adapt_mib_per_token, tokens_since_adapt_);
     tokens_since_adapt_ = 0;
-    const int64_t cap = max_swaps > 0 ? max_swaps : std::min<int64_t>(opt_.adapt_swaps, std::max<int64_t>(budget, 1));
     if (max_evict >= 0) {
         int64_t evict = max_evict;
         swaps.erase(std::remove_if(swaps.begin(), swaps.end(), [&](const Swap& w) { return w.out >= 0 && evict-- <= 0; }),
@@ -3225,7 +3410,7 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
         return false;
     }
     for (float& v : disp_.usage) v *= opt_.adapt_decay;
-    return true;
+    return opt_.adapt_async || settle_swaps(true, err);
 }
 
 // 3 windows, not Qwen3.8-Flash-Next's 2: a draft's MTP run and the drafts' head between two verify windows are short

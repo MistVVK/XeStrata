@@ -25,6 +25,13 @@ bool conversation_disk_can_compress();
 // a file, or of every regular file directly in a folder.  "-" when the path is empty, "?" when it cannot be read.
 std::string conversation_file_identity(const std::string& path);
 
+// The coding of a compressed part of these files, for the other models' engine's (plain_generate.cpp) as well:
+// the `n` bytes at `src` as chunks of ConversationBuffer::segment_bytes, each its compressed size (8 bytes) and one
+// c-blosc2 chunk (ZSTD at level 1 after a byte shuffle by `typesize`: 1, 2 or 4).  False without c-blosc2.
+bool conversation_compress(const void* src, size_t n, int typesize, std::vector<uint8_t>& out);
+// The reverse: the `stored` bytes at `src` into the `n` bytes at `dst`; false when they are not such chunks.
+bool conversation_decompress(const uint8_t* src, size_t stored, void* dst, size_t n);
+
 // The other models' engine (plain_generate.cpp) keeps its conversations in a folder too, in its own format under its
 // own extension; the folder's age limit and budget count both engines' files.
 inline constexpr const char* kConversationPlainExtension = ".xsp";

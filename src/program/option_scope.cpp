@@ -39,8 +39,7 @@ const char* const kQwen38Only[] = {
 
 // the engine's options every model could take, which the other models' path does not have yet (2026-11-01)
 const char* const kNotYet[] = {
-    "--batch-groups", "--batch-mtp", "--no-batch-mtp", "--conversation-save-compress", "--adapt-async",
-    "--suffix-draft", "--lookup-chain", "--lookup-chain-min", "--coupled-draft", "--no-coupled-draft",
+    "--batch-groups",
     "--expert-cache-device1", "--expert-cache-device2", "--expert-cache-device3", "--expert-cache-remote-placement",
     "--pipeline-windows",
 };

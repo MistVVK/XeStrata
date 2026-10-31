@@ -17,6 +17,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/coupled_draft.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/grammar.hpp"
 #include "strata/core/logit_bias.hpp"
@@ -29,6 +30,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -226,13 +228,17 @@ struct ConversationCache {
 
 // A session file (SAVE / RESTORE <path>): a conversation's tokens and state, for this model file and context only.
 // The second form adds the conversation's checkpoints (--prompt-cache): their lengths and kinds after the tokens, so
-// the folder's index reads them with the tokens, and their states after the conversation's.
+// the folder's index reads them with the tokens, and their states after the conversation's.  The third gives each
+// part of a state its element size and codec after its size: with --conversation-save-compress the floating-point
+// parts go through c-blosc2 (conversation_compress, as Qwen3.8-Flash-Next's files), then their stored size.
 constexpr char kSessionMagic1[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '1'};
-constexpr char kSessionMagic[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '2'};
+constexpr char kSessionMagic2[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '2'};
+constexpr char kSessionMagic[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '3'};
+constexpr uint8_t kPartRaw = 0, kPartBlosc2 = 1;
 
 bool session_write(const std::string& path, const std::string& model_id, const std::vector<int32_t>& ids,
                    const strata::core::PlainModel::Snapshot& snap, const std::vector<Checkpoint>& checks,
-                   size_t& bytes, std::string& err) {
+                   size_t& bytes, std::string& err, bool compress = false) {
     const std::string tmp = path + ".part";
 #if defined(_WIN32)
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -245,14 +251,29 @@ bool session_write(const std::string& path, const std::string& model_id, const s
     if (f == nullptr) { err = "cannot write " + tmp; return false; }
     auto put = [&](const void* p, size_t n) { return std::fwrite(p, 1, n, f) == n; };
     bytes = 0;
+    std::vector<uint8_t> packed;
     auto put_parts = [&](const strata::core::PlainModel::Snapshot& sn) {
         const uint64_t np = sn.parts.size();
         bool ok = put(&np, 8);
         bytes += 8;
-        for (const auto& part : sn.parts) {
+        for (size_t i = 0; i < sn.parts.size() && ok; ++i) {
+            const auto& part = sn.parts[i];
             const uint64_t n = part.size();
-            ok = ok && put(&n, 8) && put(part.data(), n);
-            bytes += 8 + n;
+            const uint8_t ts = i < sn.typesize.size() ? sn.typesize[i] : 0;
+            // a part that does not shrink is stored as it is
+            const bool z = compress && ts > 0 && n > 0 && strata::core::conversation_compress(part.data(), n, ts, packed) &&
+                           packed.size() < n;
+            const uint8_t codec = z ? kPartBlosc2 : kPartRaw;
+            ok = put(&n, 8) && put(&ts, 1) && put(&codec, 1);
+            bytes += 10;
+            if (z) {
+                const uint64_t stored = packed.size();
+                ok = ok && put(&stored, 8) && put(packed.data(), stored);
+                bytes += 8 + stored;
+            } else {
+                ok = ok && put(part.data(), n);
+                bytes += n;
+            }
         }
         return ok;
     };
@@ -288,9 +309,11 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
     char magic[8];
     uint64_t idn = 0, tok = 0, nt = 0, nc = 0;
     std::string id;
-    bool ok = get(magic, 8) && (std::memcmp(magic, kSessionMagic, 8) == 0 || std::memcmp(magic, kSessionMagic1, 8) == 0) &&
+    bool ok = get(magic, 8) &&
+              (std::memcmp(magic, kSessionMagic, 8) == 0 || std::memcmp(magic, kSessionMagic2, 8) == 0 ||
+               std::memcmp(magic, kSessionMagic1, 8) == 0) &&
               get(&idn, 8) && idn < 4096;
-    const bool v2 = ok && magic[7] == '2';
+    const bool v2 = ok && magic[7] >= '2', v3 = ok && magic[7] == '3';
     if (ok) { id.resize(idn); ok = get(id.data(), idn) && id == model_id; }
     if (!ok) { std::fclose(f); err = "not a session file of this model and context"; return false; }
     ok = get(&tok, 8) && get(&nt, 8) && nt == tok && nt < (1ull << 31);
@@ -311,18 +334,38 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
         if (!ok) err = "a short or damaged session file";
         return ok;
     }
+    std::vector<uint8_t> packed;
+    std::string why;   // a reason more useful than "damaged", when there is one
     auto get_parts = [&](strata::core::PlainModel::Snapshot& sn, int64_t tokens) {
         uint64_t np = 0;
         if (!ok || !get(&np, 8) || np >= 4096) return false;
         bytes += 8;
         sn.tokens = tokens;
         sn.parts.assign(np, {});
-        for (auto& part : sn.parts) {
+        sn.typesize.assign(np, 0);
+        for (size_t i = 0; i < np; ++i) {
+            auto& part = sn.parts[i];
             uint64_t n = 0;
+            uint8_t codec = kPartRaw;
             if (!get(&n, 8) || n >= (1ull << 40)) return false;
+            if (v3 && (!get(&sn.typesize[i], 1) || !get(&codec, 1) || codec > kPartBlosc2)) return false;
+            bytes += 8 + (v3 ? 2 : 0);
             part.resize(n);
-            if (!get(part.data(), n)) return false;
-            bytes += 8 + n;
+            if (codec == kPartRaw) {
+                if (!get(part.data(), n)) return false;
+                bytes += n;
+                continue;
+            }
+            uint64_t stored = 0;
+            if (!strata::core::conversation_disk_can_compress()) {
+                why = "a compressed session file, and this build has no c-blosc2";
+                return false;
+            }
+            if (!get(&stored, 8) || stored >= n) return false;   // written only where it shrinks
+            packed.resize(stored);
+            if (!get(packed.data(), stored) || !strata::core::conversation_decompress(packed.data(), stored, part.data(), n))
+                return false;
+            bytes += 8 + stored;
         }
         return true;
     };
@@ -333,7 +376,7 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
         c.snap = std::move(cs);
     }
     std::fclose(f);
-    if (!ok) err = "a short or damaged session file";
+    if (!ok) err = why.empty() ? "a short or damaged session file" : why;
     return ok;
 }
 
@@ -349,6 +392,7 @@ struct ConversationFolder {
     int64_t hours = 48;                   // --conversation-save-hours (0: no age limit)
     int64_t min_free_mib = 4096;          // --session-min-free-mib: the disk space a file must leave free
     int checkpoints = 2;                  // --conversation-save-checkpoints: a file's (the root, the longest)
+    bool compress = false;                // --conversation-save-compress: the floating-point parts through c-blosc2
     struct Entry {
         std::filesystem::path path;
         std::vector<int32_t> ids;
@@ -428,7 +472,7 @@ struct ConversationFolder {
         char name[32];
         std::snprintf(name, sizeof name, "%016llx", (unsigned long long) h);
         const fs::path path = dir / (std::string(name) + strata::core::kConversationPlainExtension);
-        if (!session_write(path.string(), id, ids, snap, checks, bytes, err)) return false;
+        if (!session_write(path.string(), id, ids, snap, checks, bytes, err, compress)) return false;
         for (size_t i = 0; i < entries.size();) {
             const Entry& e = entries[i];
             if (e.path != path && e.ids.size() < ids.size() && std::equal(e.ids.begin(), e.ids.end(), ids.begin())) {
@@ -642,6 +686,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     struct BSlot {
         bool active = false, stop = false, held = false;   // decoding; BSTOP; holds a conversation (`ids`)
         int32_t x = -1;                // the token to read next (not in the state yet)
+        int32_t d = -1;                // --batch-mtp: the MTP layer's draft after it (-1: none)
         int64_t p = 0, produced = 0, max_new = 0;
         std::vector<int32_t> ids;      // the tokens its state holds
         std::vector<Checkpoint> checks;
@@ -657,21 +702,39 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::printf("BDONE %d %lld %s %.1f\n", (int) b, (long long) s.produced, why,
                     std::chrono::duration<double, std::milli>(Clock::now() - s.t0).count());
     };
-    // one batch window over the active slots
+    // one batch window over the active slots.  --batch-mtp: a slot's row is followed by its draft while the window
+    // has room; the slot moves two tokens when the draft is the token after its row, else its recurrent states go
+    // back to its first row's.  Then the MTP layer reads the rows each going slot kept, and drafts its next token.
     auto batch_step = [&](std::string& berr) -> bool {
         std::vector<int32_t> toks, outs;
         std::vector<int> rows;
         std::vector<int64_t> at;
         std::vector<strata::kernels::SamplerParams> sps;
+        const bool drafts = model.batch_drafts();
+        std::vector<size_t> go;
         for (size_t b = 0; b < bs.size(); ++b) {
             BSlot& s = bs[b];
             if (!s.active) continue;
             if (s.stop) { slot_done(b, "cancel"); continue; }
             if (s.p + 1 >= ctx) { slot_done(b, "length"); continue; }
+            go.push_back(b);
+        }
+        int room = opt.max_t - (int) go.size();
+        for (const size_t b : go) {
+            BSlot& s = bs[b];
             toks.push_back(s.x);
             rows.push_back((int) b);
             at.push_back(s.p);
             sps.push_back(s.sp);
+            if (drafts && s.d >= 0 && room > 0 && s.p + 2 < ctx && s.produced + 1 < s.max_new) {
+                toks.push_back(s.d);
+                rows.push_back((int) b);
+                at.push_back(s.p + 1);
+                sps.push_back(s.sp);
+                --room;
+            } else {
+                s.d = -1;
+            }
         }
         if (toks.empty()) {
             std::fflush(stdout);
@@ -680,15 +743,57 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         outs.resize(toks.size());
         if (!model.forward_slots(toks.data(), rows.data(), at.data(), sps.data(), (int) toks.size(), outs.data(), berr))
             return false;
-        for (size_t i = 0; i < rows.size(); ++i) {
-            BSlot& s = bs[(size_t) rows[i]];
+        // the slot reads its token and takes y after it; false when that ends it
+        auto take = [&](size_t b, int32_t y) {
+            BSlot& s = bs[b];
             s.ids.push_back(s.x);
             ++s.p;
-            s.x = outs[i];
+            s.x = y;
             ++s.produced;
-            std::printf("BT %d %d\n", rows[i], (int) s.x);
-            if (std::find(eos.begin(), eos.end(), s.x) != eos.end()) slot_done((size_t) rows[i], "stop");
-            else if (s.produced >= s.max_new) slot_done((size_t) rows[i], "length");
+            std::printf("BT %d %d\n", (int) b, (int) y);
+            if (std::find(eos.begin(), eos.end(), y) != eos.end()) slot_done(b, "stop");
+            else if (s.produced >= s.max_new) slot_done(b, "length");
+            return s.active;
+        };
+        std::vector<int> mslot, mrow;
+        std::vector<int32_t> mtok;
+        std::vector<int64_t> mpos;
+        std::vector<strata::kernels::SamplerParams> msp;
+        for (size_t i = 0; i < rows.size();) {
+            const size_t b = (size_t) rows[i];
+            const bool two = i + 1 < rows.size() && rows[i + 1] == rows[i];
+            const int32_t d = bs[b].d;
+            bool going = take(b, outs[i]);
+            int kept = 1;
+            if (two) {
+                // the draft's row stays in the state when it was the token taken and the slot read it (it did not end
+                // there); else the slot's recurrent states go back to its first row's
+                if (going && outs[i] == d) {
+                    going = take(b, outs[i + 1]);
+                    kept = 2;
+                } else if (!model.slot_rollback((int) b, berr)) {
+                    return false;
+                }
+            }
+            bs[b].d = -1;
+            if (drafts && going)
+                for (int t = 0; t < kept; ++t) {   // row t of this slot and the token after it, a position on
+                    mslot.push_back((int) b);
+                    mrow.push_back((int) i + t);
+                    mtok.push_back(outs[i + (size_t) t]);
+                    mpos.push_back(at[i + (size_t) t] + 1);
+                }
+            if (drafts && going) msp.push_back(bs[b].sp);
+            i += two ? 2 : 1;
+        }
+        if (!mslot.empty()) {
+            std::vector<int32_t> next_d(msp.size(), -1);
+            if (!model.mtp_slots(mslot.data(), mrow.data(), mtok.data(), mpos.data(), msp.data(), (int) mslot.size(),
+                                 next_d.data(), berr))
+                return false;
+            size_t j = 0;
+            for (size_t i = 0; i < mslot.size(); ++i)
+                if (i + 1 == mslot.size() || mslot[i + 1] != mslot[i]) bs[(size_t) mslot[i]].d = next_d[j++];
         }
         std::fflush(stdout);
         return true;
@@ -720,8 +825,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         for (const int64_t k : model.split_points()) folder.id += std::to_string((long long) k) + ",";
         std::string ferr;
         if (folder.open(ferr))
-            std::fprintf(stderr, "strata (%s): conversation save: %s holds %zu usable conversations\n", arch.c_str(),
-                         folder.dir.string().c_str(), folder.entries.size());
+            std::fprintf(stderr, "strata (%s): conversation save: %s holds %zu usable conversations%s\n", arch.c_str(),
+                         folder.dir.string().c_str(), folder.entries.size(), folder.compress ? "; writing compressed" : "");
         else {
             std::fprintf(stderr, "strata (%s): conversation save: %s; not saving conversations\n", arch.c_str(),
                          ferr.c_str());
@@ -1701,9 +1806,21 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t1 = Clock::now();
         const char* finish = "length";
         long long produced = 0;
-        // with drafts (greedy requests): a window emits the accepted drafts and the token after them, sent one by one;
-        // the state holds every one of them but the last, as `live` does
-        const bool spec = model.drafts() > 0 && sp.greedy && !constrained;
+        // with drafts: a window emits the accepted drafts and the token after them, sent one by one; the state holds
+        // every one of them but the last, as `live` does.  Under sampling too: a window's row t draws with the counter
+        // of its position, as a token a window would, and keeps a draft only where it equals that pick, so the text
+        // is the seed's whatever the drafts (as Qwen3.8-Flash-Next's)
+        // --suffix-draft / --lookup-chain: drafts from earlier repeats of the conversation's text (spec_step's `ext`)
+        const bool lookup = opt.suffix_draft > 0 || opt.lookup_chain > 0;
+        static strata::spec::SuffixDrafter sfx(opt.suffix_draft > 0 ? opt.suffix_draft : opt.lookup_chain_min, 64,
+                                               (size_t) ctx + 4096);
+        std::vector<int32_t> ext((size_t) opt.max_t + 1);
+        const bool spec = (model.drafts() > 0 || lookup) && !constrained;
+        if (spec && lookup) {
+            sfx.reset();
+            sfx.append(ids.data(), ids.size());
+            sfx.append(next);
+        }
         if (spec && !req_prefill && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
         std::vector<int32_t> pend;
         size_t at = 0;
@@ -1725,8 +1842,24 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
             if (stop_req.load()) { finish = "cancel"; break; }
             if (spec) {
-                int n_emit = 0;
-                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err)) { ok = false; break; }
+                int n_emit = 0, n_ext = 0;
+                if (lookup) {
+                    const int wd = model.window_drafts();
+                    if (opt.suffix_draft > 0) n_ext = sfx.propose(wd, ext.data());
+                    if (n_ext == 0 && opt.lookup_chain > 0) {   // after the MTP's drafts, what followed them before
+                        const std::vector<int32_t>& d = model.pending_drafts();
+                        const int nd = std::min((int) d.size(), wd);
+                        std::copy(d.begin(), d.begin() + nd, ext.begin());
+                        const int k = sfx.propose_after(d.data(), nd, std::min(opt.lookup_chain, wd - nd), ext.data() + nd);
+                        if (k > 0) n_ext = nd + k;
+                    }
+                }
+                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err, nullptr,
+                                     n_ext > 0 ? ext.data() : nullptr, n_ext, sfx.last_match())) {
+                    ok = false;
+                    break;
+                }
+                if (lookup) sfx.append(out.data(), (size_t) n_emit);
                 live.push_back(next);
                 pend.assign(out.begin(), out.begin() + n_emit);
                 at = 0;
@@ -1773,7 +1906,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                         (int64_t) live.size() == n;
             const auto tc0 = Clock::now();
             if (cont) park_slot(admit_slot);   // the conversation the slot holds, before this one overwrites it
-            if (cont && !model.copy_session(-1, admit_slot, n, false, err)) {
+            // --batch-mtp: the MTP layer's cell at n too, where the request's first draft came from (spec_start)
+            const bool first_draft = spec && model.batch_drafts() && !model.pending_drafts().empty();
+            if (cont && !model.copy_session(-1, admit_slot, first_draft ? n + 1 : n, false, err)) {
                 std::fprintf(stderr, "strata (%s): batch admission failed: %s\n", arch.c_str(), err.c_str());
                 err.clear();
                 bs[(size_t) admit_slot].held = false;   // its state may be half written
@@ -1784,6 +1919,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 sl = BSlot{};
                 sl.active = true;
                 sl.x = next;
+                sl.d = first_draft ? model.pending_drafts()[0] : -1;
                 sl.p = n;
                 sl.produced = 1;
                 sl.max_new = admit_max_new;
@@ -1850,6 +1986,8 @@ static void plain_usage(const std::string& arch) {
                  "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
                  "                       (default 48; 0: no such bound)\n"
                  "  --adapt-decay F      the routing counts are multiplied by F after each round (default 0.7)\n"
+                 "  --adapt-async 0|1    1 (the default): a round's copies run beside the next windows; 0: the round\n"
+                 "                       waits for them (the blocking tier)\n"
                  "  --adapt-min-gain F   an expert moves in only when its decayed count is F over the one it\n"
                  "                       evicts (default 1.5)\n"
                  "  --expert-cache N|auto   the VRAM tier's most expert slots, over all the layers (default auto)\n"
@@ -1873,12 +2011,18 @@ static void plain_usage(const std::string& arch) {
                  "                       4096, or up to 32768 where the VRAM tier lends it; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
-                 "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
+                 "                       the last one and N - 1 drafts (default 3; 0: off; --serve's sampled requests\n"
+                 "                       too, the CLI's greedy runs)\n"
+                 "  --coupled-draft, --no-coupled-draft  sample the MTP drafts with the request's chain (default: off)\n"
                  "  --kv-ram on|off      GLM-5.3-Flash: the DSA layers' latent cells in RAM, their VRAM to the experts (on)\n"
                  "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
                  "                       expected to raise the tokens per ms at the measured window costs; or while\n"
                  "                       each is at least --spec-min-p P likely under the MTP layer\n"
                  "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
+                 "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
+                 "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
+                 "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
+                 "  --lookup-chain-min M  the shortest match --lookup-chain extends on (default 3)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
                  "  --yarn-ext-factor F --yarn-attn-factor F --yarn-beta-fast F --yarn-beta-slow F  YaRN's knobs\n"
@@ -1897,6 +2041,8 @@ static void plain_usage(const std::string& arch) {
                  "                       virtual memory pages are 2 MiB or more)\n"
                  "  --batch N, --slots N --serve: decode up to N conversations together, a row each in a window\n"
                  "                       (docs/BATCHING.md; at most --max-t, as many as half the free VRAM holds)\n"
+                 "  --batch-mtp, --no-batch-mtp  with the MTP layer, each slot also checks the layer's draft in a\n"
+                 "                       window where it has room, two tokens when it holds (default on)\n"
                  "  --prompt-cache N     --serve, a model with a recurrent state: keep N checkpoints of a conversation\n"
                  "                       mid-prompt, where a next request may take it up (default 6; 0 = off)\n"
                  "  --prompt-cache-every N  --serve: also a checkpoint every N fresh prompt tokens (default 16384; 0 = off)\n"
@@ -1918,6 +2064,8 @@ static void plain_usage(const std::string& arch) {
                  "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
                  "  --conversation-save-checkpoints N  --serve: a file's checkpoints: the system prompt's, then the longest\n"
                  "                       (default 2)\n"
+                 "  --conversation-save-compress  --serve: compress the files' floating-point parts (c-blosc2 ZSTD;\n"
+                 "                       only in a build that found libblosc2)\n"
                  "  --session-min-free-mib N  --serve: disk space a saved conversation must leave free (default 4096;\n"
                  "                       0 = no check)\n"
                  "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from strata-vision)\n"
@@ -1938,6 +2086,9 @@ int plain_main(int argc, char** argv) {
     linkless_gpu_adapter();
 
     strata::core::PlainOptions opt;
+    opt.coupled_draft = strata::core::coupled_draft_env();   // STRATA_SPEC_COUPLED=1, as Qwen3.8-Flash-Next's
+    if (const char* e = std::getenv("STRATA_BATCH_MTP"); e != nullptr && *e != 0)   // (=0: --no-batch-mtp)
+        opt.batch_mtp = std::strtol(e, nullptr, 10) != 0;
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
     int64_t n_new = 16;
@@ -2082,6 +2233,10 @@ int plain_main(int argc, char** argv) {
             opt.pool_tasks = (int) tasks;
         } else if (a == "--no-host-worker") opt.pool_host_works = false;
         else if (a == "--memory-limit-mib") memory_limit_mib = std::max<int64_t>(0, std::strtoll(next("--memory-limit-mib"), nullptr, 10));
+        else if (a == "--suffix-draft") opt.suffix_draft = std::max(0, (int) std::strtol(next("--suffix-draft"), nullptr, 10));
+        else if (a == "--lookup-chain") opt.lookup_chain = std::max(0, (int) std::strtol(next("--lookup-chain"), nullptr, 10));
+        else if (a == "--lookup-chain-min")
+            opt.lookup_chain_min = std::max(1, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
         else if (a == "--kv-grow") opt.kv_grow = 1;
         else if (a == "--no-kv-grow") opt.kv_grow = 0;
         else if (a == "--batch" || a == "--slots")
@@ -2118,6 +2273,7 @@ int plain_main(int argc, char** argv) {
             folder.budget_mib = std::max<int64_t>(0, std::strtoll(next("--conversation-save-mib"), nullptr, 10));
         else if (a == "--conversation-save-checkpoints")
             folder.checkpoints = std::max(0, (int) std::strtol(next("--conversation-save-checkpoints"), nullptr, 10));
+        else if (a == "--conversation-save-compress") folder.compress = true;
         else if (a == "--conversation-save-hours")
             folder.hours = std::max<int64_t>(0, std::strtoll(next("--conversation-save-hours"), nullptr, 10));
         else if (a == "--session-min-free-mib")
@@ -2127,6 +2283,11 @@ int plain_main(int argc, char** argv) {
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
         }
+        else if (a == "--batch-mtp") opt.batch_mtp = true;
+        else if (a == "--no-batch-mtp") opt.batch_mtp = false;
+        else if (a == "--coupled-draft") opt.coupled_draft = true;
+        else if (a == "--no-coupled-draft") opt.coupled_draft = false;
+        else if (a == "--adapt-async") opt.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0;
         else if (a == "--adapt-mib-per-token")
             opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
@@ -2231,6 +2392,11 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (!follow.empty()) n_new = std::min<int64_t>(n_new, (int64_t) follow.size());   // the run ends with it
+    if (folder.compress && !strata::core::conversation_disk_can_compress()) {
+        std::fprintf(stderr, "strata (%s): --conversation-save-compress: this build has no c-blosc2 (install "
+                             "libblosc2-dev and build again)\n", arch.c_str());
+        return 2;
+    }
     if (!serve && (prompt.empty() || n_new < 1)) {
         std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;

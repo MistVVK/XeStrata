@@ -92,6 +92,10 @@ struct PlainOptions {
     /// slot its own copy of the per-sequence state; at most max_t, as many as take half the VRAM free before the
     /// expert tier at most.  Not GLM-5.3-Flash's nor with --vision (one table of rotary positions) for now.
     int batch_slots = 0;
+    /// --batch-mtp (on by default) / --no-batch-mtp: with the MTP layer, a slot's row is followed by the draft the
+    /// layer made for it where the window has room, and the slot moves two tokens when it holds (Qwen3.8-Flash-Next's
+    /// --batch-mtp: one draft a slot a window).  Each slot keeps its recurrent states after its first row to go back to.
+    bool batch_mtp = true;
     /// --kv-grow (1) / --no-kv-grow (0) (--serve): the live session's K/V in virtual memory, physical memory only for
     /// the cells the requests reach, the expert tier (in --vram-elastic's segments) giving VRAM up for them and taking
     /// it back after a short request; -1: on where the device's virtual memory pages are 2 MiB or more, as
@@ -114,6 +118,10 @@ struct PlainOptions {
     /// a token.  On the B70 with an i7-14700 (DDR5) the bound changed nothing (llm-jp 8 GB 41.5 / 41.6).  0: none.
     int adapt_mib_per_token = 48;
     float adapt_decay = 0.7f;       ///< the routing counts are multiplied by this after each round
+    /// --adapt-async: a round's copies from the pinned RAM copy run beside the next windows, and their experts are
+    /// taken kPlainAdaptLag windows on (Qwen3.8-Flash-Next's --adapt-async 1); false: the round waits for them, the
+    /// blocking tier (--adapt-async 0)
+    bool adapt_async = true;
     float adapt_min_gain = 1.5f;    ///< an expert moves in only when its count is this much over the one it evicts
     /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
@@ -160,6 +168,11 @@ struct PlainOptions {
     /// drafts were the fastest of one to three on the RX 9060 XT (16 and 8 GB), the B70 and the RTX 4070 (Ornith Q6_K
     /// and Q4_K_M, 2026-10-12).
     int spec = 3;
+    /// --suffix-draft N (--serve): drafts from an earlier repeat of the context's last N+ tokens (prompt lookup), a
+    /// window of them where they go past the MTP layer's (models without that layer too); --lookup-chain K: up to K
+    /// such tokens after the MTP's drafts.  0: off.  The recurrent states' copies for the longer windows are taken then.
+    int suffix_draft = 0, lookup_chain = 0;
+    int lookup_chain_min = 3;   ///< --lookup-chain-min: the shortest match --lookup-chain extends on
     /// --spec-window: how many of the drafts a window checks.  "all": every draft made (the fixed window of spec
     /// tokens); "auto": the drafts kept while the tokens each is expected to add, at its calibrated acceptance, raise
     /// the window's expected tokens per ms at the measured window costs (strata::spec::DraftPolicy, as Qwen3.8-Flash-
@@ -168,6 +181,9 @@ struct PlainOptions {
     /// 95.8 tok/s, RTX 4070 80.0 / 84.2 against 79.4 / 84.7; GLM-5.3-Flash at 56 GB of RAM on the B70 4.17 against
     /// 4.13, 2026-10-26).
     std::string spec_window = "all";
+    /// --coupled-draft (STRATA_SPEC_COUPLED=1): under sampling the MTP layer samples its drafts with the request's chain
+    /// and the uniform of the window row that checks each (coupled_draft.hpp) instead of taking the most likely token
+    bool coupled_draft = false;
     double spec_min_p = 0.0;
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
@@ -212,6 +228,8 @@ public:
     struct Snapshot {
         int64_t tokens = 0;
         std::vector<std::vector<uint8_t>> parts;
+        /// each part's element size where it is floating point (2 or 4), for --conversation-save-compress; 0: codes
+        std::vector<uint8_t> typesize;
         size_t bytes() const;
     };
     bool save_state(int64_t tokens, Snapshot& snap, std::string& err);
@@ -227,10 +245,22 @@ public:
     int batch_slot_count() const;
     bool copy_session(int from, int to, int64_t tokens, bool recurrent_only, std::string& err);
     bool save_slot(int b, int64_t tokens, Snapshot& snap, std::string& err);
-    /// A batch window: row t is token tokens[t] of slot slot[t] (ascending, each once) at its position pos[t],
-    /// out[t] the token after it, drawn with sp[t] (the row's position its counter).  T <= max_t.
+    /// A batch window: row t is token tokens[t] of slot slot[t] at its position pos[t], out[t] the token after it,
+    /// drawn with sp[t] (the row's position its counter).  T <= max_t.  The slots ascend, each once, or (--batch-mtp)
+    /// twice at consecutive positions: its token and the MTP layer's draft after it.
     bool forward_slots(const int32_t* tokens, const int* slot, const int64_t* pos,
                        const strata::kernels::SamplerParams* sp, int T, int32_t* out, std::string& err);
+    /// --batch-mtp: whether the slots draft (the MTP layer, the batch slots and the option)
+    bool batch_drafts() const;
+    /// --batch-mtp: slot b's recurrent states back to what its first row left in the last batch window it had two in
+    /// (its draft was not the token after it)
+    bool slot_rollback(int b, std::string& err);
+    /// --batch-mtp: the MTP layer over the rows the last batch window kept, each slot's run of them in order: row i is
+    /// that window's row rows[i] (its trunk row), read with tokens[i] (the token after it) at position pos[i] (its
+    /// position + 1), slot[i] ascending; drafts[j] the draft after the j-th slot's last row, drawn with sp[j]'s chain
+    /// under --coupled-draft (else the most likely).  T <= max_t.
+    bool mtp_slots(const int* slot, const int* rows, const int32_t* tokens, const int64_t* pos,
+                   const strata::kernels::SamplerParams* sp, int T, int32_t* drafts, std::string& err);
     /// The bytes save_state would take for `tokens` tokens
     size_t state_bytes(int64_t tokens) const;
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
@@ -297,7 +327,14 @@ public:
     bool prompt_int8() const;
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
-    int drafts() const { return tail().has_mtp_ ? tail().n_snap_ : 0; }
+    int drafts() const { return tail().has_mtp_ ? tail().n_mtp_ : 0; }
+    /// The most drafts a window can check (spec_step's `ext`): the recurrent states' copies, else a window less one
+    int window_drafts() const {
+        const PlainModel& t = tail();
+        return recurrent() || t.glm_ ? t.n_snap_ : t.opt_.max_t - 1;
+    }
+    /// The MTP layer's drafts after the pending token (spec_step checks them next)
+    const std::vector<int32_t>& pending_drafts() const { return tail().drafts_; }
     /// After prompt() (or the windows of a prompt): `first`, the token picked after it, at position `pos`, the next
     /// window's first token; the MTP layer reads it and drafts the tokens after it.
     bool spec_start(int32_t first, int64_t pos, std::string& err);
@@ -306,8 +343,13 @@ public:
     /// then holds every emitted token but the last, which is pending, and the next drafts are made.
     /// `follow` (--spec-follow): the tokens the window must emit instead of its own picks, from the one after the
     /// pending token on (at least `limit`): the drafts that match them are accepted.
+    /// `ext` (n_ext tokens, --suffix-draft / --lookup-chain, `match` the lookup's match length): drafts the window
+    /// checks instead of the MTP layer's, where they start as those do (or there are none) and the window rule
+    /// (Qwen3.8-Flash-Next's DraftPolicy::choose, from the measured window costs and the lookup's acceptance by match
+    /// length) expects more tokens a ms from them, as many of them as it takes.
     bool spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
-                   std::string& err, const int32_t* follow = nullptr);
+                   std::string& err, const int32_t* follow = nullptr, const int32_t* ext = nullptr, int n_ext = 0,
+                   int match = 0);
     /// The windows and the drafts they checked and accepted since the load, for the report.
     int64_t spec_windows() const { return tail().spec_windows_; }
     int64_t spec_drafted() const { return tail().spec_drafted_; }
@@ -468,11 +510,13 @@ private:
     /// --batch: a slot's copy of the per-sequence state (the live session's in the members below), this stage's
     struct SlotSession {
         std::vector<float*> gdn_state, gdn_conv;
+        std::vector<float*> gdn_snap, conv_snap;   ///< --batch-mtp: the states after the slot's first row
         std::vector<uint16_t*> k_pool, v_pool, k_scale, v_scale;
         std::vector<int8_t*> k_q, v_q;
         std::vector<uint8_t*> k_q4, v_q4;
     };
     std::vector<SlotSession> bslots_;
+    bool bslot_snaps_ = false;   ///< the slots keep the states after their first row (--batch-mtp)
     /// --kv-grow: the live session's K/V planes in virtual memory, the bytes a page of cells takes in each, and the
     /// cells mapped (-1: no --kv-grow, every cell allocated)
     std::vector<std::unique_ptr<VmmRange>> kv_vmm_;
@@ -482,8 +526,18 @@ private:
     bool alloc_batch_slots(std::string& err);
     /// a batch window's row t is slot row_slot_[t]'s (empty: the live session's rows), while it is recorded or run
     std::vector<int> row_slot_;
-    std::map<uint32_t, strata::gpu::Graph*> bexec_;                  ///< per set of slots: the batch window
-    std::map<uint32_t, std::vector<strata::gpu::Graph*>> bsegs_;     ///< ... or its segments
+    /// per set of slots (the low 32 bits) and those of them with two rows (the high): the batch window, or its
+    /// segments; the MTP layer's batch windows likewise
+    std::map<uint64_t, strata::gpu::Graph*> bexec_, mbexec_;
+    std::map<uint64_t, std::vector<strata::gpu::Graph*>> bsegs_, mbsegs_;
+    /// row_slot_'s row t is the first of its slot's two
+    bool first_of_two(int t) const {
+        return t + 1 < (int) row_slot_.size() && row_slot_[(size_t) t + 1] == row_slot_[(size_t) t];
+    }
+    /// The key of the window whose rows are slot[0 .. T): the slots, and those with two rows
+    static uint64_t slots_key(const int* slot, int T);
+    /// The MTP layer's batch window over row_slot_'s rows: each slot's last row normed and through the head
+    bool record_mtp_slots(int T, strata::gpu::Stream cs, std::string& err);
     int64_t batch_rows_ = 0;   ///< the batch windows' rows so far (the adaptive rounds' clock in them)
     /// The head over T normed rows `x` into logits_.
     void head_logits(const float* x, int T, strata::gpu::Stream cs);
@@ -763,7 +817,7 @@ private:
     std::FILE* route_dump_ = nullptr;             ///< --dump-routing's file, or null
     /// `n` tokens' `k` routed experts of MoE layer `layer` into --dump-routing's file
     void dump_routes(int64_t layer, const int32_t* ids, int64_t n, int64_t k);
-    struct StatePart { void* dev; size_t bytes; };
+    struct StatePart { void* dev; size_t bytes; int typesize = 0; };   ///< typesize: as Snapshot's
     /// The device buffers a snapshot of `tokens` tokens copies (state_bytes, save_state, restore_state)
     /// `slot`: batch slot slot's copy (-1: the live session)
     std::vector<StatePart> state_parts(int64_t tokens, bool recurrent_only = false, int slot = -1) const;
@@ -824,6 +878,7 @@ private:
     /// The recurrent states after a window's rows 0 .. n_snap_ - 1, per GDN block (gdn_snap_[block][row]), for
     /// spec_step to go back to the last accepted row.
     int n_snap_ = 0;
+    int n_mtp_ = 0;   ///< the MTP layer's drafts a window (spec - 1; n_snap_ may be more for --suffix-draft)
     std::vector<std::vector<float*>> gdn_snap_, conv_snap_;
     // the drafting: the pending token, its position, the drafts after it; the MTP layer's input rows (device, max_t of
     // n_embd); the counts for the report
