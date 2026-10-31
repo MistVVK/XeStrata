@@ -1117,7 +1117,7 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 - Requests still run one at a time.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
 - Without `--conversation-cache-mib` the budget is sized from the RAM free once the model is loaded (upstream #3493): 40% of what is left above `--conversation-cache-min-free-mib`, at most 8192, in steps of 256, and off when that is under 1024; the start log says which in one line. `--conversation-cache-mib 0` turns it off, and so does `--prompt-cache 0`; with Qwen3.8-Flash-Next, so does running without `--mtp`.
-  Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
+  Parked conversations are written to the disk as well, as [the next section](#keeping-parked-conversations-on-the-disk) says, so they serve after the RAM cache pushed them out and after a restart.
 - Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
   If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).
   If that is still not enough, or the copy does not fit the budget, it skips parking and reads the prompt as before.
@@ -1172,32 +1172,39 @@ Under `--serve`, when the link to the card probes below 12 GB/s and none of the 
 
 The VRAM stages and slots are taken only while a sixteenth of the card's memory stays free beside them.
 
-### Keeping parked conversations across restarts (opt-in)
+### Keeping parked conversations on the disk
 
-With `"conversation_save": "<folder>"` in the config, the engine also writes its parked conversations to that folder and puts them back from there after a restart.
-It needs the previous section's `--conversation-cache-mib` as well.
+Setup writes `"conversation_save": "<models folder>/conversations/<model name>"` into each model's config.
+The engine also writes its parked conversations to that folder, and puts one back from there when a request continues a conversation the RAM cache pushed out, or one from before a restart.
+`"conversation_save": false` in the config turns it off; running setup again keeps that value and the other `conversation_save_*` keys.
+Nothing is written while the previous section's conversation cache is off (when the RAM left is too little, for example).
 A relative path is from the XeStrata folder.
 
 - A conversation is written when the RAM cache pushes it out, and at a normal exit (the parked ones and the one the engine holds).
+  With the models other than Qwen3.8-Flash-Next, a conversation too large for the RAM cache is written then as well.
   If the engine crashes, a conversation not yet written is lost.
-- Each conversation is written with up to `"conversation_save_checkpoints"` (default 2) checkpoints:
+- For each request, the engine looks for a file that matches more of the request's start than the conversation it holds and the parked ones, and reads it back if there is one.
+  When reading it would leave less RAM free than `--conversation-cache-min-free-mib`, the prompt is read instead.
+- With Qwen3.8-Flash-Next, each conversation is written with up to `"conversation_save_checkpoints"` (default 2) checkpoints:
   the start of the last turn (what the next turn of the same chat resumes from), the end of the system prompt (where a new chat of the same client starts),
   then the most recently used.
   A conversation takes about 118 MB × (1 + the checkpoints), plus about 14 KB of KV per context token (INT8).
-- When the folder holds more than `"conversation_save_mib"` (default 16384), the files used longest ago are deleted first.
+- When the folder holds more than `"conversation_save_mib"` (default 32768), the files used longest ago are deleted first.
   A file not used for `"conversation_save_hours"` (default 48) hours is deleted too, at start and every 10 minutes between requests.
+  Reading a file back counts as using it.
+- A file is not written when it would leave less disk space free than `--session-min-free-mib` (default 4096, the same floor as SAVE's).
 - Writing a conversation deletes the file of the same conversation a turn back.
 - A file is used only by an engine with the same model files, engine version and settings (KV precision, context length, MTP, control vectors, and so on).
-  Other files are left alone until their age or the budget removes them; the budget counts every file in the folder, so give each model a folder of its own.
+  Other files are left alone until their age or the budget removes them; the budget counts every file in the folder, so setup gives each model a folder of its own.
   A damaged file is deleted and the prompt is read as before.
-- Only the owner can read the files (folder 0700, files 0600).
+- Only the owner can read the files (a folder the engine makes is 0700, the files 0600).
   They hold values computed from the conversations: keep them on this PC.
-- With `"conversation_save_compress": true` the floating-point parts of a file (the DeltaNet states, the indexer rows, FP16 KV) are written compressed with c-blosc2's ZSTD at level 1 (off by default).
+- With Qwen3.8-Flash-Next, `"conversation_save_compress": true` writes the floating-point parts of a file (the DeltaNet states, the indexer rows, FP16 KV) compressed with c-blosc2's ZSTD at level 1 (off by default).
   A file gets about 10% smaller with INT8 KV and about 15% with FP16 KV. KV of 1-byte codes (INT8, Q4_0, K8V4) hardly compresses and is written as it is.
   It is available only when the build found libblosc2-dev (Debian / Ubuntu); with the key and a build without it, the engine does not start.
   A compressed file is read by any engine built with libblosc2, with or without the key; an engine without it deletes the file and reads the prompt again.
-- As engine arguments: `--conversation-save DIR`, `--conversation-save-checkpoints N`, `--conversation-save-mib N`, `--conversation-save-hours N`, `--conversation-save-compress`.
-  Running setup again rewrites the config, so add the keys again then.
+- As engine arguments: `--conversation-save DIR`, `--conversation-save-mib N`, `--conversation-save-hours N`, `--session-min-free-mib N`.
+  `--conversation-save-checkpoints N` and `--conversation-save-compress` are taken by Qwen3.8-Flash-Next's engine only.
 
 Measured on the B70 with IQ2_XS, a conversation of 9,183 tokens (INT8 KV, two checkpoints) took 471 MiB.
 After a restart it was read back from the CPU-attached NVMe in 0.28 s, and only the 7 new tokens were read (without the file, the 9,167 tokens are read again in 7.9 s).

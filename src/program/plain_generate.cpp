@@ -15,6 +15,7 @@
 #include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/plain_model.hpp"
@@ -36,6 +37,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <list>
@@ -48,6 +50,7 @@
 #if defined(_WIN32)
 #include <io.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #if defined(__linux__)
@@ -191,7 +194,14 @@ constexpr char kSessionMagic[8] = {'X', 'S', 'P', 'L', 'A', 'I', 'N', '1'};
 bool session_write(const std::string& path, const std::string& model_id, const std::vector<int32_t>& ids,
                    const strata::core::PlainModel::Snapshot& snap, size_t& bytes, std::string& err) {
     const std::string tmp = path + ".part";
+#if defined(_WIN32)
     std::FILE* f = std::fopen(tmp.c_str(), "wb");
+#else
+    // what was computed from a conversation: its owner's only, as Qwen3.8-Flash-Next's files
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    std::FILE* f = fd < 0 ? nullptr : ::fdopen(fd, "wb");
+    if (f == nullptr && fd >= 0) ::close(fd);
+#endif
     if (f == nullptr) { err = "cannot write " + tmp; return false; }
     auto put = [&](const void* p, size_t n) { return std::fwrite(p, 1, n, f) == n; };
     const uint64_t idn = model_id.size(), nt = ids.size(), np = snap.parts.size(), tok = (uint64_t) snap.tokens;
@@ -213,8 +223,9 @@ bool session_write(const std::string& path, const std::string& model_id, const s
     return true;
 }
 
+// `snap` null: the tokens only (the conversation folder's index)
 bool session_read(const std::string& path, const std::string& model_id, std::vector<int32_t>& ids,
-                  strata::core::PlainModel::Snapshot& snap, size_t& bytes, std::string& err) {
+                  strata::core::PlainModel::Snapshot* snap, size_t& bytes, std::string& err) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (f == nullptr) { err = "cannot read " + path; return false; }
     auto get = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
@@ -226,10 +237,15 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
     if (!ok) { std::fclose(f); err = "not a session file of this model and context"; return false; }
     ok = get(&tok, 8) && get(&nt, 8) && nt == tok && nt < (1ull << 31);
     if (ok) { ids.resize(nt); ok = get(ids.data(), nt * 4) && get(&np, 8) && np < 4096; }
-    snap.tokens = (int64_t) tok;
-    snap.parts.assign(ok ? np : 0, {});
     bytes = 8 + 8 + idn + 8 + 8 + nt * 4 + 8;
-    for (auto& part : snap.parts) {
+    if (snap == nullptr) {
+        std::fclose(f);
+        if (!ok) err = "a short or damaged session file";
+        return ok;
+    }
+    snap->tokens = (int64_t) tok;
+    snap->parts.assign(ok ? np : 0, {});
+    for (auto& part : snap->parts) {
         uint64_t n = 0;
         ok = ok && get(&n, 8) && n < (1ull << 40);
         if (!ok) break;
@@ -242,11 +258,126 @@ bool session_read(const std::string& path, const std::string& model_id, std::vec
     return ok;
 }
 
+// --conversation-save DIR, as Qwen3.8-Flash-Next's (conversation_disk.hpp): the conversations the RAM cache lets go,
+// and every one held at QUIT, as session files in DIR named by their tokens, so a request that comes back to one
+// after the cache dropped it, or after a restart, reads it from the file instead of the prompt.  A file is a
+// computation cache: one written by another model, engine or setting (`id`) is left alone until it expires, a damaged
+// one is deleted.  The folder's age limit and budget count both engines' files (conversation_folder_expire).
+struct ConversationFolder {
+    std::filesystem::path dir;            // empty: off
+    std::string id;                       // the model, engine and settings a file must have been written with
+    int64_t budget_mib = 32768;           // --conversation-save-mib
+    int64_t hours = 48;                   // --conversation-save-hours (0: no age limit)
+    int64_t min_free_mib = 4096;          // --session-min-free-mib: the disk space a file must leave free
+    struct Entry {
+        std::filesystem::path path;
+        std::vector<int32_t> ids;
+        size_t bytes = 0;
+    };
+    std::vector<Entry> entries;           // least recently used first
+
+    bool on() const { return !dir.empty(); }
+
+    void forget(const std::filesystem::path& p) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const Entry& e) { return e.path == p; }),
+                      entries.end());
+    }
+    size_t expire() {
+        size_t left = 0;
+        return strata::core::conversation_folder_expire(dir, std::chrono::hours(hours), (size_t) budget_mib << 20,
+                                                        left, [&](const std::filesystem::path& p) { forget(p); });
+    }
+    // Makes the folder (its owner's only), drops the writes a crash cut short, expires and indexes the usable files.
+    bool open(std::string& err) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        if (!fs::exists(dir, ec)) {
+            if (!fs::create_directories(dir, ec) || ec) {
+                err = "cannot create " + dir.string() + ": " + ec.message();
+                return false;
+            }
+            fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+        }
+        if (!fs::is_directory(dir, ec)) { err = dir.string() + " is not a folder"; return false; }
+        std::vector<fs::path> files;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const fs::path p = it->path();
+            std::error_code e;
+            if (p.extension() == ".part" && p.stem().extension() == strata::core::kConversationPlainExtension)
+                fs::remove(p, e);
+            else if (p.extension() == strata::core::kConversationPlainExtension) files.push_back(p);
+        }
+        expire();
+        std::vector<std::pair<fs::file_time_type, Entry>> found;
+        for (const fs::path& p : files) {
+            std::error_code e;
+            if (!fs::exists(p, e)) continue;   // expired just now
+            Entry en;
+            std::string why;
+            // another engine's or setting's, or damaged
+            if (!session_read(p.string(), id, en.ids, nullptr, en.bytes, why)) continue;
+            en.path = p;
+            en.bytes = (size_t) fs::file_size(p, e);
+            found.emplace_back(fs::last_write_time(p, e), std::move(en));
+        }
+        std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (auto& f : found) entries.push_back(std::move(f.second));
+        return true;
+    }
+    // Writes the conversation `ids` with its state, then deletes the files of its earlier turns (whose tokens it
+    // starts with) and the oldest over the budget.  `bytes`: the file's.
+    bool save(const std::vector<int32_t>& ids, const strata::core::PlainModel::Snapshot& snap, size_t& bytes,
+              std::string& err) {
+        namespace fs = std::filesystem;
+        const size_t need = snap.bytes() + ids.size() * 4 + id.size() + 64;
+        if (need > ((size_t) budget_mib << 20)) {
+            err = "the conversation (" + std::to_string(need >> 20) + " MiB) exceeds the folder's budget";
+            return false;
+        }
+        if (!strata::core::conversation_folder_room(dir, need, (uint64_t) min_free_mib << 20, err)) return false;
+        uint64_t h = fnv1a(id.data(), id.size());
+        h = fnv1a(ids.data(), ids.size() * sizeof(int32_t), h);
+        char name[32];
+        std::snprintf(name, sizeof name, "%016llx", (unsigned long long) h);
+        const fs::path path = dir / (std::string(name) + strata::core::kConversationPlainExtension);
+        if (!session_write(path.string(), id, ids, snap, bytes, err)) return false;
+        for (size_t i = 0; i < entries.size();) {
+            const Entry& e = entries[i];
+            if (e.path != path && e.ids.size() < ids.size() && std::equal(e.ids.begin(), e.ids.end(), ids.begin())) {
+                std::error_code ec;
+                fs::remove(e.path, ec);
+                entries.erase(entries.begin() + (std::ptrdiff_t) i);
+                continue;
+            }
+            ++i;
+        }
+        forget(path);
+        entries.push_back({path, ids, bytes});
+        expire();
+        return true;
+    }
+    // Reads entry i back; a file that fails is deleted.  A file used starts its age again and becomes the newest.
+    bool load(size_t i, std::vector<int32_t>& ids, strata::core::PlainModel::Snapshot& snap, std::string& err) {
+        const Entry e = entries.at(i);
+        size_t bytes = 0;
+        std::error_code ec;
+        if (!session_read(e.path.string(), id, ids, &snap, bytes, err)) {
+            std::filesystem::remove(e.path, ec);
+            forget(e.path);
+            return false;
+        }
+        std::filesystem::last_write_time(e.path, std::filesystem::file_time_type::clock::now(), ec);
+        entries.erase(entries.begin() + (std::ptrdiff_t) i);
+        entries.push_back(e);
+        return true;
+    }
+};
+
 }  // namespace
 
 static int plain_serve(strata::core::PlainModel& model, const strata::core::PlainOptions& opt, const std::string& arch,
                        const std::vector<int32_t>& eos, const std::string& profile_save, double save_min,
-                       ConversationCache& cache) {
+                       ConversationCache& cache, ConversationFolder& folder) {
     // the reader thread outlives this function (it is detached and ends with the process), so what it shares is
     // owned by both
     struct StdinShared {
@@ -324,6 +455,49 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         model_id = opt.gguf.substr(opt.gguf.find_last_of("/\\") + 1) + " " + std::to_string((long long) f.tellg()) +
                    " " + std::to_string((long long) ctx);
     }
+    // --conversation-save: a file is read back only by this engine version on the same model file (its size and
+    // time) with the same K/V layout and layer split, as Qwen3.8-Flash-Next's fingerprint
+    if (folder.on()) {
+        folder.id = "engine=" STRATA_VERSION "\n" + model_id + "\nmodel=" +
+                    strata::core::conversation_file_identity(opt.gguf) + "\nkv_int8=" +
+                    std::to_string((int) opt.kv_int8) + " kv_ram=" + std::to_string((int) opt.kv_ram) + " split=";
+        for (const int64_t k : model.split_points()) folder.id += std::to_string((long long) k) + ",";
+        std::string ferr;
+        if (folder.open(ferr))
+            std::fprintf(stderr, "strata (%s): conversation save: %s holds %zu usable conversations\n", arch.c_str(),
+                         folder.dir.string().c_str(), folder.entries.size());
+        else {
+            std::fprintf(stderr, "strata (%s): conversation save: %s; not saving conversations\n", arch.c_str(),
+                         ferr.c_str());
+            folder.dir.clear();
+        }
+    }
+    // a conversation the RAM cache lets go, to the folder (when it has one): failures are said and the request goes on
+    auto to_folder = [&](const std::vector<int32_t>& ids, const strata::core::PlainModel::Snapshot& snap,
+                         const char* why) {
+        if (!folder.on() || ids.empty()) return;
+        const auto t0 = Clock::now();
+        size_t bytes = 0;
+        std::string ferr;
+        if (folder.save(ids, snap, bytes, ferr))
+            std::fprintf(stderr, "strata (%s): conversation save: wrote %zu tokens (%s, %zu MiB) in %.1f ms\n",
+                         arch.c_str(), ids.size(), why, bytes >> 20,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        else
+            std::fprintf(stderr, "strata (%s): conversation save: %s\n", arch.c_str(), ferr.c_str());
+    };
+    // the live conversation itself to the folder, when the RAM cache cannot take it (its copy is freed after)
+    auto live_to_folder = [&](const char* why) {
+        if (!folder.on() || live.empty()) return;
+        const int64_t need = (int64_t) model.state_bytes((int64_t) live.size());
+        const auto avail = strata::core::available_host_bytes();
+        if (!avail || (int64_t) *avail - need <= cache.min_free) return;
+        strata::core::PlainModel::Snapshot snap;
+        std::string serr;
+        if (model.save_state((int64_t) live.size(), snap, serr)) to_folder(live, snap, why);
+        else std::fprintf(stderr, "strata (%s): conversation save: %s\n", arch.c_str(), serr.c_str());
+    };
+    auto folder_expired_at = Clock::now();
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
     std::printf("INFO context=%lld expert_slots=%lld vram_elastic=%d\n", (long long) ctx, (long long) model.slots(),
@@ -337,6 +511,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     auto saved_at = std::chrono::steady_clock::now();
     while (next_line(line)) {
         if (line == "QUIT") break;
+        // --conversation-save: files past their age go between requests too, not only at the next start
+        if (folder.on() && Clock::now() - folder_expired_at >= std::chrono::minutes(10)) {
+            if (const size_t n = folder.expire())
+                std::fprintf(stderr, "strata (%s): conversation save: deleted %zu old file%s\n", arch.c_str(), n,
+                             n == 1 ? "" : "s");
+            folder_expired_at = Clock::now();
+        }
         if (!profile_save.empty() && save_min > 0 &&
             std::chrono::steady_clock::now() - saved_at >= std::chrono::duration<double>(save_min * 60.0)) {
             if (!model.save_profile(profile_save, err))
@@ -379,7 +560,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
             } else {
                 std::vector<int32_t> ids;
-                if (!session_read(path, model_id, ids, snap, bytes, err)) { refuse("invalid", err); continue; }
+                if (!session_read(path, model_id, ids, &snap, bytes, err)) { refuse("invalid", err); continue; }
                 if (!model.restore_state(snap, err)) { refuse("invalid", err); continue; }
                 live = std::move(ids);
                 live_prompt = 0;
@@ -609,13 +790,20 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             if (live.empty()) return;
             const int64_t need = (int64_t) model.state_bytes((int64_t) live.size());
             const auto avail = strata::core::available_host_bytes();
-            if (need > cache.budget || !avail || (int64_t) *avail - need <= cache.min_free) return;
+            if (need > cache.budget || !avail || (int64_t) *avail - need <= cache.min_free) {
+                live_to_folder("too large for the RAM cache");
+                return;
+            }
             while (!cache.parked.empty() &&
                    ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
                 if (std::prev(cache.parked.end()) == keep) break;
+                to_folder(cache.parked.back().ids, cache.parked.back().snap, "evicted");
                 cache.parked.pop_back();
             }
-            if ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget) return;
+            if ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget) {
+                live_to_folder("no room in the RAM cache");
+                return;
+            }
             ConversationCache::Entry e;
             if (!model.save_state((int64_t) live.size(), e.snap, err)) return;
             e.ids = live;
@@ -630,7 +818,42 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     best = it;
                     best_r = r;
                 }
-            if (best != cache.parked.end()) {
+            // --conversation-save: a file that serves more of it than the live state and every parked one, as far as
+            // the RAM it is read into leaves the floor free
+            size_t from_file = folder.entries.size();
+            const auto avail = strata::core::available_host_bytes();
+            for (size_t i = 0; avail && i < folder.entries.size(); ++i) {
+                const auto& e = folder.entries[i];
+                if ((int64_t) *avail - (int64_t) e.bytes <= cache.min_free) continue;
+                if (const int64_t r = e.ids.size() <= (size_t) n ? takes(e.ids) : 0;
+                    r > best_r && r == (int64_t) e.ids.size()) {
+                    from_file = i;
+                    best_r = r;
+                    best = cache.parked.end();
+                }
+            }
+            if (from_file < folder.entries.size()) {
+                const auto f0 = Clock::now();
+                std::vector<int32_t> fids;
+                strata::core::PlainModel::Snapshot snap;
+                std::string ferr;
+                if (folder.load(from_file, fids, snap, ferr)) {
+                    park_live(cache.parked.end());   // the live conversation first
+                    if (!model.restore_state(snap, err)) {
+                        std::printf("FATAL %s\n", err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata (%s): conversation save: read %zu tokens (%zu MiB) in %.1f ms\n",
+                                 arch.c_str(), fids.size(), snap.bytes() >> 20,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - f0).count());
+                    live = std::move(fids);
+                    resume = best_r;
+                } else {
+                    std::fprintf(stderr, "strata (%s): conversation save: %s; reading the prompt\n", arch.c_str(),
+                                 ferr.c_str());
+                }
+            } else if (best != cache.parked.end()) {
                 park_live(best);   // the live conversation first
                 if (!model.restore_state(best->snap, err)) {
                     std::printf("FATAL %s\n", err.c_str());
@@ -741,6 +964,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                                      (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
     }
+    // --conversation-save: the parked conversations, the least recently used first, and the live one, for the next
+    // start
+    if (folder.on()) {
+        for (auto it = cache.parked.rbegin(); it != cache.parked.rend(); ++it)
+            to_folder(it->ids, it->snap, "at the end");
+        live_to_folder("at the end");
+    }
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
@@ -805,6 +1035,13 @@ static void plain_usage(const std::string& arch) {
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the picks and\n"
                  "                       accept the drafts that match it, so settings compare on the same text\n"
                  "  --serve              stay resident and take requests on stdin (server.py's protocol)\n"
+                 "  --conversation-save DIR  --serve: also keep the conversations the RAM cache lets go, and those\n"
+                 "                       held at the end, in DIR (default off; needs the conversation cache)\n"
+                 "  --conversation-save-mib N  --serve: at most N MiB of files in DIR, oldest deleted first\n"
+                 "                       (default 32768)\n"
+                 "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
+                 "  --session-min-free-mib N  --serve: disk space a saved conversation must leave free (default 4096;\n"
+                 "                       0 = no check)\n"
                  "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from strata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
@@ -833,6 +1070,7 @@ int plain_main(int argc, char** argv) {
     std::string dump_path, profile_save;
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
     ConversationCache cache;       // --serve: --conversation-cache-mib and its slots
+    ConversationFolder folder;     // --serve: --conversation-save and its limits
     double save_min = 10.0;   // --expert-profile-save-every (serve)
     // the options Qwen3.8-Flash-Next's engine takes with the same meaning, parsed by the same code
     const std::string who = "strata (" + arch + ")";
@@ -906,6 +1144,13 @@ int plain_main(int argc, char** argv) {
         else if (a == "--conversation-cache-min-free-mib")
             cache.min_free =
                 std::max<int64_t>(0, std::strtoll(next("--conversation-cache-min-free-mib"), nullptr, 10)) << 20;
+        else if (a == "--conversation-save") folder.dir = next("--conversation-save");
+        else if (a == "--conversation-save-mib")
+            folder.budget_mib = std::max<int64_t>(0, std::strtoll(next("--conversation-save-mib"), nullptr, 10));
+        else if (a == "--conversation-save-hours")
+            folder.hours = std::max<int64_t>(0, std::strtoll(next("--conversation-save-hours"), nullptr, 10));
+        else if (a == "--session-min-free-mib")
+            folder.min_free_mib = std::max<int64_t>(0, std::strtoll(next("--session-min-free-mib"), nullptr, 10));
         else if (a == "--spec-follow") {
             std::ifstream in(next("--spec-follow"));
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
@@ -1053,8 +1298,16 @@ int plain_main(int argc, char** argv) {
                                  "conversations (--conversation-cache-mib N sets it, 0 turns it off)\n", arch.c_str(),
                          (long long) mib, cache.slots);
     }
+    // the files hold what the RAM cache lets go, as generate.cpp's
+    if (folder.on() && (!serve || cache.budget == 0)) {
+        if (serve)
+            std::fprintf(stderr, "strata (%s): warning: --conversation-save needs conversation parking, and the RAM "
+                                 "cache is off (--conversation-cache-mib); not saving conversations\n", arch.c_str());
+        folder.dir.clear();
+    }
     if (serve)
-        return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache);
+        return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache,
+                           folder);
     const double load_s = std::chrono::duration<double>(Clock::now() - t0).count();
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> dump_file(nullptr, &std::fclose);
     if (!dump_path.empty()) {

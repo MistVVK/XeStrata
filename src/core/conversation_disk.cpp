@@ -447,12 +447,14 @@ struct Found {
     uint64_t bytes = 0;
 };
 
-std::vector<Found> scan(const fs::path& dir) {
+// this engine's files, oldest first; `both`: the other models' engine's too (the folder's housekeeping)
+std::vector<Found> scan(const fs::path& dir, bool both = false) {
     std::vector<Found> out;
     std::error_code ec;
     for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         std::error_code e;
-        if (!it->is_regular_file(e) || it->path().extension() != kExtension) continue;
+        const auto ext = it->path().extension();
+        if (!it->is_regular_file(e) || (ext != kExtension && (!both || ext != kConversationPlainExtension))) continue;
         const auto time = it->last_write_time(e);
         const auto bytes = e ? 0 : it->file_size(e);
         if (!e) out.push_back({it->path(), time, bytes});
@@ -584,27 +586,53 @@ bool ConversationDisk::remove_file(const fs::path& path) {
     return removed;
 }
 
-size_t ConversationDisk::expire() {
-    if (!enabled_) return 0;
+size_t conversation_folder_expire(const fs::path& dir, std::chrono::seconds max_age, size_t budget, size_t& left,
+                                  const std::function<void(const fs::path&)>& removed) {
     const auto now = fs::file_time_type::clock::now();
-    size_t removed = 0;
-    auto found = scan(options_.dir);
-    folder_bytes_ = 0;
+    size_t n = 0;
+    left = 0;
+    auto gone = [&](const fs::path& p) {
+        std::error_code ec;
+        if (!fs::remove(p, ec)) return false;
+        if (removed) removed(p);
+        ++n;
+        return true;
+    };
     std::vector<Found> kept;
-    for (const Found& f : found) {
-        if (options_.max_age.count() > 0 && now - f.time > options_.max_age) {
-            removed += remove_file(f.path);
-            continue;
-        }
+    for (const Found& f : scan(dir, true)) {
+        if (max_age.count() > 0 && now - f.time > max_age && gone(f.path)) continue;
         kept.push_back(f);
-        folder_bytes_ += (size_t) f.bytes;
+        left += (size_t) f.bytes;
     }
     // oldest first, every file in the folder (another model's too: the budget is the folder's)
-    for (size_t i = 0; i < kept.size() && folder_bytes_ > options_.budget; ++i) {
-        folder_bytes_ -= (size_t) kept[i].bytes;
-        removed += remove_file(kept[i].path);
+    for (size_t i = 0; i < kept.size() && left > budget; ++i)
+        if (gone(kept[i].path)) left -= (size_t) kept[i].bytes;
+    return n;
+}
+
+bool conversation_folder_room(const fs::path& dir, uint64_t bytes, uint64_t min_free, std::string& error) {
+    if (min_free == 0) return true;
+    std::error_code ec;
+    const fs::space_info s = fs::space(dir, ec);
+    if (ec) {
+        error = "cannot read the free disk space of " + dir.string() + ": " + ec.message();
+        return false;
     }
-    return removed;
+    if (s.available < bytes || s.available - bytes < min_free) {
+        error = "not enough disk space (" + std::to_string(bytes >> 20) + " MiB plus a reserve of " +
+                std::to_string(min_free >> 20) + " MiB needed, " + std::to_string(s.available >> 20) + " MiB free)";
+        return false;
+    }
+    return true;
+}
+
+size_t ConversationDisk::expire() {
+    if (!enabled_) return 0;
+    return conversation_folder_expire(options_.dir, options_.max_age, options_.budget, folder_bytes_,
+                                      [&](const fs::path& p) {
+        entries_.erase(std::remove_if(entries_.begin(), entries_.end(), [&](const Entry& e) { return e.path == p; }),
+                       entries_.end());
+    });
 }
 
 void ConversationDisk::touch(size_t index) {
@@ -727,6 +755,7 @@ bool ConversationDisk::save(const SavedConversation& image, size_t& written, std
         error = "the conversation (" + std::to_string(total >> 20) + " MiB) exceeds the folder's budget";
         return false;
     }
+    if (!conversation_folder_room(options_.dir, total, options_.min_free, error)) return false;
     Hash name;
     name.update(options_.fingerprint.data(), options_.fingerprint.size());
     name.update(h.ids.data(), h.ids.size() * sizeof(int32_t));

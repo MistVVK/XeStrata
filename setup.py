@@ -5843,12 +5843,21 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags(old) if f not in new))
 
 
-def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False) -> None:
+def conversation_save_default(a, cfg: dict) -> dict:
+    """The conversations the engine lets go are kept on the disk by default (serve's "conversation_save"), in a folder
+    of their own for each model beside the model files: the folder's budget is shared by every file in it, and a file
+    another model wrote only takes room.  "conversation_save": false in the config turns it off."""
+    return {"conversation_save": str(Path(a.models_dir) / "conversations" / cfg["model_name"])}
+
+
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False,
+                       defaults: dict | None = None) -> None:
     """Setup's run config, written over an earlier one for the same model without losing what the user added to it:
     the keys setup does not write are carried over (carry_over; `gpus_chosen`: this run chose its GPUs), and the
     earlier file is kept as xestrata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry
-    the keys over from when this folder has none yet (a copy set up like the last one).  A line says what was kept,
-    one what was not."""
+    the keys over from when this folder has none yet (a copy set up like the last one).  `defaults`: keys setup fills
+    in only where the earlier config has none, so the user's own value (false included) stays.  A line says what was
+    kept, one what was not."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
     if old_path is not None and old_path.is_file():
@@ -5859,6 +5868,11 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gp
         if not isinstance(old, dict):
             old = None
     kept = carry_over(old, cfg, gpus_chosen) if old is not None else []
+    for k, v in (defaults or {}).items():
+        if k not in cfg:
+            cfg[k] = v
+        elif cfg[k] == v and k in kept:               # setup's own default from the last run: not the user's
+            kept.remove(k)
     bak = None
     if cfg_path.is_file() and old != cfg:
         bak = cfg_path.with_name(cfg_path.name + ".bak")
@@ -6209,7 +6223,7 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     if free is not None and "--vram-free-mib" not in cfg["args"]:
         cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
-                       getattr(a, "gpus_chosen", False))
+                       getattr(a, "gpus_chosen", False), conversation_save_default(a, cfg))
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)

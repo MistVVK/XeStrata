@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -24,10 +25,25 @@ bool conversation_disk_can_compress();
 // a file, or of every regular file directly in a folder.  "-" when the path is empty, "?" when it cannot be read.
 std::string conversation_file_identity(const std::string& path);
 
+// The other models' engine (plain_generate.cpp) keeps its conversations in a folder too, in its own format under its
+// own extension; the folder's age limit and budget count both engines' files.
+inline constexpr const char* kConversationPlainExtension = ".xsp";
+
+// Deletes the conversation files in `dir` (either engine's) last written or restored more than `max_age` ago (0: no
+// limit), then the oldest while the rest exceed `budget` bytes.  `removed` is told each deleted path; `left` gets the
+// bytes kept.  Returns how many were deleted.
+size_t conversation_folder_expire(const std::filesystem::path& dir, std::chrono::seconds max_age, size_t budget,
+                                  size_t& left, const std::function<void(const std::filesystem::path&)>& removed);
+
+// Whether a file of `bytes` fits on the disk of `dir` with `min_free` bytes still free after it (0: no check);
+// `error` says why not.
+bool conversation_folder_room(const std::filesystem::path& dir, uint64_t bytes, uint64_t min_free, std::string& error);
+
 struct ConversationDiskOptions {
     std::filesystem::path dir;
     std::string fingerprint;       // the model, engine and settings the files must have been written with
-    size_t budget = 0;             // bytes of .xsc files the folder may hold
+    size_t budget = 0;             // bytes of conversation files the folder may hold (both engines')
+    uint64_t min_free = 0;         // disk space a file must leave free (--session-min-free-mib; 0: no check)
     std::chrono::seconds max_age{0};  // since the file was last written or restored
     size_t checkpoints = 2;        // checkpoints written per conversation: deepest, chain root, then newest use
     bool compress = false;         // the floating-point parts through c-blosc2 (needs conversation_disk_can_compress)
@@ -72,7 +88,8 @@ public:
     // The file was used: its age starts again, and it becomes the most recent.
     void touch(size_t index);
     // Writes `image` (its checkpoints cut to the configured count), then deletes the files it supersedes and the
-    // oldest ones over the budget.  A conversation whose uncompressed size exceeds the budget is not written.
+    // oldest ones over the budget.  A conversation whose uncompressed size exceeds the budget, or that would leave
+    // the disk less than min_free, is not written.
     // `written`: file bytes.
     bool save(const SavedConversation& image, size_t& written, std::string& error);
     // Deletes files older than max_age, then the oldest while the folder is over its budget.  Returns how many.

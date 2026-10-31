@@ -3023,11 +3023,12 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
 
 
 def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
-    """Opt-in: "conversation_save": "<folder>" in the config has the engine keep its parked conversations there
-    across restarts (it needs --conversation-cache-mib in "args"), with "conversation_save_checkpoints",
-    "conversation_save_mib" and "conversation_save_hours" (whole numbers >= 0) for the engine's defaults, and
-    "conversation_save_compress" (true: an engine built with libblosc2 compresses the files).  A relative
-    path is the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    """"conversation_save": "<folder>" in the config (setup writes one for each model, setup.py's
+    conversation_save_default) has the engine keep the conversations its RAM cache lets go there, and across
+    restarts, with "conversation_save_checkpoints", "conversation_save_mib" and "conversation_save_hours" (whole
+    numbers >= 0) for the engine's defaults, and "conversation_save_compress" (true: an engine built with libblosc2
+    compresses the files).  A relative path is the engine's (the config's "cwd").  Without the key, or with false,
+    the arguments are the config's, unchanged."""
     folder = cfg.get("conversation_save")
     if not isinstance(folder, str) or not folder.strip() or "--conversation-save" in args:
         return args

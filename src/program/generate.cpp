@@ -479,7 +479,7 @@ struct Options {
     /// then the most recently used), the folder's budget, and the age after its last use at which a file goes.
     std::string conversation_save;
     int conversation_save_checkpoints = 2;
-    int64_t conversation_save_mib = 16384;
+    int64_t conversation_save_mib = 32768;
     int64_t conversation_save_hours = 48;
     bool conversation_save_compress = false;   // the floating-point parts through c-blosc2 (built only when found)
     /// --serve: park only after the conversation has advanced this many tokens past the copy it would supersede.
@@ -639,11 +639,12 @@ void usage() {
                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
-                 "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                 "  --session-min-free-mib N  --serve: disk space a SAVE or a saved conversation must leave free (default\n"
+                 "                       4096; 0 = no check)\n"
                  "  --conversation-save DIR  --serve: also keep parked conversations in DIR across restarts (default off;\n"
                  "                       needs --conversation-cache-mib)\n"
                  "  --conversation-save-checkpoints N  --serve: checkpoints written per conversation (default 2)\n"
-                 "  --conversation-save-mib N  --serve: at most N MiB of files in DIR, oldest deleted first (default 16384)\n"
+                 "  --conversation-save-mib N  --serve: at most N MiB of files in DIR, oldest deleted first (default 32768)\n"
                  "  --conversation-save-hours N  --serve: delete a file N hours after its last use (default 48)\n"
                  "  --conversation-save-compress  --serve: compress the files' floating-point parts (c-blosc2 ZSTD;\n"
                  "                       10-15%% smaller; only in a build that found libblosc2)\n"
@@ -7708,6 +7709,7 @@ int main(int argc, char** argv) {
             dopt.dir = o.conversation_save;
             dopt.fingerprint = std::move(fp);
             dopt.budget = (size_t) o.conversation_save_mib * 1024 * 1024;
+            dopt.min_free = (uint64_t) o.session_min_free_mib << 20;
             dopt.max_age = std::chrono::hours(o.conversation_save_hours);
             dopt.checkpoints = (size_t) o.conversation_save_checkpoints;
             dopt.compress = o.conversation_save_compress;
