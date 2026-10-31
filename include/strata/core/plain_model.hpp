@@ -43,11 +43,14 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/spec/draft_policy.hpp"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -56,6 +59,8 @@ class GgufModel;
 }
 
 namespace strata::core {
+
+class RemoteExperts;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -96,6 +101,15 @@ struct PlainOptions {
     /// layer made for it where the window has room, and the slot moves two tokens when it holds (Qwen3.8-Flash-Next's
     /// --batch-mtp: one draft a slot a window).  Each slot keeps its recurrent states after its first row to go back to.
     bool batch_mtp = true;
+    /// --batch-groups G|auto (--serve, a layer split): the slots in G groups pipelined through the stages, each stage on
+    /// another group at once (plain_serve, PlainModel::pipe_tick); 0: not given (auto on a layer split, as
+    /// Qwen3.8-Flash-Next's: batch_groups.hpp), -1: auto
+    int batch_groups = 0;
+    /// --pipeline-windows N (a layer split): 1, the windows a prompt is read through pipelined over the stages
+    /// (forward_run; their order and rows as serial, so the same state); 2 (two stages, the MTP layer), the decode
+    /// too: the first stage computes a guess of the next window while the last checks this one (spec_step_pl);
+    /// 0: serial.  -1: 1 on a layer split.
+    int pipeline_windows = -1;
     /// --kv-grow (1) / --no-kv-grow (0) (--serve): the live session's K/V in virtual memory, physical memory only for
     /// the cells the requests reach, the expert tier (in --vram-elastic's segments) giving VRAM up for them and taking
     /// it back after a short request; -1: on where the device's virtual memory pages are 2 MiB or more, as
@@ -135,6 +149,12 @@ struct PlainOptions {
     /// --shared-expert-arena FILE (Linux): the experts' RAM shared with the other engines that name it (the arena's
     /// first loader fills it, the rest map it), as Qwen3.8-Flash-Next's
     std::string shared_arena;
+    /// --expert-cache-device1..3 N: N more experts on each helper GPU (the first ones no stage runs on), which computes
+    /// the rows routed to them instead of the CPU (core/remote_experts.hpp, as Qwen3.8-Flash-Next's); filled in the
+    /// profile's order, then expert by expert across the layers, placed "stripe" or "layer"
+    /// (--expert-cache-remote-placement)
+    std::array<int, 3> expert_cache_remote{};
+    std::string expert_cache_remote_placement = "stripe";
     bool pcie_split = true;         ///< split the missed experts between the CPU and PCIe by measured times
     /// --pcie-frac F: that share of the missed experts over PCIe in every window, instead of the measured split and the
     /// decode's first windows' choice (< 0: measured)
@@ -252,6 +272,22 @@ public:
                        const strata::kernels::SamplerParams* sp, int T, int32_t* out, std::string& err);
     /// --batch-mtp: whether the slots draft (the MTP layer, the batch slots and the option)
     bool batch_drafts() const;
+    /// --batch-groups: a group's batch window on its way through the stages: its rows (as forward_slots', one a slot),
+    /// the rows the stage it left handed on, and the tokens the last stage drew
+    struct GroupWindow {
+        std::vector<int32_t> tokens, out;
+        std::vector<int> slot;
+        std::vector<int64_t> pos;
+        std::vector<strata::kernels::SamplerParams> sp;
+        std::vector<float> hand;
+        int group = -1;
+    };
+    /// One tick of the pipelined groups: every window in the stages moves one stage on, `enter` (null: none) into the
+    /// first, and each stage computes its own beside the others (a thread each, the CPU pool one at a time); `done` is
+    /// the window the last stage finished (null: none).  No adaptive round starts while windows are in the stages.
+    bool pipe_tick(GroupWindow* enter, GroupWindow*& done, std::string& err);
+    bool pipe_empty() const;
+    int stages() const { return 1 + (int) next_.size(); }
     /// --batch-mtp: slot b's recurrent states back to what its first row left in the last batch window it had two in
     /// (its draft was not the token after it)
     bool slot_rollback(int b, std::string& err);
@@ -269,6 +305,12 @@ public:
     /// (after_rows), else every row counts.
     bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err,
                  bool defer = false);
+    /// Tokens [0, n) at positions pos .. through windows of max_t, as forward's one after another; out and logits are
+    /// the last window's (its T rows).  --pipeline-windows 1 or more on a layer split: the windows pipelined, stage s on
+    /// window j while stage s + 1 is on window j - 1 (the same rows in the same order on each stage, so the same
+    /// state).  `progress(read)` after each window the last stage finished.
+    bool forward_run(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err,
+                     const std::function<void(int64_t)>& progress = {});
     /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
     /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
@@ -338,6 +380,9 @@ public:
     /// After prompt() (or the windows of a prompt): `first`, the token picked after it, at position `pos`, the next
     /// window's first token; the MTP layer reads it and drafts the tokens after it.
     bool spec_start(int32_t first, int64_t pos, std::string& err);
+    /// --pipeline-windows 2: a guessed window the first stage computed for a next window that will not come (the
+    /// request ended) is given back, so the state holds the accepted tokens only.  Before the next use of the state.
+    bool spec_end(std::string& err);
     /// One window over the pending token and its drafts: `emitted` gets the accepted drafts and the token after them
     /// (`n_emit` of them, at most `limit`), cut after the first token in `stop`; with `logits`, their rows.  The state
     /// then holds every emitted token but the last, which is pending, and the next drafts are made.
@@ -409,6 +454,12 @@ private:
     int64_t lb_ = 0, le_ = 0;
     int dev_ = -1;
     std::vector<int> split_devs_;   ///< the root's: the engine's GPUs the stages take, in order
+    /// the root's --expert-cache-device1..3: each helper's GPU (-1: none) and its cache, every stage's dispatch's
+    std::array<int, 3> helper_dev_{-1, -1, -1};
+    std::array<std::unique_ptr<RemoteExperts>, 3> helpers_;
+    bool open_helpers(std::string& err);
+    /// The free slots of each layer take `want`'s (layer, expert) pairs in order, read in parallel; `filled`: how many
+    bool fill_tier(const std::vector<std::pair<int64_t, int32_t>>& want, int64_t& filled, std::string& err);
     PlainModel* root_ = this;
     std::vector<std::unique_ptr<PlainModel>> next_;
     bool first() const { return lb_ == 0; }
@@ -517,6 +568,11 @@ private:
     };
     std::vector<SlotSession> bslots_;
     bool bslot_snaps_ = false;   ///< the slots keep the states after their first row (--batch-mtp)
+    /// the root's --batch-groups: the window in front of each stage, whether a tick runs (the stages' threads then
+    /// take the CPU pool in turn), and that turn
+    std::vector<GroupWindow*> pipe_;
+    std::atomic<bool> piping_{false};
+    std::mutex pool_mu_;
     /// --kv-grow: the live session's K/V planes in virtual memory, the bytes a page of cells takes in each, and the
     /// cells mapped (-1: no --kv-grow, every cell allocated)
     std::vector<std::unique_ptr<VmmRange>> kv_vmm_;
@@ -560,7 +616,18 @@ private:
     /// trunk's row before it): the greedy draft after the last.
     bool mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err);
     /// The chain after mtp_run's first draft: drafts_ up to `want` from position `pos` (the first draft's).
-    bool mtp_chain(int want, int64_t pos, std::string& err);
+    /// `all`: up to `want` whatever the window rule says (--pipeline-windows 2's guesses read on past a window)
+    bool mtp_chain(int want, int64_t pos, std::string& err, bool all = false);
+    /// --pipeline-windows 2: spec_step over two stages, the first a window ahead on a guess (see pipeline_windows)
+    bool pipelined_spec() const;
+    bool spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, std::string& err);
+    /// the first stage's side: before a guess, its last window's rows' copies and the state it left are kept
+    /// (pl_save); after the verdict on that window, its state goes back to row n's (n < T - 1) or to what it left
+    bool pl_save(std::string& err);
+    bool pl_restore(int n, int T, std::string& err);
+    /// the chain from position pos1: a window's drafts, and on to the next window's guess where those are likely to be
+    /// taken whole (pl_theta)
+    bool pl_chain(int64_t pos1, std::string& err);
     /// `max_swaps` > 0: this round moves up to that many, past adapt_swaps and the copy budget (after a prompt).
     /// `max_evict` >= 0: of them at most that many evict an expert (the rest fill free slots).
     bool adapt(std::string& err, int64_t max_swaps = 0, int64_t max_evict = -1);
@@ -880,6 +947,18 @@ private:
     int n_snap_ = 0;
     int n_mtp_ = 0;   ///< the MTP layer's drafts a window (spec - 1; n_snap_ may be more for --suffix-draft)
     std::vector<std::vector<float*>> gdn_snap_, conv_snap_;
+    /// --pipeline-windows 2, a stage before the last: the rows' copies of the window before a guess and the state that
+    /// window left (per GDN block), whether the copies are there, and (the last stage's) the guessed window the first
+    /// stage computed: its tokens from position pl_pos_ and the rows it handed on
+    std::vector<std::vector<float*>> pl_bak_state_, pl_bak_conv_;
+    std::vector<float*> pl_pre_state_, pl_pre_conv_;
+    bool pl_bak_valid_ = false, pl_ready_ = false;
+    std::vector<int32_t> pl_g_;
+    std::vector<float> pl_hand_;
+    int64_t pl_pos_ = -1;
+    /// the first stage's routing records (ExpertDispatch::route_rec) of the window before a guess and of the guess:
+    /// the adaptive tier counts a window's kept rows from its own records, as the serial windows' (after_rows)
+    std::vector<int32_t> pl_rec_w_, pl_rec_g_;
     // the drafting: the pending token, its position, the drafts after it; the MTP layer's input rows (device, max_t of
     // n_embd); the counts for the report
     int32_t cur_ = -1;

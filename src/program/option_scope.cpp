@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/program/option_scope.cpp - see include/strata/program/option_scope.hpp.  The lists follow generate.cpp's
-// options: one added there goes into one of them (or into plain_generate.cpp, where the other models take it).
+// src/program/option_scope.cpp - see include/strata/program/option_scope.hpp.  The list follows generate.cpp's
+// options: one added there goes into plain_generate.cpp too, or into it when it rests on Qwen3.8-Flash-Next's own
+// structure.
 #include "strata/program/option_scope.hpp"
 
 #include <algorithm>
@@ -37,13 +38,6 @@ const char* const kQwen38Only[] = {
     "--batch-cpu-split",
 };
 
-// the engine's options every model could take, which the other models' path does not have yet (2026-11-01)
-const char* const kNotYet[] = {
-    "--batch-groups",
-    "--expert-cache-device1", "--expert-cache-device2", "--expert-cache-device3", "--expert-cache-remote-placement",
-    "--pipeline-windows",
-};
-
 bool listed(const char* const* first, const char* const* last, const std::string& name) {
     return std::any_of(first, last, [&](const char* o) { return name == o; });
 }
@@ -52,7 +46,6 @@ bool listed(const char* const* first, const char* const* last, const std::string
 
 OptionScope option_scope(const std::string& name) {
     if (listed(std::begin(kQwen38Only), std::end(kQwen38Only), name)) return OptionScope::qwen38_only;
-    if (listed(std::begin(kNotYet), std::end(kNotYet), name)) return OptionScope::not_yet;
     return OptionScope::unknown;
 }
 

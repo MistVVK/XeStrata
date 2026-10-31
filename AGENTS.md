@@ -73,7 +73,7 @@ The two do not differ in what they can do (the user's decision of 2026-10-31): a
 - Write it once, as a shared part both engines call (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`), not as a second copy in each engine.
 - upstream's changes land in `generate.cpp`: whatever of them is taken goes into the plain engine too, in the same work ([the upstream-sync skill](.claude/skills/upstream-sync/SKILL.md)).
 - Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: what `kQwen38Only` in `src/program/option_scope.cpp` lists (PLE, QSA, the separate MTP pack, their kernels and switches).
-  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`; `kNotYet` lists only what the plain engine still lacks, and it only shrinks.
+  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`.
 - A speed path taken into the plain engine is measured there as well, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B).
 
 ## What goes in

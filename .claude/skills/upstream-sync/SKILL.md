@@ -27,7 +27,7 @@ Rules for the whole run:
 - Both engines: Qwen3.8-Flash-Next (and the Gyro packs) run on `src/program/generate.cpp`, the other models (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash) on `src/program/plain_generate.cpp` and `src/core/plain_model.cpp`, and the two do not differ in what they can do (the user's decision of 2026-10-31).
   upstream's changes land in `generate.cpp`; whatever of them is taken (a feature, a fix, a speed idea, an engine option) is taken into the plain engine too, in the same run, as a shared part both engines call (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`), not as a second copy.
   Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: what `kQwen38Only` in `src/program/option_scope.cpp` lists (PLE, QSA, the separate MTP pack and their kernels).
-  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`, never into `kNotYet`.
+  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`.
 
 ## 1. The starting point
 

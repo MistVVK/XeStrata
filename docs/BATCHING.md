@@ -154,6 +154,7 @@ How the server uses them (moving from the solo path into a slot, each slot's con
 - With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `STRATA_BATCH_MTP=0` turns it off). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
 - While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.
 - A batch window is recorded as a graph once for each set of slots in it.
+- On a layer split the slots run in groups pipelined through the stages, as Qwen3.8-Flash-Next's (`--batch-groups G` or `auto`, `auto` by default there): each stage computes another group at once. The groups' windows carry no drafts, so `--batch-mtp` is off then (`--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps one group with them). No adaptive round starts while groups are in the stages. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 4 slots: 89.3 tokens/s in 2 groups, against 66.1 in one group without drafts and 69.2 with them.
 
 `tools/batch_test.py` (greedy) with 4 slots on the B70:
 

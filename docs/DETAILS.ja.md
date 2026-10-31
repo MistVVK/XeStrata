@@ -412,6 +412,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--adapt-min-gain F` | 入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差。既定 1.5） |
 | `--adapt-async 0\|1` | 1（既定）は、入れ替えの写しを次の窓の横で進め、3 窓後に入れ替えたエキスパートを使う。0 は、写しが終わるまで入れ替えのところで待つ（Qwen3.8-Flash-Next の `--adapt-async 0` と同じ） |
 | `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む（setup の `--low-ram on` か `mmap` で書かれます） |
+| `--expert-cache-device1 N`（`2`、`3` も）、`--expert-cache-remote-placement stripe\|layer` | 補助の GPU（層の分割に使っていない最初の GPU から）にエキスパートを N 個置き、そこに選ばれた行を CPU の代わりに計算させる（Qwen3.8-Flash-Next と同じ意味）。プロファイルの順、その後はエキスパートごとに層をまたいで埋めます。B70 の段を 3,000 枠にした Qwen3.6-35B-A3B で RTX 4070 に 6,000 個置くと、decode が 100.0 から 166.8 トークン/秒になりました |
 | `--shared-expert-arena FILE` | エキスパートの RAM の写しを、同じ FILE を名指すほかのエンジンと分け合う（Linux。最初に読んだエンジンが埋め、ほかは写すだけ。Qwen3.8-Flash-Next と同じ。`--mmap-experts` や RAM の段とは一緒に使えません） |
 | `--resident-experts`、`--resident-budget-gib N`、`--resident-cpu-experts` | エキスパートをファイルから読み、VRAM にないものを RAM の許す限り（`--resident-budget-gib` では N GiB まで）プロファイルの順に RAM に写す。`--resident-cpu-experts` はその写しを page-lock しない普通の RAM に置きます（Qwen3.8-Flash-Next と同じ名前） |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
@@ -429,6 +430,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--suffix-draft N`、`--lookup-chain K`、`--lookup-chain-min M` | `--serve` で、会話の文の前の繰り返し（直近の N トークン以上の一致）から下書きを作り、MTP の層の下書きより長いときはそれを窓で確かめる（MTP の層のないモデルでも）。`--lookup-chain` は MTP の下書きの後に K トークンまで続けます（既定は無効） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
+| `--pipeline-windows N` | 層を分けたとき、1（既定）はプロンプトを窓で読む分を段をまたいで流す（前の段が次の窓を計算する間に、後の段がこの窓を計算する。行と順は直列と同じなので、状態も同じ）。2 は、2 段で MTP の層のあるとき decode も流す: 最後の段がこの窓を確かめる間に、最初の段が次の窓を推測で計算する（この窓がまるごと当たり、続くトークンが下書きの層の予想どおりなら、それがそのまま次の窓になる。外れたら最初の段を戻す。その見込みが 0.5 以上のときだけ推測する。Qwen3.8-Flash-Next の既定は 0.2）。文は直列と同じです。B70 と RTX 4070 の分割（層 20）の Qwen3.6-35B-A3B では、入力を写す返事が 187.9 から 245.6 トークン/秒になり、温度 0.8 の物語は 133.9 から 129.8 トークン/秒でした。0 は直列。B70 と RTX 4070 の分割（層 20）の Qwen3.6-35B-A3B で、`--prompt-chunk 0` の 819 トークンの prefill が 108.5 から 139.3 トークン/秒になり、答えは同じでした |
 | `--vram-reserve-later-mib N` | 層を分けたとき、2 枚目以降の GPU に空けておく VRAM（既定は `--vram-reserve-mib` と同じ） |
 | `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
 | `--batch N`（`"parallel": N`） | `--serve` で最大 N 個の会話をまとめて decode する（[BATCHING](BATCHING.ja.md#ほかのモデルplain-のエンジン)。GLM-5.3-Flash と `--vision` ではまだ使えません） |

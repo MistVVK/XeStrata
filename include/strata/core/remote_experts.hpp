@@ -6,14 +6,30 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
+
+/// The pairs several helpers fill from (--expert-cache-device1..3): `profile` first, then every other (layer, expert)
+/// expert by expert, each layer in turn, so that the tail spreads over the layers instead of piling on layer zero (the
+/// shipped profile names a third of Qwen3.8-Flash-Next's experts).
+std::vector<std::pair<int32_t, int32_t>> remote_ranking(const std::vector<std::pair<int32_t, int32_t>>& profile,
+                                                        int64_t layers, int64_t experts);
+
+/// --expert-cache-remote-placement: the pairs each helper r fills (caps[r] its slots; helpers 1 and 2 count while
+/// their caps are > 0), from `ranked` without those `held` (a primary cache's).  "stripe" deals them out in turn for
+/// parallel work on the helpers; "layer" (`by_layer`) gives each layer one helper (layer % helpers), as far as it has
+/// room, to cut switches and transfers over a shared link (USB4).  Both engines' (generate.cpp, PlainModel).
+std::array<std::vector<std::pair<int32_t, int32_t>>, 3>
+remote_placement(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t layers, int64_t experts,
+                 const std::array<int, 3>& caps, bool by_layer, const std::function<bool(int32_t, int32_t)>& held);
 
 /// A static, profile-filled expert tier on another GPU. GPU 0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
@@ -72,6 +88,7 @@ private:
     int64_t n_expert_ = 0;
     int32_t groups_ = 0;
     int64_t computed_ = 0;
+    int64_t h_ = 0, ff_ = 0;   ///< the rows' width and the experts' inner size (open)
     int64_t launched_layers_ = 0;
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;

@@ -5779,52 +5779,18 @@ int main(int argc, char** argv) {
                     if (st->cache.slot_of(pr.first, pr.second) < 0) ranked.push_back(pr);
         }
         if (multi_remote) {
-            // The shipped frequency profile names only 8000 of 24576 experts. Once exhausted,
-            // fill remaining VRAM from unranked pairs in expert-then-layer order: this spreads
-            // the tail across all layers instead of concentrating it on layer zero.
-            std::vector<uint8_t> seen((size_t) g.n_layers * (size_t) g.n_expert, 0);
-            for (const auto& pair : ranked)
-                if (pair.first >= 0 && pair.first < g.n_layers && pair.second >= 0 && pair.second < g.n_expert)
-                    seen[(size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second] = 1;
-            for (int64_t e = 0; e < g.n_expert; ++e)
-                for (int64_t l = 0; l < g.n_layers; ++l)
-                    if (!seen[(size_t) l * (size_t) g.n_expert + (size_t) e])
-                        ranked.emplace_back((int32_t) l, (int32_t) e);
+            // the shipped frequency profile names only 8000 of 24576 experts: once it is exhausted the rest of the VRAM
+            // fills from the unranked pairs, expert by expert across the layers (remote_ranking)
+            ranked = strata::core::remote_ranking(ranked, g.n_layers, g.n_expert);
             std::fprintf(stderr, "strata generate: remote ranking: %zu profiled pairs, "
                                  "%zu other pairs to fill CUDA1..3\n", profile.size(), ranked.size() - profile.size());
         }
         std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
         if (multi_remote) {
-            // Either stripe experts for parallel GPU work, or give each layer one
-            // secondary GPU to reduce switches and transfers over shared USB4.
-            std::vector<uint8_t> assigned((size_t) g.n_layers * (size_t) g.n_expert, 0);
             const int devices = 1 + (o.expert_cache_remote[1] > 0) + (o.expert_cache_remote[2] > 0);
-            int next = 0;
-            for (const auto& pair : ranked) {
-                if (pair.first < 0 || pair.first >= g.n_layers || pair.second < 0 || pair.second >= g.n_expert ||
-                    xcache.slot_of(pair.first, pair.second) >= 0) continue;
-                const size_t index = (size_t) pair.first * (size_t) g.n_expert + (size_t) pair.second;
-                if (assigned[index]) continue;
-                int target = -1;
-                if (o.expert_cache_remote_placement == "layer") {
-                    target = pair.first % devices;
-                    // Other layers' owners may still have room: keep scanning ranks.
-                    if (by_device[(size_t) target].size() >=
-                        (size_t) o.expert_cache_remote[(size_t) target]) continue;
-                } else {
-                    for (int i = 0; i < devices; ++i) {
-                        const int r = (next + i) % devices;
-                        if (by_device[(size_t) r].size() < (size_t) o.expert_cache_remote[(size_t) r]) {
-                            target = r;
-                            break;
-                        }
-                    }
-                    if (target < 0) break;
-                }
-                assigned[index] = 1;
-                by_device[(size_t) target].push_back(pair);
-                next = (target + 1) % devices;
-            }
+            by_device = strata::core::remote_placement(
+                ranked, g.n_layers, g.n_expert, o.expert_cache_remote, o.expert_cache_remote_placement == "layer",
+                [&](int32_t l, int32_t e) { return xcache.slot_of(l, e) >= 0; });
             std::fprintf(stderr, "strata generate: remote ranks %s across %d CUDA devices\n",
                          o.expert_cache_remote_placement == "layer" ? "grouped by layer" : "striped", devices);
         } else {

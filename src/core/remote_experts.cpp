@@ -48,6 +48,54 @@ std::string failed(int device, const char* what) {
 RemoteExperts::~RemoteExperts() { close(); }
 
 // Opens the device's runtime (its context and queues) and reads its free memory.
+std::vector<std::pair<int32_t, int32_t>> remote_ranking(const std::vector<std::pair<int32_t, int32_t>>& profile,
+                                                        int64_t layers, int64_t experts) {
+    std::vector<std::pair<int32_t, int32_t>> ranked = profile;
+    std::vector<uint8_t> seen((size_t) layers * (size_t) experts, 0);
+    for (const auto& pair : ranked)
+        if (pair.first >= 0 && pair.first < layers && pair.second >= 0 && pair.second < experts)
+            seen[(size_t) pair.first * (size_t) experts + (size_t) pair.second] = 1;
+    for (int64_t e = 0; e < experts; ++e)
+        for (int64_t l = 0; l < layers; ++l)
+            if (!seen[(size_t) l * (size_t) experts + (size_t) e]) ranked.emplace_back((int32_t) l, (int32_t) e);
+    return ranked;
+}
+
+std::array<std::vector<std::pair<int32_t, int32_t>>, 3>
+remote_placement(const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t layers, int64_t experts,
+                 const std::array<int, 3>& caps, bool by_layer, const std::function<bool(int32_t, int32_t)>& held) {
+    std::array<std::vector<std::pair<int32_t, int32_t>>, 3> by_device;
+    std::vector<uint8_t> assigned((size_t) layers * (size_t) experts, 0);
+    const int devices = 1 + (caps[1] > 0) + (caps[2] > 0);
+    int next = 0;
+    for (const auto& pair : ranked) {
+        if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts ||
+            held(pair.first, pair.second))
+            continue;
+        const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
+        if (assigned[index]) continue;
+        int target = -1;
+        if (by_layer) {
+            target = pair.first % devices;
+            // other layers' owners may still have room: keep scanning the ranks
+            if (by_device[(size_t) target].size() >= (size_t) caps[(size_t) target]) continue;
+        } else {
+            for (int i = 0; i < devices; ++i) {
+                const int r = (next + i) % devices;
+                if (by_device[(size_t) r].size() < (size_t) caps[(size_t) r]) {
+                    target = r;
+                    break;
+                }
+            }
+            if (target < 0) break;
+        }
+        assigned[index] = 1;
+        by_device[(size_t) target].push_back(pair);
+        next = (target + 1) % devices;
+    }
+    return by_device;
+}
+
 bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     free_gib = 0;
     try {
@@ -164,10 +212,21 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
             close(); return false;
         }
 
+        // the rows' width and the experts' inner size: the model's in the native layouts (either engine's model),
+        // else Qwen3.8-Flash-Next's packs'
+        h_ = H;
+        ff_ = FF;
+        if (lay.native && !lay.fmt.empty()) {
+            h_ = ff_ = 0;
+            for (const auto& f : lay.fmt) {
+                h_ = std::max<int64_t>(h_, f.n_embd);
+                ff_ = std::max<int64_t>(ff_, f.n_ff);
+            }
+        }
         const size_t scratch = std::max<size_t>(
-            (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
-            strata::kernels::native_expert_scratch_bytes(CAP, FF));
-        const size_t rows = (size_t) CAP * H * sizeof(float);
+            (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, h_, ff_),
+            strata::kernels::native_expert_scratch_bytes(CAP, ff_));
+        const size_t rows = (size_t) CAP * h_ * sizeof(float);
         stream_ = gpu::stream_create();
         read_stream_ = gpu::stream_create_copy();
         const char* step = stream_ == nullptr                                   ? "stream"
@@ -177,8 +236,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          : !gpu::alloc_host(&h_meta_, sizeof(RemoteMeta))       ? "metadata staging"
                          : !gpu::alloc_device(&d_x_, rows)                      ? "input"
                          : !gpu::alloc_device(&d_out_, rows)                    ? "result"
-                         : !gpu::alloc_device(&d_q8_, (size_t) CAP * (H / 32) * 36) ? "activation"
-                         : !gpu::alloc_device(&d_scales_, (size_t) CAP * (H / 32) * sizeof(float)) ? "activation scales"
+                         : !gpu::alloc_device(&d_q8_, (size_t) CAP * (h_ / 32) * 36) ? "activation"
+                         : !gpu::alloc_device(&d_scales_, (size_t) CAP * (h_ / 32) * sizeof(float)) ? "activation scales"
                          : !gpu::alloc_device(&d_scratch_, scratch)             ? "scratch"
                          : !gpu::alloc_device(&d_meta_, sizeof(RemoteMeta))     ? "group metadata"
                                                                                 : nullptr;
@@ -263,7 +322,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     }
     start_.push_back((int32_t) dst_.size());
     // Buffers of this helper's own live until its GPU has read them: the CPU pool writes other rows meanwhile.
-    std::memcpy(h_x_, x, (size_t) n_tok * H * sizeof(float));
+    std::memcpy(h_x_, x, (size_t) n_tok * h_ * sizeof(float));
     auto* meta = (RemoteMeta*) h_meta_;
     std::memcpy(meta->ptr, ptr_.data(), ptr_.size() * sizeof(ptr_[0]));
     std::memcpy(meta->start, start_.data(), start_.size() * sizeof(start_[0]));
@@ -271,11 +330,11 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
     meta->count = (int32_t) group_id_.size();
     groups_ = (int32_t) group_id_.size();
-    const uint64_t compact_bytes = (uint64_t) dst_.size() * H * sizeof(float);
+    const uint64_t compact_bytes = (uint64_t) dst_.size() * h_ * sizeof(float);
     try {
         const OnDevice on(device_);
         void* s = stream_;
-        if ((!zero_copy_ && !gpu::copy_async(d_x_, h_x_, (size_t) n_tok * H * sizeof(float), s)) ||
+        if ((!zero_copy_ && !gpu::copy_async(d_x_, h_x_, (size_t) n_tok * h_ * sizeof(float), s)) ||
             !gpu::copy_async(d_meta_, h_meta_, sizeof(RemoteMeta), s)) {
             err = failed(device_, "copy input");
             return false;
@@ -286,11 +345,11 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         if (lay.native) {
             const auto& fmt = lay.fmt[(size_t) layer];
             if (fmt.had_gu) {   // APR: Hadamard-folded gate/up take H (s * x), rotated into the device rows
-                strata::kernels::hadamard_rows(xin, d_x_, n_tok, H, fmt.had_block,
-                                               strata::kernels::hadamard_device_signs(fmt.gu_signs, (int) H), s);
+                strata::kernels::hadamard_rows(xin, d_x_, n_tok, h_, fmt.had_block,
+                                               strata::kernels::hadamard_device_signs(fmt.gu_signs, (int) h_), s);
                 xin = d_x_;
             }
-            strata::kernels::quantize_q8_1_rows(xin, n_tok, H, d_q8_, s);
+            strata::kernels::quantize_q8_1_rows(xin, n_tok, h_, d_q8_, s);
             auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.up_type);
             if (fmt.had_d) {   // APR: and the down weights the rotated h
                 L.had_block = fmt.had_block;
@@ -313,7 +372,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     }
     ++launched_layers_;
     returned_bytes_ += compact_bytes;
-    full_row_bytes_ += (uint64_t) n * H * sizeof(float);
+    full_row_bytes_ += (uint64_t) n * h_ * sizeof(float);
     return true;
 }
 
@@ -329,7 +388,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     for (size_t i = 0; i < original_row_.size(); ++i)
-        std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
+        std::memcpy(out + (size_t) original_row_[i] * h_, h_out_ + i * h_, (size_t) h_ * sizeof(float));
     return true;
 }
 

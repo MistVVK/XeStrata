@@ -10,6 +10,7 @@
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
+#include "strata/program/batch_groups.hpp"
 #include "strata/program/option_scope.hpp"
 #include "strata/program/done_line.hpp"
 #include "strata/program/shared_options.hpp"
@@ -702,6 +703,53 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::printf("BDONE %d %lld %s %.1f\n", (int) b, (long long) s.produced, why,
                     std::chrono::duration<double, std::milli>(Clock::now() - s.t0).count());
     };
+    // --batch-groups (batch_groups.hpp, Qwen3.8-Flash-Next's rule): with a layer split the slots in groups pipelined
+    // through the stages, each stage on another group at once (pipe_step); their windows carry no drafts, so
+    // --batch-mtp is off beside them, as there
+    int groups = 1;
+    bool slot_drafts = model.batch_drafts();
+    if (!bs.empty()) {
+        namespace bg = strata::program::batch_groups;
+        bg::Input bin;
+        bin.set = opt.batch_groups != 0;
+        bin.auto_given = opt.batch_groups < 0;
+        bin.given = std::max(1, opt.batch_groups);
+        bin.batch = (int) bs.size();
+        bin.later_stages = model.stages() - 1;
+        bin.batch_mtp = slot_drafts;
+        const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL");
+        bin.mtp_serial = ms != nullptr && *ms != 0 && *ms != '0';
+        const bg::Result r = bg::resolve(bin);
+        groups = r.groups;
+        if (r.from_auto && r.serial != bg::Serial::None)
+            std::fprintf(stderr, "strata (%s): --batch-groups auto: 1 group of %zu slots - %s does not run in pipelined "
+                                 "groups; --batch-groups %d would pipeline them and turn it off\n", arch.c_str(),
+                         bs.size(), bg::serial_what(r.serial), r.would_be);
+        if (groups > 1 && (model.stages() < 2 || bs.size() % (size_t) groups != 0)) {
+            std::fprintf(stderr, "strata (%s): --batch-groups %d is off: it needs a layer split and to divide the %zu "
+                                 "slots\n", arch.c_str(), groups, bs.size());
+            groups = 1;
+        }
+        if (groups > 1) {
+            std::fprintf(stderr, "strata (%s): --batch-groups: %d groups of %zu slots pipelined through the %d stages%s\n",
+                         arch.c_str(), groups, bs.size() / (size_t) groups, model.stages(),
+                         slot_drafts ? "; --batch-mtp is off beside them (STRATA_BATCH_MTP_SERIAL=1 or --batch-groups 1 "
+                                       "keeps it in one group)" : "");
+            slot_drafts = false;
+        }
+    }
+    // the slot reads its token and takes y after it; false when that ends it
+    auto take = [&](size_t b, int32_t y) {
+        BSlot& s = bs[b];
+        s.ids.push_back(s.x);
+        ++s.p;
+        s.x = y;
+        ++s.produced;
+        std::printf("BT %d %d\n", (int) b, (int) y);
+        if (std::find(eos.begin(), eos.end(), y) != eos.end()) slot_done(b, "stop");
+        else if (s.produced >= s.max_new) slot_done(b, "length");
+        return s.active;
+    };
     // one batch window over the active slots.  --batch-mtp: a slot's row is followed by its draft while the window
     // has room; the slot moves two tokens when the draft is the token after its row, else its recurrent states go
     // back to its first row's.  Then the MTP layer reads the rows each going slot kept, and drafts its next token.
@@ -710,7 +758,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::vector<int> rows;
         std::vector<int64_t> at;
         std::vector<strata::kernels::SamplerParams> sps;
-        const bool drafts = model.batch_drafts();
+        const bool drafts = slot_drafts;
         std::vector<size_t> go;
         for (size_t b = 0; b < bs.size(); ++b) {
             BSlot& s = bs[b];
@@ -743,18 +791,6 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         outs.resize(toks.size());
         if (!model.forward_slots(toks.data(), rows.data(), at.data(), sps.data(), (int) toks.size(), outs.data(), berr))
             return false;
-        // the slot reads its token and takes y after it; false when that ends it
-        auto take = [&](size_t b, int32_t y) {
-            BSlot& s = bs[b];
-            s.ids.push_back(s.x);
-            ++s.p;
-            s.x = y;
-            ++s.produced;
-            std::printf("BT %d %d\n", (int) b, (int) y);
-            if (std::find(eos.begin(), eos.end(), y) != eos.end()) slot_done(b, "stop");
-            else if (s.produced >= s.max_new) slot_done(b, "length");
-            return s.active;
-        };
         std::vector<int> mslot, mrow;
         std::vector<int32_t> mtok;
         std::vector<int64_t> mpos;
@@ -794,6 +830,51 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             size_t j = 0;
             for (size_t i = 0; i < mslot.size(); ++i)
                 if (i + 1 == mslot.size() || mslot[i + 1] != mslot[i]) bs[(size_t) mslot[i]].d = next_d[j++];
+        }
+        std::fflush(stdout);
+        return true;
+    };
+    // --batch-groups: one tick of the pipeline.  The next group (in turn) not in the stages enters the first with a row
+    // for each of its active slots, unless `drain` (a line is to be read: the live session needs the stages); the
+    // group the last stage finished takes its tokens.
+    std::vector<strata::core::PlainModel::GroupWindow> gw((size_t) groups);
+    std::vector<char> in_flight((size_t) groups, 0);
+    int next_group = 0;
+    const size_t gsize = bs.size() / (size_t) groups;
+    auto pipe_step = [&](std::string& berr, bool drain) -> bool {
+        strata::core::PlainModel::GroupWindow* enter = nullptr;
+        for (int i = 0; i < groups && enter == nullptr && !drain; ++i) {
+            const int g = (next_group + i) % groups;
+            if (in_flight[(size_t) g]) continue;
+            auto& w = gw[(size_t) g];
+            w.tokens.clear();
+            w.slot.clear();
+            w.pos.clear();
+            w.sp.clear();
+            w.group = g;
+            for (size_t b = (size_t) g * gsize; b < (size_t) (g + 1) * gsize; ++b) {
+                BSlot& s = bs[b];
+                if (!s.active) continue;
+                if (s.stop) { slot_done(b, "cancel"); continue; }
+                if (s.p + 1 >= ctx) { slot_done(b, "length"); continue; }
+                w.tokens.push_back(s.x);
+                w.slot.push_back((int) b);
+                w.pos.push_back(s.p);
+                w.sp.push_back(s.sp);
+            }
+            if (!w.tokens.empty()) {
+                enter = &w;
+                in_flight[(size_t) g] = 1;
+                next_group = (g + 1) % groups;
+            }
+        }
+        if (enter != nullptr || !model.pipe_empty()) {
+            strata::core::PlainModel::GroupWindow* done = nullptr;
+            if (!model.pipe_tick(enter, done, berr)) return false;
+            if (done != nullptr) {
+                for (size_t i = 0; i < done->slot.size(); ++i) take((size_t) done->slot[i], done->out[i]);
+                in_flight[(size_t) done->group] = 0;
+            }
         }
         std::fflush(stdout);
         return true;
@@ -870,13 +951,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::printf("INFO logit_bias=1 context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld spec=%d "
                     "vram_free_mib=%lld arena_mib=%lld spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld "
                     "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_elastic=%d batch_slots=%zu "
-                    "batch_groups=1 slot_cache=%d experts_ram=%s igc_workaround=%s grammar=%d cvec=%s engine=" STRATA_VERSION
+                    "batch_groups=%d slot_cache=%d experts_ram=%s igc_workaround=%s grammar=%d cvec=%s engine=" STRATA_VERSION
                     "\n",
                     (long long) ctx, opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16",
                     (long long) model.slots(), (long long) (model.tier_bytes() >> 20), model.drafts() + 1,
                     (long long) (free_b >> 20), (long long) (model.experts_ram_bytes() >> 20), opt.spec_min_p,
                     opt.spec_window.c_str(), (long long) (cache.budget >> 20), cache.slots,
-                    (long long) (cache.min_free >> 20), model.vram_elastic() ? 1 : 0, bs.size(), bs.empty() ? 0 : 1,
+                    (long long) (cache.min_free >> 20), model.vram_elastic() ? 1 : 0, bs.size(), groups, bs.empty() ? 0 : 1,
                     model.experts_ram(), igc.empty() ? "none" : igc.c_str(), strata::core::grammar_built() ? 1 : 0,
                     cvecs.summary.c_str());
     }
@@ -890,7 +971,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     for (;;) {
         if (batch_on()) {   // the slots decode while no line waits
             if (!try_line(line)) {
-                if (!batch_step(err)) {
+                if (!(groups > 1 ? pipe_step(err, false) : batch_step(err))) {
                     std::printf("ERR the batch window failed: %s\n", err.c_str());
                     std::fflush(stdout);
                     return 1;
@@ -900,6 +981,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         } else if (!next_line(line)) {
             break;
         }
+        // --batch-groups: the groups in the stages finish before the line is read (it may use the live session)
+        if (line.rfind("BSTOP ", 0) != 0 && line.rfind("BYIELD", 0) != 0)
+            while (!model.pipe_empty())
+                if (!pipe_step(err, true)) {
+                    std::printf("ERR the batch window failed: %s\n", err.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
         if (line == "QUIT") break;
         if (line.rfind("BSTOP ", 0) == 0) {
             const long b = std::strtol(line.c_str() + 6, nullptr, 10);
@@ -1775,20 +1864,20 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 next = out[0];
                 if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
             }
-            if (win || windows) {
-                for (int64_t p = read_to; ok && p < c.to;) {
-                    const int w = (int) std::min<int64_t>(opt.max_t, c.to - p);
-                    ok = model.forward(ids.data() + p, w, p, out.data(), wlog.empty() ? nullptr : wlog.data(), err);
-                    p += w;
-                    next = out[(size_t) w - 1];
-                    if (ok && !wlog.empty())   // the last row's logits: the first pick's
-                        std::copy(wlog.begin() + (std::ptrdiff_t) ((size_t) (w - 1) * (size_t) V),
-                                  wlog.begin() + (std::ptrdiff_t) ((size_t) w * (size_t) V), lrow.begin());
-                    if (ok && p < n && Clock::now() - told >= std::chrono::seconds(1)) {   // a window is a few tokens
-                        pp(p);
-                        told = Clock::now();
-                    }
-                }
+            if (win || windows) {   // (--pipeline-windows on a layer split: the windows pipelined over the stages)
+                const int64_t from = read_to;
+                ok = model.forward_run(ids.data() + from, c.to - from, from, out.data(),
+                                       wlog.empty() ? nullptr : wlog.data(), err, [&](int64_t read) {
+                                           if (from + read < n && Clock::now() - told >= std::chrono::seconds(1)) {
+                                               pp(from + read);   // a window is a few tokens
+                                               told = Clock::now();
+                                           }
+                                       });
+                const int w = (int) ((c.to - from - 1) % opt.max_t) + 1;   // the last window's rows
+                next = out[(size_t) w - 1];
+                if (ok && !wlog.empty())   // the last row's logits: the first pick's
+                    std::copy(wlog.begin() + (std::ptrdiff_t) ((size_t) (w - 1) * (size_t) V),
+                              wlog.begin() + (std::ptrdiff_t) ((size_t) w * (size_t) V), lrow.begin());
             }
             if (!ok) break;
             read_to = c.to;
@@ -1883,6 +1972,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 break;
             }
         }
+        // --pipeline-windows 2: a guessed window ahead of the reply is given back before the state is used again
+        if (ok && spec && !model.spec_end(err)) ok = false;
         if (!ok) {
             live.clear();
             checks.clear();
@@ -2041,6 +2132,16 @@ static void plain_usage(const std::string& arch) {
                  "                       virtual memory pages are 2 MiB or more)\n"
                  "  --batch N, --slots N --serve: decode up to N conversations together, a row each in a window\n"
                  "                       (docs/BATCHING.md; at most --max-t, as many as half the free VRAM holds)\n"
+                 "  --expert-cache-device1 N (2, 3)  N more experts on a helper GPU (the first ones no stage runs on),\n"
+                 "                       which computes the rows routed to them instead of the CPU\n"
+                 "  --expert-cache-remote-placement stripe|layer  the helpers' experts dealt out in turn (default), or\n"
+                 "                       each layer's to one helper\n"
+                 "  --pipeline-windows N  with a layer split: 1 (the default there), the windows a prompt is read\n"
+                 "                       through pipelined over the stages; 2 (two stages, the MTP layer) the decode\n"
+                 "                       too, the first stage on a guess of the next window; 0 serial\n"
+                 "  --batch-groups G|auto  with a layer split: the --batch slots in G groups pipelined through the\n"
+                 "                       stages, each on another group at once (auto, the default there: the most\n"
+                 "                       groups, one a GPU at most, that divide the slots)\n"
                  "  --batch-mtp, --no-batch-mtp  with the MTP layer, each slot also checks the layer's draft in a\n"
                  "                       window where it has room, two tokens when it holds (default on)\n"
                  "  --prompt-cache N     --serve, a model with a recurrent state: keep N checkpoints of a conversation\n"
@@ -2283,6 +2384,15 @@ int plain_main(int argc, char** argv) {
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
         }
+        else if (a == "--expert-cache-device1" || a == "--expert-cache-device2" || a == "--expert-cache-device3")
+            opt.expert_cache_remote[(size_t) (a.back() - '1')] = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10));
+        else if (a == "--expert-cache-remote-placement") opt.expert_cache_remote_placement = next(a.c_str());
+        else if (a == "--pipeline-windows")
+            opt.pipeline_windows = std::max(0, (int) std::strtol(next("--pipeline-windows"), nullptr, 10));
+        else if (a == "--batch-groups") {
+            const std::string v = next("--batch-groups");
+            opt.batch_groups = v == "auto" ? -1 : std::max(1, (int) std::strtol(v.c_str(), nullptr, 10));
+        }
         else if (a == "--batch-mtp") opt.batch_mtp = true;
         else if (a == "--no-batch-mtp") opt.batch_mtp = false;
         else if (a == "--coupled-draft") opt.coupled_draft = true;
@@ -2379,10 +2489,6 @@ int plain_main(int argc, char** argv) {
                 case OptionScope::qwen38_only:
                     std::fprintf(stderr, "strata (%s): %s is Qwen3.8-Flash-Next's (qwen4exp) only: this model has no "
                                          "such part\n", arch.c_str(), a.c_str());
-                    break;
-                case OptionScope::not_yet:
-                    std::fprintf(stderr, "strata (%s): %s is not available for this model yet (--help lists what is)\n",
-                                 arch.c_str(), a.c_str());
                     break;
                 case OptionScope::unknown:
                     std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
