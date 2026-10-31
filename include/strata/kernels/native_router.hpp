@@ -32,11 +32,13 @@ void native_router_top10_publish(const float* logits, int32_t* ids, float* weigh
 /// STRATA_ROUTE_RESIDENT (upstream 5df35dcb): swap non-resident tail-rank experts for resident ones within `margin`
 /// logits (see router.cpp).  `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident
 /// before, non-resident after.
-/// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): top-10 per token over `logits` (n_tok x n_expert)
-/// where a resident expert (`res_layer[e] >= 0`) gets `lambda` added to its logit for the SELECTION; the weights are the
-/// router's own probabilities (softmax over the 512 unbiased logits) renormalised over the 10 picked.
-void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
-                       int n_tok, void* stream, int n_expert = 512);
+/// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): edits the router's top 10 per token
+/// (`ids`/`weights`, n_tok x 10, over `logits` n_tok x n_expert) towards the experts in VRAM (`res_layer[e] >= 0`): a
+/// non-resident expert from the lowest rank up gives way to the best resident one whose logit + lambda beats it (the
+/// set upstream's biased top 10 picks); weights renormalised over the new 10.  `lambda_d` is a device float read by the kernel (0: no change, the router's bits).  `stats` is nullptr or 4
+/// device uint64: tokens, tokens with a swap, swaps, dropped probability x 1e6 (router.cpp).
+void route_prior_top10(const float* logits, const int32_t* res_layer, const float* lambda_d, int32_t* ids,
+                       float* weights, int n_tok, unsigned long long* stats, void* stream, int n_expert = 512);
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
                            float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream,
                            int n_expert = 512);

@@ -1353,6 +1353,8 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        if sampling.get("strata_route_prior") is False:   # the loop guard saw a loop: route exactly from here on
+            keys += " route_prior=0"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -4790,6 +4792,10 @@ class Service:
                         # ends where it ends (the request's own sampling after it); else the request's sampling
                         smp_call, n_call = guard.sampling(sampling, n, max_new - n) if guard is not None \
                             else (sampling, max_new - n)
+                        if guard is not None and guard.events:
+                            # after a loop the rest of the reply routes the experts exactly: the engine's
+                            # STRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
+                            smp_call = {**(smp_call or {}), "strata_route_prior": False}
                         n_pass = n
                         gen = self.engine.generate(prompt, n_call, smp_call, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, n_call, smp_call, cancel)

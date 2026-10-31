@@ -108,6 +108,65 @@ struct RouteResidentCfg {
         return p;
     }
 };
+// STRATA_ROUTE_PRIOR=<lambda> (upstream 2de9ae06, opt-in, changes the output; router.cpp).  STRATA_ROUTE_PRIOR_COUNT=picked
+// feeds the expert adaptation the edited picks, as upstream does; by default it counts the router's own, so the cache
+// follows the text and not the bias it causes (a loop that could lock a long session onto the same experts).
+struct RoutePriorCfg {
+    float lambda = 0.0f;
+    bool count_router = true;
+    std::mutex mu;
+    std::map<int, unsigned long long*> blocks;   // one counter block per GPU, as RouteResidentCfg's
+    unsigned long long* stats_on(int dev);
+    static void report();
+};
+RoutePriorCfg& route_prior_cfg() {
+    static RoutePriorCfg c;
+    static const bool parsed = [] {
+        const auto num = [](const char* name, double dflt) {
+            const char* v = std::getenv(name);
+            return v != nullptr && *v != '\0' ? std::strtod(v, nullptr) : dflt;
+        };
+        c.lambda = (float) num("STRATA_ROUTE_PRIOR", 0.0);
+        const char* cnt = std::getenv("STRATA_ROUTE_PRIOR_COUNT");
+        c.count_router = cnt == nullptr || std::string(cnt) != "picked";
+        return true;
+    }();
+    (void) parsed;
+    return c;
+}
+unsigned long long* RoutePriorCfg::stats_on(int dev) {
+    if (lambda <= 0.0f || dev < 0) return nullptr;
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = blocks.find(dev);
+    if (it != blocks.end()) return it->second;
+    unsigned long long* p = nullptr;
+    {
+        const OnDevice on(dev);
+        if (!strata::gpu::alloc_device(&p, 4 * sizeof(unsigned long long)) ||
+            !strata::gpu::memset(p, 0, 4 * sizeof(unsigned long long))) {
+            if (p != nullptr) strata::gpu::free(p);
+            p = nullptr;
+        }
+    }
+    if (blocks.empty()) std::atexit(report);
+    blocks[dev] = p;
+    return p;
+}
+void RoutePriorCfg::report() {
+    RoutePriorCfg& c = route_prior_cfg();
+    for (const auto& kv : c.blocks) {
+        if (kv.second == nullptr) continue;
+        unsigned long long h[4] = {};
+        const OnDevice on(kv.first);
+        if (!strata::gpu::device_sync() || !strata::gpu::copy(h, kv.second, sizeof(h))) continue;
+        const std::string who = c.blocks.size() > 1 ? " (GPU " + std::to_string(kv.first) + ")" : "";
+        std::fprintf(stderr, "route-prior%s: lambda=%g count=%s: token-layers=%llu with swaps=%llu (%.1f%%) swaps=%llu, "
+                             "dropped router probability %.3f%% a token-layer\n",
+                     who.c_str(), c.lambda, c.count_router ? "router" : "picked", h[0], h[1],
+                     h[0] ? 100.0 * (double) h[1] / (double) h[0] : 0.0, h[2],
+                     h[0] ? 100.0 * (double) h[3] * 1e-6 / (double) h[0] : 0.0);
+    }
+}
 RouteResidentCfg& route_resident_cfg() {
     static RouteResidentCfg c;
     static const bool parsed = [] {
@@ -367,6 +426,7 @@ Verifier::~Verifier() {
     if (h_commitd_) strata::gpu::free(h_commitd_);
     if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
     if (allowed_device_) strata::gpu::free(allowed_device_);
+    if (rp_lambda_d_) strata::gpu::free(rp_lambda_d_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -432,12 +492,29 @@ bool Verifier::set_allowed(const uint32_t* rows, int T, std::string& err) {
     return true;
 }
 
+bool Verifier::set_route_prior(bool on, std::string& err) {
+    if (next_ && !next_->set_route_prior(on, err)) return false;
+    if (rp_lambda_d_ == nullptr || on == rp_on_) return true;
+    const float v = on ? route_prior_cfg().lambda : 0.0f;
+    const OnDevice on_device(device_);
+    if (!strata::gpu::copy(rp_lambda_d_, &v, sizeof(float))) { err = "cannot set the route prior"; return false; }
+    rp_on_ = on;
+    return true;
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     device_ = current_device();   // a layer split's stage on another GPU: init runs on it (OnDevice)
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    rp_stats_ = route_prior_cfg().stats_on(device_);
+    if (route_prior_cfg().lambda > 0.0f && rp_lambda_d_ == nullptr) {   // the kernel reads lambda here (set_route_prior)
+        if (!strata::gpu::alloc_device(&rp_lambda_d_, sizeof(float)) ||
+            !strata::gpu::copy(rp_lambda_d_, &route_prior_cfg().lambda, sizeof(float))) {
+            err = "cannot allocate the route prior's lambda"; return false;
+        }
+    }
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -1265,7 +1342,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         bool qdedup = false;    // the experts' q8_1 image of the input was made before the shared expert
         // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): the top-10 picked again with a
         // logit bonus for the resident experts; the weights stay the router's (router.cpp)
-        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::strtod(v, nullptr) : 0.0f; }();
+        const float route_prior = rp_lambda_d_ != nullptr ? route_prior_cfg().lambda : 0.0f;
         // the top-10 and the doorbell in one launch where nothing changes the routing between them (48 nodes fewer a
         // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
         static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
@@ -1295,10 +1372,16 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (route_prior > 0.0f && native_router_takes((int) NE, (int) K) && hits_.d_res != nullptr) {
+        const bool prior_on = route_prior > 0.0f && native_router_takes((int) NE, (int) K) && hits_.d_res != nullptr;
+        // the expert adaptation counts the router's own picks, taken before the prior edits them (RoutePriorCfg)
+        const bool count_before = prior_on && route_prior_cfg().count_router && route_rec_ && !rt_dump_ && !batch_rec_;
+        if (count_before)
+            copy_i32_from_mapped(m_route_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K, ids_ + tb * K,
+                                 (int64_t) n * K, cs);
+        if (prior_on) {
             try {
-                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs,
-                                  (int) NE);
+                route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, rp_lambda_d_, ids_ + tb * K, w_ + tb * K, n,
+                                  rp_stats_, cs, (int) NE);
             } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
         }
         if (route_resident_cfg().margin > 0.0f && native_router_takes((int) NE, (int) K) && hits_.d_res != nullptr) {
@@ -1324,7 +1407,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         if (!recording_res_ && !published)   // the resident graph asks the host nothing
             doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
                              m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
-        if ((route_rec_ || rt_dump_) && !batch_rec_)   // add_routing's ids: every layer's, also where the host is not asked
+        if ((route_rec_ || rt_dump_) && !batch_rec_ && !count_before)   // add_routing's ids: every layer's, also where the host is not asked
             copy_i32_from_mapped(m_route_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K, ids_ + tb * K,
                                  (int64_t) n * K, cs);
         if (rt_dump_ && !batch_rec_)   // STRATA_ROUTE_DUMP: the weights beside them
@@ -3390,6 +3473,7 @@ bool InProcessStage::set_logit_bias(const std::vector<float>& bias, std::string&
 bool InProcessStage::set_allowed(const uint32_t* rows, int T, std::string& err) {
     return next_->set_allowed(rows, T, err);
 }
+bool InProcessStage::set_route_prior(bool on, std::string& err) { return next_->set_route_prior(on, err); }
 void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
 bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {
     return next_->read_logits(rows, host, err);

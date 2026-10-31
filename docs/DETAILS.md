@@ -97,13 +97,30 @@ Measured (IQ3_XXS):
 | HumanEval (82) and arithmetic tasks (30) passed, off / on | 75, 25 / 76, 24 | 77, 25 / 79, 25 | 77, 24 / 77, 24 |
 | Serve decode, off to on (1K and 32K, greedy and temperature 0.7) | -1.0 to +12.7% | +7.5 to +24.5% | +6.3 to +55.4% |
 
+On a GPU whose cache is small `STRATA_ROUTE_TAIL_SKIP=4` (opt-in) decodes faster still; its answers drift 3 to 4 times
+as far as rank 7's, so it is not the default. Rank 4 against rank 7 (IQ3_XXS, the speeds two rounds each):
+
+| | B70 (VRAM limited to 12 GiB) | RTX 4070 | RX 9060 XT |
+| --- | --- | --- | --- |
+| Everyday use (context 262144), output | +13 to +26% | +14 to +21% | +14 to +42% |
+| Serve decode at 32K (greedy and temperature 0.7) | +6 to +11% | greedy +34%, temperature 0.7 -9% from the texts' lengths | (its cache holds 25% at 32K: rank 7) |
+| Mean KL (rank 7 to 4) | 0.0072 to 0.0293 | 0.0066 to 0.0226 | 0.0051 to 0.0187 |
+| Top-1 agreement (rank 7 to 4) | 97.6% to 95.2% | 97.3% to 95.5% | 98.1% to 96.7% |
+
+On the RTX 4070 (its cache holds 15%) long agent turns (23 turns from 2.5K to 100K tokens, temperature 1) decode at
+80.7 tok/s instead of 67.3 at rank 7, and half of HumanEval (82) and the arithmetic tasks (30) pass 103 at rank 7 and
+102 at 4.
+
 `STRATA_ROUTE_RESIDENT=<margin>` (upstream 5df35dcb, experimental, opt-in) swaps a verify window's missed experts at
 ranks 6-9 of the top 10 for resident ones whose logit is within the margin (`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`).
-`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06) picks the top 10 again with lambda added to the resident
-experts' logits (the weights stay the router's).
-It is off by default. On a GPU whose expert cache is small `STRATA_ROUTE_PRIOR=1.5` makes the serve path decode 20-80%
-faster, but in long agent sessions it repeats itself and its results are weaker (upstream #4402); on a GPU that holds
-more of the experts it is no faster or slower. Both change the answers.
+`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06) replaces the router's missed experts in its top 10 with resident
+ones whose logit plus lambda beats theirs (the weights stay the router's).
+It is off by default. Unlike the tail skip, which drops a missed expert unread, it adds experts the router did not pick,
+and the text suffers: on the RTX 4070 (its cache holds 15%) long agent turns decode 28% faster, but the NLL against the
+exact routing rises 8.2%, two tool names came out broken, and 99 of the 112 tasks pass (103 without it; upstream's #4402 also finds
+repetition and weaker results in long agent sessions).
+When it is on, the expert adaptation still counts the router's own picks (`STRATA_ROUTE_PRIOR_COUNT=picked`: the
+replaced ones), and once serve's loop guard finds a loop the rest of that reply does without it. Both change the answers.
 
 ### Small cards and GPUs without XMX
 

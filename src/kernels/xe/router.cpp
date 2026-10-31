@@ -300,14 +300,21 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
 }
 
 // STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): cache-conditioned routing, after "Mixture
-// of Cache-Conditional Experts" (arXiv 2412.00099) without training.  When a token's 10 experts are picked, an expert
-// already in VRAM gets a `lambda` bonus on its logit: the SELECTION uses the biased logits, the WEIGHTS stay the
-// router's (softmax over the 512 unbiased logits) renormalised over the 10 picked.  One sub-group per token, 16 values
-// a lane (8 for 256 experts), as the native router.
+// of Cache-Conditional Experts" (arXiv 2412.00099) without training.  upstream picks the top 10 again with `lambda`
+// added to the logit of every expert already in VRAM.  Here the router's exact top 10 (ids/weights, already written) is
+// edited instead: from the lowest rank up, a non-resident expert is replaced by the best resident one not yet picked
+// while that one's logit + lambda beats it - the same set upstream's biased top 10 picks.  The weights are the router's
+// probabilities over the new 10.  A token without a swap keeps the router's bits, so lambda 0 (the device value, set per
+// request) is the exact routing.  Bounding the swaps did not make the prior harmless (RTX 4070, 2026-10-30, teacher-
+// forced against the exact routing): the first 4 ranks kept, NLL +4.2% (unbounded +8.2%) at nearly the same speed; the
+// dropped probability capped at 2%, NLL +1.2% but the speed gone (+3%); lambda scaled by the router's entropy over its
+// 10 changed nothing, the 10's weights are nearly flat.  Skipping missed experts instead (STRATA_ROUTE_TAIL_SKIP) keeps
+// the text.
+// stats (device, 4 x uint64, or nullptr): tokens, tokens with a swap, swaps, the dropped probability x 1e6.
 namespace {
 template <int NPL>
-void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_layer, float lambda, int32_t* ids,
-                        float* weights, int n_tok) {
+void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_layer, const float* lambda_d,
+                        int32_t* ids, float* weights, int n_tok, unsigned long long* stats) {
     q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it)
                    [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
@@ -316,44 +323,79 @@ void route_prior_launch(sycl::queue& q, const float* logits, const int32_t* res_
         int32_t* id = ids + tok * 10;
         float* w = weights + tok * 10;
         const int lane = (int) sg.get_local_linear_id();
-        float p[NPL], s[NPL];
+        const float lambda = *lambda_d;
+        if (!(lambda > 0.0f)) return;
+        int idl[10];
+        for (int r = 0; r < 10; ++r) idl[r] = id[r];
+        float l[NPL];
+        bool cand[NPL];   // resident and not among the 10
         float mx = -INFINITY;
-        for (int i = 0; i < NPL; ++i) { p[i] = lg[lane + 32 * i]; mx = sycl::fmax(mx, p[i]); }
-        for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
         for (int i = 0; i < NPL; ++i) {
             const int e = lane + 32 * i;
-            s[i] = p[i] + (res_layer[e] >= 0 ? lambda : 0.0f);   // the selection score
-            p[i] = sycl::exp(p[i] - mx);                         // the router's probability (unnormalised)
+            l[i] = lg[e];
+            mx = sycl::fmax(mx, l[i]);
+            bool picked = false;
+            for (int r = 0; r < 10; ++r) picked |= idl[r] == e;
+            cand[i] = !picked && res_layer[e] >= 0;
         }
-        float sel_p = 0.0f, sel_sum = 0.0f;
-        for (int rank = 0; rank < 10; ++rank) {
-            float best = -FLT_MAX, bp = 0.0f;
+        for (int m = 16; m; m >>= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, m));
+        float z = 0.0f;
+        for (int i = 0; i < NPL; ++i) z += sycl::exp(l[i] - mx);
+        z = sycl::reduce_over_group(sg, z, sycl::plus<float>());
+        int swaps = 0;
+        float dropped = 0.0f;
+        for (int r = 9; r >= 0; --r) {
+            const int e = idl[r];
+            if (res_layer[e] >= 0) continue;
+            const float le = lg[e];
+            float best = -FLT_MAX;
             int be = 1 << 30;
             for (int i = 0; i < NPL; ++i)
-                if (s[i] > best) { best = s[i]; be = lane + 32 * i; bp = p[i]; }
+                if (cand[i] && l[i] > best) { best = l[i]; be = lane + 32 * i; }
             for (int m = 16; m; m >>= 1) {
                 const float ob = sycl::permute_group_by_xor(sg, best, m);
                 const int oe = sycl::permute_group_by_xor(sg, be, m);
-                const float op = sycl::permute_group_by_xor(sg, bp, m);
-                if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
+                if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; }
             }
-            if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
-            if (lane == rank) { id[rank] = be; sel_p = bp; }
-            sel_sum += bp;                                       // the same on every lane
+            // the next non-resident one up has a larger logit and the next resident candidate a smaller one: stop
+            if (be >= (1 << 30) || !(best + lambda > le)) break;
+            dropped += sycl::exp(le - mx) / z;
+            idl[r] = be;
+            if ((be & 31) == lane) cand[be >> 5] = false;
+            ++swaps;
         }
-        if (lane < 10) w[lane] = sel_p / sycl::fmax(sel_sum, 1e-30f);
+        if (stats != nullptr && lane == 0) {
+            sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::global_space> s0(stats[0]), s1(stats[1]), s2(stats[2]), s3(stats[3]);
+            s0.fetch_add(1ull);
+            if (swaps > 0) {
+                s1.fetch_add(1ull);
+                s2.fetch_add((unsigned long long) swaps);
+                s3.fetch_add((unsigned long long) (dropped * 1e6f));
+            }
+        }
+        if (swaps == 0) return;
+        float sp = 0.0f;
+        for (int r = 0; r < 10; ++r) sp += sycl::exp(lg[idl[r]] - mx);
+        if (lane < 10) {
+            int e = idl[0];
+            for (int r = 1; r < 10; ++r) if (lane == r) e = idl[r];
+            id[lane] = e;
+            w[lane] = sycl::exp(lg[e] - mx) / sycl::fmax(sp, 1e-30f);
+        }
     });
 }
 }  // namespace
 
-void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
-                       int n_tok, void* stream, int n_expert) {
+void route_prior_top10(const float* logits, const int32_t* res_layer, const float* lambda_d, int32_t* ids,
+                       float* weights, int n_tok, unsigned long long* stats, void* stream, int n_expert) {
     if (n_tok <= 0) return;
-    if (!stream || res_layer == nullptr) throw std::invalid_argument("route-prior requires a stream and the residency row");
+    if (!stream || res_layer == nullptr || lambda_d == nullptr)
+        throw std::invalid_argument("route-prior requires a stream, the residency row and lambda");
     require_shape(n_expert, "route-prior");
     sycl::queue& q = queue_for(stream, true);
-    if (n_expert == 512) route_prior_launch<16>(q, logits, res_layer, lambda, ids, weights, n_tok);
-    else route_prior_launch<8>(q, logits, res_layer, lambda, ids, weights, n_tok);
+    if (n_expert == 512) route_prior_launch<16>(q, logits, res_layer, lambda_d, ids, weights, n_tok, stats);
+    else route_prior_launch<8>(q, logits, res_layer, lambda_d, ids, weights, n_tok, stats);
 }
 
 // STRATA_ROUTE_RESIDENT (upstream 5df35dcb, EXPERIMENTAL, opt-in, changes the output): residency-biased routing for

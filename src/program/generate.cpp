@@ -5572,6 +5572,12 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        // STRATA_ROUTE_PRIOR swaps missed experts for ones the router did not pick (verify.cpp, router.cpp): RTX 4070, IQ3_XXS,
+        // 15% cached, 2026-10-30: teacher-forced NLL +8.2%, two broken tool names in 23 agent turns
+        if (const char* rp = std::getenv("STRATA_ROUTE_PRIOR"); rp != nullptr && std::strtod(rp, nullptr) > 0.0)
+            std::fprintf(stderr, "strata generate: info: STRATA_ROUTE_PRIOR=%s is on: the answers' quality drops (it uses "
+                                 "experts the router did not pick; in long agent sessions it can break tool calls); "
+                                 "STRATA_ROUTE_PRIOR=0 turns it off\n", rp);
         // Residency-biased routing (STRATA_ROUTE_PRIOR) is not turned on here: XeStrata set 1.5 by itself on one GPU whose
         // cache held less than 20% of the expert pairs (serve decode +6..+80% there), and upstream took its own default back
         // (20a63cf0f, #4402: repetition loops and weaker results in long agent sessions, 4.5 of 10 agent tasks on against 5.6
@@ -8266,6 +8272,12 @@ int main(int argc, char** argv) {
                                      "%d or lower contributes zero to it (answers differ slightly); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
                              tse == nullptr ? " (default)" : "", strata::core::tail_skip_rank());
+            // ranks below the default skip experts with larger weights: the answers drift further (rank 4 against 7,
+            // IQ3_XXS, 2026-10-31: KL 0.0226 against 0.0066 on an RTX 4070, 0.0293 against 0.0072 on a B70 at 12 GiB)
+            if (strata::core::tail_skip_rank() > 0 && strata::core::tail_skip_rank() < 7 && !all_experts_resident)
+                std::fprintf(stderr, "strata serve: info: STRATA_ROUTE_TAIL_SKIP=%d is below the default 7: the answers' "
+                                     "quality drops (at rank 4 they drift 3 to 4 times as far as at 7)\n",
+                             strata::core::tail_skip_rank());
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         // #477 --expert-profile-save: what the adaptive tier learned, kept across restarts (opt-in; off: `heat` stays
@@ -10415,6 +10427,8 @@ int main(int argc, char** argv) {
             // allowed=a,b,c: the LP line names only these ids after the chosen one (the server renormalises over them;
             // OpenAI's allowed_token_ids, upstream 9ea044962).  Empty: the K most likely tokens, as before
             std::vector<int32_t> req_allowed;
+            // route_prior=0|1: STRATA_ROUTE_PRIOR for this request (serve turns it off after a loop; absent: on as started)
+            bool req_route_prior = true;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10439,6 +10453,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_last_n") req_penalty_last_n = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(tok.c_str() + eq + 1, nullptr, 10), -1L, 20L);
                     else if (key == "grammar") req_grammar = tok.substr(eq + 1);
+                    else if (key == "route_prior") req_route_prior = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "allowed") {   // allowed=a,b,c: with logprobs, these ids only (upstream 9ea044962, #3200)
                         req_allowed.clear();
                         for (const char* c = tok.c_str() + eq + 1; *c != '\0';) {
@@ -11514,7 +11529,8 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err)) ||
-                !ver.set_allowed(nullptr, 0, err)) {   // a grammar's masks are set window by window
+                !ver.set_allowed(nullptr, 0, err) ||   // a grammar's masks are set window by window
+                !ver.set_route_prior(req_route_prior, err) || (pipe && !ver_b.set_route_prior(req_route_prior, err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
