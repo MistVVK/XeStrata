@@ -821,6 +821,7 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
             if (!st->prompt_chunks(tokens, n, pos, out, logits, err, c0, c0 + longest, hand)) { ok = false; break; }
             hand = st->hand_host_;
         }
+        if (ok && prompt_progress_) prompt_progress_(std::min(n, c0 + longest), n);
     }
     std::string err2;
     for (PlainModel* st : c) {
@@ -1101,9 +1102,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched = prompt_attn_on && !opt_.kv_int8 &&   // prompt_attn reads FP16 pools
-                                         k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, pa,
-                                                        T, qs, P.attn, cs);
+                    const bool batched = prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs);
                     for (int64_t t = 0; !batched && t < T; t += nq_max) {
                         const int nq = (int) std::min<int64_t>(nq_max, T - t);
                         k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
@@ -1193,6 +1192,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
                     for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
+            // the whole prompt on one GPU (a layer split's chunks are told by prompt_split, through every stage)
+            if (prompt_progress_ && c_begin == 0 && c_end >= n) prompt_progress_(c0 + T, n);
         }
     } catch (const std::exception& e) {
         err = std::string("plain prompt: ") + e.what();

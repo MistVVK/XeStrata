@@ -890,18 +890,34 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         bool ok = true;
         int32_t next = -1;
         bool windows = opt.prompt_chunk <= 0;
+        // PP <position reached> <prompt tokens> <ms> <fresh tokens/s>, as Qwen3.8-Flash-Next's engine prints it: the
+        // server's progress, and its sign that a long prompt is still being read (a silent engine is ended after
+        // engine_silence_s: a 70K-token prompt of llm-jp-4.1 was, at 955 s)
+        auto pp = [&](int64_t reached) {
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) reached, (long long) n, ms,
+                        ms > 0.0 ? 1000.0 * (double) (reached - resume) / ms : 0.0);
+            std::fflush(stdout);
+        };
         if (geni) model.set_embeddings(&row_ptr);   // the pictures' rows for the prompt's cells
         if (!windows) {
+            model.set_prompt_progress([&](int64_t read, int64_t) { pp(resume + read); });
             ok = model.prompt(ids.data() + resume, n - resume, resume, out.data(), nullptr, err);
+            model.set_prompt_progress(nullptr);
             next = out[0];
             if (!ok && err.empty()) ok = windows = true;   // no room for the chunks: through the windows
         }
         if (windows) {
+            auto told = Clock::now();
             for (int64_t p = resume; ok && p < n;) {
                 const int w = (int) std::min<int64_t>(opt.max_t, n - p);
                 ok = model.forward(ids.data() + p, w, p, out.data(), nullptr, err);
                 p += w;
                 next = out[(size_t) w - 1];
+                if (ok && p < n && Clock::now() - told >= std::chrono::seconds(1)) {   // a window is a few tokens
+                    pp(p);
+                    told = Clock::now();
+                }
             }
         }
         model.set_embeddings(nullptr);

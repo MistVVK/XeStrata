@@ -5,12 +5,26 @@
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
+#include "mma_gemm.hpp"
+#include "strata/kernels/xmx_gemm.hpp"
+#include "strata/core/per_device.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -155,7 +169,7 @@ struct Kernel {
 #define STRATA_PA_WMMA 0
 #endif
 
-template <int HD, int G, int BQ>
+template <int HD, int G, int BQ, bool I8 = false>   // I8: INT8 pools, as JmKernel takes them
 struct WmmaKernel {
     static constexpr int BK = 32, R = BQ * G, W = R / 16, DT = HD / 16, CT = BK / 16;
     static constexpr int KS = HD + 8, VS = BK + 8, PS = BK + 8;   // local row strides (halves), 16-byte multiples
@@ -171,6 +185,23 @@ struct WmmaKernel {
     int n_head, n_kv, page_size;
     float scale;
     sycl::local_accessor<uint16_t, 1> ks, vs, ps;
+    const int8_t* kq = nullptr;     // I8: the codes and their FP16 scales per 64 values (kp, vp unused)
+    const int8_t* vq = nullptr;
+    const uint16_t* ksc = nullptr;
+    const uint16_t* vsc = nullptr;
+
+    // 8 values of a pool row from element dd on, as FP16 bits (JmKernel::row8)
+    h8 row8(const uint16_t* f16, const int8_t* codes, const uint16_t* scales, int64_t row, int dd) const {
+        if constexpr (!I8) {
+            return *reinterpret_cast<const h8*>(f16 + row * HD + dd);
+        } else {
+            const auto c = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(codes + row * HD + dd);
+            const float sc = (float) sycl::bit_cast<sycl::half>(scales[row * (HD / 64) + dd / 64]);
+            h8 out;
+            for (int e = 0; e < 8; ++e) out[e] = sycl::bit_cast<uint16_t>((sycl::half) ((float) c[e] * sc));
+            return out;
+        }
+    }
 
     void operator()(sycl::nd_item<2> it) const {
 #if STRATA_PA_WMMA
@@ -231,8 +262,8 @@ struct WmmaKernel {
                 h8 kv(0), vv(0);
                 if (c < n_cells) {
                     const int64_t row = ((int64_t) table[c / page_size] * n_kv + h) * page_size + c % page_size;
-                    kv = *reinterpret_cast<const h8*>(kp + row * HD + dd);
-                    vv = *reinterpret_cast<const h8*>(vp + row * HD + dd);
+                    kv = row8(kp, kq, ksc, row, dd);
+                    vv = row8(vp, vq, vsc, row, dd);
                 }
                 *reinterpret_cast<h8*>(K + j * KS + dd) = kv;
                 for (int e = 0; e < 8; ++e) Vt[(dd + e) * VS + j] = vv[e];
@@ -292,17 +323,18 @@ struct WmmaKernel {
     }
 };
 
-template <int HD, int G, int BQ>
+template <int HD, int G, int BQ, bool I8 = false>
 void launch_wmma(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t* vp, const int32_t* table,
-                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn) {
-    using KT = WmmaKernel<HD, G, BQ>;
+                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn, const QsaAttnPools* i8 = nullptr) {
+    using KT = WmmaKernel<HD, G, BQ, I8>;
     const size_t blocks = (size_t) ((T + BQ - 1) / BQ), nt = (size_t) KT::W * 32;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint16_t, 1> ks(sycl::range<1>((size_t) KT::BK * KT::KS), h),
             vs(sycl::range<1>((size_t) HD * KT::VS), h), ps(sycl::range<1>((size_t) KT::W * 16 * KT::PS), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) s.n_head_kv, blocks * nt), sycl::range<2>(1, nt)),
                        KT{qv, kp, vp, table, attn, pos0, T, (int) s.n_head, (int) s.n_head_kv, (int) s.page_size,
-                          1.0f / std::sqrt((float) HD), ks, vs, ps});
+                          1.0f / std::sqrt((float) HD), ks, vs, ps, i8 ? i8->k_q : nullptr, i8 ? i8->v_q : nullptr,
+                          i8 ? i8->k_scale : nullptr, i8 ? i8->v_scale : nullptr});
     });
 }
 
@@ -310,7 +342,7 @@ void launch_wmma(sycl::queue& q, const float* qv, const uint16_t* kp, const uint
 // probabilities within the local memory
 template <int HD, int G, int BQ>
 bool wmma_fits(const sycl::device& d) {
-    using KT = WmmaKernel<HD, G, BQ>;
+    using KT = WmmaKernel<HD, G, BQ>;   // (its INT8 form takes the same work-group and local memory)
     const size_t bytes = (size_t) (KT::BK * KT::KS + HD * KT::VS + KT::W * 16 * KT::PS) * sizeof(uint16_t);
     return (size_t) KT::W * 32 <= d.get_info<sycl::info::device::max_work_group_size>() &&
            bytes <= d.get_info<sycl::info::device::local_mem_size>();
@@ -329,6 +361,419 @@ void launch(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t*
                        KT{qv, kp, vp, table, attn, pos0, T, (int) s.n_head, (int) s.n_head_kv, (int) s.page_size,
                           1.0f / std::sqrt((float) HD), qs, sc, mrow, lrow, arow, ks, vs});
     });
+}
+
+
+// The matrix engines through joint_matrix: Intel's XMX (FP16 8 x 16 x 16 on 16 lanes, the large register file) and
+// any GPU whose joint_matrix runs FP16 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores from sm_70 on; RDNA3 and RDNA4
+// keep WmmaKernel).  The FMA kernel above ran the prompt's attention at about 3 TFLOP/s on a B70: 63 to 96% of a 32K
+// prompt of the plain models (llm-jp-4.1: 274 of 286 s), the share growing with the length.  The scheme is
+// WmmaKernel's with the accumulators' layout unknown, as qsa_prompt_attn's portable kernel takes it: each sub-group
+// owns TM rows (query, head) of the work-group's R = NSG x TM, the BQ = R / G queries' K and V go through local memory
+// BK cells at a step and are read once for all of them; Q . K^T lands in the sub-group's local rows, where its lanes
+// keep the rows' online softmax in FP32 and write the probabilities in FP16; P . V starts from zero each step and goes
+// through local memory into FP32 registers, scaled by the softmax's correction there (the output is never accumulated
+// in the matrix engines, which align and cut the addends).  Q and the probabilities enter in FP16, as WmmaKernel's at
+// head_dim 256.  INT8 pools (--kv int8: codes with an FP16 scale per 64 values) are turned into FP16 values as K and
+// V come in, so they take this kernel as FP16 ones do; the FMA kernel never read them (the decode kernel did, every
+// cell again for each query).
+#if defined(__SYCL_DEVICE_ONLY__) && (defined(__AMDGCN__) || (defined(__NVPTX__) && STRATA_NV_ARCH < 700))
+#define STRATA_PA_JM_PORTABLE 0
+#else
+#define STRATA_PA_JM_PORTABLE 1
+#endif
+// The body exists only in a compile with joint_matrix: AMD's device compile has it on CDNA alone, and B's FP16 16 x 16
+// tiles do not depend on the kernel's template, so even an uncalled body would instantiate them there
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+#define STRATA_PA_JM_BODY 0
+#else
+#define STRATA_PA_JM_BODY 1
+#endif
+
+namespace mx = sycl::ext::oneapi::experimental::matrix;
+namespace syclex = sycl::ext::oneapi::experimental;
+
+template <typename A>
+inline auto lptr(const A& a, size_t off) {   // a local accessor's element `off`, as joint_matrix loads and stores
+    return a.template get_multi_ptr<sycl::access::decorated::no>() + off;
+}
+
+template <int HD, int TM, int SG, int NSG, int BK, bool I8>
+struct JmKernel {
+    static constexpr int R = NSG * TM, DT = HD / 16, CT = BK / 16, EPL = TM * 16 / SG, WG = NSG * SG;
+    static constexpr int QS = HD + 8, KS = HD + 8, SS = BK + 4, PS = BK + 8;   // local row strides
+    static constexpr float TAU = 8.0f;   // the lazy rescaling's margin (log2 units)
+    static_assert(HD % 64 == 0 && BK % 16 == 0 && SG % 16 == 0 && (TM * 16) % SG == 0, "whole tiles");
+    using half = sycl::half;
+    using h8 = sycl::vec<uint16_t, 8>;
+    const float* q;
+    QsaAttnPools pools;
+    float* attn;
+    int64_t pos0, T;
+    int G, BQ, n_head, n_kv, page_size;
+    float scale;
+    sycl::local_accessor<half, 1> qs, ks, vs, ps;   // Q [R][QS]; K, V [BK][KS]; P [NSG][TM][PS]
+    sycl::local_accessor<float, 1> ss, cs, as;      // S [NSG][TM][SS]; P.V's tile [NSG][TM][16]; correction [NSG][TM]
+
+    // 8 values of a pool row from element dd on, as FP16 bits: FP16 pools as they are, INT8 ones as code x scale
+    static h8 row8(const uint16_t* f16, const int8_t* codes, const uint16_t* scales, int64_t row, int dd) {
+        if constexpr (!I8) {
+            return *reinterpret_cast<const h8*>(f16 + row * HD + dd);
+        } else {
+            // the codes are exact in FP16 and so is their product with the FP16 scale before its one rounding: as
+            // (half) (code x scale in FP32), eight at a time
+            const auto c = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(codes + row * HD + dd);
+            const half sc = sycl::bit_cast<half>(scales[row * (HD / 64) + dd / 64]);
+            const sycl::vec<half, 8> v = c.template convert<half>() * sycl::vec<half, 8>(sc);
+            return v.template as<h8>();
+        }
+    }
+
+    // an empty body in a device compile without this form (Intel's 8-row tiles outside Intel's compiles; the 16-row
+    // ones on AMD and on NVIDIA before sm_70): the run-time checks (prompt_attn) never launch it there
+    void operator()(sycl::nd_item<2> it) const {
+#if STRATA_PA_JM_BODY
+        if constexpr (TM == 8) {
+#if STRATA_DEVICE_NOT_INTEL
+            (void) it;
+#else
+            body(it);
+#endif
+        } else {
+#if STRATA_PA_JM_PORTABLE
+            body(it);
+#else
+            (void) it;
+#endif
+        }
+#else
+        (void) it;
+#endif
+    }
+
+#if STRATA_PA_JM_BODY
+
+    void body(sycl::nd_item<2> it) const {
+        using MA = mx::joint_matrix<sycl::sub_group, half, mx::use::a, TM, 16, mx::layout::row_major>;
+        using MBc = mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::col_major>;
+        using MBr = mx::joint_matrix<sycl::sub_group, half, mx::use::b, 16, 16, mx::layout::row_major>;
+        using MC = mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, 16>;
+        constexpr float NEG = -std::numeric_limits<float>::infinity();
+        // Intel's 8 x 16 accumulator gives each lane one column, its element i in row i (Xe's DPAS layout, as
+        // qsa_prompt_attn takes it; prompt_attn_parity checks it): the output stays in the accumulators there and its
+        // rows are scaled by element order.  Elsewhere the layout is unknown and each step's P . V goes through local
+        // memory into registers
+        constexpr bool IN_ACC = TM == 8;
+        // and the scores stay in the accumulators too where the registers hold them beside the output: head_dim 128
+        // (at 256 the output's 16 tiles and the scores' spilled: 261 ms against 218 through local memory, B70, a
+        // 2,048-query chunk after 28K cells; at 128 they ran 187 ms against 315)
+        constexpr bool S_IN_ACC = IN_ACC && HD <= 128;
+        const auto grp = it.get_group();
+        const auto sg = it.get_sub_group();
+        const int t = (int) it.get_local_id(1), h = (int) it.get_group(0);
+        const int w = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int64_t qbase = (int64_t) it.get_group(1) * BQ;
+        half* Q = qs.template get_multi_ptr<sycl::access::decorated::no>().get();
+        half* K = ks.template get_multi_ptr<sycl::access::decorated::no>().get();
+        half* V = vs.template get_multi_ptr<sycl::access::decorated::no>().get();
+        half* P = ps.template get_multi_ptr<sycl::access::decorated::no>().get() + (size_t) w * TM * PS;
+        float* S = ss.template get_multi_ptr<sycl::access::decorated::no>().get() + (size_t) w * TM * SS;
+        float* C = cs.template get_multi_ptr<sycl::access::decorated::no>().get() + (size_t) w * TM * 16;
+        const int rows = BQ * G;   // rows past them (and queries past T) are zero and written nowhere
+        // the scores in log2 units: exp2 in the softmax
+        const float qscale = scale * 1.4426950408889634f;
+        for (int i = t; i < R * HD; i += WG) {
+            const int r = i / HD, dd = i - r * HD;
+            const int64_t tq = qbase + r / G;
+            const float v = r < rows && tq < T ? q[(tq * n_head + (int64_t) h * G + r % G) * HD + dd] * qscale : 0.0f;
+            Q[r * QS + dd] = (half) v;
+        }
+        float m[TM], l[TM], f[TM];
+        for (int r = 0; r < TM; ++r) {
+            m[r] = NEG;
+            l[r] = 0.0f;
+        }
+        MC oa[IN_ACC ? DT : 1];
+        float o[IN_ACC ? 1 : DT][IN_ACC ? 1 : EPL];
+        if constexpr (IN_ACC) {
+            for (int d = 0; d < DT; ++d) mx::joint_matrix_fill(sg, oa[d], 0.0f);
+        } else {
+            for (int d = 0; d < DT; ++d)
+                for (int e = 0; e < EPL; ++e) o[d][e] = 0.0f;
+        }
+        const int64_t n_cells = pos0 + sycl::min<int64_t>(qbase + BQ, T);   // through the block's last query
+        const int r0 = w * TM;   // the sub-group's first row
+        for (int64_t c0 = 0; c0 < n_cells; c0 += BK) {
+            sycl::group_barrier(grp);   // the last step's K and V are read
+            for (int i = t; i < BK * HD / 8; i += WG) {   // K and V as [cell][dim]
+                const int j = i / (HD / 8), dd = (i - j * (HD / 8)) * 8;
+                const int64_t c = c0 + j;
+                h8 kv(0), vv(0);
+                if (c < n_cells) {
+                    const int64_t row = ((int64_t) pools.page_table[c / page_size] * n_kv + h) * page_size + c % page_size;
+                    kv = row8(pools.k_pool, pools.k_q, pools.k_scale, row, dd);
+                    vv = row8(pools.v_pool, pools.v_q, pools.v_scale, row, dd);
+                }
+                *reinterpret_cast<h8*>(K + (size_t) j * KS + dd) = kv;
+                *reinterpret_cast<h8*>(V + (size_t) j * KS + dd) = vv;
+            }
+            sycl::group_barrier(grp);
+            bool same = true;
+            if constexpr (S_IN_ACC) {
+                // S = Q . K^T kept in the accumulators: lane `lane` holds column ct 16 + lane of tile ct, its element i
+                // row i; masked, the rows' maxima, the probabilities written to local memory as FP16 and summed, all
+                // without S itself going through local memory
+                MC sacc[CT];
+                #pragma unroll
+                for (int ct = 0; ct < CT; ++ct) {
+                    mx::joint_matrix_fill(sg, sacc[ct], 0.0f);
+                    for (int d = 0; d < DT; ++d) {
+                        MA a;
+                        MBc b;
+                        mx::joint_matrix_load(sg, a, lptr(qs, (size_t) r0 * QS + (size_t) d * 16), QS);
+                        mx::joint_matrix_load(sg, b, lptr(ks, (size_t) ct * 16 * KS + (size_t) d * 16), KS);
+                        mx::joint_matrix_mad(sg, sacc[ct], a, b, sacc[ct]);
+                    }
+                }
+                int64_t qpos[TM];
+                float mxr[TM], sum[TM];
+                for (int r = 0; r < TM; ++r) {
+                    qpos[r] = pos0 + qbase + (r0 + r) / G;
+                    mxr[r] = NEG;
+                    sum[r] = 0.0f;
+                }
+                #pragma unroll
+                for (int ct = 0; ct < CT; ++ct) {
+                    const int64_t c = c0 + (int64_t) ct * 16 + lane;
+                    int i = 0;
+                    mx::joint_matrix_apply(sg, sacc[ct], [&](float& x) {
+                        const int r = i++;
+                        if (c > qpos[r] || c >= n_cells) x = NEG;
+                        mxr[r] = sycl::fmax(mxr[r], x);
+                    });
+                }
+                for (int r = 0; r < TM; ++r) {   // the lazy reference (below)
+                    const float mxv = sycl::reduce_over_group(sg, mxr[r], sycl::maximum<float>());
+                    mxr[r] = m[r] == NEG || mxv > m[r] + TAU ? mxv : m[r];
+                }
+                #pragma unroll
+                for (int ct = 0; ct < CT; ++ct) {
+                    int i = 0;
+                    mx::joint_matrix_apply(sg, sacc[ct], [&](float& x) {
+                        const int r = i++;
+                        const half p = (half) (x == NEG ? 0.0f : sycl::exp2(x - mxr[r]));
+                        P[r * PS + ct * 16 + lane] = p;
+                        sum[r] += (float) p;
+                    });
+                }
+                for (int r = 0; r < TM; ++r) {
+                    const float total = sycl::reduce_over_group(sg, sum[r], sycl::plus<float>());
+                    const float a = mxr[r] == m[r] ? 1.0f : m[r] == NEG ? 0.0f : sycl::exp2(m[r] - mxr[r]);
+                    l[r] = l[r] * a + total;
+                    m[r] = mxr[r];
+                    f[r] = a;
+                    same = same && a == 1.0f;
+                }
+            } else {
+            for (int ct = 0; ct < CT; ++ct) {   // S = Q . K^T for the sub-group's rows
+                MC acc;
+                mx::joint_matrix_fill(sg, acc, 0.0f);
+                for (int d = 0; d < DT; ++d) {
+                    MA a;
+                    MBc b;
+                    mx::joint_matrix_load(sg, a, lptr(qs, (size_t) r0 * QS + (size_t) d * 16), QS);
+                    mx::joint_matrix_load(sg, b, lptr(ks, (size_t) ct * 16 * KS + (size_t) d * 16), KS);
+                    mx::joint_matrix_mad(sg, acc, a, b, acc);
+                }
+                mx::joint_matrix_store(sg, acc, lptr(ss, (size_t) w * TM * SS + (size_t) ct * 16), SS, mx::layout::row_major);
+            }
+            sycl::group_barrier(sg);
+            // each row's online softmax, its BK columns across the lanes.  Lazily rescaled (as FlashAttention-3 and
+            // qsa_prompt_attn): a row's reference moves only when a score passes it by more than 2^TAU, so p <= 2^TAU
+            // stays within FP16, and most steps leave the output as it is
+            for (int r = 0; r < TM; ++r) {
+                const int64_t qpos = pos0 + qbase + (r0 + r) / G;
+                float mxv = NEG;
+                for (int cj = lane; cj < BK; cj += SG) {
+                    const int64_t c = c0 + cj;
+                    if (c > qpos || c >= n_cells) S[r * SS + cj] = NEG;
+                    mxv = sycl::fmax(mxv, S[r * SS + cj]);
+                }
+                mxv = sycl::reduce_over_group(sg, mxv, sycl::maximum<float>());
+                const float m_new = m[r] == NEG || mxv > m[r] + TAU ? mxv : m[r];
+                float sum = 0.0f;
+                for (int cj = lane; cj < BK; cj += SG) {
+                    const float x = S[r * SS + cj];
+                    const half p = (half) (x == NEG ? 0.0f : sycl::exp2(x - m_new));
+                    P[r * PS + cj] = p;
+                    sum += (float) p;
+                }
+                sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                const float a = m_new == m[r] ? 1.0f : m[r] == NEG ? 0.0f : sycl::exp2(m[r] - m_new);
+                l[r] = l[r] * a + sum;
+                m[r] = m_new;
+                f[r] = a;
+                same = same && a == 1.0f;
+            }
+            }
+            sycl::group_barrier(sg);   // the probabilities are written
+            if constexpr (IN_ACC) {   // O = O x correction (only when a reference moved) + P . V, in the accumulators
+                if (!same)
+                    #pragma unroll
+                    for (int d = 0; d < DT; ++d) {
+                        int i = 0;
+                        mx::joint_matrix_apply(sg, oa[d], [&](float& x) { x *= f[i++]; });
+                    }
+                #pragma unroll
+                for (int kk = 0; kk < CT; ++kk) {
+                    MA a;
+                    mx::joint_matrix_load(sg, a, lptr(ps, (size_t) w * TM * PS + (size_t) kk * 16), PS);
+                    #pragma unroll
+                    for (int d = 0; d < DT; ++d) {
+                        MBr b;
+                        mx::joint_matrix_load(sg, b, lptr(vs, (size_t) kk * 16 * KS + (size_t) d * 16), KS);
+                        mx::joint_matrix_mad(sg, oa[d], a, b, oa[d]);
+                    }
+                }
+            } else {   // P . V from zero, through local memory into the registers: O = O x correction + it
+                for (int d = 0; d < DT; ++d) {
+                    MC acc;
+                    mx::joint_matrix_fill(sg, acc, 0.0f);
+                    for (int kk = 0; kk < CT; ++kk) {
+                        MA a;
+                        MBr b;
+                        mx::joint_matrix_load(sg, a, lptr(ps, (size_t) w * TM * PS + (size_t) kk * 16), PS);
+                        mx::joint_matrix_load(sg, b, lptr(vs, (size_t) kk * 16 * KS + (size_t) d * 16), KS);
+                        mx::joint_matrix_mad(sg, acc, a, b, acc);
+                    }
+                    mx::joint_matrix_store(sg, acc, lptr(cs, (size_t) w * TM * 16), 16, mx::layout::row_major);
+                    sycl::group_barrier(sg);
+                    for (int e = 0; e < EPL; ++e) {   // element e * SG + lane of the tile: row (e SG + lane) / 16
+                        const int r = (e * SG + lane) / 16;
+                        o[d][e] = (same ? o[d][e] : o[d][e] * f[r]) + C[r * 16 + lane % 16];
+                    }
+                    sycl::group_barrier(sg);   // read before the next tile overwrites it
+                }
+            }
+        }
+        for (int d = 0; d < DT; ++d) {
+            if constexpr (IN_ACC) {   // the accumulators through local memory, once
+                mx::joint_matrix_store(sg, oa[d], lptr(cs, (size_t) w * TM * 16), 16, mx::layout::row_major);
+                sycl::group_barrier(sg);
+            }
+            for (int e = 0; e < EPL; ++e) {
+                const int r = (e * SG + lane) / 16, row = r0 + r;
+                const int64_t tq = qbase + row / G;
+                const float x = IN_ACC ? C[r * 16 + lane % 16] : o[IN_ACC ? 0 : d][IN_ACC ? 0 : e];
+                if (row < rows && tq < T) attn[(tq * n_head + (int64_t) h * G + row % G) * HD + (int64_t) d * 16 + lane % 16] = x / l[r];
+            }
+            if constexpr (IN_ACC) sycl::group_barrier(sg);
+        }
+    }
+
+#endif
+
+    auto get(syclex::properties_tag) const {
+        if constexpr (TM == 8)
+            return syclex::properties{sycl::ext::intel::experimental::grf_size<256>,
+                                      syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+        else
+            return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>};
+    }
+
+    static size_t local_bytes() {
+        return (size_t) (R * QS + 2 * BK * KS + NSG * TM * PS) * sizeof(half) +
+               (size_t) (NSG * TM * SS + NSG * TM * 16 + NSG * TM) * sizeof(float);
+    }
+};
+
+template <int HD, int TM, int SG, int NSG, int BK, bool I8>
+void launch_jm(sycl::queue& q, const float* qv, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s,
+               float* attn) {
+    using KT = JmKernel<HD, TM, SG, NSG, BK, I8>;
+    const int G = (int) (s.n_head / s.n_head_kv), BQ = std::max(1, KT::R / G);
+    const size_t blocks = (size_t) ((T + BQ - 1) / BQ);
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half, 1> qs(sycl::range<1>((size_t) KT::R * KT::QS), h),
+            ks(sycl::range<1>((size_t) BK * KT::KS), h), vs(sycl::range<1>((size_t) BK * KT::KS), h),
+            ps(sycl::range<1>((size_t) NSG * TM * KT::PS), h);
+        sycl::local_accessor<float, 1> ss(sycl::range<1>((size_t) NSG * TM * KT::SS), h),
+            cs(sycl::range<1>((size_t) NSG * TM * 16), h), as(sycl::range<1>((size_t) NSG * TM), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) s.n_head_kv, blocks * KT::WG), sycl::range<2>(1, KT::WG)),
+                       KT{qv, pools, attn, pos0, T, G, BQ, (int) s.n_head, (int) s.n_head_kv, (int) s.page_size,
+                          1.0f / std::sqrt((float) HD), qs, ks, vs, ps, ss, cs, as});
+    });
+}
+
+
+// RDNA3's and RDNA4's WmmaKernel over INT8 pools, for the shapes prompt_attn takes there; false for another shape
+bool wmma_i8(sycl::queue& q, const float* qv, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s,
+             float* attn) {
+    const int64_t g = s.n_head / s.n_head_kv;
+    const int32_t* t = pools.page_table;
+    if (s.head_dim == 128 && g == 10) launch_wmma<128, 10, 8, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+    else if (s.head_dim == 256 && g == 8) launch_wmma<256, 8, 8, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+    else if (s.head_dim == 256 && g == 12) launch_wmma<256, 12, 4, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+    else if (s.head_dim == 256 && g == 4) {
+        const sycl::device d = q.get_device();
+        if (wmma_fits<256, 4, 64>(d)) launch_wmma<256, 4, 64, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+        else if (wmma_fits<256, 4, 32>(d)) launch_wmma<256, 4, 32, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+        else launch_wmma<256, 4, 16, true>(q, qv, nullptr, nullptr, t, pos0, T, s, attn, &pools);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// JmKernel<HD, TM, SG, NSG, BK, I8> launched when its work-group fits the device (work-items and local memory)
+template <int HD, int TM, int SG, int NSG, int BK, bool I8>
+bool jm_try(sycl::queue& q, const float* qv, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s,
+            float* attn) {
+    using KT = JmKernel<HD, TM, SG, NSG, BK, I8>;
+    const sycl::device d = q.get_device();
+    if ((size_t) KT::WG > d.get_info<sycl::info::device::max_work_group_size>() ||
+        KT::local_bytes() > d.get_info<sycl::info::device::local_mem_size>())
+        return false;
+    launch_jm<HD, TM, SG, NSG, BK, I8>(q, qv, pools, pos0, T, s, attn);
+    return true;
+}
+
+// the largest work-group of the form that fits, more rows (queries reading the same K and V) first
+template <int HD, int TM, int SG, bool I8>
+bool jm_form(sycl::queue& q, const float* qv, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s,
+             float* attn) {
+    // 64 rows either way, then half as many; steps of at least 32 cells (Intel's compiler took no single-tile array of
+    // scores through joint_matrix_apply)
+    constexpr int WIDE = TM == 8 ? 8 : 4;
+    return jm_try<HD, TM, SG, WIDE, 64, I8>(q, qv, pools, pos0, T, s, attn) ||
+           jm_try<HD, TM, SG, WIDE, 32, I8>(q, qv, pools, pos0, T, s, attn) ||
+           jm_try<HD, TM, SG, WIDE / 2, 32, I8>(q, qv, pools, pos0, T, s, attn);
+}
+
+// The joint_matrix kernel for the device: Intel's XMX form where xmx_available says so (the XMX products' check: its
+// matrix combinations, 16-wide sub-groups and the large register file), else the portable one where the device's
+// joint_matrix takes FP16 16 x 16 x 16 on 32 lanes; false when there is neither, for a head_dim other than 128 or 256,
+// or when no work-group of it fits
+bool jm_attn(sycl::queue& q, const float* qv, const QsaAttnPools& pools, bool i8, int64_t pos0, int64_t T,
+             const QsaShapes& s, float* attn) {
+    static core::PerDevice<int> per_device;   // 8: Intel's form, 16: the portable one, 0: none
+    const int form = per_device.get(q.get_device(), [&q] {
+        if (xmx_available(XmxType::f16)) return 8;
+        return xe::mma_shape_is(q, 16, 16, 16, 32) ? 16 : 0;
+    });
+    if (form == 0 || (s.head_dim != 128 && s.head_dim != 256)) return false;
+    if (form == 8) {
+        if (s.head_dim == 128)
+            return i8 ? jm_form<128, 8, 16, true>(q, qv, pools, pos0, T, s, attn)
+                      : jm_form<128, 8, 16, false>(q, qv, pools, pos0, T, s, attn);
+        return i8 ? jm_form<256, 8, 16, true>(q, qv, pools, pos0, T, s, attn)
+                  : jm_form<256, 8, 16, false>(q, qv, pools, pos0, T, s, attn);
+    }
+    if (s.head_dim == 128)
+        return i8 ? jm_form<128, 16, 32, true>(q, qv, pools, pos0, T, s, attn)
+                  : jm_form<128, 16, 32, false>(q, qv, pools, pos0, T, s, attn);
+    return i8 ? jm_form<256, 16, 32, true>(q, qv, pools, pos0, T, s, attn)
+              : jm_form<256, 16, 32, false>(q, qv, pools, pos0, T, s, attn);
 }
 
 }  // namespace
@@ -373,6 +818,201 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     }
     if (stream == nullptr) queue.wait_and_throw();
     return true;
+}
+
+namespace {
+
+// The kernel a prompt's attention takes, for a GPU, a shape and a pool format (prompt_attn_tune): the matrix
+// engines' (JmKernel, or WmmaKernel's INT8 form on RDNA3 and RDNA4), the FP16 pools' FMA or WMMA kernel, or none: the
+// caller's decode kernel (qsa_dense_attn_batch).  Their order changes with the GPU, the pools and the context: over a
+// 2,048-query chunk after 28K cells of Qwen3.6-35B-A3B's 16/2 heads of 256 they ran 222, 256 and 216 ms on a B70 with
+// FP16 pools (237, -, 272 with INT8 ones), 217, 166 and 397 ms on an RTX 4070 (222, -, 391); llm-jp-4.1's 40/4 heads
+// of 128 187 and 1,078 ms on the B70 (226 and 194 on the RTX 4070).  The decode kernel reads every cell again for
+// each query: Qwen3.5-9B's 16/4 heads of 256 took it at 16K cells on the B70 and its 64K prompt then ran 86.1 s against
+// the FP16 kernel's 83.5.  So the choice is timed at a short and a long context and taken by the request's length.
+enum Pick : int { kPickUntimed = -1, kPickNone = 0, kPickMma = 1, kPickFp16 = 2 };
+const char* const kPickNames[3] = {"the decode kernel", "the matrix engines'", "the FP16 kernel"};
+constexpr double kDecodeMargin = 0.9;   // the decode kernel's dummy time must be under this share of the others' (below)
+struct Picks {
+    int short_pick = kPickUntimed, long_pick = kPickUntimed;
+    int64_t split = 0;   // a chunk reaching this many cells takes long_pick
+};
+using PickKey = std::tuple<int64_t, int64_t, int64_t, bool>;   // head_dim, query heads, KV heads, INT8 pools
+std::mutex picks_mu;
+std::map<PickKey, std::unique_ptr<core::PerDevice<Picks>>> picks;
+
+core::PerDevice<Picks>& picks_for(const QsaShapes& s, bool i8) {
+    std::lock_guard<std::mutex> lock(picks_mu);
+    auto& p = picks[PickKey{s.head_dim, s.n_head, s.n_head_kv, i8}];
+    if (!p) p = std::make_unique<core::PerDevice<Picks>>();
+    return *p;
+}
+
+bool env_off(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+}
+
+// the matrix engines' kernel for the pools, launched (false: none takes them on this GPU)
+bool run_mma(sycl::queue& queue, const float* q, const QsaAttnPools& pools, bool i8, int64_t pos0, int64_t T,
+             const QsaShapes& s, float* attn) {
+    if (xe::amd_wmma(queue.get_device())) return i8 && wmma_i8(queue, q, pools, pos0, T, s, attn);
+    return jm_attn(queue, q, pools, i8, pos0, T, s, attn);
+}
+
+// The fastest of the kernels over a dummy chunk: up to 2,048 queries after the rest of `cells` cells, zero pools
+// behind an identity table; one line to stderr.  kPickUntimed when the dummy could not be made (its VRAM).  As many
+// queries as a prompt's chunk keeps the GPU as busy as the prompt does: with 512 the FMA kernel's blocks of a few
+// queries left it idle and the decode kernel (which also splits the cells) came out 29% ahead at 64K cells on a B70,
+// where the prompt ran it 3.5% behind
+int time_pick(sycl::queue& queue, const QsaShapes& s, bool int8_pools, int64_t cells, void* stream) {
+    const int64_t PS = s.page_size, nkv = s.n_head_kv, nh = s.n_head, hd = s.head_dim;
+    const int64_t T = std::min<int64_t>(2048, std::max<int64_t>(1, cells / 2));
+    const int64_t pos0 = cells - T, pages = (cells + PS - 1) / PS, rows = pages * nkv * PS;
+    std::vector<void*> owned;
+    auto dev = [&](size_t bytes) {
+        void* p = sycl::malloc_device(std::max<size_t>(bytes, 64), queue);
+        if (p == nullptr) throw std::bad_alloc();
+        queue.memset(p, 0, std::max<size_t>(bytes, 64));
+        owned.push_back(p);
+        return p;
+    };
+    int best = kPickNone;
+    double ms[3] = {-1.0, -1.0, -1.0};   // the decode kernel, the matrix engines', the FP16 kernel
+    try {
+        QsaAttnPools pools;
+        std::vector<int32_t> table((size_t) pages);
+        for (int64_t i = 0; i < pages; ++i) table[(size_t) i] = (int32_t) i;
+        auto* tbl = static_cast<int32_t*>(dev(table.size() * 4));
+        queue.memcpy(tbl, table.data(), table.size() * 4);
+        pools.page_table = tbl;
+        if (int8_pools) {
+            pools.k_q = static_cast<int8_t*>(dev((size_t) (rows * hd)));
+            pools.v_q = static_cast<int8_t*>(dev((size_t) (rows * hd)));
+            pools.k_scale = static_cast<uint16_t*>(dev((size_t) (rows * hd / 64) * 2));
+            pools.v_scale = static_cast<uint16_t*>(dev((size_t) (rows * hd / 64) * 2));
+        } else {
+            pools.k_pool = static_cast<uint16_t*>(dev((size_t) (rows * hd) * 2));
+            pools.v_pool = static_cast<uint16_t*>(dev((size_t) (rows * hd) * 2));
+        }
+        auto* qv = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
+        auto* out = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
+        queue.wait_and_throw();
+        // a warm run of a few queries (the kernel's compile), then the timed chunk; -1: not taken
+        auto timed = [&](auto&& run) -> double {
+            if (!run(std::min<int64_t>(T, 16))) return -1.0;
+            queue.wait_and_throw();
+            const auto t0 = std::chrono::steady_clock::now();
+            run(T);
+            queue.wait_and_throw();
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        ms[kPickMma] = timed([&](int64_t n) { return run_mma(queue, qv, pools, int8_pools, pos0 + T - n, n, s, out); });
+        if (!int8_pools)
+            ms[kPickFp16] = timed([&](int64_t n) {
+                return prompt_attn(qv, pools.k_pool, pools.v_pool, pools.page_table, pos0 + T - n, n, s, out, stream);
+            });
+        // the decode kernel over a slice of the queries its scratch fits in (it takes each query alike)
+        const uint64_t per_q = qsa_decode_attn_scratch_floats(cells, s) * 4;
+        const int64_t nq = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((256ull << 20) / std::max<uint64_t>(per_q, 1))));
+        std::vector<int32_t> hs((size_t) (nq * kStepCount));
+        for (int64_t t = 0; t < nq; ++t) qsa_step_fill(hs.data() + t * kStepCount, pos0 + T - nq + t, s);
+        auto* steps = static_cast<int32_t*>(dev(hs.size() * 4));
+        queue.memcpy(steps, hs.data(), hs.size() * 4);
+        auto* scratch = static_cast<float*>(dev((size_t) (per_q * (uint64_t) nq)));
+        queue.wait_and_throw();
+        try {
+            const double d = timed([&](int64_t n) {
+                if (n == T) qsa_dense_attn_batch(qv, pools, steps, cells, s, scratch, out, nq, stream);
+                else qsa_dense_attn_batch(qv, pools, steps, cells, s, scratch, out, std::min<int64_t>(nq, n), stream);
+                return true;
+            });
+            ms[kPickNone] = d * (double) T / (double) nq;
+        } catch (const std::exception&) {   // a shape the decode kernel does not take
+            ms[kPickNone] = -1.0;
+        }
+        // the kernels that read a cell once for many queries first; the decode kernel only when it is clearly ahead:
+        // timed alone it came out 1.3% ahead of the matrix engines' at 64K cells of Qwen3.5-9B's 16/4 heads of 256 on
+        // a B70, and in the prompt (its per-query scratch beside the other layers' work) it ran 15% behind them
+        // (attention 75.1 s against 65.2 of a 63K prompt)
+        double t_best = -1.0;
+        for (int k : {(int) kPickMma, (int) kPickFp16})
+            if (ms[k] >= 0.0 && (t_best < 0.0 || ms[k] < t_best)) {
+                t_best = ms[k];
+                best = k;
+            }
+        if (ms[kPickNone] >= 0.0 && (t_best < 0.0 || ms[kPickNone] < kDecodeMargin * t_best)) best = kPickNone;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata: timing the prompt attention at %lld cells: %s\n", (long long) cells, e.what());
+        best = kPickUntimed;
+    }
+    for (void* p : owned) sycl::free(p, queue);
+    if (best >= 0)
+        std::fprintf(stderr, "strata: prompt attention (%lld/%lld heads of %lld, %s pools, %lld queries after %lld cells): "
+                             "the decode kernel %.1f ms, the matrix engines' %.1f, the FP16 kernel %.1f: %s\n",
+                     (long long) s.n_head, (long long) s.n_head_kv, (long long) s.head_dim, int8_pools ? "INT8" : "FP16",
+                     (long long) T, (long long) pos0, ms[kPickNone], ms[kPickMma], ms[kPickFp16], kPickNames[best]);
+    return best;
+}
+
+// STRATA_PROMPT_ATTN_PICK=decode|mma|fp16: that kernel whatever the timing would choose (A/B); kPickUntimed: none
+int forced_pick() {
+    const char* v = std::getenv("STRATA_PROMPT_ATTN_PICK");
+    if (v == nullptr) return kPickUntimed;
+    const std::string w = v;
+    return w == "decode" ? kPickNone : w == "mma" ? kPickMma : w == "fp16" ? kPickFp16 : kPickUntimed;
+}
+
+}  // namespace
+
+void prompt_attn_tune(const QsaShapes& s, bool int8_pools, int64_t max_cells, void* stream) {
+    if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0 || max_cells <= 0) return;
+    sycl::queue& queue = core::Runtime::get().stream(stream);
+    picks_for(s, int8_pools).get(queue.get_device(), [&] {
+        Picks p;
+        if (env_off("STRATA_PROMPT_ATTN_MMA")) return p;   // the fixed choice (prompt_attn)
+        if (const int f = forced_pick(); f != kPickUntimed) {   // prompt_attn takes it untimed
+                    std::fprintf(stderr, "strata: prompt attention: %s (STRATA_PROMPT_ATTN_PICK)\n", kPickNames[f]);
+            return p;
+        }
+        // 8K and up to 64K cells (1 to 2 s on a B70); a cache shorter than the long point takes the short one's choice
+        const int64_t a = std::min<int64_t>(max_cells, 8192), b = std::min<int64_t>(max_cells, 65536);
+        p.short_pick = time_pick(queue, s, int8_pools, a, stream);
+        p.long_pick = b > a ? time_pick(queue, s, int8_pools, b, stream) : p.short_pick;
+        p.split = (a + b) / 2;
+        return p;
+    });
+}
+
+bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s, float* attn,
+                 void* stream) {
+    if (T <= 0) return true;
+    if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0 || pools.page_table == nullptr) return false;
+    const bool i8 = pools.k_q != nullptr;
+    if (i8 ? pools.v_q == nullptr || pools.k_scale == nullptr || pools.v_scale == nullptr
+           : pools.k_pool == nullptr || pools.v_pool == nullptr)
+        return false;
+    sycl::queue& queue = core::Runtime::get().stream(stream);
+    // STRATA_PROMPT_ATTN_MMA=0: the FP16 kernel for FP16 pools and the decode kernel for INT8 ones, as before; untimed
+    // (no prompt_attn_tune for this shape): the matrix engines' kernel where there is one
+    static const bool no_mma = env_off("STRATA_PROMPT_ATTN_MMA");
+    static const int forced = forced_pick();
+    int pick = kPickUntimed;
+    if (no_mma) {
+        pick = i8 ? kPickNone : kPickFp16;
+    } else if (forced != kPickUntimed) {
+        pick = forced;
+    } else {
+        const Picks& p = picks_for(s, i8).get(queue.get_device(), [] { return Picks{}; });
+        pick = pos0 + T >= p.split ? p.long_pick : p.short_pick;
+    }
+    if (pick == kPickNone) return false;
+    if (pick != kPickFp16 && run_mma(queue, q, pools, i8, pos0, T, s, attn)) {
+        if (stream == nullptr) queue.wait_and_throw();
+        return true;
+    }
+    if (i8) return false;   // the FP32 and WMMA kernels read FP16 pools: the caller keeps the decode kernel
+    return prompt_attn(q, pools.k_pool, pools.v_pool, pools.page_table, pos0, T, s, attn, stream);
 }
 
 }  // namespace strata::kernels

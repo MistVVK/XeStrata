@@ -65,6 +65,17 @@ Rules:
 - The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
 - Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
 
+## Two engines, one set of capabilities
+
+Qwen3.8-Flash-Next (and the Gyro packs) run on `src/program/generate.cpp`; the other models (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash) on the plain engine, `src/program/plain_generate.cpp` and `src/core/plain_model.cpp`.
+The two do not differ in what they can do (the user's decision of 2026-10-31): a feature, a fix, a speed path or an engine option goes into both.
+
+- Write it once, as a shared part both engines call (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`), not as a second copy in each engine.
+- upstream's changes land in `generate.cpp`: whatever of them is taken goes into the plain engine too, in the same work ([the upstream-sync skill](.claude/skills/upstream-sync/SKILL.md)).
+- Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: what `kQwen38Only` in `src/program/option_scope.cpp` lists (PLE, QSA, the separate MTP pack, their kernels and switches).
+  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`; `kNotYet` lists only what the plain engine still lacks, and it only shrinks.
+- A speed path taken into the plain engine is measured there as well, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B).
+
 ## What goes in
 
 Every change goes in only on these two conditions, whoever writes it: the maintainer, a coding agent, a pull request, a port from upstream or another project.

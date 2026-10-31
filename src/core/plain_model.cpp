@@ -43,6 +43,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -731,6 +732,9 @@ bool PlainModel::load_qwen(std::string& err) {
             return false;
         }
     }
+    // and the prompt attention's kernel (prompt_attn: the matrix engines', the FP16 one or the decode one), as long
+    // as the VRAM is free; GLM-5.3-Flash's prompt takes its own (plain_prompt_glm5.cpp)
+    if (opt_.prompt_chunk > 0 && !glm_) k::prompt_attn_tune(qs, opt_.kv_int8, opt_.max_cells, cs_);
     {
         const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);

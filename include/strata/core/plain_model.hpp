@@ -197,6 +197,10 @@ public:
     /// where the windows would have left it.  False with `err` empty when the VRAM tier cannot lend the prompt's
     /// buffers even for a short chunk (a 4 GB card): nothing ran, and the caller reads the prompt through the windows.
     bool prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// Told after each chunk prompt() reads: the tokens read so far and the prompt's (its `n`); empty: nothing.  The
+    /// serve loop prints it as Qwen3.8-Flash-Next's engine does (PP), which the server reads as progress and as
+    /// the engine being alive.
+    void set_prompt_progress(std::function<void(int64_t read, int64_t total)> f) { prompt_progress_ = std::move(f); }
     /// How forward and prompt pick their tokens (greedy by default): each row's draw counted from its position, so a
     /// seed repeats a run.
     void set_sampler(const strata::kernels::SamplerParams& sp);
@@ -564,6 +568,7 @@ private:
         float clamp = 0.0f;                   ///< the dense FFN's / shared expert's SwiGLU limit
     };
     bool glm_ = false;
+    std::function<void(int64_t, int64_t)> prompt_progress_;   ///< set_prompt_progress (the root's only)
     std::vector<GBlock> gblocks_;
     GBlock gmtp_;                             ///< GLM's MTP layer (has_mtp_): a DSA block of one stream
     bool load_glm5(std::string& err);

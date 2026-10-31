@@ -336,6 +336,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
                     for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
+            if (prompt_progress_ && c_begin == 0 && c_end >= n) prompt_progress_(c0 + T, n);   // as plain_prompt.cpp
         }
     } catch (const std::exception& e) {
         err = std::string("plain prompt: ") + e.what();
