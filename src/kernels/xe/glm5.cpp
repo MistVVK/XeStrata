@@ -13,9 +13,11 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_glm5
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace strata::kernels {
@@ -443,30 +445,38 @@ void glm5_idx_scores(const float* pooled, const float* q, const float* w, int n_
                                 " blocks, " + std::to_string(n_tokens) + " tokens");
     const size_t gx = (size_t) ((max_blocks + SG - 1) / SG);
     const int H = n_heads;
-    const auto event = queue_for(stream).parallel_for(
-        sycl::nd_range<2>({(size_t) n_tokens, gx * SG * WARP}, {1, (size_t) SG * WARP}),
-        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int64_t b = (int64_t) it.get_group(1) * SG + (int64_t) sg.get_group_linear_id();
-            const int64_t n_bid = steps[t * kStepCount + kStepNBid];
-            if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
-            const int lane = (int) sg.get_local_linear_id();
-            float score = 0.0f;
-            if (b < n_bid) {
-                float k[PER];
-                for (int i = 0; i < PER; ++i) k[i] = pooled[b * D + (int64_t) lane * PER + i];
-                for (int h = 0; h < H; ++h) {
-                    const float* qh = q + (t * H + h) * D + (int64_t) lane * PER;
-                    float d = 0.0f;
-                    for (int i = 0; i < PER; ++i) d += qh[i] * k[i];
-                    d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
-                    score += (d > 0.0f ? d : 0.0f) * w[t * H + h];
+    // the kernels' ids are ints (-fsycl-id-queries-range=int): a launch's work-items stay within one, so a long
+    // context's chunk goes in slices of tokens (a 131072-cell context's 32768 blocks take 1 M work-items a token, and
+    // a prompt chunk of over 2047 tokens failed)
+    const int64_t row = (int64_t) (gx * SG * WARP);
+    const int64_t slice = std::max<int64_t>(1, (int64_t) std::numeric_limits<int32_t>::max() / row);
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += slice) {
+        const int64_t nt = std::min<int64_t>(slice, n_tokens - t0);
+        const auto event = queue_for(stream).parallel_for(
+            sycl::nd_range<2>({(size_t) nt, (size_t) row}, {1, (size_t) SG * WARP}),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+                const sycl::sub_group sg = it.get_sub_group();
+                const int64_t t = t0 + (int64_t) it.get_group(0);
+                const int64_t b = (int64_t) it.get_group(1) * SG + (int64_t) sg.get_group_linear_id();
+                const int64_t n_bid = steps[t * kStepCount + kStepNBid];
+                if (b > n_bid || b >= max_blocks) return;   // uniform over the sub-group
+                const int lane = (int) sg.get_local_linear_id();
+                float score = 0.0f;
+                if (b < n_bid) {
+                    float k[PER];
+                    for (int i = 0; i < PER; ++i) k[i] = pooled[b * D + (int64_t) lane * PER + i];
+                    for (int h = 0; h < H; ++h) {
+                        const float* qh = q + (t * H + h) * D + (int64_t) lane * PER;
+                        float d = 0.0f;
+                        for (int i = 0; i < PER; ++i) d += qh[i] * k[i];
+                        d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
+                        score += (d > 0.0f ? d : 0.0f) * w[t * H + h];
+                    }
                 }
-            }
-            if (lane == 0) scores[t * max_blocks + b] = score;
-        });
-    sync_if_needed(stream, event, "glm5_idx_scores");
+                if (lane == 0) scores[t * max_blocks + b] = score;
+            });
+        sync_if_needed(stream, event, "glm5_idx_scores");
+    }
 }
 
 void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, int64_t rank, uint16_t* latent,
