@@ -47,9 +47,15 @@ from __future__ import annotations
 import collections
 import json
 import math
+import os
 import re
+import secrets
+import shutil
 import struct
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
@@ -782,3 +788,199 @@ def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
             continue
         uses.append({"name": entry["name"], "path": f.file_of(entry), "scale": scale})
     return TAG.sub("", text), uses, unknown
+
+
+# ------------------------------------------------------------------------------------------- the page's own adapters
+# The web app adds an adapter to the image models' LoRA folders - a file it uploads, or one the server fetches from
+# Hugging Face - and takes one away.  A file is kept only where an image model of this server takes it (Folder._entry,
+# the listing's own check), under its own name made safe, and never in the place of one that is there; a file no model
+# takes is removed again, with each model's reason.  The human's decision of 2026-11-02: an upload, a remove and
+# Hugging Face's files (no other site).
+ADD_MAX = 8 << 30                  # the largest adapter added (a rank-256 LoRA of a 20B DiT is about 2.5 GiB in bf16)
+ADD_SPARE = 1 << 30                # free disk an added file leaves
+_UNSAFE = re.compile(r"[^A-Za-z0-9._ +-]+")
+HF_FILE = re.compile(r"https://huggingface\.co/(?!datasets/|spaces/)([\w.-]+/[\w.-]+)/(?:resolve|blob)/([^/?#]+)/"
+                     r"([^?#]+\.(?:safetensors|gguf))(?:[?#].*)?", re.IGNORECASE)
+
+
+def file_name(name: str) -> str:
+    """An added adapter's file name: the name given, without folders, its characters made safe."""
+    base = Path(str(name or "").replace("\\", "/")).name.strip()
+    stem, ext = os.path.splitext(base)
+    if ext.lower() not in EXTS:
+        raise LoraError(f"a LoRA is a {' or '.join(EXTS)} file, not {base or 'nothing'}")
+    stem = _UNSAFE.sub("_", stem).strip(" ._")[:120]
+    if not stem:
+        raise LoraError("the file needs a name")
+    return stem + ext.lower()
+
+
+def _dirs(folders: list[Folder]) -> list[Path]:
+    seen: list[Path] = []
+    for f in folders:
+        if f.dir.absolute() not in [d.absolute() for d in seen]:
+            seen.append(f.dir)
+    return seen
+
+
+def staging(folders: list[Folder], size: int | None = None) -> Path:
+    """Where an adapter on its way in is written: a hidden file in the first LoRA folder (the listing skips it), on
+    the disk it will stay on.  LoraError when there is no folder, the file is too large or the disk too full."""
+    takes = [f for f in folders if f.takes]
+    if not takes:
+        raise LoraError("no image model of this server takes a LoRA")
+    if size is not None and size > ADD_MAX:
+        raise LoraError(f"the file is {size >> 20} MiB; an added LoRA is at most {ADD_MAX >> 20} MiB")
+    d = takes[0].dir
+    d.mkdir(parents=True, exist_ok=True)
+    if size is not None and shutil.disk_usage(d).free < size + ADD_SPARE:
+        raise LoraError(f"the disk of {d} has too little room for {size >> 20} MiB")
+    return d / f".adding-{secrets.token_hex(8)}.part"
+
+
+def add(folders: list[Folder], tmp: Path, name: str) -> dict:
+    """Keep the file at `tmp` as `name` where an image model takes it (moved into its folder, copied into a second
+    folder that takes it too), or remove it: {"path", "name", "models": the families that take it}.  LoraError with
+    each model's reason when none does, or when the name is there already."""
+    try:
+        final = file_name(name)
+        stem = final[: -len(Path(final).suffix)]
+        takes, why = [], []
+        for f in folders:
+            if not f.takes:
+                why.append(f"{FAMILY_NAMES.get(f.family, f.family)} takes no LoRA")
+                continue
+            try:
+                entry = f._entry(tmp, final, stem)
+            except (OSError, ValueError, struct.error) as exc:
+                entry = f"its header could not be read ({exc})"
+            if isinstance(entry, str):
+                why.append(f"{FAMILY_NAMES.get(f.family, f.family)}: {entry}")
+            else:
+                takes.append(f)
+        if not takes:
+            raise LoraError("no image model here takes this file - " + "; ".join(why))
+        dirs = _dirs(takes)
+        for d in dirs:
+            if (d / final).exists():
+                raise LoraError(f"{final} is in the LoRA folder already (remove it first, or give the file another "
+                                "name)")
+        for i, d in enumerate(dirs):
+            d.mkdir(parents=True, exist_ok=True)
+            if i + 1 < len(dirs):
+                shutil.copyfile(tmp, d / final)
+            else:
+                os.replace(tmp, d / final)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    for f in folders:
+        f._scan(force=True)
+    return {"path": final, "name": stem, "models": sorted({f.family for f in takes})}
+
+
+def remove(folders: list[Folder], path: str) -> dict:
+    """Take an adapter away: the file `path` (a listing entry's) from every LoRA folder that has it."""
+    gone = []
+    for d in _dirs(folders):
+        try:
+            root = d.resolve()
+            full = (root / str(path or "")).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if root in full.parents and full.suffix.lower() in EXTS and full.is_file():
+            full.unlink()
+            gone.append(str(full.relative_to(root).as_posix()))
+    if not gone:
+        raise LoraError(f"there is no LoRA {path!r} in the LoRA folder")
+    for f in folders:
+        f._scan(force=True)
+    return {"removed": gone[0]}
+
+
+def hf_file(url: str) -> tuple[str, str]:
+    """A Hugging Face file's address (a /blob/ or /resolve/ link of a model repository) -> (its download URL, its file
+    name).  LoraError for anything else."""
+    m = HF_FILE.fullmatch(str(url or "").strip())
+    if not m:
+        raise LoraError("a Hugging Face file's link: https://huggingface.co/<owner>/<repo>/blob/<revision>/<file>"
+                        f"{' or '.join(EXTS)}")
+    repo, rev, path = m.groups()
+    return f"https://huggingface.co/{repo}/resolve/{rev}/{path}", Path(path).name
+
+
+class Fetch:
+    """One adapter the server fetches from Hugging Face, on its own thread: its state for the page to read."""
+    CHUNK = 1 << 20
+
+    def __init__(self, folders: list[Folder], url: str):
+        self.folders = folders
+        self.url, self.name = hf_file(url)
+        self.id = secrets.token_hex(8)
+        self.state, self.got = "running", 0
+        self.total: int | None = None
+        self.error: str | None = None
+        self.added: dict | None = None
+        self.cancel = threading.Event()
+        threading.Thread(target=self._run, daemon=True, name="strata-lora-fetch").start()
+
+    def view(self) -> dict:
+        return {"id": self.id, "name": self.name, "state": self.state, "bytes": self.got, "total": self.total,
+                "error": self.error, "added": self.added}
+
+    def _run(self) -> None:
+        tmp = None
+        try:
+            req = urllib.request.Request(self.url, headers={"User-Agent": "XeStrata"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                total = r.headers.get("Content-Length")
+                self.total = int(total) if total and total.isdigit() else None
+                tmp = staging(self.folders, self.total)
+                with open(tmp, "wb") as out:
+                    while not self.cancel.is_set():
+                        chunk = r.read(self.CHUNK)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        self.got += len(chunk)
+                        if self.got > ADD_MAX:
+                            raise LoraError(f"the file is over {ADD_MAX >> 20} MiB, the most an added LoRA may be")
+            if self.cancel.is_set():
+                raise LoraError("cancelled")
+            if self.total is not None and self.got != self.total:
+                raise LoraError(f"the download ended at {self.got} of {self.total} bytes")
+            self.added = add(self.folders, tmp, self.name)
+            self.state = "done"
+        except urllib.error.HTTPError as exc:
+            self.state, self.error = "failed", f"Hugging Face answered {exc.code} ({exc.reason}) for {self.url}"
+        except (urllib.error.URLError, OSError, LoraError, ValueError) as exc:
+            self.state, self.error = "failed", str(getattr(exc, "reason", None) or exc)
+        finally:
+            if tmp is not None and tmp.exists():
+                tmp.unlink()
+
+
+class Fetches:
+    """The fetches of this server, the newest 16 kept for their pages."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items: dict[str, Fetch] = {}
+
+    def start(self, folders: list[Folder], url: str) -> Fetch:
+        f = Fetch(folders, url)
+        with self.lock:
+            self.items[f.id] = f
+            while len(self.items) > 16:
+                old = next((k for k, v in self.items.items() if v.state != "running"), None)
+                if old is None:
+                    break
+                del self.items[old]
+        return f
+
+    def get(self, fid: str) -> Fetch | None:
+        with self.lock:
+            return self.items.get(fid)
+
+
+FETCHES = Fetches()

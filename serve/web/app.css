@@ -269,6 +269,13 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-lora-chip__name{font-size:var(--st-fs-sm);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .img-lora-chip input[type=number]{width:84px}
 .img-lora-chip .st-btn--icon{font-size:var(--st-fs-md);line-height:1}
+.img-lora-new{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.img-lora-new .st-input{flex:1;min-width:180px}
+.img-lora.is-drop{outline:2px dashed var(--st-accent);outline-offset:4px}
+.img-lora-files summary{cursor:pointer;font-size:var(--st-fs-sm)}
+.img-lora-file-list{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+.img-lora-file{display:flex;gap:8px;align-items:center;font-size:var(--st-fs-sm)}
+.img-lora-file span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .img-layout{display:flex;flex-direction:column;gap:8px}
 .img-layout-stage{position:relative;width:100%;max-width:512px;border:1px dashed var(--st-line);border-radius:8px;
   background:var(--st-surface-2) center/100% 100% no-repeat;touch-action:none;cursor:crosshair;user-select:none;overflow:hidden}

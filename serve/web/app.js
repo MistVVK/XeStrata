@@ -1007,6 +1007,8 @@ function inline(s) {
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>")
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // the NUL around a stashed code span is the marker set above
+  // eslint-disable-next-line no-control-regex
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
 // An ```svg or ```html block that is complete gets a Preview button (serve/web/preview.js): the block's own code in a sandboxed
@@ -2280,8 +2282,9 @@ function imgDefaults() {
 const IMG_LORA_COUNT = 4, IMG_LORA_SCALE = 2;   // serve/loras.py's MAX_LORA, and its SCALE_MIN..SCALE_MAX
 let imgLoraSel = [];   // [{name, scale}]: the adapters the next request applies, in the order they were chosen
 function imgLoras() {
-  const list = (imgModel().defaults || {}).loras || [];
-  $("img-lora").hidden = !list.length;
+  const d = imgModel().defaults || {}, list = d.loras || [];
+  $("img-lora").hidden = !(d.loras_take ?? list.length);    // an older server says nothing of loras_take
+  imgLoraFiles(list);
   const by = new Map(list.map(e => [e.name, e]));
   const kept = list.length ? store.get(`img_loras.${imgModel().id || "default"}`, []) : [];
   const names = new Set();
@@ -2350,6 +2353,23 @@ function imgLoraDraw(list) {
   $("img-lora-hint").textContent = most;
   $("img-lora-hint").hidden = !most;
 }
+// this model's files, each with its delete button
+function imgLoraFiles(list) {
+  $("img-lora-files").hidden = !list.length;
+  $("img-lora-files-sum").textContent = tr("img.loraFiles", "LoRA files on the server ({n})", {n: list.length});
+  $("img-lora-file-list").replaceChildren(...list.map((e) => {
+    const row = document.createElement("div"), name = document.createElement("span"), rm = document.createElement("button");
+    row.className = "img-lora-file";
+    name.textContent = e.path;
+    name.title = imgLoraAbout(e);
+    rm.type = "button";
+    rm.className = "st-btn st-btn--secondary";
+    rm.textContent = tr("img.loraDelete", "Delete");
+    rm.onclick = () => imgLoraRemove(e);
+    row.append(name, rm);
+    return row;
+  }));
+}
 // a chip's tooltip: the rank and the file's size, and the kinds of weight it changes
 function imgLoraAbout(e) {
   const parts = [tr("img.loraAbout", "rank {rank}, {size} MiB", {rank: e.rank || "–", size: e.size_mib == null ? "–" : e.size_mib})];
@@ -2408,6 +2428,96 @@ function imgEstimate(n) {
   const scale = mp / near;
   return n * (steps * stepS * scale ** (scale > 1 ? (d.size_exp || 1.5) : 1) + restS * scale);
 }
+// The server's LoRA folder from here (serve/loras.py): a file uploaded (the button, or dropped on the block), or one
+// the server fetches from Hugging Face, kept where an image model takes it; and each file of this model, to remove.
+// After each, /health is read again for the listings.
+function imgLoraStatus(text, kind = "") {
+  const el = $("img-lora-status");
+  el.textContent = text || "";
+  el.hidden = !text;
+  el.dataset.kind = kind;
+}
+async function imgLoraRefresh() {
+  try { health = await (await fetch("health", {cache: "no-store"})).json(); } catch (e) { return; }
+  imgModels();
+}
+async function imgLoraError(r) {
+  try { return (await r.json()).error.message; } catch (e) { return `HTTP ${r.status}`; }
+}
+function imgLoraUpload(file) {
+  if (!file) return;
+  if (!/\.(safetensors|gguf)$/i.test(file.name)) {
+    imgLoraStatus(tr("img.loraType", "A LoRA is a .safetensors or .gguf file"), "error");
+    return;
+  }
+  const x = new XMLHttpRequest();                 // XHR, not fetch: its upload reports how far it is
+  x.open("POST", `v1/images/loras?name=${encodeURIComponent(file.name)}`);
+  for (const [k, v] of Object.entries(headers())) x.setRequestHeader(k, v);
+  x.setRequestHeader("Content-Type", "application/octet-stream");
+  x.upload.onprogress = (e) => {
+    if (e.lengthComputable) imgLoraStatus(tr("img.loraUploading", "Uploading {name}: {pct}%", {name: file.name, pct: Math.round(100 * e.loaded / e.total)}));
+  };
+  x.onerror = () => imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: tr("pill.unreachable", "Server not reachable")}), "error");
+  x.onload = async () => {
+    let j = {};
+    try { j = JSON.parse(x.responseText); } catch (e) { /* not json */ }
+    if (x.status !== 200) {
+      imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: (j.error && j.error.message) || `HTTP ${x.status}`}), "error");
+      return;
+    }
+    imgLoraStatus(tr("img.loraAdded", "Added {name}", {name: j.added.name}));
+    await imgLoraRefresh();
+  };
+  imgLoraStatus(tr("img.loraUploading", "Uploading {name}: {pct}%", {name: file.name, pct: 0}));
+  x.send(file);
+}
+async function imgLoraFetch() {
+  const url = $("img-lora-url").value.trim();
+  if (!url) return;
+  let r;
+  try {
+    r = await fetch("v1/images/loras/fetch", {method: "POST", headers: headers(true), body: JSON.stringify({url})});
+  } catch (e) { imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: tr("pill.unreachable", "Server not reachable")}), "error"); return; }
+  if (r.status !== 202) { imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: await imgLoraError(r)}), "error"); return; }
+  const job = await r.json();
+  $("img-lora-url").value = "";
+  for (;;) {                                       // the download, until it ends (the server keeps going without us)
+    const mb = (n) => fmt((n || 0) / 1048576, 0);
+    imgLoraStatus(job.total ? tr("img.loraFetching", "Fetching {name}: {got} of {total} MB", {name: job.name, got: mb(job.bytes), total: mb(job.total)})
+                            : tr("img.loraFetchingSize", "Fetching {name}: {got} MB", {name: job.name, got: mb(job.bytes)}));
+    await new Promise((ok) => setTimeout(ok, 1000));
+    let j;
+    try { j = await (await fetch(`v1/images/loras/fetch/${job.id}`, {headers: headers()})).json(); } catch (e) { continue; }
+    Object.assign(job, j);
+    if (job.state === "done") { imgLoraStatus(tr("img.loraAdded", "Added {name}", {name: job.added.name})); await imgLoraRefresh(); return; }
+    if (job.state === "failed") { imgLoraStatus(tr("img.loraFailed", "Not added: {why}", {why: job.error}), "error"); return; }
+  }
+}
+async function imgLoraRemove(e) {
+  if (!confirm(tr("img.loraRemoveConfirm", "Delete {name} from the server's LoRA folder? The file is removed for every image model.", {name: e.path}))) return;
+  let r;
+  try {
+    r = await fetch("v1/images/loras/remove", {method: "POST", headers: headers(true), body: JSON.stringify({path: e.path})});
+  } catch (err) { imgLoraStatus(tr("img.loraRemoveFailed", "Not removed: {why}", {why: tr("pill.unreachable", "Server not reachable")}), "error"); return; }
+  if (!r.ok) { imgLoraStatus(tr("img.loraRemoveFailed", "Not removed: {why}", {why: await imgLoraError(r)}), "error"); return; }
+  imgLoraSel = imgLoraSel.filter((u) => u.name !== e.name);
+  imgLoraSave();
+  imgLoraStatus(tr("img.loraRemoved", "Removed {name}", {name: e.name}));
+  await imgLoraRefresh();
+}
+$("img-lora-upload").onclick = () => $("img-lora-file").click();
+$("img-lora-file").onchange = () => { imgLoraUpload($("img-lora-file").files[0]); $("img-lora-file").value = ""; };
+$("img-lora-fetch").onclick = imgLoraFetch;
+$("img-lora-url").onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); imgLoraFetch(); } };
+for (const ev of ["dragenter", "dragover"]) $("img-lora").addEventListener(ev, (e) => {
+  if ([...(e.dataTransfer.items || [])].some((i) => i.kind === "file")) { e.preventDefault(); $("img-lora").classList.add("is-drop"); }
+});
+$("img-lora").addEventListener("dragleave", () => $("img-lora").classList.remove("is-drop"));
+$("img-lora").addEventListener("drop", (e) => {
+  $("img-lora").classList.remove("is-drop");
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) { e.preventDefault(); imgLoraUpload(f); }
+});
 // the strength a request without one gets: an edit's 1; an img2img's d.strength at most, lowered with few steps so
 // that it skips one (the server's img2img_strength)
 function imgStrength(d, steps) {

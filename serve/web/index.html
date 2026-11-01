@@ -124,6 +124,17 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <span class="composer-hint" id="img-lora-hint" hidden></span>
           </div>
           <div class="img-lora-chips" id="img-lora-chips"></div>
+          <!-- adapters added to the server's LoRA folder: a file (or one dropped here), or a Hugging Face file -->
+          <div class="img-lora-new">
+            <button class="st-btn st-btn--secondary" id="img-lora-upload" type="button" data-i18n="img.loraUpload">Upload a LoRA…</button>
+            <input type="file" id="img-lora-file" accept=".safetensors,.gguf" hidden>
+            <input class="st-input" id="img-lora-url" type="url" autocomplete="off" placeholder="Hugging Face link to a .safetensors file"
+                   aria-label="Hugging Face link" data-i18n-placeholder="img.loraUrl" data-i18n-label="img.loraUrlLabel">
+            <button class="st-btn st-btn--secondary" id="img-lora-fetch" type="button" data-i18n="img.loraFetch">Fetch</button>
+          </div>
+          <span class="composer-hint" id="img-lora-status" role="status" hidden></span>
+          <details class="img-lora-files" id="img-lora-files" hidden><summary id="img-lora-files-sum"></summary>
+            <div class="img-lora-file-list" id="img-lora-file-list"></div></details>
         </div>
         <div class="img-row">
           <label class="st-field" id="img-model-f" hidden><span data-i18n="img.model">Model</span>

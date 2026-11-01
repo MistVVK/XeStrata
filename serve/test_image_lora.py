@@ -519,6 +519,88 @@ def cfg(**kw) -> dict:
     return out
 
 
+class Added(Tree):
+    """The web page's adapters (serve/loras.py's add, remove, hf_file): kept where a model takes them, refused with
+    each model's reason where none does, and taken away."""
+
+    def staged(self, tensors) -> Path:
+        tmp = loras.staging([self.folder("mage-flow")], 1000)
+        safetensors(tmp, tensors)
+        return tmp
+
+    def test_add_refuse_remove(self):
+        mage, qwen = self.folder("mage-flow"), self.folder()
+        got = loras.add([mage, qwen], self.staged(mage_lora()), "My Style (v2).safetensors")
+        self.assertEqual(got, {"path": "My Style _v2.safetensors", "name": "My Style _v2", "models": ["mage-flow"]})
+        self.assertEqual([e["name"] for e in mage.listing()], ["My Style _v2"])
+        self.assertEqual(qwen.listing(), [])
+        with self.assertRaisesRegex(loras.LoraError, "in the LoRA folder already"):
+            loras.add([mage, qwen], self.staged(mage_lora()), "My Style _v2.safetensors")
+        with self.assertRaisesRegex(loras.LoraError, "no image model here takes this file"):
+            junk = self.staged({"foo.lora_A.weight": (4, 8), "foo.lora_B.weight": (8, 4)})
+            loras.add([mage, qwen], junk, "x.safetensors")
+        with self.assertRaises(loras.LoraError):
+            loras.file_name("evil.exe")
+        self.assertEqual(loras.file_name("../../up/x.safetensors"), "x.safetensors")
+        self.assertEqual(loras.remove([mage, qwen], "My Style _v2.safetensors"),
+                         {"removed": "My Style _v2.safetensors"})
+        self.assertEqual(mage.listing(), [])
+        with self.assertRaises(loras.LoraError):
+            loras.remove([mage], "../x.safetensors")
+        self.assertEqual([p.name for p in self.d.iterdir() if p.name.startswith(".")], [])   # nothing staged is left
+
+    def test_hugging_face_links(self):
+        self.assertEqual(loras.hf_file("https://huggingface.co/a/b/blob/main/style.safetensors"),
+                         ("https://huggingface.co/a/b/resolve/main/style.safetensors", "style.safetensors"))
+        self.assertEqual(loras.hf_file("https://huggingface.co/a/b/resolve/v1/sub/x.gguf?download=true"),
+                         ("https://huggingface.co/a/b/resolve/v1/sub/x.gguf", "x.gguf"))
+        for url in ("https://huggingface.co/datasets/a/b/blob/main/x.safetensors", "https://example.com/x.safetensors",
+                    "https://huggingface.co/a/b/blob/main/x.bin"):
+            with self.assertRaises(loras.LoraError):
+                loras.hf_file(url)
+
+    def test_the_server_routes(self):
+        import http.client
+        from serve.server import ChatTemplate, MockEngine, Service, serve
+        from serve.test_server import CTX, ROOT, ByteTokenizer
+        for name in ("dit.safetensors", "vae.safetensors", "text.gguf"):
+            (self.d.parent / name).write_bytes(b"x")
+        cfg = {"model_name": "mage-test", "family": "mage-flow", "exe": "strata-image", "steps": 4, "schedule": "mage",
+               "diffusion_model": str(self.d.parent / "dit.safetensors"), "vae": str(self.d.parent / "vae.safetensors"),
+               "llm": str(self.d.parent / "text.gguf"), "lora_dir": str(self.d)}
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "hi", max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        svc.images = images.ImageModels([cfg])
+        httpd = serve(svc, port=0)
+        try:
+            def post(path, body, kind):
+                c = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=30)
+                c.request("POST", path, body, {"Content-Type": kind})
+                r = c.getresponse()
+                out = r.status, json.loads(r.read())
+                c.close()
+                return out
+            good, bad = self.d.parent / "good.safetensors", self.d.parent / "bad.safetensors"
+            safetensors(good, mage_lora())
+            safetensors(bad, {"foo.lora_A.weight": (4, 8), "foo.lora_B.weight": (8, 4)})
+            status, out = post("/v1/images/loras?name=Gouache.safetensors", good.read_bytes(),
+                               "application/octet-stream")
+            self.assertEqual((status, out["added"]["path"]), (200, "Gouache.safetensors"))
+            self.assertEqual([e["name"] for e in svc.images.default.defaults()["loras"]], ["Gouache"])
+            status, _ = post("/v1/images/loras?name=bad.safetensors", bad.read_bytes(), "application/octet-stream")
+            self.assertEqual(status, 400)
+            status, _ = post("/v1/images/loras?name=g.safetensors", good.read_bytes(), "text/plain")
+            self.assertEqual(status, 415)                    # a form or text: not an upload
+            status, out = post("/v1/images/loras/remove", json.dumps({"path": "Gouache.safetensors"}),
+                               "application/json")
+            self.assertEqual((status, out), (200, {"removed": "Gouache.safetensors"}))
+            self.assertEqual(svc.images.default.defaults()["loras"], [])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class FakeTokenizer:
     """What prompt_ids asks of a tokenizer: a prompt's ids (20 of them, as the chat form's turn has)."""
 

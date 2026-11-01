@@ -1451,7 +1451,8 @@ class ImageGen:
         (loras: each with name, path, rank, scale, trigger, targets and size_mib; serve/loras.py), and the speed it was
         measured at (rates: [megapixels, a step's seconds, the rest's] of each size, for the web page's estimate,
         estimate_s)."""
-        return {**model_defaults(self.cfg), "loras": self.loras.listing(), "size_exp": SIZE_EXP,
+        return {**model_defaults(self.cfg), "loras": self.loras.listing(), "loras_take": self.loras.takes,
+                "size_exp": SIZE_EXP,
                 "rates": {k: [[mp, *v] for mp, v in sorted(pts.items())] for k, pts in self.rates.items()}}
 
     @staticmethod
@@ -2013,6 +2014,14 @@ class ImageModels:
         quantizations, its steps and whether it edits."""
         return [{"id": g.model, "quant": g.cfg.get("quant"), "text_quant": g.cfg.get("text_quant"),
                  "steps": g.cfg.get("steps"), "edits": can_edit(g.cfg)} for g in self.gens.values()]
+
+    def folders(self) -> list:
+        """The models' LoRA folders (serve/loras.py), each once."""
+        out: list = []
+        for g in self.gens.values():
+            if all(f is not g.loras for f in out):
+                out.append(g.loras)
+        return out
 
     def models(self) -> list[dict]:
         """Each model's name, defaults and whether it edits (the web page's choice), the default first."""

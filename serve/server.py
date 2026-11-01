@@ -84,6 +84,7 @@ from serve.structured import (StructuredOutputError, answer_grammar, checked_cal
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import loras as lora_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -6847,6 +6848,15 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/images/loras/fetch/"):   # a Hugging Face fetch of the Images view, as it goes
+                if not self._authorized():
+                    return
+                f = lora_api.FETCHES.get(path[len("/v1/images/loras/fetch/"):])
+                if f is None:
+                    self._json(404, {"error": {"message": "no such fetch"}})
+                    return
+                self._json(200, f.view())
+                return
             if path.startswith("/v1/strata/replies/"):      # a kept reply again, from its line `from`
                 if not self._authorized():
                     return
@@ -7112,6 +7122,9 @@ def make_handler(svc: Service):
             if not self._authorized():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path == "/v1/images/loras" or path.startswith("/v1/images/loras/"):   # the Images view's adapters:
+                self._loras_post(path)                   # its own page checks (an upload is not JSON)
+                return
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path == "/settings":
@@ -7547,6 +7560,79 @@ def make_handler(svc: Service):
                                                       f"config's trusted_origins)"}})
                 return False
             return True
+
+        def _loras_post(self, path):
+            """The Images view's adapters (serve/loras.py): an upload (POST /v1/images/loras?name=<file>, the file
+            itself the body, application/octet-stream: a page elsewhere cannot send that without a CORS preflight,
+            which this server never grants), a remove (/v1/images/loras/remove {"path"}) and a Hugging Face fetch
+            (/v1/images/loras/fetch {"url"}, read with GET /v1/images/loras/fetch/<id>).  From this server's own page
+            (or a trusted origin), as /settings."""
+            folders = svc.images.folders() if svc.images is not None else []
+            if path == "/v1/images/loras":
+                if not self.headers.get("Content-Type", "").startswith("application/octet-stream"):
+                    self._json(415, {"error": {"message": "send the file as application/octet-stream"}})
+                    return
+                if self._foreign_origin():
+                    self._json(403, {"error": {"message": "LoRA files are added only from Strata's own page"}})
+                    return
+                name = parse_qs(urlsplit(self.path).query).get("name", [""])[0]
+                try:
+                    length = int(self.headers.get("Content-Length", ""))
+                except ValueError:
+                    self._json(411, {"error": {"message": "the upload needs a Content-Length"}})
+                    return
+                try:
+                    lora_api.file_name(name)
+                    tmp = lora_api.staging(folders, length)
+                except (lora_api.LoraError, OSError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                left = length
+                try:
+                    with open(tmp, "wb") as out:
+                        while left:
+                            chunk = self.rfile.read(min(1 << 20, left))
+                            if not chunk:
+                                raise OSError("the upload ended before its Content-Length")
+                            out.write(chunk)
+                            left -= len(chunk)
+                except OSError as e:
+                    tmp.unlink(missing_ok=True)
+                    self.close_connection = True
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                finally:
+                    self.body_read = True
+                try:
+                    added = lora_api.add(folders, tmp, name)
+                except (lora_api.LoraError, OSError) as e:
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                    return
+                print(f"[strata] LoRA added: {added['path']} ({', '.join(added['models'])})", flush=True)
+                self._json(200, {"added": added})
+                return
+            if not self._own_page("LoRA files can be added or removed"):
+                return
+            try:
+                req = json.loads(self._body() or b"{}")
+            except ValueError:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "send a JSON object"}})
+                return
+            req = req if isinstance(req, dict) else {}
+            try:
+                if path == "/v1/images/loras/remove":
+                    gone = lora_api.remove(folders, req.get("path"))
+                    print(f"[strata] LoRA removed: {gone['removed']}", flush=True)
+                    self._json(200, gone)
+                elif path == "/v1/images/loras/fetch":
+                    lora_api.staging(folders)                    # a model that takes one, before the download
+                    f = lora_api.FETCHES.start(folders, req.get("url"))
+                    print(f"[strata] LoRA fetch: {f.url}", flush=True)
+                    self._json(202, f.view())
+                else:
+                    self._json(404, {"error": {"message": f"Invalid URL (POST {path})"}})
+            except (lora_api.LoraError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _config_get(self):
             if not svc.config_path:
