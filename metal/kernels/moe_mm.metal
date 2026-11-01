@@ -267,7 +267,7 @@ kernel void mm_combine(device const float* YE [[buffer(0)]], device const int* p
 #define MMDN(F, M, N, K, S) MMDN_(F, M, N, K, S)
 #define MM_GU_SET(F) MMGU(F, 32, 64, 64, 4) MMGU(F, 64, 64, 64, 4) MMGU(F, 16, 64, 64, 2) MMGU(F, 32, 32, 64, 2)
 #define MM_DN_SET(F) MMDN(F, 32, 64, 64, 4) MMDN(F, 64, 64, 64, 4) MMDN(F, 16, 64, 64, 2) MMDN(F, 32, 32, 64, 2)
-MM_GU_SET(T_Q2_0) MM_GU_SET(T_IQ3_XXS) MM_GU_SET(T_IQ2_XXS) MM_GU_SET(T_IQ2_XS) MM_GU_SET(T_IQ2_S) MM_GU_SET(T_IQ3_S)
+MM_GU_SET(T_Q2_0) MM_GU_SET(T_IQ3_XXS) MM_GU_SET(T_IQ2_XXS) MM_GU_SET(T_IQ2_XS) MM_GU_SET(T_IQ2_S) MM_GU_SET(T_IQ3_S) MM_GU_SET(T_IQ1_M)
 MM_DN_SET(T_Q2_0) MM_DN_SET(T_IQ4_NL) MM_DN_SET(T_Q5_0)
 
 // ---- v2: activations gathered once per layer as fp16 rows, read by matmul2d from device memory ---------------------
@@ -413,6 +413,7 @@ MMDN2(T_IQ3_S, 16, 64, 16, 2) MMDN2(T_IQ3_S, 16, 64, 32, 2) MMDN2(T_IQ3_S, 16, 3
 MMGU2(T_IQ4_XS, 16, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 64, 64, 2) MMGU2(T_IQ4_XS, 32, 64, 32, 2) MMGU2(T_IQ4_XS, 16, 32, 32, 2)
 MMGU2(T_IQ4_XS, 64, 64, 32, 4)
 MM_GU2_SET(T_Q2_0) MM_GU2_SET(T_IQ3_XXS) MM_GU2_SET(T_IQ2_XXS) MM_GU2_SET(T_IQ2_XS) MM_GU2_SET(T_IQ2_S) MM_GU2_SET(T_IQ3_S)
+MM_GU2_SET(T_IQ1_M)   // IQ1_M's expert gate/up in the GSQ packs (ported from the 0.1.45 line)
 MM_GU2_SET(T_TQK6) MM_GU2_SET(T_TQ2T)   // Gyro: the trellis gate/up (units of 16 weights: TK 16 or a multiple)
 MM_GU2_SET(T_TQP5) MM_GU2_SET(T_TQP6) MM_GU2_SET(T_TQP7)   // the pair trellis gate/up (same 16-weight units)
 MM_DN2_SET(T_Q2_0)

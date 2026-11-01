@@ -518,6 +518,30 @@ template <> inline float deq<T_IQ2_S>(device const uchar* b, int ui, thread floa
     return rdh(b) * (0.5f + float((sc >> (4 * h)) & 15)) * 0.25f;
 }
 
+// IQ1_M: qs[32], qh[16], scales[8] (56 bytes); the fp16 scale is packed in the four u16 scales' nibbles.  One unit =
+// one 32-group half of 16 (grids l = 2h, 2h + 1 of group ib = ui >> 1, h = ui & 1), each grid's delta bit in qh.  The
+// delta (+-1/8) folds into q[j], the unit's scale is dl (dl1's nibble for the first unit half, dl2's for the second).
+// Ported from the 0.1.45 line's deq<T_IQ1_M>: there a packed grid_iq1m constant stores nibble j = grid-row byte j + 1
+// (the rows' bytes are -1/0/1), so here the same value is the row's signed byte straight out of the module's
+// iq1s_grid constant (the 0.1.45 threadgroup-table path is gone: TAB = 1, and load_tab<T_IQ1_M> is a no-op).
+template <> inline float deq<T_IQ1_M>(device const uchar* b, int ui, thread float* q, threadgroup const uint*) {
+    const int ib = ui >> 1, h = ui & 1;
+    device const ushort* sc = (device const ushort*)(b + 48);
+    const float d = float(as_type<half>(ushort((sc[0] >> 12) | ((sc[1] >> 8) & 0x0f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000))));
+    const float dl = d * (2 * ((sc[ib >> 1] >> (6 * (ib & 1) + 3 * h)) & 7) + 1);
+    const uint qh = b[32 + 2 * ib + h];
+    const int qb = 4 * ib + 2 * h;
+    const ulong g0 = iq1s_grid[uint(b[qb]) | ((qh << 8) & 0x700u)];
+    const ulong g1 = iq1s_grid[uint(b[qb + 1]) | ((qh << 4) & 0x700u)];
+    const float d0 = (qh & 0x08) ? -0.125f : 0.125f, d1 = (qh & 0x80) ? -0.125f : 0.125f;
+    for (int j = 0; j < 8; ++j) {
+        const uint b0 = uint((g0 >> (8 * j)) & 0xffu), b1 = uint((g1 >> (8 * j)) & 0xffu);
+        q[j] = float(int(b0) - ((b0 & 0x80u) ? 256 : 0)) + d0;
+        q[8 + j] = float(int(b1) - ((b1 & 0x80u) ? 256 : 0)) + d1;
+    }
+    return dl;
+}
+
 // IQ3_S: qs[64] low 8 bits of 9-bit indices, qh[8], signs[32], scales[4] (nibble per 32).
 template <> inline float deq<T_IQ3_S>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {
     const int ib = ui >> 1, h = ui & 1;
