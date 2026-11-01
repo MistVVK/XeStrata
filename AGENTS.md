@@ -35,6 +35,19 @@ Windows is a target as well, built natively for the MSVC ABI with intel/llvm's c
 - A change to the C++ code is also compiled for Windows on Linux with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): at least the files it touches, and the whole build, linked, when dev is integrated. It must compile and link with no new warnings.
 - Running on Windows is checked only at milestones; until then a report marks it `unverified`.
 
+### The Windows launcher does what setup does
+
+The launcher's window (`windows/launcher/`, `xestrata.exe`) is setup's front end on Windows, and offers everything `setup.py` offers a user of the 7z:
+
+- each question setup asks (step 2 and after it: the model, its size, the context, the pictures, the KV cache, the RoPE extension, the speed projection, the image models) is a field of the install page, shown where setup would ask it, with setup's default answer;
+- each option that changes an install or a start, which setup takes without asking, is a field (under Advanced);
+- each action (a start, an installed model's image models, `--calibrate`, `--bench` and `--bench-original-compat`, `--inspect`, `--remove-data`, `--check-update`) is a button, and a question setup asks during it (`--json`'s ask objects) is asked on the page.
+
+A change to setup's questions, options or defaults changes the launcher in the same commit.
+A default lives in setup alone: `--describe` reports what the window needs to show it (which questions a family and size ask, the image models a new model is offered), and the window reads it from there.
+Left out is only what the 7z cannot run: building from the source (`--license`, `--intel-llvm*`, `--cmake-arg`, `--allow-no-xmx`, `--packages`, `--update`) and `--original-strata` (upstream's engine fetched with git and built).
+`xestrata-cli.exe` runs setup on the console as it is, with every option.
+
 ## Free and non-free builds (Debian main)
 
 XeStrata builds in two modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:

@@ -32,7 +32,11 @@ type Model =
       Experimental: bool
       Recommended: bool
       /// the recommended context for this PC
-      Context: int }
+      Context: int
+      /// whether it can read pictures (setup's "Do you want images?", --vision)
+      Vision: bool
+      /// whether setup takes a RAM budget of its experts, the rest read from the SSD (--resident-budget-gib)
+      Budget: bool }
 
 type Family =
     { Id: string
@@ -43,6 +47,12 @@ type Family =
       Experimental: bool
       /// whether setup can add image generation to its models
       Images: bool
+      /// whether setup asks the KV cache's precision above 8K of context (--kv)
+      Kv: bool
+      /// whether setup asks for the experimental speed projection (--experimental-speed-projection)
+      SpeedProjection: bool
+      /// the precisions --kv takes (where setup does not ask: 16-bit unless one is given)
+      KvTakes: string[]
       Contexts: int[]
       Models: Model[] }
 
@@ -81,7 +91,9 @@ type Describe =
       DataDir: string
       Families: Family[]
       Installed: Installed[]
-      Images: ImageModel[] }
+      Images: ImageModel[]
+      /// the image models a model set up for the first time is offered (--images names, the default first)
+      ImageDefault: string[] }
 
 type Update =
     { Current: string

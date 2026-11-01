@@ -7,17 +7,30 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 English | [日本語](README.ja.md)
 
-Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
+**All in One**: chat, an API for coding agents, reading pictures and making them, on one GPU in one ordinary PC.
 
-XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that
-normally runs on a server, on your own PC.
-It uses an Intel Arc, AMD Radeon (RDNA2 or later) or NVIDIA GPU, on Linux or Windows.
+XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a 125-billion-parameter AI model
+that normally runs on a server, and models that make images, on your own PC.
+It uses one Intel Arc, AMD Radeon (RDNA2 or later) or NVIDIA GPU, on Linux or Windows.
+One run of `xestrata --setup` gives you the text model, the image models, the browser app and the API.
 Ubuntu 26.04 and Fedora 44 have deb and rpm packages, Windows a 7z, and it runs in a Podman container as well.
 It is free software, and on an Intel or AMD GPU it also builds and runs with free software only.
 
-> **Contents:** [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
+> **Contents:** [All in One](#all-in-one) · [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
 > [Choosing a model](#choosing-a-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
 > [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Image generation](docs/IMAGE.md)
+
+## All in One
+
+- **Text and images on one GPU:** the text model and the image model take turns on the same GPU and share its VRAM.
+  Before an image, the VRAM it needs is weighed against what is free: when both fit, the text model stays as it is; when they do not, the text model gives up VRAM for the while, or the image's layers are streamed from RAM.
+  Only when even that does not fit is the conversation saved and the text model unloaded, to come back with the next request ([Sharing the GPU's memory](docs/IMAGE.md#sharing-the-gpus-memory)).
+  A chat request that comes while several images are being made is answered after the current image, and the rest are made after it.
+- **Everything in one install:** `xestrata --setup` (on Windows, `xestrata.exe`'s install screen) asks for the text model, whether it should read pictures and which models should make images, and downloads them together.
+  For the image models, Enter installs three: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image.
+  Whatever is installed is used at one address, `http://127.0.0.1:8095`:
+  the browser app (Chat, Images, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image API (vLLM-Omni-compatible); asked in the chat, it makes images as well.
+- The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0 and MOSS-Image, and each goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models).
 
 ## About XeStrata
 
@@ -28,8 +41,6 @@ A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Inte
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, and the same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
 The models, the install, the app and the API are much the same as Strata's.
 
-- **Chat and coding agents:** a chat in the browser, a chat in the terminal, and OpenAI- and Anthropic-compatible APIs.
-- **Images:** it reads pictures, and it can make them too (optional; [Image generation](docs/IMAGE.md)).
 - **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B and GLM-5.3-Flash (BETA).
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC, of different makers too (with NVIDIA, in the contrib-llvm build).
   With two, it chooses by itself whichever is faster: the second GPU taking a share of the layers, or helping the first one's cache ([MULTIGPU](docs/MULTIGPU.md)).
@@ -139,7 +150,7 @@ Each model's own license applies to its files.
 
 ### Image generation (optional)
 
-`xestrata --setup --images qwen-image-turbo` installs a model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0 or OpenMOSS's MOSS-Image) besides the text model.
+A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0 or OpenMOSS's MOSS-Image) can be installed with the text model: choose it in `xestrata --setup`'s questions, or name it, as in `xestrata --setup --images qwen-image-turbo`.
 The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
 Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
 
@@ -192,6 +203,7 @@ podman compose up -d                         # http://127.0.0.1:8095 (podman com
 - **The model and its size:** see [Choosing a model](#choosing-a-model).
 - **The context:** how much text it can keep in mind at once. It suggests one for your GPU.
 - **Images:** whether it should also read pictures.
+- **Image models:** which models that make images to install: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image by default (about 60 GB to download together), none for none ([Image generation](docs/IMAGE.md)).
 - **Experimental speed projection:** an experimental feature that changes how the model answers, off by default.
   Read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before you turn it on.
 
@@ -242,7 +254,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 ### Windows
 
 1. Download `XeStrata-<version>-windows-x64.7z` from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`) and unpack it into a folder of your choice.
-1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux).
+1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux).
 
 - **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
   Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.

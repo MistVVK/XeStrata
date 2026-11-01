@@ -783,6 +783,9 @@ MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 ESP_VECTOR = (ROOT / "third_party" / "nonfree" / "experimental-speed-projection" /
               "Qwen3.8-Flash-Next-experimental-speed-projection.gguf")
 ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba2b0e1b0c8426312b"
+# the families it applies to: the Coder and Unsloth's files are the same model's residual stream (Unsloth's: the
+# user's decision of 2026-10-22)
+SPEED_PROJECTION_FAMILIES = ("qwen", "coder", "unsloth")
 
 
 def esp_release_url(name: str) -> str:
@@ -4125,7 +4128,8 @@ def ask_images(cfg_path: Path) -> str | None:
         need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
         say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
             f"~{need:.0f} GB of RAM)")
-    default = ",".join(str(plain.index(c) + 1) for c in had if c in plain) or "none"
+    # a model set up for the first time: SETUP_DEFAULT; set up again: what it has (none included)
+    default = ",".join(str(plain.index(c) + 1) for c in (had if cfg else QI.SETUP_DEFAULT) if c in plain) or "none"
     while True:
         got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
                   free=True)
@@ -4714,8 +4718,9 @@ def folder_size(path: Path) -> int:
 def remove_data() -> int:
     """--remove-data: what XeStrata keeps for this user, which apt and dnf leave when they remove the program - the
     model files, the prepared packs and the MTP layer in the data folder, the settings and model configs, the logs -
-    listed with their sizes and deleted after a yes typed at the question (--yes is not one).  GGUF files given with
-    --gguf-dir are the user's own and stay; in a Strata folder (no package), its own files stay too."""
+    listed with their sizes and deleted after a yes typed at the question (or its button in the launcher; --yes is
+    not one).  GGUF files given with --gguf-dir are the user's own and stay; in a Strata folder (no package), its own
+    files stay too."""
     settings = load_settings()
     data = Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
     targets = [data / d for d in DATA_ITEMS] + [settings_path().parent]
@@ -4728,7 +4733,12 @@ def remove_data() -> int:
     say("These folders hold what XeStrata keeps for you:")
     for t in targets:
         say(f"  {t}  ({folder_size(t) / 1e9:.1f} GB)")
-    if not sys.stdin.isatty() or input("Delete them? Type yes to delete: ").strip().lower() != "yes":
+    # --json (the Windows launcher): the question as an ask object, whose button the person presses
+    if JSON_OUT:
+        sure = ask("Delete them?", ["yes", "no"], "no", False) == "yes"
+    else:
+        sure = sys.stdin.isatty() and input("Delete them? Type yes to delete: ").strip().lower() == "yes"
+    if not sure:
         say("Nothing was deleted.")
         return 1
     for t in targets:
@@ -6009,6 +6019,13 @@ def replicas_config(a, cfg: dict) -> None:
          "check that the RAM holds them")
 
 
+def plain_kv_takes(family: str) -> tuple:
+    """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
+    forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only."""
+    return ("fp16",) if family == "glm53" else ("fp16", "int8") if family == "llmjp" else \
+        ("fp16", "int8", "q4_0", "k8v4")
+
+
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
@@ -6170,11 +6187,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
     elif vision != "none":
         args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
-    # --kv: the KV cache's precision, as far as the model's engine path takes it (the Hadamard-rotated Q4_0 forms for
-    # heads of 256; GLM-5.3-Flash's DSA caches in FP16 only)
+    # --kv: the KV cache's precision, as far as the model's engine path takes it
     if a.kv:
-        takes = ("fp16",) if family == "glm53" else ("fp16", "int8") if family == "llmjp" else \
-            ("fp16", "int8", "q4_0", "k8v4")
+        takes = plain_kv_takes(family)
         if a.kv not in takes:
             warn(f"--kv {a.kv} is not available for {fam['title']} ({', '.join(takes)}): the KV cache stays FP16")
         elif a.kv != "fp16":
@@ -6308,9 +6323,11 @@ def describe() -> dict:
     """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
     GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
     needs, whether it fits and which is recommended (the rules the questions of step 2 use, for that GPU), the data
-    folder, the installed models (and their image models), and the image models one can add.  It reports only:
-    nothing is made, moved or saved.  The front end passes its choices back as --family, --model, --context, --gpu,
-    --data-dir and --images (an installed model's image models through tools/image/install.py)."""
+    folder, the installed models (and their image models), the image models one can add and those a new model is
+    offered, and which of step 2's other questions (the pictures, the KV cache, the speed projection, a RAM budget)
+    each family and size asks.  It reports only: nothing is made, moved or saved.  The front end passes its choices
+    back as setup's options (--family, --model, --context, --vision, --kv, ..., and --images; an installed model's
+    image models through tools/image/install.py)."""
     ram = ram_gb()
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
@@ -6336,7 +6353,8 @@ def describe() -> dict:
                 models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
                                "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
                                "fits": fits, "tested": bool(d.get("tested")),
-                               "experimental": False, "recommended": m == rec, "context": ctx_f})
+                               "experimental": False, "recommended": m == rec, "context": ctx_f,
+                               "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
             max_ctx = fam["max_context"]
         else:
             names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
@@ -6349,11 +6367,17 @@ def describe() -> dict:
                         "no")
                 models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
                                "fits": fits, "tested": True, "experimental": bool(d.get("experimental")),
-                               "recommended": m == rec, "context": min(by_vram, ram_ctx(m, ram, low))})
+                               "recommended": m == rec, "context": min(by_vram, ram_ctx(m, ram, low)),
+                               "vision": d.get("vision", fam.get("vision")) is not False,
+                               "budget": bool(d.get("budget"))})
             max_ctx = CONTEXTS[-1]
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
                          "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
                          "images": not fam.get("plain"),             # setup_plain sets up no image generation
+                         # the questions setup_plain does not ask: the KV cache's precision, the speed projection
+                         "kv": not fam.get("plain"), "speed_projection": f in SPEED_PROJECTION_FAMILIES,
+                         # the precisions --kv takes; a plain family's are not asked, FP16 unless one is given
+                         "kv_takes": list(plain_kv_takes(f)) if fam.get("plain") else ["int8", "q4_0", "k8v4", "fp16"],
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
     images = []
@@ -6389,7 +6413,7 @@ def describe() -> dict:
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
                       "problem": gpu_problem(g)} for g in found],
             "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
-            "images": images}
+            "images": images, "image_default": list(QI.SETUP_DEFAULT)}
 
 
 def main() -> int:
@@ -7105,8 +7129,7 @@ def main() -> int:
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
     esp_choice = (a.experimental_speed_projection or "").strip()
-    # the Coder and Unsloth's files: the same model's residual stream (Unsloth's: the user's decision of 2026-10-22)
-    if family in ("qwen", "coder", "unsloth"):
+    if family in SPEED_PROJECTION_FAMILIES:
         if not esp_choice:
             say()
             say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")

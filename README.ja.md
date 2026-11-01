@@ -7,17 +7,30 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 [English](README.md) | 日本語
 
-1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
+**All in One**: チャット、コーディングエージェント向けの API、画像を読むこと、画像を作ることを、GPU 1 枚と普通の PC 1 台にまとめます。
 
-XeStrata は、ふつうはサーバーで動かす大きな AI モデル
-**[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** を、自分の PC で動かすためのソフトウェアです。
-GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれかを使い、OS は Linux か Windows です。
+XeStrata は、ふつうはサーバーで動かす 1,250 億パラメーターの AI モデル
+**[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** と、画像を作るモデルを、自分の PC で動かすためのソフトウェアです。
+GPU は Intel Arc、AMD Radeon（RDNA2 以降）、NVIDIA のどれか 1 枚を使い、OS は Linux か Windows です。
+`xestrata --setup` を 1 回実行すれば、文章のモデル、画像のモデル、ブラウザの画面と API がそろいます。
 Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows には 7z があり、Podman のコンテナでも動きます。
 自由ソフトウェアで、Intel と AMD の GPU なら自由ソフトウェアだけでもビルドして動かせます。
 
-> **目次:** [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
+> **目次:** [All in One](#all-in-one) · [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
 > [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md) · [画像の生成](docs/IMAGE.ja.md)
+
+## All in One
+
+- **GPU 1 枚で文章と画像**: 文章のモデルと画像のモデルは、同じ GPU を順番に使い、VRAM を分け合います。
+  画像を作る前に、その画像に要る VRAM と空きを比べ、両方が入れば文章のモデルをそのまま残し、入らなければ文章のモデルの VRAM を一時的に空けるか、画像の層を RAM から流し込みます。
+  それでも入らないときだけ、会話を保存して文章のモデルを外し、次の要求で戻します（[GPU のメモリの分け合い](docs/IMAGE.ja.md#gpu-のメモリの分け合い)）。
+  何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にチャットに答え、そのあと残りを作ります。
+- **1 回の入れ方で全部**: `xestrata --setup`（Windows では `xestrata.exe` の導入の画面）で、文章のモデル、画像を読むかどうか、画像を作るモデルを選び、まとめてダウンロードします。
+  画像を作るモデルは、Enter を押せば Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つを入れます。
+  入れたものは、どれも同じアドレス `http://127.0.0.1:8095` で使えます。
+  ブラウザの画面（Chat、Images、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作ります。
+- 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（BETA のモデルとはまだ組み合わせられません）。
 
 ## XeStrata とは
 
@@ -28,8 +41,6 @@ XeStrata は、オープンな標準の SYCL で書いた 1 つのコードで�
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコードを AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
-- **チャットとコーディングエージェント**: ブラウザのチャット、端末の会話、OpenAI 互換と Anthropic 互換の API で使えます。
-- **画像**: 画像を読ませることも、画像を作ることもできます（任意。[画像の生成](docs/IMAGE.ja.md)）。
 - **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash も動かせます（BETA）。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもでき、メーカーの違う GPU も組み合わせられます（NVIDIA を含むときは contrib-llvm のビルド）。
   2 枚のときは、2 枚目を層の分担にするか、1 枚目のキャッシュの助けにするかを、速い方に自動で選びます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
@@ -135,7 +146,7 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は setup のメニューにはな�
 
 ### 画像の生成（任意）
 
-`xestrata --setup --images qwen-image-turbo` で、文章のモデルとは別に画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image）を入れられます。
+文章のモデルと一緒に、画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image）を入れられます。`xestrata --setup` の質問で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。
 画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
@@ -188,6 +199,7 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 - **モデルと大きさ**: [モデルの選び方](#モデルの選び方)を見てください。
 - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
 - **画像**: 画像も読ませるかどうか。
+- **画像を作るモデル**: どのモデルを入れるか。既定は Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つ（ダウンロードは合わせて約 60 GB）で、none で入れません（[画像の生成](docs/IMAGE.ja.md)）。
 - **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
   [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
 
@@ -234,7 +246,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ### Windows
 
 1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
-1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。

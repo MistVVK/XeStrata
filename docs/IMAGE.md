@@ -6,9 +6,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 English | [日本語](IMAGE.ja.md)
 
-Besides the text model, XeStrata can install a model that makes images (optional).
+XeStrata makes images as well, in the same PC and on the same GPU as the text model (All in One).
+The models that make images are optional, installed with the text model by `xestrata --setup`'s questions or `--images`.
 The images are made by XeStrata's own image engine, `strata-image`. It runs on the same SYCL kernels as the text engine, on Intel, AMD and NVIDIA GPUs alike.
-It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), and is used from the web page's Images tab, from the chat and through the API (vLLM-Omni-compatible, so OpenAI-compatible).
+It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), and is used from the text model's server: the web page's Images tab, the chat and the API (vLLM-Omni-compatible, so OpenAI-compatible).
+Text and images take turns on one GPU and share its VRAM. What happens to the text model while an image is made (it stays, gives up VRAM for the while, or is unloaded and comes back) is chosen by itself from the VRAM the image needs ([Sharing the GPU's memory](#sharing-the-gpus-memory)).
 
 > **Contents:** [Choosing a model](#choosing-a-model) · [Installing](#installing) · [Sizes and memory](#sizes-and-memory) · [Options](#options) ·
 > [The web page and the chat](#the-web-page-and-the-chat) · [API](#api) · [LoRA](#lora-adapters) · [Sharing the GPU's memory](#sharing-the-gpus-memory) · [Speed](#speed) ·
@@ -59,9 +61,9 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
 - HunyuanImage 3.0 downloads five files: its image model (Tencent's quantization), the VAE, the model's own `tokenizer.json`, the `system_prompt.py` that holds its system prompt, and the last of the model's bf16 shards, which holds the SigLIP2 that reads an edit's reference images (3.3 GB, of which the engine reads 0.9 GB). It also takes what the model chooses its size with (the final norm and the output rows of the 37 aspect-ratio tokens) out of the bf16 shards by range requests, into `ratio_head.safetensors` (311 KB).
   Setup reads the system prompt out of `system_prompt.py` into `en_unified.txt` beside them (it never runs the file). It has no text encoder.
   Tencent publishes the weights in bf16 only, so XeStrata takes Tencent's quantized files (single checkpoints made for ComfyUI) pinned where they are published.
-- Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). Run again for a model, it offers that model's present ones as the default answer.
+- Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). For a model set up for the first time, the default answer is Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image (about 60 GB to download, Mage-Flow-Turbo first, the default model); run again for a model, it offers that model's present ones.
 - It does not ask with `--images` or `--yes`. Run again with `--yes` and without `--images`, setup keeps the earlier image settings as they are.
-- The Windows launcher (`xestrata.exe`) has the image models (and the sizes of those with several) on its page for installing a model, and an installed model's "Images ..." chooses its image models again (none takes image generation out).
+- The Windows launcher (`xestrata.exe`) has the image models (and the sizes of those with several) on its page for installing a model, the same three checked to begin with, and an installed model's "Images ..." chooses its image models again (none takes image generation out).
 - `--images no` removes image generation.
 - Several models can be installed, comma-separated (`--images qwen-image-turbo,magetrail`). The first is the default; the others are used through the API's `model` or the web page's choice of model.
   A size after a model's name chooses that model's own (`--images qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M`); a model without one takes `--image-quant`'s, or the RAM decides.

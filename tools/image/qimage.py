@@ -275,6 +275,9 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "moss-image-base": ("moss-image-base", "moss-base", "moss-stock"),
                 "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored")}
 DEFAULT_MODEL = "qwen-image-turbo"
+# the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
+# time (the first the default model); one set up again offers what it has
+SETUP_DEFAULT = ("mage-flow-turbo", "qwen-image-turbo", "moss-image")
 # what a front end (setup --describe, the Windows launcher) says of each choice without -uncensored
 ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "qwen-image-base": "Turbo's base model: the steps can be changed, about 5 times as long an image",
