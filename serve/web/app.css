@@ -346,6 +346,10 @@ main { flex: 1; min-height: 0; display: flex; }
 .history-actions .st-btn, .history-undo .st-btn, .pending .st-btn, .history-panel .st-btn { height: 30px; padding: 0 10px; font-size: var(--st-fs-xs); }
 .history-actions { margin-top: var(--st-s-1); }
 .st-msg--user .history-actions { justify-content: flex-end; }
+/* where a chat's next segment starts (segments.js): a rule across the chat with its words */
+.segment-divider { align-self: stretch; display: flex; align-items: center; gap: var(--st-s-2); margin: var(--st-s-2) 0;
+                   font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.segment-divider::before, .segment-divider::after { content: ""; flex: 1; border-top: 1px solid var(--st-line-soft); }
 .history-panel, .history-editor { width: 100%; display: flex; flex-direction: column; gap: var(--st-s-2); padding: var(--st-s-3);
                                   border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface-2); }
 .history-choice { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; }

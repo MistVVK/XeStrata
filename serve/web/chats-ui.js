@@ -12,7 +12,7 @@
 // messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending.
 // app.js calls initChats() once, from start().
 /* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy, pending, setBusy, renderChat,
-          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore */
+          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments */
 /* exported initChats, setChatList, syncActions, renderParent */
 "use strict";
 
@@ -263,6 +263,7 @@ const hiddenText = (n) => tr("hist.hidden", {one: "{n} message hidden", other: "
 function msgActions(m, i) {
   if (!settings.chatEdit) return null;
   if (busy && busy.msg === m) return null;              // the answer being written has no buttons until it is done
+  if (i < StrataSegments.segmentStart(messages)) return null;   // an earlier segment is read back as it was (segments.js)
   const row = node("div", "history-actions");
   const lock = historyLocked();
   const add = (label, title, run) => {

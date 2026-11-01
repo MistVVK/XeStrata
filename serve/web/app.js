@@ -4,8 +4,9 @@
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 /* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
-          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen */
-// serve/web/i18n.js, math.js, preview.js and chats-ui.js, loaded before this file
+          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen, chatId,
+          StrataSegments */
+// serve/web/i18n.js, math.js, preview.js, segments.js and chats-ui.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -975,7 +976,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait"};
+                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait", segments: true, segmentLimit: ""};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -995,6 +996,12 @@ function msgEl(m, i) {
   const el = document.createElement("div");
   el.className = `st-msg st-msg--${m.role}`;
   el.dataset.i = i;
+  if (m.role === "user" && m.segment && m.segment.k > 1) {
+    const d = document.createElement("div");
+    d.className = "segment-divider";
+    d.textContent = tr("chat.segment", "Segment {k}: the model reads the earlier ones back when it needs them", {k: m.segment.k});
+    el.appendChild(d);
+  }
   if (m.role === "user") {
     if (m.files && m.files.length) {
       const wrap = document.createElement("div");
@@ -1254,50 +1261,156 @@ $("chat").addEventListener("toggle", (e) => {
   if (d.open && body.dataset.pending) { body.textContent = messages[+d.closest(".st-msg").dataset.i].reasoning; delete body.dataset.pending; }
 }, true);
 
-function apiMessages() {
-  const out = [];
-  for (const m of messages) {
+// The messages of the current segment as the API takes them (segments.js): its system note and the exchanges it carries,
+// then its messages, each as it was sent before, so the prompt only grows. `partial`: the answer being written goes too,
+// as far as it got (a round that called the page's own tools goes on).
+function apiMessages(partial) {
+  const start = StrataSegments.segmentStart(messages), seg = messages[start] && messages[start].segment;
+  const out = seg ? [{role: "system", content: seg.system}, ...seg.carry] : [];
+  for (const m of messages.slice(start)) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
-      const text = userText(m);
+      const text = userText(m) + (m.ctx ? `\n\n${m.ctx}` : "");
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
         ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
     } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
+    } else if (partial) {
+      out.push(...assistantMessages(m, true));
     }
   }
   return out;
 }
-// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
-// their results (as the model read them), then the rest - so the next question can build on what the tools found.
-function assistantMessages(m) {
+// An answer that used tools goes back as the model wrote it: per round the text before the calls, the calls and their
+// results (as the model read them), then the rest - so the next question can build on what the tools found. With its
+// thinking where the answer keeps it (`keep`, settleTurn; always within the turn being written): then the prompt is the
+// one the model wrote, and the conversation cache serves it. An answer written since segments (`v` 2) goes back as it
+// streamed, less the blank lines the page put between rounds; an older one, trimmed as before.
+function assistantMessages(m, partial) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
+  const keep = partial || !!m.keep, exact = m.v === 2, reasoning = m.reasoning || "";
+  const words = (s) => (exact ? s : s.trim());
   // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
   // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
   if (!ran.length) {
     const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
+    if (reasoning && (keep || !m.text)) msg.reasoning_content = reasoning;
     return [msg];
   }
   const out = [];
-  let pos = 0;
+  let pos = 0, rpos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
-    const calls = ran.filter((t) => t.round === r);
+    const calls = ran.filter((t) => t.round === r), endCall = calls[calls.length - 1];
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
-              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
+    const rat = Math.min(Math.max(rpos, calls[0].rat || 0), reasoning.length);
+    const msg = {role: "assistant", content: words(m.text.slice(pos, at)),
+                 tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))};
+    if (keep && rat > rpos) msg.reasoning_content = reasoning.slice(rpos, rat);
+    out.push(msg);
     for (const t of calls) {
       const pictures = t.vision ? (t.images || []).filter((im) => safeToolMedia(im.url)) : [];
       const content = pictures.length ? [{type: "text", text: t.result}, ...pictures.map((im) =>
         ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : t.result;
       out.push({role: "tool", tool_call_id: t.id, content});
     }
-    pos = at;
+    pos = at + (exact && endCall.csep ? 2 : 0);
+    rpos = rat + (exact && endCall.rsep ? 2 : 0);
   }
-  const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  const rest = words(m.text.slice(pos)), after = reasoning.slice(rpos);
+  if (rest || (keep && after)) {
+    const msg = {role: "assistant", content: rest};
+    if (keep && after) msg.reasoning_content = after;
+    out.push(msg);
+  }
   return out;
+}
+
+// ---- segments (segments.js): one chat that goes on past the context, with no summary
+const PAGE_ROUNDS = 8;                 // rounds of the page's own tools in one turn
+// the record of the current segment, or null (a chat from before segments: it goes on as it was until a handoff)
+function segmentNow() {
+  const i = StrataSegments.segmentStart(messages);
+  return (messages[i] && messages[i].segment) || null;
+}
+// the room an answer keeps: what the settings ask for, else a tenth of the context (2K to 16K)
+function answerReserve() {
+  const ctx = health.max_context || 0;
+  return +settings.max > 0 ? +settings.max : Math.min(16384, Math.max(2048, Math.floor(ctx / 10)));
+}
+// a segment's tokens: the context less the answer's room and a twentieth for the exchanges a new segment carries, or
+// the settings' limit if smaller; 0 when the server has not said its context
+function segmentLimit() {
+  const ctx = health.max_context || 0;
+  if (!ctx) return 0;
+  const auto = ctx - answerReserve() - Math.floor(ctx / 20);
+  return Math.max(1024, +settings.segmentLimit > 0 ? Math.min(+settings.segmentLimit, auto) : auto);
+}
+function lastUserIndex() {
+  for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "user") return i;
+  return -1;
+}
+function lastAnswerBefore(i) {
+  for (let j = i - 1; j >= 0; j--) if (messages[j].role === "assistant") return messages[j];
+  return null;
+}
+// the record that makes user message i start segment k
+function newSegment(k, i, limit) {
+  const S = StrataSegments, memory = S.memoryAt(messages, i);
+  return {k, limit, system: S.systemNote(k, limit) + (memory ? `\n\nYour memory:\n${memory}` : ""),
+          carry: k > 1 ? S.carryFrom(messages, i, userText) : [],
+          tools: S.TOOLS.map((t) => t.function.name).filter((n) => k > 1 || !n.startsWith("history_"))};
+}
+// A message sent: a new chat starts segment 1; one that would take the segment past its limit (the last answer's
+// prompt and words, and this message at about two characters a token) starts the next. Else its room line.
+function placeSegment(i) {
+  if (!settings.segments) return;
+  const S = StrataSegments, u = messages[i], limit = segmentLimit();
+  if (!limit) return;
+  const prev = lastAnswerBefore(i), used = (prev && prev.used) || 0;
+  if (i === 0) u.segment = newSegment(1, i, limit);
+  else if (used && used + Math.ceil(userText(u).length / 2) > limit) u.segment = newSegment(S.segmentAt(messages, i - 1) + 1, i, limit);
+  const seg = segmentNow();
+  if (seg && !u.segment && used) u.ctx = S.roomLine(used, seg.limit);
+}
+// a turn the server refused as too long: its message starts the next segment, or, starting one already, carries one
+// exchange fewer; false when there is nothing left to take
+function handOffAt(i) {
+  if (!settings.segments || i < 0) return false;
+  const u = messages[i], limit = segmentLimit();
+  if (!limit) return false;
+  if (!u.segment) {
+    u.segment = newSegment(StrataSegments.segmentAt(messages, i - 1) + 1, i, limit);
+    delete u.ctx;
+    return true;
+  }
+  if (u.segment.carry.length > 2) { u.segment.carry = u.segment.carry.slice(-2); return true; }
+  return false;
+}
+// what the next turn needs of an answer that ended: the segment's tokens after it, and whether its thinking goes back
+// (segments.js keepThinking: its thinking against what would be read again without it, the answer and its tools'
+// results at the answer's own characters a token)
+function settleTurn(m, usage) {
+  m.v = 2;
+  m.used = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
+  if (!settings.segments) return;
+  const thinking = (usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens) || 0;
+  const chars = (m.reasoning || "").length + (m.text || "").length;
+  const perToken = usage.completion_tokens > 0 && chars > 0 ? chars / usage.completion_tokens : 3;
+  const results = (m.tools || []).reduce((n, t) => n + (t.result ? t.result.length : 0), 0);
+  const seg = segmentNow();
+  m.keep = StrataSegments.keepThinking({thinking, after: (usage.completion_tokens - thinking) + results / perToken,
+                                        used: m.used, limit: seg ? seg.limit : segmentLimit()});
+}
+// a chat that goes on for good needs a store the browser does not clear: asked once a visit, said once
+async function askPersist() {
+  try {
+    if (!navigator.storage || !navigator.storage.persist || await navigator.storage.persisted()) return;
+    if (!(await navigator.storage.persist()) && !store.get("persistTold", false)) {
+      store.set("persistTold", true);
+      toast("warn", tr("store.persistTitle", "Chats may be cleared"), tr("store.persistText", "This browser did not promise to keep this page's data. A long chat's earlier segments live there."), 8000);
+    }
+  } catch (e) { /* no storage manager here */ }
 }
 
 function busyHint() {
@@ -1400,6 +1513,7 @@ async function send(payload) {
   if (busy) { park(p, own); return; }
   clearUndo();
   messages.push({role: "user", text: p.text, images: p.images, files: p.files, time: Date.now()});
+  placeSegment(messages.length - 1);
   if (own) {
     attachments = [];
     renderAttachments();
@@ -1419,7 +1533,7 @@ async function generateReply() {
   setBusy(true);
   paintLive();
 
-  const body = {model: health.model, messages: apiMessages(), stream: true};
+  const body = {model: health.model, messages: [], stream: true};
   const effort = thinkingEffort(settings);
   if (effort) body.reasoning_effort = effort;
   if (!(settings.temperature > 0)) {
@@ -1436,64 +1550,97 @@ async function generateReply() {
   const ci = $("chat-images").value;
   if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
+  let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  const seg = segmentNow();                                  // null: a chat from before segments, or segments off
+  if (seg) {
+    body.tools = StrataSegments.TOOLS.filter((t) => seg.tools.includes(t.function.name));
+    body.prompt_cache_key = `${chatId || "chat"}-${seg.k}`;  // the same slot again for this chat (BATCHING.md)
+  }
   try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                   signal: controller.signal});
-    if (!r.ok) {
-      let msg = `HTTP ${r.status}`;
-      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = tr("toast.keyNeeded", "This server needs an API key: add it under About > Settings.");
-      throw new Error(msg);
-    }
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
-        let j;
-        try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || tr("toast.engineError", "the engine reported an error"));
-        if (j.usage) usage = j.usage;
-        if (j.strata_mcp) {
-          onTool(m, j.strata_mcp);
-          // an interjection waited for a running tool: it has its result now, so the answer can stop
-          if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; controller.abort(); }
-        }
-        const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
-        const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
-        if (d.reasoning_content) {
-          if (!firstAt) firstAt = performance.now();
-          if (!thinkStart) thinkStart = performance.now();
-          if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
-          m.reasoning += d.reasoning_content;
-        }
-        if (d.content) {
-          if (!firstAt) firstAt = performance.now();
-          if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-          if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
-          m.text += d.content;
-        }
-        if (!frame) frame = requestAnimationFrame(paint);
+    // a round that called the page's own tools goes on in another request, with their results
+    for (let round = 0; ; round++) {
+      body.messages = apiMessages(round > 0);
+      const own = [];
+      const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
+                                                     signal: controller.signal});
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+        if (r.status === 401) msg = tr("toast.keyNeeded", "This server needs an API key: add it under About > Settings.");
+        overflow = r.status === 400 && /exceeds the context window/.test(msg);
+        throw new Error(msg);
       }
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          let j;
+          try { j = JSON.parse(data); } catch (e) { continue; }
+          if (j.error) throw new Error(j.error.message || tr("toast.engineError", "the engine reported an error"));
+          if (j.usage) usage = j.usage;
+          if (j.strata_mcp) {
+            onTool(m, j.strata_mcp);
+            // an interjection waited for a running tool: it has its result now, so the answer can stop
+            if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; controller.abort(); }
+          }
+          const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+          const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
+          if (d.reasoning_content) {
+            if (!firstAt) firstAt = performance.now();
+            if (!thinkStart) thinkStart = performance.now();
+            if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) { m.reasoning += "\n\n"; lastTool.rsep = true; }
+            m.reasoning += d.reasoning_content;
+          }
+          if (d.content) {
+            if (!firstAt) firstAt = performance.now();
+            if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+            if (lastTool && m.text && lastTool.at === m.text.length) { m.text += "\n\n"; lastTool.csep = true; }
+            m.text += d.content;
+          }
+          for (const c of d.tool_calls || []) {                // the page's own tools (segments.js): it runs them
+            const o = own[c.index] || (own[c.index] = {id: "", name: "", args: ""});
+            if (c.id) o.id = c.id;
+            if (c.function && c.function.name) o.name = c.function.name;
+            if (c.function && c.function.arguments) o.args += c.function.arguments;
+          }
+          if (!frame) frame = requestAnimationFrame(paint);
+        }
+      }
+      const calls = own.filter((c) => c && StrataSegments.TOOL_NAMES.has(c.name));
+      if (!calls.length || busy.cut || round >= PAGE_ROUNDS) break;
+      const room = usage ? usage.prompt_tokens + usage.completion_tokens : 0;
+      for (const c of calls) {
+        let a = {};
+        try { a = JSON.parse(c.args || "{}"); } catch (e) { a = {}; }
+        const t = {id: c.id, name: c.name, tool: c.name, arguments: a, round: `page-${round}`, at: m.text.length, rat: m.reasoning.length,
+                   page: true, ok: true, state: "done"};
+        t.result = StrataSegments.runTool(messages, StrataSegments.segmentStart(messages), c.name, a) +
+                   (seg ? `\n${StrataSegments.roomLine(room, seg.limit)}` : "");
+        m.tools = m.tools || [];
+        m.tools.push(t);
+      }
+      if (!frame) frame = requestAnimationFrame(paint);
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
+    else if (overflow && handOffAt(lastUserIndex())) handoff = true;
     else { m.error = e.message || String(e); toast("error", tr("toast.requestFailed", "The request failed"), m.error, 6000); }
   }
   const cut = busy.cut;                                      // an interjection ended it: kept as written, marked interrupted
   if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
+  if (usage) settleTurn(m, usage);
   const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
@@ -1506,8 +1653,16 @@ async function generateReply() {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
   if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "tool limit reached ({n} rounds, mcp.max_rounds)", {n: m.limit})}`;
+  if (seg && m.used) m.meta = `${m.meta || ""} · ${tr("chat.context", "context {n} of {limit}", {n: fmt(m.used), limit: fmt(seg.limit)})}`;
   busy = null;
   setBusy(false);
+  if (handoff) {                                     // the turn did not fit: it starts the next segment and runs again
+    if (frame) cancelAnimationFrame(frame);
+    messages.splice(messages.indexOf(m), 1);
+    saveChat();
+    renderChat();
+    return generateReply();
+  }
   paintLive();
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
@@ -1659,6 +1814,9 @@ function loadDrawer(s = settings) {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   $("s-list").setAttribute("aria-checked", String(!!s.chatList));
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
+  $("s-seg").setAttribute("aria-checked", String(s.segments !== false));
+  $("s-seglimit").value = s.segmentLimit || "";
+  $("s-memory").value = StrataSegments.memoryAt(messages);
   for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy || "wait")));
   outputs();
 }
@@ -1745,7 +1903,7 @@ function outputs() {
 }
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit", "s-seg"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
@@ -1759,8 +1917,14 @@ $("s-apply").onclick = async () => {
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
-              whileBusy: segValue("s-busy") || "wait"};
+              whileBusy: segValue("s-busy") || "wait", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim()};
   store.set("sampling", settings);
+  // the chat's memory, edited here: kept on the last message, so a rewind past it takes the edit back too (segments.js)
+  const memory = $("s-memory").value;
+  if (!locked && messages.length && memory !== StrataSegments.memoryAt(messages)) {
+    messages[messages.length - 1].memoryEdit = memory;
+    saveChat();
+  }
   StrataMath.reset();                                  // math on or off: every answer is drawn again
   if (settings.chatList !== !!prev.chatList) await setChatList(settings.chatList, true);
   if (settings.chatEdit !== !!prev.chatEdit) { clearUndo(); syncActions(); }
@@ -1829,6 +1993,7 @@ async function start() {
   renderEmptyChat();
   initChats();
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
+  if (settings.segments) askPersist();
   setBusy(false);
   renderChat();
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)

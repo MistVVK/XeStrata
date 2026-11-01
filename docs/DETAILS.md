@@ -1370,6 +1370,14 @@ Every switch below is **off by default**; with all of them off the page behaves 
   *Send after*: your message waits and goes when the answer is done.
   *Interrupt*: the answer stops where it is, what was written stays and is marked interrupted, and your message goes at once; a tool that is running finishes first.
   Only one message waits, and **Take back** returns it to the box. Stop keeps a waiting message for you to send yourself.
+- **Go on past the context** (on by default). One chat goes on past the context with no summary, as [Mainplane](#mainplane)'s sessions do.
+  Within a segment the earlier messages go back as they were sent, so the prompt only grows and each turn reads only what it added.
+  Whether an answer's thinking goes back with it is decided once, when the answer ends: it does while more than half the segment is left, and where dropping it would read again more (the answer and its tools' results) than the thinking holds.
+  A message that would take the segment past its size (estimated from the last answer and the message, or refused by the server as too long) starts a new segment.
+  A new segment's prompt is a note on the segments and the tools, this chat's memory, the last two exchanges word for word, and the message.
+  The earlier segments stay in the chat, and the model finds and reads them back with tools the page runs (`history_search`, `history_read`); what must carry on it writes to the memory with `memory_write`, which every segment starts with.
+  **Segment size** makes the segments smaller (empty: the context less the answer's room), and **This chat's memory** shows the memory and lets you correct it.
+  The page draws a rule where a segment starts and offers no edit controls on an earlier segment's messages. Since the chat stays in the browser's storage, the page asks the browser not to clear it (`navigator.storage.persist()`).
 
 An answer's ` ```svg ` or ` ```html ` block gets a **Preview** button.
 The code is drawn in a frame that is cut off from the page: an empty sandbox (no scripts, forms, popups or downloads, and no access to the page, its storage or the server), a policy inside the frame that allows no address at all, and a page header (`Content-Security-Policy: frame-src 'none'`) that keeps a link or a redirect in the model's HTML from loading a web page into it.

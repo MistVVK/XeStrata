@@ -404,6 +404,17 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="toggle-row"><span><span data-i18n="drawer.edit">Edit and rewind messages</span><br><span class="muted small"
         data-i18n="drawer.editNote">edit an answer, ask for a new one, or go back to an earlier message (with an Undo)</span></span>
         <button class="st-toggle" id="s-edit" role="switch" aria-checked="false" aria-label="Edit and rewind messages" data-i18n-label="drawer.edit"></button></div>
+      <div class="toggle-row"><span><span data-i18n="drawer.segments">Go on past the context</span><br><span class="muted small"
+        data-i18n="drawer.segmentsNote">a chat that fills the context goes on in a new segment, with no summary: the model reads the earlier ones back when it needs them</span></span>
+        <button class="st-toggle" id="s-seg" role="switch" aria-checked="true" aria-label="Go on past the context" data-i18n-label="drawer.segments"></button></div>
+      <div class="st-field">
+        <label class="st-label" for="s-seglimit"><span data-i18n="drawer.segLimit">Segment size</span> <output data-i18n="drawer.segLimitNote">tokens; empty = the context less the answer's room</output></label>
+        <input class="st-input" id="s-seglimit" type="number" min="1024" step="1024" placeholder="Auto" data-i18n-placeholder="drawer.auto">
+      </div>
+      <div class="st-field">
+        <label class="st-label" for="s-memory"><span data-i18n="drawer.memory">This chat's memory</span> <output data-i18n="drawer.memoryNote">every segment starts with it</output></label>
+        <textarea class="st-input" id="s-memory" rows="4" placeholder="The model writes here what must carry on" data-i18n-placeholder="drawer.memoryEmpty"></textarea>
+      </div>
       <div class="st-field">
         <label class="st-label" for="s-busy"><span data-i18n="drawer.busy">When you send while it is answering</span></label>
         <div class="seg seg--3" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
@@ -428,6 +439,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 <script src="web/math-adapter.js"></script>
 <script src="web/history.js"></script>
 <script src="web/chatstore.js"></script>
+<script src="web/segments.js"></script>
 <script src="web/chats-ui.js"></script>
 <script src="web/app.js"></script>
 </body>
