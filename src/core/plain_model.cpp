@@ -167,6 +167,8 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         w.type = k::kNativeQ8Rows;
     }
     w.data = d;
+    // the shape's decode layout on this GPU, before any graph captures it (native_mmvq_tune)
+    if (k::native_mmvq_supported(w.type)) k::native_mmvq_tune(w.type, d, w.n_in, w.n_out, cs_);
     return true;
 }
 

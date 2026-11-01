@@ -453,6 +453,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         for (auto& item : pending) {
+            // each shape's decode layout on this GPU, before any graph captures it (native_mmvq_tune)
+            strata::kernels::native_mmvq_tune(item.type, item.data.get(), (int) item.ref->ne0, (int) item.ref->ne1,
+                                              &compute);
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();

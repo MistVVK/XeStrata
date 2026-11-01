@@ -10,7 +10,8 @@
 //         this CPU runs, 1..8 tokens, each token's rows bit for bit the scalar variant's rows for that token alone (so
 //         also the same at every width, #152); the scalar rows against ggml-cpu's vec_dot (Q2_0: a double
 //         reference), rel <= 1e-5; and where the engine's dispatch (native_gu_rows) takes the multi-token kernel from
-//         one token on (native_gu_mt_min), each token's rows the same alone and in a group.
+//         one token on (native_gu_mt_min), each token's rows the same alone and in a group: the i-quants', and the
+//         K-quants' and Q8_0's (the other models' experts) whichever kernel the dispatch takes for them.
 //     iq_avx2_parity --bench [--cpu N] [--nt 1,2,3,4] [--mb 256] [--reps 5] [--pairs iq3_s/iq4_nl,...]
 //                    [--shape 2560x640] [--dispatch]
 //         ms per expert on one thread: each variant, ggml-cpu's per-token dot, and the engine's dispatch
@@ -623,7 +624,7 @@ int main(int argc, char** argv) {
     for (int type : {16, 17, 22, 18, 21, 23}) failures += check_gate_up(type);
     for (int type : {20, 42}) failures += check_down(type);
 #if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
-    for (int type : {16, 17, 22, 18, 21, 23}) failures += check_engine_width(type);
+    for (int type : {16, 17, 22, 18, 21, 23, 10, 11, 12, 13, 14, 8}) failures += check_engine_width(type);
 #endif
     std::printf("iq_avx2_parity: %d failures\n", failures);
     return failures == 0 ? 0 : 1;

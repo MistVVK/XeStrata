@@ -36,16 +36,27 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/gpu.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <typeindex>
 
 namespace strata::kernels {
 namespace {
@@ -618,26 +629,159 @@ sycl::event launch_row(sycl::queue& q, const void* weights, const void* x_q8_1, 
     });
 }
 
+// the work-group layout: four sub-groups a row (or a row each, for rows of fewer blocks than an iteration takes)
 template<typename F, int NCOLS>
-void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+sycl::event launch_group(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+    if (n_in / F::DIV < F::BPI)
+        return launch_kernel<F, NCOLS, WARPS, WARPS>(q, weights, x_q8_1, y, n_in, n_out,
+                                                     (std::size_t(n_out) + WARPS - 1) / WARPS);
+    return launch_kernel<F, NCOLS, WARPS, 1>(q, weights, x_q8_1, y, n_in, n_out, std::size_t(n_out));
+}
+
+// Which layout a shape's rows take on a GPU.  A sub-group alone walks a row in ceil(blocks / (WARP / T)) dependent
+// steps; the work-group's four sub-groups split it and add their sums through local memory.  On a B70 the sub-group
+// is the faster up to 10 steps (the 2560-wide rows), the work-group beyond (the 6144-wide rows, 12-24 steps; the
+// 2026-10-02-xe-decode-gpu record); on an RX 9060 XT the work-group from 8 (Qwen3.5-9B's 4096-wide Q4_K and Q5_K rows:
+// its decode 47.1 -> 49.4 tok/s, 2026-11-01).  So a shape's layout is timed on each GPU on its first product
+// (native_mmvq_tune, or the first call outside a graph's capture) and kept for the process: either layout gives every
+// column the bits of its one-column call, and a shape keeping its layout keeps a token's rows the same in every
+// window.  The steps rule stands where the shape is first met in a capture, and under STRATA_MMVQ_TUNE=0.
+bool steps_rule(int blocks, int per_step) { return (blocks + per_step - 1) / per_step <= 10; }
+
+// Timed by the host over back-to-back launches, as the decode runs them (HIP's profiling events added some 35 us to
+// each kernel on an RX 9060 XT and turned its choices around).  Each timing lasts about kTuneUs, the two layouts in
+// turn kTuneRounds times.  The launches read random weights at places through a span of VRAM several times the GPU's
+// last cache (kTuneSpanCaches of it, at least kTuneSpanMin): the decode reads every other weight before a matrix
+// comes again, so its rows come from VRAM, and the same rows read again and again stayed in an RX 9060 XT's 32 MiB
+// Infinity Cache, where the sub-group's layout came out ahead and its decode the slower (4096-wide Q4_K: 54.8 us
+// against the work-group's 66.2 in the cache, the decode 47.1 tok/s against 49.4).  The span is not the cache the
+// device reports alone: HIP reports the L2 only.  Random, not zero: a GPU that compresses its memory may read a
+// zeroed buffer faster than weights.  The other layout is taken only where it beats the rule's in all the rounds but
+// one, by kTuneMargin: on an RTX 4070 every shape of Qwen3.5-9B was within 5% either way and the choices of those
+// ties changed from run to run, the text with them, for no speed; at 0.95 an RX 9060 XT's 4096 x 12288 Q4_K (0.944)
+// did too.  A shape that near the margin can still change its layout from one run to the next.  A product shorter than kTuneFloorUs keeps the
+// rule: what it could save is small and its times are the least steady.
+constexpr double kTuneUs = 3000.0;
+constexpr int kTuneRounds = 7;
+constexpr double kTuneMargin = 0.93;
+constexpr double kTuneFloorUs = 10.0;
+constexpr uint64_t kTuneSpanCaches = 4;
+constexpr uint64_t kTuneSpanMin = 256ull << 20;
+using LayoutKey = std::tuple<std::type_index, int, int>;   // the format, n_in, n_out
+std::mutex layouts_mu;
+std::map<LayoutKey, std::unique_ptr<core::PerDevice<char>>> layouts;
+
+core::PerDevice<char>& layouts_for(const LayoutKey& key) {
+    std::lock_guard<std::mutex> lock(layouts_mu);
+    auto& p = layouts[key];
+    if (!p) p = std::make_unique<core::PerDevice<char>>();
+    return *p;
+}
+
+const char* format_name(const std::type_index& t);
+
+// the faster layout of the shape on the queue's GPU (y is written; the caller's weights only where no span fits);
+// true: the sub-group's
+template<typename F>
+bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+    const bool rule = steps_rule(n_in / F::DIV, WARP / F::T);
+    uint8_t* span = nullptr;
+    try {
+        // the span: as many places for the matrix as fit, each on a 256-byte boundary
+        const sycl::device dev = q.get_device();
+        const uint64_t bytes = (uint64_t) n_out * (uint64_t) (n_in / F::DIV) * sizeof(typename F::Block);
+        const uint64_t stride = (bytes + 255) / 256 * 256;
+        uint64_t want = std::max<uint64_t>(kTuneSpanCaches * dev.get_info<sycl::info::device::global_mem_cache_size>(),
+                                           kTuneSpanMin);
+        want = std::min<uint64_t>(std::max(want, 2 * stride), dev.get_info<sycl::info::device::max_mem_alloc_size>());
+        uint64_t got = 0;
+        for (uint64_t w = want; w >= 2 * stride && span == nullptr; w /= 2) {
+            span = sycl::malloc_device<uint8_t>(w, q);
+            got = w;
+        }
+        const uint64_t places = span != nullptr ? got / stride : 1;
+        if (span != nullptr) {
+            auto* w32 = reinterpret_cast<uint32_t*>(span);
+            q.parallel_for(sycl::range<1>((size_t) (places * stride / 4)), [=](sycl::id<1> i) {
+                uint32_t x = (uint32_t) i[0] * 2654435761u;
+                x ^= x >> 13;
+                x *= 0x5bd1e995u;
+                w32[i] = x ^ (x >> 15);
+            }).wait_and_throw();
+        }
+        uint64_t next = 0;
+        auto run = [&](int l) {
+            const void* w = span != nullptr ? (const void*) (span + (next++ % places) * stride) : weights;
+            if (l == 1) launch_row<F, 1, 8>(q, w, x_q8_1, y, n_in, n_out);
+            else launch_group<F, 1>(q, w, x_q8_1, y, n_in, n_out);
+        };
+        auto timed = [&](int l, int reps) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < reps; ++i) run(l);
+            q.wait_and_throw();
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+        };
+        run(0);
+        run(1);
+        q.wait_and_throw();
+        const int reps = (int) std::clamp(kTuneUs / std::max(timed(rule ? 1 : 0, 4), 1.0), 4.0, 2000.0);
+        timed(0, reps);   // the GPU's clocks up before the rounds
+        double us[2] = {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity()};
+        double ratio[kTuneRounds];   // the other layout's time over the rule's, a round
+        for (int round = 0; round < kTuneRounds; ++round) {
+            const double g = timed(0, reps), r = timed(1, reps);
+            us[0] = std::min(us[0], g);
+            us[1] = std::min(us[1], r);
+            ratio[round] = rule ? g / r : r / g;
+        }
+        std::sort(ratio, ratio + kTuneRounds);
+        const double worse = ratio[kTuneRounds - 2];   // the other's second least favourable round
+        const bool row = us[rule ? 1 : 0] >= kTuneFloorUs && worse < kTuneMargin ? !rule : rule;
+        static const bool log_all = std::getenv("STRATA_MMVQ_TUNE_LOG") != nullptr;
+        if (row != rule || log_all)
+            std::fprintf(stderr, "strata: the decode products of %s %d -> %d on %s: %s a row (timed: %.1f us a "
+                                 "work-group, %.1f a sub-group; the other's rounds at %.3f of the rule's or less "
+                                 "but one)\n", format_name(std::type_index(typeid(F))), n_in, n_out,
+                         dev.get_info<sycl::info::device::name>().c_str(), row ? "a sub-group" : "a work-group",
+                         us[0], us[1], worse);
+        if (span != nullptr) sycl::free(span, q);
+        return row;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata: timing the decode products of %s %d -> %d: %s\n",
+                     format_name(std::type_index(typeid(F))), n_in, n_out, e.what());
+        if (span != nullptr) {
+            q.wait();
+            sycl::free(span, q);
+        }
+        return rule;
+    }
+}
+
+bool env_off(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr && std::strtol(v, nullptr, 10) == 0;
+}
+
+// the shape's layout on the queue's GPU (true: a sub-group a row), timed over the call's buffers the first time
+template<typename F>
+bool row_layout(sycl::queue& q, void* stream, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+    static const bool tune = !env_off("STRATA_MMVQ_TUNE");
+    if (!tune) return steps_rule(n_in / F::DIV, WARP / F::T);
+    return layouts_for(LayoutKey{std::type_index(typeid(F)), n_in, n_out}).get(q.get_device(), [&]() -> char {
+        if (gpu::is_capturing(stream)) return steps_rule(n_in / F::DIV, WARP / F::T);
+        return time_layout<F>(q, weights, x_q8_1, y, n_in, n_out);
+    }) != 0;
+}
+
+template<typename F, int NCOLS>
+void launch_n(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, bool row) {
     if (NCOLS > 1 && !g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         launch_kernel<F, NCOLS, NW, 2>(q, weights, x_q8_1, y, n_in, n_out, (std::size_t(n_out) + 1) / 2);
         return;
     }
-    // A sub-group alone walks a row in ceil(blocks / (WARP / T)) dependent steps: up to 10 (the 2560-wide rows) it
-    // beats the work-group layout, beyond (the 6144-wide rows, 12-24 steps) the work-group's four sub-groups win
-    // (the 2026-10-02-xe-decode-gpu record).
-    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
-    if (steps <= 10) {
-        launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
-        return;
-    }
-    if (n_in / F::DIV < F::BPI)
-        launch_kernel<F, NCOLS, WARPS, WARPS>(q, weights, x_q8_1, y, n_in, n_out,
-                                              (std::size_t(n_out) + WARPS - 1) / WARPS);
-    else
-        launch_kernel<F, NCOLS, WARPS, 1>(q, weights, x_q8_1, y, n_in, n_out, std::size_t(n_out));
+    if (row) launch_row<F, NCOLS, 8>(q, weights, x_q8_1, y, n_in, n_out);
+    else launch_group<F, NCOLS>(q, weights, x_q8_1, y, n_in, n_out);
 }
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
@@ -665,16 +809,41 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
     validate_pointer(x_q8_1);
     validate_pointer(y);
     auto& q = validate_stream(stream);
+    const bool row = row_layout<F>(q, stream, weights, x_q8_1, y, n_in, n_out);
     switch (ncols) {
-        case 1: launch_n<F, 1>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 2: launch_n<F, 2>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 3: launch_n<F, 3>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 4: launch_n<F, 4>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 5: launch_n<F, 5>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out); break;
-        case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out); break;
+        case 1: launch_n<F, 1>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 2: launch_n<F, 2>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 3: launch_n<F, 3>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 4: launch_n<F, 4>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 5: launch_n<F, 5>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out, row); break;
     }
+}
+
+// native_mmvq_tune: the layout timed over a zero activation and an output of the shape's own
+template<typename F>
+void mmvq_tune(const void* weights, int n_in, int n_out, void* stream) {
+    validate_shape(n_in, 1, F::DIV);
+    if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
+    validate_pointer(weights);
+    auto& q = validate_stream(stream);
+    if (env_off("STRATA_MMVQ_TUNE") || gpu::is_capturing(stream)) return;
+    layouts_for(LayoutKey{std::type_index(typeid(F)), n_in, n_out}).get(q.get_device(), [&]() -> char {
+        void* x = sycl::malloc_device(native_q8_1_bytes(n_in, 1), q);
+        float* y = sycl::malloc_device<float>((size_t) n_out, q);
+        if (x == nullptr || y == nullptr) {   // no VRAM for it: the rule, as in a capture
+            if (x != nullptr) sycl::free(x, q);
+            if (y != nullptr) sycl::free(y, q);
+            return steps_rule(n_in / F::DIV, WARP / F::T);
+        }
+        q.memset(x, 0, native_q8_1_bytes(n_in, 1)).wait_and_throw();
+        const bool row = time_layout<F>(q, weights, x, y, n_in, n_out);
+        sycl::free(x, q);
+        sycl::free(y, q);
+        return row;
+    });
 }
 
 // the pair in one launch where launch_n would take launch_row (a row of at most 10 steps; exact multi-column
@@ -690,8 +859,7 @@ bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, fl
     validate_pointer(y1);
     validate_pointer(y2);
     auto& q = validate_stream(stream);
-    const int steps = (n_in / F::DIV + WARP / F::T - 1) / (WARP / F::T);
-    if ((ncols > 1 && !g_multi_exact) || steps > 10) return false;
+    if ((ncols > 1 && !g_multi_exact) || !row_layout<F>(q, stream, w1, x_q8_1, y1, n_in, n_out)) return false;
     switch (ncols) {
         case 1: launch_row<F, 1, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
         case 2: launch_row<F, 2, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
@@ -744,6 +912,18 @@ struct Q80RowTraits {
     }
 };
 using IQ4NLTraits = SmallTraits<IQ4NLBlock, 4>;
+
+const char* format_name(const std::type_index& t) {
+    const std::pair<std::type_index, const char*> names[] = {
+        {typeid(Q5KTraits), "Q5_K"}, {typeid(Q4KTraits), "Q4_K"}, {typeid(Q20Traits), "Q2_0"},
+        {typeid(Q3KTraits), "Q3_K"}, {typeid(Q2KTraits), "Q2_K"}, {typeid(Q6KTraits), "Q6_K"},
+        {typeid(Q6KRowTraits), "Q6_K"}, {typeid(IQ4XSTraits), "IQ4_XS"}, {typeid(Q40Traits), "Q4_0"},
+        {typeid(Q50Traits), "Q5_0"}, {typeid(Q80Traits), "Q8_0"}, {typeid(Q80RowTraits), "Q8_0"},
+        {typeid(IQ4NLTraits), "IQ4_NL"}};
+    for (const auto& [ti, name] : names)
+        if (ti == t) return name;
+    return "a format";
+}
 
 } // namespace
 
@@ -994,6 +1174,29 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 7: case 16: case 17: case 18: case 19: case 21: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
+    }
+}
+
+void native_mmvq_tune(int ggml_type, const void* weights, int n_in, int n_out, void* stream) {
+    switch (ggml_type) {
+    case 2: mmvq_tune<Q40Traits>(weights, n_in, n_out, stream); break;
+    case 6: mmvq_tune<Q50Traits>(weights, n_in, n_out, stream); break;
+    case 8: mmvq_tune<Q80Traits>(weights, n_in, n_out, stream); break;
+    case 20: mmvq_tune<IQ4NLTraits>(weights, n_in, n_out, stream); break;
+    case 10: mmvq_tune<Q2KTraits>(weights, n_in, n_out, stream); break;
+    case 11: mmvq_tune<Q3KTraits>(weights, n_in, n_out, stream); break;
+    case 12: mmvq_tune<Q4KTraits>(weights, n_in, n_out, stream); break;
+    case 13: mmvq_tune<Q5KTraits>(weights, n_in, n_out, stream); break;
+    case 14: mmvq_tune<Q6KTraits>(weights, n_in, n_out, stream); break;
+    case kNativeQ6KRows:
+        if (native_q6_k_rows_ok(n_in)) mmvq_tune<Q6KRowTraits>(weights, n_in, n_out, stream);
+        break;
+    case kNativeQ8Rows:
+        if (native_q8_0_rows_ok(n_in)) mmvq_tune<Q80RowTraits>(weights, n_in, n_out, stream);
+        break;
+    case 23: mmvq_tune<IQ4XSTraits>(weights, n_in, n_out, stream); break;
+    case 42: mmvq_tune<Q20Traits>(weights, n_in, n_out, stream); break;
+    default: break;   // the i-quants' own kernels (iq_mmvq), BF16: one layout
     }
 }
 
