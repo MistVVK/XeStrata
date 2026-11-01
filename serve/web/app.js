@@ -115,8 +115,9 @@ function saveApiKey(notify = false) {
   apiKey = $("api-key").value.trim();                // usable even when browser storage is blocked or full
   const saved = store.set("apikey", apiKey);
   if (notify) {
-    if (saved) toast("success", "API key saved", "Kept in this browser only.");
-    else toast("warn", "API key used for this page only", "Browser storage is unavailable. Enter it again after reloading.");
+    if (saved) toast("success", tr("about.keySaved", "API key saved"), tr("about.keySavedText", "Kept in this browser only."));
+    else toast("warn", tr("about.keyPageOnly", "API key used for this page only"),
+               tr("about.keyPageOnlyText", "Browser storage is unavailable. Enter it again after reloading."));
   }
 }
 $("api-key").oninput = () => saveApiKey();
@@ -194,19 +195,20 @@ $("model-select").onchange = async () => {
 };
 
 // ------------------------------------------------------------------ Monitor
+// label: in the language of the moment (renderMonitor writes it again after a switch)
 const METRICS = [
-  {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
-  {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
-  {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
-  {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
-  {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
-  {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
-  {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
-  {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "speed", label: () => tr("mon.speed", "Speed"), icon: "gauge", unit: "t/s", series: "tok_s"},
+  {key: "gpu", label: () => tr("mon.gpuLoad", "GPU load"), icon: "gpu", unit: "%", series: "gpu_util", max: 100},
+  {key: "vram", label: () => "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
+  {key: "temp", label: () => tr("mon.gpuTemp", "GPU temp"), icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
+  {key: "power", label: () => tr("mon.power", "Power"), icon: "bolt", unit: "W", series: "gpu_power"},
+  {key: "pcie", label: () => "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
+  {key: "cpu", label: () => "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
+  {key: "disk", label: () => tr("mon.diskRead", "Disk read"), icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"><div class="st-metric">
-    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
+    <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}<span id="ml-${m.key}">${esc(m.label())}</span></span>
     ${m.key === "speed" ? `<div class="speed-values">
       <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span></div>
@@ -263,6 +265,8 @@ let metricsEpoch = 0;
 // poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
 let metricsHold = null;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+// /metrics live.loading: the model is loading again ("after_image": an image job unloaded it), which a request waits for
+let modelLoading = null;
 function metricsAgree(live, state) {
   const s = (live && live.state) || "";
   if (state === "unloaded") return s === "unloaded";
@@ -285,6 +289,8 @@ async function poll() {
       lastMetrics = m;
       metricsFailures = 0;
       render(lastMetrics);
+      const loading = (m.live && m.live.loading) || null;
+      if (loading !== modelLoading) { modelLoading = loading; if (busy) setBusy(true); }
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -483,7 +489,8 @@ function render(m) {
 function since(t) {
   if (!t) return "";
   const s = Math.max(0, Date.now() / 1000 - t);
-  return s < 60 ? "just now" : s < 3600 ? `${fmt(s / 60)} min ago` : `${fmt(s / 3600, 1)} h ago`;
+  return s < 60 ? tr("mon.justNow", "just now") : s < 3600 ? tr("mon.minAgo", "{n} min ago", {n: fmt(s / 60)})
+                                                     : tr("mon.hAgo", "{n} h ago", {n: fmt(s / 3600, 1)});
 }
 function renderConvCache(c) {
   $("cc-card").hidden = !c;
@@ -497,30 +504,46 @@ function renderConvCache(c) {
     $("cc-mem-text").textContent = `${gb(c.bytes)} / ${gb(budget)} GB`;
     $("cc-mem-bar").style.width = pct(c.bytes, budget);
   }
-  $("cc-sum").textContent = c.requests ? `${fmt(c.requests_reused)} of ${fmt(c.requests)} requests reused part of their prompt` : "";
-  const share = c.prompt_tokens ? ` (${fmt((100 * c.reused_tokens) / c.prompt_tokens)}% of all prompt tokens)` : "";
-  const event = c.last_event ? `${c.last_event === "parked" ? "Parked" : "Restored"} ${fmt(c.last_tokens)} tokens, ${since(c.last_at)}` : null;
+  $("cc-sum").textContent = c.requests ? tr("mon.ccSum", "{reused} of {requests} requests reused part of their prompt",
+                                            {reused: fmt(c.requests_reused), requests: fmt(c.requests)}) : "";
+  const share = c.prompt_tokens ? tr("mon.ccShare", " ({pct}% of all prompt tokens)", {pct: fmt((100 * c.reused_tokens) / c.prompt_tokens)}) : "";
+  const event = !c.last_event ? null : c.last_event === "parked"
+    ? tr("mon.ccParked", "Parked {n} tokens, {when}", {n: fmt(c.last_tokens), when: since(c.last_at)})
+    : tr("mon.ccRestored", "Restored {n} tokens, {when}", {n: fmt(c.last_tokens), when: since(c.last_at)});
   facts($("cc-facts"), [
-    ["Last request", c.last_prompt != null ? `${fmt(c.last_reused || 0)} of ${fmt(c.last_prompt)} prompt tokens reused` : null],
-    ["Reused since start", c.requests ? `${fmt(c.reused_tokens)} tokens${share}` : null],
-    ["Parked / restored", c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}${c.evictions ? ` · ${fmt(c.evictions)} evicted` : ""}` : null],
-    ["Last switch", c.enabled ? event : null],
+    [tr("mon.ccLast", "Last request"), c.last_prompt != null ? tr("mon.ccLastValue", "{reused} of {prompt} prompt tokens reused",
+                                                                  {reused: fmt(c.last_reused || 0), prompt: fmt(c.last_prompt)}) : null],
+    [tr("mon.ccSince", "Reused since start"), c.requests ? tr("mon.ccSinceValue", "{n} tokens{share}", {n: fmt(c.reused_tokens), share}) : null],
+    [tr("mon.ccParks", "Parked / restored"), c.enabled ? `${fmt(c.parks)} / ${fmt(c.restores)}` +
+      (c.evictions ? tr("mon.ccEvicted", " · {n} evicted", {n: fmt(c.evictions)}) : "") : null],
+    [tr("mon.ccSwitch", "Last switch"), c.enabled ? event : null],
   ]);
   $("cc-note").textContent = c.enabled
-    ? "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full."
-    : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
+    ? tr("mon.ccNoteOn", "A request that continues a parked conversation gets its state back instead of reading it again; the oldest goes when the slots or the memory are full.")
+    : tr("mon.ccNoteOff", "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).");
 }
 
 function renderTotals(t) {
   if (!t || !t.requests) return "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
-  const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
-  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+  const pSpeed = t.prompt_ms > 0 && read > 0 ? tr("mon.atRate", " at {rate} tok/s", {rate: fmt(read / (t.prompt_ms / 1000))}) : "";
+  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? tr("mon.atRate", " at {rate} tok/s", {rate: fmt(t.output_tokens / (t.decode_ms / 1000), 1)}) : "";
+  return tr("mon.totals", "Since {since}: {requests} requests · {read} prompt tokens read{prefill} ({reused} reused) · {written} written{decode}",
+            {since, requests: fmt(t.requests), read: fmt(read), prefill: pSpeed, reused: fmt(t.reused), written: fmt(t.output_tokens), decode: oSpeed});
+}
+// the server's phase of a turn (serve/server.py), in the language of the moment; another one as the server says it
+function phaseText(phase) {
+  if (!phase) return tr("mon.generating", "Generating");
+  const tool = /^writing a tool call: (.*)$/.exec(phase);
+  if (tool) return tr("mon.phaseTool", "Writing a tool call: {name}", {name: tool[1]});
+  const known = {thinking: () => tr("mon.phaseThinking", "Thinking"), answering: () => tr("mon.phaseAnswering", "Answering"),
+                 "tool call complete": () => tr("mon.phaseToolDone", "Tool call complete"),
+                 "reading the prompt": () => tr("pill.reading", "Reading prompt")};
+  return known[phase] ? known[phase]() : phase[0].toUpperCase() + phase.slice(1);
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
+  for (const m of METRICS) $(`ml-${m.key}`).textContent = m.label();
   // model state
   // A local turn keeps metrics on "unloaded" for the whole engine start.
   const imageNow = imageLive(live);
@@ -531,7 +554,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     b.classList.toggle("on", lit);
   }
   const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
+  let label = tr("mon.waiting", "Waiting for a request"), detail = "", pct = 0;
   if (live.image) {
     const img = live.image;
     label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
@@ -542,38 +565,39 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
               img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
       .filter(Boolean).join(" · ");
   } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
-    label = "Loading";
+    label = tr("mon.loading", "Loading");
     delete prog.dataset.tone;
-    detail = "The model is loading.";
+    detail = tr("mon.loadingDetail", "The model is loading.");
   } else if (imageNow) {
     label = tr("img.generating", "Generating image");
     delete prog.dataset.tone;
     detail = tr("model.imageBusy", "An image is generating. It finishes on its own.");
   } else if (modelOp === "unload") {
-    label = "Unloading";
+    label = tr("mon.unloading", "Unloading");
     delete prog.dataset.tone;
-    detail = "Freeing the GPU.";
+    detail = tr("mon.unloadingDetail", "Freeing the GPU.");
   } else if (live.state === "reading") {
-    label = "Reading prompt";
+    label = tr("pill.reading", "Reading prompt");
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+      detail = tr("mon.readProgress", "{read} / {total} tokens · {pct}%", {read: fmt(live.prompt_read), total: fmt(live.prompt_total), pct: fmt(pct)});
     } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
+      detail = tr("chat.tokens", "{n} tokens", {n: fmt(live.prompt_tokens)});
     }
   } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+    label = phaseText(live.phase);
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = tr("mon.genProgress", "{n} tokens · {rate} tok/s", {n: fmt(live.generated), rate: fmt(live.tok_s, 1)});
   } else if (live.state === "unloaded") {
-    label = "Unloaded";
+    label = tr("pill.unloaded", "Unloaded");
     delete prog.dataset.tone;
-    detail = "Load brings it back. A message does too.";
+    detail = tr("mon.unloadedDetail", "Load brings it back. A message does too.");
   } else if (last) {
     delete prog.dataset.tone;
-    detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
+    detail = last.decode_tok_s ? tr("mon.lastAt", "last: {n} tokens at {rate} tok/s", {n: fmt(last.output_tokens), rate: fmt(last.decode_tok_s, 1)})
+                               : tr("mon.last", "last: {n} tokens", {n: fmt(last.output_tokens)});
   }
   if (fail && live.state === "idle") {   // issue #10: the last engine that stopped, until a request runs again
     label = tr("engine.stoppedAt", "Engine stopped at {time}", {time: new Date(fail.at * 1000).toLocaleTimeString()});
@@ -591,13 +615,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   } else {
     const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-              live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+              live.state === "generating" ? tr("mon.decodeNow", "Decode now") : last ? tr("mon.decodeLast", "Decode last request") : tr("mon.decode", "Decode"));
   }
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   if (live.image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
   else setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-                 live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+                 live.state === "reading" ? tr("mon.prefillNow", "Prefill now") : live.state === "generating" ? tr("mon.prefillThis", "Prefill this request")
+                 : last ? tr("mon.prefillLast", "Prefill last request") : tr("mon.prefill", "Prefill"));
   spark("sp-speed", h.tok_s, undefined, true);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
@@ -608,7 +633,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : "");
+                  : eng.expert_slots ? tr("mon.expertsCached", "{n} experts cached", {n: fmt(eng.expert_slots)}) : "");
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
   // an idle GPU on the xe driver may report its last temperature, not its present one (Battlemage's hwmon): dimmed
   const stale = Boolean(hw.gpu_temp_may_be_stale) && hw.gpu_temp != null;
@@ -618,21 +643,23 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
             : hw.gpu_mem_temp == null ? "" : `VRAM ${fmt(hw.gpu_mem_temp)} °C`);
   $("mv-temp").classList.toggle("is-stale", stale);
   spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");
+  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? tr("mon.powerLimit", "of {n} W limit", {n: fmt(hw.gpu_power_limit)}) : "");
   spark("sp-power", h.gpu_power, hw.gpu_power_limit);
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
+            hw.gpu_pcie_rx_mb == null ? "" : tr("mon.toGpu", "to GPU {rate} MB/s", {rate: fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)}) +
             (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · ${tr("mon.nowGen", "now Gen{n}", {n: hw.gpu_pcie_own_gen})}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
-  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
+  setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", !st.threads ? ""
+            : st.cores ? tr("mon.coresThreads", "{cores} cores · {threads} threads", {cores: st.cores, threads: st.threads})
+            : tr("mon.threads", "{threads} threads", {threads: st.threads}));
   spark("sp-cpu", h.cpu, 100);
   if (hw.disk_read_mb == null) {
-    setMetric("disk", null, "", st.psutil ? "" : "needs psutil (setup installs it)");
+    setMetric("disk", null, "", st.psutil ? "" : tr("mon.needsPsutil", "needs psutil (setup installs it)"));
   } else {
     const big = hw.disk_read_mb >= 1000;
     setMetric("disk", big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
-              hw.disk_write_mb == null ? "" : `write ${fmt(hw.disk_write_mb, 1)} MB/s`);
+              hw.disk_write_mb == null ? "" : tr("mon.diskWrite", "write {rate} MB/s", {rate: fmt(hw.disk_write_mb, 1)}));
   }
   spark("sp-disk", h.disk_read_mb);
 
@@ -659,11 +686,11 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="muted">${esc(tr("mon.noRequests", "No requests yet"))}</td></tr>`;
   } else {
-    const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
-                   timeout: ["st-badge--queued", "Timeout"]};
+    const badge = {stop: ["", tr("tool.done", "Done")], length: ["", tr("drawer.maxTokens", "Max tokens")],
+                   cancel: ["st-badge--queued", tr("chat.stopped", "Stopped")], disconnect: ["st-badge--queued", tr("mon.closed", "Closed")],
+                   error: ["st-badge--error", tr("tool.error", "Error")], timeout: ["st-badge--queued", tr("mon.timeout", "Timeout")]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -679,10 +706,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
           <td colspan="6" class="req-image${r.error ? " req-image--error" : ""}">${esc(what)}${stages ? ` <span class="muted">· ${esc(stages)}</span>` : ""}</td>
           <td class="num">${fmt(r.seconds != null ? r.seconds : r.duration_s, 1)} s</td></tr>`;
       }
-      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
+      const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="${esc(r.projection ? tr("mon.projOn", "experimental speed projection on") : tr("mon.projOff", "experimental speed projection off"))}">${r.projection ? "ESP" : esc(tr("mon.stock", "stock"))}</span>`;
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "") +
+        (r.pcie_share ? ` <span class="muted" title="${esc(tr("mon.pcieShare", "routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed"))}">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "") +
         // the experts below VRAM: taken from the RAM copy and read from the model files (the SSD), as the engine counts them
         ([r.ram_blobs ? `RAM ${fmt(r.ram_blobs)}` : null,
           r.file_blobs ? `SSD ${fmt(r.file_blobs)}${r.file_mb ? ` (${fmt(r.file_mb / 1000, 1)} GB)` : ""}` : null]
@@ -698,65 +725,73 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
   all.hidden = kept <= 12;
-  all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
+  all.textContent = reqShowAll ? tr("mon.showFewer", "Show fewer") : tr("mon.showAll", "Show all ({n})", {n: kept});
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
 }
 
 function facts(el, rows) {
   el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
-    `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
+    `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="${esc(tr("chat.copy", "Copy"))}">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
 }
 // INFO cvec=project:4-44[:singleL] | add:A-B | 0
 function projectionText(c) {
   if (!c || c === "0" || c === 0) return null;
   const [mode, range, single] = String(c).split(":");
   const [a, b] = (range || "").split("-");
-  return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
-         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
-         "describes the vector as a refusal-direction projection; measure the speed yourself";
+  const vars = {a, b, single: single ? tr("about.projSingle", " (layer {n}'s direction)", {n: single.replace("single", "")}) : ""};
+  return mode === "project"
+    ? tr("about.projProject", "Projection control vector on layers {a}–{b}{single}. Per chat in Sampling. Its package describes the vector as a refusal-direction projection; measure the speed yourself", vars)
+    : tr("about.projAdd", "Additive control vector on layers {a}–{b}{single}. Per chat in Sampling. Its package describes the vector as a refusal-direction projection; measure the speed yourself", vars);
 }
 // the picture reader that serves: where it runs and how many tokens a picture becomes (an older server: on or off)
 function visionText(eng) {
   const v = eng.vision;
-  if (v === undefined) return eng.images ? "on" : "off";
-  if (!v) return "off";
-  if (v.error) return `off: ${v.error}`;
-  const where = /GPU/.test(v.encoder || "") ? "on the GPU" : "on the CPU";
-  return `${where}, up to ${fmt(v.max_tokens)} tokens a picture${v.fallback ? ` (the configured encoder did not start: ${v.fallback})` : ""}`;
+  if (v === undefined) return eng.images ? tr("about.on", "on") : tr("img.off", "off");
+  if (!v) return tr("img.off", "off");
+  if (v.error) return tr("about.visionOff", "off: {error}", {error: v.error});
+  const vars = {n: fmt(v.max_tokens), fallback: v.fallback ? tr("about.visionFallback", " (the configured encoder did not start: {why})", {why: v.fallback}) : ""};
+  return /GPU/.test(v.encoder || "") ? tr("about.visionGpu", "on the GPU, up to {n} tokens a picture{fallback}", vars)
+                                     : tr("about.visionCpu", "on the CPU, up to {n} tokens a picture{fallback}", vars);
 }
 // one row a model, the default first: its quantizations, steps and whether it edits
 function imageModelRows(models) {
   if (!Array.isArray(models)) return [];
-  if (!models.length) return [["Image generation", "off"]];
-  return models.map((m, i) => [i ? "" : "Image generation",
-    `${m.id}${i ? "" : " (default)"}: ${[m.quant ? `DiT ${m.quant}` : null, m.text_quant ? `text encoder ${m.text_quant}` : null,
-                                          m.steps ? `${m.steps} steps` : null, m.edits ? "edits images" : null].filter(Boolean).join(", ")}`]);
+  const title = tr("about.imageGen", "Image generation");
+  if (!models.length) return [[title, tr("img.off", "off")]];
+  return models.map((m, i) => [i ? "" : title,
+    `${m.id}${i ? "" : ` ${tr("drawer.thinkDefault", "(default)")}`}: ${[m.quant ? `DiT ${m.quant}` : null,
+      m.text_quant ? tr("about.textEncoder", "text encoder {quant}", {quant: m.text_quant}) : null,
+      m.steps ? tr("about.steps", "{n} steps", {n: m.steps}) : null, m.edits ? tr("about.edits", "edits images") : null].filter(Boolean).join(", ")}`]);
 }
 function renderAbout(eng, hw, st) {
-  const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
+  const kv = {int8: tr("about.kv8", "8-bit"), q4_0: tr("about.kv4", "4-bit (Hadamard-rotated)"), fp16: tr("about.kv16", "16-bit")}[eng.kv] || eng.kv;
+  const drafts = Math.max(0, (eng.mtp_max || eng.spec) - 1);
   facts($("facts-engine"), [
-    ["Model", eng.model],
-    ["Engine", eng.version ? `v${eng.version}` : "built from source"],
-    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
-    ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
-    ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
-    ["Reading images", visionText(eng)],
+    [tr("switch.model", "Model"), eng.model],
+    [tr("about.engine", "Engine"), eng.version ? `v${eng.version}` : tr("about.fromSource", "built from source")],
+    [tr("about.context", "Context"), eng.max_context ? tr("chat.tokens", "{n} tokens", {n: fmt(eng.max_context)}) : null],
+    [tr("about.kv", "KV cache"), !kv ? null : eng.kv_resident
+      ? tr("about.kvStreamed", "{kv}, streamed: {n} positions per layer in VRAM, the rest in RAM", {kv, n: fmt(eng.kv_resident)})
+      : tr("about.kvAll", "{kv}, all in VRAM", {kv})],
+    [tr("mon.expertsVram", "Experts in VRAM"), eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
+    [tr("about.spec", "Speculation"), !eng.spec ? null : eng.lookup ? tr("about.specLookup", "MTP drafts up to {n} tokens, prompt lookup on", {n: drafts})
+                                                                     : tr("about.specMtp", "MTP drafts up to {n} tokens", {n: drafts})],
+    [tr("about.vision", "Reading images"), visionText(eng)],
     ...imageModelRows(eng.image_models),
-    ["Experimental speed projection", projectionText(eng.cvec)],
+    [tr("about.projection", "Experimental speed projection"), projectionText(eng.cvec)],
     [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("about.gpuUnreadable", "not readable (xe driver)")],
-    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
+    ["CPU", !st.cpu_name ? null : st.threads ? tr("about.cpuThreads", "{name}, {threads} threads", {name: st.cpu_name, threads: st.threads}) : st.cpu_name],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
   const base = location.origin;
   facts($("facts-api"), [
-    ["OpenAI base URL", `${base}/v1`, true],
-    ["Anthropic base URL", base, true],
-    ["Model name", eng.model, true],
+    [tr("about.openaiUrl", "OpenAI base URL"), `${base}/v1`, true],
+    [tr("about.anthropicUrl", "Anthropic base URL"), base, true],
+    [tr("about.modelName", "Model name"), eng.model, true],
   ]);
 }
 document.addEventListener("click", (e) => {
@@ -819,21 +854,26 @@ async function loadMcp() {
   clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
   if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
 }
-const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-badge--reading", "Starting"],
-                   failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
+const MCP_STATE = {ready: ["st-badge--generating", () => tr("mon.mcpConnected", "Connected")],
+                   starting: ["st-badge--reading", () => tr("mon.mcpStarting", "Starting")],
+                   failed: ["st-badge--error", () => tr("mon.mcpFailed", "Failed")], stopped: ["st-badge--queued", () => tr("chat.stopped", "Stopped")],
+                   idle: ["", () => tr("mon.mcpWaiting", "Waiting")]};
 function renderMcp() {
   const servers = mcpInfo.servers || [];
   $("mcp-card").hidden = !servers.length;
   $("mcp-row").hidden = !servers.length;
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
-  $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
-  $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
-                                               : "no server is connected yet (see the Monitor)";
+  $("mcp-sum").textContent = servers.length ? tr("mon.mcpSum", "{tools} tools · {ready} of {servers} servers connected",
+                                                {tools: fmt(mcpInfo.tools), ready: ready.length, servers: servers.length}) : "";
+  $("mcp-row-sub").textContent = mcpInfo.tools ? tr("drawer.mcpTools", "{n} tools from {names}; the model calls them when it decides to",
+                                                    {n: fmt(mcpInfo.tools), names: ready.map((s) => s.name).join(", ")})
+                                               : tr("drawer.mcpNone", "no server is connected yet (see the Monitor)");
   $("mcp-list").innerHTML = servers.map((s) => {
-    const [cls, text] = MCP_STATE[s.status] || ["", s.status];
+    const [cls, label] = MCP_STATE[s.status] || ["", () => s.status];
+    const text = label();
     const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
     return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
-      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${fmt(s.tools.length)} tools${esc(info)}</span></div>` +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${esc(tr("mon.mcpTools", "{n} tools", {n: fmt(s.tools.length)}))}${esc(info)}</span></div>` +
       (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") +
       (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => `<span class="chip" title="${esc(t.description || "")}">${esc(t.tool)}</span>`).join("")}</div>` : "") +
       `</div>`;
@@ -846,18 +886,36 @@ function renderMcp() {
 // for every model (scopes: global) gets a second field for the user's settings (settings.json); the model's field
 // then overrides it, and "off" there turns an address off for this model alone.  A secret (deepseek_api_key) is set
 // for every model only and is write-only: the server says whether it is set, an empty field leaves it, Clear removes it.
-let cfgKeys = [];
+let cfgKeys = [], cfgGlobalFile = "settings.json";
+// the keys' help in the language of the moment: the English text is serve/runconfig.py's (a key not here shows the server's)
+const CFG_HELP = {
+  "sampling.temperature": () => tr("about.cfgTemperature", "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
+  "sampling.top_p": () => tr("about.cfgTopP", "Default top_p for requests that send none"),
+  "sampling.top_k": () => tr("about.cfgTopK", "Default top_k for requests that send none (1-64)"),
+  "sampling.min_p": () => tr("about.cfgMinP", "Default min_p for requests that send none"),
+  reasoning_budget_tokens: () => tr("about.cfgBudget", "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
+  fit_max_tokens: () => tr("about.cfgFit", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
+  anthropic_thinking: () => tr("about.cfgAnthropic", "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
+  effort_position: () => tr("about.cfgEffort", "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+  aliases: () => tr("about.cfgAliases", "Other model names the server lists and answers to (comma-separated)"),
+  idle_unload_s: () => tr("about.cfgIdle", "Unload the model after this many seconds without requests (0 or empty: never)"),
+  lazy_load: () => tr("about.cfgLazy", "Start without loading the model; the first request loads it (text only)"),
+  engine_silence_s: () => tr("about.cfgSilence", "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
+  api_monitor: () => tr("about.cfgMonitor", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+  open_browser: () => tr("about.cfgBrowser", "Open the chat page in the browser when the model is ready"),
+  vram_reserve_mib: () => tr("about.cfgReserve", "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+};
 function cfgInput(k, id, v, placeholder) {
   if (k.kind === "bool" || k.kind === "enum") {
-    const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+    const opts = k.kind === "bool" ? [["true", tr("about.on", "on")], ["false", tr("img.off", "off")]] : k.choices.map((x) => [x, x]);
     const cur = v == null ? "" : String(v);
     return `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>${esc(placeholder)}</option>` +
       opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
   }
   if (k.kind === "secret")
-    return `<input class="st-input" id="${id}" type="password" value="" placeholder="${k.set ? "set (type to replace)" : "not set"}" autocomplete="off">` +
-      (k.set ? ` <button class="st-btn st-btn--secondary" type="button" data-cfg-clear="${esc(k.key)}">Clear</button>` : "");
-  const text = v == null ? "" : v === "" ? "off" : Array.isArray(v) ? v.join(", ") : String(v);
+    return `<input class="st-input" id="${id}" type="password" value="" placeholder="${esc(k.set ? tr("about.cfgSecretSet", "set (type to replace)") : tr("about.cfgSecretUnset", "not set"))}" autocomplete="off">` +
+      (k.set ? ` <button class="st-btn st-btn--secondary" type="button" data-cfg-clear="${esc(k.key)}">${esc(tr("about.cfgClear", "Clear"))}</button>` : "");
+  const text = v == null ? "" : v === "" ? tr("img.off", "off") : Array.isArray(v) ? v.join(", ") : String(v);
   return `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
     `value="${esc(text)}" placeholder="${esc(placeholder)}" autocomplete="off">`;
 }
@@ -868,18 +926,31 @@ async function loadConfig() {
   const c = await r.json();
   cfgKeys = c.keys || [];
   $("cfg-file").textContent = c.file || "";
-  const every = `Every model (${esc(c.global_file || "settings.json")})`;
+  cfgGlobalFile = c.global_file || "settings.json";
+  renderConfig(false);
+  $("cfg-card").hidden = false;
+}
+// the form in the language of the moment; again after a language switch (keep: the values typed and not saved stay)
+function renderConfig(keep) {
+  const ids = cfgKeys.flatMap((k, i) => [`cfg-${i}`, `cfg-g-${i}`]);
+  const typed = keep ? ids.map((id) => ($(id) ? $(id).value : null)) : [];
+  const every = tr("about.cfgEvery", "Every model ({file})", {file: cfgGlobalFile});
   $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
-    const scopes = k.scopes || ["model"], id = `cfg-${i}`, gid = `cfg-g-${i}`;
-    const label = (forId, extra) => `<label for="${forId}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}${extra}</code></label>`;
-    if (!scopes.includes("model")) return label(gid, ` &middot; ${every}`) + cfgInput(k, gid, null, "");
-    const row = (extra) => label(id, extra) + cfgInput(k, id, k.value, scopes.includes("global") ? "as for every model" : "default");
+    const scopes = k.scopes || ["model"], id = `cfg-${i}`, gid = `cfg-g-${i}`, help = CFG_HELP[k.key] ? CFG_HELP[k.key]() : k.help;
+    const label = (forId, extra) => `<label for="${forId}" title="${esc(help)}">${esc(help)}<code>${esc(k.key)}${extra}</code></label>`;
+    if (!scopes.includes("model")) return label(gid, ` &middot; ${esc(every)}`) + cfgInput(k, gid, null, "");
+    const row = (extra) => label(id, extra) + cfgInput(k, id, k.value, scopes.includes("global")
+      ? tr("about.cfgAsEvery", "as for every model") : tr("about.cfgDefault", "default"));
     if (!scopes.includes("global")) return row("");
-    const inUse = k.effective != null && k.effective !== "" ? `in use: ${k.effective} (${k.from === "model" ? "this model" : "every model"})` : "in use: none";
-    return label(gid, ` &middot; ${every}`) + cfgInput(k, gid, k.global, "none") + row(` &middot; this model &middot; ${esc(inUse)}`);
+    const inUse = k.effective != null && k.effective !== ""
+      ? tr("about.cfgInUse", "in use: {value} ({from})", {value: k.effective,
+        from: k.from === "model" ? tr("about.cfgThisModel", "this model") : tr("about.cfgEveryModel", "every model")})
+      : tr("about.cfgInUseNone", "in use: none");
+    return label(gid, ` &middot; ${esc(every)}`) + cfgInput(k, gid, k.global, tr("about.cfgNone", "none")) +
+      row(` &middot; ${esc(tr("about.cfgThisModel", "this model"))} &middot; ${esc(inUse)}`);
   }).join("");
   $("cfg-form").querySelectorAll("[data-cfg-clear]").forEach((b) => b.addEventListener("click", () => saveConfig({[b.dataset.cfgClear]: null}, {})));
-  $("cfg-card").hidden = false;
+  typed.forEach((v, i) => { if (v != null && $(ids[i])) $(ids[i]).value = v; });
 }
 function configValue(k, el) {
   const s = el.value.trim();
@@ -890,7 +961,7 @@ function configValue(k, el) {
   return s;                                         // enum, secret, or names (the server splits them at commas)
 }
 async function saveConfig(globalSet, set) {
-  if (!Object.keys(set).length && !Object.keys(globalSet).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+  if (!Object.keys(set).length && !Object.keys(globalSet).length) { $("cfg-msg").textContent = tr("about.cfgNothing", "Nothing changed."); return; }
   try {
     const saved = [];
     for (const [scope, keys] of [["global", globalSet], ["model", set]]) {
@@ -898,13 +969,15 @@ async function saveConfig(globalSet, set) {
       const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set: keys, scope})});
       const b = await r.json();
       if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
-      if (b.changed.length) saved.push(scope === "global" ? `${b.changed.join(", ")} for every model`
-        : `${b.changed.join(", ")}; the earlier file is ${b.file}.bak`);
+      if (b.changed.length) saved.push(scope === "global" ? tr("about.cfgSavedEvery", "{keys} for every model", {keys: b.changed.join(", ")})
+        : tr("about.cfgSavedModel", "{keys}; the earlier file is {file}.bak", {keys: b.changed.join(", "), file: b.file}));
     }
-    $("cfg-msg").textContent = saved.length ? `Saved (${saved.join("; ")}). Start the model again to use it.` : "Nothing changed.";
+    $("cfg-msg").textContent = saved.length
+      ? tr("about.cfgSaved", "Saved ({keys}). Start the model again to use it.", {keys: saved.join("; ")})
+      : tr("about.cfgNothing", "Nothing changed.");
   } catch (e) {
     $("cfg-msg").textContent = "";
-    toast("error", "Not saved", String(e.message || e), 6000);
+    toast("error", tr("about.cfgNotSaved", "Not saved"), String(e.message || e), 6000);
   }
   loadConfig();
 }
@@ -1481,11 +1554,16 @@ function busyHint() {
 }
 // While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
 const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
+// what the chat is waiting for while the model loads (after an image job, every image that took the GPU from it)
+const loadingHint = () => modelLoading === "after_image"
+  ? tr("composer.loadingAfterImage", "The model is loading again after the image (a minute or two); the answer goes on then")
+  : tr("composer.loading", "The model is loading (a minute or two); the answer goes on then");
 function setBusy(on) {
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
+                                         : on && modelLoading ? loadingHint()
                                          : on ? busyHint() : tr("composer.send", "Ctrl+Enter: send");
   if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
   $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
@@ -1508,7 +1586,7 @@ function requestCut() {
   if (!busy || busy.cut) return;
   if ((busy.msg.tools || []).some((t) => t.state === "running")) { busy.cutAfterTool = true; return; }   // let the tool finish
   busy.cut = true;
-  busy.controller.abort();
+  stopReply();
 }
 function renderPending() {
   let el = $("pending");
@@ -1584,6 +1662,55 @@ async function send(payload) {
   return generateReply();
 }
 // an answer for the messages as they are: the last one is a user turn
+// A streamed reply the server keeps past its connection (strata_reply): its data lines are counted as they are read, so
+// that a connection that breaks (not the page's own abort) is read again from where it stopped, a few times, waiting a
+// little longer each time.  A connection that ends before [DONE] broke too (a proxy or a network that closed it); an
+// error the stream itself reports is not a broken connection.
+const REPLY_TRIES = 6;
+const replyId = () => [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+const replyError = (message) => Object.assign(new Error(message), {fromStream: true});
+async function readReply(r, rid, signal, onData) {
+  let seen = 0, ended = false;
+  for (let tries = 0; ;) {
+    try {
+      const reader = r.body.getReader(), dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const {value, done} = await reader.read();
+        if (done && (ended || !rid)) return;
+        if (done) throw new TypeError("the connection closed before the reply ended");
+        buf += dec.decode(value, {stream: true});
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
+          seen++;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") ended = true;
+          onData(data);
+        }
+      }
+    } catch (e) {
+      if (e.name === "AbortError" || e.fromStream || !rid) throw e;
+      for (;;) {                                               // the connection broke: the rest, from line `seen`
+        if (++tries > REPLY_TRIES) throw e;
+        await new Promise((ok) => setTimeout(ok, Math.min(1000 * tries, 5000)));
+        if (signal.aborted) throw e;
+        try {
+          r = await fetch(`v1/strata/replies/${rid}?from=${seen}`, {headers: headers(), signal});
+          if (r.ok) break;
+          if (r.status === 404) throw e;                       // the server no longer has it (restarted)
+        } catch (e2) { if (e2 === e || e2.name === "AbortError") throw e2; }
+      }
+    }
+  }
+}
+// Stop (and an interjection): the server ends the reply too, then this page's connection is closed
+function stopReply() {
+  if (busy.rid) fetch(`v1/strata/replies/${busy.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+  busy.controller.abort();
+}
 async function generateReply() {
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
@@ -1624,6 +1751,9 @@ async function generateReply() {
     for (let round = 0; ; round++) {
       body.messages = apiMessages(round > 0);
       const own = [];
+      // kept past its connection (a tab put to sleep, a network that dropped): the rest is read again below
+      busy.rid = health.kept_replies ? replyId() : null;
+      if (busy.rid) body.strata_reply = {id: busy.rid};
       const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
                                                      signal: controller.signal});
       if (!r.ok) {
@@ -1633,27 +1763,16 @@ async function generateReply() {
         overflow = r.status === 400 && /exceeds the context window/.test(msg);
         throw new Error(msg);
       }
-      const reader = r.body.getReader(), dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const {value, done} = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, {stream: true});
-        let nl;
-        while ((nl = buf.indexOf("\n")) >= 0) {
-          const line = buf.slice(0, nl).trim();
-          buf = buf.slice(nl + 1);
-          if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
+      await readReply(r, busy.rid, controller.signal, (data) => {
+          if (data === "[DONE]") return;
           let j;
-          try { j = JSON.parse(data); } catch (e) { continue; }
-          if (j.error) throw new Error(j.error.message || tr("toast.engineError", "the engine reported an error"));
+          try { j = JSON.parse(data); } catch (e) { return; }
+          if (j.error) throw replyError(j.error.message || tr("toast.engineError", "the engine reported an error"));
           if (j.usage) usage = j.usage;
           if (j.strata_mcp) {
             onTool(m, j.strata_mcp);
             // an interjection waited for a running tool: it has its result now, so the answer can stop
-            if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; controller.abort(); }
+            if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; stopReply(); }
           }
           const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
           const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -1676,8 +1795,7 @@ async function generateReply() {
             if (c.function && c.function.arguments) o.args += c.function.arguments;
           }
           if (!frame) frame = requestAnimationFrame(paint);
-        }
-      }
+      });
       const calls = own.filter((c) => c && StrataSegments.TOOL_NAMES.has(c.name));
       if (!calls.length || busy.cut || round >= PAGE_ROUNDS) break;
       const room = usage ? usage.prompt_tokens + usage.completion_tokens : 0;
@@ -1734,7 +1852,7 @@ async function generateReply() {
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
-$("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+$("stop-btn").onclick = () => { if (busy) stopReply(); };
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send(); }   // Enter alone: a new line
 });
@@ -2043,6 +2161,8 @@ function showLanguage() {
   thinkingButtons();   // the level buttons are built in the code, in the language of the moment
   imgModels();         // so are the Images tab's texts and the chat's image choice
   loadUpdate();        // and About's Updates card
+  renderConfig(true);  // and its Model settings card
+  renderMcp();         // and the Monitor's MCP card
   renderChat();
   setBusy(!!busy);
   if (lastMetrics) render(lastMetrics);

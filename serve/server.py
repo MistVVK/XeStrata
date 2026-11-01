@@ -353,6 +353,86 @@ class ModelBusy(RuntimeError):
     """Explicit model controls must not interrupt active or queued requests."""
 
 
+REPLY_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+
+
+class Reply:
+    """A streamed chat reply kept apart from its connection (strata_reply): its SSE lines as they were made, so that a
+    client whose connection broke (a browser that put the tab to sleep, a network that dropped for a moment) reads the
+    rest again, and the answer, an image job's included, is not cancelled with the connection.  It is cancelled only
+    by its own cancel (POST /v1/strata/replies/<id>/cancel: the web app's Stop)."""
+
+    def __init__(self, cancel: threading.Event):
+        self.cancel = cancel
+        self.lines: list[bytes] = []
+        self.done = False
+        self.ended_at: float | None = None
+        self.cond = threading.Condition()
+
+    def put(self, line: bytes) -> None:
+        with self.cond:
+            self.lines.append(line)
+            self.cond.notify_all()
+
+    def finish(self) -> None:
+        with self.cond:
+            self.done, self.ended_at = True, time.time()
+            self.cond.notify_all()
+
+    def read(self, start: int, wait_s: float) -> tuple[list[bytes], bool]:
+        """The lines from `start`, waiting up to wait_s for one, and whether the reply has ended."""
+        with self.cond:
+            if len(self.lines) <= start and not self.done:
+                self.cond.wait(wait_s)
+            return self.lines[start:], self.done
+
+
+class Replies:
+    """The replies kept for their clients: a finished one for KEEP_S, at most MAX of them (the oldest finished go
+    first; one still running is never dropped)."""
+    KEEP_S = 600.0
+    MAX = 32
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items: dict[str, Reply] = {}
+
+    def open(self, rid: str, cancel: threading.Event) -> Reply:
+        with self.lock:
+            now = time.time()
+            for k, r in list(self.items.items()):
+                if r.done and r.ended_at is not None and now - r.ended_at > self.KEEP_S:
+                    del self.items[k]
+            ended = sorted((r.ended_at or 0, k) for k, r in self.items.items() if r.done)
+            while len(self.items) >= self.MAX and ended:
+                del self.items[ended.pop(0)[1]]
+            old = self.items.get(rid)
+            if old is not None and not old.done:
+                raise ValueError("strata_reply: a reply with this id is still running")
+            r = self.items[rid] = Reply(cancel)
+            return r
+
+    def get(self, rid: str) -> Reply | None:
+        with self.lock:
+            return self.items.get(rid)
+
+
+REPLIES = Replies()
+
+
+def reply_id(req: dict) -> str | None:
+    """A streamed request's strata_reply id (the web app's: {"id": ...}), or None."""
+    r = req.get("strata_reply")
+    if r is None:
+        return None
+    rid = r.get("id") if isinstance(r, dict) else None
+    if not isinstance(rid, str) or not REPLY_ID.fullmatch(rid):
+        raise ValueError("strata_reply: {\"id\": 8 to 64 letters, digits, - or _}")
+    if not req.get("stream"):
+        raise ValueError("strata_reply needs stream: true")
+    return rid
+
+
 class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
@@ -3794,19 +3874,28 @@ class Service:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
+        # what the web app's chat says while a request waits for it (/metrics live.loading): after an image job
+        # (restore_after_load) the model comes back with the conversation it had
+        with self.status_lock:
+            self.status["loading"] = "after_image" if self.restore_after_load else "again"
         try:
-            self.engine.restart()
-        except Exception as e:
-            if vision_started:
-                self.vision.unload()
-            # the program could not be started at all (missing, not executable, or blocked by Windows - #735): the
-            # request path answers EngineDied with a 503, but takes a bare OSError for a client that went away (#2496)
-            if isinstance(e, OSError):
-                raise EngineDied(f"the engine could not be started: {e}") from e
-            raise
-        print("[strata] the engine is running again", flush=True)
-        if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
-            images_api.restore_session(self)
+            try:
+                self.engine.restart()
+            except Exception as e:
+                if vision_started:
+                    self.vision.unload()
+                # the program could not be started at all (missing, not executable, or blocked by Windows - #735):
+                # the request path answers EngineDied with a 503, but takes a bare OSError for a client that went
+                # away (#2496)
+                if isinstance(e, OSError):
+                    raise EngineDied(f"the engine could not be started: {e}") from e
+                raise
+            print("[strata] the engine is running again", flush=True)
+            if self.restore_after_load:                  # an image job unloaded it: its conversation comes back
+                images_api.restore_session(self)
+        finally:
+            with self.status_lock:
+                self.status.pop("loading", None)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -4087,6 +4176,7 @@ class Service:
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
+                "loading": s.get("loading"),
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
                 "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
                 "max_tokens": s.get("max_tokens") if s.get("busy") else None,
@@ -6757,6 +6847,21 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/strata/replies/"):      # a kept reply again, from its line `from`
+                if not self._authorized():
+                    return
+                reply = REPLIES.get(path[len("/v1/strata/replies/"):])
+                if reply is None:
+                    self._json(404, {"error": {"message": "no such reply (it ended long ago, or never began)"}})
+                    return
+                try:
+                    start = max(0, int(parse_qs(urlsplit(self.path).query).get("from", ["0"])[0]))
+                except ValueError:
+                    self._json(400, {"error": {"message": "from: a line number"}})
+                    return
+                self._sse()
+                self._stream_reply(reply, start)
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -6901,6 +7006,8 @@ def make_handler(svc: Service):
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
                                  "thinking": getattr(svc.template, "thinking", None),
+                                 # a streamed chat reply can be kept past its connection (strata_reply)
+                                 "kept_replies": True,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -7031,6 +7138,16 @@ def make_handler(svc: Service):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            if path.startswith("/v1/strata/replies/") and path.endswith("/cancel"):   # the web app's Stop
+                if not self._control_body():
+                    return
+                reply = REPLIES.get(path[len("/v1/strata/replies/"):-len("/cancel")])
+                if reply is None:
+                    self._json(404, {"error": {"message": "no such reply"}})
+                    return
+                reply.cancel.set()
+                self._json(200, {"cancelled": not reply.done})
                 return
             if path == "/update":                            # About's "Check now": ask GitHub again
                 if self._control_body() and self._own_page("a check for a new release can be asked"):
@@ -7671,7 +7788,9 @@ def make_handler(svc: Service):
             if n > 1 and use_mcp:
                 raise ValueError("n above 1 with MCP or image tools is not supported")
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            rid = reply_id(req)
+            if rid is None:                                  # a kept reply is cancelled by its own cancel alone
+                self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
             # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
@@ -7708,45 +7827,82 @@ def make_handler(svc: Service):
                 return self._json(200, body)
             if legacy:
                 chunks = legacy_chunks(chunks)
+            lines = self._openai_sse(chunks, req.get("stream_options"))
+            if rid is not None:                              # kept: made on its own thread, read from the reply
+                reply = REPLIES.open(rid, cancel)
+
+                def make():                              # its events, one a line: what a read `from` counts
+                    try:
+                        for line in lines:
+                            for event in line.split(b"\n\n"):
+                                if event and not event.startswith(b":"):   # a keep-alive is _stream_reply's own
+                                    reply.put(event + b"\n\n")
+                    finally:
+                        reply.finish()
+                threading.Thread(target=make, daemon=True, name="strata-reply").start()
+                self._sse()
+                self._stream_reply(reply, 0)
+                return
             self._sse()
-            options = req.get("stream_options")
+            try:
+                for line in lines:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()                                 # client went away: stop the engine
+                lines.close()
+                chunks.close()
+
+        def _openai_sse(self, chunks, options):
+            """A streamed chat completion's SSE lines: the chunks (None a keep-alive), OpenAI's usage chunk when
+            asked, [DONE]; an error after the stream started as an error event, then [DONE]."""
             last = None
             try:
                 for c in chunks:
                     if c is None:
-                        self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
+                        yield b": keep-alive\n\n"                # an SSE comment: clients ignore it
                     else:
-                        self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        yield b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n"
                         last = c
-                    self.wfile.flush()
                 if isinstance(options, dict) and options.get("include_usage") and last and last.get("usage"):
                     # OpenAI's usage chunk, after the finishing one (which also keeps its usage, as llama.cpp's)
                     usage = {k: last[k] for k in ("id", "object", "created", "model", "system_fingerprint")
                              if k in last}
-                    self.wfile.write(b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
-                                                            ensure_ascii=False).encode() + b"\n\n")
-                self.wfile.write(b"data: [DONE]\n\n")
-            except OSError:
-                self._note(outcome="disconnected")
-                cancel.set()                                 # client went away: stop the engine
-                chunks.close()
+                    yield b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
+                                                 ensure_ascii=False).encode() + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
             except EngineDied as e:                          # mid-stream: say so, then end the stream properly
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except StructuredOutputError as e:
                 err = {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                  "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except Exception as e:  # noqa: BLE001 - a bug after the stream started: said, and the stream ends
                 err = {"error": {"type": "server_error", "message": self._stream_bug(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            self._note(error=err["error"])
+            yield b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n"
+
+        def _stream_reply(self, reply: Reply, start: int) -> None:
+            """Write a kept reply's lines from `start` as they come, a keep-alive while none does, until it ends.  A
+            connection that breaks only ends this read: the reply goes on (GET /v1/strata/replies/<id> reads it
+            again)."""
+            at = start
+            try:
+                while True:
+                    got, done = reply.read(at, 1.0)
+                    for line in got:
+                        self.wfile.write(line)
+                    at += len(got)
+                    if done and not got:
+                        break
+                    if not got:
+                        self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except OSError:
+                self._note(outcome="disconnected (the reply goes on)")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""

@@ -28,6 +28,7 @@ const field = {{value: ""}};
 const notices = [];
 const $ = () => field;
 const toast = (...args) => notices.push(args);
+const tr = (key, text) => text;   // the page's translation (i18n.js): its English text here
 const localStorage = {{
   getItem(k) {{
     if ({json.dumps(blocked)}) throw new Error("Storage blocked");

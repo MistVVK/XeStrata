@@ -27,7 +27,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite,  # noqa: E402
-                          MockEngine, PP_DONE_TAIL, Service,
+                          MockEngine, PP_DONE_TAIL, REPLIES, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           parse_multipart, prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -3128,6 +3128,81 @@ class LiveRate(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+class KeptReplies(unittest.TestCase):
+    """A web app's reply (strata_reply) lives on past its connection: a client whose connection broke reads the rest
+    again (GET /v1/strata/replies/<id>), and only its own cancel stops it (the web app's Stop)."""
+
+    TOKENS = 120
+    PACE_S = 0.01                    # about 1.2 s for the whole answer
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = MockEngine(self.tok, "y" * self.TOKENS, max_context=CTX, delay_s=self.PACE_S)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.port = self.httpd.server_address[1]
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def request(self, method, path, body=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        c.request(method, path, json.dumps(body) if body is not None else None, {"Content-Type": "application/json"})
+        return c, c.getresponse()
+
+    def chat(self, rid):
+        return self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True, "strata_reply": {"id": rid},
+                                                             "messages": [{"role": "user", "content": "hi"}]})
+
+    @staticmethod
+    def text(raw):
+        out = ""
+        for line in raw.split(b"\n"):
+            if line.startswith(b"data: {"):
+                for ch in json.loads(line[6:]).get("choices", []):
+                    d = ch.get("delta") or {}
+                    out += (d.get("content") or "") + (d.get("reasoning_content") or "")
+        return out
+
+    def test_a_dropped_connection_reads_the_rest_again(self):
+        c, r = self.chat("kept-drop-0001")
+        r.read1(1024)                                    # the start of the answer, then the connection breaks
+        c.close()
+        reply = REPLIES.get("kept-drop-0001")
+        t0 = time.time()
+        while not reply.done and time.time() - t0 < 10:
+            time.sleep(0.02)
+        self.assertTrue(reply.done)                      # made to the end without its client
+        c, r = self.request("GET", "/v1/strata/replies/kept-drop-0001?from=0")
+        raw = r.read()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(self.text(raw), "y" * self.TOKENS)
+        self.assertTrue(raw.rstrip().endswith(b"data: [DONE]"))
+        c.close()
+
+    def test_its_cancel_stops_it(self):
+        c, r = self.chat("kept-cancel-0001")
+        r.read1(256)
+        c2, r2 = self.request("POST", "/v1/strata/replies/kept-cancel-0001/cancel", {})
+        self.assertEqual(r2.status, 200)
+        self.assertEqual(json.loads(r2.read()), {"cancelled": True})
+        raw = r.read()                                   # the stream ends, short of the whole answer
+        self.assertTrue(raw.rstrip().endswith(b"data: [DONE]"))
+        self.assertLess(len(self.text(raw)), self.TOKENS)
+        c.close()
+        c2.close()
+
+    def test_ids(self):
+        c, r = self.chat("bad id!")
+        self.assertEqual(r.status, 400)
+        c.close()
+        c, r = self.request("GET", "/v1/strata/replies/no-such-reply-0001")
+        self.assertEqual(r.status, 404)
+        c.close()
 
 
 class PromptProgress(unittest.TestCase):
