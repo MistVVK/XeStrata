@@ -5646,7 +5646,9 @@ def warm_up(cfg_path: Path) -> None:
 
 def start_free_mib(elog: str | None, since: int) -> int | None:
     """The VRAM free at the engine's start ("strata generate: N MiB of VRAM free at the start") in its log after byte
-    `since`, the lowest if it started more than once; None when the log has none."""
+    `since`, the lowest if it started more than once; None when the log has none, or only 0: an engine that could not
+    read the free VRAM wrote 0 (an unsupported integrated GPU beside the card broke Level Zero's sysman for both), and
+    kept in the config, it left every start without an expert cache."""
     if not elog:
         return None
     try:
@@ -5655,8 +5657,9 @@ def start_free_mib(elog: str | None, since: int) -> int | None:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    found = re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)
-    return min(int(v) for v in found) if found else None
+    found = [int(v) for v in re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)]
+    found = [v for v in found if v > 0]
+    return min(found) if found else None
 
 
 VRAM_FREE_MARGIN_MIB = 32   # the free VRAM moved by up to ~20 MiB between starts on the B70 (2026-10-17)
@@ -5683,8 +5686,10 @@ def fix_vram_free(cfg_path: Path, free_mib: int) -> None:
 
 
 def saved_vram_free(cfg: dict) -> str | None:
-    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any."""
-    return (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
+    """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any; not a 0 an
+    engine that could not read it left (start_free_mib)."""
+    v = (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
+    return v if v not in (None, "0") else None
 
 
 def measured_cpu_share(elog: str | None, since: int) -> float | None:

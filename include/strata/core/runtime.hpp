@@ -17,6 +17,9 @@ namespace strata::core {
 
 /// Whether a GPU is the processor's own graphics (src/core/device.cpp).
 bool integrated_gpu(const sycl::device& d);
+/// The device's free memory as its runtime reports it, or for a GPU of the xe driver whose runtime cannot say, as the
+/// driver does.  False when neither knows.
+bool device_free_memory(const sycl::device& d, uint64_t& free);
 /// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
 /// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
 std::string compiler_workaround();

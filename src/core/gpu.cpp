@@ -61,8 +61,7 @@ std::string refusal_state() {
     std::string free_mib = "unknown (set ZES_ENABLE_SYSMAN=1)";
     try {
         const auto& d = strata::core::Runtime::get().device();
-        if (d.has(sycl::aspect::ext_intel_free_memory))
-            free_mib = std::to_string(d.get_info<sycl::ext::intel::info::device::free_memory>() >> 20) + " MiB";
+        if (uint64_t free = 0; core::device_free_memory(d, free)) free_mib = std::to_string(free >> 20) + " MiB";
     } catch (const std::exception& e) { free_mib = std::string("unreadable: ") + e.what(); }
     std::string ram;
     // the xe driver gives VRAM only with RAM free beside it, and the file cache does not count as free there: a big
@@ -418,11 +417,11 @@ bool memset_async(void* dst, int value, size_t bytes, Stream s) {
 bool mem_info(size_t* free_bytes, size_t* total_bytes) {
     try {
         const auto& d = rt().device();
-        if (!d.has(sycl::aspect::ext_intel_free_memory)) {
+        uint64_t free = 0;
+        if (!core::device_free_memory(d, free)) {
             g_error = "mem_info: the device does not report free memory (set ZES_ENABLE_SYSMAN=1)";
             return false;
         }
-        uint64_t free = d.get_info<sycl::ext::intel::info::device::free_memory>();
         uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
         if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
         else if (d.has(sycl::aspect::ext_intel_pci_address)) {

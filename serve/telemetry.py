@@ -100,6 +100,45 @@ class _Zes:
         return (total - free, total) if total else (None, None)
 
 
+# DRM_IOCTL_XE_DEVICE_QUERY (_IOWR('d', 0x40, struct drm_xe_device_query), 40 bytes) and its memory regions' query; a
+# region (struct drm_xe_mem_region, 88 bytes) holds mem_class (u16) at 0, total_size at 8 and used at 16
+_XE_DEVICE_QUERY, _XE_QUERY_MEM_REGIONS, _XE_MEM_CLASS_VRAM, _XE_REGION_BYTES = 0xC0286440, 1, 1, 88
+
+
+def _xe_vram(pci):
+    """(used, total) bytes of the VRAM of the xe driver's card at `pci`, asked of the driver itself, or (None, None):
+    sysman's zesInit fails for every card when one is not its driver's (a Coffee Lake UHD 630 beside an Arc Pro B60).
+    A driver that gives the use only to CAP_PERFMON says 0, which a card's driver never uses: unknown too."""
+    import fcntl
+    import struct
+    for node in sorted(glob.glob(f"/sys/bus/pci/devices/{pci}/drm/renderD*")):
+        try:
+            fd = os.open("/dev/dri/" + os.path.basename(node), os.O_RDWR | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            q = bytearray(struct.pack("=QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, 0, 0, 0, 0))
+            fcntl.ioctl(fd, _XE_DEVICE_QUERY, q)
+            size = struct.unpack_from("=I", q, 12)[0]
+            if size < 8:
+                return None, None
+            buf = ctypes.create_string_buffer(size)
+            q = bytearray(struct.pack("=QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, size, ctypes.addressof(buf), 0, 0))
+            fcntl.ioctl(fd, _XE_DEVICE_QUERY, q)
+            used = total = 0
+            for i in range(min(struct.unpack_from("=I", buf.raw, 0)[0], (size - 8) // _XE_REGION_BYTES)):
+                off = 8 + i * _XE_REGION_BYTES
+                if struct.unpack_from("=H", buf.raw, off)[0] == _XE_MEM_CLASS_VRAM:
+                    total += struct.unpack_from("=Q", buf.raw, off + 8)[0]
+                    used += struct.unpack_from("=Q", buf.raw, off + 16)[0]
+            return (used, total) if total and used else (None, None)
+        except OSError:
+            return None, None
+        finally:
+            os.close(fd)
+    return None, None
+
+
 def _read(path, conv=int):
     try:
         with open(path, encoding="ascii") as f:
@@ -301,6 +340,8 @@ class _XeGpu:
         # load's; github.com/hugs7/intel-xe-battlemage-hwmon-fix): the web app marks the reading while nothing runs
         out["temp_may_be_stale"] = self.driver == "xe" and out["util"] is not None and out["util"] < 1.0
         out["mem_used"], out["mem_total"] = self.zes.read()
+        if out["mem_total"] is None and self.driver == "xe":
+            out["mem_used"], out["mem_total"] = _xe_vram(self.pci)
         out["pcie_gen"], out["pcie_width"], out["pcie_gen_max"] = self._link()
         out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
         return out

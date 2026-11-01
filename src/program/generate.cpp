@@ -3170,15 +3170,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: CUDA%d context ready, %.2f GiB free before expert arena registration\n",
                      remote_dev[0], free_gib);
     }
-    // the VRAM free before the engine takes any: setup's warm-up reads it from the log (--vram-free-mib)
+    // the VRAM free before the engine takes any: setup's warm-up reads it from the log (--vram-free-mib), so an
+    // unknown one is not written as 0 (the warm-up kept a 0 in the config, and every start had no expert cache)
     size_t start_free_b = 0;
     {
         size_t total_b = 0;
-        strata::gpu::mem_info(&start_free_b, &total_b);
-        std::fprintf(stderr, "strata generate: %llu MiB of VRAM free at the start%s\n",
-                     (unsigned long long) (start_free_b >> 20),
-                     o.vram_free_mib >= 0 ? (" (the cache counts at most " + std::to_string(o.vram_free_mib) +
-                                             ": --vram-free-mib)").c_str() : "");
+        if (strata::gpu::mem_info(&start_free_b, &total_b))
+            std::fprintf(stderr, "strata generate: %llu MiB of VRAM free at the start%s\n",
+                         (unsigned long long) (start_free_b >> 20),
+                         o.vram_free_mib >= 0 ? (" (the cache counts at most " + std::to_string(o.vram_free_mib) +
+                                                 ": --vram-free-mib)").c_str() : "");
+        else
+            std::fprintf(stderr, "strata generate: the VRAM free at the start is unknown (%s)\n",
+                         strata::gpu::last_error());
     }
     strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading

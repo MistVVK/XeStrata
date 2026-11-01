@@ -39,6 +39,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -693,6 +694,81 @@ bool integrated_gpu(const sycl::device& d) {
 #pragma clang diagnostic pop
 }
 
+namespace {
+// The VRAM a GPU of the xe kernel driver has free, asked of the driver (DRM_XE_DEVICE_QUERY_MEM_REGIONS: its VRAM
+// regions' size and what is used of them) through the render node of the card at the PCI address `pci`.  False on
+// another driver, and where the driver gives no use: it may give it only to a process with CAP_PERFMON and 0 to
+// others (Linux 7.0 gives a user the VRAM's use, the system memory's 0), and its own allocations are never none.
+bool xe_vram(const std::string& pci, uint64_t& total, uint64_t& used) {
+#if defined(STRATA_XE_QUERY)
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/sys/bus/pci/devices/" + pci + "/drm", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("renderD", 0) != 0) continue;
+        const int fd = open(("/dev/dri/" + name).c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        char drv[16] = {};
+        drm_version ver{};
+        ver.name_len = sizeof(drv) - 1;
+        ver.name = drv;
+        uint64_t size = 0, in_use = 0;
+        if (ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0 && std::strcmp(drv, "xe") == 0) {
+            drm_xe_device_query q{};
+            q.query = DRM_XE_DEVICE_QUERY_MEM_REGIONS;
+            if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0 && q.size >= sizeof(drm_xe_query_mem_regions)) {
+                std::vector<uint64_t> buf((q.size + 7) / 8);
+                q.data = (uint64_t) (uintptr_t) buf.data();
+                if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
+                    const auto* r = reinterpret_cast<const drm_xe_query_mem_regions*>(buf.data());
+                    for (uint32_t i = 0; i < r->num_mem_regions; ++i)
+                        if (r->mem_regions[i].mem_class == DRM_XE_MEM_REGION_CLASS_VRAM) {
+                            size += r->mem_regions[i].total_size;
+                            in_use += r->mem_regions[i].used;
+                        }
+                }
+            }
+        }
+        close(fd);
+        if (size == 0 || in_use == 0) return false;
+        total = size;
+        used = in_use;
+        return true;
+    }
+#else
+    (void) pci; (void) total; (void) used;
+#endif
+    return false;
+}
+
+bool driver_free_memory(const sycl::device& d, uint64_t& free) {
+    if (integrated_gpu(d) || !d.has(sycl::aspect::ext_intel_pci_address)) return false;
+    std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+    for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+    uint64_t total = 0, used = 0;
+    if (!xe_vram(pci, total, used)) return false;
+    total = std::min(total, (uint64_t) d.get_info<sycl::info::device::global_mem_size>());
+    free = total > used ? total - used : 0;
+    return true;
+}
+}  // namespace
+
+// The SYCL runtime's free memory (ext_intel_free_memory) comes on Level Zero from the driver's usable-memory property,
+// or, from a driver without it (compute-runtime 26.05), from sysman, whose zesInit fails for every GPU when one of
+// them is not the driver's (a Coffee Lake UHD 630 beside an Arc Pro B60: the B60's free VRAM read 0, and the warm-up
+// kept the 0 in the config; technicalife.net, 2026-11-01).  There the xe driver is asked; capped at the size the SYCL
+// runtime reports, the B60's 23256 MiB of the driver's 24480.
+bool device_free_memory(const sycl::device& d, uint64_t& free) {
+    if (d.has(sycl::aspect::ext_intel_free_memory)) {
+        try {
+            free = d.get_info<sycl::ext::intel::info::device::free_memory>();
+            return true;
+        } catch (const sycl::exception&) {
+            return driver_free_memory(d, free);
+        }
+    }
+    return driver_free_memory(d, free);
+}
+
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not
 // subtract the CPU's allocations (an AMD APU's figure counts its whole shared pool).  The engine takes the smaller of
 // that figure and what the OS can give back, less STRATA_UMA_HEADROOM_GIB (default 6) for the system.
@@ -764,12 +840,7 @@ DeviceInfo device_info(int ordinal) {
     out.driver_version = d.get_info<sycl::info::device::driver_version>();
     out.platform_version = d.get_platform().get_info<sycl::info::platform::version>();
     out.total_bytes = d.get_info<sycl::info::device::global_mem_size>();
-    if (d.has(sycl::aspect::ext_intel_free_memory)) {
-        try {
-            out.free_bytes = d.get_info<sycl::ext::intel::info::device::free_memory>();
-            out.free_bytes_known = true;
-        } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
-    }
+    out.free_bytes_known = device_free_memory(d, out.free_bytes);   // never zero for unknown
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
     if (out.free_bytes_known && !integrated(d)) apply_os_budget(pci_of(d), free);
     apply_vram_limit(free, out.total_bytes);
