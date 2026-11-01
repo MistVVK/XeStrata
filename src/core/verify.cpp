@@ -2230,6 +2230,7 @@ void Verifier::publish_plan(void* ctx) {
 
 bool Verifier::read_logits(int rows, float* host, std::string& err) const {
     if (le_ < g_->n_layers) return next_ != nullptr && next_->read_logits(rows, host, err);
+    const OnDevice on_device(device_);   // a layer split's last stage: its GPU's queue, not the caller's
     if (!strata::gpu::copy(host, head_logits_, (size_t) rows * (size_t) n_vocab_ * 4)) {
         err = "verify: reading the head's logits back failed";
         return false;
@@ -3043,6 +3044,7 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
 bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
+    const OnDevice on_device(device_);   // as read_logits
     return strata::gpu::copy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float));
 }
 
@@ -3055,6 +3057,7 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
     }
     // run() synchronized its stream before returning, so the head of this window is complete
     std::vector<float> h((size_t) T * (size_t) n_vocab_);
+    const OnDevice on_device(device_);   // as read_logits
     if (!strata::gpu::copy(h.data(), head_logits_, h.size() * sizeof(float))) {
         err = "window_logprobs: the head logits copy failed";
         return false;

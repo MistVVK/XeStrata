@@ -3645,7 +3645,10 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
                 const std::string name = "blk." + std::to_string(lay.block_of(l)) + ".ffn_" + roles[r] + "_exps.weight";
                 const strata::TensorInfo* t = f->find(name);
-                const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
+                // up may be of a type of its own (native_mixed_gu: Ornith-1.5's GSQ-RCO files)
+                const uint64_t want_type = (uint64_t) (r == 0 ? fm.gu_type
+                                                       : r == 1 ? (fm.up_type >= 0 ? fm.up_type : fm.gu_type)
+                                                                : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
                 const uint64_t cols = (uint64_t) (r < 2 ? fm.n_embd : fm.n_ff);
                 const uint64_t rows = (uint64_t) (r < 2 ? fm.n_ff : fm.n_embd);
