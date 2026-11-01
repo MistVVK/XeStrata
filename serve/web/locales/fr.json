@@ -134,7 +134,7 @@
   "composer.hintInterject": "Ctrl+Entrée arrête la réponse ici et envoie tout de suite",
   "composer.hintQueue": "Ctrl+Entrée envoie quand la réponse est terminée",
   "composer.message": "Message",
-  "composer.send": "Ctrl+Entrée : envoyer",
+  "composer.sendHint": "Ctrl+Entrée : envoyer",
   "composer.loadingAfterImage": "Le modèle se recharge après l'image (une ou deux minutes) ; la réponse continue ensuite",
   "composer.loading": "Le modèle se charge (une ou deux minutes) ; la réponse continue ensuite",
   "composer.placeholder": "Posez une question…",

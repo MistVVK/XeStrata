@@ -1566,7 +1566,7 @@ function setBusy(on) {
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
                                          : on && modelLoading ? loadingHint()
-                                         : on ? busyHint() : tr("composer.send", "Ctrl+Enter: send");
+                                         : on ? busyHint() : tr("composer.sendHint", "Ctrl+Enter: send");
   if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
   $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
   renderUndoBar();

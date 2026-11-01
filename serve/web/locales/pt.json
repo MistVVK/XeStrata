@@ -131,7 +131,7 @@
   "composer.hintInterject": "Ctrl+Enter interrompe a resposta aqui e envia agora",
   "composer.hintQueue": "Ctrl+Enter envia quando a resposta terminar",
   "composer.message": "Mensagem",
-  "composer.send": "Ctrl+Enter: enviar",
+  "composer.sendHint": "Ctrl+Enter: enviar",
   "composer.loadingAfterImage": "O modelo está carregando de novo depois da imagem (um ou dois minutos); depois a resposta continua",
   "composer.loading": "O modelo está carregando (um ou dois minutos); depois a resposta continua",
   "composer.placeholder": "Pergunte o que quiser…",

@@ -131,7 +131,7 @@
   "composer.hintInterject": "Ctrl+Enter で回答をここで止めてすぐに送信します",
   "composer.hintQueue": "Ctrl+Enter で回答が終わってから送信します",
   "composer.message": "メッセージ",
-  "composer.send": "Ctrl+Enter: 送信",
+  "composer.sendHint": "Ctrl+Enter: 送信",
   "composer.loadingAfterImage": "画像の後でモデルを読み直しています（1〜2 分）。終わると答えが続きます",
   "composer.loading": "モデルを読み込んでいます（1〜2 分）。終わると答えが続きます",
   "composer.placeholder": "なんでも聞いてください…",

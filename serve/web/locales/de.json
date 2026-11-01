@@ -131,7 +131,7 @@
   "composer.hintInterject": "Strg+Eingabe stoppt die Antwort hier und sendet sofort",
   "composer.hintQueue": "Strg+Eingabe sendet, sobald die Antwort fertig ist",
   "composer.message": "Nachricht",
-  "composer.send": "Strg+Eingabe: senden",
+  "composer.sendHint": "Strg+Eingabe: senden",
   "composer.loadingAfterImage": "Das Modell wird nach dem Bild neu geladen (ein bis zwei Minuten); danach geht die Antwort weiter",
   "composer.loading": "Das Modell wird geladen (ein bis zwei Minuten); danach geht die Antwort weiter",
   "composer.placeholder": "Fragen Sie, was Sie möchten…",

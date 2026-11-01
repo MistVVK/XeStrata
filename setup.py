@@ -1699,6 +1699,42 @@ def check_igc(makers: set) -> None:
         say_driver_update(lts)
 
 
+IOMMU_PT = {   # the kernel option iommu=pt, set the way each distribution's boot loader takes it
+    "ubuntu": ["echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT iommu=pt\"' | "
+               "sudo tee /etc/default/grub.d/90-iommu-pt.cfg", "sudo update-grub"],
+    "fedora": ["sudo grubby --update-kernel=ALL --args=iommu=pt"],
+    "arch": ["add iommu=pt to the kernel's command line in the boot loader's configuration"],
+}
+
+
+def check_iommu(pcis: list) -> None:
+    """Says, without stopping, when the IOMMU translates a chosen GPU's memory accesses (its IOMMU group's type DMA
+    or DMA-FQ in sysfs).  Each start pins and maps tens of GB of host memory for the GPU, and with translation on
+    the kernel allocates an I/O address for every page: on the B70 (xe, Linux 7.0) the fill of the expert slots at
+    the start fell from 23 GB/s to 139-459 MB/s when the engine started again soon after it stopped (setup's warm-up
+    start and then the real one), with the kernel's iova_depot_work_func hogging a CPU; booted with iommu=pt
+    (identity for the host's own devices) six such starts filled at 23-25 GB/s (2026-11-02)."""
+    if WIN:
+        return
+    found = []
+    for pci in pcis:
+        try:
+            kind = Path(f"/sys/bus/pci/devices/{pci}/iommu_group/type").read_text().strip()
+        except OSError:                                # no IOMMU, or no such file on this kernel
+            continue
+        if kind in ("DMA", "DMA-FQ"):
+            found.append(f"{pci} ({kind})")
+    if not found:
+        return
+    warn("the IOMMU translates the GPU's memory accesses (PCI " + ", ".join(found) + "): the engine's start can "
+         "copy to the GPU many times slower, mostly when it starts again soon after it stopped. Starting Linux "
+         "with iommu=pt (the host's own devices then reach memory directly; devices passed to a virtual machine "
+         "keep the IOMMU) avoids it:")
+    for line in IOMMU_PT.get(distro_family(), IOMMU_PT["arch"]):
+        say(f"  {line}")
+    say("  and restart the PC")
+
+
 def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> None:
     """When the Level Zero driver is older than the build that fixed it refusing device memory while the VRAM is
     free (intel/compute-runtime #916; XeStrata #34 and #15: every allocation on the card can fail that way after a
@@ -3098,11 +3134,13 @@ SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
     """--gguf-dir's shards (upstream 5a18f83a1, #305): every -0000i-of-0000N file of the model, N read from the first
     shard's name as the engine and tools/iq_pack.py do.  The published name first; else the one first shard in the
-    folder whose name has the size in it (an upload split or named differently).  A missing shard is check_shards'
-    error later, as before."""
+    folder whose name has the size in it (an upload split or named differently), never another choice's published
+    file (the regular Qwen3.8 IQ3_XXS taken for huihui-swift's: gguf_dir_problem then names that choice).  A missing
+    shard is check_shards' error later, as before."""
     first = folder / model_file(fam, model, 1)
     if not first.exists():
-        found = sorted(p for p in folder.glob("*-00001-of-*.gguf") if SHARD_NAME.search(p.name))
+        found = sorted(p for p in folder.glob("*-00001-of-*.gguf")
+                       if SHARD_NAME.search(p.name) and not gguf_choice(p.name))
         mine = [p for p in found if model.lower() in p.name.lower()]
         pick = mine if mine else found
         if len(pick) == 1:
@@ -6973,6 +7011,7 @@ def main() -> int:
              "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
     makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
     amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
+    check_iommu([x["pci"] for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x.get("pci")])
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
         check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
     elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA

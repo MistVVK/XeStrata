@@ -134,7 +134,7 @@
   "composer.hintInterject": "Ctrl+Enter stops the answer here and sends now",
   "composer.hintQueue": "Ctrl+Enter sends when the answer is done",
   "composer.message": "Message",
-  "composer.send": "Ctrl+Enter: send",
+  "composer.sendHint": "Ctrl+Enter: send",
   "composer.loadingAfterImage": "The model is loading again after the image (a minute or two); the answer goes on then",
   "composer.loading": "The model is loading (a minute or two); the answer goes on then",
   "composer.placeholder": "Ask anything…",

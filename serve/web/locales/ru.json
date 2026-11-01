@@ -131,7 +131,7 @@
   "composer.hintInterject": "Ctrl+Enter остановит ответ здесь и сразу отправит",
   "composer.hintQueue": "Ctrl+Enter отправит, когда ответ закончится",
   "composer.message": "Сообщение",
-  "composer.send": "Ctrl+Enter: отправить",
+  "composer.sendHint": "Ctrl+Enter: отправить",
   "composer.loadingAfterImage": "Модель снова загружается после изображения (минуту-две); потом ответ продолжится",
   "composer.loading": "Модель загружается (минуту-две); потом ответ продолжится",
   "composer.placeholder": "Спрашивайте что угодно…",

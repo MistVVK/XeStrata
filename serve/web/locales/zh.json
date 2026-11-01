@@ -131,7 +131,7 @@
   "composer.hintInterject": "按 Ctrl+Enter 会在此处停止回答并立即发送",
   "composer.hintQueue": "按 Ctrl+Enter 会在回答结束后发送",
   "composer.message": "消息",
-  "composer.send": "Ctrl+Enter: 发送",
+  "composer.sendHint": "Ctrl+Enter: 发送",
   "composer.loadingAfterImage": "图片之后正在重新加载模型（一两分钟）；之后回答会继续",
   "composer.loading": "正在加载模型（一两分钟）；之后回答会继续",
   "composer.placeholder": "想问什么都可以…",

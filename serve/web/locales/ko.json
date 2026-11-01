@@ -131,7 +131,7 @@
   "composer.hintInterject": "Ctrl+Enter를 누르면 답변을 여기서 멈추고 바로 보냅니다",
   "composer.hintQueue": "Ctrl+Enter를 누르면 답변이 끝난 뒤에 보냅니다",
   "composer.message": "메시지",
-  "composer.send": "Ctrl+Enter: 보내기",
+  "composer.sendHint": "Ctrl+Enter: 보내기",
   "composer.loadingAfterImage": "이미지 뒤에 모델을 다시 불러오는 중입니다(1~2분). 끝나면 답이 이어집니다",
   "composer.loading": "모델을 불러오는 중입니다(1~2분). 끝나면 답이 이어집니다",
   "composer.placeholder": "무엇이든 물어보세요…",
