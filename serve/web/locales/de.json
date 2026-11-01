@@ -127,6 +127,8 @@
   "composer.attach": "Textdatei anhängen (oder hierher ziehen)",
   "composer.attachLabel": "Datei anhängen",
   "composer.attachPictures": "Textdatei oder Bild anhängen (oder hierher ziehen)",
+  "composer.image": "Aus dieser Nachricht ein Bild erstellen",
+  "composer.imageLabel": "Bild erstellen",
   "composer.finishOpen": "Speichern oder abbrechen, was oben offen ist, um fortzufahren",
   "composer.hintInterject": "Strg+Eingabe stoppt die Antwort hier und sendet sofort",
   "composer.hintQueue": "Strg+Eingabe sendet, sobald die Antwort fertig ist",

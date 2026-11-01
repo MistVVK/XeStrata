@@ -117,6 +117,7 @@ setup のオプションです（`xestrata --setup` に付けます）。
 | `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow の画像のモデルを 8 ビットにするか。`auto` は、文の読み手と一緒に VRAM に全部入るときは 16 ビットのまま、入らないときは 8 ビット |
 | `--image-dit-keep on\|off` | `on` | Mage-Flow の使っていない方（生成用か編集用）の画像のモデルを 8 ビットで RAM に残す。`off` で RAM が約 4.4 GB 減り、差し替えのたびにファイルから読み直す |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | 画像を作るときの文章のモデルの扱い（[下](#gpu-のメモリの分け合い)）。`--images` と一緒に指定します |
+| `--image-gpu auto\|same\|<PCI>` | `auto` | 画像を作る GPU。`auto` は文章のモデルが使っていない、CPU 内蔵でない GPU のうち VRAM の最も大きいもの（なければ文章のモデルと同じ GPU）、`same` は文章のモデルと同じ GPU、PCI のアドレス（`--check` に出るもの）はその GPU。`--images` と一緒に指定します |
 
 Mage-Flow の 8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は、重みと活性の両方を int8 にして掛けます（ComfyUI の int8_convrot と同じ形）。ほかの GPU では Q8_0 です。
 Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じく int8 で掛けます。
@@ -264,6 +265,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 
 - `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
+- `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の画像のボタンで送ります。`tool_choice` とは一緒に使えません。
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
@@ -342,7 +344,10 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 ## GPU のメモリの分け合い
 
 画像の仕事は GPU で 1 つずつ動きます。
-エンジンは仕事の前に、その画像に要る VRAM（最低限と、画像のモデルを全部載せて VAE を 1 回で回せる量）を答え、サーバーは `--image-gpu-policy` で文章のモデルの扱いを決めます。
+文章のモデルが使っていない GPU が画像用になっているとき（`--image-gpu`）は、画像はその GPU で作り、その間もチャットに答えます。文章のモデルはそのままです。
+起動のログに `image GPU: <PCI> (separate from the text model's)` と出ます。
+その GPU を文章のモデルも使うとき（層の分担、レプリカ、その起動だけの `--gpu`）と、補助の GPU（`--expert-cache-device1..3`）や GPU を絞る環境変数（`ONEAPI_DEVICE_SELECTOR` など）があるときは、ログにそう出て、文章のモデルと同じ GPU を順番に使います。
+同じ GPU を使うときは、エンジンが仕事の前に、その画像に要る VRAM（最低限と、画像のモデルを全部載せて VAE を 1 回で回せる量）を答え、サーバーは `--image-gpu-policy` で文章のモデルの扱いを決めます。
 
 | `--image-gpu-policy` | 文章のモデルの扱い |
 | --- | --- |
@@ -351,7 +356,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `unload` | 会話を保存して文章のエンジンを外し、次の起動で会話を戻します |
 | `auto`（既定） | 全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`。CPU 内蔵の GPU では `keep` |
 
-- 仕事のあと、`keep` で VRAM に余裕があるときだけ、画像のエンジンは層を残します。それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
+- 仕事のあと、`keep` か別の GPU で VRAM に余裕があるときだけ、画像のエンジンは層を残します。それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
 - 画像のエンジンは最初の画像で起動し、そのまま残ります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
 - 画像のエンジンはサーバーとは別のプロセスで、文章のモデルを替えても残ります。どのサーバーもつながらなくなって 30 分たつと終わります（`daemon_idle_s`）。
 - Qwen-Image-2.1 の編集の参照画像のトークンの K と V のキャッシュ（1024x1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。

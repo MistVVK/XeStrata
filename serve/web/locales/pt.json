@@ -127,6 +127,8 @@
   "composer.attach": "Anexar um arquivo de texto (ou soltá-lo aqui)",
   "composer.attachLabel": "Anexar um arquivo",
   "composer.attachPictures": "Anexar um arquivo de texto ou uma imagem (ou soltá-los aqui)",
+  "composer.image": "Criar uma imagem a partir desta mensagem",
+  "composer.imageLabel": "Criar uma imagem",
   "composer.finishOpen": "Salve ou cancele o que está aberto acima para continuar",
   "composer.hintInterject": "Ctrl+Enter interrompe a resposta aqui e envia agora",
   "composer.hintQueue": "Ctrl+Enter envia quando a resposta terminar",

@@ -1562,7 +1562,7 @@ const loadingHint = () => modelLoading === "after_image"
   : tr("composer.loading", "The model is loading (a minute or two); the answer goes on then");
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  $("send-btn").disabled = $("image-btn").disabled = (on && !parksWhileBusy()) || !!panel;
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
                                          : on && modelLoading ? loadingHint()
@@ -1645,10 +1645,11 @@ function settlePending(cut, finished) {
 }
 
 // the message box (or a parked message, `payload`) becomes a user turn and a reply is asked for
-async function send(payload) {
+// image: the reply must make an image (the image button): strata_images' force
+async function send(payload, image = false) {
   const own = !payload;
   const p = payload || {text: $("input").value.trim(), images: attachments.filter((a) => a.kind !== "file"),
-                        files: attachments.filter((a) => a.kind === "file")};
+                        files: attachments.filter((a) => a.kind === "file"), image};
   if (!p.text && !p.images.length && !p.files.length) return;
   if (panel) return;                                  // something is open above (an edit): finish it first
   if (busy) { park(p, own); return; }
@@ -1661,7 +1662,7 @@ async function send(payload) {
     $("input").value = "";
     autosize();
   }
-  return generateReply();
+  return generateReply({image: !!p.image});
 }
 // an answer for the messages as they are: the last one is a user turn
 // A streamed reply the server keeps past its connection (strata_reply): its data lines are counted as they are read, so
@@ -1713,7 +1714,7 @@ function stopReply() {
   if (busy.rid) fetch(`v1/strata/replies/${busy.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
   busy.controller.abort();
 }
-async function generateReply() {
+async function generateReply(opts = {}) {
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
   renderChat();
@@ -1739,6 +1740,8 @@ async function generateReply() {
   // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
   const ci = $("chat-images").value;
   if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
+  if (health.image_generation && opts.image)                // the image button: by the model chosen, else the words'
+    body.strata_images = {...(ci && ci !== "auto" && ci !== "off" ? {model: ci} : {}), force: true};
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
@@ -1843,7 +1846,7 @@ async function generateReply() {
     messages.splice(messages.indexOf(m), 1);
     saveChat();
     renderChat();
-    return generateReply();
+    return generateReply(opts);
   }
   paintLive();
   if (frame) cancelAnimationFrame(frame);
@@ -1854,6 +1857,7 @@ async function generateReply() {
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
+$("image-btn").onclick = () => send(null, true);
 $("stop-btn").onclick = () => { if (busy) stopReply(); };
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send(); }   // Enter alone: a new line
@@ -2226,7 +2230,7 @@ function chatImages() {
   if (ms.length > 1) opts.push(...ms.map(m => new Option(tr("chatImages.model", "Images: {model}", {model: m.id}), m.id)));
   sel.replaceChildren(...opts);
   sel.value = [...sel.options].some(o => o.value === was) ? was : "auto";
-  sel.hidden = !health.image_generation;
+  sel.hidden = $("image-btn").hidden = !health.image_generation;
 }
 $("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
 // the chat's web search (the server's search_url): on or off, kept here; on sends web_search_options

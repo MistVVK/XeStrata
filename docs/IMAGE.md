@@ -117,6 +117,7 @@ Setup's options (given to `xestrata --setup`):
 | `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow's image model in 8 bits or not. `auto` keeps 16 bits when it fits the VRAM with the text encoder, 8 bits when it does not |
 | `--image-dit-keep on\|off` | `on` | Keeps Mage-Flow's image model not in use (the generation or the edit one) in RAM in 8 bits. `off` uses about 4.4 GB less RAM and reads it from the file again at each switch |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | What happens to the text model while an image is made ([below](#sharing-the-gpus-memory)); given together with `--images` |
+| `--image-gpu auto\|same\|<PCI>` | `auto` | The GPU that makes the images: `auto` the one with the most VRAM of the GPUs the text model does not take and that are not the processor's own (else the text model's GPU), `same` the text model's GPU, a PCI address (as `--check` lists it) that GPU; given together with `--images` |
 
 Mage-Flow in 8 bits multiplies both the weights and the activations in int8 where the GPU's math library has int8 products (contrib-llvm on Intel and NVIDIA, and AMD), in the form of ComfyUI's int8_convrot; on other GPUs it is Q8_0.
 Qwen-Image-2.1's image model too is multiplied in int8 on a GPU with int8 products.
@@ -264,6 +265,7 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 
 - `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
   `edit_image` changes the conversation's last image (one attached or one made in the conversation); it takes a `strength` too, and is img2img with a model without edits. One request calls the tools up to 4 times.
+- `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with the image button left of the send button. It does not go together with a `tool_choice`.
 - With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
@@ -342,7 +344,10 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 ## Sharing the GPU's memory
 
 Image jobs run on the GPU one at a time.
-Before a job the engine says the VRAM the image needs (the least, and enough to hold the whole image model and run the VAE in one pass), and the server decides what happens to the text model with `--image-gpu-policy`.
+When a GPU the text model does not take is the images' (`--image-gpu`), the images are made there and the chat is answered meanwhile; the text model stays as it is.
+The start's log says `image GPU: <PCI> (separate from the text model's)`.
+When the text model takes that GPU too (a layer split, replicas, a `--gpu` for one start), or a helper GPU (`--expert-cache-device1..3`) or an environment variable that narrows the GPUs (`ONEAPI_DEVICE_SELECTOR` and the like) is there, the log says so and the images take turns on the text model's GPU.
+On the text model's GPU, before a job the engine says the VRAM the image needs (the least, and enough to hold the whole image model and run the VAE in one pass), and the server decides what happens to the text model with `--image-gpu-policy`.
 
 | `--image-gpu-policy` | The text model |
 | --- | --- |
@@ -351,7 +356,7 @@ Before a job the engine says the VRAM the image needs (the least, and enough to 
 | `unload` | The conversation is saved and the text engine taken off; the next start brings the conversation back |
 | `auto` (default) | `keep` when everything fits; else `shrink` when VRAM can be freed; `keep` with the layers streamed when the least fits; `unload` otherwise. `keep` on the processor's own graphics |
 
-- After a job the image engine keeps its layers only with `keep` and VRAM to spare; otherwise it lets go of what it holds (waiting, the process alone, about 200 MiB).
+- After a job the image engine keeps its layers only with `keep` or on a GPU of its own, and VRAM to spare; otherwise it lets go of what it holds (waiting, the process alone, about 200 MiB).
 - The image engine starts at the first image and stays. Its kernels are prepared once, and the text state of the same prompt and the layers in VRAM stay for the next image.
 - The image engine is a process apart from the server, and stays when the text model is changed. It ends 30 minutes after the last server leaves (`daemon_idle_s`).
 - The K and V cache of the reference images' tokens in a Qwen-Image-2.1 edit (about 2 GB for one 1024x1024 image) keeps what the VRAM cannot hold in pinned RAM and brings it over at each step.

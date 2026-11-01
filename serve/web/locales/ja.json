@@ -127,6 +127,8 @@
   "composer.attach": "テキストファイルを添付 (ここにドロップも可)",
   "composer.attachLabel": "ファイルを添付",
   "composer.attachPictures": "テキストファイルまたは画像を添付 (ここにドロップも可)",
+  "composer.image": "このメッセージから画像を作る",
+  "composer.imageLabel": "画像を作る",
   "composer.finishOpen": "続けるには、上で開いているものを保存するかキャンセルしてください",
   "composer.hintInterject": "Ctrl+Enter で回答をここで止めてすぐに送信します",
   "composer.hintQueue": "Ctrl+Enter で回答が終わってから送信します",

@@ -3255,6 +3255,41 @@ def child_env(cfg: dict) -> dict:
     return env
 
 
+SELECT_ENV = ("ONEAPI_DEVICE_SELECTOR", "ZE_AFFINITY_MASK", "HIP_VISIBLE_DEVICES")   # each narrows the GPUs listed
+
+
+def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
+    """The image engine's environment, from the text engine's (`env`, child_env) -> (it, whether the image jobs have a
+    card of their own (images_api.ImageModels' separate), the line the log says of it).  The "images" section's
+    "gpu_pci" (setup --image-gpu) is that card unless a text engine of the server takes it: the server's card, a layer
+    split's, the replicas' and a split serve's.  A helper GPU (--expert-cache-device1..3, by device number) or an
+    environment that narrows the GPUs the runtime lists leaves the jobs on the text engine's card."""
+    want = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
+    if not want:
+        return env, False, ""
+    text = {str(env.get("STRATA_GPU_PCI") or cfg.get("gpu_pci") or "").lower()}
+    text |= {str(p).lower() for p in cfg.get("split_pci") or []}
+    reps = cfg.get("replicas")
+    for r in reps if isinstance(reps, list) else []:
+        text |= {str(p).lower() for p in ((r.get("gpus") if isinstance(r, dict) else r) or [])}
+    ss = cfg.get("split_serve")
+    if isinstance(ss, dict):
+        text |= {str(ss.get(k) or "").lower() for k in ("prefill_gpu", "decode_gpu")}
+    text.discard("")
+    args = [str(a) for a in cfg.get("args") or []]
+    why = ("a helper GPU (--expert-cache-device1..3) is named by its device number" if any(
+        a.startswith("--expert-cache-device") for a in args) else
+           f"{next(k for k in SELECT_ENV if env.get(k))} narrows the GPUs" if any(env.get(k) for k in SELECT_ENV)
+           else "the text model takes it" if want in text else
+           "no text card is named (the engine takes the first)" if not text else "")
+    if why:
+        return env, False, f"image GPU: {want} is not used ({why}); the image jobs share the text model's card"
+    out = dict(env, STRATA_GPU_PCI=want)
+    if cfg.get("gpu") not in (None, ""):          # CUDA_VISIBLE_DEVICES of the text card alone would hide this one
+        out.pop("CUDA_VISIBLE_DEVICES", None)
+    return out, True, f"image GPU: {want} (separate from the text model's)"
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -3810,6 +3845,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if self.images is not None and hasattr(self.images, "give_back"):
+            self.images.give_back()                  # an image engine kept warm holds the VRAM the model needs
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -7837,20 +7874,32 @@ def make_handler(svc: Service):
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
                 if extra:
                     hubs.append(svc.mcp)
-            want = req.get("strata_images")                   # opt-in: the image tools (true, or {"model": name})
+            # opt-in: the image tools (true, or {"model": name}); {"force": true} (the web page's image button): the
+            # reply opens a call of one of them, as the Responses route's tool_choice image_generation does, and they
+            # are the request's only tools
+            want = req.get("strata_images")
+            image_force = isinstance(want, dict) and want.get("force") is True
+            if image_force and (svc.images is None or force or tool_choice_of(req.get("tool_choice"))[0] == "none"):
+                raise ValueError("strata_images.force: " + ("this server makes no images" if svc.images is None else
+                                                            "it is a tool_choice of its own; send none beside it"))
             if (want is True or isinstance(want, dict)) and svc.images is not None:
                 image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
                                                     model=want.get("model") if isinstance(want, dict) else None)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if image_force:
+                    if not more:
+                        raise ValueError("strata_images.force: the image tools are not available for this request")
+                    tools, extra, hubs = None, list(more), []
+                    force = forced_call("required", more, getattr(svc.template, "call_form", "qwen"))
                 if more:
-                    extra += more
+                    extra += [] if image_force else more
                     hubs.append(image_tools)
             search_tools = None                               # web_search_options: the search tools (search.py)
             ws = req.get("web_search_options")
             if ws is not None and not isinstance(ws, dict):
                 raise ValueError("web_search_options must be an object")
-            if ws is not None and svc.search_backend is not None:   # without one: answered as before, unsearched
+            if ws is not None and svc.search_backend is not None and not image_force:   # without one: unsearched
                 size = ws.get("search_context_size")
                 if size is not None and size not in search_api.CONTEXT:
                     raise ValueError('web_search_options.search_context_size is "low", "medium" or "high"')
@@ -7862,7 +7911,7 @@ def make_handler(svc: Service):
             use_mcp = bool(hubs)
             if use_mcp:
                 tools = (tools or []) + extra or None
-            if force and use_mcp:
+            if force and use_mcp and not image_force:
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -9372,8 +9421,11 @@ def main() -> int:
                   for k, v in section.items()} for section in [cfg["images"], *extra]]
         try:
             ilog = open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None
-            # the text engine's environment: the same GPU (STRATA_GPU_PCI, CUDA_VISIBLE_DEVICES) and libraries
-            svc.images = images_api.ImageModels(icfgs, log=ilog, env=child_env(cfg))
+            # the text engine's environment: its libraries, and its GPU unless the images have a card of their own
+            ienv, separate, said = image_env(cfg, child_env(cfg))
+            if said:
+                print(f"[strata] {said}", flush=True)
+            svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()

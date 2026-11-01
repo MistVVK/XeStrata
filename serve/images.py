@@ -66,17 +66,22 @@ field gives it and taken out of the prompt with a warning where a tag does (the 
 [{"name", "scale"}], and strata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
-request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
-holds and what is free, less a reserve; layers that do not fit are streamed from RAM, so it runs, more slowly, in a few
-GB.  Before each job it says what the image needs (NEED: the least, and the DiT resident with the VAE in one piece),
-and the config's "gpu_policy" says what happens to the text engine during the job (gpu_turn):
+request takes), so no chat turn runs on the GPU meanwhile.  A config whose "images" section names a card of its own
+("gpu_pci", setup --image-gpu) that no text engine of the server takes runs the jobs there (separate): they take only
+that GPU's turn (GpuTurn), so chat requests run beside them, and the text engine is left as it is.  The image engine
+works in the VRAM it is given: what it holds and what is free, less a reserve; layers that do not fit are streamed from
+RAM, so it runs, more slowly, in a few GB.  Before each job it says what the image needs (NEED: the least, and the DiT
+resident with the VAE in one piece), and the config's "gpu_policy" says what happens to the text engine during the job
+(gpu_turn):
   keep    - it stays loaded and idle (an APU's shared memory, a card with room for both)
   shrink  - an engine started with --vram-elastic gives the image job VRAM from its expert cache and takes it back
             afterwards (POST /v1/vram's mechanism; the conversation stays in the engine)
   unload  - its conversation is saved to a session file, the engine is stopped, and the next start restores it
   auto    - (default) keep when the image fits beside it at full speed, else shrink when the engine can, else keep
             when the image fits at all (its layers streamed), else unload
-After a job the image engine keeps what it holds (the next image starts warm) only under keep with VRAM to spare;
+  separate - not a value of "gpu_policy": the policy of every job on a card of its own (above)
+After a job the image engine keeps what it holds (the next image starts warm) only under keep or separate with VRAM to
+spare;
 otherwise it lets go of everything but its process (about 200 MiB).  The daemon ends after daemon_idle_s (default
 1800) without a server.
 
@@ -1952,7 +1957,8 @@ class ImageModels:
     it for theirs) and ends every other daemon of the GPU first, this server's other models' and other servers'.
     Anything else is the model of the last job's (the Monitor's, /v1/status)."""
 
-    def __init__(self, cfgs: list[dict], log=None, env: dict | None = None):
+    def __init__(self, cfgs: list[dict], log=None, env: dict | None = None, separate: bool = False):
+        self.separate = separate     # `env` names a card no text engine of the server takes (the policy separate)
         self.gens: dict[str, ImageGen] = {}
         for c in cfgs:
             g = ImageGen(c, log=log, env=env)
@@ -1960,7 +1966,7 @@ class ImageModels:
                 raise ValueError(f'two image models are named {g.model!r} ("images" and "image_models")')
             self.gens[g.model] = g
         self.default = self.current = next(iter(self.gens.values()))
-        self.gpu = GpuTurn(self.default.engine.env)   # the models share the text engine's environment, so its GPU
+        self.gpu = GpuTurn(self.default.engine.env)   # the models share one environment, so one GPU
 
     def __getattr__(self, name):
         return getattr(self.current, name)
@@ -1991,6 +1997,18 @@ class ImageModels:
         for addr in self.gpu.keep_only(mine):
             gen._say(f"image model: {names.get(addr, 'another server')}'s engine ended for {gen.model}")
         self.current = gen
+
+    def give_back(self) -> None:
+        """Before the text engine starts: every model's engine lets go of all it holds.  A job that ran while the text
+        engine was unloaded kept its layers (policy keep: nothing to make room from), and the text engine that starts
+        after it would find the card full (no expert cache: it stops before the prompt).  Not on a card of their own
+        (separate), where a job may be running."""
+        if self.separate:
+            return
+        for g in self.gens.values():
+            if g.engine.alive():
+                g._say(f"image model: {g.model}'s engine gives the GPU back for the model")
+                g.release(True)
 
     def missing(self) -> list[str]:
         return [f for g in self.gens.values() for f in g.missing()]
@@ -2466,7 +2484,8 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
                 preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
     waits for the turn after an image, the turn is given to it and taken again for the rest, so a chat is not held up
-    by a batch; not under unload (giving it would load the text model and unload it again for each image).  Too many
+    by a batch; not under unload (giving it would load the text model and unload it again for each image) nor on a card
+    of its own (separate: the chat does not wait for it).  Too many
     images for budget_s are refused first (ImageGen.check_n).  MOSS-Image's prompt enhancer (enhance_prompt) runs
     first, in the chat model's turn."""
     if job.get("enhance") and not job.get("enhanced"):
@@ -2480,8 +2499,10 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
             used = policy
 
             def pause() -> bool:
+                if used in ("unload", "separate"):   # separate: the chat requests do not wait for the job
+                    return False
                 with svc.status_lock:
-                    return used != "unload" and svc.status["queued"] > 0
+                    return svc.status["queued"] > 0
             made, figures = gen.run(job, cancel, len(images), pause, preview)
         images += made
         parts.append(figures)
@@ -2500,7 +2521,12 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
-    once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used."""
+    once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
+    card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""
+    if isinstance(getattr(svc, "images", None), ImageModels) and svc.images.separate:
+        with separate_turn(svc, gen, job, cancel) as policy:
+            yield policy
+        return
     with svc.status_lock:
         svc.status["queued"] += 1
     queued = True
@@ -2571,6 +2597,48 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
+@contextlib.contextmanager
+def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
+    """gpu_turn on a card no text engine takes: only that GPU's turn (GpuTurn), so chat requests run meanwhile and the
+    text engine is left as it is (the policy separate); the chat's status is not touched.  MOSS-Image's prompt read by
+    the chat's engine (text_states) takes the service's turn for that read alone."""
+    models: ImageModels = svc.images
+    error: str | None = None
+    held = False
+    try:
+        def waiting():
+            gen._say("image job: waiting for another server's image job on this GPU")
+        models.gpu.acquire(cancel, waiting)
+        held = True
+        models.activate(gen)
+        gen.begin(job)
+        if gen.family == "moss-image":
+            with svc._turn(cancel):
+                text_states(svc, gen, job)
+        try:
+            need = gen.need(job)
+        except ImageJobFailed:
+            gen.totals["failed"] += 1
+            raise
+        check_room(need, ram_available_mib())
+        try:
+            budget = gen.fit()
+            gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT resident "
+                     f"from {need['full_mib']} MiB, at least {need['least_mib']} MiB)")
+            yield "separate"
+        finally:
+            _give_back(svc, gen, "separate", None)
+            svc.last_request_at = time.time()
+    except BaseException as e:
+        error = str(e) or type(e).__name__
+        raise
+    finally:
+        if held:
+            models.gpu.release()
+        if error is not None:                     # a job that ends well: make_images ends it, after its last image
+            gen.end(error, cancelled=cancel is not None and cancel.is_set())
+
+
 def _make_room(svc, gen: ImageGen, policy: str, need: dict):
     """Do what `policy` says before the job; -> what _give_back needs."""
     eng = svc.engine
@@ -2603,9 +2671,9 @@ def _make_room(svc, gen: ImageGen, policy: str, need: dict):
 
 
 def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
-    """After the job: the image engine keeps its layers (the next image starts warm) only under keep with spare_mib
-    still free; else it lets them go, and the text engine gets back what it gave."""
-    keep = policy == "keep"
+    """After the job: the image engine keeps its layers (the next image starts warm) only under keep or separate with
+    spare_mib still free; else it lets them go, and the text engine gets back what it gave."""
+    keep = policy in ("keep", "separate")
     if keep:
         try:
             keep = gen.engine.alive() and gen.free_mib() >= gen.spare

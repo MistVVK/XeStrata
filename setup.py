@@ -40,7 +40,7 @@ request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8
 system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
 encoder Qwen3.5-9B; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
 auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
---image-gpu-policy auto|keep|shrink|unload).
+--image-gpu-policy auto|keep|shrink|unload, --image-gpu auto|same|PCI).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -4306,6 +4306,42 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     return cfgs[0], cfgs[1:]
 
 
+def image_gpu(a, cfg: dict) -> str | None:
+    """--image-gpu -> the PCI address of the card the image jobs take on their own (the "images" section's "gpu_pci",
+    serve/server.py's image_env), or None for the text model's.  auto: a usable discrete GPU that no text engine of
+    `cfg` takes (its "gpu_pci" and "split_pci", the replicas' cards among them), the one with the most VRAM; none
+    when the config names no text card (one GPU)."""
+    want = getattr(a, "image_gpu", None) or "auto"
+    if want == "same":
+        return None
+    usable = [x for x in gpus() if gpu_problem(x) is None]
+    if want != "auto":
+        g = next((x for x in usable if x["pci"].lower() == want.lower()), None)
+        if g is None:
+            fail(f"--image-gpu {want}: no usable GPU at that PCI address",
+                 "--check lists the GPUs and their PCI addresses")
+        return g["pci"]
+    text = {cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])} - {None}
+    free = [x for x in usable if x["pci"] not in text and not x.get("integrated")]
+    if not text or not free:
+        return None
+    return max(free, key=lambda x: x["vram_gb"])["pci"]
+
+
+def place_images(a, cfg: dict) -> None:
+    """The "images" section's card (image_gpu), said as setup chose it."""
+    if not isinstance(cfg.get("images"), dict):
+        return
+    pci = image_gpu(a, cfg)
+    cfg["images"].pop("gpu_pci", None)
+    if pci and pci in {cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])}:
+        warn(f"--image-gpu {pci}: the text model takes that GPU too, so the image jobs share it (one at a time)")
+    elif pci:
+        g = next(x for x in gpus() if x["pci"] == pci)
+        cfg["images"]["gpu_pci"] = pci
+        ok(f"image GPU: {gpu_name(g)}, apart from the text model's: the images are made beside the chat")
+
+
 # ------------------------------------------------------------------------------------------------ the data folder
 # The model files - the GGUFs, the prepared packs and the MTP layer, 70-120 GB - live in a data folder NEXT TO the
 # Strata folder (`XeStrata-data`), not inside it: updating Strata by unzipping a new copy used to give a new, empty
@@ -6398,6 +6434,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         text_gb = DENSE_RAM_GB if dense else d["size"] / 1e9 + 8
         got = setup_images(a, gpu, Path(a.models_dir), eng, text_gb, gguf)
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
@@ -6638,6 +6675,10 @@ def main() -> int:
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help="what the text model does during an image job (default auto: stays loaded when both fit, "
                          "else gives VRAM back or is unloaded and its conversation restored afterwards)")
+    ap.add_argument("--image-gpu", metavar="auto|same|PCI",
+                    help="the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the "
+                         "one with the most VRAM, where the images are made beside the chat; else the text model's); "
+                         "same: the text model's GPU; a PCI address as --check lists it: that GPU")
     ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
                     help="EXPERIMENTAL, off by default: the control vector in "
                          "third_party/nonfree/experimental-speed-projection "
@@ -7630,6 +7671,7 @@ def main() -> int:
     if a.images:                                       # only when given: else an earlier "images" is carried over
         got = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent, text_ram_gb(cfg["args"], ram, model))
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
