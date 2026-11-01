@@ -4572,6 +4572,18 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    def _next_pass(self, ids: list, nxt: list, raw_ids: list) -> list:
+        """The next pass's prompt after the server wrote into the reply (a thinking budget's wrap-up, the thinking
+        closed, a forced call's opening, the loop guard's note): the reply's text encoded whole, as the template
+        renders it when the client sends the reply back, not the pieces as they were joined.  Joined, the model's
+        last token and the inserted text can split differently ("  \n" + "\n\n" against "  \n\n\n"): the
+        engine's state then is not the prompt the next turn sends, and a recurrent model reads that turn again
+        from its checkpoint at the prompt (Mainplane, the chat's segments: 11,269 tokens after one wrap-up).
+        `nxt` as it is where the reply is not exactly `raw_ids` after the prompt (a pass that cut it)."""
+        if nxt[len(ids):] != raw_ids:
+            return nxt
+        return ids + list(self.tok.encode(self.tok.decode(raw_ids), parse_special=True))
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -5008,7 +5020,7 @@ class Service:
                             if stops is not None and stops.hit is not None:
                                 finish = "stop"
                                 break
-                            prompt = prompt + seg + extra
+                            prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                             continue
                         if (stream is not None and stream.finished and n_call < max_new - n_pass and seg
                                 and finish == "length" and n < max_new and not cancel.is_set()
@@ -5056,7 +5068,7 @@ class Service:
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
-                                prompt = prompt + seg + extra
+                                prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                                 finish = "length"
                                 continue
                         if not (wrap or opens) or cancel.is_set():
@@ -5089,7 +5101,7 @@ class Service:
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
                             break
-                        prompt = prompt + seg + extra
+                        prompt = self._next_pass(ids, prompt + seg + extra, raw_ids)
                     if cancel.is_set():
                         finish = "cancel"
                     elif guard_stopped and not answered:

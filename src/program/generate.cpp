@@ -498,6 +498,8 @@ struct Options {
     bool session_save_reclaim = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    /// --serve: a checkpoint every N tokens of a reply, the newest kept (0 = off; not with --pipeline-windows 2)
+    int64_t reply_checkpoint_every = 512;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
     bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
@@ -653,6 +655,9 @@ void usage() {
                  "                       10-15%% smaller; only in a build that found libblosc2)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --reply-checkpoint-every N  --serve: a checkpoint every N tokens of a reply, the newest kept (default\n"
+                 "                       512, 0 = off; not with --pipeline-windows 2): a request that leaves the reply near its\n"
+                 "                       end reads that much again\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
                  "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
@@ -2583,6 +2588,8 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
+        else if (a == "--reply-checkpoint-every")
+            o.reply_checkpoint_every = std::max(0LL, std::strtoll(next("--reply-checkpoint-every"), nullptr, 10));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
         else if (a == "--turn-token") o.turn_token = std::strtoll(next("--turn-token"), nullptr, 10);
         else if (a == "--tail-role-token") o.tail_role_token = std::strtoll(next("--tail-role-token"), nullptr, 10);
@@ -11737,6 +11744,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            int64_t reply_ck = (int64_t) consumed.size();   // --reply-checkpoint-every: where the last one was taken
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -12210,6 +12218,11 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
+                    for (int i = 0; i < a; ++i)   // the reply ends at its first stop token (as the serial windows')
+                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end()) {
+                            a = i;
+                            break;
+                        }
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -12490,6 +12503,15 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // the reply ends at its first stop token: the drafts after it (an accepted "\n<|endoftext|>" after
+                // <|im_end|>) stay out of the session, as plain's spec_step keeps them out.  In it they made the session
+                // end in tokens the next turn's prompt does not have ("<|im_end|>\n<|im_start|>"), and a recurrent
+                // state read that turn again from its last checkpoint
+                for (int i = 0; i < a; ++i)
+                    if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                        a = i;
+                        break;
+                    }
                 if (grammar.active() && !grammar.commit(outv.data(), a + 1)) {   // the masks made this impossible
                     std::fprintf(stderr, "strata serve: the grammar refused a token its mask allowed: the rest of this "
                                          "reply is not constrained\n");
@@ -12615,6 +12637,43 @@ int main(int argc, char** argv) {
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
+                // --reply-checkpoint-every: a long reply's state now and then (here `consumed` is the session's), so
+                // that a request that leaves the reply near its end reads at most that many tokens again.  The server
+                // does after a thinking budget's wrap-up: the next pass and the next turn send the reply's text
+                // encoded whole, whose last token can differ from the one the model wrote (plain_generate.cpp's)
+                if (o.reply_checkpoint_every > 0 && o.prompt_cache > 0 && req_ckpt &&
+                    (int64_t) consumed.size() - reply_ck >= o.reply_checkpoint_every) {
+                    reply_ck = (int64_t) consumed.size();
+                    if (!ver.wait_commit(err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                    ConvCheckpoint c;
+                    c.ids = consumed;
+                    c.imgs = imgs_below(req_imgs, reply_ck);
+                    bool saved = strata::gpu::device_sync() && checkpoint_save(c, ss, g);
+                    for (auto& st : stages) {   // a layer split's later stages: their sessions' part (checkpoint_at's)
+                        if (!saved) break;
+                        const strata::core::OnDevice on(st->dev);
+                        ConvCheckpoint part;
+                        part.ids = c.ids;
+                        saved = strata::gpu::device_sync() && checkpoint_save(part, st->ss, g);
+                        c.stage_parts.push_back(std::move(part));
+                    }
+                    if (saved) {
+                        checks.erase(std::remove_if(checks.begin(), checks.end(), [](const ConvCheckpoint& k) {
+                                         if (!k.reply) return false;
+                                         strata::core::conversation_checkpoint_join(k.gdn.data());   // (STRATA_CKPT_ASYNC)
+                                         return true;
+                                     }), checks.end());
+                        c.reply = true;
+                        std::fprintf(stderr, "strata serve: checkpoint at %lld tokens, in the reply\n", (long long) reply_ck);
+                        keep_checkpoint(std::move(c), reply_ck, false);
+                    } else if (!strata::gpu::device_sync()) {
+                        std::printf("ERR saving a reply checkpoint failed\n");
+                        return 1;
+                    }
+                }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it

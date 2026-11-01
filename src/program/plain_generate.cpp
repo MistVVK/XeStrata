@@ -194,6 +194,7 @@ struct Checkpoint {
     uint64_t used = 0;            // the LRU clock: taken or resumed from
     bool root = false, pinned = false;
     bool tail = false;            // --prompt-cache-tail's: the first to leave
+    bool reply = false;           // --reply-checkpoint-every's: in a reply, the newest kept
 };
 
 struct ConversationCache {
@@ -202,6 +203,7 @@ struct ConversationCache {
     int64_t min_free = 2560ll << 20;
     int checkpoints = 6;          // --prompt-cache N: a conversation's checkpoints (0: none)
     int64_t every = 16384;        // --prompt-cache-every N fresh tokens (0: none)
+    int64_t reply_every = 512;    // --reply-checkpoint-every N tokens of a reply (0: none)
     int64_t root = 2048;          // --prompt-cache-root N: the system prompt's checkpoint from N tokens (0: none)
     int32_t turn = -2;            // --turn-token ID; -2: the vocabulary's <|im_start|>, else <|start|>
     int32_t tail_role = -1;       // --tail-role-token ID: a turn of this role right before the last stays out of it
@@ -1787,7 +1789,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         cuts.push_back({n_end, false, false});
         // the recurrent states after the first L tokens, kept in RAM while it leaves the floor free; the least
         // recently used one leaves past --prompt-cache, never the root or the pinned one
-        auto checkpoint_at = [&](int64_t L, bool root, bool pin, bool tail) {
+        auto checkpoint_at = [&](int64_t L, bool root, bool pin, bool tail, bool reply = false) {
             auto snap = std::make_shared<strata::core::PlainModel::Snapshot>();
             std::string cerr;
             if (!model.save_recurrent(L, *snap, cerr)) {
@@ -1805,7 +1807,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 for (Checkpoint& c : checks) c.pinned = false;
             std::fprintf(stderr, "strata (%s): checkpoint at %lld tokens (%zu MiB%s)\n", arch.c_str(), (long long) L,
                          snap->bytes() >> 20, root ? ", the system prompt's" : pin ? ", pinned" : "");
-            checks.push_back({L, std::move(snap), ++check_clock, root, pin, tail});
+            if (reply)   // a reply's newest only: the next request leaves it near its end, if at all
+                checks.erase(std::remove_if(checks.begin(), checks.end(), [](const Checkpoint& c) { return c.reply; }),
+                             checks.end());
+            checks.push_back({L, std::move(snap), ++check_clock, root, pin, tail, reply});
             while ((int) checks.size() > cache.checkpoints) {
                 auto evictable = [](const Checkpoint& c) { return !c.root && !c.pinned; };
                 auto drop = checks.end();
@@ -1913,6 +1918,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         if (spec && !req_prefill && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
         std::vector<int32_t> pend;
         size_t at = 0;
+        int64_t reply_ck = (int64_t) live.size();   // --reply-checkpoint-every: where the last one was taken
         if (ok && !req_prefill && !picked(next)) {
             err = cerr;
             ok = false;
@@ -1930,6 +1936,16 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 continue;
             }
             if (stop_req.load()) { finish = "cancel"; break; }
+            // --reply-checkpoint-every: the state of a long reply now and then (here, between windows, it is that of
+            // `live`), so that a request that leaves the reply near its end reads at most that many tokens again.
+            // The server does after a thinking budget's wrap-up: the next pass and the next turn send the reply's text
+            // encoded whole, whose last token can differ from the one the model wrote (and a recurrent state goes back
+            // only to a checkpoint)
+            if (cache.reply_every > 0 && cache.checkpoints > 0 && model.recurrent() &&
+                (int64_t) live.size() - reply_ck >= cache.reply_every) {
+                checkpoint_at((int64_t) live.size(), false, false, true, true);
+                reply_ck = (int64_t) live.size();
+            }
             if (spec) {
                 int n_emit = 0, n_ext = 0;
                 if (lookup) {
@@ -2147,6 +2163,8 @@ static void plain_usage(const std::string& arch) {
                  "  --prompt-cache N     --serve, a model with a recurrent state: keep N checkpoints of a conversation\n"
                  "                       mid-prompt, where a next request may take it up (default 6; 0 = off)\n"
                  "  --prompt-cache-every N  --serve: also a checkpoint every N fresh prompt tokens (default 16384; 0 = off)\n"
+                 "  --reply-checkpoint-every N  --serve: a checkpoint every N tokens of a reply, the newest kept (default\n"
+                 "                       512; 0 = off): a request that leaves the reply near its end reads that much again\n"
                  "  --prompt-cache-root N  --serve: a checkpoint at the end of a system prompt of N tokens or more, read\n"
                  "                       from token 0 (default 2048; 0 = off)\n"
                  "  --turn-token ID      --serve: the token a turn starts with (default <|im_start|>, else <|start|>)\n"
@@ -2350,6 +2368,8 @@ int plain_main(int argc, char** argv) {
             cache.checkpoints = std::max(0, (int) std::strtol(next("--prompt-cache"), nullptr, 10));
         else if (a == "--prompt-cache-every")
             cache.every = std::max<int64_t>(0, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
+        else if (a == "--reply-checkpoint-every")
+            cache.reply_every = std::max<int64_t>(0, std::strtoll(next("--reply-checkpoint-every"), nullptr, 10));
         else if (a == "--prompt-cache-root")
             cache.root = std::max<int64_t>(0, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
         else if (a == "--turn-token") cache.turn = (int32_t) std::max(-1L, std::strtol(next("--turn-token"), nullptr, 10));

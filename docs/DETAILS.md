@@ -453,7 +453,7 @@ The engine's options (added to the settings' `args`):
 | `--no-pcie-split` | the CPU computes every expert VRAM does not hold |
 | `--pcie-frac F` | that share of the experts VRAM does not hold read by the GPU over PCIe in every window, instead of the measured split (a request's `strata_tune` `pcie_frac` too) |
 | `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
-| `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; the default `auto` takes it from the times measured at start; 0: all on the GPU) |
+| `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; the default `auto` takes it from the times measured at start; 0: all on the GPU). The CPU rounds differently from the GPU, and which experts it takes follows which are in VRAM, a tier that `--expert-cache auto` sizes from the free VRAM at start: a greedy answer to the same question can differ a little from run to run. With 0 it is the same each time |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
 | `--pool-cores LIST`, `--aux-cpus SET`, `--pool-tasks N`, `--no-host-worker`, `--memory-limit-mib N` | the CPUs of the expert workers, the CPUs of the threads that are neither workers nor the host (a request's `strata_tune` `aux_cpus` too), the pool's tasks a phase, the host thread kept out of the drain, the RAM the parking and saving of conversations counts (Qwen3.8-Flash-Next's meanings) |
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096, or a larger chunk the VRAM tier of experts lends, up to 32768, its buffers within 85% of the slots; 0: none at once) |
@@ -1096,6 +1096,8 @@ Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--promp
 `--prompt-cache-every` does not set the size of the pieces a prompt is read in: the checkpoint every N tokens is taken at a chunk boundary of the prefill, and the read goes on.
 What splits a read is the end of the system prompt (`--prompt-cache-root`), the start of the last message, the `STRATA_CACHE_MESSAGE_BOUNDARY` boundary and the `"strata_prefix"` boundary (the chunk size is `--prefill`).
 `--prompt-cache-every 0` takes neither the checkpoint every N tokens nor the `--prompt-cache-tail` one, so a client that rewrote an earlier message reads again from a checkpoint that much farther back.
+A reply is checkpointed too, every `--reply-checkpoint-every N` tokens (default 512, 0 = off; not with Qwen3.8-Flash-Next's `--pipeline-windows 2`), the newest kept.
+A next request that leaves the reply near its end reads from there. After a thinking budget's wrap-up the server goes on with the reply's text encoded whole, and the next turn comes in that form, so the last token can differ from the one the model wrote (Qwen3.6-35B-A3B on a B70, a reply with a thinking budget of 150: its continuation read 158 tokens again before and about 23 after, the next turn 236 and 18).
 
 A one-shot request that no later request continues (a classification call, a probe) can send `"strata_checkpoint": false` in its body.
 It takes no checkpoint at the start of its last turn nor every 16K tokens, and its session is neither kept nor parked for a next request.

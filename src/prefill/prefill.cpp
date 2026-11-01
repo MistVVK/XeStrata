@@ -155,6 +155,9 @@ constexpr int64_t STREAM_ALL_MIN = 2048;
 // an answer can differ slightly from the GPU-only one.  Unset, --prefill-cpu-share (set_cpu_share) fixes the share
 // where the default arms it: the measured one moves from run to run, and which experts the CPU takes with it, so two
 // greedy runs of one prompt parted (2026-10-16, an RTX 4070: logits up to 1.5 apart at the first generated token).
+// A fixed share does not make the runs alike: the CPU takes from the experts outside VRAM, and --expert-cache auto
+// sizes that tier from the free VRAM at start (a B70: 14,870 or 14,873 slots, the matrix library's 6 or 10 MiB), so a
+// few experts move and the reply with them (2026-11-01, 1 run in 6).  Only 0 gives the same reply each time.
 double g_cpu_share_fixed = -1.0;   // set_cpu_share: -1 measured
 inline double cpu_share_env() {   // -1: measured
     static const double v = [] {

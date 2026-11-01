@@ -418,7 +418,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
 | `--pcie-frac F` | VRAM にないエキスパートのうち、どの窓でもこの割合を PCIe で GPU が読む（測った分け方の代わり。要求ごとの `strata_tune` の `pcie_frac` も効きます） |
 | `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
-| `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU） |
+| `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU）。CPU と GPU は丸めが違い、CPU が受け持つエキスパートは VRAM にあるエキスパートで変わります。そのエキスパートの段は `--expert-cache auto` のとき起動時の空き VRAM で大きさが決まるので、同じ問いの貪欲な答えが実行ごとに少し変わることがあります。0 なら毎回同じです |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
 | `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
@@ -1056,6 +1056,8 @@ print(r.choices[0].message.content)
 `--prompt-cache-every` は、prompt を読む塊の大きさを決めません。N トークンごとのチェックポイントは prefill の塊の境目で取り、読みはそのまま続きます。
 読みを分けるのは、システムプロンプトの終わり（`--prompt-cache-root`）、最後の発言の始まり、`STRATA_CACHE_MESSAGE_BOUNDARY` の境目、`"strata_prefix"` の境目です（塊の大きさは `--prefill`）。
 `--prompt-cache-every 0` は、N トークンごとのチェックポイントも、`--prompt-cache-tail` のチェックポイントも取りません。前の発言を書き換えたクライアントは、それだけ前のチェックポイントから読み直します。
+返事の途中でも、`--reply-checkpoint-every N`（既定 512、0 でオフ。Qwen3.8-Flash-Next の `--pipeline-windows 2` では取りません）トークンごとにチェックポイントを取り、最新の 1 つを残します。
+返事の終わり近くで分かれる次の要求は、そこから読みます。思考の予算で思考を締めくくった返事は、サーバーが返事の文をまとめて符号化し直して続け、次のターンもその形で届くので、最後のトークンがモデルの書いたものと変わることがあります（B70 の Qwen3.6-35B-A3B で、思考の予算 150 の返事の続きの読み直しが 158 から約 23 トークンに、次のターンが 236 から 18 トークンになりました）。
 
 続きの要求が来ない使い捨ての要求（分類や確認の呼び出し）は、本文に `"strata_checkpoint": false` を書けます。
 最後の発言の始まりと 16K トークンごとのチェックポイントを取らず、そのセッションを次の要求のために残しも置きもしません。
