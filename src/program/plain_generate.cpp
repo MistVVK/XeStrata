@@ -2732,6 +2732,10 @@ int plain_main(int argc, char** argv) {
                      (double) (model.spec_accepted() + model.spec_windows()) / (double) model.spec_windows(),
                      model.spec_ms_check() / (double) model.spec_windows(),
                      model.spec_ms_draft() / (double) model.spec_windows());
+    if (model.pl_gate().started() > 0)
+        std::fprintf(stderr, "strata (%s): --pipeline-windows 2: %lld guessed windows, %lld held; a guess starts at an "
+                             "estimate of %.2f\n", arch.c_str(), (long long) model.pl_gate().started(),
+                     (long long) model.pl_gate().held(), model.pl_gate().threshold(false));
     return 0;
 }
 

@@ -3548,13 +3548,13 @@ bool PlainModel::pipelined_spec() const {
            root_->pl_ready_;
 }
 
-namespace {
-// --pipeline-windows 2: a guessed window starts only when the chain's estimate that the window before is taken whole,
-// with the guess its next token, is at least this (STRATA_PIPELINE_THETA with STRATA_PIPELINE_DEBUG=1, as
-// Qwen3.8-Flash-Next's, whose default is 0.2).  Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, the experts'
-// places fixed, serial 187.9 tok/s for a copy reply and 133.9 for a story at temperature 0.8: 240.4 and 124.5 at 0.2,
-// 245.6 and 129.8 at 0.5 (2026-11-01; the same text each time).  Measured on that pair only.
-float pl_theta() {
+// --pipeline-windows 2: until the windows' costs are measured (pl_gate_), a guessed window starts only when the chain's
+// estimate that the window before is taken whole, with the guess its next token, is at least this
+// (STRATA_PIPELINE_THETA with STRATA_PIPELINE_DEBUG=1, as Qwen3.8-Flash-Next's, whose default is 0.2).  Qwen3.6-35B-A3B
+// on a B70 + RTX 4070 split at layer 20, the experts' places fixed, serial 187.9 tok/s for a copy reply and 133.9 for
+// a story at temperature 0.8: 240.4 and 124.5 at 0.2, 245.6 and 129.8 at 0.5 (2026-11-01; the same text each time).
+// Measured on that pair only.
+float PlainModel::pl_theta() {
     static const float t = [] {
         const char* dbg = std::getenv("STRATA_PIPELINE_DEBUG");
         const char* v = dbg != nullptr && std::strcmp(dbg, "1") == 0 ? std::getenv("STRATA_PIPELINE_THETA") : nullptr;
@@ -3562,13 +3562,16 @@ float pl_theta() {
     }();
     return t;
 }
-}  // namespace
 
 bool PlainModel::pl_chain(int64_t pos1, std::string& err) {
     if (!mtp_chain(n_mtp_, pos1, err, true)) return false;
     float pa = 1.0f;
     for (size_t i = 0; i < (size_t) n_mtp_ && i < dprob_.size(); ++i) pa *= dprob_[i];
-    return pa < pl_theta() || mtp_chain(2 * n_mtp_ + 1, pos1, err, true);
+    if (!pl_gate_.extend(pa)) return true;
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = mtp_chain(2 * n_mtp_ + 1, pos1, err, true);
+    pl_gate_.observe_extend(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return ok;
 }
 
 bool PlainModel::pl_save(std::string& err) {
@@ -3676,6 +3679,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     // the next window's guess: this one whole, then the chain's next token and its drafts after it
     std::vector<int32_t> guess;
+    float p_on = 0.0f;
     if ((int) drafts_.size() > nd && limit - T >= 1 && cur_pos_ + T < opt_.max_cells - 1) {
         int kg = (int) std::min<int64_t>({(int64_t) drafts_.size() - nd - 1, (int64_t) K, limit - T - 1,
                                           opt_.max_cells - (cur_pos_ + T) - 1});
@@ -3684,9 +3688,9 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
         for (int j = 0; j < kg && j < strata::spec::DraftPolicy::kMaxT; ++j) gp[j] = prob((size_t) nd + 1 + (size_t) j);
         kg = rule(gp, kg);
         // the estimate that this window is taken whole and the guess's first token is its next one
-        float p_on = prob((size_t) nd);
+        p_on = prob((size_t) nd);
         for (int j = 0; j < nd; ++j) p_on *= probs[j];
-        if (p_on >= pl_theta()) guess.assign(drafts_.begin() + nd, drafts_.begin() + nd + 1 + kg);
+        if (pl_gate_.start(p_on)) guess.assign(drafts_.begin() + nd, drafts_.begin() + nd + 1 + kg);
     }
     const auto t0 = std::chrono::steady_clock::now();
     // the first stage's part of this window (done already when it was the guess)
@@ -3698,11 +3702,13 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
         if (!s0.stage_forward(win, T, cur_pos_, nullptr, err, true)) return false;
         hand.assign(s0.h_hand_, s0.h_hand_ + (size_t) T * (size_t) s0.hand_w_);
         s0.pl_bak_valid_ = false;
+        pl_gate_.observe_front(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     pl_g_.clear();
     // the guess on the first stage beside this window on the last
     std::string gerr;
     bool gfail = false;
+    const auto tb = std::chrono::steady_clock::now();
     s0.piping_ = true;
     std::thread front;
     if (!guess.empty())
@@ -3728,6 +3734,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
     if (!ok) return false;
     if (gfail) { err = gerr; return false; }
     const auto t1 = std::chrono::steady_clock::now();
+    pl_gate_.observe_back(std::chrono::duration<double, std::milli>(t1 - tb).count(), !guess.empty());
     spec_ms_check_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
     // accepted: the drafts the window's own picks agree with, up to the first stop token among the emitted
     int n = 0;
@@ -3761,6 +3768,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
                 return false;
             }
     const bool held = !guess.empty() && n == T - 1 && out[n] == guess[0];
+    if (!guess.empty()) pl_gate_.observe_guess(p_on, held);
     {
         const OnDevice on(s0.dev_);
         if (held) s0.pl_bak_valid_ = false;   // its last window is the guess now (its rows' copies in its snapshots)

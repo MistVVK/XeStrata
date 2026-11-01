@@ -42,6 +42,7 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/guess_gate.hpp"
 
 #include <array>
 #include <atomic>
@@ -402,6 +403,8 @@ public:
     /// The time spent in the windows that checked drafts, and in making the drafts (ms, since the load).
     double spec_ms_check() const { return tail().spec_ms_check_; }
     double spec_ms_draft() const { return tail().spec_ms_draft_; }
+    /// --pipeline-windows 2: the guessed windows started and held
+    const strata::spec::GuessGate& pl_gate() const { return tail().pl_gate_; }
 
     /// The VRAM tier, for the report: slots, slots holding an expert, and the routed entries it served so far (every
     /// GPU's, with a layer split).
@@ -626,8 +629,9 @@ private:
     bool pl_save(std::string& err);
     bool pl_restore(int n, int T, std::string& err);
     /// the chain from position pos1: a window's drafts, and on to the next window's guess where those are likely to be
-    /// taken whole (pl_theta)
+    /// taken whole (pl_gate_)
     bool pl_chain(int64_t pos1, std::string& err);
+    static float pl_theta();
     /// `max_swaps` > 0: this round moves up to that many, past adapt_swaps and the copy budget (after a prompt).
     /// `max_evict` >= 0: of them at most that many evict an expert (the rest fill free slots).
     bool adapt(std::string& err, int64_t max_swaps = 0, int64_t max_evict = -1);
@@ -959,6 +963,8 @@ private:
     /// the first stage's routing records (ExpertDispatch::route_rec) of the window before a guess and of the guess:
     /// the adaptive tier counts a window's kept rows from its own records, as the serial windows' (after_rows)
     std::vector<int32_t> pl_rec_w_, pl_rec_g_;
+    /// the last stage's: whether a guess is worth starting, from the windows' measured costs
+    strata::spec::GuessGate pl_gate_{pl_theta()};
     // the drafting: the pending token, its position, the drafts after it; the MTP layer's input rows (device, max_t of
     // n_embd); the counts for the report
     int32_t cur_ = -1;
