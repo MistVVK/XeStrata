@@ -716,6 +716,23 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
+// the picture reader that serves: where it runs and how many tokens a picture becomes (an older server: on or off)
+function visionText(eng) {
+  const v = eng.vision;
+  if (v === undefined) return eng.images ? "on" : "off";
+  if (!v) return "off";
+  if (v.error) return `off: ${v.error}`;
+  const where = /GPU/.test(v.encoder || "") ? "on the GPU" : "on the CPU";
+  return `${where}, up to ${fmt(v.max_tokens)} tokens a picture${v.fallback ? ` (the configured encoder did not start: ${v.fallback})` : ""}`;
+}
+// one row a model, the default first: its quantizations, steps and whether it edits
+function imageModelRows(models) {
+  if (!Array.isArray(models)) return [];
+  if (!models.length) return [["Image generation", "off"]];
+  return models.map((m, i) => [i ? "" : "Image generation",
+    `${m.id}${i ? "" : " (default)"}: ${[m.quant ? `DiT ${m.quant}` : null, m.text_quant ? `text encoder ${m.text_quant}` : null,
+                                          m.steps ? `${m.steps} steps` : null, m.edits ? "edits images" : null].filter(Boolean).join(", ")}`]);
+}
 function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
@@ -725,7 +742,8 @@ function renderAbout(eng, hw, st) {
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
-    ["Images", eng.images ? "on" : "off"],
+    ["Reading images", visionText(eng)],
+    ...imageModelRows(eng.image_models),
     ["Experimental speed projection", projectionText(eng.cvec)],
     [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
   ]);
@@ -1006,7 +1024,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait", segments: true, segmentLimit: ""};
+                  mcp: true, math: true, chatList: true, chatEdit: true, whileBusy: "wait", segments: true, segmentLimit: ""};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1015,6 +1033,8 @@ function samplingUntouched(s) {
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 // before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
 if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
+// the math, the saved-chats list and the edit controls were off by default before defaults_v 2, and saved so: on once
+if (settings.defaults_v !== 2) settings.math = settings.chatList = settings.chatEdit = true;
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
@@ -1456,8 +1476,8 @@ async function askPersist() {
 
 function busyHint() {
   const mode = settings.whileBusy;
-  return mode === "queue" ? tr("composer.hintQueue", "Enter sends when the answer is done")
-       : mode === "interject" ? tr("composer.hintInterject", "Enter stops the answer here and sends now") : "";
+  return mode === "queue" ? tr("composer.hintQueue", "Ctrl+Enter sends when the answer is done")
+       : mode === "interject" ? tr("composer.hintInterject", "Ctrl+Enter stops the answer here and sends now") : "";
 }
 // While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
 const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
@@ -1466,7 +1486,7 @@ function setBusy(on) {
   $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
-                                         : on ? busyHint() : tr("composer.newline", "Shift+Enter: new line");
+                                         : on ? busyHint() : tr("composer.send", "Ctrl+Enter: send");
   if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
   $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
   renderUndoBar();
@@ -1716,7 +1736,7 @@ async function generateReply() {
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 $("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
 $("input").addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send(); }   // Enter alone: a new line
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
@@ -1945,16 +1965,22 @@ function outputs() {
 }
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit", "s-seg"]) {
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
+// going on past the context is what keeps a long chat going: switching it off asks first
+$("s-seg").onclick = () => {
+  const on = checked("s-seg");
+  if (on && !confirm(tr("drawer.segmentsOff", "Turn off going on past the context?\n\nA chat that fills the context will then stop with an error instead of going on in a new segment. Chats already in segments stay as they are."))) return;
+  $("s-seg").setAttribute("aria-checked", String(!on));
+};
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const prev = settings;
   // the list and the edit controls change the messages on the screen: not while an answer is written or something is open
   const locked = !!busy || !!panel;
   const sel = segValue("s-thinking");
-  settings = {thinking: sel && sel !== thinkingInfo().default ? sel : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: sel && sel !== thinkingInfo().default ? sel : "", thinking_v: 2, defaults_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),

@@ -2008,6 +2008,12 @@ class ImageModels:
         for g in self.gens.values():
             g.close(shutdown)
 
+    def about(self) -> list[dict]:
+        """Each model as the web page's About shows it, the default first: its name, the DiT's and the text encoder's
+        quantizations, its steps and whether it edits."""
+        return [{"id": g.model, "quant": g.cfg.get("quant"), "text_quant": g.cfg.get("text_quant"),
+                 "steps": g.cfg.get("steps"), "edits": can_edit(g.cfg)} for g in self.gens.values()]
+
     def models(self) -> list[dict]:
         """Each model's name, defaults and whether it edits (the web page's choice), the default first."""
         return [{"id": g.model, "defaults": g.defaults(), "edits": can_edit(g.cfg)} for g in self.gens.values()]

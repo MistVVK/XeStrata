@@ -4119,7 +4119,14 @@ class Service:
         # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
         # conversation cache counts the chat's only
         rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
-        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": self.vision is not None,
+        vision = self.vision
+        engine = {"model": self.model, "max_context": self.reported_ctx(), "images": vision is not None,
+                  # the About's other models: the picture reader that serves (the configured one or its fallback) and
+                  # the image models
+                  "vision": None if vision is None else {
+                      "encoder": vision.label, "max_tokens": vision.max_tokens,
+                      "error": getattr(vision, "dead", None) or self.vision_error, "fallback": self.vision_fallback},
+                  "image_models": self.images.about() if self.images is not None else [],
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
