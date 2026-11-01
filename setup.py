@@ -82,14 +82,15 @@ WIN = places.WIN
 
 
 # A deb or rpm package installs this folder read-only (/usr/share/xestrata) with a PACKAGED record (where the engine
-# package puts the engine), and so does the Windows 7z.  Then nothing is compiled, the Python packages are the
-# distribution's (or the 7z's), and what setup writes for a model (its config, the logs) goes to the user's folders
-# (serve/places.py) instead of next to this file.
+# package puts the engine), and so does the Windows 7z.  Then nothing is compiled and the Python packages are the
+# distribution's (or the 7z's).  What setup writes for a model (its config, the logs) goes to the user's folders
+# (serve/places.py) in every case, a Strata folder's as well: the configs sit beside the settings (settings.json, which
+# a model's config can override), and every copy of Strata of this user shares them.
 PACKAGED: dict[str, Any] | None = None
 if (ROOT / "PACKAGED").is_file():
     PACKAGED = json.loads((ROOT / "PACKAGED").read_text(encoding="utf-8"))
-CONF = places.user_dir("config") if PACKAGED else ROOT   # the model configs, xestrata-<model>.json
-STATE = places.user_dir("state") if PACKAGED else ROOT    # the logs, and the engine's working folder
+CONF = places.user_dir("config")    # the model configs, xestrata-<model>.json
+STATE = places.user_dir("state")    # the logs, and the engine's working folder
 SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh"
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
@@ -4736,9 +4737,7 @@ def remove_data() -> int:
     files stay too."""
     settings = load_settings()
     data = Path(settings["data_dir"]) if settings.get("data_dir") else default_data_dir()
-    targets = [data / d for d in DATA_ITEMS] + [settings_path().parent]
-    if PACKAGED:
-        targets += [CONF, STATE]
+    targets = [data / d for d in DATA_ITEMS] + [settings_path().parent, CONF, STATE]
     targets = [t for t in dict.fromkeys(targets) if t.exists()]
     if not targets:
         say("Nothing of XeStrata's is kept for this user.")
@@ -4899,6 +4898,52 @@ def model_config(path: Path) -> bool:
         why = "not valid JSON"
     warn(f"skipped {path.name} ({why}): it is not a XeStrata model config")
     return False
+
+
+def move_checkout_configs() -> None:
+    """The model configs an earlier setup wrote into this Strata folder (before they went to the user's folder, CONF)
+    moved there once, with their .bak and Chat settings; the config's log and working folder go to STATE, and its
+    start script is written again for the moved config.  The old logs stay where they are.  A file CONF already has
+    is left: the same content is removed here, a different one stays (CONF's is used) and is named."""
+    if PACKAGED or same_folder(ROOT, CONF):
+        return
+    for old in [p for p in model_config_files(ROOT) if model_config(p)]:
+        new = CONF / old.name
+        moved = not new.exists()
+        if moved:
+            try:
+                cfg = json.loads(old.read_text(encoding="utf-8-sig"))
+                if isinstance(cfg.get("log"), str) and Path(cfg["log"]).parent == ROOT:
+                    cfg["log"] = str(STATE / Path(cfg["log"]).name)
+                if cfg.get("cwd") == str(ROOT):
+                    cfg["cwd"] = str(STATE)
+                CONF.mkdir(parents=True, exist_ok=True)
+                STATE.mkdir(parents=True, exist_ok=True)
+                write_config(new, cfg)
+            except (OSError, ValueError) as e:
+                warn(f"could not move {old} to {CONF} ({getattr(e, 'strerror', None) or e}): it stays there")
+                continue
+            old.unlink()
+            ok(f"moved {old.name} to {CONF}")
+            tag = old.stem[len("xestrata-"):]
+            if (ROOT / f"run-{tag}.sh").is_file():
+                write_run_script(tag, new, cfg.get("port", 8095), cfg.get("open_browser") is not False)
+        for f in [*([] if moved else [old]), old.with_name(old.name + ".bak"),
+                  old.with_name(old.stem + ".shared-settings.json")]:
+            if not f.is_file():
+                continue
+            there = CONF / f.name
+            try:
+                if not there.exists():
+                    copy_private(f, there)
+                elif there.read_bytes() != f.read_bytes():
+                    warn(f"{f} was not moved: {there} is used (yours to compare or delete)")
+                    if f == old:
+                        break                          # another config of that name: its .bak and settings stay too
+                    continue
+                f.unlink()
+            except OSError as e:
+                warn(f"could not move {f} to {CONF} ({e.strerror or e})")
 
 
 def installed_configs():
@@ -6720,6 +6765,8 @@ def main() -> int:
         a.models_dir = str(data / "models")
 
     # ---- 0. already installed: just start it
+    if not (a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update)):
+        move_checkout_configs()
     have = installed_configs()
     if a.update:                                       # #475: update.sh - never starts the model
         return update_install(have)

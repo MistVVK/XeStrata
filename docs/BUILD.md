@@ -30,7 +30,7 @@ setup checks the GPU, RAM and CPU, chooses a SYCL compiler and builds the engine
   `--license free` builds with free software only (Intel and AMD GPUs).
 - **Time**: the first run takes a while for the download (60-110 GB) and the build. If it stops, the next run continues.
 - **Where things go**: the model files in `XeStrata-data` next to the XeStrata folder, the model configs
-  (`xestrata-<model>.json`) and logs in the XeStrata folder.
+  (`xestrata-<model>.json`) in `~/.config/xestrata` and the logs in `~/.local/state/xestrata` (as with the packages).
 
 **Afterwards**, `./setup.sh` starts the model right away.
 The README's `xestrata` options work the same with `./setup.sh`. The terminal chat is `.venv/bin/python chat.py`.

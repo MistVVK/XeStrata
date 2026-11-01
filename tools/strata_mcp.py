@@ -520,8 +520,14 @@ class Strata:
 
     # ---- what is installed
     def configs(self) -> list[Path]:
-        return sorted((p for p in self.root.glob(CONFIG + "*.json") if not p.name.endswith(".shared-settings.json")),
-                      key=lambda p: p.stat().st_mtime, reverse=True)   # #346: the Chat settings file is no config
+        # setup's folder for them (the user's, beside settings.json), then the ones an earlier setup wrote into this
+        # Strata folder, which the next setup moves there; a name in both is the user folder's
+        found: dict[str, Path] = {}
+        for folder in (self.settings_path().parent, self.root):
+            for p in folder.glob(CONFIG + "*.json"):
+                if not p.name.endswith(".shared-settings.json"):   # #346: the Chat settings file is no config
+                    found.setdefault(p.name, p)
+        return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
 
     @staticmethod
     def read_config(path: Path) -> dict:
@@ -555,7 +561,7 @@ class Strata:
     def find_config(self, model: str | None) -> Path:
         have = self.configs()
         if not have:
-            raise ToolError("no model is installed in " + str(self.root) + " yet: install one first (strata_install)")
+            raise ToolError("no model is installed yet: install one first (strata_install)")
         if not model:
             return have[0]                              # the most recently used, as setup starts it
         m = model.strip().lower()

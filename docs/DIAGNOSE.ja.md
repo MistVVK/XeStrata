@@ -133,8 +133,7 @@ XDG の環境変数や独自の配置がある場合は、実際の設定と起�
 
 | 導入方法 | モデルの設定 | エンジンのログ |
 | --- | --- | --- |
-| ソース版の setup | XeStrata のフォルダーの `xestrata-<model>.json` | 通常、同じフォルダーの `xestrata-<model>.log` |
-| deb/rpm 版 | `$XDG_CONFIG_HOME/xestrata`（既定 `~/.config/xestrata`）の `xestrata-<model>.json` | `$XDG_STATE_HOME/xestrata`（既定 `~/.local/state/xestrata`）の `xestrata-<model>.log` |
+| setup（ソース版と deb/rpm 版） | `$XDG_CONFIG_HOME/xestrata`（既定 `~/.config/xestrata`）の `xestrata-<model>.json` | `$XDG_STATE_HOME/xestrata`（既定 `~/.local/state/xestrata`）の `xestrata-<model>.log` |
 | 手動起動 | 起動コマンドで指定された設定 | 設定の `log`、または実際の標準エラーの出力先 |
 
 設定は全体を表示せず、`exe`、`cwd`、`log`、`lib_dirs` と必要なエンジン引数を抽出してください。

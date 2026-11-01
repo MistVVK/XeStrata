@@ -133,8 +133,7 @@ Actual configuration and launch methods take precedence when XDG variables or cu
 
 | Installation | Model configuration | Engine log |
 | --- | --- | --- |
-| Source setup | `xestrata-<model>.json` in the XeStrata folder | Usually `xestrata-<model>.log` in the same folder |
-| deb/rpm | `xestrata-<model>.json` in `$XDG_CONFIG_HOME/xestrata` (default `~/.config/xestrata`) | `xestrata-<model>.log` in `$XDG_STATE_HOME/xestrata` (default `~/.local/state/xestrata`) |
+| setup (source and deb/rpm) | `xestrata-<model>.json` in `$XDG_CONFIG_HOME/xestrata` (default `~/.config/xestrata`) | `xestrata-<model>.log` in `$XDG_STATE_HOME/xestrata` (default `~/.local/state/xestrata`) |
 | Manual launch | Configuration specified by the command | Configuration's `log` or the actual stderr destination |
 
 Extract `exe`, `cwd`, `log`, `lib_dirs` and needed engine arguments without displaying the whole configuration.

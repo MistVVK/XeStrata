@@ -537,6 +537,8 @@ GPU、CPU、RAM、ディスクの目安は [README](../README.ja.md#必要なも
 - この XeStrata のフォルダーに: `.venv/`（Python の環境）、`engine/`（ビルドしたエンジン）、`third_party/main/llama.cpp`、
   `--intel-llvm-build` なら `.tools/intel-llvm/`
 - **このフォルダーの隣の `XeStrata-data`** に: モデルのファイル（`models/`、`packs/`、`mtp/`、70〜120 GB）
+- `~/.config/xestrata` と `~/.local/state/xestrata` に: パッケージと同じく、設定・モデルの設定とログ。同じユーザーの XeStrata のコピーはどれもこの設定を使います。
+  以前の setup が XeStrata のフォルダーに書いたモデルの設定は、次の setup が `~/.config/xestrata` へ移します（同じ名前の設定がもうあれば、そちらを使い、移さなかったことを伝えます）。
 
 モデルのファイルを隣のフォルダーに置くのは、別の場所に展開した新しい XeStrata のコピーが、それを見つけて同じ設定で動けるようにするためです。
 場所はユーザーごとに記録します（`~/.config/xestrata/settings.json`）。
@@ -1862,7 +1864,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 要求の途中でエンジンが止まった（Web アプリにトーストと、Monitor の状態に「Engine stopped」） | GPU のランタイムがカーネルの起動を断った（VRAM や資源が足りない）か、GPU が応答しなくなった、などの例外です。エンジンは、何をしていたか（段階と prompt の区切り）、SYCL と Unified Runtime のエラーの番号、VRAM の空き、GPU がまだ応答するか（Level Zero の `zeDeviceGetStatus`）を 1 行に書いて終わり、次の要求で起動し直します（issue #10）。`level_zero backend failed with error: 40` は、Level Zero ではデバイスのメモリ不足でも資源不足でも同じ番号で出ます。GPU が「lost」なら、`sudo dmesg` の xe の行と PCIe の AER の行を添えて issue を立ててください。 |
 | `the engine said nothing for ... s during the request` | エンジンと server の歩調がずれました（エンジンは次の指示を、server は要求の終わりを待っていて、GPU は 0%、ログにも何も出ない。upstream #481）。server は、要求の間にエンジンから 300 秒何も来なければエンジンを終わらせ、要求はエラーで終わり、次の要求でエンジンを起動し直します。`xestrata-<model>.json` の `"engine_silence_s": 600` で時間を変えます（0 で、以前どおりいつまでも待つ）。 |
 | `the engine said nothing for ... s and used no CPU or disk in that time (frozen ...)` | 上の見張りの速い版です（upstream #1317）。エンジンが何も出さず、CPU もディスクも使わないまま 90 秒たつと、止まっているとみなして終わらせ、次の要求で起動し直します。GPU が動いているとき（使用率 10% 以上）と、何も出さなくても働いているときは終わらせず、1 度だけ知らせます。`STRATA_ENGINE_STALL_S` で秒数を変えます（0 で切る）。プロンプトの層がファイルの段を読み直している間（メモリが少ないとき）は、エンジン自身の見張りも最大 10 倍まで待ちます（`STRATA_WATCHDOG_IO_S`、upstream #1407）。 |
-| ほかのこと | エンジンのログは、実際に使っているモデルの設定の `log` で辿れます。ソース版では通常 XeStrata のフォルダー、deb/rpm 版では通常 `~/.local/state/xestrata` です。 |
+| ほかのこと | エンジンのログは、実際に使っているモデルの設定の `log` で辿れます。通常は `~/.local/state/xestrata` です（以前の setup で入れたソース版では XeStrata のフォルダーのこともあります）。 |
 
 端末を操作できる LLM エージェント向けに、[復旧と原因調査の指示書](DIAGNOSE.ja.md)があります。
 ソース版と deb/rpm 版で調査の入口を分け、動くように直した場合も、詰まった場合も、原因と根拠を報告します。

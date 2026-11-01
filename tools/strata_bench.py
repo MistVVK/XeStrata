@@ -667,11 +667,18 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
 
 
 # --------------------------------------------------------------------------------------------------- the server
-def find_configs(folder: Path = ROOT) -> list[Path]:
-    out = []
-    for p in folder.glob("xestrata-*.json"):                 # XeStrata: its model configs
+def config_folders() -> list[Path]:
+    """XeStrata: setup's folder for the model configs (the user's, serve/places.py), then this Strata folder, where an
+    earlier setup wrote them."""
+    sys.path.insert(0, str(ROOT))
+    from serve import places
+    return [places.user_dir("config"), ROOT]
 
-        if p.name.endswith(".shared-settings.json"):
+
+def find_configs(folders: list[Path] | None = None) -> list[Path]:
+    out, names = [], set()
+    for p in [q for f in (folders or config_folders()) for q in f.glob("xestrata-*.json")]:   # XeStrata: its configs
+        if p.name.endswith(".shared-settings.json") or p.name in names:
             continue
         try:
             c = json.loads(p.read_text(encoding="utf-8-sig"))
@@ -679,6 +686,7 @@ def find_configs(folder: Path = ROOT) -> list[Path]:
             continue
         if isinstance(c, dict) and c.get("exe") and isinstance(c.get("args"), list):
             out.append(p)
+            names.add(p.name)
     return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
@@ -972,7 +980,7 @@ def server_base(host, port) -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Measure this Strata install and write a shareable report (see the top of "
                                              "this file).")
-    ap.add_argument("--config", help="the model config to run (default: the newest xestrata-*.json of this folder)")
+    ap.add_argument("--config", help="the model config to run (default: the newest xestrata-*.json setup wrote)")
     ap.add_argument("--url", help="use the server already running at this address (http://127.0.0.1:8080) instead of "
                                   "starting one")
     ap.add_argument("--port", type=int, help="the port to start the server on (default: the config's)")

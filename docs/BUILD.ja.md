@@ -28,8 +28,8 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
   contrib-llvm は自由ソフトウェアでない部品（oneMKL、NVIDIA の GPU には CUDA ツールキット）を使います。
   `--license free` で自由ソフトウェアだけ（Intel と AMD の GPU）のビルドにします。
 - **時間**: 初回はダウンロード（60〜110 GB）とビルドに時間がかかります。途中で止めても、次は続きから始まります。
-- **置き場所**: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）とログは
-  XeStrata のフォルダーに置きます。
+- **置き場所**: モデルのファイルは XeStrata のフォルダーの隣の `XeStrata-data`、モデルの設定（`xestrata-<モデル>.json`）は
+  `~/.config/xestrata`、ログは `~/.local/state/xestrata` に置きます（パッケージ版と同じ）。
 
 **次からは** `./setup.sh` を実行すると、すぐに起動します。
 README にある `xestrata` のオプションは、`./setup.sh` でも同じです。端末での会話は `.venv/bin/python chat.py` です。
