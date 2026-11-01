@@ -443,6 +443,10 @@ private:
     std::vector<mtl::Buffer> gstBig_, hbBig_, kqBig_, vqBig_, kscBig_, vscBig_, tailBig_, deadBig_, pooledBig_;
     mtl::Buffer pleBig_, rinfo_;
     size_t st_gst_ = 0, st_hist_ = 0, st_kq_ = 0, st_sc_ = 0, st_tail_ = 0, st_dead_ = 0, st_pooled_ = 0, st_ple_ = 0;   // bytes between sets
+    // --vision: the slots' own M-RoPE tables side by side (set idx at idx * st_mrope_), so a batch row rotates by its own
+    // slot's table (rinfo_ row word 3: its offset in ints); allocated with the slots, only when the table is set
+    mtl::Buffer mropeBig_;
+    size_t st_mrope_ = 0;
     bool rows_ = false;       // the window being built / run holds one token of each of rows_n_ DIFFERENT sequences (batch slots)
     int rows_n_ = 0;
     strata::core::SessionState* rows_ss_[MAXT] = {};
@@ -459,6 +463,9 @@ private:
     struct SeqSet {
         std::vector<mtl::Buffer> gst, gh0, gh1, kq, vq, ksc, vsc, tail, dead, pooled;
         mtl::Buffer pleHist;
+        // --vision: this slot's own M-RoPE table (int32 [cells][3]), set by slot_copy into the slot from the request that
+        // admitted it: the process's table is rebuilt by every request, the slot's is not.  Not swapped by activate.
+        mtl::Buffer mrope;
         std::vector<float> ple_hist;
         std::vector<float> last_norm;
         int hp = 0, pend_fold = 0, last_T = 0;
@@ -640,7 +647,10 @@ private:
     void mrope_sync(int64_t c0, int64_t n) {
         if (!mrope_on()) return;
         const int64_t a = std::max<int64_t>(0, c0 & ~(int64_t) 3), b = std::min<int64_t>(max_cells_, c0 + n);
-        if (b > a) std::memcpy(mrope_.as<int32_t>() + a * 3, g_mrope_host + a * 3, (size_t) (b - a) * 12);
+        // a batch slot's own window (activate, the slot-by-slot path): the slot's table, not the process's
+        const SeqSet* live = active_ != 0 && (size_t) active_ < sets_.size() ? sets_[(size_t) active_].get() : nullptr;
+        const int32_t* src = live != nullptr && live->mrope.bytes > 0 ? live->mrope.as<int32_t>() : g_mrope_host;
+        if (b > a) std::memcpy(mrope_.as<int32_t>() + a * 3, src + a * 3, (size_t) (b - a) * 12);
     }
     mtl::Constants qsa_c() const { return mrope_on() ? mtl::Constants().b(24, true) : mtl::Constants(); }
     std::string qsa_k() const { return mrope_on() ? "qsa_prep#mrope" : "qsa_prep"; }
@@ -797,6 +807,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     };
     if (bigs_ok_) { pleBig_ = A(st_ple_ * NSET); pleHist_ = view_of(pleBig_, 0, PLEH_B); } else pleHist_ = A(PLEH_B);
     rinfo_ = A(4 * (8 + 4 * MAXT));
+    st_mrope_ = R256(12 * (size_t) (MAXC + 16));
     auto act = [&](int n) {
         Act a;
         a.n = n;
@@ -1155,14 +1166,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         const mtl::Buffer& TL = rw ? tailBig_[(size_t) qi] : tail_[(size_t) qi];
         const mtl::Buffer& DD = rw ? deadBig_[(size_t) qi] : dead_[(size_t) qi];
         const mtl::Buffer& PL = rw ? pooledBig_[(size_t) qi] : pooled_[(size_t) qi];
-        d.p = rw ? P(lqsa_, "qsa_prep", rc, "qsa_prep#rows") : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
+        // (pictures in batch slots: each row reads its own slot's M-RoPE table in mropeBig_)
+        const mtl::Constants rcm = mrope_on() ? mtl::Constants().b(30, true).b(24, true) : rc;
+        d.p = rw ? P(lqsa_, "qsa_prep", rcm, mrope_on() ? "qsa_prep#rows#mrope" : "qsa_prep#rows")
+                 : P(lqsa_, "qsa_prep", qsa_c(), qsa_k());
         d.args = {mtl::Arg::B(qfull_), mtl::Arg::B(kcur_), mtl::Arg::B(vcur_), mtl::Arg::B(iqr_), mtl::Arg::B(ikr_),
                   mtl::Arg::B(W_, T(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(b + "attn_k_norm.weight").offset),
                   mtl::Arg::B(W_, T(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
                   mtl::Arg::B(cs_), mtl::Arg::B(qcur_), mtl::Arg::B(qidx_), mtl::Arg::B(KQ),
                   mtl::Arg::B(VQ), mtl::Arg::B(KS), mtl::Arg::B(VS),
                   mtl::Arg::B(TL), mtl::Arg::B(DD), mtl::Arg::B(PL),
-                  mtl::Arg::V(a), mtl::Arg::B(mrope_)};
+                  mtl::Arg::V(a), mtl::Arg::B(rw && mrope_on() ? mropeBig_ : mrope_)};
         if (rw) d.args.push_back(mtl::Arg::B(rinfo_));
         d.grid[0] = G_QPREP;
         d.grid[1] = ntok;
@@ -1572,6 +1586,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
 
 bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err) {
     if (S < 1 || S > MAXT || S > max_t_) { err = "metal window: batch window size out of range"; return false; }
+    if (mrope_on() && mropeBig_.bytes == 0) { err = "metal window: batch rows without the slots' M-RoPE tables"; return false; }
     if (active_ != 0) activate(0);
     uint32_t* ri = rinfo_.as<uint32_t>() + 8;
     int64_t maxpos = 0;
@@ -1585,7 +1600,7 @@ bool Window::run_rows(const int* rows, int S, const int32_t* tokens, const int64
         ri[4 * t] = (uint32_t) set;
         ri[4 * t + 1] = (uint32_t) pos[t];
         ri[4 * t + 2] = (uint32_t) sets_[(size_t) set]->hp;
-        ri[4 * t + 3] = 0;
+        ri[4 * t + 3] = mrope_on() ? (uint32_t) ((size_t) set * st_mrope_ / 4) : 0;   // its own M-RoPE table, in ints
         maxpos = std::max<int64_t>(maxpos, pos[t]);
     }
     rows_ = true;
@@ -2090,6 +2105,12 @@ void Window::swap_state(SeqSet& o) {
 // the buffers of one sequence's running state, shaped like the live ones (real: allocated and zero; else empty placeholders)
 void Window::alloc_set(SeqSet& o, bool real, int idx) {
     const size_t MAXC = (size_t) max_cells_, MB = MAXC / 4 + 2;
+    if (real && mrope_on()) {   // the identity until a request is copied in (slot_copy)
+        o.mrope = mropeBig_.bytes > 0 && idx <= g_slot_cap ? view_of(mropeBig_, (size_t) idx * st_mrope_, 12 * (MAXC + 16))
+                                                         : cx_->alloc(12 * (MAXC + 16));
+        int32_t* m = o.mrope.as<int32_t>();
+        for (size_t c = 0; c < MAXC + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) c;
+    }
     if (real && bigs_ok_) {   // set idx's part of the big buffers
         for (size_t i = 0; i < gst_.size(); ++i) {
             o.gst.push_back(view_of(gstBig_[i], (size_t) idx * st_gst_, GST_B));
@@ -2131,6 +2152,7 @@ void Window::alloc_set(SeqSet& o, bool real, int idx) {
 bool Window::slots_init(const std::vector<strata::core::SessionState*>& slots, std::string& err) {
     if (!sets_.empty()) return true;   // (asked once)
     if (cx_ == nullptr) { err = "metal window: slots before the window is up"; return false; }
+    if (mrope_on() && bigs_ok_) mropeBig_ = cx_->alloc(st_mrope_ * (1 + (size_t) std::max(0, g_slot_cap)));
     std::vector<std::unique_ptr<SeqSet>> v;
     v.push_back(std::make_unique<SeqSet>());
     alloc_set(*v[0], false);
@@ -2191,6 +2213,18 @@ bool Window::slot_copy(bool into_slot, int b, int64_t upto, bool kv_only, std::s
     activate(0);
     SeqSet& o = *sets_[(size_t) b + 1];
     if (pend_fold_ > 0 || o.pend_fold > 0) { err = "metal window: a slot copy with a fold pending"; return false; }
+    if (into_slot && mrope_on() && o.mrope.bytes > 0) {
+        // the slot's positions from the request's table: its cells [0, upto) as they are (the K/V rows hold them rotated
+        // already), then the text after them, one position a cell on from the last one (a prompt never ends in an image,
+        // so its t, h and w are one position)
+        const int64_t n = std::min<int64_t>(upto, max_cells_);
+        if (n < 1) { err = "metal window: a slot copy of an empty conversation with the M-RoPE table set"; return false; }
+        const int32_t* last = g_mrope_host + (n - 1) * 3;
+        if (last[0] != last[1] || last[0] != last[2]) { err = "metal window: a slot copy that ends in an image"; return false; }
+        int32_t* m = o.mrope.as<int32_t>();
+        std::memcpy(m, g_mrope_host, (size_t) n * 12);
+        for (int64_t c = n; c < max_cells_ + 16; ++c) m[c * 3] = m[c * 3 + 1] = m[c * 3 + 2] = (int32_t) (last[0] + (c - n + 1));
+    }
     const size_t cells = (size_t) std::max<int64_t>(0, std::min<int64_t>(upto, max_cells_));
     auto cp = [&](const mtl::Buffer& live, const mtl::Buffer& stash, size_t n) {
         n = std::min({n, live.bytes, stash.bytes});
