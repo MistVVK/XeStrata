@@ -93,7 +93,9 @@ type Describe =
       Installed: Installed[]
       Images: ImageModel[]
       /// the image models a model set up for the first time is offered (--images names, the default first)
-      ImageDefault: string[] }
+      ImageDefault: string[]
+      /// web search for every model as setup set it up: "deepseek", or null (none)
+      WebSearch: string }
 
 type Update =
     { Current: string

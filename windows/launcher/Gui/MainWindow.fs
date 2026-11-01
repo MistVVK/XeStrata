@@ -520,6 +520,18 @@ type MainWindow() as this =
         let vector = TextBox(PlaceholderText = "(optional) another control vector, a GGUF file", MinWidth = 420.0)
         let vectorField = field "The speed projection's vector" vector
         let images, imagesValue = imagePicker d.Images d.ImageDefault
+        let webSearch, webSearchValue =
+            choice
+                [ "Off", "no"
+                  "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek", "deepseek" ]
+                (match d.WebSearch with "deepseek" -> 1 | _ -> 0)
+        let deepseekKey =
+            TextBox(PasswordChar = '*', MinWidth = 420.0,
+                    PlaceholderText = (if d.WebSearch = "deepseek" then "set (type to replace)" else "your DeepSeek API key"))
+        let deepseekField = field "DeepSeek API key (kept in your settings, never shown)" deepseekKey
+        deepseekField.IsVisible <- webSearchValue () = "deepseek"
+        webSearch.SelectionChanged.Add(fun _ -> deepseekField.IsVisible <- webSearchValue () = "deepseek")
+        let webSearchField = field "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)" webSearch
         let imagesField = field "Image generation: models to make images with, besides the text model" images
         // the options setup takes without asking, under Advanced
         let reader, readerValue =
@@ -612,7 +624,8 @@ type MainWindow() as this =
                                  | true, file -> file)
                       match imagesValue () with
                       | Some v when f.Images -> yield! [ "--images"; v ]
-                      | _ -> () ]
+                      | _ -> ()
+                      yield! [ "--web-search"; webSearchValue () ] ]
                 let withImages = f.Images && (imagesValue ()).IsSome
                 let advanced =
                     collectArgs [
@@ -632,9 +645,14 @@ type MainWindow() as this =
                         Result.Ok(if withImages then [ for name, v in imageValues () do yield! [ "--image-" + name; v ] ] else [])
                         serverArgs ()
                     ]
+                let key = trimmed deepseekKey
                 match advanced with
                 | Error why -> problem.Text <- why
+                | Result.Ok _ when webSearchValue () = "deepseek" && key = "" && d.WebSearch <> "deepseek" ->
+                    problem.Text <- "Web search with DeepSeek needs your DeepSeek API key."
                 | Result.Ok more ->
+                    // the key reaches setup in its environment, never on its command line (process lists show that)
+                    Environment.SetEnvironmentVariable("XESTRATA_DEEPSEEK_API_KEY", (if key = "" then null else key))
                     let args =
                         [ "--setup"; "--yes"; "--no-start"; "--family"; f.Id; "--model"; m.Id; "--data-dir"; dataDir.Text ]
                         @ questions
@@ -684,6 +702,8 @@ type MainWindow() as this =
                 ropeField
                 projection
                 imagesField
+                webSearchField
+                deepseekField
                 advanced
                 problem
                 actions [ button "Back" (fun () -> homePage d); install ]

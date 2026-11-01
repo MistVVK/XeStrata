@@ -282,6 +282,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 **Good to know:** it answers one request at a time (several at once is opt-in: `"parallel": 2`, [BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that
 it keeps the conversation and reads only what is new, so follow-ups start right away.
 The API in full, MCP tools and llama-swap: [DETAILS](docs/DETAILS.md#using-it) and [LLAMA_SWAP](docs/LLAMA_SWAP.md).
+With a SearXNG-compatible search server set, the API and the web page can search the web ([Web search](docs/DETAILS.md#web-search)).
 
 ## When something goes wrong
 

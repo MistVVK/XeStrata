@@ -34,6 +34,7 @@ from urllib.parse import unquote
 
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
 from serve.structured import jsonschema_modules
+from serve import search as search_api
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -744,6 +745,7 @@ class Assembler:
         # separate summary), with the reasoning_summary_* events
         self.summary = reasoning.get("summary") in ("auto", "concise", "detailed")
         self.spell = None                            # text -> its tokens' logprobs entries (include asks for them)
+        self.sources: list[dict] = []                # the web search's results (serve/search.py): url_citation
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
@@ -807,6 +809,13 @@ class Assembler:
                                     else "completed")
         if item["type"] == "message":
             part = item["content"][0]
+            for c in search_api.cited(part["text"], self.sources):   # an address the answer writes: its citation
+                note = {"type": "url_citation", "start_index": c["start"], "end_index": c["end"], "url": c["url"],
+                        "title": c["title"]}
+                part["annotations"].append(note)
+                out.append(self.event("response.output_text.annotation.added", item_id=item["id"], output_index=at,
+                                      content_index=0, annotation_index=len(part["annotations"]) - 1,
+                                      annotation=note))
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
                                text=part["text"], logprobs=part["logprobs"]),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
@@ -968,6 +977,29 @@ class Assembler:
             else:
                 self.item["error"] = x.get("text")
                 out += self.close("failed")
+        return out
+
+    def search_call(self, x: dict) -> list[dict]:
+        """A web search tool's activity (run_with_mcp's "mcp" events: call, result) as a web_search_call item, as
+        OpenAI's hosted web_search tool shows one: the action is a search (its query and the sources found) or, for
+        fetch_page, an open_page."""
+        out: list[dict] = []
+        if x.get("event") == "call":
+            out += self.close()
+            raw = x.get("arguments")
+            args: dict = raw if isinstance(raw, dict) else {}
+            action = ({"type": "open_page", "url": args.get("url")} if x.get("name") == "fetch_page"
+                      else {"type": "search", "query": args.get("query")})
+            item = {"id": new_id("ws"), "type": "web_search_call", "status": "in_progress", "action": action}
+            out += self._open(item)
+            out.append(self.event("response.web_search_call.in_progress", item_id=item["id"], output_index=self.index))
+            out.append(self.event("response.web_search_call.searching", item_id=item["id"], output_index=self.index))
+        elif x.get("event") == "result" and self.item is not None and self.item["type"] == "web_search_call":
+            if self.item["action"]["type"] == "search":
+                self.item["action"]["sources"] = [{"type": "url", "url": s["url"]} for s in x.get("sources") or []]
+            out.append(self.event("response.web_search_call.completed", item_id=self.item["id"],
+                                  output_index=self.index))
+            out += self.close("completed" if x.get("ok") else "failed")
         return out
 
     def finish(self, done: dict, validate=None) -> list[dict]:

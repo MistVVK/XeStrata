@@ -824,8 +824,25 @@ function renderMcp() {
 
 // ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
 // A few documented keys of the run config (xestrata-<model>.json), for every client, from the next start on.  The
-// server lists them, checks every value and keeps every other key of the file as it is.
+// server lists them, checks every value and keeps every other key of the file as it is.  A key that can also be set
+// for every model (scopes: global) gets a second field for the user's settings (settings.json); the model's field
+// then overrides it, and "off" there turns an address off for this model alone.  A secret (deepseek_api_key) is set
+// for every model only and is write-only: the server says whether it is set, an empty field leaves it, Clear removes it.
 let cfgKeys = [];
+function cfgInput(k, id, v, placeholder) {
+  if (k.kind === "bool" || k.kind === "enum") {
+    const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
+    const cur = v == null ? "" : String(v);
+    return `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>${esc(placeholder)}</option>` +
+      opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
+  }
+  if (k.kind === "secret")
+    return `<input class="st-input" id="${id}" type="password" value="" placeholder="${k.set ? "set (type to replace)" : "not set"}" autocomplete="off">` +
+      (k.set ? ` <button class="st-btn st-btn--secondary" type="button" data-cfg-clear="${esc(k.key)}">Clear</button>` : "");
+  const text = v == null ? "" : v === "" ? "off" : Array.isArray(v) ? v.join(", ") : String(v);
+  return `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
+    `value="${esc(text)}" placeholder="${esc(placeholder)}" autocomplete="off">`;
+}
 async function loadConfig() {
   let r;
   try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
@@ -833,49 +850,62 @@ async function loadConfig() {
   const c = await r.json();
   cfgKeys = c.keys || [];
   $("cfg-file").textContent = c.file || "";
+  const every = `Every model (${esc(c.global_file || "settings.json")})`;
   $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
-    const id = `cfg-${i}`, v = k.value;
-    let input;
-    if (k.kind === "bool" || k.kind === "enum") {
-      const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.choices.map((x) => [x, x]);
-      const cur = v == null ? "" : String(v);
-      input = `<select class="st-input" id="${id}"><option value=""${cur === "" ? " selected" : ""}>default</option>` +
-        opts.map(([val, text]) => `<option value="${esc(val)}"${cur === val ? " selected" : ""}>${esc(text)}</option>`).join("") + `</select>`;
-    } else {
-      const text = v == null ? "" : Array.isArray(v) ? v.join(", ") : String(v);
-      input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
-        `value="${esc(text)}" placeholder="default" autocomplete="off">`;
-    }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
+    const scopes = k.scopes || ["model"], id = `cfg-${i}`, gid = `cfg-g-${i}`;
+    const label = (forId, extra) => `<label for="${forId}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}${extra}</code></label>`;
+    if (!scopes.includes("model")) return label(gid, ` &middot; ${every}`) + cfgInput(k, gid, null, "");
+    const row = (extra) => label(id, extra) + cfgInput(k, id, k.value, scopes.includes("global") ? "as for every model" : "default");
+    if (!scopes.includes("global")) return row("");
+    const inUse = k.effective != null && k.effective !== "" ? `in use: ${k.effective} (${k.from === "model" ? "this model" : "every model"})` : "in use: none";
+    return label(gid, ` &middot; ${every}`) + cfgInput(k, gid, k.global, "none") + row(` &middot; this model &middot; ${esc(inUse)}`);
   }).join("");
+  $("cfg-form").querySelectorAll("[data-cfg-clear]").forEach((b) => b.addEventListener("click", () => saveConfig({[b.dataset.cfgClear]: null}, {})));
   $("cfg-card").hidden = false;
 }
 function configValue(k, el) {
   const s = el.value.trim();
   if (s === "") return null;
+  if (k.kind === "url") return s.toLowerCase() === "off" ? "" : s;
   if (k.kind === "bool") return s === "true";
   if (k.kind === "number") return Number(s);
-  return s;                                         // enum, or names (the server splits them at commas)
+  return s;                                         // enum, secret, or names (the server splits them at commas)
 }
-$("cfg-save").addEventListener("click", async () => {
-  const set = {};
-  cfgKeys.forEach((k, i) => {
-    const v = configValue(k, $(`cfg-${i}`));
-    const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
-    if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
-  });
-  if (!Object.keys(set).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
+async function saveConfig(globalSet, set) {
+  if (!Object.keys(set).length && !Object.keys(globalSet).length) { $("cfg-msg").textContent = "Nothing changed."; return; }
   try {
-    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
-    const b = await r.json();
-    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
-    $("cfg-msg").textContent = b.changed.length
-      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
-    loadConfig();
+    const saved = [];
+    for (const [scope, keys] of [["global", globalSet], ["model", set]]) {
+      if (!Object.keys(keys).length) continue;
+      const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set: keys, scope})});
+      const b = await r.json();
+      if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+      if (b.changed.length) saved.push(scope === "global" ? `${b.changed.join(", ")} for every model`
+        : `${b.changed.join(", ")}; the earlier file is ${b.file}.bak`);
+    }
+    $("cfg-msg").textContent = saved.length ? `Saved (${saved.join("; ")}). Start the model again to use it.` : "Nothing changed.";
   } catch (e) {
     $("cfg-msg").textContent = "";
     toast("error", "Not saved", String(e.message || e), 6000);
   }
+  loadConfig();
+}
+$("cfg-save").addEventListener("click", () => {
+  const set = {}, globalSet = {};
+  cfgKeys.forEach((k, i) => {
+    const m = $(`cfg-${i}`), g = $(`cfg-g-${i}`);
+    if (m) {
+      const v = configValue(k, m);
+      const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
+      if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
+    }
+    if (g) {
+      const gv = configValue(k, g);
+      if (k.kind === "secret") { if (gv != null) globalSet[k.key] = gv; }   // empty: left as it is
+      else if (JSON.stringify(gv) !== JSON.stringify(k.global ?? null)) globalSet[k.key] = gv;
+    }
+  });
+  saveConfig(globalSet, set);
 });
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
@@ -1125,7 +1155,17 @@ function answerHtml(m) {
     pos = at;
     html += toolHtml(t, k) + toolImages(t);
   });
-  return html + answerMarkdown(m.text.slice(pos));
+  return html + answerMarkdown(m.text.slice(pos)) + sourcesHtml(m.tools);
+}
+// the pages the web search found for this answer, once each, as links
+function sourcesHtml(tools) {
+  const seen = new Set(), links = [];
+  for (const t of tools) for (const s of t.sources || []) {
+    if (seen.has(s.url) || !/^https?:\/\//.test(s.url)) continue;
+    seen.add(s.url);
+    links.push(`<li><a href="${esc(s.url)}" target="_blank" rel="noopener noreferrer">${esc(s.title || s.url)}</a></li>`);
+  }
+  return links.length ? `<div class="msg-sources"><span class="muted small">${esc(tr("chatSearch.sources", "Sources"))}</span><ol>${links.join("")}</ol></div>` : "";
 }
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
@@ -1138,6 +1178,7 @@ function onTool(m, x) {
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
+    if (x.sources) t.sources = x.sources;              // a web search's results: listed under the answer
   }
 }
 function updateAssistant(el, m, streaming) {
@@ -1549,6 +1590,7 @@ async function generateReply() {
   // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
   const ci = $("chat-images").value;
   if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
+  if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -2039,8 +2081,17 @@ function chatImages() {
   sel.hidden = !health.image_generation;
 }
 $("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
+// the chat's web search (the server's search_url): on or off, kept here; on sends web_search_options
+function chatSearch() {
+  const sel = $("chat-search"), was = sel.value || store.get("chat_search", "on");
+  sel.replaceChildren(new Option(tr("chatSearch.on", "Search: on"), "on"), new Option(tr("chatSearch.off", "Search: off"), "off"));
+  sel.value = was === "off" ? "off" : "on";
+  sel.hidden = !health.web_search;
+}
+$("chat-search").onchange = () => store.set("chat_search", $("chat-search").value);
 function imgModels() {
   chatImages();
+  chatSearch();
   const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
   sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
   if (ms.some(m => m.id === was)) sel.value = was;

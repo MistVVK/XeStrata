@@ -14,7 +14,7 @@ The Japanese version ([DETAILS.ja.md](DETAILS.ja.md)) is the original; this is i
 
 > **On this page:** [Speed](#speed-measured) · [Which model](#which-model) · [What you need](#what-you-need) ·
 > [Install and start](#install-and-start) · [Sharing the GPU](#sharing-the-gpu-with-other-programs) ·
-> [API](#using-it) · [MCP tools](#tools-from-mcp-servers) · [Images](#images) · [Troubleshooting](#troubleshooting) ·
+> [API](#using-it) · [Web search](#web-search) · [MCP tools](#tools-from-mcp-servers) · [Images](#images) · [Troubleshooting](#troubleshooting) ·
 > [How it works](#how-it-works)
 
 ---
@@ -1049,6 +1049,11 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   An empty field removes the key (its default).
   Every other key of the file stays as it is, the earlier file is kept as `xestrata-<model>.json.bak`, and the model uses the change from its next start.
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
+- **Settings for every model.** A few keys can be written, besides a model's `xestrata-<model>.json`, into the user's settings (`~/.config/xestrata/settings.json`, on Windows `%APPDATA%\xestrata\settings.json`), where they apply to every model.
+  These are the web search's `search_engine`, `search_url` and `deepseek_api_key` ([Web search](#web-search)); `deepseek_api_key` is held in settings.json only.
+  A model's config that has the key wins, and an empty value (`""`) turns the key off for that model alone.
+  The Model settings card gives such a key an "Every model" field, and shows the value in use and where it comes from; `off` in the model's field turns it off for that model alone.
+  `POST /config` with `{"set": {...}, "scope": "global"}` changes settings.json, without `scope` (or with `"model"`) the model's config; settings.json's other keys (setup's) stay as they are.
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
@@ -1566,6 +1571,48 @@ echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"worke
 - Mainplane sends each session's `prompt_cache_key`. With [parallel requests](BATCHING.md) (`"parallel"`), when no slot holds the prompt's start, the slot the same session used last is taken first, and the other sessions' conversations stay.
 - Going back and forth between many long sessions pushes conversations out of the RAM cache; they are [on the disk as well](#keeping-parked-conversations-on-the-disk), so they come back without being read again.
 - Mainplane gives up on a response after 300 s without headers or bytes. While a long prompt is read, XeStrata sends an SSE comment every 10 s.
+
+## Web search
+
+XeStrata lets a request that asks for it search the web.
+The model calls the `web_search` (search) and `fetch_page` (read a page's text) tools, and XeStrata runs them and returns the results.
+`search_engine` chooses the search engine: `searxng` (the default) is a SearXNG-compatible search server, `deepseek` is DeepSeek's search API.
+
+**The search server** (`searxng`): anything that answers `GET /search?q=...&format=json`.
+
+- [SearXNG](https://github.com/searxng/searxng): add `json` to `search.formats` in its `settings.yml` (without it, it answers 403).
+- A server that returns the pages' text too (`include_raw_content`): XeStrata uses that text, and reads a page itself when there is none.
+
+**DeepSeek's search API** (`deepseek`): DeepSeek's [Search API](https://api-docs.deepseek.com/guides/search), with your own DeepSeek API key.
+DeepSeek bills USD 0.75 per 1,000 searches that find something (failures, empty results and timeouts are not billed). The search words go to DeepSeek.
+The key is `deepseek_api_key` in settings.json (one for every model, in a file only you can read). The web page's Model settings can only write it and never shows it ("Clear" removes it).
+A query is at most 128 characters; anything longer is cut. The pages' text comes with the search results, and `fetch_page` is read by XeStrata itself.
+
+**Setting it up with setup**: `xestrata --setup` asks once (and at each `--setup`) whether to use web search (`deepseek` for DeepSeek, `no`). The default is no, and without an answer nothing is done.
+With `deepseek` it asks for the API key without showing it (`--web-search deepseek`; the Windows launcher's Web search choice and key field).
+`--web-search no` takes it out. A `search_url` you wrote yourself is left as it is.
+
+**Setting it yourself**: write the search server's address in `search_url` (for example `http://127.0.0.1:8888`).
+
+- For every model: `"search_url": "http://127.0.0.1:8888"` in `~/.config/xestrata/settings.json` (on Windows `%APPDATA%\xestrata\settings.json`; for DeepSeek `"search_engine": "deepseek"` and `"deepseek_api_key"`).
+- For one model: the same key in `xestrata-<model>.json`. `"search_url": ""` turns the search off for that model alone.
+- The web page: the About tab's Model settings ([Settings for every model](#using-it)).
+
+It is used from the next start. Without it nothing is searched, and the requests below are answered as before.
+
+**Requests** (only those that ask for it search):
+
+| API | How to ask | The answer |
+| --- | --- | --- |
+| Chat Completions | `web_search_options` (`search_context_size` `low`, `medium` or `high`: the number of results and how much page text) | `url_citation` in `message.annotations` for the addresses the answer writes |
+| Responses | the hosted tool `web_search` in `tools` (or `web_search_preview`; `filters.allowed_domains`, `search_context_size`) | `web_search_call` items (the query and the pages found in `action`), and `url_citation` in `output_text` |
+| Anthropic Messages | the server tool `web_search_20250305` (`max_uses`, `allowed_domains`, `blocked_domains`); `web_fetch_20250910` to read pages | `server_tool_use` and `web_search_tool_result` (`web_fetch_tool_result`) blocks, `usage.server_tool_use` |
+
+The web page's chat has a "Search: on / off" switch; on sends `web_search_options`. The pages found are listed under the answer.
+
+**Safeguards**: `fetch_page` reads public addresses only. It checks the address the name resolves to, connects to the address it checked, and checks every redirect the same way; pages on this PC or its network are not read.
+One result holds at most 24,000 characters, a page is read up to 2 MiB and for 15 seconds. When the search server does not answer or finds nothing, the model is told so and the answer goes on.
+`user_location` is not used.
 
 ## Tools from MCP servers
 

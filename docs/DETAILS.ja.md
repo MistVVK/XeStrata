@@ -14,7 +14,7 @@ Intel の GPU での実装と、それをどう確かめたかは [XE.ja.md](XE.
 
 > **目次:** [速さ](#速さ) · [モデルの選び方](#モデルの選び方) · [必要なもの](#必要なもの) ·
 > [インストールと起動](#インストールと起動) · [GPU をほかのプログラムと分け合う](#gpu-をほかのプログラムと分け合う) ·
-> [API](#api) · [MCP のツール](#mcp-サーバーのツールを使う) · [画像](#画像) · [困ったとき](#困ったとき) ·
+> [API](#api) · [Web 検索](#web-検索) · [MCP のツール](#mcp-サーバーのツールを使う) · [画像](#画像) · [困ったとき](#困ったとき) ·
 > [しくみ](#しくみ)
 
 ---
@@ -1009,6 +1009,11 @@ print(r.choices[0].message.content)
   空の欄はそのキーを消します（既定に戻ります）。
   ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
+- **すべてのモデルの設定**: いくつかのキーは、モデルごとの `xestrata-<model>.json` のほかに、ユーザーの設定（`~/.config/xestrata/settings.json`、Windows では `%APPDATA%\xestrata\settings.json`）にも書けて、すべてのモデルに効きます。
+  Web 検索の `search_engine`・`search_url`・`deepseek_api_key` です（[Web 検索](#web-検索)）。`deepseek_api_key` は settings.json にだけ置きます。
+  モデルの設定にそのキーがあればそちらが勝ち、空の値（`""`）はそのモデルだけそのキーを切ります。
+  Model settings のカードには、そのキーに「Every model」の欄が加わり、いま効いている値とその出どころも出ます。モデルの欄に `off` と書くと、そのモデルだけ切ります。
+  `POST /config` は `{"set": {...}, "scope": "global"}` で settings.json を、`scope` なし（または `"model"`）でモデルの設定を変えます。settings.json のほかのキー（setup のもの）はそのまま残します。
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
@@ -1519,6 +1524,48 @@ echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"worke
 - Mainplane はセッションごとの `prompt_cache_key` を送ります。[並列の要求](BATCHING.ja.md)（`"parallel"`）では、プロンプトの先頭を持つスロットがないとき、同じセッションが前に使ったスロットから使い直し、ほかのセッションの会話を残します。
 - 長いセッションをいくつも行き来すると、会話は RAM の置き場から追い出されます。[ディスクにも置く](#置いた会話をディスクにも置く)ので、読み直さずに戻ります。
 - Mainplane は、応答のヘッダーまでとバイトの間の待ちを 300 秒で切ります。長いプロンプトを読む間も、XeStrata は 10 秒ごとに SSE のコメントを送ります。
+
+## Web 検索
+
+XeStrata は、求めたリクエストにだけ Web を検索させます。
+モデルは `web_search`（検索）と `fetch_page`（ページの本文を読む）のツールを使い、XeStrata がそれを実行して結果を返します。
+検索エンジンは `search_engine` で選びます。`searxng`（既定）は SearXNG 互換の検索サーバー、`deepseek` は DeepSeek の検索 API です。
+
+**検索サーバー**（`searxng`）: `GET /search?q=...&format=json` に答えるものなら何でも使えます。
+
+- [SearXNG](https://github.com/searxng/searxng): `settings.yml` の `search.formats` に `json` を加えます（ないと 403 を返します）。
+- ページの本文も返すサーバー（`include_raw_content`）なら、XeStrata はその本文を使い、ないときは自分でページを読みます。
+
+**DeepSeek の検索 API**（`deepseek`）: DeepSeek の [Search API](https://api-docs.deepseek.com/guides/search) を、自分の DeepSeek の API キーで使います。
+DeepSeek が、何か見つかった検索 1,000 件ごとに 0.75 米ドルを課金します（失敗・0 件・時間切れは課金されません）。検索語は DeepSeek に送られます。
+キーは settings.json の `deepseek_api_key`（すべてのモデルで 1 つ、本人だけが読めるファイル）に置きます。Web の Model settings では書き込みだけができ、値は表示しません（「Clear」で消します）。
+検索語は 128 字までで、それを超える分は切ります。ページの本文は検索の結果に入り、`fetch_page` は XeStrata が自分で読みます。
+
+**setup で用意する**: `xestrata --setup` は最初に一度（と `--setup` のたびに）「Web 検索を使うか」を尋ねます（`deepseek` は DeepSeek、`no`）。既定は「いいえ」で、答えなければ何もしません。
+`deepseek` なら、API キーを画面に出さずに尋ねます（`--web-search deepseek`。Windows のランチャーでは Web search の選択とキーの欄）。
+`--web-search no` で外します。自分で書いた `search_url` はそのまま残します。
+
+**自分で設定する**: `search_url` に検索サーバーのアドレスを書きます（例 `http://127.0.0.1:8888`）。
+
+- すべてのモデルに: `~/.config/xestrata/settings.json`（Windows では `%APPDATA%\xestrata\settings.json`）に `"search_url": "http://127.0.0.1:8888"`（DeepSeek なら `"search_engine": "deepseek"` と `"deepseek_api_key"`）。
+- 1 つのモデルだけ: `xestrata-<model>.json` に同じキー。`"search_url": ""` はそのモデルだけ検索を切ります。
+- Web のページ: About のタブの Model settings（[すべてのモデルの設定](#api)）。
+
+次の起動から使います。書かなければ検索はせず、下のリクエストにもこれまでどおり答えます。
+
+**リクエスト**（検索を求めるものだけが検索します）:
+
+| API | 求め方 | 答え |
+| --- | --- | --- |
+| Chat Completions | `web_search_options`（`search_context_size` の `low`・`medium`・`high` で件数と本文の量） | 答えが書いたアドレスに `message.annotations` の `url_citation` |
+| Responses | `tools` のホストのツール `web_search`（または `web_search_preview`、`filters.allowed_domains`・`search_context_size`） | `web_search_call` の項目（`action` に検索語と見つけたページ）と、`output_text` の `url_citation` |
+| Anthropic Messages | サーバーのツール `web_search_20250305`（`max_uses`・`allowed_domains`・`blocked_domains`）、ページを読むのは `web_fetch_20250910` | `server_tool_use` と `web_search_tool_result`（`web_fetch_tool_result`）のブロック、`usage.server_tool_use` |
+
+Web のページのチャットには「検索: オン／オフ」の切り替えがあり、オンなら `web_search_options` を送ります。見つけたページは答えの下に並びます。
+
+**守り**: `fetch_page` が読むのは公開のアドレスだけです。名前を引いた後のアドレスで確かめ、確かめたアドレスにつなぎ、リダイレクト先も同じように確かめます。この PC や同じネットワークのページは読みません。
+1 回の結果は 24,000 字までで、ページは 2 MiB まで、15 秒で打ち切ります。検索サーバーが答えないときや何も見つからないときは、モデルにそう伝え、答えは続きます。
+`user_location` は使いません。
 
 ## MCP サーバーのツールを使う
 

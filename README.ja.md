@@ -273,6 +273,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 **知っておくと良いこと**: 要求は 1 つずつ処理します（複数を同時に処理するには `"parallel": 2`、[BATCHING](docs/BATCHING.ja.md)）。会話の最初のメッセージはすべて読み込みますが、
 そのあとは会話を覚えておき、新しく足された部分だけを読むので、続きの返事はすぐに始まります。
 API の一覧、MCP のツール、llama-swap との組み合わせは [DETAILS](docs/DETAILS.ja.md#api) と [LLAMA_SWAP](docs/LLAMA_SWAP.ja.md) にあります。
+SearXNG 互換の検索サーバーを設定すると、API と Web のページから Web を検索できます（[Web 検索](docs/DETAILS.ja.md#web-検索)）。
 
 ## 困ったとき
 

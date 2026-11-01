@@ -73,6 +73,8 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, Har
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import places  # noqa: E402
+from serve import search as search_api  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
@@ -3397,6 +3399,9 @@ class Service:
         self.effort_end = False
         self.config_path = None                         # #564: the run config the web page's Settings view edits
         self.config_lock = threading.Lock()
+        self.settings_path = places.settings_path()     # the user's settings: GLOBAL keys for every model (runconfig)
+        self.search_url: str | None = None              # web search: a SearXNG-compatible server's address
+        self.search_backend: search_api.Searxng | search_api.DeepSeek | None = None   # the engine (search.py)
         self.switcher: str | None = None                # the host's model swapper RPC (config model_switcher)
         self.port = 0                                   # the port this server listens on (the switcher's models)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -5467,7 +5472,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             yield "mcp", {"event": "result", "id": c.id,
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
-                          **({"image": r["image"]} if r.get("image") else {})}
+                          **({"image": r["image"]} if r.get("image") else {}),
+                          **({"sources": r["sources"]} if "sources" in r else {})}   # a web search's (search.py)
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -5978,8 +5984,27 @@ def _is_json(text: str) -> bool:
         return False
 
 
+def cite_chunks(chunks, search_tools):
+    """The chunks, with one more before the finishing one: the url_citation annotations of the addresses the answer
+    writes from what the web search found (OpenAI's message.annotations)."""
+    text: list[str] = []
+    for c in chunks:
+        choice = c["choices"][0] if c is not None and c.get("choices") else None
+        if choice is not None:
+            text.append(choice["delta"].get("content") or "")
+            if choice.get("finish_reason") is not None:
+                notes = [{"type": "url_citation", "url_citation": {"start_index": x["start"], "end_index": x["end"],
+                                                                   "url": x["url"], "title": x["title"]}}
+                         for x in search_api.cited("".join(text), search_tools.sources)]
+                if notes:
+                    yield {**{k: c[k] for k in ("id", "object", "created", "model", "system_fingerprint") if k in c},
+                           "choices": [{"index": 0, "delta": {"annotations": notes}, "finish_reason": None}]}
+        yield c
+
+
 def openai_collect(chunks) -> dict:
     content, reasoning, last, mcp = [], [], None, []
+    notes: list[dict] = []                         # a web search's url_citation annotations (cite_chunks)
     by_index: dict = {}
     lps: dict[str, list] = {"content": [], "reasoning_content": []}
     for c in chunks:
@@ -5992,6 +6017,7 @@ def openai_collect(chunks) -> dict:
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
+        notes += d.get("annotations") or []
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
             if tc.get("type") == "custom":         # a custom tool's call comes whole
                 by_index[tc.get("index", len(by_index))] = {k: v for k, v in tc.items() if k != "index"}
@@ -6013,6 +6039,8 @@ def openai_collect(chunks) -> dict:
         msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
+    if notes:
+        msg["annotations"] = notes
     if mcp:
         msg["strata_mcp"] = mcp
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
@@ -6132,7 +6160,39 @@ def anthropic_usage(ids, reused, output_tokens: int) -> dict:
             "cache_read_input_tokens": reused, "output_tokens": output_tokens}
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
+def anthropic_search_blocks(x: dict, calls: dict) -> list[dict]:
+    """A web search tool's activity (run_with_mcp's "mcp" events) as Anthropic's server tool blocks: its call a
+    server_tool_use block (web_search or web_fetch), its result a web_search_tool_result (or web_fetch_tool_result)
+    block.  `calls`: call id -> the tool's name, filled here.  The results' encrypted_content is the snippet, in
+    base64: this server keeps nothing to decrypt it with, and a client only sends it back."""
+    sid = "srvtoolu_" + str(x.get("id", "")).removeprefix("call_")
+    if x.get("event") == "call":
+        raw = x.get("arguments")
+        args: dict = raw if isinstance(raw, dict) else {}
+        fetch = x.get("name") == "fetch_page"
+        calls[x.get("id")] = "web_fetch" if fetch else "web_search"
+        return [{"type": "server_tool_use", "id": sid, "name": calls[x.get("id")],
+                 "input": {"url": args.get("url")} if fetch else {"query": args.get("query")}}]
+    if x.get("event") != "result" or x.get("id") not in calls:
+        return []
+    if calls[x.get("id")] == "web_fetch":
+        src = (x.get("sources") or [{}])[0]
+        content: dict | list = (
+            {"type": "web_fetch_result", "url": src.get("url"), "content": {
+                "type": "document", "title": src.get("title"),
+                "source": {"type": "text", "media_type": "text/plain", "data": x.get("text", "")}}}
+            if x.get("ok") else {"type": "web_fetch_tool_error", "error_code": "unavailable"})
+        return [{"type": "web_fetch_tool_result", "tool_use_id": sid, "content": content}]
+    content = ([{"type": "web_search_result", "url": r["url"], "title": r["title"], "page_age": None,
+                 "encrypted_content": base64.b64encode(r["url"].encode()).decode("ascii")}
+                for r in x.get("sources") or []] if x.get("ok") else
+               {"type": "web_search_tool_result_error", "error_code": "unavailable"})
+    return [{"type": "web_search_tool_result", "tool_use_id": sid, "content": content}]
+
+
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
+    """`run`: the events to send instead of Service.run's (run_with_mcp with the web search tools): their activity
+    becomes Anthropic's server tool blocks (anthropic_search_blocks) and usage.server_tool_use."""
     mid = "msg_" + uuid.uuid4().hex[:24]
 
     def start(reused):
@@ -6154,7 +6214,9 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
         yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
-    for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
+    server_calls: dict = {}                        # the web search calls run here: id -> web_search / web_fetch
+    for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                                       declared_only=True):
         if kind == "ping":
             yield None
             continue
@@ -6162,6 +6224,22 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             started = True
             yield start(cast(dict, x).get("reused") if kind == "done" else
                         0 if getattr(svc.engine, "batch", 0) else getattr(svc.engine, "reused", 0))
+        if kind == "mcp":
+            for server_block in anthropic_search_blocks(cast(dict, x), server_calls):
+                if open_kind is not None:
+                    yield from closing()
+                index += 1
+                open_kind = server_block["type"]
+                if open_kind == "server_tool_use":       # its input as one piece, as a tool_use's
+                    yield "content_block_start", {"type": "content_block_start", "index": index,
+                                                  "content_block": {**server_block, "input": {}}}
+                    yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(server_block["input"], ensure_ascii=False)}}
+                else:
+                    yield "content_block_start", {"type": "content_block_start", "index": index,
+                                                  "content_block": server_block}
+            continue
         if kind == "event":
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (None but for the tool_* events)
@@ -6215,9 +6293,13 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 and x["completion_tokens"] < asked else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
             # the final counts: the engine's own figure of the prompt its cache held
+            usage: dict = anthropic_usage(ids, x.get("reused"), x["completion_tokens"])
+            if server_calls:
+                usage["server_tool_use"] = {
+                    "web_search_requests": sum(v == "web_search" for v in server_calls.values()),
+                    "web_fetch_requests": sum(v == "web_fetch" for v in server_calls.values())}
             delta_event = {"type": "message_delta",
-                           "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
-                           "usage": anthropic_usage(ids, x.get("reused"), x["completion_tokens"])}
+                           "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")}, "usage": usage}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             yield "message_delta", delta_event
@@ -6807,6 +6889,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
+                                 "web_search": svc.search_backend is not None,
                                  "image_note": svc.images.note() if svc.images is not None else None,
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
@@ -7350,7 +7433,11 @@ def make_handler(svc: Service):
             except (OSError, ValueError) as e:
                 self._json(500, {"error": {"type": "server_error", "message": f"the run config cannot be read: {e}"}})
                 return
-            self._json(200, runconfig.view(cfg, svc.config_path))
+            try:
+                settings = runconfig.load_settings(svc.settings_path)
+            except (OSError, ValueError):
+                settings = {}                           # shown as unset; a change to it is refused (POST)
+            self._json(200, runconfig.view(cfg, svc.config_path, settings, svc.settings_path))
 
         def _config_post(self):
             """#564: change a few documented keys of the run config - JSON from XeStrata's own page only, as
@@ -7361,13 +7448,28 @@ def make_handler(svc: Service):
             if not svc.config_path:
                 self._json(404, {"error": {"message": "this server was started without a run config"}})
                 return
+            scope, settings = "model", {}
             try:
                 req = json.loads(body or b"{}")
+                if isinstance(req, dict) and req.get("scope") is not None:
+                    scope = req["scope"]
                 with svc.config_lock:
                     cfg = runconfig.load(svc.config_path)
-                    new, changed = runconfig.apply(cfg, req.get("set") if isinstance(req, dict) else None)
-                    if changed:
-                        bak = runconfig.save(svc.config_path, new)
+                    try:
+                        settings = runconfig.load_settings(svc.settings_path)
+                    except (OSError, ValueError) as e:
+                        if scope == "global":           # setup's keys are in there: never written over
+                            raise ValueError(f"{svc.settings_path} cannot be read ({e}): fix or remove it first")
+                    sets = req.get("set") if isinstance(req, dict) else None
+                    if scope == "global":
+                        settings, changed = runconfig.apply(settings, sets, "global")
+                        if changed:
+                            runconfig.save_settings(svc.settings_path, settings)
+                        new = cfg
+                    else:
+                        new, changed = runconfig.apply(cfg, sets, scope)
+                        if changed:
+                            bak = runconfig.save(svc.config_path, new)
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
@@ -7376,9 +7478,11 @@ def make_handler(svc: Service):
                                            "message": f"the run config cannot be written: {e}"}})
                 return
             if changed:
-                print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
-                      f"(the earlier file: {bak.name}); used from the next start", flush=True)
-            self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
+                where = (f"{svc.settings_path} (every model)" if scope == "global" else
+                         f"{Path(svc.config_path).name} (the earlier file: {bak.name})")
+                print(f"[strata] the Settings view changed {', '.join(changed)} in {where}; used from the next start",
+                      flush=True)
+            self._json(200, {**runconfig.view(new, svc.config_path, settings, svc.settings_path), "changed": changed})
 
         def _foreign_origin(self) -> bool:
             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
@@ -7532,6 +7636,19 @@ def make_handler(svc: Service):
                 if more:
                     extra += more
                     hubs.append(image_tools)
+            search_tools = None                               # web_search_options: the search tools (search.py)
+            ws = req.get("web_search_options")
+            if ws is not None and not isinstance(ws, dict):
+                raise ValueError("web_search_options must be an object")
+            if ws is not None and svc.search_backend is not None:   # without one: answered as before, unsearched
+                size = ws.get("search_context_size")
+                if size is not None and size not in search_api.CONTEXT:
+                    raise ValueError('web_search_options.search_context_size is "low", "medium" or "high"')
+                search_tools = search_api.SearchTools(svc.search_backend, {"context": size})
+                more = search_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(search_tools)
             use_mcp = bool(hubs)
             if use_mcp:
                 tools = (tools or []) + extra or None
@@ -7574,6 +7691,8 @@ def make_handler(svc: Service):
                 chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
                 if validator is not None:
                     chunks = structured_chunks(chunks, validator)
+                if search_tools is not None:
+                    chunks = cite_chunks(chunks, search_tools)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
                 body = openai_collect_choices(chunks) if n > 1 else openai_collect(chunks)
@@ -7664,7 +7783,10 @@ def make_handler(svc: Service):
             def check(text, finish):
                 return validated_json(text, validator, finish)
 
-            image_tools = self.image_tools
+            image_tools, search_tools = self.image_tools, self.search_tools
+            hubs = [h for h in (image_tools, search_tools) if h is not None]
+            hub = None if not hubs else hubs[0] if len(hubs) == 1 else ToolHubs(hubs)
+            search_names = set(search_tools.routes()) if search_tools is not None else set()
 
             def image_b64(url: str) -> str | None:
                 f = svc.images.file(url.rsplit("/", 1)[-1]) if svc.images is not None else None
@@ -7676,11 +7798,11 @@ def make_handler(svc: Service):
                     asm.spell = lambda text: lp.spell(svc.engine, text)
                 yield from asm.start()
                 done = None
-                if image_tools is not None:   # the image tools run here, each an image_generation_call item
+                if hub is not None:   # the image and search tools run here: image_generation_call, web_search_call
                     messages, kw = self.prepared
-                    source = run_with_mcp(svc, image_tools, messages, tools, kw, ids, thinking, max_new,
+                    source = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new,
                                           int(req.get("max_output_tokens") or 0), req, cancel,
-                                          set(image_tools.routes()), force=force)
+                                          set(hub.routes()), force=force)
                 else:
                     # Compaction may replay undeclared calls, but an explicit none still forbids calls, just as
                     # it does on the other routes.  Do not promote a quoted call to an executable output item.
@@ -7693,7 +7815,12 @@ def make_handler(svc: Service):
                     elif kind == "event":
                         yield from asm.feed(x)
                     elif kind == "mcp":
-                        yield from asm.image_call(cast(dict, x), image_b64)
+                        x = cast(dict, x)
+                        if x.get("name") in search_names if x.get("event") == "call" else \
+                                asm.item is not None and asm.item["type"] == "web_search_call":
+                            yield from asm.search_call(x)
+                        else:
+                            yield from asm.image_call(x, image_b64)
                     elif kind == "done":
                         done = x
                 if done is not None and done["finish"] != "cancel" and not cancel.is_set():
@@ -7804,6 +7931,20 @@ def make_handler(svc: Service):
                 skipped = [k for k in skipped if k != "image_generation"]
             else:
                 image_names = []
+            # OpenAI's hosted web_search tool (and web_search_preview): the search tools, run here (serve/search.py)
+            self.search_tools, search_names = None, []
+            hosted = [k for k in skipped if k.startswith("web_search")]
+            if hosted and svc.search_backend is not None and req.get("tool_choice") != "none":
+                spec = next((t for t in req.get("tools") or [] if isinstance(t, dict) and t.get("type") in hosted), {})
+                domains = (spec.get("filters") or {}).get("allowed_domains") if isinstance(spec.get("filters"),
+                                                                                           dict) else None
+                self.search_tools = search_api.SearchTools(svc.search_backend, {
+                    "context": spec.get("search_context_size"),
+                    "include": domains if isinstance(domains, list) else []})
+                offered = self.search_tools.template_tools(exclude={t["name"] for t in tools or []})
+                search_names = [t["name"] for t in offered]
+                tools = (tools or []) + offered
+                skipped = [k for k in skipped if not k.startswith("web_search")]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             messages = responses_api.verbosity_messages(req, messages)
             if req.get("truncation") not in (None, "auto", "disabled"):
@@ -7813,6 +7954,8 @@ def make_handler(svc: Service):
                 raise ResponsesError("max_tool_calls must be a positive whole number", "max_tool_calls")
             if self.image_tools is not None:              # the hosted tools this server runs: the image tools
                 self.image_tools.max_calls = calls
+            if self.search_tools is not None and calls is not None:   # ... and the search tools
+                self.search_tools.max_uses = calls
             include = req.get("include") if isinstance(req.get("include"), list) else []
             if "message.output_text.logprobs" in include:
                 req = {**req, "logprobs": True}           # the engine's LP lines, read into output_text's logprobs
@@ -7828,7 +7971,14 @@ def make_handler(svc: Service):
                         raise ValueError("tool_choice image_generation: the request has no image_generation tool "
                                          "this server can run")
                     tools, choice = [t for t in tools or [] if t["name"] in image_names], "required"
-                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names})
+                if isinstance(choice, dict) and str(choice.get("type")).startswith("web_search"):
+                    if not search_names:
+                        raise ValueError(f"tool_choice {choice.get('type')}: the request has no web search tool this "
+                                         "server can run (search_engine, search_url)")
+                    tools, choice = [t for t in tools or [] if t["name"] == "web_search"], "required"
+                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names,
+                                                              **({k: search_names for k in hosted}
+                                                                 if search_names else {})})
                 force = forced_call(choice, tools, getattr(svc.template, "call_form", "qwen"))
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
@@ -7897,6 +8047,8 @@ def make_handler(svc: Service):
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
+            if self.search_tools is not None:
+                asm.sources = self.search_tools.sources      # the same list: what the searches find, as they run
             self.prepared = (messages, kw)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
             return ids, thinking, tools, max_new, asm, validator, req, force
@@ -7928,8 +8080,27 @@ def make_handler(svc: Service):
                 raise ValueError("max_tokens: a whole number of 1 or more is required")
             svc.load()
             req = svc.with_shared(req, "anthropic")
+            # Anthropic's server tools web_search and web_fetch (web_search_20250305, web_fetch_20250910): the search
+            # tools, run here (serve/search.py); without a search server they stay the client tools they were
+            given = req.get("tools") if isinstance(req.get("tools"), list) else []
+            hosted = [t for t in given if isinstance(t, dict) and str(t.get("type", "")).startswith(("web_search_",
+                                                                                                    "web_fetch_"))]
+            search_tools = None
+            if hosted and svc.search_backend is not None:
+                req = {**req, "tools": [t for t in given if t not in hosted]}
+                ws = next((t for t in hosted if t["type"].startswith("web_search_")), hosted[0])
+                uses = [t.get("max_uses") for t in hosted if isinstance(t.get("max_uses"), int)]
+                search_tools = search_api.SearchTools(svc.search_backend, {
+                    "include": ws.get("allowed_domains"), "exclude": ws.get("blocked_domains"),
+                    "max_uses": sum(uses) if uses else None})
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
+            if search_tools is not None:
+                want = {"web_search": any(t["type"].startswith("web_search_") for t in hosted),
+                        "fetch_page": any(t["type"].startswith("web_fetch_") for t in hosted)}
+                offered = [t for t in search_tools.template_tools(exclude={t["name"] for t in tools or []})
+                           if want.get(t["name"])]
+                tools = (tools or []) + offered or None
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
@@ -7948,7 +8119,14 @@ def make_handler(svc: Service):
                                                  getattr(svc.template, "call_form", "qwen")))
             svc.check_strict(req, tools, strict)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            run = None
+            if search_tools is not None and tools:
+                if validator is not None:
+                    raise ValueError("output_config.format with the web search tools is not supported")
+                run = run_with_mcp(svc, search_tools, messages, tools, kw, ids, thinking, max_new,
+                                   int(req.get("max_tokens") or 0), req, cancel,
+                                   {t["name"] for t in tools} & set(search_tools.routes()), force=force)
+            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run)
             if validator is not None:
                 events = anthropic_structured(events, validator)
             events = self._capture(events, "anthropic")
@@ -9079,6 +9257,30 @@ def main() -> int:
         svc.gpu_pci, svc.split_pci = split_serve["decode_gpu"], [split_serve["prefill_gpu"]]
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    try:                                                # the user's settings: the keys every model shares (runconfig)
+        user_settings = runconfig.load_settings(svc.settings_path)
+    except (OSError, ValueError) as e:
+        print(f"[strata] WARNING: {svc.settings_path} cannot be read ({e}); started without it", flush=True)
+        user_settings = {}
+    searcher = None
+    try:                                                # web search: the engine and its address (search.py)
+        searcher = runconfig.check("search_engine", runconfig.effective(cfg, user_settings, "search_engine"),
+                                   cfg) or "searxng"
+        svc.search_url = runconfig.check("search_url", runconfig.effective(cfg, user_settings, "search_url"),
+                                         cfg) or None
+    except ValueError as e:
+        print(f"[strata] WARNING: web search is off: {e}", flush=True)
+    deepseek_key = user_settings.get("deepseek_api_key")   # the settings' only (runconfig.GLOBAL_ONLY): never logged
+    if searcher == "deepseek" and isinstance(deepseek_key, str) and deepseek_key.strip():
+        svc.search_backend = search_api.DeepSeek(deepseek_key.strip())
+        print("[strata] web search: DeepSeek's search API (for requests that ask for it; billed per search)",
+              flush=True)
+    elif searcher == "deepseek":
+        print(f"[strata] WARNING: web search is off: search_engine is deepseek, but {svc.settings_path} has no "
+              "deepseek_api_key", flush=True)
+    elif searcher == "searxng" and svc.search_url:
+        svc.search_backend = search_api.Searxng(svc.search_url)
+        print(f"[strata] web search: {svc.search_url} (for requests that ask for it)", flush=True)
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
     # the swap: the web app then offers the models served on this port. {"mode": m} switches, {} only reports.
     svc.switcher = cfg.get("model_switcher") or None
