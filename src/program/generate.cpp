@@ -5688,9 +5688,13 @@ int main(int argc, char** argv) {
         // the expert arena is registered for device copies with CUDA0's context only: this GPU's fills and adaptive
         // swaps copied from it as pageable memory (B70 + 4070, iq3_s: the swaps took 4.5 ms a window against 0.1).
         // LAYER SPLIT, same process only: one RAM expert region serves every stage
+        // kept for the run: where this GPU is of another runtime, the arena stays out of host USM (the PCIe share's
+        // move would leave this GPU's copies pageable; PinnedArena::to_host_usm)
         if (st.dev != 0 && !srcp->register_on(st.dev, err))
             std::fprintf(stderr, "strata generate: layer split, CUDA%d: %s; its copies from the arena are slower\n",
                          st.dev, err.c_str());
+        else if (st.dev != 0)
+            srcp->hold_registration(st.dev);
         std::vector<int64_t> sized;
         int64_t used = 0;
         for (const auto& pr : st.profile) {

@@ -17,6 +17,8 @@
 // Coder exceeds, while registering an ordinary 51 GB mapping works and copies at the same rate as host USM.
 #pragma once
 
+#include "strata/core/on_device.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -76,6 +78,9 @@ struct PinnedArena {
     /// of the rate, blocking the host.  Released by the destructor.  False (and `err`) when the device refuses; the
     /// copies are then correct, only slower.
     bool register_on(int device, std::string& err);
+    /// register_on's registration on `device` is kept (a layer split's later GPU, which copies from the arena for as
+    /// long as the engine runs): to_host_usm refuses where that GPU is of another runtime
+    void hold_registration(int device) { held_.push_back(device); }
     /// Whether register_on registered it on engine device `device` (and it is still so).
     bool registered_on(int device) const {
         for (const auto& o : other_reg_)
@@ -106,6 +111,10 @@ private:
     std::vector<void*> reg_;       // the starts of the mapping's registrations for device copies
     std::vector<std::pair<void*, size_t>> pieces_;   // what is registered (or host USM) on the first device
     std::vector<std::pair<int, std::vector<void*>>> other_reg_;   // register_on: a device, its registrations
+    // the GPU whose runtime made the arena: its registrations, its host USM and their release are that runtime's,
+    // whichever GPU is current when a later stage calls in (to_host_usm, the destructor)
+    int owner_ = current_device();
+    std::vector<int> held_;   // hold_registration's devices
 };
 
 struct LoadStats {

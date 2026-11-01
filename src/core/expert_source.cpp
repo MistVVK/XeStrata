@@ -3746,6 +3746,10 @@ bool ArenaExpertSource::register_on(int device, std::string& err) {
     return arena_ == nullptr || static_cast<PinnedArena*>(arena_)->register_on(device, err);
 }
 
+void ArenaExpertSource::hold_registration(int device) {
+    if (arena_ != nullptr) static_cast<PinnedArena*>(arena_)->hold_registration(device);
+}
+
 bool ArenaExpertSource::registered_on(int device) const {
     return arena_ != nullptr && static_cast<PinnedArena*>(arena_)->registered_on(device);
 }

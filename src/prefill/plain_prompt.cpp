@@ -57,6 +57,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -252,6 +253,9 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
         }
         jobs.push_back(j);
     }
+    // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
+    std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
+    if (root_->piping_) turn.lock();
     for (size_t i = 0; i < jobs.size(); i += kc::ExpertPool::kMaxSplitMulti)
         pool_->run_split_multi_native(f, jobs.data() + i,
                                       (int) std::min<size_t>(kc::ExpertPool::kMaxSplitMulti, jobs.size() - i));
@@ -815,14 +819,60 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
         longest = std::max(longest, c[i]->pb_.T);
     }
     bool ok = true;
-    for (int64_t c0 = 0; ok && c0 < n; c0 += longest) {
-        const float* hand = nullptr;
-        for (PlainModel* st : c) {
-            const OnDevice on(st->dev_);
-            if (!st->prompt_chunks(tokens, n, pos, out, logits, err, c0, c0 + longest, hand)) { ok = false; break; }
-            hand = st->hand_host_;
+    if (opt_.pipeline_windows == 0) {
+        for (int64_t c0 = 0; ok && c0 < n; c0 += longest) {
+            const float* hand = nullptr;
+            for (PlainModel* st : c) {
+                const OnDevice on(st->dev_);
+                if (!st->prompt_chunks(tokens, n, pos, out, logits, err, c0, c0 + longest, hand)) { ok = false; break; }
+                hand = st->hand_host_;
+            }
+            if (ok && prompt_progress_) prompt_progress_(std::min(n, c0 + longest), n);
         }
-        if (ok && prompt_progress_) prompt_progress_(std::min(n, c0 + longest), n);
+    } else {
+        // the chunks pipelined over the stages (--pipeline-windows, as Qwen3.8-Flash-Next's prefill chain): stage s
+        // reads chunk j while stage s + 1 reads chunk j - 1, a thread each.  Each stage reads its chunks in order, the
+        // same rows as the serial loop, so the same state; a chunk's rows handed on are copied out between the ticks
+        std::vector<int64_t> starts;
+        for (int64_t c0 = 0; c0 < n; c0 += longest) starts.push_back(c0);
+        const size_t J = starts.size(), S = c.size();
+        std::vector<std::vector<float>> hands(J);
+        std::vector<std::string> errs(S);
+        std::vector<char> failed(S, 0);
+        auto run = [&](size_t s, size_t j) {
+            PlainModel* st = c[s];
+            const OnDevice on(st->dev_);
+            if (!st->prompt_chunks(tokens, n, pos, out, logits, errs[s], starts[j], starts[j] + longest,
+                                   s == 0 ? nullptr : hands[j].data())) {
+                failed[s] = 1;
+                return;
+            }
+            if (s + 1 < S) {
+                const int64_t rows = std::min(n, starts[j] + longest) - starts[j];
+                hands[j].assign(st->hand_host_, st->hand_host_ + (size_t) rows * (size_t) st->hand_w_);
+            }
+        };
+        for (size_t tick = 0; ok && tick < J + S - 1; ++tick) {
+            piping_ = true;
+            {
+                std::vector<std::thread> later;
+                for (size_t s = 1; s < S; ++s)
+                    if (tick >= s && tick - s < J) later.emplace_back(run, s, tick - s);
+                if (tick < J) run(0, tick);
+                for (auto& t : later) t.join();
+            }
+            piping_ = false;
+            for (size_t s = 0; s < S && ok; ++s)
+                if (failed[s]) {
+                    err = errs[s];
+                    ok = false;
+                }
+            if (ok && tick >= S - 1) {
+                const size_t j = tick - (S - 1);
+                std::vector<float>().swap(hands[j]);
+                if (prompt_progress_) prompt_progress_(std::min(n, starts[j] + longest), n);
+            }
+        }
     }
     std::string err2;
     for (PlainModel* st : c) {

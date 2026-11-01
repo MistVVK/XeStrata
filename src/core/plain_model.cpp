@@ -1363,7 +1363,16 @@ bool PlainModel::open_experts(std::string& err) {
     trunk_layers_.assign(moe_local_.begin(), moe_local_.begin() + moe_trunk_);
     // (also after the RAM copy of what no VRAM tier holds is pinned, and on a later stage once the root's RAM is
     // registered on its GPU: finish_experts)
-    if (in_ram_ && root_ == this) pinned_split();
+    if (in_ram_ && root_ == this) {
+        // the later stages' GPUs first: the PCIe share's move into host USM (make_kernel_readable) keeps the mapping
+        // where one of them is of another runtime, which could not register the moved memory (finish_experts)
+        for (size_t i = 1; i < split_devs_.size() && !opt_.split_at.empty() && i <= opt_.split_at.size(); ++i) {
+            std::string why;
+            if (src_->register_on(split_devs_[i], why)) src_->hold_registration(split_devs_[i]);
+            // (a refusal is said once the stage is loaded)
+        }
+        pinned_split();
+    }
     // the adaptive tier's copy stream: its rounds bring experts in beside the windows (adapt)
     swap_cs_ = strata::gpu::stream_create();
     if (swap_cs_ == nullptr || !strata::gpu::event_create(&swap_ev_)) {

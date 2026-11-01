@@ -166,6 +166,7 @@ public:
     double cached_share(int64_t samples) const override { return fallback_.cached_share(samples); }
     bool register_on(int device, std::string& err) override { return fallback_.register_on(device, err); }
     bool registered_on(int device) const override { return fallback_.registered_on(device); }
+    void hold_registration(int device) override { fallback_.hold_registration(device); }
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
     bool advise_pairs(const std::pair<int32_t, int32_t>* pairs, int64_t n) const override {
         return fallback_.advise_pairs(pairs, n);

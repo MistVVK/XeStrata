@@ -209,6 +209,9 @@ public:
     /// Whether every blob device_alias names is registered on engine device `device` (register_on), which a CUDA or
     /// HIP GPU's kernels then read in place (gpu::kernels_read_host).
     virtual bool registered_on(int device) const { (void) device; return false; }
+    /// A layer split's later GPU copies from the arena for as long as the engine runs: its registration (register_on)
+    /// is kept, and where that GPU is of another runtime the arena stays out of host USM (PinnedArena::to_host_usm)
+    virtual void hold_registration(int device) { (void) device; }
     /// Disk sessions: the files this source read its experts from, as (role, path), resolved by the loader itself
     /// - the pack's experts.bin, or every GGUF tensor native_experts.txt named, per layer and role
     /// ("expert blk.L.ffn_up").  Filled by open(); empty before.
@@ -1010,6 +1013,7 @@ class ArenaExpertSource : public ExpertSource {
 public:
     bool register_on(int device, std::string& err) override;
     bool registered_on(int device) const override;
+    void hold_registration(int device) override;
     ArenaExpertSource() = default;
     ~ArenaExpertSource() override;
     ArenaExpertSource(const ArenaExpertSource&) = delete;

@@ -499,8 +499,18 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         err = "only a private mapping with layer bounds moves into host USM";
         return false;
     }
-    auto& runtime = Runtime::get();
+    auto& runtime = Runtime::at(owner_);
     namespace sx = sycl::ext::oneapi::experimental;
+    // registered on a layer split's later GPU of another runtime as well (hold_registration; a helper GPU's goes, as
+    // before): this runtime's host USM is its GPU driver's memory, which the other refuses to register (the B70's on an RTX 4070: CUDA_ERROR_INVALID_VALUE, 2026-11-01), so the move would
+    // leave that GPU's copies pageable; the mapping stays, registered for copies on every GPU
+    for (const auto& o : other_reg_)
+        if (std::find(held_.begin(), held_.end(), o.first) != held_.end() &&
+            Runtime::at(o.first).device().get_backend() != runtime.device().get_backend()) {
+            err = "the arena is registered on " + Runtime::at(o.first).device().get_info<sycl::info::device::name>() +
+                  " as well, whose runtime cannot register this one's host USM";
+            return false;
+        }
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
         for (auto& o : other_reg_) {
@@ -673,11 +683,11 @@ PinnedArena::~PinnedArena() {
         }
     }
     if (!layer_base.empty()) {
-        for (uint8_t* p : layer_base) Runtime::get().free(p);
+        for (uint8_t* p : layer_base) Runtime::at(owner_).free(p);
         return;
     }
     if (!base) return;
-    auto& runtime = Runtime::get();
+    auto& runtime = Runtime::at(owner_);
     try {
         runtime.finish();   // no copy may still read the mapping
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, runtime.context());
