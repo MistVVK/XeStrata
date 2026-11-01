@@ -952,6 +952,7 @@ class StrataEngine:
         # log (R9700 x2, IQ3_S, 30.8 GiB page-locked, the GPU caches filled at 88 MB/s).
         work_base = None
         work_window = min(x for x in (ENGINE_STALL_S, ENGINE_READY_S) if x is not None) if ENGINE_STALL_S else None
+        start_err = None                                # an ERR line before READY: the engine said it cannot start
         while True:
             left = None if ready_deadline is None else ready_deadline - time.monotonic()
             if left is not None and left <= 0:
@@ -980,9 +981,14 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 break
+            if line.startswith("ERR"):
+                # not waited for to exit: a process that failed to load and then hung in its clean-up (two engines on
+                # one pair of GPUs, 2026-11-01) kept a CPU busy, which the READY wait above reads as still loading
+                start_err = line[3:].strip()
+                break
         loading.set()
         if self.max_context <= 0:
-            if timed_out:                               # still loading, or hung: end it, so the turn is not held
+            if timed_out or start_err is not None:      # still loading, hung or failed: end it, so the turn is not held
                 try:
                     self.proc.kill()
                 except OSError:
@@ -997,7 +1003,7 @@ class StrataEngine:
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            if not timed_out and _attempt < START_RETRIES and \
+            if not timed_out and start_err is None and _attempt < START_RETRIES and \
                     transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
                 exit_words = engine_exit_words(self.proc.returncode)
@@ -1015,10 +1021,11 @@ class StrataEngine:
                 StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, fds=fds)
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+                   f"the engine could not start: {start_err}" if start_err is not None else
                    f"the engine exited before it was ready ({exit_text(self.proc.poll())})")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
-            note = "" if timed_out else start_exit_note(self.proc.returncode)
+            note = "" if timed_out or start_err is not None else start_exit_note(self.proc.returncode)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
             if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
@@ -1091,9 +1098,15 @@ class StrataEngine:
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
         self.__dict__.setdefault("lp_lines", LPLines())   # (token id, LP line): logprobs
         last_t = None
+        # a request asking for logprobs: its T line is held until the LP line after it is read, so that the token is
+        # never spelled before its logprob is there (it went to the next token's text, and the last token had none)
+        held = None
         slot_q: list[queue.Queue] = getattr(self, "slot_q", [])
         line = None
         for line in proc.stdout:
+            if held is not None and not line.startswith("LP "):   # no LP line for it after all
+                lines.put(held)
+                held = None
             # checked before batch routing: a fatal line is never a slot's own
             if line.startswith(FATAL_PREFIXES):
                 # release_gpu_waits invalidates the verifier, even if the native
@@ -1114,13 +1127,21 @@ class StrataEngine:
                     pass
             if line.startswith("LP "):                  # beside the token before it, not in the queue: in the lines of
                 self.lp_lines.append((last_t, line))    # the request that has the control lines now (LPLines)
+                if held is not None:
+                    lines.put(held)
+                    held = None
                 continue
             if line.startswith("T "):
                 try:
                     last_t = int(line[2:])
                 except ValueError:
                     last_t = None
+                if getattr(self.lp_lines, "owner", None) is not None:
+                    held = line
+                    continue
             lines.put(line)
+        if held is not None:
+            lines.put(held)
         if self.proc is proc:                           # a killed engine's pump must not mark its successor dead
             self.ended = True                           # its output closed: it is gone, even before the OS says so
             if line and line.startswith("ERR"):         # #997 #890: why it exited, though no request may read it

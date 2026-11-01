@@ -159,7 +159,7 @@ How the server uses them (moving from the solo path into a slot, each slot's con
 `tools/batch_test.py` (greedy) with 4 slots on the B70:
 
 - Qwen3.5-9B Q4_K_M: four 64-token answers, each the same tokens as alone, 111 tokens/s together (about 52 one at a time).
-- Qwen3.6-35B-A3B UD-Q4_K_XL: with `--no-pcie-split --adapt-every 0` all four were the same tokens as alone; with the default settings four 128-token answers ran at 186 tokens/s together (about 140 one at a time, with MTP drafts).
+- Qwen3.6-35B-A3B UD-Q4_K_XL: with `--no-pcie-split --adapt-every 0` all four were the same tokens as alone, and with 3,000 slots in VRAM and the CPU computing the rest, `--pcie-frac 0 --adapt-every 0` gave the same tokens too. With the adaptive tier on (its round after each prompt included) an expert can be computed in another place (a GPU or the CPU) in the slots than alone, which rounds it differently, and a near-tie can flip; a PCIe share above 0 does the same, as a batch window's misses past the staging slots go to the CPU; with the default settings four 128-token answers ran at 186 tokens/s together (about 140 one at a time, with MTP drafts).
 
 ## Measured
 

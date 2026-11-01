@@ -2561,6 +2561,14 @@ int plain_main(int argc, char** argv) {
     }
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
         std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can
+        // wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
+        if (serve) {
+            std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+            std::fflush(stderr);
+            std::_Exit(1);
+        }
         return 1;
     }
     {   // --aux-cpus: the threads that are neither pool workers nor the host thread beside the workers
