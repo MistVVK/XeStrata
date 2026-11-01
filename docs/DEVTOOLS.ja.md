@@ -163,6 +163,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   17 番目: v7.2.0 から、SYCL のサブグループの shuffle（`sycl/detail/spirv.hpp` の Shuffle・ShuffleXor・ShuffleUp・ShuffleDown）は、NVIDIA 以外のすべての対象で SPIR-V の GroupNonUniform の形を呼びますが、AMD 向けの libspirv には SubgroupShuffle*INTEL の形しかありません。
   shuffle を使う AMD 向けのプログラムはどれもリンクで止まっていました（「undefined symbol: __spirv_GroupNonUniformShuffleXor(int, float, unsigned int)」）。
   修正後は、AMD 向けの libspirv がスカラーの型について 4 つの GroupNonUniform の shuffle を SubgroupShuffle*INTEL で定義します（`hip-group-shuffle`）。
+  18 番目: HIP のアダプタは仮想メモリの呼び出し（`urVirtualMem*`・`urPhysicalMem*`）に全部 UNSUPPORTED を返し、対応なしと報告していたので、AMD の GPU では SYCL の `ext_oneapi_virtual_mem` がなく、`--vram-elastic` と `--kv-grow` が 1 つの割り当てに戻っていました。
+  修正後は、CUDA のアダプタが CUDA の仮想メモリで実装するのと同じく HIP の仮想メモリ（`hipMemAddressReserve`・`hipMemCreate`・`hipMemMap` など）で実装し、対応の有無は HIP の `hipDeviceAttributeVirtualMemoryManagementSupported` のとおりに報告します（`hip-virtual-mem`）。
   CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。

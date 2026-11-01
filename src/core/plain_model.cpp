@@ -25,6 +25,7 @@
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/pinned.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -1144,7 +1145,9 @@ bool PlainModel::open_experts(std::string& err) {
     // Level Zero GPU's, with a layer split).  The root opens the tier; the later stages read from it.
     if (root_ == this) {
         in_ram_ = !opt_.mmap_experts && opt_.resident_gib == 0;
-        if (in_ram_) {
+        // a shared arena an engine before this one filled (the server's, across an image job's unload) is in RAM
+        // already, and counted as used: its RAM is not asked for again
+        if (in_ram_ && !(!opt_.shared_arena.empty() && PinnedArena::shared_filled(opt_.shared_arena))) {
             detail::HostMemory hm;
             const uint64_t need = lay.total + lay.max_blob;
             uint64_t beside = 8ull << 30;
@@ -1986,6 +1989,12 @@ void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n
 // become misses (the CPU's or PCIe's, as any expert outside the tier) and the slots leave the layers' free lists; the
 // prompt's loan takes the end of what is left (prompt_borrow).  A grow maps them again and puts each slot's expert
 // back, or, when the adaptive tier already brought that one back, the layer's most-routed missing expert.
+bool PlainModel::arena_drop(const std::string& line, std::string& answer, std::string& err) {
+    auto* arena = dynamic_cast<ArenaExpertSource*>(src_own_.get());
+    if (arena == nullptr) { err = "the experts are not in an arena"; return false; }
+    return arena_drop_command(*arena, line, prior_, answer, err);
+}
+
 bool PlainModel::vram(int64_t reserve_mib, std::string& answer, std::string& err) {
     if (!cache_.segmented()) {
         err = "VRAM needs an engine started with --vram-elastic (--serve, one GPU with virtual memory)";

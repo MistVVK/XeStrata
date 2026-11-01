@@ -18,7 +18,7 @@ class PoolCoresConfig(unittest.TestCase):
         self.assertEqual(pool_cores_args({"pool_cores": []}, []), [])
         self.assertEqual(pool_cores_args({"pool_cores": False}, []), [])
         # nothing is added to an ordinary config
-        self.assertEqual(engine_args({"args": ["--pack", "p"]}), ["--pack", "p"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "session_save_reclaim": False}), ["--pack", "p"])
 
     def test_text_and_list_forms(self):
         self.assertEqual(pool_cores_args({"pool_cores": "2,4,6,8"}, []), ["--pool-cores", "2,4,6,8"])

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -319,11 +320,23 @@ struct SharedArenaHeader {
     char magic[16] = "STRATA-ARENA-V1";
     uint32_t version = 1, header_bytes = kArenaHeaderBytes;
     uint64_t arena_bytes = 0, pack_hash = 0;
-    uint64_t reserved[4] = {};   // reserved[0]: durable population completion
+    // reserved[0]: durable population completion; reserved[1] kArenaPartial: complete but for the units whose bits
+    // (reserved[2] bytes from kDroppedAt) are set, which the server took out of the file - an engine that does not
+    // know it sees an arena to fill, and loads all of it
+    uint64_t reserved[4] = {};
 };
+constexpr uint64_t kArenaPartial = 2;
+constexpr uint64_t kDroppedAt = 512;
 #if defined(_WIN32)
 // The backing file is a CRT descriptor, as on Linux; its handle does the locking, the mapping and the positioned I/O.
 HANDLE os_handle(int fd) { return (HANDLE) _get_osfhandle(fd); }
+std::wstring wide(const std::string& s) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring w(n > 0 ? (size_t) n : 1, L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+    w.resize(w.empty() ? 0 : w.size() - 1);
+    return w;
+}
 bool try_lock(int fd) {
     OVERLAPPED ov{};
     return LockFileEx(os_handle(fd), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, MAXDWORD, MAXDWORD, &ov);
@@ -390,6 +403,56 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
     if (!bytes || bytes > (uint64_t) std::numeric_limits<int64_t>::max() - kArenaHeaderBytes - kHugePage)
         throw DeviceError("shared arena: invalid size");
 #if defined(_WIN32)
+    if (file.rfind("section:", 0) == 0) {
+        // the server's page-file-backed section (SEC_RESERVE, as large as the RAM): this arena's pages committed in
+        // the view, which the section keeps for the next engine while the server holds it; never written to a file
+        const std::wstring name = wide(file.substr(8));
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name.c_str());
+        if (mapping == nullptr) throw DeviceError("shared arena: no section " + file.substr(8));
+        map_bytes_ = (size_t) (bytes + kArenaHeaderBytes);
+        map_ = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, map_bytes_);
+        CloseHandle(mapping);
+        if (map_ == nullptr || VirtualAlloc(map_, map_bytes_, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            unmap(true);
+            throw DeviceError("shared arena: the section's view could not be committed (" + gib_text(bytes) + ")");
+        }
+        section_ = true;
+        section_lock_ = CreateMutexW(nullptr, FALSE, (name + L"-lock").c_str());
+        try {
+            header_lock();
+            shared_locked_ = true;
+            SharedArenaHeader hdr;
+            header_io(&hdr, sizeof hdr, 0, false);
+            if (hdr.magic[0] == '\0') {   // the section is new: zero pages
+                SharedArenaHeader fresh;
+                fresh.arena_bytes = bytes; fresh.pack_hash = pack_hash;
+                header_io(&fresh, sizeof fresh, 0, true);
+            } else if (std::memcmp(hdr.magic, "STRATA-ARENA-V1", 16) != 0 || hdr.version != 1 ||
+                       hdr.header_bytes != kArenaHeaderBytes || hdr.arena_bytes != bytes || hdr.pack_hash != pack_hash) {
+                throw DeviceError("shared arena: the section holds another arena");
+            }
+            base = (uint8_t*) map_ + kArenaHeaderBytes;
+            std::string capped;
+            registered_bytes = register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_,
+                                               arena_pin_cap(bytes, capped));
+            registered_slices = 1; slice_starts = {0};
+            backing = PageBacking::NormalPages;
+            note = "shared section registered in device-sized slices" +
+                   (registered_bytes < bytes ? ", its first " + gib_text(registered_bytes) + " of " + gib_text(bytes) +
+                                                   " (" + capped + ")"
+                                             : std::string());
+            header_unlock(); shared_locked_ = false;
+        } catch (...) {
+            for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
+            reg_.clear();
+            if (shared_locked_) { header_unlock(); shared_locked_ = false; }
+            unmap(true);
+            if (section_lock_) CloseHandle((HANDLE) section_lock_);
+            section_lock_ = nullptr; section_ = false;
+            throw;
+        }
+        return;
+    }
     shared_fd_ = _open(file.c_str(), _O_RDWR | _O_CREAT | _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
 #else
     shared_fd_ = open(file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -464,38 +527,112 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
     }
 }
 
+bool PinnedArena::header_io(void* p, uint64_t n, uint64_t off, bool write) {
+    if (section_) {
+        if (write) std::memcpy((uint8_t*) map_ + off, p, (size_t) n);
+        else std::memcpy(p, (const uint8_t*) map_ + off, (size_t) n);
+        return true;
+    }
+    return write ? pwrite_all(shared_fd_, p, n, off) && sync_file(shared_fd_) : pread_all(shared_fd_, p, n, off);
+}
+
+void PinnedArena::header_lock() {
+#if defined(_WIN32)
+    if (section_) {
+        if (WaitForSingleObject((HANDLE) section_lock_, 120000) == WAIT_TIMEOUT)
+            throw DeviceError("shared arena: population lock timed out");
+        return;
+    }
+#endif
+    arena_lock(shared_fd_);
+}
+
+void PinnedArena::header_unlock() {
+#if defined(_WIN32)
+    if (section_) { ReleaseMutex((HANDLE) section_lock_); return; }
+#endif
+    unlock(shared_fd_);
+}
+
 bool PinnedArena::begin_shared_population() {
-    if (shared_fd_ < 0) return true;
-    arena_lock(shared_fd_); shared_locked_ = true;
+    if (!shared()) return true;
+    header_lock(); shared_locked_ = true;
     SharedArenaHeader hdr;
-    if (!pread_all(shared_fd_, &hdr, sizeof hdr, 0)) throw DeviceError("shared arena: cannot read population state");
+    if (!header_io(&hdr, sizeof hdr, 0, false)) throw DeviceError("shared arena: cannot read population state");
     if (hdr.reserved[0] == 1) {
-        unlock(shared_fd_); shared_locked_ = false;
+        header_unlock(); shared_locked_ = false;
         return false;
+    }
+    shared_missing_.clear();
+    if (hdr.reserved[1] == kArenaPartial && hdr.reserved[2] > 0 && hdr.reserved[2] <= kArenaHeaderBytes - kDroppedAt) {
+        shared_missing_.resize((size_t) hdr.reserved[2]);
+        if (!header_io(shared_missing_.data(), hdr.reserved[2], kDroppedAt, false)) shared_missing_.clear();
     }
     return true;
 }
 
-void PinnedArena::publish_shared() {
-    if (shared_fd_ < 0) return;
-    if (!shared_locked_) throw DeviceError("shared arena: population lock is not held");
-    // The complete body must reach storage before another process can observe its completion record.
+bool PinnedArena::shared_filled(const std::string& file) {
 #if defined(_WIN32)
-    const bool flushed = FlushViewOfFile(base, (size_t) capacity) != 0;
-#else
-    const bool flushed = msync(base, (size_t) capacity, MS_SYNC) == 0;
+    if (file.rfind("section:", 0) == 0) {
+        HANDLE mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wide(file.substr(8)).c_str());
+        if (mapping == nullptr) return false;
+        // the header's page only, committed before it is read (a SEC_RESERVE section's page no view committed yet
+        // cannot be read; committed, a new section's is zeros)
+        void* v = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, kArenaHeaderBytes);
+        CloseHandle(mapping);
+        if (v == nullptr) return false;
+        const bool filled = VirtualAlloc(v, kArenaHeaderBytes, MEM_COMMIT, PAGE_READWRITE) != nullptr &&
+                            std::memcmp(v, "STRATA-ARENA-V1", 16) == 0;
+        UnmapViewOfFile(v);
+        return filled;
+    }
 #endif
-    if (!flushed || !sync_file(shared_fd_)) throw DeviceError("shared arena: cannot persist populated weights");
-    const uint64_t complete = 1;
-    if (!pwrite_all(shared_fd_, &complete, sizeof complete, offsetof(SharedArenaHeader, reserved)) ||
-        !sync_file(shared_fd_))
+    std::error_code ec;
+    const auto n = std::filesystem::file_size(file, ec);
+    return !ec && n > 0;
+}
+
+uint64_t PinnedArena::shared_header_bytes() { return kArenaHeaderBytes; }
+
+bool PinnedArena::mark_shared_dropped(const std::vector<uint8_t>& bits, std::string& err) {
+    if (!shared()) { err = "the expert arena is not a shared one (--shared-expert-arena)"; return false; }
+    if (bits.empty() || bits.size() > kArenaHeaderBytes - kDroppedAt) {
+        err = "the arena's header holds " + std::to_string((kArenaHeaderBytes - kDroppedAt) * 8) + " experts, not " +
+              std::to_string(bits.size() * 8);
+        return false;
+    }
+    header_lock();
+    uint64_t state[3] = {0, kArenaPartial, (uint64_t) bits.size()};
+    std::vector<uint8_t> copy = bits;
+    const bool ok = header_io(copy.data(), copy.size(), kDroppedAt, true) &&
+                    header_io(state, sizeof state, offsetof(SharedArenaHeader, reserved), true);
+    header_unlock();
+    if (!ok) err = "the arena's header could not be written";
+    return ok;
+}
+
+void PinnedArena::publish_shared() {
+    if (!shared()) return;
+    if (!shared_locked_) throw DeviceError("shared arena: population lock is not held");
+    // The complete body must reach storage before another process can observe its completion record (a section's
+    // pages are the memory itself: nothing to write out).
+    if (!section_) {
+#if defined(_WIN32)
+        const bool flushed = FlushViewOfFile(base, (size_t) capacity) != 0;
+#else
+        const bool flushed = msync(base, (size_t) capacity, MS_SYNC) == 0;
+#endif
+        if (!flushed || !sync_file(shared_fd_)) throw DeviceError("shared arena: cannot persist populated weights");
+    }
+    uint64_t complete[2] = {1, 0};
+    if (!header_io(complete, sizeof complete, offsetof(SharedArenaHeader, reserved), true))
         throw DeviceError("shared arena: cannot publish completed weights");
-    unlock(shared_fd_); shared_locked_ = false;
+    header_unlock(); shared_locked_ = false;
 }
 
 bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available) {
     if (!layer_base.empty()) return true;
-    if (base == nullptr || map_ == nullptr || shared_fd_ >= 0 || bounds_.size() < 2) {
+    if (base == nullptr || map_ == nullptr || shared() || bounds_.size() < 2) {
         err = "only a private mapping with layer bounds moves into host USM";
         return false;
     }
@@ -573,7 +710,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         if (b > a) madvise((void*) a, (size_t) (b - a), MADV_DONTNEED);
 #endif
     }
-    unmap(shared_fd_ >= 0);
+    unmap(shared());
     map_bytes_ = 0;
     layer_base = std::move(blocks);
     pieces_.clear();
@@ -666,8 +803,11 @@ void PinnedArena::unmap(bool file_view) {
 }
 
 PinnedArena::~PinnedArena() {
-    const bool file_view = shared_fd_ >= 0;
+    const bool file_view = shared();
     if (shared_fd_ >= 0) close_file(shared_fd_);
+#if defined(_WIN32)
+    if (section_lock_ != nullptr) CloseHandle((HANDLE) section_lock_);
+#endif
     for (auto& o : other_reg_) {
         try {
             auto& r = Runtime::at(o.first);

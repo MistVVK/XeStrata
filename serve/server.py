@@ -940,6 +940,7 @@ class StrataEngine:
     gpu_busy = None
     last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    kept_arena: "KeptArena | None" = None   # main() sets it: the experts' arena kept across an image job's unload
     eos_ids = EOS_IDS                    # the tokens that end a reply (Service sets the model's: stop_token_ids)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -1288,10 +1289,43 @@ class StrataEngine:
         except subprocess.TimeoutExpired:
             return None
 
-    def unload(self):
-        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
+    def unload(self, keep_arena: bool = False):
+        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading.  `keep_arena`: an image
+        job's unload, after which the experts stay in the server's arena (kept_arena) but for those arena_drop gave
+        up; any other unload gives the whole arena back."""
         self.close()
         self.unloaded = True
+        kept = getattr(self, "kept_arena", None)
+        if kept is not None:
+            kept.after_unload(keep_arena)
+
+    def arena_drop(self, mib: int, path: str, timeout: float = 60.0) -> dict:
+        """`ARENA DROP <mib> <file>` before an image job's unload (the caller holds the service's FIFO): the engine
+        marks at least `mib` of its coldest experts dropped from the shared arena and writes their ranges in the file
+        to `path` -> {"dropped_mib", "ranges"}; ValueError with the engine's reason, EngineDied when it ended."""
+        proc = self.proc
+        if not self.alive() or proc is None or proc.stdin is None:
+            raise EngineDied("the engine is not running")
+        if any(c in path for c in "\r\n\0"):
+            raise ValueError("invalid arena drop path")
+        proc.stdin.write(f"ARENA DROP {int(mib)} {path}\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the ARENA command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the ARENA command")
+            if line.startswith("ARENA "):
+                out = {k: int(v) for k, _, v in (kv.partition("=") for kv in line.split()[1:]) if v.isdigit()}
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the ARENA command")
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its
@@ -2661,9 +2695,9 @@ class Vision:
         self.stopped = True                             # until _start: a lazy encoder starts with the model
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
-        # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
-        # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
-        # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
+        # the vision section's "elastic" (vision_elastic_on: by default with a GPU encoder and an elastic expert cache):
+        # the encoder starts with the first picture and stops after elastic_idle_s without one; while it runs, the
+        # engine's expert cache keeps elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
         self.max_tokens = self.token_limit(cfg)
         self.elastic = cfg.get("elastic") is True
         self.elastic_mib = int(cfg.get("elastic_mib") or 2048)
@@ -3070,6 +3104,27 @@ def layer_split_value(cfg: dict) -> str:
     return ",".join(str(x) for x in vals)
 
 
+def vram_elastic_on(cfg: dict) -> bool:
+    """#533: the expert cache in segments it gives back and maps again (--vram-elastic): the config's "vram_elastic",
+    else on when something borrows the VRAM between requests - image generation, or a GPU vision encoder.  The engine
+    keeps one allocation where it cannot (a runtime without virtual memory, a layer split, the resident low-RAM mode)."""
+    v = cfg.get("vram_elastic")
+    if isinstance(v, bool):
+        return v
+    vision = cfg.get("vision")
+    return isinstance(cfg.get("images"), dict) or (isinstance(vision, dict) and vision.get("gpu") is True)
+
+
+def vision_elastic_on(cfg: dict) -> bool:
+    """Upstream ca41a6b9: a GPU vision encoder started with the first picture (and stopped when none came for a while)
+    instead of with the model - the section's "elastic", else on with a GPU encoder and an elastic expert cache."""
+    vision = cfg.get("vision")
+    if not isinstance(vision, dict):
+        return False
+    v = vision.get("elastic")
+    return v if isinstance(v, bool) else vision.get("gpu") is True and vram_elastic_on(cfg)
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3098,13 +3153,18 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--split-order", "as-given"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
-    # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
-    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
-    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
+    # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
+    # picture and POST /v1/vram can take VRAM and give it back; "vram_segment_mib" sets the segment size (the engine's
+    # default: 512)
+    if vram_elastic_on(cfg) and "--vram-elastic" not in args:
         args.append("--vram-elastic")
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # upstream 73ed39ae: a conversation save that its RAM check refuses (an image job's unload, when the RAM is short)
+    # first lets the caches it can build again go; "session_save_reclaim": false keeps the refusal
+    if cfg.get("session_save_reclaim") is not False and "--session-save-reclaim" not in args:
+        args.append("--session-save-reclaim")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return conversation_save_args(cfg, learned_profile_args(cfg, args))
@@ -3210,12 +3270,15 @@ def profile_shape(path: str) -> tuple[int, int] | None:
 
 
 def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
-    """#477 (opt-in): "expert_profile_save": "<path>" in the config has the engine save what its adaptive
-    tier learned there - on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) -
-    and the next start begins from it instead of the config's --expert-profile, when it is a profile of the same
-    model (its header's layers and experts match); otherwise from the config's own, as before.  A relative path is
-    the engine's (the config's "cwd").  Without the key, the arguments are the config's, unchanged."""
+    """#477: "expert_profile_save": "<path>" in the config has the engine save what its adaptive tier learned there -
+    on QUIT and every "expert_profile_save_every" minutes (10 by default, 0 = at QUIT only) - and the next start
+    begins from it instead of the config's --expert-profile, when it is a profile of the same model (its header's
+    layers and experts match); otherwise from the config's own, as before.  A relative path is the engine's (the
+    config's "cwd").  Without the key, expert-profile-<model>.bin there, for a config with an --expert-profile;
+    "expert_profile_save": false keeps the config's arguments as they are."""
     save = cfg.get("expert_profile_save")
+    if save is None and "--expert-profile" in args[:-1]:
+        save = "expert-profile-" + re.sub(r"[^\w.-]", "_", str(cfg.get("model_name") or "model")) + ".bin"
     if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
         return args
     args = args + ["--expert-profile-save", save]
@@ -3768,6 +3831,18 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False) or v.alive():
             return
+        if str((getattr(self.engine, "info", None) or {}).get("vram_elastic")) in ("0", "False") and self.loaded():
+            # the engine cannot give VRAM back (a runtime that keeps an unmapped segment's VRAM: ROCm 7.x's HIP): the
+            # encoder starts before the model from now on, as a non-elastic one does, the model loaded again once
+            print("[strata] images: the expert cache cannot give VRAM back on this GPU's runtime, so the image "
+                  "encoder starts before the model from now on (the model loads again once)", flush=True)
+            v.elastic = False
+            if getattr(self.engine, "kept_arena", None) is not None:
+                self.engine.unload(keep_arena=True)
+            else:
+                self.engine.unload()
+            self.ensure_loaded()
+            return
         if hasattr(self.engine, "vram") and self.loaded():
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
@@ -3945,7 +4020,7 @@ class Service:
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to vram_wait_s).
-        Only an engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes
+        Only an engine started with --vram-elastic (vram_elastic_on) can do it; it never resizes
         on its own.  An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
@@ -9101,6 +9176,144 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
+class KeptArena:
+    """The one engine's expert arena in memory the server holds, when image jobs may unload the engine: started again
+    after the image, it maps the arena instead of reading the experts from the model files (the SSD, when the page
+    cache has let them go).  On Linux a memory file (--shared-expert-arena /proc/self/fd/N, as split.arena_path makes
+    it), on Windows a page-file-backed section (section:<name>, SEC_RESERVE and as large as the RAM: the engine commits
+    its arena in it).  Before such an unload, when the image needs the RAM, the engine marks its coldest experts
+    dropped (arena_drop); once it has ended their pages are given back here - punched out of the file, or reset in the
+    section (MEM_RESET: the system takes them without writing them to the page file) - and the next start reads those
+    alone.  An unload for any other reason gives the whole arena back (a new, empty one in its place)."""
+
+    PUNCH = 0x02 | 0x01                              # FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+    PAGE = 4096
+
+    def __init__(self, fd: int | None = None):
+        self.fd = fd
+        self.handle: int | None = None               # Windows: the section
+        self.name = ""
+        if fd is None:
+            self.name = f"Local\\xestrata-arena-{os.getpid()}-{os.urandom(4).hex()}"
+            self.handle = self._section()
+            self.path = f"section:{self.name}"
+        else:
+            self.path = f"/proc/self/fd/{fd}"
+        self.pending: str | None = None              # arena_drop's ranges file, given back after the unload
+
+    @staticmethod
+    def _k32():
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)        # type: ignore[attr-defined]
+        k.CreateFileMappingW.restype = wintypes.HANDLE
+        k.CreateFileMappingW.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                         wintypes.DWORD, wintypes.LPCWSTR]
+        k.MapViewOfFile.restype = ctypes.c_void_p
+        k.MapViewOfFile.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+        k.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+        k.VirtualAlloc.restype = ctypes.c_void_p
+        k.VirtualAlloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        return k
+
+    def _section(self) -> int:
+        """A new page-file-backed section of the RAM's size, reserved (committed by the engine's view as it fills)."""
+        import ctypes
+        import psutil
+        size = psutil.virtual_memory().total
+        h = self._k32().CreateFileMappingW(ctypes.c_void_p(-1).value, None, 0x04 | 0x4000000,   # PAGE_READWRITE |
+                                           size >> 32, size & 0xFFFFFFFF, self.name)          # SEC_RESERVE
+        if not h:
+            raise OSError(ctypes.get_last_error(), "CreateFileMappingW")    # type: ignore[attr-defined]
+        return h
+
+    def after_unload(self, keep: bool) -> None:
+        pending, self.pending = self.pending, None
+        if not keep:
+            self.reset()
+        elif pending:
+            try:
+                n = self.punch(pending)
+                print(f"[strata] expert arena: {n / 2 ** 30:.2f} GiB of the coldest experts given back to the RAM "
+                      "(the next start reads them again)", flush=True)
+            except OSError as e:
+                print(f"[strata] expert arena: the dropped experts could not be given back ({e}); the whole arena "
+                      "goes", flush=True)
+                self.reset()
+        with contextlib.suppress(OSError):
+            if pending:
+                os.unlink(pending)
+
+    def punch(self, ranges_file: str) -> int:
+        """The ranges ("offset bytes" lines) given back -> their bytes.  In a section only the whole pages inside each
+        range can be reset (the page at each end stays, a few KiB an expert)."""
+        import ctypes
+        with open(ranges_file, encoding="ascii") as f:
+            ranges = [tuple(int(x) for x in line.split()) for line in f if line.strip()]
+        if self.fd is not None:
+            libc = ctypes.CDLL(None, use_errno=True)
+            libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+            for off, n in ranges:
+                if libc.fallocate(self.fd, self.PUNCH, off, n) != 0:
+                    raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+            return sum(n for _, n in ranges)
+        k = self._k32()
+        view = k.MapViewOfFile(self.handle, 0xF001F, 0, 0, 0)       # FILE_MAP_ALL_ACCESS, the whole section
+        if not view:
+            raise OSError(ctypes.get_last_error(), "MapViewOfFile")         # type: ignore[attr-defined]
+        total = 0
+        try:
+            for off, n in ranges:
+                a, e = -(-off // self.PAGE) * self.PAGE, (off + n) // self.PAGE * self.PAGE
+                if e > a:
+                    if not k.VirtualAlloc(view + a, e - a, 0x80000, 0x04):   # MEM_RESET, PAGE_READWRITE
+                        raise OSError(ctypes.get_last_error(), "VirtualAlloc MEM_RESET")   # type: ignore[attr-defined]
+                    total += e - a
+        finally:
+            k.UnmapViewOfFile(view)
+        return total
+
+    def reset(self) -> None:
+        """A new, empty arena under the same name (the engine's argument stays valid); the old one's RAM goes with it:
+        a memory file at the same descriptor, or the section closed and made again."""
+        if self.fd is None:
+            self._k32().CloseHandle(self.handle)
+            self.handle = self._section()
+            return
+        new = os.memfd_create("strata-arena")
+        os.dup2(new, self.fd, inheritable=False)
+        os.close(new)
+
+
+def kept_arena(cfg: dict, args: list[str]) -> tuple[KeptArena | None, str]:
+    """The one engine's KeptArena, or None and why not: only with image generation on the text model's card (an image
+    job may unload it), not with a layer split or an engine that reads its experts from the files or keeps part of
+    them in RAM, nor when the "images" section says "keep_arena": false."""
+    from serve import split as sp
+    images = cfg.get("images")
+    if not isinstance(images, dict):
+        return None, ""
+    if images.get("keep_arena") is False:
+        return None, "the experts are read again after an image job (\"keep_arena\": false)"
+    if cfg.get("split_pci"):                         # a shared mapping is not moved into host USM for the PCIe share
+        return None, "the experts are read again after an image job (a layer split)"
+    tier = next((f for f in ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena")
+                 if f in args), None)
+    if tier:
+        return None, f"the experts are read again after an image job ({tier})"
+    said = "the experts stay in RAM across an image job that unloads the model (a shared arena)"
+    if os.name == "nt":
+        try:
+            return KeptArena(), said
+        except (OSError, ImportError) as e:
+            return None, f"the experts are read again after an image job: no section for them ({e})"
+    path, fd, note = sp.arena_path({"args": args}, {"shared_arena": True})
+    if fd is None:
+        return None, f"the experts are read again after an image job: {note}"
+    return KeptArena(fd), said
+
+
 def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool):
     """Opt-in split serving (serve/split.py, upstream 690172c46): a prefill engine and a decode engine, one card each,
     the same model and the same session settings.  Started one after the other, so a shared expert arena is filled
@@ -9300,7 +9513,7 @@ def main() -> int:
         vision_error = vision_fallback = None
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
-            elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
+            elastic = vision_elastic_on(cfg) and vram_elastic_on(cfg)
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
                   "loading the vision encoder ..." if not lazy else
                   "vision encoder unloaded; it starts with the model ...", flush=True)
@@ -9308,7 +9521,8 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+            vcfg["elastic"] = vision_elastic_on(cfg)
+            if vcfg["elastic"] and not vram_elastic_on(cfg):
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
@@ -9373,8 +9587,15 @@ def main() -> int:
         elif split_serve:
             engine = start_split(cfg, split_serve, exe, effort_end or [], lazy)
         else:
-            engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                                  env=env, lazy=lazy)
+            eargs = engine_args(cfg) + (effort_end or [])
+            kept, said = (None, "") if image_env(cfg, env)[1] else kept_arena(cfg, eargs)
+            if said:
+                print(f"[strata] {said}", flush=True)
+            if kept is not None:
+                eargs += ["--shared-expert-arena", kept.path]
+            engine = StrataEngine(exe, eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
+                                  fds=(kept.fd,) if kept is not None and kept.fd is not None else ())
+            engine.kept_arena = kept                    # an attribute of its own: restart() keeps it
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))
         note = None if groups or split_serve else desktop_vram_note(amd_card(cfg.get("gpu_pci")),

@@ -66,8 +66,20 @@ struct PinnedArena {
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes,
                 const std::string& shared_file, uint64_t pack_hash, const std::vector<uint64_t>& cuts = {});
     /// Holds the shared file's population lock until publish_shared() or destruction. False: already complete.
+    /// True with shared_missing() not empty: only those units (mark_shared_dropped's) are to be loaded again.
     bool begin_shared_population();
     void publish_shared();
+    /// The units (one bit each, 1: not in the arena) begin_shared_population found dropped; empty: load it all.
+    const std::vector<uint8_t>& shared_missing() const { return shared_missing_; }
+    /// Records in the shared file's header that the units set in `bits` are no longer in the arena (the server takes
+    /// their pages away once this engine has ended), so the next engine that maps it loads only those.  False (and
+    /// `err`) without a shared file, or when `bits` does not fit the header.
+    bool mark_shared_dropped(const std::vector<uint8_t>& bits, std::string& err);
+    /// Where the arena starts in the shared file (its header before it).
+    static uint64_t shared_header_bytes();
+    /// Whether the shared arena `file` (a path, or on Windows "section:<name>", a page-file-backed section the server
+    /// holds) holds an arena already: an engine filled it, or dropped part of it.  False: new and empty, or absent.
+    static bool shared_filled(const std::string& file);
     std::vector<uint64_t> slice_starts;
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
@@ -105,6 +117,17 @@ private:
     void unmap(bool file_view);   // the mapping, if any; `file_view`: it maps the shared backing file
     int shared_fd_ = -1;
     bool shared_locked_ = false;
+    std::vector<uint8_t> shared_missing_;
+    // Windows' "section:<name>": a page-file-backed section the server made (serve/server.py's KeptArena), mapped
+    // with its header; the header is read and written in the view, under a named mutex
+    bool section_ = false;
+#if defined(_WIN32)
+    void* section_lock_ = nullptr;
+#endif
+    bool shared() const { return shared_fd_ >= 0 || section_; }
+    bool header_io(void* p, uint64_t n, uint64_t off, bool write);
+    void header_lock();
+    void header_unlock();
     std::vector<uint64_t> bounds_;
     void* map_ = nullptr;          // the mapping `base` is aligned inside
     size_t map_bytes_ = 0;

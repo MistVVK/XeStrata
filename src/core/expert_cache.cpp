@@ -7,10 +7,12 @@
 #include "strata/core/gpu.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <numeric>
+#include <thread>
 #include <utility>
 #include <cstring>
 
@@ -174,8 +176,13 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
     // a whole number of 2 MiB pages as well: Level Zero reports 64 KiB but refused a 0.49 GiB segment of 64 KiB
     // pages (UR_RESULT_ERROR_INVALID_VALUE, the B70), and CUDA's granularity is 2 MiB
     const uint64_t g = std::lcm(gran, (uint64_t) 2 << 20);
-    const uint64_t total = (want + g - 1) / g * g;
-    seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
+    // the segments all of one size, as many as the size asked for gives: HIP refused access to a segment shorter than
+    // the ones mapped before it (hipMemSetAccess: invalid argument, the RX 9060 XT on ROCm 7.1, 2026-11-02; segments
+    // of one size, from 2 MiB to 1 GiB, were taken).  What it adds to the arena is under a granule a segment.
+    const uint64_t asked = std::max<uint64_t>(((uint64_t) seg_req_ + g - 1) / g * g, g);
+    const uint64_t n_seg = std::max<uint64_t>((want + asked - 1) / asked, 1);
+    seg_ = (int64_t) (((want + n_seg - 1) / n_seg + g - 1) / g * g);
+    const uint64_t total = n_seg * (uint64_t) seg_;
     void* va = strata::gpu::vmem_reserve((size_t) total);
     if (va == nullptr) {
         err = std::string("ExpertCache: cannot reserve the segmented cache's address range: ") + strata::gpu::last_error();
@@ -199,6 +206,30 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
             return false;
         }
         mapped_segs_ = (int64_t) i + 1;
+    }
+    // whether the runtime gives an unmapped segment's VRAM back, not only keeps it for this process (ROCm 7.1 and
+    // 7.2's HIP kept it until the whole range was freed, 2026-11-02): the last segment unmapped, the device's free
+    // memory read before and after, and mapped again.  Half a segment more free is taken for given back.
+    returns_vram_ = true;
+    size_t before = 0, after = 0, total_b = 0;
+    if (segs_.size() >= 2 && strata::gpu::device_sync() && strata::gpu::mem_info(&before, &total_b)) {
+        const size_t last = segs_.size() - 1;
+        strata::gpu::vmem_unmap(base_ + last * (size_t) seg_, (size_t) seg_size_[last], segs_[last]);
+        segs_[last] = nullptr;
+        mapped_segs_ = (int64_t) last;
+        returns_vram_ = strata::gpu::device_sync() && strata::gpu::mem_info(&after, &total_b) &&
+                        after >= before + (size_t) seg_size_[last] / 2;
+        for (int tries = 0; tries < 50 && segs_[last] == nullptr; ++tries) {
+            segs_[last] = strata::gpu::vmem_map(base_ + last * (size_t) seg_, (size_t) seg_size_[last]);
+            if (segs_[last] == nullptr) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (segs_[last] == nullptr) {
+            err = std::string("ExpertCache: the segmented cache's last segment could not be mapped again: ") +
+                  strata::gpu::last_error();
+            release_segmented();
+            return false;
+        }
+        mapped_segs_ = (int64_t) segs_.size();
     }
     return true;
 }
@@ -233,6 +264,11 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     if (segs_.empty()) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
+        return false;
+    }
+    if (!returns_vram_) {
+        err = "this GPU's runtime keeps the VRAM of an unmapped segment in the process (it does not reach another "
+              "program; ROCm 10.1 gives it back): the expert cache cannot give VRAM back";
         return false;
     }
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes

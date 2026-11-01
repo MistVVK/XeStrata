@@ -664,14 +664,15 @@ For a game, a 3D program or another model beside it, leave more (upstream #493).
 The expert cache is then that much smaller, so answers can be a little slower.
 
 The amount can also change while it runs (upstream #533).
-With `"vram_elastic": true` in the config, the expert cache is held in pieces of 512 MiB (`"vram_segment_mib"` changes it).
+A config with image generation or a GPU encoder holds the expert cache in pieces of 512 MiB (`"vram_segment_mib"` changes it; `--vram-elastic`). Other configs do the same with `"vram_elastic": true`, and `"vram_elastic": false` always keeps one allocation. Held in pieces, the cache read the prompt and wrote the answer as fast on the B70, the RTX 4070 and the RX 9060 XT.
 Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's last pieces back to the GPU until that much is free, and `{"reserve_mib": null}` goes back to the amount the start left.
 A running request finishes first.
 The experts of the pieces given back are computed on the CPU: the same answers, slower.
 `GET /v1/status` shows the current size under `"vram"`.
 A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
 While a request runs or waits, it waits up to 300 s, then answers `409`.
-Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.2.0 does not).
+Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP has it with XeStrata's intel/llvm patch `hip-virtual-mem`).
+At start the engine gives its last piece back and checks that the GPU's free memory grows. A runtime where it does not (ROCm 7.1 and 7.2's HIP keep an unmapped piece's VRAM in the process; ROCm 10.1 gives it back) refuses to free VRAM, and `GET /v1/status`'s `"vram"` and INFO's `vram_elastic` say 0. The server then never picks `shrink` for an image job, and starts a GPU encoder before the model.
 
 ### Leaving RAM for other programs
 
@@ -810,7 +811,7 @@ They need the API key (when one is set), `application/json`, and no foreign brow
 They answer **409** while a request is running or queued and **404** for an unknown model.
 `/api/health` is the same as `/health`; `/v1/status` reports `loaded` and `auto_load`.
 
-### Keeping what the expert cache learned across restarts (opt-in)
+### Keeping what the expert cache learned across restarts
 
 A start fills the GPU's expert cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use (upstream #477).
 `--adapt-mib-per-token N` caps a round's copies at N MiB for each window since the last round (Qwen3.8-Flash-Next: off by default; the other models' engine bounds them at 48 MiB a token).
@@ -822,7 +823,8 @@ The next start begins from it instead of the config's `--expert-profile` when it
 A relative path is in the XeStrata folder; one file per model.
 A profile per project works the same way: point the key at another file.
 The file is a fingerprint of what you used the model for: keep it on your PC.
-Without the key nothing is counted or written.
+Without the key it is saved as `expert-profile-<model name>.bin` (in the engine's working folder) when the config has an `--expert-profile`; `"expert_profile_save": false` counts and writes nothing.
+A model unloaded for an image job comes back from the learned profile too, and the experts it lets go of in RAM before the unload (`ARENA DROP`) are the last ones of this profile.
 A setup run again keeps the key, and `--expert-profile` (a file that still exists) and `--expert-profile-save` added to `"args"` by hand (upstream #775).
 
 An expert the adaptive tier swaps in is used on the GPU from the second window, so no window waits for its copy
@@ -1270,7 +1272,7 @@ curl -X POST "http://127.0.0.1:8095/slots/0?action=restore" -H "Content-Type: ap
   The files hold the conversation's tokens and state and are created with mode 0600. Nothing deletes them.
 - `filename` is a file name inside DIR only: no path, drive, `:`, Windows device name, control character, leading `.`, or trailing `.` or space.
 - Before a save, the disk must have room for the new file plus `--session-min-free-mib` (an engine argument; default 4096, 0 = no check).
-- `--session-save-reclaim` (an engine argument, off by default; upstream 73ed39ae): a save that fails its RAM check first releases host caches that can be rebuilt, then checks again.
+- `--session-save-reclaim` (an engine argument the server adds by default, `"session_save_reclaim": false` in the config leaves it out; upstream 73ed39ae): a save that fails its RAM check first releases host caches that can be rebuilt, then checks again.
   In this order: the retained K/V copies, the oldest unpinned parked conversations, the unpinned checkpoints other than the one written to the file.
   Pinned prefixes and the checkpoint written stay. The server gives the released RAM up to 30 seconds to show in the figures before it tries again.
 - A file is restored only by the same engine version with the same model files and settings (KV precision, context length, MTP, control vector and so on).
@@ -1713,13 +1715,14 @@ That is the same value as the text-only default, but the engine then no longer l
 ([XE.md](XE.md#the-vram-reserve-on-a-small-card)).
 The GPU encoder's own VRAM can leave the expert cache smaller and the text a little slower.
 
-**The encoder only while there are pictures** (opt-in, upstream ca41a6b9): with the config's `"vram_elastic": true`, `"elastic": true` in the `"vision"` section keeps the GPU encoder from starting with the server, so the expert cache keeps all of the VRAM.
+**The encoder only while there are pictures** (upstream ca41a6b9): with the expert cache held in pieces (`vram_elastic`), the GPU encoder does not start with the server by default, so the expert cache keeps all of the VRAM. `"elastic": false` in the `"vision"` section starts it with the model, as before.
 The first picture's request makes the cache keep `"elastic_mib"` (default 2048) free on top of the reserve and starts the encoder there (a few seconds).
 If the cache cannot shrink (the resident low-RAM mode, an engine without `--vram-elastic`, a layer split) the encoder starts anyway and the log says why; on a layer split the server says at start that the encoder's VRAM has to be kept free with `--vram-reserve-mib`.
 An encoder that fails to start (out of VRAM) ends the request with a `503`; the next picture tries again.
 After `"elastic_idle_s"` (default 120) without a picture it stops between requests and the cache takes the VRAM back.
 A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encoder's share; an unload stops the encoder too.
-Without `"vram_elastic"` the server says so and starts the encoder with the model, as before.
+With `"vram_elastic": false` the server says so and starts the encoder with the model, as before.
+When the engine says it cannot give pieces back (`vram_elastic` 0, above), the first picture starts the encoder first and loads the model again, and from then on the encoder starts with the model.
 
 The GPU encoder's build (Vulkan), its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
@@ -1837,6 +1840,7 @@ Each side is 256 to 2048 pixels. A size whose sides are not multiples of 16 (192
 The image engine starts with the first image and stays; it is a process apart from the server, stays when the text model is changed, and ends 30 minutes (the config's `daemon_idle_s`) after the last server leaves: its kernels are prepared once, and the same prompt's text states and the layers it holds in VRAM are kept for the next image.
 When the `"images"` section's `"gpu_pci"` (setup's `--image-gpu`) names a GPU that none of the server's text engines takes (the server's GPU, a layer split's, the replicas' and a split serve's cards), the images are made on it. Its jobs take that GPU's turn alone and not the service's queue, so the chat is answered meanwhile and nothing is done to the text model (the policy `separate`); only while MOSS-Image's text encoder runs on the chat's engine does a job take the queue. With a helper GPU (`--expert-cache-device1..3` names it by its device number) or an environment variable that narrows the GPUs (`ONEAPI_DEVICE_SELECTOR`, `ZE_AFFINITY_MASK`, `HIP_VISIBLE_DEVICES`), the text model's GPU is used.
 Image jobs run one at a time on the GPU. Before a job the engine says what the image needs in VRAM (the least, and the DiT whole with the VAE in one piece), and what the text model does meanwhile is `--image-gpu-policy`: `keep` (stays as it is), `shrink` (gives VRAM back through `--vram-elastic`), `unload` (its conversation saved, unloaded, restored at the next start), or `auto` (the default: `keep` when everything fits, else `shrink` when the engine can, else `keep` with the layers streamed when the least fits, else `unload`).
+Under `unload`, a single engine whose images run on its own GPU gets a shared arena from the server when there is an image model (`--shared-expert-arena`; on Linux a memfd, on Windows a page-file-backed `section:<name>`), and its experts stay there while it is off. When the RAM the image needs (`host_mib`, the image model's files, 2 GiB, `--ram-reserve-mib`) is short even with what the unload frees, the server sends the engine `ARENA DROP <MiB> <file>`, and the engine marks that much of its experts dropped in the arena's header, from the end of the `--expert-profile` ranking. Once the engine has ended the server gives their pages back (a punched hole on Linux, `MEM_RESET` on Windows), and the next start reads those alone. Any other unload gives the whole arena back. It is not given with `--mmap-experts`, the RAM tier or `"keep_arena": false`.
 After a job the image engine keeps its layers only under `keep` or `separate` with VRAM to spare; otherwise it lets go of what it holds (idle, the process alone, about 200 MiB).
 `tools/image/install.py --config <config>` adds it to an existing install.
 

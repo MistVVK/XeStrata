@@ -430,7 +430,10 @@ public:
     /// free, or grows it back towards its full size when more is free (reserve_mib < 0: the reserve it started with).
     /// `answer` gets the protocol line (VRAM reserve_mib=... expert_slots=...); false with `err` when not elastic.
     bool vram(int64_t reserve_mib, std::string& answer, std::string& err);
-    bool vram_elastic() const { return cache_.segmented(); }
+    bool vram_elastic() const { return cache_.elastic(); }   // segmented, and its VRAM goes back when unmapped
+    /// `ARENA DROP <mib> <file>` (arena_drop_command): the coldest experts of a shared arena, by the profile the tier
+    /// was filled from, marked dropped before the server unloads the engine.  False with `err` without an arena.
+    bool arena_drop(const std::string& line, std::string& answer, std::string& err);
     /// --kv-grow: the K/V holds at least `cells` cells (whole steps), the tier giving VRAM up for them; and, when it
     /// holds far more than `cells`, it gives the rest back to the tier.  Between requests; true without --kv-grow.
     bool kv_grow_to(int64_t cells, std::string& err);

@@ -24,7 +24,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 - **Text and images on one GPU:** the text model and the image model take turns on the same GPU and share its VRAM.
   Before an image, the VRAM it needs is weighed against what is free: when both fit, the text model stays as it is; when they do not, the text model gives up VRAM for the while, or the image's layers are streamed from RAM.
-  Only when even that does not fit is the conversation saved and the text model unloaded, to come back with the next request ([Sharing the GPU's memory](docs/IMAGE.md#sharing-the-gpus-memory)).
+  Only when even that does not fit is the conversation saved and the text model unloaded, to come back with the next request ([Sharing the GPU's memory](docs/IMAGE.md#sharing-the-gpus-memory)). Its experts stay in RAM meanwhile, so it comes back without reading the model files again.
   A chat request that comes while several images are being made is answered after the current image, and the rest are made after it.
 - **A free GPU makes the images:** when a GPU is there that the text model does not take, setup gives it to the images, and the chat goes on answering while an image is made; the text model neither gives up VRAM nor is unloaded.
 - **Everything in one install:** `xestrata --setup` (on Windows, `xestrata.exe`'s install screen) asks for the text model, whether it should read pictures and which models should make images, and downloads them together.

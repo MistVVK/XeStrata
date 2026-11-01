@@ -352,10 +352,14 @@ On the text model's GPU, before a job the engine says the VRAM the image needs (
 | `--image-gpu-policy` | The text model |
 | --- | --- |
 | `keep` | Stays. The image engine loads the layers the free VRAM holds and streams the rest |
-| `shrink` | The text engine frees VRAM (`--vram-elastic`) and takes it back after the image |
+| `shrink` | The text engine frees VRAM (`--vram-elastic`, on by default with an image model; not where the GPU's runtime cannot give it back, ROCm 7.x) and takes it back after the image |
 | `unload` | The conversation is saved and the text engine taken off; the next start brings the conversation back |
 | `auto` (default) | `keep` when everything fits; else `shrink` when VRAM can be freed; `keep` with the layers streamed when the least fits; `unload` otherwise. `keep` on the processor's own graphics |
 
+- While `unload` has taken the text model off, the server keeps its experts in RAM (on Linux in a memfd, on Windows in a page-file section), and the next start uses them without reading the model files.
+  When the image needs more RAM than is left (the image model's files, the reference images' K and V cache, 2 GiB to spare, `--ram-reserve-gib`), the experts used least are let go, as many as are short, and the next start reads those alone again.
+  An unload for any other reason (unused for a while, the web page's Unload) lets go of all of them.
+  With `--mmap-experts`, `--low-ram`, the RAM tier (`--resident-budget-gib`), a layer split or replicas, the model is read again at each unload as before. `"keep_arena": false` in the config's `"images"` always reads it again.
 - After a job the image engine keeps its layers only with `keep` or on a GPU of its own, and VRAM to spare; otherwise it lets go of what it holds (waiting, the process alone, about 200 MiB).
 - The image engine starts at the first image and stays. Its kernels are prepared once, and the text state of the same prompt and the layers in VRAM stay for the next image.
 - The image engine is a process apart from the server, and stays when the text model is changed. It ends 30 minutes after the last server leaves (`daemon_idle_s`).

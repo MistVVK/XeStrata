@@ -1030,6 +1030,15 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (line.empty()) continue;
         stop_req.store(false);   // a STOP between requests ends nothing
+        // ARENA DROP <mib> <file>: the shared arena's coldest experts marked dropped before an unload (server.py)
+        if (line.rfind("ARENA DROP ", 0) == 0) {
+            std::string answer;
+            if (!model.arena_drop(line, answer, err)) std::printf("ERR %s\n", err.c_str());
+            else std::printf("%s\n", answer.c_str());
+            err.clear();
+            std::fflush(stdout);
+            continue;
+        }
         // VRAM [reserve_mib] (#533, --vram-elastic): the tier shrinks or grows between requests (server.py's vram)
         if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
             char* end = nullptr;

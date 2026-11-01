@@ -163,6 +163,8 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Seventeenth, since v7.2.0 SYCL's sub-group shuffles (Shuffle, ShuffleXor, ShuffleUp and ShuffleDown in `sycl/detail/spirv.hpp`) call the SPIR-V GroupNonUniform forms on every target but NVIDIA's, and AMD's libspirv has only the SubgroupShuffle*INTEL ones.
   Every AMD program with a shuffle stopped at its link ("undefined symbol: __spirv_GroupNonUniformShuffleXor(int, float, unsigned int)").
   Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with SubgroupShuffle*INTEL (`hip-group-shuffle`).
+  Eighteenth, the HIP adapter answered every virtual memory call (`urVirtualMem*`, `urPhysicalMem*`) with UNSUPPORTED and reported no support, so SYCL's `ext_oneapi_virtual_mem` was not there on AMD GPUs, and `--vram-elastic` and `--kv-grow` fell back to one allocation.
+  Fixed, the calls are implemented with HIP's virtual memory (`hipMemAddressReserve`, `hipMemCreate`, `hipMemMap` and the others) as the CUDA adapter implements them with CUDA's, and the support is reported as HIP's `hipDeviceAttributeVirtualMemoryManagementSupported` says (`hip-virtual-mem`).
   The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).

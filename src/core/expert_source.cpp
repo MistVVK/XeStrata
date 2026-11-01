@@ -3754,6 +3754,91 @@ LoadStats load_experts_gguf(const std::string& gguf, const std::vector<uint8_t*>
     return st;
 }
 
+namespace {
+// A shared arena an earlier engine left with units dropped (PinnedArena::mark_shared_dropped): only the experts whose
+// bit is set in `missing` (layer * n_expert + expert) read again, from experts.bin (`path`, in the arena's layout) or
+// from the GGUF's gate, up and down tensors (`gguf`), a run of adjacent experts at a time.  st.bytes: what was read.
+LoadStats load_expert_units(const std::string& path, const std::string& gguf, bool from_gguf,
+                            const std::vector<uint8_t*>& layer_dst, const strata::kernels::cpu::ExpertLayout& lay,
+                            const std::vector<uint8_t>& missing, int threads) {
+    LoadStats st;
+    st.layers = (uint64_t) lay.n_layers;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto dropped = [&](int64_t l, int64_t e) {
+        const uint64_t u = (uint64_t) (l * lay.n_expert + e);
+        return u / 8 < missing.size() && (missing[u / 8] >> (u % 8) & 1) != 0;
+    };
+    const size_t cut = gguf.find_last_of("/\\");
+    const std::string dir = cut == std::string::npos ? std::string() : gguf.substr(0, cut + 1);
+    auto file_of = [&](int64_t l, int r) -> std::string {
+        if (!from_gguf) return path;
+        if (lay.gguf_file.empty() || lay.gguf_file[(size_t) (3 * l + r)].empty()) return gguf;
+        return dir + lay.gguf_file[(size_t) (3 * l + r)];
+    };
+    std::atomic<int64_t> next{0};
+    std::atomic<bool> bad{false};
+    std::atomic<uint64_t> bytes{0};
+    auto worker = [&]() {
+        std::ifstream f;
+        std::string open_name;
+        std::vector<uint8_t> buf;
+        auto read_at = [&](const std::string& name, uint64_t off, uint64_t n) {
+            if (name != open_name) {
+                f.close();
+                f.clear();
+                f.open(name, std::ios::binary);
+                open_name = f ? name : std::string();
+            }
+            buf.resize((size_t) n);
+            f.seekg((std::streamoff) off);
+            f.read((char*) buf.data(), (std::streamsize) n);
+            return (bool) f && (uint64_t) f.gcount() == n;
+        };
+        for (;;) {
+            const int64_t l = next.fetch_add(1);
+            if (l >= lay.n_layers || bad) break;
+            const uint64_t blob = lay.blob_bytes(l);
+            uint8_t* dst = layer_dst[(size_t) l];
+            for (int64_t e0 = 0; e0 < lay.n_expert;) {
+                if (!dropped(l, e0)) { ++e0; continue; }
+                int64_t e1 = e0 + 1;
+                while (e1 < lay.n_expert && dropped(l, e1)) ++e1;
+                const uint64_t n = (uint64_t) (e1 - e0);
+                if (!from_gguf) {
+                    if (!read_at(path, lay.blob_offset(l, e0), n * blob)) { bad = true; return; }
+                    std::memcpy(dst + (lay.blob_offset(l, e0) - lay.layer_offset(l)), buf.data(), (size_t) (n * blob));
+                } else {
+                    const auto& fm = lay.fmt[(size_t) l];
+                    const uint64_t per[3] = {fm.up_off, fm.down_off - fm.up_off, blob - fm.down_off};
+                    const uint64_t at[3] = {0, fm.up_off, fm.down_off};
+                    for (int r = 0; r < 3; ++r) {
+                        if (!read_at(file_of(l, r), lay.gguf_off[(size_t) (3 * l + r)] + (uint64_t) e0 * per[r],
+                                     n * per[r])) { bad = true; return; }
+                        for (uint64_t k = 0; k < n; ++k)
+                            std::memcpy(dst + (lay.blob_offset(l, e0 + (int64_t) k) - lay.layer_offset(l)) + at[r],
+                                        buf.data() + k * per[r], (size_t) per[r]);
+                    }
+                }
+                bytes += n * blob;
+                e0 = e1;
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    if (bad) {
+        st.ok = false;
+        st.error = "short read or unreadable file while reading the dropped experts again";
+        return st;
+    }
+    st.bytes = bytes.load();
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return st;
+}
+}  // namespace
+
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                             const strata::kernels::cpu::ExpertLayout& lay, int threads) {
     std::vector<uint8_t*> layers;
@@ -3969,8 +4054,15 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     ldst.reserve((size_t) n_layers);
     for (int64_t l = 0; l < n_layers; ++l) ldst.push_back(a->at(lay.layer_offset(l)));
     LoadStats st;
+    uint64_t reloaded = 0;
     try {
-        if (a->begin_shared_population()) {
+        const bool fill = a->begin_shared_population();
+        if (fill && !a->shared_missing().empty()) {
+            // an engine before this one dropped its coldest experts from the shared arena (drop_cold): those alone
+            st = load_expert_units(path, gguf_, from_gguf, ldst, lay, a->shared_missing(), threads);
+            reloaded = st.bytes;
+            if (st.ok) { st.bytes = want; a->publish_shared(); }
+        } else if (fill) {
             st = from_gguf ? load_experts_gguf(gguf_, ldst, lay, threads)
                            : load_experts_ranges(path, ldst, loff, lbytes, threads, /*chunk=*/8u << 20);
             if (st.ok && st.bytes == want) a->publish_shared();
@@ -4040,11 +4132,80 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     n_expert_ = n_expert;
     reads_ = 0;
     note_ = a->note;
+    if (reloaded > 0) {
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "; the rest was in the shared arena: %.2f GiB of experts an engine before this one "
+                                       "dropped read again in %.1f s", (double) reloaded / 1073741824.0, st.seconds);
+        note_ += buf;
+    }
     gib_per_s_ = st.gib_per_second();
     load_seconds_ = st.seconds;
     load_read_s_ = st.read_seconds;
     load_copy_s_ = st.copy_seconds;
     record_inputs(path, gguf_, lay, from_gguf);
+    return true;
+}
+
+bool ArenaExpertSource::drop_cold(uint64_t want_bytes, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                                  std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t& dropped,
+                                  std::string& err) {
+    ranges.clear();
+    dropped = 0;
+    if (arena_ == nullptr) { err = "the experts are not in an arena"; return false; }
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const int64_t units = lay.n_layers * lay.n_expert;
+    // the coldest first: the pairs the profile does not rank (the last layer first), then the ranked ones from the end
+    std::vector<uint8_t> seen((size_t) units, 0);
+    for (const auto& [l, e] : ranked)
+        if (l >= 0 && l < lay.n_layers && e >= 0 && e < lay.n_expert) seen[(size_t) (l * lay.n_expert + e)] = 1;
+    std::vector<int64_t> order;
+    order.reserve((size_t) units);
+    for (int64_t u = units - 1; u >= 0; --u)
+        if (!seen[(size_t) u]) order.push_back(u);
+    for (auto it = ranked.rbegin(); it != ranked.rend(); ++it)
+        if (it->first >= 0 && it->first < lay.n_layers && it->second >= 0 && it->second < lay.n_expert) {
+            const int64_t u = (int64_t) it->first * lay.n_expert + it->second;
+            if (seen[(size_t) u] == 1) { seen[(size_t) u] = 2; order.push_back(u); }
+        }
+    std::vector<uint8_t> bits((size_t) ((units + 7) / 8), 0);
+    for (int64_t u : order) {
+        if (dropped >= want_bytes) break;
+        bits[(size_t) (u / 8)] |= (uint8_t) (1u << (u % 8));
+        dropped += lay.blob_bytes(u / lay.n_expert);
+    }
+    if (dropped == 0) return true;
+    auto* a = (PinnedArena*) arena_;
+    if (!a->mark_shared_dropped(bits, err)) { dropped = 0; return false; }
+    // the file's ranges, adjacent experts as one (the server punches them out of the file once this engine ended)
+    const uint64_t head = PinnedArena::shared_header_bytes();
+    for (int64_t u = 0; u < units; ++u) {
+        if (!(bits[(size_t) (u / 8)] >> (u % 8) & 1)) continue;
+        const int64_t l = u / lay.n_expert, e = u % lay.n_expert;
+        const uint64_t off = head + lay.blob_offset(l, e), n = lay.blob_bytes(l);
+        if (!ranges.empty() && ranges.back().first + ranges.back().second == off) ranges.back().second += n;
+        else ranges.emplace_back(off, n);
+    }
+    return true;
+}
+
+bool arena_drop_command(ArenaExpertSource& arena, const std::string& line,
+                        const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& answer, std::string& err) {
+    const std::string head = "ARENA DROP ";
+    char* end = nullptr;
+    const long long mib = line.rfind(head, 0) == 0 ? std::strtoll(line.c_str() + head.size(), &end, 10) : -1;
+    if (mib < 0 || end == nullptr || *end != ' ' || end[1] == '\0') {
+        err = "expected: ARENA DROP <mib> <file>";
+        return false;
+    }
+    const std::string file = end + 1;
+    std::vector<std::pair<uint64_t, uint64_t>> ranges;
+    uint64_t dropped = 0;
+    if (!arena.drop_cold((uint64_t) mib << 20, ranked, ranges, dropped, err)) return false;
+    std::ofstream out(file, std::ios::trunc);
+    for (const auto& [off, n] : ranges) out << off << ' ' << n << '\n';
+    out.close();
+    if (!out) { err = "ARENA DROP: cannot write " + file; return false; }
+    answer = "ARENA dropped_mib=" + std::to_string(dropped >> 20) + " ranges=" + std::to_string(ranges.size());
     return true;
 }
 

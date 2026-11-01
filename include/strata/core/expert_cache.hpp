@@ -134,6 +134,10 @@ public:
     /// `slots()` after a shrink must hold no resident expert and no loan: the CALLER evicts them first.
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     bool segmented() const { return !segs_.empty(); }
+    /// Segmented, and the runtime gives an unmapped segment's VRAM back to the device, as `open` saw it with its last
+    /// segment: some keep it in the process until the whole range goes (ROCm 7.1 and 7.2's HIP did; 10.1's gives it
+    /// back), and then `shrink` refuses - nothing it unmaps would reach another program.
+    bool elastic() const { return segmented() && returns_vram_; }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -242,6 +246,7 @@ private:
     std::vector<strata::gpu::VmemSegment*> segs_;   ///< #533: each segment's memory (null: unmapped)
     std::vector<int64_t> seg_size_;       ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;             ///< #533: segments [0, mapped_segs_) are backed
+    bool returns_vram_ = true;            ///< #533: an unmapped segment's VRAM went back to the device (open's check)
     std::unique_ptr<VmmRange> vmm_;       ///< the arena's range when it is in virtual memory (set_vmm, --kv-grow)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;

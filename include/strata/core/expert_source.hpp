@@ -1036,6 +1036,13 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's shard 1.
     void set_gguf(const std::string& shard1) { gguf_ = shard1; }
     void close();
+    /// Before an unload that must leave RAM free (the server's ARENA DROP): marks the coldest experts of a shared
+    /// arena dropped, at least `want_bytes` of them - those `ranked` (a profile, hottest first) does not hold, then
+    /// its last ones - so the next engine on it reads only those again.  `ranges`: their (offset, bytes) in the
+    /// shared file, adjacent ones joined, which the server punches out once this engine has ended; `dropped`: their
+    /// bytes.  False (and `err`) without a shared arena.
+    bool drop_cold(uint64_t want_bytes, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                   std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t& dropped, std::string& err);
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
@@ -1082,6 +1089,13 @@ private:
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
 };
+
+/// The engines' `ARENA DROP <mib> <file>` (server.py's arena_drop, before it unloads the engine to make room in RAM):
+/// `arena`'s coldest experts (by `ranked`, hottest first) of at least <mib> marked dropped (drop_cold), their ranges in
+/// the shared file written to <file> as "offset bytes" lines -> `answer`, "ARENA dropped_mib=N ranges=N".  False (and
+/// `err`) for a malformed line or an arena that cannot.
+bool arena_drop_command(ArenaExpertSource& arena, const std::string& line,
+                        const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& answer, std::string& err);
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err);
 /// The routed experts of a GGUF model read in place (no pack, no experts.bin) as the process-wide expert layout: per

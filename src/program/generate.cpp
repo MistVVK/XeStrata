@@ -5091,8 +5091,12 @@ int main(int argc, char** argv) {
     // 33 GiB of IQ2_XS in 28 GiB free).  Such a start runs as --resident-experts would: the experts the GPU's cache
     // does not hold are copied into RAM as far as it has room, the rest read from the model files.  #11: the arena is
     // page-locked as well, so it also needs the resident copy's headroom beside it (resident_pin_fits).
-    // STRATA_ARENA_LOW_RAM=keep: the whole arena anyway (the warning below only).
-    if (!o.mmap_experts && o.shared_expert_arena.empty() &&
+    // STRATA_ARENA_LOW_RAM=keep: the whole arena anyway (the warning below only).  A shared arena another engine has
+    // filled is in RAM already, so its RAM is not asked for again; an empty one (its file 0 bytes: the server's memfd
+    // before the first start) is, and a start without the room does not share it.
+    const bool shared_empty = !o.shared_expert_arena.empty() &&
+                              !strata::core::PinnedArena::shared_filled(o.shared_expert_arena);
+    if (!o.mmap_experts && (o.shared_expert_arena.empty() || shared_empty) &&
         !(native_pack && !std::ifstream(o.pack + "/experts.bin", std::ios::binary) && o.native_preset.empty())) {
         const char* keep = std::getenv("STRATA_ARENA_LOW_RAM");
         strata::core::detail::HostMemory hm;
@@ -5112,6 +5116,9 @@ int main(int argc, char** argv) {
                          (double) hm.available / 1073741824.0);
             o.mmap_experts = o.resident_pin = true;
             o.resident_gib = -1;
+            if (!o.shared_expert_arena.empty())
+                std::fprintf(stderr, "strata generate: the shared expert arena is not used (it needs the room)\n");
+            o.shared_expert_arena.clear();
         }
     }
     if (o.mmap_experts) {
@@ -8986,7 +8993,7 @@ int main(int argc, char** argv) {
                         (long long) (ram_experts >> 20), pool.workers(), o.pcie_frac,
                         o.spec_min_p, o.spec_window.c_str(), (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                        (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
+                        (long long) o.tail_role_token, xcache.elastic() ? 1 : 0, o.batch,
                         o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
                         igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0);
         }
@@ -10116,6 +10123,17 @@ int main(int argc, char** argv) {
                 disk_expired_at = Clock::now();
             }
             if (line == "QUIT") break;
+            // before the server unloads the engine for an image job that needs the RAM: the coldest experts of the
+            // shared arena marked dropped, so the next start reads only those again
+            if (line.rfind("ARENA DROP ", 0) == 0) {
+                std::string answer, aerr;
+                if (srcp != &arena_src) std::printf("ERR the experts are not in an arena\n");
+                else if (!strata::core::arena_drop_command(arena_src, line, profile, answer, aerr))
+                    std::printf("ERR %s\n", aerr.c_str());
+                else std::printf("%s\n", answer.c_str());
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("VRAM", 0) == 0) {   // #533 (above): between requests, not a request
                 std::string verr;
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";

@@ -2564,15 +2564,16 @@ class VisionSection(unittest.TestCase):
 
     def test_a_vision_section_starts_the_engine_with_images_1322(self):
         args = ["--native", "x"]
-        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}})
+        off = {"vram_elastic": False, "session_save_reclaim": False}            # this test's arguments alone
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": True}, **off})
         self.assertEqual(got, args + ["--vision", "--vram-reserve-mib", "700"])
-        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}})
+        got = engine_args({"args": list(args), "vision": {"exe": "v", "gpu": False}, **off})
         self.assertEqual(got, args + ["--vision"])
         mine = args + ["--vram-reserve-mib", "1500"]
-        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}}), mine + ["--vision"])
+        self.assertEqual(engine_args({"args": list(mine), "vision": {"gpu": True}, **off}), mine + ["--vision"])
         done = args + ["--vision", "--vram-reserve-mib", "700"]                  # setup wrote it: unchanged
-        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}}), done)
-        self.assertEqual(engine_args({"args": list(args)}), args)                # no section: no images
+        self.assertEqual(engine_args({"args": list(done), "vision": {"gpu": True}, **off}), done)
+        self.assertEqual(engine_args({"args": list(args), **off}), args)        # no section: no images
 
 
 class LayerSplit(unittest.TestCase):
@@ -2580,7 +2581,7 @@ class LayerSplit(unittest.TestCase):
     not."""
 
     def cfg(self, split, gpus=(2, 0, 1, 3)):
-        c = {"args": ["--native", "x"], "gpu": list(gpus)}
+        c = {"args": ["--native", "x"], "gpu": list(gpus), "session_save_reclaim": False}
         if split is not ...:
             c["layer_split"] = split
         return c
@@ -2604,8 +2605,8 @@ class LayerSplit(unittest.TestCase):
             self.assertIn('"12,24,36"', str(e.exception))   # the example for 4 GPUs
 
     def test_one_gpu_ignores_it(self):
-        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16"}),
-                         ["--native", "x"])
+        self.assertEqual(engine_args({"args": ["--native", "x"], "gpu": [0], "layer_split": "24,16",
+                                      "session_save_reclaim": False}), ["--native", "x"])
 
 
 class DesktopVramNote(unittest.TestCase):
@@ -2636,7 +2637,8 @@ class DesktopVramNote(unittest.TestCase):
 
 class LearnedProfile(unittest.TestCase):
     """#477: "expert_profile_save" in the config: the engine saves its learned profile there, and the next start
-    begins from it when it is a profile of the same model; without the key the arguments are unchanged."""
+    begins from it when it is a profile of the same model; without the key expert-profile-<model>.bin, and false
+    leaves the arguments unchanged."""
 
     def write(self, path, nl=48, ne=512, n=4):
         sys.path.insert(0, str(ROOT / "tools"))
@@ -2648,16 +2650,19 @@ class LearnedProfile(unittest.TestCase):
         finally:
             make_profile.N_LAYER = old
 
-    def test_without_the_key_nothing_changes(self):
+    def test_without_the_key_the_model_s_file_and_false_nothing(self):
         args = ["--native", "x", "--expert-profile", "data/expert-profile.bin", "--adapt-every", "4"]
-        self.assertEqual(engine_args({"args": list(args)}), args)
-        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": ""}), args)
+        base = {"session_save_reclaim": False}
+        self.assertEqual(engine_args({"args": list(args), "model_name": "qwen3.8/iq3", **base}),
+                         args + ["--expert-profile-save", "expert-profile-qwen3.8_iq3.bin"])
+        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": False, **base}), args)
+        self.assertEqual(engine_args({"args": list(args), "expert_profile_save": "", **base}), args)
 
     def test_save_and_start_from_it(self):
         d = Path(tempfile.mkdtemp())
         self.write(d / "base.bin")
         cfg = {"args": ["--expert-profile", "base.bin"], "cwd": str(d), "expert_profile_save": "learned.bin",
-               "expert_profile_save_every": 5}
+               "expert_profile_save_every": 5, "session_save_reclaim": False}
         # nothing saved yet: the config's profile, and the engine is told where to save
         self.assertEqual(engine_args(cfg), ["--expert-profile", "base.bin", "--expert-profile-save", "learned.bin",
                                             "--expert-profile-save-every", "5"])
@@ -2672,7 +2677,7 @@ class LearnedProfile(unittest.TestCase):
         self.assertEqual(engine_args(cfg)[:2], ["--expert-profile", "base.bin"])
 
     def test_no_profile_in_the_args(self):
-        cfg = {"args": ["--native", "x"], "expert_profile_save": "learned.bin"}
+        cfg = {"args": ["--native", "x"], "expert_profile_save": "learned.bin", "session_save_reclaim": False}
         self.assertEqual(engine_args(cfg), ["--native", "x", "--expert-profile-save", "learned.bin"])
 
 

@@ -209,6 +209,7 @@ MOSS_CANVASES = ("single", "multi_panel", "collage")
 REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
 REF_MAX_BYTES = 32 << 20
 MAX_REFS = 10                      # Qwen-Image-2.1's own limit (its model card)
+GROW_WAIT_S = 10.0                 # the expert cache's growing back after a shrink, tried again for this long
 RAM_SPARE_MIB = 2048               # RAM an image job leaves free beside its prefix cache (the OS, the server)
 START_TIMEOUT_S = 600              # the engine's start: the parts opened and a small image made (kernels built)
 
@@ -2294,8 +2295,9 @@ def engine_elastic(eng) -> bool:
     """An engine that resizes its expert cache on request (--vram-elastic, #533)."""
     if not hasattr(eng, "vram"):
         return False
-    if (getattr(eng, "info", None) or {}).get("vram_elastic"):
-        return True
+    info = getattr(eng, "info", None) or {}
+    if "vram_elastic" in info:   # the engine's own word: a runtime that keeps an unmapped segment's VRAM says 0
+        return bool(info["vram_elastic"])
     spawn = getattr(eng, "spawn", None)
     args = spawn[1] if isinstance(spawn, (list, tuple)) and len(spawn) > 1 else []
     return "--vram-elastic" in (args or [])
@@ -2663,11 +2665,79 @@ def _make_room(svc, gen: ImageGen, policy: str, need: dict):
                 gen._say(f"image job: the conversation could not be saved ({e}); unloading the model")
                 with contextlib.suppress(OSError):
                     os.unlink(path)
-        eng.unload()
+        kept = getattr(eng, "kept_arena", None)
+        if kept is not None:
+            kept = _drop_for(eng, gen, need, kept)
+        if kept is not None:
+            eng.unload(keep_arena=True)
+        else:
+            eng.unload()
         if svc.vision is not None and hasattr(svc.vision, "unload"):
             svc.vision.unload()
         return saved or "unloaded"
     return None
+
+
+def model_mib(gen: ImageGen) -> int:
+    """The image model's files (its DiT, a folder of them for MOSS-Image, its VAE, text encoder and vision encoder) in
+    MiB: what its job reads, from the page cache or a copy in RAM."""
+    total = 0
+    for k in ("diffusion_model", "vae", "llm", "vision", "edit_model"):
+        p = Path(gen.cfg[k]) if isinstance(gen.cfg.get(k), str) else None
+        if p is None or not p.exists():
+            continue
+        total += sum(f.stat().st_size for f in p.rglob("*") if f.is_file()) if p.is_dir() else p.stat().st_size
+    return total >> 20
+
+
+def engine_anon_mib(eng) -> int:
+    """The text engine's own RAM, what its unload gives back and the shared arena is not in (Linux's RssAnon, Windows'
+    private bytes), 0 unknown."""
+    pid = getattr(getattr(eng, "proc", None), "pid", None)
+    if os.name == "nt":
+        try:
+            import psutil
+            return int(getattr(psutil.Process(pid).memory_info(), "private")) >> 20   # Windows' field
+        except (ImportError, OSError, ValueError, TypeError, AttributeError):
+            return 0
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) >> 10
+    except (OSError, ValueError, TypeError):
+        pass
+    return 0
+
+
+def _drop_for(eng, gen: ImageGen, need: dict, kept):
+    """Before an image job's unload that keeps the text engine's experts in RAM (server.py's KeptArena): the RAM the
+    job wants - its prefix cache, its model's files, RAM_SPARE_MIB and the RAM reserve the user asked for - against
+    what is available once the engine's own RAM is back; what is short, the engine marks dropped from its coldest
+    experts (arena_drop), punched out after it ends.  -> `kept`, or None when the whole arena is to go (the engine
+    could not, or the RAM is not known)."""
+    avail = ram_available_mib()
+    if avail is None:
+        gen._say("image job: the free RAM is not known; the expert arena goes with the model")
+        return None
+    reserve = int(str(gen.engine.env.get("STRATA_RAM_RESERVE_MIB") or "0") or 0)
+    want = int(need.get("host_mib") or 0) + model_mib(gen) + RAM_SPARE_MIB + reserve
+    short = want - avail - engine_anon_mib(eng)
+    if short <= 0:
+        gen._say(f"image job: the experts stay in RAM ({want} MiB wanted, enough is free)")
+        return kept
+    path = str(gen.dir / f"arena-drop-{secrets.token_hex(6)}.txt")
+    try:
+        r = eng.arena_drop(short, path)
+    except Exception as e:                           # noqa: BLE001 - the unload gives the whole arena back
+        gen._say(f"image job: the engine could not drop experts from its arena ({e}); the whole arena goes")
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        return None
+    kept.pending = path
+    gen._say(f"image job: {r.get('dropped_mib')} MiB of the coldest experts leave the RAM for the image "
+             f"({short} MiB short); the rest stay")
+    return kept
 
 
 def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
@@ -2683,10 +2753,22 @@ def _give_back(svc, gen: ImageGen, policy: str, restore) -> None:
         gen.release(True)
     eng = svc.engine
     if restore == "shrunk":
-        try:
-            eng.vram(svc.vram_reserve)               # the reserve asked for last (None: the start's)
-        except Exception as e:                       # noqa: BLE001
-            gen._say(f"image job: the expert cache did not grow back ({e}); POST /v1/vram can retry")
+        # the reserve asked for last (None: the start's).  The image engine's VRAM reaches the device a moment after
+        # it lets go (ROCm 10.1's HIP refused the first segments mapped again at once, 2026-11-02): tried again for
+        # GROW_WAIT_S while the cache is short of its full size
+        end, why = time.monotonic() + GROW_WAIT_S, ""
+        while True:
+            try:
+                out = eng.vram(svc.vram_reserve)
+                why = "" if out.get("expert_slots", 0) >= out.get("expert_slots_full", 0) else \
+                    f"{out.get('expert_slots')} of {out.get('expert_slots_full')} slots"
+            except Exception as e:                   # noqa: BLE001
+                why = str(e)
+            if not why or time.monotonic() >= end:
+                break
+            time.sleep(0.25)
+        if why:
+            gen._say(f"image job: the expert cache did not grow back ({why}); POST /v1/vram can retry")
     elif policy == "unload" and restore:
         if restore != "unloaded":
             svc.restore_after_load = restore         # Service.ensure_loaded restores it after the next start
