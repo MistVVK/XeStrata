@@ -539,6 +539,7 @@ type MainWindow() as this =
                 0
         let budget = TextBox(PlaceholderText = "setup's choice for this RAM", MinWidth = 260.0)
         let budgetField = field "GiB of the experts kept in RAM (the rest read from the SSD)" budget
+        let ramReserve = TextBox(PlaceholderText = "(none) GiB of RAM to leave free for other programs", MinWidth = 260.0)
         let parallelBox = TextBox(PlaceholderText = "1: one request at a time", MinWidth = 260.0)
         let replicas = TextBox(PlaceholderText = "1", MinWidth = 260.0)
         let source, sourceValue =
@@ -622,6 +623,7 @@ type MainWindow() as this =
                         Result.Ok(match lowRamValue () with "auto" -> [] | v -> [ "--low-ram"; v ])
                         Result.Ok(if f.Kv then [] else match plainKvValue f with "fp16" -> [] | k -> [ "--kv"; k ])
                         (if m.Budget then optionOf "--resident-budget-gib" budget (isNumber 1.0 1e6) "a number of GiB" else Result.Ok [])
+                        optionOf "--ram-reserve-gib" ramReserve (isNumber 0.0 1e6) "a number of GiB, 0 or more"
                         optionOf "--parallel" parallelBox (isInt 1) "a number of requests, 1 or more"
                         optionOf "--replicas" replicas (isInt 1) "a number of engines, 1 or more"
                         Result.Ok(match sourceValue () with "" -> [] | v -> [ "--source"; v ])
@@ -655,6 +657,7 @@ type MainWindow() as this =
                         plainKvField
                         field "Low-RAM mode: the experts read from the model files instead of all copied into RAM" lowRam
                         budgetField
+                        field "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and the image models' sizes are chosen with that much less; slower when the experts are then read from the SSD)" ramReserve
                         field "Requests decoded together (each takes VRAM from the expert cache)" parallelBox
                         field "With a layer split: independent engines, each on an equal group of the GPUs" replicas
                         field "Where the model files come from" source

@@ -97,6 +97,16 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
 /// from the files through the page cache); `why` gets the numbers either way, for the log.
 bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why);
 
+/// The RAM the user asked XeStrata to leave free for other programs (setup's --ram-reserve-gib): the engine's
+/// --ram-reserve-mib (set_ram_reserve_bytes), else STRATA_RAM_RESERVE_MIB, which the server gives the image engine;
+/// 0 when none was asked.
+uint64_t ram_reserve_bytes();
+void set_ram_reserve_bytes(uint64_t bytes);
+
+/// A headroom kept free beside a RAM copy or cache, raised to the RAM reserve: the copy (an engine's experts, the
+/// image engine's streamed layers) takes less, so the reserve stays free.
+inline uint64_t ram_headroom(uint64_t headroom) { return std::max(headroom, ram_reserve_bytes()); }
+
 /// #4051 (upstream 07d5ecfac): wait for the RAM an arena needs to come back.  An engine that was still exiting (or a
 /// program that was ending) holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB
 /// host into reclaim for good.  Calls `sample(available)` (false: the RAM cannot be read; the wait ends) every `step_s`

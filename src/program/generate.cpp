@@ -493,6 +493,8 @@ struct Options {
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
+    /// --ram-reserve-mib N: RAM left free for other programs (setup's --ram-reserve-gib; core::detail::ram_headroom)
+    int64_t ram_reserve_mib = -1;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
@@ -636,6 +638,9 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
+                 "  --ram-reserve-mib N  leave N MiB of RAM free for other programs (setup's --ram-reserve-gib): the\n"
+                 "                       experts' RAM copy keeps at least it beside it instead of 8 GiB, and it is the\n"
+                 "                       least --conversation-cache-min-free-mib (also STRATA_RAM_RESERVE_MIB; 0 = none)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
                  "                       the container cannot see its real limit (also STRATA_MEMORY_LIMIT_MIB; the flag\n"
                  "                       wins; 0 = none). Parking and session save/restore keep their floor under it\n"
@@ -800,8 +805,8 @@ void usage() {
                  "                       copy of them all in RAM; the GPU cache holds the most used\n"
                  "  --resident-budget-gib N  with it: the experts the GPU cache does not hold copied into RAM\n"
                  "                       in the profile's order while they fit N GiB (at most the free RAM\n"
-                 "                       less 8 GiB); the rest are read from the files\n"
-                 "  --resident-experts   the same with as much RAM as is free (less 8 GiB)\n"
+                 "                       less 8 GiB, or less --ram-reserve-mib); the rest are read from the files\n"
+                 "  --resident-experts   the same with as much RAM as is free (less 8 GiB or --ram-reserve-mib)\n"
                  "  --resident-cpu-experts  cache the static GPU cache's misses in ordinary RAM (with --mmap-experts)\n"
                  "  --shared-expert-arena FILE  share completed expert weights between Linux processes\n"
                  "  --coupled-draft / --no-coupled-draft  sample MTP drafts with the target's chain (default: off)\n"
@@ -2559,7 +2564,7 @@ int main(int argc, char** argv) {
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-save-checkpoints" ||
                  a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
-                 a == "--conversation-cache-park-gain" || a == "--memory-limit-mib") {
+                 a == "--conversation-cache-park-gain" || a == "--memory-limit-mib" || a == "--ram-reserve-mib") {
             const std::string value = next(a.c_str());
             int64_t parsed = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
@@ -2581,6 +2586,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = parsed;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = parsed;
+            else if (a == "--ram-reserve-mib") o.ram_reserve_mib = parsed;
             else o.conversation_cache_slots = (int) parsed;
         }
         else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
@@ -2690,6 +2696,10 @@ int main(int argc, char** argv) {
     }
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next discrete ones); "auto" chooses the K before anything is loaded (below).
+    // the RAM reserve: the experts' RAM copy, the pinned prompt buffers and the parked conversations leave it free
+    if (o.ram_reserve_mib >= 0) strata::core::detail::set_ram_reserve_bytes((uint64_t) o.ram_reserve_mib << 20);
+    o.conversation_cache_min_free_mib =
+        std::max<int64_t>(o.conversation_cache_min_free_mib, (int64_t) (strata::core::detail::ram_reserve_bytes() >> 20));
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {
@@ -4417,7 +4427,8 @@ int main(int argc, char** argv) {
             for (int64_t l = 0; l < elay.n_layers; ++l) experts_ram += elay.blob_bytes(l) * (uint64_t) elay.n_expert;
             const auto available = strata::core::available_host_bytes();
             if (auto_ram != nullptr && (int) std::strtol(auto_ram, nullptr, 10) != 0 && need > 0 && experts_ram > 0 &&
-                strata::core::conversation_memory_admit(available, need + experts_ram, 8ull << 30)) {
+                strata::core::conversation_memory_admit(available, need + experts_ram,
+                                                        strata::core::detail::ram_headroom(8ull << 30))) {
                 const strata::kernels::PleIoOptions direct_pio = pio;
                 ple_table.close();
                 pio.mode = strata::kernels::PleIo::Mmap;
@@ -5083,15 +5094,17 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const uint64_t need = lay.total + lay.max_blob;
         std::string why;
+        const uint64_t headroom = strata::core::detail::ram_headroom(8ull << 30);
         if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
             !strata::core::detail::resident_pin_fits(
-                need, 0, 8ull << 30, hm.available - std::min(hm.available, strata::platform::cma_free_bytes()), why) &&
+                need, 0, headroom, hm.available - std::min(hm.available, strata::platform::cma_free_bytes()), why) &&
             hm.cgroup_limit >= need) {
             std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
                                  "STRATA_ARENA_LOW_RAM=keep loads the whole arena anyway)\n",
-                         (double) need / 1073741824.0, 8.0, (double) hm.available / 1073741824.0);
+                         (double) need / 1073741824.0, (double) headroom / 1073741824.0,
+                         (double) hm.available / 1073741824.0);
             o.mmap_experts = o.resident_pin = true;
             o.resident_gib = -1;
         }
@@ -6988,7 +7001,8 @@ int main(int argc, char** argv) {
         const Pin pin = !o.resident_pin || (pin_env != nullptr && std::strcmp(pin_env, "0") == 0) ? Pin::off
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0 ? Pin::on
                                                                                : Pin::automatic;
-        if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from, 8ull << 30, budget,
+        if (!src.pin_cache_complement(xcache, err, pin, other_gpus, lend_from,
+                                      strata::core::detail::ram_headroom(8ull << 30), budget,
                                       stages.empty() ? &profile : &profile_all)) {
             // upstream #403 / #467: a RAM copy that cannot be made is not a reason to stop - the experts it would have
             // held are read from the files like the ones outside it (pin_cache_complement leaves nothing half-built)

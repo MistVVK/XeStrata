@@ -1027,6 +1027,19 @@ def ram_gb():
     return 0.0
 
 
+def ram_reserve_args(a) -> list:
+    """The engines' --ram-reserve-mib for setup's --ram-reserve-gib (none without it); the server gives the image
+    engine the same (STRATA_RAM_RESERVE_MIB)."""
+    return ["--ram-reserve-mib", str(int(a.ram_reserve_gib * 1024))] if a.ram_reserve_gib else []
+
+
+def usable_ram_gb(a=None) -> float:
+    """The RAM setup plans with: all of it (ram_gb), less --ram-reserve-gib, the RAM left free for other programs
+    (`a`'s, else the command line's: tools/image/install.py passes the model's own)."""
+    reserve = getattr(a if a is not None else ARGS, "ram_reserve_gib", None) or 0.0
+    return ram_gb() - reserve
+
+
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
@@ -4065,7 +4078,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     # the text encoder in the messages, where the model has one
     was, now = (f" (text encoder {tasked})", f" (text encoder {tquant})") if tasked else ("", "")
     if not ssd and text_gb is not None:
-        left = ram_gb() - text_gb
+        left = usable_ram_gb(a) - text_gb
         if shared:   # the chat model's file: counted in text_gb already, so not twice
             left += QI.FILES[QI.text_file(enc, shared)][2] / 1e9
         quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep, q8)
@@ -4833,6 +4846,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     esp = val("--control-vector-scaled")
     rv = val("--vram-reserve-mib") or ""
     reserve = int(rv) if rv.isdigit() else None
+    rr = val("--ram-reserve-mib") or ""
     esp_path = esp.rsplit(":", 1)[0] if esp else None
     return {"family": family, "model": model if model in FAMILIES[family].get("models", MODELS) else None,
             "context": int(ctx) if (ctx := val("--max-context")) else None,
@@ -4844,7 +4858,8 @@ def choices_from_config(cfg_path: Path) -> dict:
             "split_pci": [cfg.get("gpu_pci"), *cfg["split_pci"]] if cfg.get("split_pci") else None,
             # #493: --vram-reserve-mib given at setup (images write the default 700 themselves)
             "vram_reserve_mib": reserve if reserve is not None and (
-                vis is None or reserve != VISION["gpu"]["reserve_mib"]) else None}
+                vis is None or reserve != VISION["gpu"]["reserve_mib"]) else None,
+            "ram_reserve_gib": int(rr) / 1024 if rr.isdigit() and int(rr) > 0 else None}
 
 
 def calibration_targets(have: list, model: str | None, family: str | None) -> list:
@@ -6187,6 +6202,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
     elif vision != "none":
         args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    args += ram_reserve_args(a)
     # --kv: the KV cache's precision, as far as the model's engine path takes it
     if a.kv:
         takes = plain_kv_takes(family)
@@ -6328,7 +6344,7 @@ def describe() -> dict:
     each family and size asks.  It reports only: nothing is made, moved or saved.  The front end passes its choices
     back as setup's options (--family, --model, --context, --vision, --kv, ..., and --images; an installed model's
     image models through tools/image/install.py)."""
-    ram = ram_gb()
+    ram = usable_ram_gb()                              # the fits with --ram-reserve-gib given with --describe
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
     usable = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
@@ -6407,7 +6423,7 @@ def describe() -> dict:
                           "images": [by_name[s["model_name"]] for s in secs
                                      if isinstance(s, dict) and s.get("model_name") in by_name]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
-            "ram_gb": round(ram, 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
+            "ram_gb": round(ram_gb(), 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
             "gpus": [{"index": g["index"], "name": g["name"], "vendor": g.get("vendor"),
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
@@ -6557,6 +6573,11 @@ def main() -> int:
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
                          "default: 700); the expert cache takes that much less")
+    ap.add_argument("--ram-reserve-gib", type=float, metavar="N",
+                    help="RAM in GiB XeStrata leaves free for other programs: setup chooses the model's mode, the "
+                         "RAM its experts keep and the image models' sizes with that much less, and the engines keep "
+                         "it free beside their RAM copies (slower when the experts no longer fit and are read from "
+                         "the SSD; default: none, as before); set up again to change it")
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
@@ -6653,6 +6674,8 @@ def main() -> int:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if any(x and "=" not in x for x in a.cmake_arg or []):
         ap.error("--cmake-arg takes KEY=VALUE, e.g. --cmake-arg STRATA_ROCM_DEVICE_LIBS=/opt/rocm-7.1.1/amdgcn/bitcode")
+    if a.ram_reserve_gib is not None and not 0 <= a.ram_reserve_gib < 1e6:
+        ap.error("--ram-reserve-gib takes a number of GiB, 0 or more, e.g. --ram-reserve-gib 16")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
@@ -6713,6 +6736,8 @@ def main() -> int:
                 a.port = a.port or ch["port"]
                 if a.vram_reserve_mib is None:          # #493: an explicit reserve set up before
                     a.vram_reserve_mib = ch.get("vram_reserve_mib")
+                if a.ram_reserve_gib is None:
+                    a.ram_reserve_gib = ch.get("ram_reserve_gib")
                 by_pci = {x["pci"]: x["index"] for x in gpus()}
                 if ch.get("split_pci") and all(pci in by_pci for pci in ch["split_pci"]):
                     # a layer split: set up across the same cards again
@@ -6866,18 +6891,29 @@ def main() -> int:
              "no matrix engines (XMX) on most processors")
     elif gpu["vram_gb"] < 11:
         warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
-    ram = ram_gb()
+    ram, ram_total = usable_ram_gb(), ram_gb()
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
     low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
+    if a.ram_reserve_gib and ram < need - 4 and not low_ok and ram_total >= need - 4:
+        # the reserve leaves less than the smallest model runs in: it keeps that least, and less stays free
+        ram = need - 4
+        warn(f"--ram-reserve-gib {a.ram_reserve_gib:g} leaves less RAM than the smallest model runs in "
+             f"({need - 4:.0f} GB): XeStrata takes that much, and about {ram_total - ram:.0f} GB stay free")
+        a.ram_reserve_gib = math.floor(ram_total - ram)
     if ram < need - 4 and not a.check and not low_ok:
         # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
         fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
              "Strata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: it "
              "needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of them")
-    ok(f"RAM: {ram:.0f} GB" if ram >= need - 4 else
-       f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
-       ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
+    if a.ram_reserve_gib:
+        ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
+           f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
+    elif ram >= need - 4:
+        ok(f"RAM: {ram:.0f} GB")
+    else:
+        ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
+           ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; Strata needs at least AVX2")
@@ -7387,6 +7423,7 @@ def main() -> int:
             args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
+    args += ram_reserve_args(a)
     if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB:
         # #496, #41: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when
         # that is what it takes, and says what is short when even that is not enough.  Setup names the models instead.

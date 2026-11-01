@@ -1156,6 +1156,7 @@ bool PlainModel::open_experts(std::string& err) {
                     strata::gpu::mem_info(&f, &t))
                     beside += (uint64_t) t;
             }
+            beside = detail::ram_headroom(beside);   // the RAM the user asked to leave free (--ram-reserve-mib)
             std::string why;
             const uint64_t cma = strata::platform::cma_free_bytes();   // not for pinned pages (upstream #3698)
             if (detail::host_available_memory(hm) &&
@@ -1693,6 +1694,7 @@ void PlainModel::finish_experts() {
         // with 8 GiB left is not known: dropping the files' cache before and during the copy changed nothing.
         if (!level_zero_)
             headroom += std::min<uint64_t>(strata::platform::total_physical_memory() / 5, 16ull << 30);
+        headroom = detail::ram_headroom(headroom);   // the RAM the user asked to leave free (--ram-reserve-mib)
         // the order the RAM takes them in: the profile's, else each layer's experts in turn
         std::vector<std::pair<int32_t, int32_t>> order = prior_;
         if (order.empty())

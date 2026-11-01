@@ -3160,6 +3160,9 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries
         env[str(k)] = str(v)
+    args = cfg.get("args")
+    if isinstance(args, list) and "--ram-reserve-mib" in args[:-1]:   # setup's --ram-reserve-gib: the image engine too
+        env["STRATA_RAM_RESERVE_MIB"] = str(args[args.index("--ram-reserve-mib") + 1])
     if cfg.get("gpu_pci"):                           # the Xe engine: the GPU setup chose, by PCI address
         env.setdefault("STRATA_GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]

@@ -636,6 +636,7 @@ Engine options you added to `"args"` by hand are not carried over: setup names t
 ./setup.sh --gpu 1                          another GPU (numbered as --check lists them; the default has the most VRAM)
 ./setup.sh --gpus 1,2                       spread the layers over two or more GPUs (remembered; docs/MULTIGPU.md)
 ./setup.sh --vram-reserve-mib 2048          leave 2 GB of VRAM free for other programs (remembered)
+./setup.sh --setup --ram-reserve-gib 16     leave 16 GiB of RAM free for other programs (remembered)
 ./setup.sh --no-browser                     do not open the chat page when the model is ready (remembered; --browser undoes it)
 ./setup.sh --calibrate                      tune the engine for this PC (about 15-30 minutes), then start
 ./setup.sh --check                          only check this PC
@@ -669,6 +670,18 @@ The experts of the pieces given back are computed on the CPU: the same answers, 
 A reserve that cannot be met (the cache at its smallest size, or no VRAM from the driver for the next segment) still answers `200`: compare the answer's `vram_free_mib` with your `reserve_mib` (upstream #1034).
 While a request runs or waits, it waits up to 300 s, then answers `409`.
 Where the GPU's runtime has no virtual memory it is off and the cache stays as it started (Intel's Level Zero and NVIDIA's CUDA have it; AMD's HIP in intel/llvm 7.2.0 does not).
+
+### Leaving RAM for other programs
+
+With `--ram-reserve-gib N` at setup, XeStrata runs leaving N GiB of RAM free for other programs.
+Without it, nothing changes.
+
+- Setup chooses how the model runs (all its experts in RAM, or the low-RAM mode), how many of its experts stay in RAM, the recommended size and context, and the image models' sizes as if the RAM were N GiB smaller.
+  When the experts no longer fit the RAM, the rest are read from the SSD while it answers, which is slower.
+- The text engine (`--ram-reserve-mib`) and the image engine keep at least N GiB beside the experts and layers they copy into RAM and the conversations they keep there (otherwise 8 GiB, and 2.5 GiB for the conversations).
+- When leaving N would not leave the least RAM the model runs in, setup says so and installs it with that least (less than N is then left free).
+- It is kept in the model's config. To change it, set up again with `--setup --ram-reserve-gib` (set up again without it, nothing is left free any more).
+- XeStrata keeps it by itself; it is not a limit the OS enforces. The OS's cache of the model files read from the SSD does not count: the OS gives it back when another program needs the RAM.
 
 ### Model files downloaded by hand, or from a mirror
 

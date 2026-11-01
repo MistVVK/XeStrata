@@ -92,6 +92,9 @@ def main(argv=None) -> int:
                             image_dit_keep=a.dit_keep)
     path = Path(a.config) if a.config else None
     cfg = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None and path.is_file() else {}
+    # the RAM the model was set up to leave free (setup's --ram-reserve-gib, its engine's --ram-reserve-mib)
+    rr = S.choices_from_config(path).get("ram_reserve_gib") if cfg and path is not None else None
+    ns.ram_reserve_gib = rr
     eng = Path(cfg["exe"]).parent if cfg.get("exe") else ROOT / "engine"     # the text engine's folder
     # the RAM the text model of that config keeps (its size by the name setup gave it), none without a config; a
     # model of PLAIN_FAMILIES (`strata --native`) as setup_plain estimates it, its GGUF the file a text encoder can

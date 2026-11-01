@@ -436,6 +436,25 @@ bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint
     return fits;
 }
 
+namespace {
+// -1: not set yet, read from STRATA_RAM_RESERVE_MIB at the first ram_reserve_bytes
+std::atomic<int64_t> g_ram_reserve{-1};
+}  // namespace
+
+uint64_t ram_reserve_bytes() {
+    int64_t v = g_ram_reserve.load();
+    if (v < 0) {
+        const char* e = std::getenv("STRATA_RAM_RESERVE_MIB");
+        const long long mib = e != nullptr ? std::strtoll(e, nullptr, 10) : 0;
+        int64_t expected = -1;
+        g_ram_reserve.compare_exchange_strong(expected, mib > 0 ? (int64_t) mib << 20 : 0);
+        v = g_ram_reserve.load();
+    }
+    return (uint64_t) v;
+}
+
+void set_ram_reserve_bytes(uint64_t bytes) { g_ram_reserve.store((int64_t) bytes); }
+
 std::string page_cache_hint(const std::string& meminfo_text) {
     const auto kib = [&](const char* key) -> uint64_t {
         std::istringstream in(meminfo_text);

@@ -219,7 +219,8 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     if (streaming) {
         size_t vfree = 0, vtotal = 0;
         gpu::mem_info(&vfree, &vtotal);
-        home_headroom_ = (8ull << 30) + (uint64_t) vtotal;
+        // at least the RAM the user asked to leave free (STRATA_RAM_RESERVE_MIB, from the server)
+        home_headroom_ = core::detail::ram_headroom((8ull << 30) + (uint64_t) vtotal);
         choose_source(slots_[0]);
         homes_pending_ = true;   // taken once a streamed layer is first begun: a budget set ahead of its use (the
                                  // DiT's, before the text encoder runs) does not take RAM and the copies' time early

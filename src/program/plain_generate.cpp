@@ -2187,6 +2187,9 @@ static void plain_usage(const std::string& arch) {
                  "                       only in a build that found libblosc2)\n"
                  "  --session-min-free-mib N  --serve: disk space a saved conversation must leave free (default 4096;\n"
                  "                       0 = no check)\n"
+                 "  --ram-reserve-mib N  leave N MiB of RAM free for other programs (setup's --ram-reserve-gib): the\n"
+                 "                       experts' RAM copy keeps at least it beside it, and it is the least\n"
+                 "                       --conversation-cache-min-free-mib (also STRATA_RAM_RESERVE_MIB; 0 = none)\n"
                  "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from strata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
@@ -2351,6 +2354,9 @@ int plain_main(int argc, char** argv) {
             }
             opt.pool_tasks = (int) tasks;
         } else if (a == "--no-host-worker") opt.pool_host_works = false;
+        else if (a == "--ram-reserve-mib")
+            strata::core::detail::set_ram_reserve_bytes(
+                (uint64_t) std::max<int64_t>(0, std::strtoll(next("--ram-reserve-mib"), nullptr, 10)) << 20);
         else if (a == "--memory-limit-mib") memory_limit_mib = std::max<int64_t>(0, std::strtoll(next("--memory-limit-mib"), nullptr, 10));
         else if (a == "--suffix-draft") opt.suffix_draft = std::max(0, (int) std::strtol(next("--suffix-draft"), nullptr, 10));
         else if (a == "--lookup-chain") opt.lookup_chain = std::max(0, (int) std::strtol(next("--lookup-chain"), nullptr, 10));
@@ -2518,6 +2524,8 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (!follow.empty()) n_new = std::min<int64_t>(n_new, (int64_t) follow.size());   // the run ends with it
+    // the parked conversations leave the RAM reserve free, as the experts' RAM copy does (plain_model.cpp)
+    cache.min_free = std::max<int64_t>(cache.min_free, (int64_t) strata::core::detail::ram_reserve_bytes());
     if (folder.compress && !strata::core::conversation_disk_can_compress()) {
         std::fprintf(stderr, "strata (%s): --conversation-save-compress: this build has no c-blosc2 (install "
                              "libblosc2-dev and build again)\n", arch.c_str());
