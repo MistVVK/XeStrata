@@ -58,6 +58,7 @@ LINUX_DRIVER = (
 
 # ---- macOS -----------------------------------------------------------------------------------------------------------------
 MAC_OS_PREFIXES = ("/usr/lib/", "/System/Library/")
+MAC_MIN_OS = (15, 0)
 
 
 def _match(name: str, patterns: tuple[str, ...], fold: bool) -> bool:
@@ -158,8 +159,7 @@ def elf_needed_bytes(data: bytes, where: str = "the file") -> list[str]:
     return out
 
 
-def macho_dylibs(path: Path) -> list[str]:
-    """Install names a Mach-O file loads (LC_LOAD_DYLIB, weak, reexport). A fat file reads its first slice."""
+def _macho_commands(path: Path):
     data = path.read_bytes()
     magic = struct.unpack_from(">I", data, 0)[0]
     base = 0
@@ -171,15 +171,49 @@ def macho_dylibs(path: Path) -> list[str]:
     is64 = struct.unpack_from("<I", data, base)[0] == 0xFEEDFACF
     ncmds, = struct.unpack_from("<I", data, base + 16)
     o = base + (32 if is64 else 28)
-    out = []
     for _ in range(ncmds):
         cmd, size = struct.unpack_from("<II", data, o)
+        yield data, cmd, o
+        o += size
+
+
+def macho_dylibs(path: Path) -> list[str]:
+    """Install names a Mach-O file loads (LC_LOAD_DYLIB, weak, reexport). A fat file reads its first slice."""
+    out = []
+    for data, cmd, o in _macho_commands(path):
         if cmd in (0xC, 0x80000018, 0x8000001F):     # LOAD_DYLIB, LOAD_WEAK_DYLIB, REEXPORT_DYLIB
             name_off, = struct.unpack_from("<I", data, o + 8)
             s = o + name_off
             out.append(data[s:data.index(b"\0", s)].decode("utf-8", "replace"))
-        o += size
     return out
+
+
+def macho_min_os(path: Path) -> tuple[int, int] | None:
+    """The oldest macOS a Mach-O file says it runs on (LC_BUILD_VERSION, or LC_VERSION_MIN_MACOSX), or None."""
+    for data, cmd, o in _macho_commands(path):
+        if cmd in (0x32, 0x24):
+            v, = struct.unpack_from("<I", data, o + (12 if cmd == 0x32 else 8))
+            return v >> 16, (v >> 8) & 0xFF
+    return None
+
+
+def too_new_for_mac(folder: Path, files: list[str] | None = None, floor: tuple[int, int] = MAC_MIN_OS) -> list[tuple[str, str]]:
+    """(file, its minimum macOS) for every Mach-O file that needs a newer macOS than the app's minimum."""
+    folder = Path(folder)
+    rels = files if files is not None else [p.relative_to(folder).as_posix() for p in sorted(folder.rglob("*")) if p.is_file() and not p.is_symlink()]
+    problems = []
+    for rel in rels:
+        p = folder / rel
+        try:
+            with p.open("rb") as f:
+                if f.read(4) not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"):
+                    continue
+            minos = macho_min_os(p)
+        except (ValueError, OSError, struct.error):
+            continue
+        if minos is not None and minos > floor:
+            problems.append((rel, f"{minos[0]}.{minos[1]}"))
+    return problems
 
 
 def imports(path: Path) -> tuple[str, list[str]]:

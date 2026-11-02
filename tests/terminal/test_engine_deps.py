@@ -144,5 +144,45 @@ class SubfolderDlls(unittest.TestCase):
             self.assertEqual(binary_deps.uncovered(Path(d)), [])
 
 
+class MacMinimumOs(unittest.TestCase):
+    """#4634: a macOS binary built for a newer macOS than the app's minimum stops in dyld before main() on the older Mac."""
+
+    @staticmethod
+    def make_macho(minos):
+        major, minor = minos
+        cmd = struct.pack("<IIIIII", 0x32, 24, 1, (major << 16) | (minor << 8), (27 << 16), 0)
+        return struct.pack("<IiiIIIII", 0xFEEDFACF, 0x0100000C, 0, 2, 1, len(cmd), 0, 0) + cmd
+
+    def test_min_os_is_read_from_the_build_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "strata"
+            p.write_bytes(self.make_macho((27, 0)))
+            self.assertEqual(binary_deps.macho_min_os(p), (27, 0))
+
+    def test_a_binary_newer_than_the_app_minimum_is_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "strata").write_bytes(self.make_macho((15, 0)))
+            (Path(d) / "strata-vision").write_bytes(self.make_macho((27, 0)))
+            self.assertEqual(binary_deps.too_new_for_mac(Path(d)), [("strata-vision", "27.0")])
+
+    def test_the_floor_matches_the_app_and_both_cmake_projects(self):
+        import json
+        app = json.loads((ROOT / "apps/desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+        floor = ".".join(map(str, binary_deps.MAC_MIN_OS))
+        self.assertEqual(app["bundle"]["macOS"]["minimumSystemVersion"], floor)
+        for cmake in ("metal/CMakeLists.txt", "tools/vision/CMakeLists.txt"):
+            self.assertIn(f'CMAKE_OSX_DEPLOYMENT_TARGET "{floor}"', (ROOT / cmake).read_text(encoding="utf-8"), cmake)
+
+    def test_the_packager_refuses_a_macos_engine_built_for_a_newer_macos(self):
+        with tempfile.TemporaryDirectory() as d:
+            src, out = Path(d) / "src", Path(d) / "out"
+            src.mkdir()
+            (src / "strata").write_bytes(self.make_macho((27, 0)))
+            with self.assertRaises(SystemExit) as caught:
+                package_engine.build(src, "metal", "9.9.9", "macos-arm64", out, archs=("apple-gpu",))
+            self.assertIn("strata (macOS 27.0)", str(caught.exception))
+            self.assertFalse(any(out.glob("*")) if out.exists() else False)
+
+
 if __name__ == "__main__":
     unittest.main()

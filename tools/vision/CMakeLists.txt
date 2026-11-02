@@ -14,6 +14,7 @@
 # -DSTRATA_PORTABLE=OFF.  The CPU tower picks its kernel tier at run time (tools/vision/own/cpu_caps.h), so the flag only decides the generic code's floor.
 # -DLLAMA_DIR is read only with STRATA_VISION_ORACLES=ON (the package scripts and setup pass it no longer).
 cmake_minimum_required(VERSION 3.21)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "the oldest macOS the binaries run on")
 project(strata_vision C CXX)
 
 set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/strata-llama" CACHE PATH "llama.cpp tree for the test oracles only (STRATA_VISION_ORACLES)")

@@ -11,6 +11,7 @@
 #   cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release -DMETAL_CPP_DIR=... [-DSTRATA_GGML_DIR=...]
 #   ninja -C build-metal
 cmake_minimum_required(VERSION 3.24)
+set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING "the oldest macOS the binaries run on")
 project(strata_metal LANGUAGES C CXX OBJCXX)
 include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name> (default flash_next, no flag added)
 
