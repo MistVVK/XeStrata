@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp: cuDNN's SDPA through cudnn-frontend on NVIDIA GPUs (contrib-llvm),
-// cuDNN opened at the first attention (the user's installation, not free software: open_cudnn), on the queue's CUDA
-// stream, a graph built once a shape and kept.
+// src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp and qi_conv.hpp: cuDNN's SDPA and convolution through cudnn-frontend
+// on NVIDIA GPUs (contrib-llvm), cuDNN opened at the first use (the user's installation, not free software:
+// open_cudnn), on the queue's CUDA stream, a graph built once a shape and kept.
 
 #include <cudnn_frontend.h>   // with its dynamic loading: windows.h on Windows
 #include <sycl/backend/cuda.hpp>
@@ -18,6 +18,7 @@ void* cudnn_dlhandle = nullptr;
 }
 #endif
 
+#include "qi_conv.hpp"
 #include "qi_sdpa.hpp"
 
 #include <sycl/sycl.hpp>
@@ -43,9 +44,10 @@ std::mutex g_mu;
 namespace fe = cudnn_frontend;
 
 struct Cudnn {
-    bool failed = false;
+    bool failed = false, conv_failed = false;   // conv_failed: cuDNN not opened for the convolutions
     cudnnHandle_t handle = nullptr;
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, std::shared_ptr<fe::graph::Graph>> graphs;
+    std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
     void* ws = nullptr;
     int64_t ws_bytes = 0;
 };
@@ -72,6 +74,42 @@ std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows
     (void) stats;
     O->set_output(true).set_dim({1, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
     if (!g->build(handle, {fe::HeurMode_t::A}).is_good()) throw std::runtime_error("cuDNN builds no SDPA plan");
+    return g;
+}
+
+constexpr int64_t kX = 11, kW = 12, kB = 13, kR = 14, kY = 15;   // the convolution's tensors
+
+// x [H][W][C] (FP16) by w [O][k][k][C] (FP16), stride 1 and padding k / 2, plus the bias and the residual where given,
+// into y [H][W][O] (FP32): the bias and the residual (y itself, read and written in the same pass) as the
+// convolution's epilogue
+std::shared_ptr<fe::graph::Graph> conv_graph(cudnnHandle_t handle, int64_t H, int64_t W, int64_t C, int64_t O,
+                                             int64_t k, bool bias, bool add) {
+    auto g = std::make_shared<fe::graph::Graph>();
+    g->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto X = g->tensor(fe::graph::Tensor_attributes().set_name("X").set_uid(kX).set_dim({1, C, H, W}).set_stride(
+        {H * W * C, 1, W * C, C}));
+    auto Wt = g->tensor(fe::graph::Tensor_attributes().set_name("W").set_uid(kW).set_dim({O, C, k, k}).set_stride(
+        {k * k * C, 1, k * C, C}));
+    const int64_t p = k / 2;
+    auto Y = g->conv_fprop(
+        X, Wt, fe::graph::Conv_fprop_attributes().set_padding({p, p}).set_stride({1, 1}).set_dilation({1, 1}));
+    const std::vector<int64_t> yd{1, O, H, W}, ys{H * W * O, 1, W * O, O};
+    if (bias) {
+        auto B = g->tensor(fe::graph::Tensor_attributes().set_name("B").set_uid(kB).set_dim({1, O, 1, 1}).set_stride(
+            {O, 1, O, O}).set_data_type(fe::DataType_t::FLOAT));
+        Y = g->pointwise(Y, B, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    }
+    if (add) {
+        auto R = g->tensor(fe::graph::Tensor_attributes().set_name("R").set_uid(kR).set_dim(yd).set_stride(ys)
+                               .set_data_type(fe::DataType_t::FLOAT));
+        Y = g->pointwise(Y, R, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    }
+    Y->set_output(true).set_dim(yd).set_stride(ys).set_uid(kY).set_data_type(fe::DataType_t::FLOAT);
+    // the fallback heuristics too: mode A alone found no plan for these (cuDNN 9 on the RTX 4070, 2026-11-02)
+    if (!g->build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good())
+        throw std::runtime_error("cuDNN builds no convolution plan");
     return g;
 }
 
@@ -197,3 +235,54 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
 }
 
 }  // namespace strata::image::sdpa
+
+namespace strata::image::conv {
+
+bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
+           const float* bias, bool add, float* y) {
+    namespace fe = cudnn_frontend;
+    std::lock_guard<std::mutex> lock(sdpa::g_mu);
+    sdpa::Cudnn& d = sdpa::g_cudnn[q.get_device()];
+    if (d.conv_failed) return false;
+    const std::vector<int64_t> key{H, W, C, O, k, bias != nullptr, add};
+    try {
+        if (d.handle == nullptr) sdpa::open_cudnn(d.handle);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata-image: cuDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
+                     e.what());
+        d.conv_failed = true;
+        return false;
+    }
+    try {
+        const CUstream cs = sycl::get_native<sycl::backend::ext_oneapi_cuda>(q);
+        if (fe::detail::set_stream(d.handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
+        auto it = d.convs.find(key);
+        if (it == d.convs.end())
+            it = d.convs.emplace(key, sdpa::conv_graph(d.handle, H, W, C, O, k, bias != nullptr, add)).first;
+        if (!it->second) return false;
+        int64_t ws = 0;
+        if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
+        if (ws > d.ws_bytes) {
+            q.wait();
+            if (d.ws != nullptr) sycl::free(d.ws, q);
+            d.ws = sycl::malloc_device(ws, q);
+            d.ws_bytes = d.ws != nullptr ? ws : 0;
+        }
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
+            {sdpa::kX, const_cast<uint16_t*>(x)}, {sdpa::kW, const_cast<uint16_t*>(w)}, {sdpa::kY, y}};
+        if (bias != nullptr) pack.emplace(sdpa::kB, const_cast<float*>(bias));
+        if (add) pack.emplace(sdpa::kR, y);
+        if (!it->second->execute(d.handle, pack, d.ws).is_good())
+            throw std::runtime_error("cuDNN's convolution failed");
+        return true;
+    } catch (const std::exception& e) {   // this shape on the engine's own path from now on
+        std::fprintf(stderr,
+                     "strata-image: cuDNN does not take a convolution of %lld x %lld x %lld to %lld (%s): the "
+                     "engine's own path for it\n",
+                     (long long) H, (long long) W, (long long) C, (long long) O, e.what());
+        d.convs[key] = nullptr;
+        return false;
+    }
+}
+
+}  // namespace strata::image::conv

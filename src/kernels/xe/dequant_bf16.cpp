@@ -165,6 +165,9 @@ inline void group32(const uint8_t* row_blocks, int gi_in_row, int groups_per_row
             const float dl = d * (float) (sc & 0xF), ml = dmin * (float) (sc >> 4);
             put(out, l, dl * (float) ((q[l] >> (2 * j)) & 3) - ml);
         }
+    } else if constexpr (TYPE == 1) {                              // F16: 32 values of 2 B, a "block" of 64 B
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 64;
+        for (int l = 0; l < 32; ++l) put(out, l, h2f(b + 2 * (ptrdiff_t) l));
     } else if constexpr (TYPE == 30) {                             // BF16: 32 values of 2 B, a "block" of 64 B
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 64;
         for (int l = 0; l < 32; ++l)
@@ -250,6 +253,7 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
     case 23: block_elems = 256; block_bytes = 136; return true;
     case 42: block_elems = 64; block_bytes = 18; return true;
     case 30: block_elems = 32; block_bytes = 64; return true;   // BF16, in 32-value pieces
+    case 1: block_elems = 32; block_bytes = 64; return true;    // F16, in 32-value pieces (an F16 GGUF's embedding)
     default: return false;
     }
 }
@@ -282,6 +286,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     case 23: STRATA_DQ(23);
     case 42: STRATA_DQ(42);
     case 30: STRATA_DQ(30);
+    case 1: STRATA_DQ(1);
     }
 #undef STRATA_DQ
     if (!stream) core::Runtime::get().wait(e, "dequant");

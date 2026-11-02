@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/qi_vae.hpp - Qwen-Image-2.1's VAE decoder on the GPU: a latent [64][h][w] to an RGBA image
-// [4][16 h][16 w] in 0 .. 1.
+// [4][16 h][16 w] in 0 .. 1.  The same part reads Qwen-Image's first VAE, which is Wan 2.1's (Anima's: its 16 channels
+// at an eighth of the image's sides, ComfyUI's names), whose causal 3-D convolutions take one frame: the zero frames
+// before it leave each kernel's last time slice, a 2-D convolution, and the upsamplers' time convolutions are not run
+// on a first frame.
 //
 // The activations are channels-last ([pixel][channel], FP32); a convolution is a product on the matrix path
 // (prefill::Gemm, FP16 operands) of the input's 3 x 3 neighbourhoods (unfolded a band of rows at a time, so the scratch
@@ -23,7 +26,8 @@ public:
     QiVae(const QiVae&) = delete;
     QiVae& operator=(const QiVae&) = delete;
 
-    /// Reads the VAE's safetensors (the diffusers names) and puts the decoder's weights on the current GPU.
+    /// Reads the VAE's safetensors (Qwen-Image-2.1's diffusers names, or Wan 2.1's as ComfyUI has them) and puts the
+    /// decoder's weights on the current GPU.
     /// `dry`: read for its sizes only (weight_bytes, scratch_bytes), nothing put on the GPU; such a part cannot run.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
@@ -49,6 +53,9 @@ public:
     /// What the working buffers hold now.
     uint64_t scratch_held() const { return (uint64_t) cap16_ * 2 + (uint64_t) cap32_ * 4 * 3 + (uint64_t) col_cap_ * 2; }
     uint64_t weight_bytes() const { return weight_bytes_; }
+    /// The image's side over the latent's (16; Wan 2.1's 8) and the latent's channels (64; Wan 2.1's 16).
+    int scale() const { return scale_; }
+    int64_t latent_channels() const { return pq_.in; }
 
 private:
     struct Need {
@@ -69,7 +76,8 @@ private:
     const float* vec(class SafeTensors& st, const std::string& name);
     Res res_w(class SafeTensors& st, const std::string& p);
     // out [HW][c.out] = c(in16 [H][W][c.in]) + bias
-    void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
+    // out = the convolution of in16 plus its bias, or out += that with `add` (a residual)
+    void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add = false);
     // x [HW][C] -> x + the residual block (x replaced; scratch buffers)
     void resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin);
     void attention(float* x, int64_t H, int64_t W, int64_t C, const float* g, const Conv& qkv, const Conv& proj);
@@ -87,10 +95,11 @@ private:
     const float *ag_ = nullptr;
     Conv aqkv_, aproj_;
     struct Up {
-        Res r[3];
+        std::vector<Res> r;
         Conv up;   // up.out 0: no upsampling
-        int ft = 1;
-    } up_[5];
+        int ft = 1;   // the shortcut's frames; 0: no shortcut over the block (Wan 2.1's)
+    };
+    std::vector<Up> up_;
     const float* gout_ = nullptr;
     // the encoder
     bool has_encoder_ = false;
@@ -99,10 +108,15 @@ private:
     const float* eag_ = nullptr;
     Conv eaqkv_, eaproj_;
     struct Down {
-        Res r[2];
+        std::vector<Res> r;
         Conv down;   // down.out 0: no downsampling
-        int ft = 1;  // the shortcut's frames (2 where the block also halves time)
-    } down_[5];
+        int ft = 1;  // the shortcut's frames (2 where the block also halves time); 0: none (Wan 2.1's)
+    };
+    std::vector<Down> down_;
+    void open_wan21(class SafeTensors& st);
+    bool wan21_ = false;
+    int scale_ = 16;
+    int64_t rgb_in_ = 4;   // the encoder's input channels taken from the image (Wan 2.1's 3: no alpha)
     const float* egout_ = nullptr;
     // scratch, grown on demand
     int64_t cap16_ = 0, cap32_ = 0;

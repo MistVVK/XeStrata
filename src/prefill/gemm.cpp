@@ -539,6 +539,10 @@ bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, bool half_sums) {
+    if (ggml_type == 1) {   // F16 rows (an F16 GGUF's, Anima's Qwen3-0.6B-Base): the product takes them as they are
+        f16(X, static_cast<const uint16_t*>(W_blocks), Y, T, N, K, ldy, half_sums);
+        return;
+    }
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices (of 16 rows, so every slice's Y stays 64-byte aligned).
         const int64_t rows = scratch_elems_ / K / 16 * 16;

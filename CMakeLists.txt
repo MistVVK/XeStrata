@@ -734,11 +734,12 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_vision.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
-  # Intel GPUs: oneDNN's SDPA (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the tag pinned here; Ubuntu's
-  # libdnnl-sycl is built for another SYCL runtime than intel/llvm's), built with the engine's compiler for Intel GPUs
-  # only (its SYCL GPU runtime, no CPU runtime) beside the build, and linked to the image engine alone (the text engine
-  # does not load it).  Windows: cross-built as the engine is, without its VTune hooks (their assembly is MASM's).
-  option(STRATA_ONEDNN "the image attention through oneDNN's SDPA on Intel GPUs" ON)
+  # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
+  # tag pinned here; Ubuntu's libdnnl-sycl is built for another SYCL runtime than intel/llvm's), built with the engine's
+  # compiler for Intel GPUs only (its SYCL GPU runtime, no CPU runtime) beside the build, and linked to the image engine
+  # alone (the text engine does not load it).  Windows: cross-built as the engine is, without its VTune hooks (their
+  # assembly is MASM's).
+  option(STRATA_ONEDNN "the image attention and the VAEs' convolutions through oneDNN on Intel GPUs" ON)
   set(STRATA_ONEDNN_SOURCE "" CACHE STRING
       "oneDNN's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
   # the projects built beside the engine for Windows (oneDNN, aotriton): cross-built as the engine is
@@ -788,9 +789,10 @@ if(STRATA_ENABLE_XE)
       set_target_properties(strata_dnnl PROPERTIES IMPORTED_LOCATION ${_strata_dnnl_lib})
     endif()
     add_dependencies(strata_image strata_onednn)
-    target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp)
+    target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp src/image/qi_conv_onednn.cpp)
     target_link_libraries(strata_image PRIVATE strata_dnnl)
-    set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
+    set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp APPEND PROPERTY
+                 COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
   # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256
@@ -921,9 +923,9 @@ if(STRATA_ENABLE_XE)
       set(_strata_aotriton_lib ${_strata_aot_dir}/lib)   # for the packages
     endif()
   endif()
-  # NVIDIA GPUs (contrib-llvm): cuDNN's SDPA through cudnn-frontend (Apache-2.0, header-only, the tag pinned here),
-  # which opens cuDNN at run time (libcudnn.so.9, cudnn64_9.dll: the user's installation, not free software; without
-  # it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for Linux and Windows) are found under
+  # NVIDIA GPUs (contrib-llvm): cuDNN's SDPA and the VAEs' convolutions through cudnn-frontend (Apache-2.0,
+  # header-only, the tag pinned here), which opens cuDNN at run time (libcudnn.so.9, cudnn64_9.dll: the user's
+  # installation, not free software; without it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for Linux and Windows) are found under
   # STRATA_CUDNN_ROOT, CUDNN_PATH or the CUDA toolkit's folder, outside a cross build's roots too; the build goes on
   # without them.
   set(STRATA_CUDNN_ROOT "" CACHE PATH "cuDNN's folder (its include/cudnn.h), for the image attention on NVIDIA GPUs")
@@ -949,7 +951,8 @@ if(STRATA_ENABLE_XE)
       set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                    NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
       set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
-      set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
+      set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp APPEND PROPERTY
+                   COMPILE_DEFINITIONS STRATA_CUDNN=1)
       target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_cudnn_frontend ON)   # its license text goes with the packages
     else()

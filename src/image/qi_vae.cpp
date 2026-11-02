@@ -11,6 +11,10 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#if STRATA_ONEDNN || STRATA_CUDNN
+#include "qi_conv.hpp"
+#endif
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -42,6 +46,11 @@ const float kStd[64] = {3.2001f, 3.2936f, 3.4321f, 3.0091f, 3.1061f, 4.0379f, 4.
                         3.5327f, 4.7833f, 3.1286f, 4.1819f, 3.8527f, 3.8312f, 3.5605f, 4.3875f, 3.9624f, 4.0168f,
                         3.5643f, 4.055f, 5.5614f, 4.2963f, 4.408f, 3.4959f, 3.8747f, 3.7608f, 3.5735f, 3.149f,
                         3.7662f, 3.6746f, 3.4563f, 3.8161f};
+// Wan 2.1's (ComfyUI's latent_formats.Wan21): Qwen-Image's first VAE, Anima's
+const float kWanMean[16] = {-0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f, 0.9653f, -0.1517f, 1.5508f,
+                            0.4134f,  -0.0715f, 0.5517f,  -0.3632f, -0.1922f, -0.9497f, 0.2503f, -0.2921f};
+const float kWanStd[16] = {2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
+                           3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f};
 const bool kTemporalUp[5] = {true, true, true, false, false};   // the up blocks whose shortcut also spans time
 constexpr int64_t kColBytes = 256ll << 20;                      // the unfolded neighbourhoods a product at most
 
@@ -205,12 +214,12 @@ void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* 
     });
 }
 
-// rgba [4][HW] = clamp((x [HW][4] + 1) / 2, 0, 1)
-void to_rgba(const float* x, int64_t HW, float* rgba, void* s) {
+// rgba [4][HW] = clamp((x [HW][C] + 1) / 2, 0, 1); C 3: alpha 1
+void to_rgba(const float* x, int64_t HW, int64_t C, float* rgba, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i / HW, p = i - c * HW;
-        rgba[i] = sycl::clamp((x[p * 4 + c] + 1.f) * 0.5f, 0.f, 1.f);
+        rgba[i] = c < C ? sycl::clamp((x[p * C + c] + 1.f) * 0.5f, 0.f, 1.f) : 1.f;
     });
 }
 
@@ -250,12 +259,12 @@ void normalize(float* acc, const float* wsum, int64_t HW, void* s) {
     });
 }
 
-// out16 [HW][Cp] = rgba [4][HW] scaled to -1 .. 1, channels past 4 zero (the convolution reads 8 at a time)
-void rgba_tokens16(const float* rgba, int64_t HW, int64_t Cp, uint16_t* out16, void* s) {
+// out16 [HW][Cp] = rgba [4][HW]'s first n channels scaled to -1 .. 1, the rest zero (the convolution reads 8 at a time)
+void rgba_tokens16(const float* rgba, int64_t HW, int64_t Cp, int64_t n, uint16_t* out16, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (HW * Cp)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t p = i / Cp, c = i - p * Cp;
-        out16[i] = f16_from_f32(c < 4 ? rgba[c * HW + p] * 2.f - 1.f : 0.f);
+        out16[i] = f16_from_f32(c < n ? rgba[c * HW + p] * 2.f - 1.f : 0.f);
     });
 }
 
@@ -315,25 +324,28 @@ QiVae::~QiVae() {
 
 QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
     const SafeTensor* t = st.find(name + ".weight");
-    if (t == nullptr || t->shape.size() != 4) throw std::runtime_error("image engine (VAE): no " + name);
+    if (t == nullptr || (t->shape.size() != 4 && t->shape.size() != 5))
+        throw std::runtime_error("image engine (VAE): no " + name);
     Conv c;
     c.out = t->shape[0];
     const int64_t in = t->shape[1];
     c.in = (in + 7) / 8 * 8;   // the input channels padded with zeros to 8s (the unfolding reads 8 at a time)
-    c.k = t->shape[2];
+    // a causal 3-D kernel [out][in][kt][k][k] on one frame after kt - 1 zero frames: its last time slice
+    const int64_t kt = t->shape.size() == 5 ? t->shape[2] : 1;
+    c.k = t->shape[t->shape.size() - 1];
     if (dry_) {
         weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
         c.b = vec(st, name + ".bias");
         return c;
     }
-    const auto w = st.f32(name + ".weight");   // [out][in][k][k]
+    const auto w = st.f32(name + ".weight");   // [out][in][kt][k][k]
     std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
     for (int64_t o = 0; o < c.out; ++o)
         for (int64_t i = 0; i < in; ++i)
             for (int64_t dy = 0; dy < c.k; ++dy)
                 for (int64_t dx = 0; dx < c.k; ++dx)
-                    h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] =
-                        kernels::f16_from_f32(w[(size_t) (((o * in + i) * c.k + dy) * c.k + dx)]);
+                    h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] = kernels::f16_from_f32(
+                        w[(size_t) ((((o * in + i) * kt + kt - 1) * c.k + dy) * c.k + dx)]);
     uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
@@ -366,11 +378,92 @@ QiVae::Res QiVae::res_w(SafeTensors& st, const std::string& p) {
     return r;
 }
 
+// Wan 2.1's VAE as ComfyUI names it (comfy/ldm/wan/vae.py): conv2 the post-quantization 1 x 1, decoder.conv1, the
+// middle's residual block, attention and residual block, the upsamples (residual blocks, each run's resample after
+// it), the head's norm and convolution to RGB; the encoder the other way round, conv1 its quantization 1 x 1.  A
+// residual block's norms and convolutions are residual.0, .2, .3 and .6, its 1 x 1 shortcut `shortcut`.
+void QiVae::open_wan21(SafeTensors& st) {
+    wan21_ = true;
+    rgb_in_ = 3;
+    if (!dry_) {
+        mean_ = alloc<float>(allocs_, 16);
+        std_ = alloc<float>(allocs_, 16);
+        gpu::copy((void*) mean_, kWanMean, sizeof(kWanMean));
+        gpu::copy((void*) std_, kWanStd, sizeof(kWanStd));
+    }
+    auto res = [&](const std::string& p) {
+        Res r;
+        r.g1 = vec(st, p + "residual.0.gamma");
+        r.g2 = vec(st, p + "residual.3.gamma");
+        r.c1 = conv_w(st, p + "residual.2");
+        r.c2 = conv_w(st, p + "residual.6");
+        if (st.find(p + "shortcut.weight") != nullptr) r.sc = conv_w(st, p + "shortcut");
+        return r;
+    };
+    pq_ = conv_w(st, "conv2");
+    cin_ = conv_w(st, "decoder.conv1");
+    mid0_ = res("decoder.middle.0.");
+    mid1_ = res("decoder.middle.2.");
+    ag_ = vec(st, "decoder.middle.1.norm.gamma");
+    aqkv_ = conv_w(st, "decoder.middle.1.to_qkv");
+    aproj_ = conv_w(st, "decoder.middle.1.proj");
+    up_.assign(1, Up{});
+    scale_ = 1;
+    for (int i = 0;; ++i) {
+        const std::string p = "decoder.upsamples." + std::to_string(i) + ".";
+        if (st.find(p + "residual.2.weight") != nullptr) {
+            up_.back().r.push_back(res(p));
+        } else if (st.find(p + "resample.1.weight") != nullptr) {
+            up_.back().up = conv_w(st, p + "resample.1");
+            up_.back().ft = 0;
+            up_.push_back(Up{});
+            scale_ *= 2;
+        } else {
+            break;
+        }
+    }
+    up_.back().ft = 0;
+    if (up_.back().r.empty()) up_.pop_back();
+    gout_ = vec(st, "decoder.head.0.gamma");
+    cout_ = conv_w(st, "decoder.head.2");
+    if (st.find("encoder.conv1.weight") == nullptr) return;
+    ein_ = conv_w(st, "encoder.conv1");
+    down_.assign(1, Down{});
+    for (int i = 0;; ++i) {
+        const std::string p = "encoder.downsamples." + std::to_string(i) + ".";
+        if (st.find(p + "residual.2.weight") != nullptr) {
+            down_.back().r.push_back(res(p));
+        } else if (st.find(p + "resample.1.weight") != nullptr) {
+            down_.back().down = conv_w(st, p + "resample.1");
+            down_.back().ft = 0;
+            down_.push_back(Down{});
+        } else {
+            break;
+        }
+    }
+    down_.back().ft = 0;
+    if (down_.back().r.empty()) down_.pop_back();
+    emid0_ = res("encoder.middle.0.");
+    emid1_ = res("encoder.middle.2.");
+    eag_ = vec(st, "encoder.middle.1.norm.gamma");
+    eaqkv_ = conv_w(st, "encoder.middle.1.to_qkv");
+    eaproj_ = conv_w(st, "encoder.middle.1.proj");
+    egout_ = vec(st, "encoder.head.0.gamma");
+    eout_ = conv_w(st, "encoder.head.2");
+    quant_ = conv_w(st, "conv1");
+    has_encoder_ = true;
+}
+
 bool QiVae::open(const std::string& path, void* stream, std::string& err, bool dry) {
     try {
         s_ = stream;
         dry_ = dry;
         SafeTensors st(path);
+        if (st.find("decoder.conv1.weight") != nullptr) {   // Wan 2.1's, as ComfyUI has it
+            open_wan21(st);
+            if (dry_) return true;
+            return gemm_.init(s_, 16, err);
+        }
         if (!dry_) {
             mean_ = alloc<float>(allocs_, 64);
             std_ = alloc<float>(allocs_, 64);
@@ -384,9 +477,10 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
         ag_ = vec(st, "decoder.mid_block.attentions.0.norm.gamma");
         aqkv_ = conv_w(st, "decoder.mid_block.attentions.0.to_qkv");
         aproj_ = conv_w(st, "decoder.mid_block.attentions.0.proj");
+        up_.assign(5, Up{});
         for (int i = 0; i < 5; ++i) {
             const std::string p = "decoder.up_blocks." + std::to_string(i) + ".";
-            for (int j = 0; j < 3; ++j) up_[i].r[j] = res_w(st, p + "resnets." + std::to_string(j) + ".");
+            for (int j = 0; j < 3; ++j) up_[i].r.push_back(res_w(st, p + "resnets." + std::to_string(j) + "."));
             if (st.find(p + "upsampler.resample.1.weight") != nullptr) up_[i].up = conv_w(st, p + "upsampler.resample.1");
             up_[i].ft = kTemporalUp[i] ? 2 : 1;
         }
@@ -394,9 +488,10 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
         cout_ = conv_w(st, "decoder.conv_out");
         if (st.find("encoder.conv_in.weight") != nullptr) {   // the encoder, for the edits' reference images
             ein_ = conv_w(st, "encoder.conv_in");
+            down_.assign(5, Down{});
             for (int i = 0; i < 5; ++i) {
                 const std::string p = "encoder.down_blocks." + std::to_string(i) + ".";
-                for (int j = 0; j < 2; ++j) down_[i].r[j] = res_w(st, p + "resnets." + std::to_string(j) + ".");
+                for (int j = 0; j < 2; ++j) down_[i].r.push_back(res_w(st, p + "resnets." + std::to_string(j) + "."));
                 if (st.find(p + "downsampler.resample.1.weight") != nullptr)
                     down_[i].down = conv_w(st, p + "downsampler.resample.1");
                 down_[i].ft = st.find(p + "downsampler.time_conv.weight") != nullptr ? 2 : 1;
@@ -440,16 +535,27 @@ void QiVae::grow(int64_t elems16, int64_t elems32, int64_t col16) {
     }
 }
 
-void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
+void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
     const int64_t HW = H * W;
+#if STRATA_ONEDNN
+    // oneDNN where it takes them (Intel GPUs), the bias and the residual within its pass: the 3 x 3 ones, and the 1 x 1
+    // ones that add to a residual (the others gained nothing over the library's product on the B70, 2026-11-02)
+    const int p = (int) c.k / 2;
+    if ((c.k == 3 || add) &&
+        conv::onednn(q_of(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p, c.b, add, out))
+        return;
+#endif
+#if STRATA_CUDNN
+    if ((c.k == 3 || add) && conv::cudnn(q_of(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, c.b, add, out)) return;
+#endif
     if (c.k == 1) {
-        gemm_.f16(in16, c.w, out, HW, c.out, c.in);
+        gemm_.f16(in16, c.w, out, HW, c.out, c.in, 0, false, add);
     } else {
         const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
         for (int64_t p0 = 0; p0 < HW; p0 += rows) {
             const int64_t n = std::min(rows, HW - p0);
             im2col3(in16, H, W, c.in, p0, n, col16_, s_);
-            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
+            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
         }
     }
     bias_add(out, c.b, nullptr, HW, c.out, s_);
@@ -457,20 +563,19 @@ void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
 
 void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin) {
     const int64_t HW = H * W, cout = r.c1.out;
-    float* y = x == t0_ ? t1_ : t0_;   // the block's output
     float* tmp = t2_;
     rms16(x, r.g1, HW, cin, true, a16_, s_);
     conv(r.c1, a16_, H, W, tmp);
     rms16(tmp, r.g2, HW, cout, true, a16_, s_);
-    conv(r.c2, a16_, H, W, y);
     if (r.sc.w != nullptr) {
+        float* y = x == t0_ ? t1_ : t0_;   // the block's output: the shortcut's channels are not x's
+        conv(r.c2, a16_, H, W, y);
         qi_to_f16(x, HW * cin, a16_, s_);
-        conv(r.sc, a16_, H, W, tmp);
-        qi_axpy(y, tmp, 1.0f, HW * cout, s_);
+        conv(r.sc, a16_, H, W, y, true);
+        x = y;
     } else {
-        qi_axpy(y, x, 1.0f, HW * cout, s_);
+        conv(r.c2, a16_, H, W, x, true);   // x itself takes the sum
     }
-    x = y;
 }
 
 void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g, const Conv& qkv_w, const Conv& proj) {
@@ -486,8 +591,7 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g,
     softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, qkv, HW, C, HW);   // O = P . V (V^T's rows are V's columns)
     qi_to_f16(qkv, HW * C, a16_, s_);
-    conv(proj, a16_, H, W, t2_);
-    qi_axpy(x, t2_, 1.0f, HW * C, s_);
+    conv(proj, a16_, H, W, x, true);
 }
 
 QiVae::Need QiVae::need(int64_t h, int64_t w) const {
@@ -508,6 +612,8 @@ QiVae::Need QiVae::need(int64_t h, int64_t w) const {
             n.big32 = std::max(n.big32, H * W * co);
             n.big16 = std::max(n.big16, H * W * co);
             unfold = std::max(unfold, H * W * 9 * co);
+            c = u.up.out;
+            continue;
         }
         c = co;
     }
@@ -539,11 +645,11 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
     while (t > 8 && scratch_bytes(t, t) > max_scratch) t -= 4;
     if (scratch_bytes(t, t) > max_scratch)
         throw std::runtime_error("image engine (VAE): not enough GPU memory for a tile of the image");
-    const int64_t ov = std::max<int64_t>(2, t / 4), step = t - ov, H = 16 * h, W = 16 * w, C = pq_.in;
+    const int64_t S = scale_, ov = std::max<int64_t>(2, t / 4), step = t - ov, H = S * h, W = S * w, C = pq_.in;
     const int64_t th = std::min(t, h), tw = std::min(t, w);
     float *sub = nullptr, *piece = nullptr, *wsum = nullptr;
     if (!gpu::alloc_device(&sub, (size_t) (C * th * tw) * 4) ||
-        !gpu::alloc_device(&piece, (size_t) ((int64_t) 4 * 256 * th * tw) * 4) ||
+        !gpu::alloc_device(&piece, (size_t) (4 * S * S * th * tw) * 4) ||
         !gpu::alloc_device(&wsum, (size_t) (H * W) * 4))
         throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
     gpu::memset_async(rgba, 0, (size_t) (4 * H * W) * 4, s_);
@@ -554,8 +660,8 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
             const int64_t xx = std::min(x0, w - tw);
             crop_latent(z, C, h, w, yy, xx, th, tw, sub, s_);
             decode_piece(sub, th, tw, piece);
-            blend_add(piece, 16 * th, 16 * tw, 16 * yy, 16 * xx, H, W, 16 * ov, yy > 0, yy + th < h, xx > 0,
-                      xx + tw < w, rgba, wsum, s_);
+            blend_add(piece, S * th, S * tw, S * yy, S * xx, H, W, S * ov, yy > 0, yy + th < h, xx > 0, xx + tw < w,
+                      rgba, wsum, s_);
             if (xx + tw >= w) break;
         }
         if (yy + th >= h) break;
@@ -583,7 +689,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
         const int64_t cin = c, co = u.r[0].c1.out;
         // the block's input, for its shortcut: in the buffer neither the residual blocks nor the upsampling write
         float* keep = nullptr;
-        if (u.up.out > 0) {
+        if (u.up.out > 0 && u.ft > 0) {
             keep = alloc<float>(allocs_, H * W * cin);
             gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
         }
@@ -595,18 +701,21 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
             up2x16(x, H, W, co, a16_, s_);
             float* y = x == t0_ ? t1_ : t0_;
             conv(u.up, a16_, 2 * H, 2 * W, y);
-            dupup_add(y, keep, H, W, cin, co, u.ft, s_);
-            gpu::stream_sync(s_);
-            release(allocs_, keep);
+            if (keep != nullptr) {
+                dupup_add(y, keep, H, W, cin, co, u.ft, s_);
+                gpu::stream_sync(s_);
+                release(allocs_, keep);
+            }
             x = y;
             H *= 2;
             W *= 2;
+            c = u.up.out;   // Wan 2.1's upsampler halves the channels
         }
     }
     rms16(x, gout_, H * W, c, true, a16_, s_);
     float* out = x == t0_ ? t1_ : t0_;
     conv(cout_, a16_, H, W, out);
-    to_rgba(out, H * W, rgba, s_);
+    to_rgba(out, H * W, cout_.out, rgba, s_);
     gpu::stream_sync(s_);
 }
 
@@ -647,14 +756,17 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
         throw std::invalid_argument("image engine (VAE): the sides must be multiples of 16");
     const Need nd = encode_need(H, W);
     grow(nd.big16, nd.big32, nd.col);
-    rgba_tokens16(rgba, H * W, ein_.in, a16_, s_);
+    rgba_tokens16(rgba, H * W, ein_.in, rgb_in_, a16_, s_);
     float* x = t0_;
     conv(ein_, a16_, H, W, x);
     int64_t c = ein_.out;
     for (const Down& d : down_) {
         const int64_t cin = c;
-        float* keep = alloc<float>(allocs_, H * W * cin);   // the block's input, for its shortcut
-        gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
+        float* keep = nullptr;   // the block's input, for its shortcut
+        if (d.ft > 0) {
+            keep = alloc<float>(allocs_, H * W * cin);
+            gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
+        }
         for (const Res& r : d.r) {
             resblock(r, x, H, W, c);
             c = r.c1.out;
@@ -673,9 +785,11 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
             x = y;
             fs = 2;
         }
-        avgdown_add(x, keep, H, W, cin, c, d.ft, fs, s_);
-        gpu::stream_sync(s_);
-        release(allocs_, keep);
+        if (keep != nullptr) {
+            avgdown_add(x, keep, H, W, cin, c, d.ft, fs, s_);
+            gpu::stream_sync(s_);
+            release(allocs_, keep);
+        }
         H /= fs;
         W /= fs;
     }

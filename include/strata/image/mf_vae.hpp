@@ -127,7 +127,8 @@ private:
     const float* upload(const std::vector<float>& v);
     Attn attn_w(class SafeTensors& st, const std::string& norm, const std::string (&qkv)[3], const std::string& proj,
                 int64_t C);
-    void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
+    // out = the convolution of in16 plus its bias, or out += that with `add` (a residual)
+    void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add = false);
     /// A 3 x 3 convolution of stride 2 (the input padded by one on the bottom and the right): out [H / 2][W / 2].
     void conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
     void gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu, uint16_t* y16);
