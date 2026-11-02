@@ -1360,6 +1360,35 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def helper(self, on: bool, timeout: float = 120.0) -> dict:
+        """`HELPER off|on` between requests (the caller holds the service's FIFO): the helper GPU's expert cache closed,
+        its VRAM given back for an image job there, or filled again from the RAM copy (a second or two).  -> the
+        engine's figures (experts, vram_free_mib, ms); ValueError with the engine's reason, EngineDied when it ended."""
+        proc = self.proc
+        if not self.alive() or proc is None or proc.stdin is None:
+            raise EngineDied("the engine is not running")
+        proc.stdin.write(f"HELPER {'on' if on else 'off'}\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the HELPER command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the HELPER command")
+            if line.startswith("HELPER "):
+                out: dict = {}
+                for kv in line.split()[2:]:
+                    k, _, v = kv.partition("=")
+                    out[k] = int(v) if v.lstrip("-").isdigit() else v
+                return out
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the HELPER command")
+
     def encode(self, ids_path: str, out_path: str, timeout: float = 600.0) -> dict:
         """`ENCODE <ids file> <states file>` between requests (the caller holds the service's FIFO; images.text_states):
         the prompt's states after the final norm into the file, the engine's conversation set aside and put back.
@@ -3159,6 +3188,14 @@ def engine_args(cfg: dict) -> list[str]:
         # "gpu_order": "as_given": the auto split keeps the cards in the config's order (upstream be8db787)
         if cfg.get("gpu_order") == "as_given" and "--split-order" not in args:
             args += ["--split-order", "as-given"]
+        # "split_skip_if_fits": true (opt-in, upstream 18ad40c0d): the first card alone when it holds every profiled
+        # expert with the KV
+        if cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
+            args.append("--split-skip-if-fits")
+        # the image jobs on a later card of the text model's (image_helper_card): that card is a helper expert cache
+        # or none, never a stage - the server closes a helper for each image job and opens it again after
+        if image_helper_card(cfg) and "--split-roles" not in args:
+            args += ["--split-roles", "helper"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
     # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
@@ -3329,6 +3366,23 @@ def child_env(cfg: dict) -> dict:
 SELECT_ENV = ("ONEAPI_DEVICE_SELECTOR", "ZE_AFFINITY_MASK", "HIP_VISIBLE_DEVICES")   # each narrows the GPUs listed
 
 
+def image_helper_card(cfg: dict) -> str:
+    """The "images" section's "gpu_pci" when it is one of the text engine's later cards ("split_pci", two cards in
+    all) and no other text engine of the server takes it: the engine then gives that card a helper expert cache's role
+    or none (--split-roles helper), and each image job runs there beside the chat while the helper is closed (images'
+    separate_turn).  On a B70 + RTX 4070 a split's later stage shrunk for an image read prompts at half the speed of
+    the first card alone (801 against 1,592 tok/s at 4K), and a helper closes in 29 ms and fills again in 1.9 s.
+    "" otherwise."""
+    images = cfg.get("images")
+    want = str((images or {}).get("gpu_pci") or "").lower() if isinstance(images, dict) else ""
+    later = [str(p).lower() for p in cfg.get("split_pci") or []]
+    if not want or len(later) != 1 or want != later[0] or cfg.get("replicas") or cfg.get("split_serve"):
+        return ""
+    if os.environ.get("STRATA_LAYER_SPLIT") == "off" or cfg.get("layer_split") not in (None, "", "auto"):
+        return ""
+    return want
+
+
 def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     """The image engine's environment, from the text engine's (`env`, child_env) -> (it, whether the image jobs have a
     card of their own (images_api.ImageModels' separate), the line the log says of it).  The "images" section's
@@ -3347,6 +3401,8 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     if isinstance(ss, dict):
         text |= {str(ss.get(k) or "").lower() for k in ("prefill_gpu", "decode_gpu")}
     text.discard("")
+    if want == image_helper_card(cfg):            # the text engine's helper card, handed over for each image job
+        text.discard(want)
     args = [str(a) for a in cfg.get("args") or []]
     why = ("a helper GPU (--expert-cache-device1..3) is named by its device number" if any(
         a.startswith("--expert-cache-device") for a in args) else
@@ -3358,6 +3414,9 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     out = dict(env, STRATA_GPU_PCI=want)
     if cfg.get("gpu") not in (None, ""):          # CUDA_VISIBLE_DEVICES of the text card alone would hide this one
         out.pop("CUDA_VISIBLE_DEVICES", None)
+    if want == image_helper_card(cfg):
+        return out, True, (f"image GPU: {want}, the text model's second card: a helper expert cache there is closed "
+                           "for each image job and opened again after it")
     return out, True, f"image GPU: {want} (separate from the text model's)"
 
 
@@ -9223,24 +9282,31 @@ def check_request_sampling(req) -> None:
 
 def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: list[str], lazy: bool):
     """Opt-in data-parallel replicas (serve/replicas.py, upstream 8d276c19): one StrataEngine per card group, each with
-    its own cards, log and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
+    its own cards, log and CPU cores; the ReplicaEngine in front spreads the requests.  On Linux the replicas share one
+    expert arena in RAM (upstream 3ccfd5aed, 378200894; "replica_shared_arena": false gives each its own copy), as
+    split serving's engines do: the first replica fills it, the others start after it and map what it filled."""
     from serve import replicas as rp
+    from serve import split as sp
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
+    arena, arena_fd, arena_note = sp.arena_path(cfg, {"shared_arena": cfg.get("replica_shared_arena", True)})
     print(f"[strata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, "
-          "a conversation back to its own",
+          f"a conversation back to its own; {arena_note}",
           flush=True)
     engines: list = [None] * n
     errors: list = []
 
     def one(i: int):
         rc = rp.replica_cfg(cfg, i, groups[i])
+        if arena:
+            rc["args"] = list(rc.get("args") or []) + ["--shared-expert-arena", arena]
         env = child_env(rc)
         env["STRATA_GPU_PCI"] = rc["gpu_pci"]           # its own card, whatever the server's environment names
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=env, lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=env, lazy=lazy, cpus=cpus[i] if cpus else None,
+                                      fds=(arena_fd,) if arena_fd is not None else ())
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -9249,7 +9315,11 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
         for i in range(n):
             one(i)
     else:
-        ts = [threading.Thread(target=one, args=(i,)) for i in range(n)]
+        rest = range(n)
+        if arena:                         # the arena filled once: the first replica, then the others beside each other
+            one(0)
+            rest = range(1, n) if not errors else range(0)
+        ts = [threading.Thread(target=one, args=(i,)) for i in rest]
         for t in ts:
             t.start()
         for t in ts:
@@ -9261,6 +9331,8 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
                     e.close()
                 except Exception:        # noqa: BLE001
                     pass
+        if arena_fd is not None:
+            os.close(arena_fd)
         i, e = errors[0]
         raise SystemExit(f"[strata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
@@ -9738,6 +9810,7 @@ def main() -> int:
             if said:
                 print(f"[strata] {said}", flush=True)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
+            svc.images.helper_card = image_helper_card(cfg)
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()

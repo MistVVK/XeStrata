@@ -128,7 +128,7 @@ Setup's options (given to `xestrata --setup`):
 | `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow's, MOSS-Image's and Anima's image model in 8 bits or not. `auto` keeps 16 bits when it fits the VRAM with the text encoder, 8 bits when it does not |
 | `--image-dit-keep on\|off` | `on` | Keeps Mage-Flow's image model not in use (the generation or the edit one) in RAM in 8 bits. `off` uses about 4.4 GB less RAM and reads it from the file again at each switch |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | What happens to the text model while an image is made ([below](#sharing-the-gpus-memory)); given together with `--images` |
-| `--image-gpu auto\|same\|<PCI>` | `auto` | The GPU that makes the images: `auto` the one with the most VRAM of the GPUs the text model does not take and that are not the processor's own (else the text model's GPU), `same` the text model's GPU, a PCI address (as `--check` lists it) that GPU; given together with `--images` |
+| `--image-gpu auto\|same\|<PCI>` | `auto` | The GPU that makes the images: `auto` the one with the most VRAM of the GPUs the text model does not take and that are not the processor's own (else, when the text model takes two GPUs, its second, otherwise the text model's GPU), `same` the text model's GPU, a PCI address (as `--check` lists it) that GPU; given together with `--images` |
 
 Mage-Flow in 8 bits multiplies both the weights and the activations in int8 where the GPU's math library has int8 products (contrib-llvm on Intel and NVIDIA, and AMD), in the form of ComfyUI's int8_convrot; on other GPUs it is Q8_0.
 Qwen-Image-2.1's image model too is multiplied in int8 on a GPU with int8 products.
@@ -366,6 +366,9 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 Image jobs run on the GPU one at a time.
 When a GPU the text model does not take is the images' (`--image-gpu`), the images are made there and the chat is answered meanwhile; the text model stays as it is.
 The start's log says `image GPU: <PCI> (separate from the text model's)`.
+When the text model takes two GPUs and its second is the images' (`--image-gpu auto` on a PC with two), the text model does not run a layer split's stage there: it makes that GPU a helper expert cache (when that is predicted faster than its first GPU alone) or leaves it.
+With a helper there, the server closes it before each image job and hands the GPU to the image (tens of ms), and the text model answers on its first GPU meanwhile. After the image, once no other image job has come for 2 s, it opens the helper again with what the GPU has free (a second or so, from RAM).
+A split's second stage shrunk to share the GPU with the images read prompts at less than half the speed of the first GPU alone (B70 + RTX 4070), hence this.
 When the text model takes that GPU too (a layer split, replicas, a `--gpu` for one start), or a helper GPU (`--expert-cache-device1..3`) or an environment variable that narrows the GPUs (`ONEAPI_DEVICE_SELECTOR` and the like) is there, the log says so and the images take turns on the text model's GPU.
 On the text model's GPU, before a job the engine says the VRAM the image needs (the least, and enough to hold the whole image model and run the VAE in one pass), and the server decides what happens to the text model with `--image-gpu-policy`.
 

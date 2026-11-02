@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <immintrin.h>
 
 namespace strata::core {
 namespace {
@@ -148,7 +149,7 @@ void RemoteExperts::close() {
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
                          const std::vector<std::pair<int32_t, int32_t>>& ranked,
                          const ExpertCache& primary, ExpertSource& source,
-                         std::vector<uint8_t>& claimed, std::string& err) {
+                         std::vector<uint8_t>& claimed, std::string& err, bool fit) {
     close();
     if (device < 1 || device >= Runtime::count() || slots <= 0 || ranked.empty() ||
         layers <= 0 || experts <= 0 || claimed.size() != (size_t) layers * (size_t) experts) {
@@ -175,8 +176,10 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
             if (pair.first < 0 || pair.first >= layers || pair.second < 0 || pair.second >= experts) continue;
             const size_t index = (size_t) pair.first * (size_t) experts + (size_t) pair.second;
             if (primary.slot_of(pair.first, pair.second) < 0 && !claimed[index] && !picked[index]) {
+                const uint64_t blob = lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+                if (fit && needed + blob + (512ull << 20) > free_bytes) break;
                 selected.push_back(pair);
-                needed += lay.native ? (lay.blob_bytes(pair.first) + 255) / 256 * 256 : lay.max_blob;
+                needed += blob;
                 picked[index] = 1;
                 if ((int) selected.size() >= slots) break;
             }
@@ -371,6 +374,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         return false;
     }
     ++launched_layers_;
+    launched_at_ = std::chrono::steady_clock::now();
     returned_bytes_ += compact_bytes;
     full_row_bytes_ += (uint64_t) n * h_ * sizeof(float);
     return true;
@@ -378,15 +382,38 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 
 bool RemoteExperts::finish(float* out, std::string& err) {
     if (group_id_.empty()) return true;
+    // This thread polls the helper's queue while it runs, as upstream's CUDA helper spins (cudaDeviceScheduleSpin):
+    // a wait in the driver is a barrier submitted and a sleep woken by an interrupt, every layer of every window, on
+    // the decode's critical path once the CPU pool is done.  The polling stops 4x the helper's layer time after the
+    // launch (begin to done, a moving average; none yet: the first wait blocks), then blocks as before, so a stuck
+    // GPU still reaches the runtime's watchdog.  STRATA_REMOTE_SPIN=0 always blocks.
+    static const bool spin = [] {
+        const char* v = std::getenv("STRATA_REMOTE_SPIN");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
     const auto w0 = std::chrono::steady_clock::now();
     try {
         const OnDevice on(device_);
-        if (!gpu::stream_sync(stream_)) { err = failed(device_, "finish"); return false; }
+        bool done = false;
+        if (spin && run_avg_ms_ > 0) {
+            const auto bound = launched_at_ + std::chrono::duration<double, std::milli>(4.0 * run_avg_ms_);
+            for (;;) {
+                const gpu::Status st = gpu::stream_status(stream_);
+                if (st == gpu::Status::Failed) { err = failed(device_, "finish"); return false; }
+                if (st == gpu::Status::Done) { done = true; break; }
+                if (std::chrono::steady_clock::now() > bound) break;
+                for (int i = 0; i < 16; ++i) _mm_pause();
+            }
+        }
+        if (!done && !gpu::stream_sync(stream_)) { err = failed(device_, "finish"); return false; }
     } catch (const std::exception& e) {
         err = "GPU" + std::to_string(device_) + " experts: " + e.what();
         return false;
     }
-    ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    const auto w1 = std::chrono::steady_clock::now();
+    ms_wait_ += std::chrono::duration<double, std::milli>(w1 - w0).count();
+    const double run = std::chrono::duration<double, std::milli>(w1 - launched_at_).count();
+    run_avg_ms_ = run_avg_ms_ > 0 ? 0.9 * run_avg_ms_ + 0.1 * run : run;
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * h_, h_out_ + i * h_, (size_t) h_ * sizeof(float));
     return true;

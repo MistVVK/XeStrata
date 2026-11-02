@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -43,10 +44,12 @@ public:
     /// Initialise the device before the host expert arena registers
     /// tens of GiB of portable mapped memory with CUDA.
     static bool preflight(int device, double& free_gib, std::string& err);
+    /// `fit`: up to `slots` as far as the device's free memory takes them (HELPER on, after an image job that kept
+    /// part of the card), instead of refusing when they do not all fit.
     bool open(int device, int slots, int64_t layers, int64_t experts,
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
-              std::vector<uint8_t>& claimed, std::string& err);
+              std::vector<uint8_t>& claimed, std::string& err, bool fit = false);
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
@@ -93,6 +96,8 @@ private:
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
+    std::chrono::steady_clock::time_point launched_at_;   ///< begin()'s last launch
+    double run_avg_ms_ = 0;    ///< launch to done, a moving average: how long finish() polls before it blocks
     ExpertCache cache_;
     void* stream_ = nullptr;
     void* read_stream_ = nullptr;   ///< STRATA_PREFILL_HELPER_SOURCE: cache -> host copies

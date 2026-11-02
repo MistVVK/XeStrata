@@ -89,10 +89,15 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   Up to four GPUs every order is tried, from five on the order by bandwidth (the fastest last); the config's order changes only for one predicted 2% faster or more.
   The first GPU is set when the engine starts and is not swapped, but when another first GPU is predicted faster, the log names the cards' order to set.
 - A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
+- The misses left to the CPU are priced without those the route tail skip (default rank 7, [DETAILS](DETAILS.md)) neither reads nor computes.
+- With `--pipeline-windows 2` a window is priced at its slowest stage, not the stages' sum: the first GPU runs the next window while the later ones verify this one, so a balanced split is the faster one.
+- Last, the first GPU alone is priced too: unless the second GPU's role (split or helper) is predicted 5% shorter, the first GPU runs alone (`STRATA_SPLIT_GAIN_PCT`). On a B70 + RTX 4070 the first GPU alone decoded IQ3_XXS fastest (32K: 104 tok/s, the helper 96, the split 79; predicted 12.0, 12.1 and 12.3 ms), and the helper won with IQ3_S and with both GPUs at 12 GiB (predicted 9% shorter or more).
+- `--split-roles helper` (the server's, when it makes images on the second GPU) gives the second GPU a helper cache's role or none: a helper can be closed and opened again between requests (`HELPER off` / `HELPER on`; [IMAGE](IMAGE.md)).
+- `--split-skip-if-fits` (`"split_skip_if_fits": true` in the config; opt-in, upstream 18ad40c0d) runs on the first GPU alone when its cache holds every profiled pair beside the session, the drafter and the reserve: a split would only add hand-offs.
 - With two GPUs, the second is also priced, with the same model, as a helper cache (as `--expert-cache-device1`) instead of a stage, and the helper is taken only when its time is more than 5% shorter.
   The model prices decode only: the split reads a prompt on both GPUs, while with the helper the first GPU reads every layer. On two cards of one kind, a helper predicted slightly faster took 1.8 times the split's time to read a prompt.
   The first GPU then runs every layer, and the second holds the experts the first one's cache does not, as many as its free VRAM takes, and computes those of them that decode would have given the CPU (and, in a short prompt, those few tokens route to: [DETAILS](DETAILS.md#prefill-tokenss)).
-  The prediction counts the round trip over its link each layer (the inputs there, the results back).
+  The prediction counts, each layer, the launches and the wait measured on the second GPU at start and the round trip over its link (the inputs there, the results back).
   The log shows which one wins (`as a helper expert cache instead: ... -> the helper`).
   With `--pipeline-windows`, `--no-pool` or `--batch` the split stays.
 
@@ -106,6 +111,8 @@ Environment variables change the model's assumptions:
 | `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
 | `STRATA_SPLIT_HELPER_GAIN_PCT` | 5 | how much shorter (%) the helper cache's predicted time must be to be taken; 0 takes it when shorter at all |
 | `STRATA_SPLIT_ROLE` | predicted | the second GPU's role with two GPUs: `split` a stage, `helper` the helper cache |
+| `STRATA_SPLIT_GAIN_PCT` | 5 | how much shorter (%) the second GPU's role must be predicted than the first GPU alone; also the helper against the split (unless `STRATA_SPLIT_HELPER_GAIN_PCT` is set) |
+| `STRATA_REMOTE_SPIN` | 1 | the host polls for the helper cache's results each layer (as upstream's CUDA helper spins); 0 waits in the driver |
 
 `--vram-reserve-later-mib N` is the VRAM left free on the second and later GPUs (default: `--vram-reserve-mib`'s value; upstream 5c4105c0).
 The GPU that drives the monitors needs more headroom than one that drives none.
@@ -162,7 +169,7 @@ An entry may add `"env"` and `"args"`.
 - A request goes to the replica with the lowest cost: the prompt tokens it would read again and the requests running there. A conversation's next turn goes back to its replica unless another is much less busy.
 - On Linux every replica gets physical cores of its own (`"replica_cpus": false` turns that off).
 - A replica that stopped is started again in the background; the others keep serving.
-- Every replica keeps its own copy of the model's experts in RAM: check that the RAM holds them.
+- On Linux the replicas keep one copy of the model's experts in RAM and share it (upstream 3ccfd5aed, 378200894). The first replica fills it; the others start after it and skip the read. `"replica_shared_arena": false` gives each replica its own copy (the RAM for as many copies as replicas). On Windows each replica keeps its own.
 
 ## Read the prompt on one card, make the answer on another (split serving, opt-in)
 

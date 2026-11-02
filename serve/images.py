@@ -154,6 +154,7 @@ MIN_SIDE = 256
 MAX_N = 16                         # "max_n": the most images one request makes
 BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
 UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
+HELPER_REOPEN_S = 2.0              # an image job closed the text engine's helper: filled again after this long idle
 # img2img's strength when a request gives none (a model without edits, an image and no mask), at most: the denoise of
 # ComfyUI's own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img), lowered for a model of few steps
 # (img2img_strength).  An edit's, and a mask's alone, is 1.0, the default denoise of ComfyUI's KSampler (nodes.py)
@@ -2102,6 +2103,10 @@ class ImageModels:
 
     def __init__(self, cfgs: list[dict], log=None, env: dict | None = None, separate: bool = False):
         self.separate = separate     # `env` names a card no text engine of the server takes (the policy separate)
+        # the text engine's helper card, when the jobs run there (server.image_helper_card): closed for each job
+        self.helper_card = ""
+        self.helper_jobs = 0
+        self.helper_lock = threading.Lock()
         self.gens: dict[str, ImageGen] = {}
         for c in cfgs:
             g = ImageGen(c, log=log, env=env)
@@ -2766,6 +2771,49 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
+def _helper_off(svc, gen: ImageGen, models, cancel: threading.Event | None) -> bool:
+    """Before a job on the text engine's helper card (ImageModels.helper_card): the helper closed (`HELPER off`, the
+    service's turn for that command alone), so the image engine has the card; the text engine decodes on its first
+    card meanwhile.  False where the engine runs no helper there (it chose its first card alone: the card is free)."""
+    card = getattr(models, "helper_card", "")
+    eng = svc.engine
+    info = getattr(eng, "info", None) or {}
+    if not card or str(info.get("helper_pci", "")).lower() != card or not hasattr(eng, "helper"):
+        return False
+    with models.helper_lock:
+        models.helper_jobs += 1
+    try:
+        with svc._turn(cancel):
+            r = eng.helper(False)
+        gen._say(f"image job: the text model's helper GPU handed over ({r.get('vram_free_mib', '?')} MiB free there, "
+                 f"{r.get('ms', '?')} ms)")
+    except Exception as e:                       # noqa: BLE001 - the job still runs, on what the card has free
+        gen._say(f"image job: the text model's helper GPU was not handed over ({e})")
+    return True
+
+
+def _helper_on_later(svc, gen: ImageGen, models) -> None:
+    """After a job that closed the helper: open it again (`HELPER on`, the service's turn for that command, a second
+    or two to fill from RAM) once no other image job of this server has started within HELPER_REOPEN_S, so a run of
+    image requests does not close and fill it each time."""
+    with models.helper_lock:
+        models.helper_jobs -= 1
+
+    def reopen():
+        time.sleep(HELPER_REOPEN_S)
+        with models.helper_lock:
+            if models.helper_jobs > 0:
+                return
+            try:
+                with svc._turn():
+                    r = svc.engine.helper(True)
+                gen._say(f"image jobs done: the text model's helper GPU filled again ({r.get('experts', '?')} experts, "
+                         f"{r.get('ms', '?')} ms)")
+            except Exception as e:               # noqa: BLE001 - the text engine decodes on its first card meanwhile
+                gen._say(f"image jobs done: the text model's helper GPU was not filled again ({e})")
+    threading.Thread(target=reopen, daemon=True, name="helper-reopen").start()
+
+
 @contextlib.contextmanager
 def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """gpu_turn on a card no text engine takes: only that GPU's turn (GpuTurn), so chat requests run meanwhile and the
@@ -2790,6 +2838,7 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
             gen.totals["failed"] += 1
             raise
         check_room(need, ram_available_mib())
+        handed = _helper_off(svc, gen, models, cancel)
         try:
             budget = gen.fit()
             gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT resident "
@@ -2798,6 +2847,8 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
         finally:
             _give_back(svc, gen, "separate", None)
             svc.last_request_at = time.time()
+            if handed:
+                _helper_on_later(svc, gen, models)
     except BaseException as e:
         error = str(e) or type(e).__name__
         raise

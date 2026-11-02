@@ -4329,8 +4329,10 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
 def image_gpu(a, cfg: dict) -> str | None:
     """--image-gpu -> the PCI address of the card the image jobs take on their own (the "images" section's "gpu_pci",
     serve/server.py's image_env), or None for the text model's.  auto: a usable discrete GPU that no text engine of
-    `cfg` takes (its "gpu_pci" and "split_pci", the replicas' cards among them), the one with the most VRAM; none
-    when the config names no text card (one GPU)."""
+    `cfg` takes (its "gpu_pci" and "split_pci", the replicas' cards among them), the one with the most VRAM; when the
+    text model takes every card and has exactly one later card, that card (the server lends it to each image job:
+    a helper expert cache there closes for it, serve/server.py image_helper_card); none when the config names no
+    text card (one GPU)."""
     want = getattr(a, "image_gpu", None) or "auto"
     if want == "same":
         return None
@@ -4343,8 +4345,11 @@ def image_gpu(a, cfg: dict) -> str | None:
         return g["pci"]
     text = {cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])} - {None}
     free = [x for x in usable if x["pci"] not in text and not x.get("integrated")]
-    if not text or not free:
+    if not text:
         return None
+    if not free:
+        later = cfg.get("split_pci") or []
+        return later[0] if len(later) == 1 and not cfg.get("replicas") else None
     return max(free, key=lambda x: x["vram_gb"])["pci"]
 
 
@@ -4354,7 +4359,13 @@ def place_images(a, cfg: dict) -> None:
         return
     pci = image_gpu(a, cfg)
     cfg["images"].pop("gpu_pci", None)
-    if pci and pci in {cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])}:
+    later = cfg.get("split_pci") or []
+    if pci and len(later) == 1 and pci == later[0] and not cfg.get("replicas"):
+        g = next(x for x in gpus() if x["pci"] == pci)
+        cfg["images"]["gpu_pci"] = pci
+        ok(f"image GPU: {gpu_name(g)}, the text model's second card: lent to each image job (the text model uses it "
+           "as a helper expert cache, or not at all when the first card is as fast alone)")
+    elif pci and pci in {cfg.get("gpu_pci"), *later}:
         warn(f"--image-gpu {pci}: the text model takes that GPU too, so the image jobs share it (one at a time)")
     elif pci:
         g = next(x for x in gpus() if x["pci"] == pci)

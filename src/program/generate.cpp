@@ -458,6 +458,14 @@ struct Options {
     /// GPU, sharing everything - the bit-exact A/B of the hand-off)
     std::string split_device;
     bool split_order_given = false;   ///< --split-order as-given: the auto layer split keeps the GPUs' order
+    /// --split-skip-if-fits (opt-in, upstream 18ad40c0d; the server passes it for a config's "split_skip_if_fits"): with
+    /// --layer-split auto, CUDA0 alone when its cache holds every profiled pair beside the session, the drafter and the
+    /// reserve - a split then only adds the hand-offs
+    bool split_skip_if_fits = false;
+    /// --split-roles any|helper: the second GPU's roles --layer-split auto chooses from.  helper (the server's, when it
+    /// also makes images): a helper expert cache or none, never a stage - a helper can be closed for an image job and
+    /// opened again between requests, a stage cannot (HELPER off / on, the serve loop)
+    bool split_roles_helper = false;
     /// Plan v0.3 P8: stay resident and take requests on stdin (see the --serve block in main).
     bool serve = false;
     /// The vision path: keep a per-cell (t, h, w) rotary position table so --serve can take GENI requests.
@@ -761,6 +769,9 @@ void usage() {
                  "                       auto chooses K from what this PC measures, before loading\n"
                  "  --gpu ADDR           the GPU by PCI address (domain:bus:device.function), as STRATA_GPU_PCI\n"
                  "  --split-device D[,D2..]  the GPU for each split point, by engine number or PCI address\n"
+                 "  --split-skip-if-fits  --layer-split auto: CUDA0 alone when it holds every profiled expert\n"
+                 "  --split-roles any|helper  --layer-split auto: the second GPU a stage or a helper cache (any), or\n"
+                 "                       a helper cache only (helper: the server's when it makes images there)\n"
                  "  --split-order auto|as-given  auto (default): --layer-split auto also chooses which of the later\n"
                  "                       GPUs runs which stage; as-given keeps the order of --split-device\n"
                  "                       (default: the other discrete GPUs)\n"
@@ -1655,6 +1666,48 @@ double probe_copy_latency_ms() {
     if (ms.empty()) return -1.0;
     std::sort(ms.begin(), ms.end());
     return ms[ms.size() / 2];
+}
+
+// A helper GPU's fixed cost a layer (RemoteExperts::begin and finish): a small upload and three small commands on one
+// of its streams, then polled until done, the median of 16 after one warm-up.  `submit_ms`: the host's part, the
+// submissions, which come before the CPU pool's work; the return: launch to done.  -1 where it could not run.
+double probe_helper_layer_ms(double& submit_ms) {
+    constexpr size_t kMeta = (size_t) 2 << 10, kBytes = (size_t) 64 << 10;
+    submit_ms = -1.0;
+    void* h = nullptr;
+    void* d = nullptr;
+    strata::gpu::Stream s = strata::gpu::stream_create();
+    if (s == nullptr) return -1.0;
+    if (!strata::gpu::alloc_host(&h, kMeta) || !strata::gpu::alloc_device(&d, kBytes)) {
+        if (h != nullptr) strata::gpu::free(h);
+        strata::gpu::stream_destroy(s);
+        return -1.0;
+    }
+    std::memset(h, 0, kMeta);
+    std::vector<double> sub, all;
+    for (int i = 0; i < 17; ++i) {
+        const Clock::time_point t0 = Clock::now();
+        bool ok = strata::gpu::copy_async(d, h, kMeta, s);
+        for (int c = 0; c < 3 && ok; ++c) ok = strata::gpu::memset_async((char*) d + kMeta, c, kBytes - kMeta, s);
+        if (!ok) break;
+        const Clock::time_point t1 = Clock::now();
+        strata::gpu::Status st = strata::gpu::Status::Pending;
+        while ((st = strata::gpu::stream_status(s)) == strata::gpu::Status::Pending) std::this_thread::yield();
+        if (st == strata::gpu::Status::Failed) break;
+        if (i > 0) {
+            sub.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            all.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        }
+    }
+    strata::gpu::stream_sync(s);
+    strata::gpu::free(d);
+    strata::gpu::free(h);
+    strata::gpu::stream_destroy(s);
+    if (all.empty()) return -1.0;
+    std::sort(sub.begin(), sub.end());
+    std::sort(all.begin(), all.end());
+    submit_ms = sub[sub.size() / 2];
+    return all[all.size() / 2];
 }
 
 // The PCIe share of the missed experts for a link measured at `gbps`: `base` (the share measured on x16 links) from
@@ -2557,6 +2610,8 @@ int main(int argc, char** argv) {
         else if (a == "--gpu") (void) next("--gpu");   // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-order") o.split_order_given = std::strcmp(next("--split-order"), "as-given") == 0;
+        else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
+        else if (a == "--split-roles") o.split_roles_helper = std::strcmp(next("--split-roles"), "helper") == 0;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
@@ -3623,7 +3678,17 @@ int main(int argc, char** argv) {
                        ? copy_ms[(size_t) d] + hand_bytes / (link_gbps[(size_t) d] * 1e6) : 0.05;
         };
         const bool drafts = !o.mtp.empty();
+        // the CPU's share of the misses left by the route tail skip (STRATA_ROUTE_TAIL_SKIP, rank 7 by default without
+        // --batch, below): the entries at rank >= R of the Ka routed are neither read nor computed, taken as that share
+        // of the missed bytes (#53: one RTX 4070 Ti skipped about 36% of its misses, the ranks 7 to 9 being 30% of the
+        // routes, and the misses leaning to the low ranks).  Every placement skips, a helper GPU's experts excepted.
+        const int tail_r = [&] {
+            const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+            return v != nullptr ? (int) std::strtol(v, nullptr, 10) : o.batch <= 0 ? 7 : 0;
+        }();
+        const double tail_keep = tail_r > 0 && tail_r < Ka ? (double) tail_r / (double) Ka : 1.0;
         // the predicted window time (ms) of a placement (`at`: the split points; empty: CUDA0 alone)
+        const bool pipelined = o.pipeline_windows >= 2;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         bool startable = true;   // predict's: every stage can start its prompt path
         auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
@@ -3649,32 +3714,47 @@ int main(int argc, char** argv) {
                 layer_held[(size_t) l] += mass[r];
                 ++held;
             }
-            double ms = 0, all = 0, kept = 0;
-            for (int i = 1; i < nst; ++i) ms += side_ms(ord[(size_t) i - 1]) + side_ms(ord[(size_t) i]);
+            double hand = 0, all = 0, kept = 0;
+            std::vector<double> stage_ms((size_t) nst, 0.0);
+            for (int i = 1; i < nst; ++i) hand += side_ms(ord[(size_t) i - 1]) + side_ms(ord[(size_t) i]);
             for (int64_t l = 0; l < L; ++l) {
                 int st = 0;
                 while (st + 1 < nst && l >= at[(size_t) st]) ++st;
                 const int d = ord[(size_t) st];
                 const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
                 const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
-                ms += dense_layer / bw[(size_t) d] +
-                      std::max(experts * hit / bw[(size_t) d], experts * (1.0 - hit) / cpu_bw * link_scale[(size_t) d]);
+                stage_ms[(size_t) st] += dense_layer / bw[(size_t) d] +
+                                         std::max(experts * hit / bw[(size_t) d],
+                                                  experts * (1.0 - hit) * tail_keep / cpu_bw * link_scale[(size_t) d]);
                 all += layer_mass[(size_t) l];
                 kept += layer_held[(size_t) l];
             }
             // the last stage's own work: the head once a window and, with --mtp, the draft layer for each draft
             // (taken as one layer's dense weights: its experts are left out)
             const int last = ord[(size_t) nst - 1];
-            ms += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) / bw[(size_t) last];
+            stage_ms[(size_t) nst - 1] += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) /
+                                          bw[(size_t) last];
             held_mass = all > 0 ? kept / all : 1.0;
+            // --pipeline-windows 2: the first GPU runs the next window while the later ones verify this one, so a
+            // window takes about its slowest stage, not their sum, and the balanced split wins.  Priced as the sum,
+            // auto chose K=47 on a B70 + RTX 4070 (IQ2_XS), where the pipeline lost 17 to 27%, and K=24 gained 5 to 22%
+            // (docs/MULTIGPU.md)
+            if (pipelined && nst > 1) return hand + *std::max_element(stage_ms.begin(), stage_ms.end());
+            double ms = hand;
+            for (const double t : stage_ms) ms += t;
             return ms;
         };
+        bool alone_holds_all = false;   // CUDA0's cache alone takes every profiled pair (--split-skip-if-fits)
+        double alone_ms = 0;            // CUDA0 alone's predicted window (the last choice below)
         {
             double hm = 0;
             int64_t held = 0;
             const double one = predict({}, hm, held);
+            alone_ms = startable ? one : 1e30;
+            alone_holds_all = startable && held == (int64_t) prof.size();
             std::fprintf(stderr, "strata generate: layer split auto: CUDA0 alone would take %.1f ms per window (~%.1f%% "
-                                 "of the routed mass cached)\n", one, 100.0 * hm);
+                                 "of the routed mass cached%s)\n", one, 100.0 * hm,
+                         alone_holds_all ? ", every profiled pair" : "");
         }
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;
@@ -3917,9 +3997,10 @@ int main(int argc, char** argv) {
         split_auto = false;   // from here on, as an explicit --layer-split
         std::string ks;
         for (const int64_t k : split_at) ks += (ks.empty() ? "" : ",") + std::to_string(k);
-        std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window; the caches "
+        std::fprintf(stderr, "strata generate: layer split auto: K=%s - predicted %.1f ms per decode window%s; the caches "
                              "hold %lld of %zu profiled pairs (~%.1f%% of the routed mass)\n", ks.c_str(), best_ms,
-                     (long long) best_held, prof.size(), 100.0 * best_mass);
+                     pipelined ? " (--pipeline-windows 2: its slowest stage)" : "", (long long) best_held, prof.size(),
+                     100.0 * best_mass);
         // a near tie on a mixed pair (upstream 8bb250d8, #1428): the model prices a decode window only, not the prompt,
         // and on cards of different speed or link the winner can flip within a few percent of its error: name the
         // other split that is almost as good, so the user can try it.  Only printed, the choice stays.
@@ -3961,7 +4042,27 @@ int main(int argc, char** argv) {
         // slots (their groups run one a GPU on a split; the helper was not tried with them).
         const char* role_env = std::getenv("STRATA_SPLIT_ROLE");
         const std::string role = role_env != nullptr ? role_env : "";
-        if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split") {
+        // the margin a second GPU's role must win by against the next choice (the model's error, #34): the helper
+        // against the split, and either against CUDA0 alone (below)
+        const char* gain_env = std::getenv("STRATA_SPLIT_GAIN_PCT");
+        const double gain = (gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0) / 100.0;
+        double chosen_ms = o.split_roles_helper ? 1e30 : best_ms;   // the second GPU's role, as predicted
+        std::string chosen = o.split_roles_helper ? "none" : "the split at K=" + ks;
+        if (o.split_roles_helper) o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
+        if (o.split_skip_if_fits && alone_holds_all && role.empty()) {
+            // upstream 18ad40c0d: every profiled pair in CUDA0's cache beside its session, drafter and reserve (the
+            // room predict() gives a lone CUDA0); a split would only add hand-offs.  Two R9700-class cards, upstream:
+            // 4K 1,244 -> 1,776 tok/s, decode 51 -> 60, 16K prompts 5% slower.
+            std::fprintf(stderr, "strata generate: layer split skipped (--split-skip-if-fits): CUDA0 holds every one of "
+                                 "the %zu profiled pairs with the session, the drafter and the reserve - one GPU\n",
+                         prof.size());
+            split_devs.clear();
+            split_at.clear();
+            o.layer_split.clear();
+            o.pipeline_windows = 0;   // a split's own (its 2 for two Xe2 GPUs, above)
+            multi_gpu = false;
+            chosen_ms = -1;           // decided
+        } else if (ns == 2 && !o.no_pool && o.pipeline_windows <= 0 && o.batch <= 0 && role != "split") {
             const int h = 1;   // the second GPU's index in the measurements above
             std::vector<double> held0_l((size_t) L, 0.0), heldh_l((size_t) L, 0.0);
             const int64_t cap0 = std::max<int64_t>(cap_raw(0, 0, -1, true), 0);
@@ -3983,16 +4084,31 @@ int main(int argc, char** argv) {
                 heldh_l[(size_t) l] += mass[r];
                 ++nh;
             }
-            const double rt = 2.0 * side_ms(h);
+            // its round trip a layer it computes in: the commands and the wait measured on it (the probe above), and
+            // the window's activations there and its rows back over its link; the submissions are the host's, before
+            // the CPU pool's work.  Priced as two copies of a stage hand-off before (#53: predicted 40.8 ms a window
+            // against CUDA0's 50.4 alone, measured 15% slower)
+            double submit_ms = 0.0, layer_ms = 0.0;
+            {
+                const strata::core::OnDevice on(dev_of_stage(h));
+                layer_ms = probe_helper_layer_ms(submit_ms);
+            }
+            if (layer_ms < 0.0) {
+                layer_ms = 2.0 * side_ms(h);
+                submit_ms = 0.0;
+            }
+            const double rt = layer_ms + (link_gbps[(size_t) h] > 0.0 ? 2.0 * hand_bytes / (link_gbps[(size_t) h] * 1e6) : 0.0);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d as a helper: %.3f ms a layer it computes in "
+                                 "(%.3f ms of it the host's submissions)\n", dev_of_stage(h), rt, submit_ms);
             double ms = 0, kept = 0, all = 0;
             for (int64_t l = 0; l < L; ++l) {
                 const double lm = layer_mass[(size_t) l];
                 const double hit0 = lm > 0 ? held0_l[(size_t) l] / lm : 1.0, hith = lm > 0 ? heldh_l[(size_t) l] / lm : 0.0;
                 const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
                 const double gpu = experts * hit0 / bw[0];
-                const double cpu = experts * std::max(0.0, 1.0 - hit0 - hith) / cpu_bw * link_scale[0];
+                const double cpu = experts * std::max(0.0, 1.0 - hit0 - hith) * tail_keep / cpu_bw * link_scale[0];
                 const double help = hith > 0 ? experts * hith / bw[(size_t) h] + rt : 0.0;
-                ms += dense_layer / bw[0] + std::max({gpu, cpu, help});
+                ms += dense_layer / bw[0] + (hith > 0 ? submit_ms : 0.0) + std::max({gpu, cpu, help});
                 kept += held0_l[(size_t) l] + heldh_l[(size_t) l];
                 all += lm;
             }
@@ -4001,10 +4117,11 @@ int main(int argc, char** argv) {
             // prices decode only, and the split reads a prompt on both GPUs, the helper every layer on CUDA0: on two
             // B70s the helper, predicted 1.7% faster, read a 2.5K prompt in 1.8x the time and decoded slower; on a
             // B70 + RTX 4070 (IQ3_XXS, serve) predicted 2.4 to 3% faster, it read 4K 21% faster and 32K as fast,
-            // and decoded 32K 10 to 25% slower (2026-10-21).  STRATA_SPLIT_HELPER_GAIN_PCT: the margin, 0 = any.
-            const char* gain_env = std::getenv("STRATA_SPLIT_HELPER_GAIN_PCT");
-            const double gain_pct = gain_env != nullptr ? std::strtod(gain_env, nullptr) : 5.0;
-            const bool faster = ms < best_ms * (1.0 - gain_pct / 100.0);
+            // and decoded 32K 10 to 25% slower (2026-10-21).  With --split-roles helper the split is no choice.
+            // STRATA_SPLIT_HELPER_GAIN_PCT: this margin alone, 0 = any (STRATA_SPLIT_GAIN_PCT otherwise).
+            const char* hgain_env = std::getenv("STRATA_SPLIT_HELPER_GAIN_PCT");
+            const double hgain = hgain_env != nullptr ? std::strtod(hgain_env, nullptr) / 100.0 : gain;
+            const bool faster = o.split_roles_helper || ms < best_ms * (1.0 - hgain);
             const bool helper = nh > 0 && (role == "helper" || (role.empty() && faster));
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d as a helper expert cache instead: %.1f ms per "
                                  "decode window (%lld more experts there, ~%.1f%% of the routed mass on the GPUs) "
@@ -4012,9 +4129,12 @@ int main(int argc, char** argv) {
                          dev_of_stage(h), ms, (long long) nh, all > 0 ? 100.0 * kept / all : 0.0, best_ms, ks.c_str(),
                          helper ? "the helper" : "the split",
                          !role.empty() ? " (STRATA_SPLIT_ROLE)"
+                         : o.split_roles_helper ? " (--split-roles helper)"
                          : !helper && nh > 0 && ms < best_ms ? " (not faster by STRATA_SPLIT_HELPER_GAIN_PCT; the "
                                                                "split also reads the prompt on both GPUs)" : "");
             if (helper) {
+                chosen_ms = ms;
+                chosen = "the helper";
                 o.expert_cache_remote[0] = (int) nh;
                 remote_dev[0] = dev_of_stage(h);
                 split_devs.clear();
@@ -4022,6 +4142,24 @@ int main(int argc, char** argv) {
                 o.layer_split.clear();
                 multi_gpu = false;
             }
+        }
+        // CUDA0 alone, last: the second GPU only when its role is predicted shorter than CUDA0 alone by the margin.
+        // On a B70 + RTX 4070 (serve, 4K and 32K) CUDA0 alone decoded IQ3_XXS fastest (78 / 104 tok/s against the
+        // helper's 78 / 96 and the split's 90 / 79; predicted 12.0 ms against 12.1 and 12.3), and the helper won where
+        // it was predicted 9% faster or more (IQ3_S; both GPUs at 12 GiB).  A second GPU left alone is free for the
+        // images (serve's separate image card).  STRATA_SPLIT_ROLE names a role whatever the prediction.
+        if (chosen_ms >= 0 && role.empty() && !(chosen_ms < alone_ms * (1.0 - gain))) {
+            char cms[32] = "no other role";
+            if (chosen_ms < 1e29) std::snprintf(cms, sizeof cms, "%.1f ms", chosen_ms);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA0 alone (%.1f ms per decode window) - %s is not "
+                                 "predicted %.0f%% shorter (%s; STRATA_SPLIT_GAIN_PCT, STRATA_SPLIT_ROLE)\n", alone_ms,
+                         chosen.c_str(), 100.0 * gain, cms);
+            if (chosen == "the helper") o.expert_cache_remote[0] = 0;
+            split_devs.clear();
+            split_at.clear();
+            o.layer_split.clear();
+            o.pipeline_windows = 0;
+            multi_gpu = false;
         }
     }
     // Layer split across GPUs (upstream e50f2663, 12c099b3, 13f70a34): every GPU holds only the dense weights of ITS
@@ -5803,6 +5941,10 @@ int main(int argc, char** argv) {
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+    // the one helper's open() arguments, kept for HELPER on (serve, between requests): its ranked pairs and what was
+    // claimed before it took its own
+    std::vector<std::pair<int32_t, int32_t>> helper_ranked;
+    std::vector<uint8_t> helper_claimed;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
             std::fprintf(stderr, "strata generate: remote experts need --expert-profile, "
@@ -5838,6 +5980,10 @@ int main(int argc, char** argv) {
             for (const auto& pr : st->profile)
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+        if (!multi_remote) {
+            helper_ranked = by_device[0];
+            helper_claimed = claimed;
+        }
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err)) {
@@ -8262,13 +8408,11 @@ int main(int argc, char** argv) {
             // missed expert that every token of a verify window routes at rank 7 or lower is neither copied nor computed
             // (answers differ slightly; =0 restores the bytes of a build without it).  No default and no line when every
             // expert is in VRAM (nothing to skip); off with --batch slots (a window then mixes requests, and one request's
-            // skip would depend on another's tokens) and with a helper GPU (the dispatch skips nothing there).  A layer
-            // split is fine: each stage skips by itself.
+            // skip would depend on another's tokens).  A layer split is fine: each stage skips by itself; so is a helper
+            // GPU, whose experts are computed there and only the misses it does not hold are skipped (#53).
             const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
             const bool all_experts_resident = !host_res.empty() &&
                 std::all_of(host_res.begin(), host_res.end(), [](int32_t r) { return r >= 0; });
-            const bool helper = std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                            [](int n) { return n > 0; });
             // #1884 (upstream 6ab541f6): with nearly every expert in the GPU cache the few misses are cheap and the skip
             // costs more draft acceptance than it saves (upstream: V100 32 GB, Coder IQ1_M, 94.8% cached, -1..2% decode).
             // STRATA_TAIL_SKIP_MAX_CACHED=<percent> (default 90) moves the line; 101 = never.
@@ -8278,12 +8422,12 @@ int main(int argc, char** argv) {
             const double max_cached = mcs != nullptr && mcs[0] != 0 ? std::strtod(mcs, nullptr) / 100.0 : 0.90;
             const bool nearly_all_cached = !host_res.empty() && !all_experts_resident &&
                                            (double) cached_experts >= max_cached * (double) host_res.size();
-            if (tse == nullptr && nearly_all_cached && o.batch <= 0 && !helper)
+            if (tse == nullptr && nearly_all_cached && o.batch <= 0)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in "
                                      "the GPU cache, so few are missed and skipping them costs more draft acceptance than "
                                      "it saves; STRATA_ROUTE_TAIL_SKIP=7 turns it on\n",
                              100.0 * (double) cached_experts / (double) host_res.size());
-            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0 && !helper)
+            if (tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch <= 0)
                 strata::core::set_tail_skip_rank(7);
             if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert a token routes at rank "
@@ -8985,7 +9129,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
                         "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d experts_ram=%s "
-                        "igc_workaround=%s grammar=%d script_table=%d engine=" STRATA_VERSION "\n",
+                        "igc_workaround=%s grammar=%d script_table=%d helper_pci=%s engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -8997,7 +9141,8 @@ int main(int argc, char** argv) {
                         (long long) o.tail_role_token, xcache.elastic() ? 1 : 0, o.batch,
                         o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
                         igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0,
-                        o.batch == 0 ? 1 : 0);
+                        o.batch == 0 ? 1 : 0,
+                        drive.d.remote_count > 0 ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -10141,6 +10286,51 @@ int main(int argc, char** argv) {
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
                 else vram_command(line, verr);
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            // HELPER off | on, between requests: the helper GPU's cache closed, its VRAM given back (the server makes
+            // images there meanwhile), and opened again from the RAM copy.  Closed, the rows it computed go to the CPU
+            // pool and the tail skip takes its misses as one GPU's: the answers stay, the decode is one GPU's.
+            if (line == "HELPER off" || line == "HELPER on") {
+                const bool on = line == "HELPER on";
+                const auto t0 = Clock::now();
+                std::string herr;
+                if (helper_ranked.empty()) herr = "HELPER: no helper GPU of its own (--expert-cache-device1 alone)";
+                else if (batch_on()) herr = "HELPER: not while batch slots are decoding";
+                else if (prefill_helper_src) herr = "HELPER: not with STRATA_PREFILL_HELPER_SOURCE";
+                else if (on && drive.d.remote_count == 0) {
+                    std::vector<uint8_t> claimed = helper_claimed;
+                    // as many as the card has room for: an image engine may keep its model there between jobs
+                    if (!remote_experts[0].open(remote_dev[0], o.expert_cache_remote[0], g.n_layers, g.n_expert,
+                                                helper_ranked, xcache, *srcp, claimed, herr, true)) {
+                        herr.insert(0, "HELPER on: ");
+                    } else {
+                        drive.d.remote[0] = &remote_experts[0];
+                        drive.d.remote_count = 1;
+                        if (o.batch <= 0 && !multi_gpu) attach_prompt_helper(sp, remote_experts[0], "serve");
+                    }
+                } else if (!on && drive.d.remote_count > 0) {
+                    std::string serr;
+                    (void) sp.set_helper(nullptr, 0, serr);
+                    drive.d.remote_count = 0;
+                    remote_experts[0].close();
+                }
+                if (!herr.empty()) {
+                    std::printf("ERR %s\n", herr.c_str());
+                } else {
+                    size_t hf = 0, ht = 0;
+                    {
+                        const strata::core::OnDevice od(remote_dev[0]);
+                        (void) strata::gpu::mem_info(&hf, &ht);
+                    }
+                    std::fprintf(stderr, "strata serve: helper GPU %s: %s in %.0f ms\n", on ? "on" : "off",
+                                 on ? "its cache filled from the RAM copy" : "its cache closed",
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    std::printf("HELPER %s experts=%lld vram_free_mib=%lld ms=%.0f\n", on ? "on" : "off",
+                                (long long) (drive.d.remote_count > 0 ? remote_experts[0].resident() : 0),
+                                (long long) (hf >> 20), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                }
                 std::fflush(stdout);
                 continue;
             }

@@ -128,7 +128,7 @@ setup のオプションです（`xestrata --setup` に付けます）。
 | `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow、MOSS-Image、Anima の画像のモデルを 8 ビットにするか。`auto` は、文の読み手と一緒に VRAM に全部入るときは 16 ビットのまま、入らないときは 8 ビット |
 | `--image-dit-keep on\|off` | `on` | Mage-Flow の使っていない方（生成用か編集用）の画像のモデルを 8 ビットで RAM に残す。`off` で RAM が約 4.4 GB 減り、差し替えのたびにファイルから読み直す |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | 画像を作るときの文章のモデルの扱い（[下](#gpu-のメモリの分け合い)）。`--images` と一緒に指定します |
-| `--image-gpu auto\|same\|<PCI>` | `auto` | 画像を作る GPU。`auto` は文章のモデルが使っていない、CPU 内蔵でない GPU のうち VRAM の最も大きいもの（なければ文章のモデルと同じ GPU）、`same` は文章のモデルと同じ GPU、PCI のアドレス（`--check` に出るもの）はその GPU。`--images` と一緒に指定します |
+| `--image-gpu auto\|same\|<PCI>` | `auto` | 画像を作る GPU。`auto` は文章のモデルが使っていない、CPU 内蔵でない GPU のうち VRAM の最も大きいもの（なければ、文章のモデルが 2 枚を使うときはその 2 枚目、それ以外は文章のモデルと同じ GPU）、`same` は文章のモデルと同じ GPU、PCI のアドレス（`--check` に出るもの）はその GPU。`--images` と一緒に指定します |
 
 Mage-Flow の 8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は、重みと活性の両方を int8 にして掛けます（ComfyUI の int8_convrot と同じ形）。ほかの GPU では Q8_0 です。
 Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じく int8 で掛けます。
@@ -366,6 +366,9 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 画像の仕事は GPU で 1 つずつ動きます。
 文章のモデルが使っていない GPU が画像用になっているとき（`--image-gpu`）は、画像はその GPU で作り、その間もチャットに答えます。文章のモデルはそのままです。
 起動のログに `image GPU: <PCI> (separate from the text model's)` と出ます。
+文章のモデルが GPU を 2 枚使い、その 2 枚目が画像用のとき（2 枚の PC の `--image-gpu auto`）は、文章のモデルは 2 枚目を層の分担に使わず、補助のエキスパートキャッシュにするか（1 枚目だけより速いと見積もるとき）、使いません。
+補助にしたときは、画像の仕事の前に補助を閉じて 2 枚目を画像に渡し（数十 ms）、文章は 1 枚目で答え続けます。画像の後、ほかの画像の仕事が 2 秒来なければ、2 枚目に空いている分だけで補助を開き直します（RAM から 1 秒前後）。
+層の分担の 2 段目を縮めて画像と分け合うと、prefill が 1 枚目だけの半分以下になったため、この形にしています（B70 + RTX 4070）。
 その GPU を文章のモデルも使うとき（層の分担、レプリカ、その起動だけの `--gpu`）と、補助の GPU（`--expert-cache-device1..3`）や GPU を絞る環境変数（`ONEAPI_DEVICE_SELECTOR` など）があるときは、ログにそう出て、文章のモデルと同じ GPU を順番に使います。
 同じ GPU を使うときは、エンジンが仕事の前に、その画像に要る VRAM（最低限と、画像のモデルを全部載せて VAE を 1 回で回せる量）を答え、サーバーは `--image-gpu-policy` で文章のモデルの扱いを決めます。
 
