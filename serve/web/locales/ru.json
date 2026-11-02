@@ -325,6 +325,7 @@
   "img.rowCount": {"one": "{n} изображение", "few": "{n} изображения", "many": "{n} изображений", "other": "{n} изображения"},
   "img.rowEdit": "Правка {size}",
   "img.rowImage": "Изображение {size}",
+  "img.sampler": "Сэмплер",
   "img.seed": "Seed",
   "img.seedRandom": "случайно",
   "img.size": "Размер",

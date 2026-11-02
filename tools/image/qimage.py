@@ -50,11 +50,21 @@ chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QU
 the others').  When the chat model is that same file, setup links it instead of fetching it again and the server has
 the chat engine encode the prompts (serve/images.py's text_states).  No reference edits: a picture is changed by
 img2img and masks.
+
+Anima (CircleStone Labs and Comfy Org, its own non-commercial license and NVIDIA's Open Model License; anima-base,
+anima-aesthetic, anima-turbo, and Gazingstars123's anima-2.9b): a DiT of one bf16 file (the engine keeps it 16-bit or
+quantizes it to 8 bits as it reads it, as Mage-Flow's), Wan 2.1's VAE (the release's qwen_image_vae), Qwen3-0.6B-Base
+as its text encoder (mradermacher's GGUFs, F16 lowered to Q8_0 for the RAM) and T5's tokenizer.json (google-t5/t5-base,
+Apache 2.0: the LLM adapter's queries), in its own folder (anima).  A derivative's DiT the user puts in that folder
+(a safetensors file of the same structure, with or without ComfyUI's prefix) is a model of its own, anima:<its name>
+(anima_user_dits): setup sets it up beside the release's files.
 """
 from __future__ import annotations
 
 import ast
+import json
 import os
+import struct
 from pathlib import Path
 
 # the ComfyUI checkpoint repository's revision, named apart: its repository name and its hash on one line would be
@@ -78,6 +88,10 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "OpenMOSS-Team/MOSS-Image-Base": "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",                    # 2026-10-27
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
+    "circlestone-labs/Anima": "f973fc41ec7545364ac9776c2440285f43ff2a30",                          # 2026-11-02
+    "Gazingstars123/Anima-2.9B": "9f9cb502dbae7a616c3cc5a530633427fe735665",                       # 2026-11-02
+    "mradermacher/Qwen3-0.6B-Base-GGUF": "b8b11a6dbbb14c739e25018f3f77abac860c28f4",               # 2026-11-02
+    "google-t5/t5-base": "a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1",                               # 2026-11-02
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -95,6 +109,9 @@ _MB = "OpenMOSS-Team/MOSS-Image-Base"
 _Q35 = "unsloth/Qwen3.5-9B-GGUF"
 _Q35H = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 _Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
+_AN = "circlestone-labs/Anima"
+_AN29 = "Gazingstars123/Anima-2.9B"
+_Q306 = "mradermacher/Qwen3-0.6B-Base-GGUF"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -220,12 +237,31 @@ FILES = {
                                  "c0ba7beb68fd3fe47891bd549486d38dcf62d00817296ea314ad37017f5a4986"),
     "llm-moss-uncensored-Q8_0": (_Q35H, _Q35H_FILE.format("Q8_0"), 9_527_501_184,
                                  "99e7f2201c0046b05d2825e4d8be6a2efad2b87b071cd55d37bdd9fbe201a58b"),
+    # Anima: its DiTs ("<dit>-bf16"), Wan 2.1's VAE, Qwen3-0.6B-Base ("llm-anima-stock-<ANIMA_TEXT_QUANTS>") and T5's
+    # tokenizer.json (not an LFS file: its SHA-256 is the file's as fetched at the revision)
+    "anima-base-bf16": (_AN, "split_files/diffusion_models/anima-base-v1.0.safetensors", 4_182_218_328,
+                        "bd43b7cffe1ed1153d9c41e7beb2f18cb1273eafbaa3af3edd6a173dc90a006e"),
+    "anima-aesthetic-bf16": (_AN, "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors", 4_182_230_656,
+                             "3c1868387a3a1ff504bbb87c33678321965ead381fcf87afbd0264daa600c082"),
+    "anima-turbo-bf16": (_AN, "split_files/diffusion_models/anima-turbo-v1.1.safetensors", 4_182_230_656,
+                         "fba11953276b57edf59d1dc4f1857ac05aa079c56f982b4d7c20298d57d3f7eb"),
+    "anima-2.9b-bf16": (_AN29, "Anima-2.9B-preview-v1.safetensors", 5_843_204_206,
+                        "0b3020d1b906155f7eb30667622723e87160632c8c7a5f1c93bdce685f2a346d"),
+    "anima-vae": (_AN, "split_files/vae/qwen_image_vae.safetensors", 253_806_246,
+                  "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"),
+    "llm-anima-stock-Q8_0": (_Q306, "Qwen3-0.6B-Base.Q8_0.gguf", 639_447_232,
+                             "4b088f1793f6cba9f0c2f77ab835ef6734f205c2159168698c6e1a51b7df168a"),
+    "llm-anima-stock-F16": (_Q306, "Qwen3-0.6B-Base.f16.gguf", 1_198_182_592,
+                            "d7f3a9d59cc8de30bbc9f1feda8d1e1809b2aadd139b72a0342c769a14002b37"),
+    "anima-t5-tokenizer": ("google-t5/t5-base", "tokenizer.json", 1_389_353,
+                           "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
 # MOSS-Image's text encoder, Qwen3.5-9B: the chat model's own sizes (setup's PLAIN_FAMILIES "qwen35"), so a chat model
 # of the same file encodes its prompts (serve/images.py's text_states)
 MOSS_TEXT_QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
+ANIMA_TEXT_QUANTS = ("Q8_0", "F16")   # Anima's Qwen3-0.6B-Base: F16 by default, Q8_0 for the RAM
 # HunyuanImage 3.0 comes in Tencent's two quantizations only, smallest first; w4a8 is the one to start with (43.7 GiB
 # against the int8's 76.2, about twice as fast a step) and the int8 the nearer the bf16 weights.
 HUNYUANIMAGE3_QUANTS = ("w4a8", "int8")
@@ -273,7 +309,12 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "moss-image": ("moss-image", "moss-sft", "moss-stock"),
                 "moss-image-uncensored": ("moss-image-uncensored", "moss-sft", "moss-uncensored"),
                 "moss-image-base": ("moss-image-base", "moss-base", "moss-stock"),
-                "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored")}
+                "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored"),
+                # Anima: the release's three and the 2.9B expansion, Qwen3-0.6B-Base as the text encoder
+                "anima-base": ("anima-base", "anima-base", "anima-stock"),
+                "anima-aesthetic": ("anima-aesthetic", "anima-aesthetic", "anima-stock"),
+                "anima-turbo": ("anima-turbo", "anima-turbo", "anima-stock"),
+                "anima-2.9b": ("anima-2.9b", "anima-2.9b", "anima-stock")}
 DEFAULT_MODEL = "qwen-image-turbo"
 # the image models setup's question and the Windows launcher's checkboxes offer a text model set up for the first
 # time (the first the default model); one set up again offers what it has
@@ -289,7 +330,12 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
                                    "prompt, needs about 50 GB of RAM; edits with up to 3 reference images",
          "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
                        "guidance; changes a picture (img2img, masks), no reference edits",
-         "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance"}
+         "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
+         "anima-base": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the "
+                       "model to train LoRAs on",
+         "anima-aesthetic": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
+         "anima-turbo": "Anima distilled for speed, 10 steps without guidance",
+         "anima-2.9b": "Anima expanded to 40 blocks (2.9B, a preview), 30 steps with guidance"}
 # the DiT -> its name, its steps (Turbo's are its own 8 sigmas; the base model's, the default of its pipeline,
 # diffusers' QwenImage21Pipeline, sampled without guidance as Qwen meant it), its Hugging Face model
 DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
@@ -306,17 +352,31 @@ DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
         # MOSS-Image's two: its pipeline's defaults (50 steps, guidance 3 with the negative pass skipping block 22,
         # shift 5), the same for both
         "moss-sft": ("MOSS-Image", 50, "OpenMOSS-Team/MOSS-Image-SFT"),
-        "moss-base": ("MOSS-Image-Base", 50, "OpenMOSS-Team/MOSS-Image-Base")}
+        "moss-base": ("MOSS-Image-Base", 50, "OpenMOSS-Team/MOSS-Image-Base"),
+        # Anima's: the model card's 30 steps with guidance 4 (Turbo 8 to 12 at guidance 1), on shift 3
+        "anima-base": ("Anima", 30, "circlestone-labs/Anima"),
+        "anima-aesthetic": ("Anima-Aesthetic", 30, "circlestone-labs/Anima"),
+        "anima-turbo": ("Anima-Turbo", 10, "circlestone-labs/Anima"),
+        "anima-2.9b": ("Anima-2.9B", 30, "Gazingstars123/Anima-2.9B")}
 MF_CFG = {"mf-turbo": 1.0, "mf-rl": 5.0, "mf-base": 5.0, "mf-trail": 5.0}   # Mage-Flow's guidance scale by DiT
 # each Mage-Flow DiT's edit model and its steps (its README: Edit-Turbo 4, Edit (RL) and Edit-Base 30)
 MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-base": ("mf-edit-base", 30)}
 MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
 # files whose own name says too little
-LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors"}
+LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors",
+               "anima-t5-tokenizer": "t5-tokenizer.json"}
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
 MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)
 MOSS_SHIFT = 5.0
+ANIMA_DIR = "anima"
+ANIMA_CFG = {"anima-turbo": 1.0}   # Anima's guidance scale by DiT where it is not 4
+ANIMA_SHIFT = 3.0
+ANIMA_USER = "anima:"              # a derivative's --images name: anima:<its file's name without .safetensors>
+# Anima-2.9B's 12 blocks inserted between the release's 28 (its expand_manifest.json's insertion_positions): the
+# release's block k is the 2.9B's k-th of the others, where an adapter made for the release is bound (lora_block_map)
+ANIMA_29_INSERTED = (2, 5, 8, 11, 14, 17, 21, 24, 27, 30, 33, 36)
+ANIMA_29_MAP = tuple(b for b in range(40) if b not in ANIMA_29_INSERTED)
 MF_Q8_SHARE = 34 / 64      # Mage-Flow's DiT in RAM: its bf16 blocks quantized to Q8_0 (34 bytes a 32 values)
 # every model's files in one folder (named after the first one): they share all but the DiT
 MODEL_DIR = "qwen-image-2.1-turbo"
@@ -338,15 +398,25 @@ def is_moss(dit: str) -> bool:
     return dit.startswith("moss-")
 
 
+def is_anima(dit: str) -> bool:
+    return dit.startswith("anima")
+
+
 def engine_quantized(dit: str) -> bool:
     """A DiT that comes in one bf16 size, which the engine keeps 16-bit or quantizes to 8 bits as it reads it
-    (Mage-Flow's, MOSS-Image's: --dit-q8)."""
-    return is_mage(dit) or is_moss(dit)
+    (Mage-Flow's, MOSS-Image's, Anima's: --dit-q8)."""
+    return is_mage(dit) or is_moss(dit) or is_anima(dit)
 
 
 def text_quants(dit: str) -> tuple[str, ...]:
-    """The text encoder's sizes for a DiT, smallest first: MOSS-Image's Qwen3.5-9B's, the others' TEXT_QUANTS."""
-    return MOSS_TEXT_QUANTS if is_moss(dit) else TEXT_QUANTS
+    """The text encoder's sizes for a DiT, smallest first: MOSS-Image's Qwen3.5-9B's, Anima's Qwen3-0.6B-Base's, the
+    others' TEXT_QUANTS."""
+    return MOSS_TEXT_QUANTS if is_moss(dit) else ANIMA_TEXT_QUANTS if is_anima(dit) else TEXT_QUANTS
+
+
+def default_text_quant(dit: str) -> str:
+    """The text encoder's size setup starts from: Anima's F16 (the encoder is small), the others' DEFAULT_TEXT_QUANT."""
+    return ANIMA_TEXT_QUANTS[-1] if is_anima(dit) else DEFAULT_TEXT_QUANT
 
 
 def dit_quants(dit: str) -> tuple[str, ...]:
@@ -378,6 +448,43 @@ def mage_q8(size: str | None) -> bool | None:
     return {"int8": True, "bf16": False}.get(size or "")
 
 
+def anima_header(path: Path) -> str:
+    """Why a safetensors file is not an Anima DiT ("" when it is one): its header read alone, the names with or
+    without a prefix (`net.`, ComfyUI's `model.diffusion_model.`), the LLM adapter and the blocks of
+    Cosmos-Predict2 beside it.  An adapter (LoRA) file is named as one."""
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if not 0 < n < (64 << 20):
+                return "not a safetensors file"
+            header = json.loads(f.read(n))
+    except (OSError, ValueError, struct.error) as e:
+        return f"not readable as a safetensors file ({e})"
+    keys = [k for k in header if k != "__metadata__"]
+    if any("lora_" in k or ".lora." in k or "hada_" in k or "lokr_" in k for k in keys):
+        return "an adapter (LoRA) file: it goes into the adapters' folder (loras)"
+    for pre in ("", "net.", "model.diffusion_model.", "diffusion_model."):
+        if f"{pre}llm_adapter.embed.weight" in header and f"{pre}x_embedder.proj.1.weight" in header:
+            if f"{pre}blocks.0.self_attn.q_proj.weight" not in header:
+                return "Anima's LLM adapter without the DiT's blocks"
+            return ""
+    return "not Anima's DiT (no LLM adapter beside Cosmos-Predict2's blocks)"
+
+
+def anima_user_dits(models_dir: Path) -> dict[str, Path]:
+    """The derivatives' DiTs the user put in the Anima folder: every .safetensors there that setup did not fetch and
+    whose header is Anima's (anima_header) -> {"anima:<name>": path}, sorted by name."""
+    folder = Path(models_dir) / ANIMA_DIR
+    ours = {local_path(models_dir, k).name for k in FILES if k.startswith(("anima-", "llm-anima-"))}
+    out: dict[str, Path] = {}
+    if not folder.is_dir():
+        return out
+    for p in sorted(folder.glob("*.safetensors")):
+        if p.name not in ours and not anima_header(p):
+            out[ANIMA_USER + p.stem] = p
+    return out
+
+
 def parse_choices(value: str) -> list[tuple[str, str | None]]:
     """--images (setup) / --model (install.py): image models, comma-separated, the first the default, each with its
     image model's size after a colon or not (qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M,magetrail:int8; without
@@ -385,7 +492,16 @@ def parse_choices(value: str) -> list[tuple[str, str | None]]:
     size or None)].  ValueError naming what is wrong."""
     out = []
     for part in value.split(","):
-        name, _, size = part.strip().partition(":")
+        part = part.strip()
+        if part.startswith(ANIMA_USER):   # a derivative of Anima: its name may hold no size after it
+            user, _, size = part[len(ANIMA_USER):].partition(":")
+            if not user:
+                raise ValueError(f"{part!r}: {ANIMA_USER}<the DiT's file name in the anima folder>")
+            if size and size not in size_choices("anima-base"):
+                raise ValueError(f"{part}: a size of int8 or bf16, not {size}")
+            out.append((ANIMA_USER + user, size or None))
+            continue
+        name, _, size = part.partition(":")
         if name not in IMAGE_MODELS:
             raise ValueError(f"{name or part!r} is no image model (one of {', '.join(IMAGE_MODELS)})")
         sizes = size_choices(IMAGE_MODELS[name][1])
@@ -404,6 +520,10 @@ def license_note(dit: str) -> str:
                 "European Union, the United Kingdom or South Korea: "
                 "https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE - read it and its Acceptable "
                 "Use Policy before you use the images")
+    if is_anima(dit):
+        return (f"{name} is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is "
+                f"built on Cosmos-Predict2): https://huggingface.co/{repo} - the model may not be used commercially; "
+                "the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0")
     if is_moss(dit):
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
                 "too (HauhauCS's uncensored one, from it, as well)")
@@ -433,6 +553,8 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
     if is_moss(dit):
         return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", text_file(text_encoder, text_quant))
+    if is_anima(dit):
+        return (f"{dit}-bf16", "anima-vae", text_file(text_encoder, text_quant), "anima-t5-tokenizer")
     if is_mage(dit):
         vae, text = MF_VAE.get(dit, "mf-vae"), text_file(text_encoder, text_quant)
         if dit not in MF_EDIT:
@@ -456,7 +578,7 @@ def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
     if is_moss(dit):   # its shards: the blocks' weights, all but a few hundred MB of them
         return sum(FILES[k][2] * (share if k[-1].isdigit() else 1) for k in names) / 1e9 + HOST_GB
-    return sum(FILES[k][2] * (share if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
+    return sum(FILES[k][2] * (share if k.endswith("-bf16") and engine_quantized(dit) else 1) for k in names) / 1e9 \
         + HOST_GB
 
 
@@ -499,6 +621,8 @@ def local_path(models_dir: Path, name: str) -> Path:
         return Path(models_dir) / MOSS_DIR / name.split("-")[1] / Path(FILES[name][1]).name
     elif name.startswith(("moss-", "llm-moss-")):
         folder = MOSS_DIR
+    elif name.startswith(("anima-", "llm-anima-")):
+        folder = ANIMA_DIR
     else:
         folder = MF_DIR if name.startswith(("mf-", "llm-mf-")) else MODEL_DIR
     return Path(models_dir) / folder / LOCAL_NAMES.get(name, Path(FILES[name][1]).name)
@@ -613,7 +737,12 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
     blocks as Q8_0 (True), FP16 (False) or by the VRAM (None, the default: no "dit_q8" in the section); dit_keep: its
     DiT not in use kept in RAM.  The models that take LoRA adapters name the folder they are read from ("lora_dir",
     one folder for all of them: <models>/loras), which the user puts their files in; HunyuanImage 3.0 applies none."""
-    name, dit, text_encoder = IMAGE_MODELS[model]
+    user = None
+    if model.startswith(ANIMA_USER):   # a derivative: Anima's files but its own DiT, Base's defaults
+        user = Path(models_dir) / ANIMA_DIR / (model[len(ANIMA_USER):] + ".safetensors")
+        name, dit, text_encoder = "anima-" + model[len(ANIMA_USER):], "anima-base", "anima-stock"
+    else:
+        name, dit, text_encoder = IMAGE_MODELS[model]
     if is_hunyuanimage3(dit):
         return {"model_name": name, "family": "hunyuan-image-3", "exe": str(exe), "quant": quant,
                 "diffusion_model": str(local_path(models_dir, f"hunyuanimage3-{quant}")),
@@ -626,6 +755,18 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     loras = {"lora_dir": str(Path(models_dir) / "loras")}   # the folder the models that take adapters read
+    if is_anima(dit):
+        q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
+        start: dict = {"prompt_start": ""} if dit == "anima-aesthetic" else {}   # its training dropped the quality tags
+        if dit == "anima-2.9b":
+            start["lora_block_map"] = list(ANIMA_29_MAP)
+        return {**q8, "model_name": name, "family": "anima", "exe": str(exe), "quant": "bf16", **loras, **start,
+                "diffusion_model": str(user or local_path(models_dir, f"{dit}-bf16")), "steps": DITS[dit][1],
+                "schedule": "anima", "cfg_scale": ANIMA_CFG.get(dit, 4.0), "shift": ANIMA_SHIFT,
+                "sampler": "er_sde", "transparency": False, "vae": str(local_path(models_dir, "anima-vae")),
+                "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))),
+                "t5_tokenizer": str(local_path(models_dir, "anima-t5-tokenizer")), "text_encoder": text_encoder,
+                "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_moss(dit):
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
         return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16",

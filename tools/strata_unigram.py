@@ -136,6 +136,33 @@ class UnigramTokenizer:
                    bool(md.get("tokenizer.ggml.add_space_prefix", False)),
                    bool(md.get("tokenizer.ggml.remove_extra_whitespaces", False)), special)
 
+    @classmethod
+    def from_hf_json(cls, path) -> "UnigramTokenizer":
+        """A Hugging Face tokenizer.json of a SentencePiece unigram model (T5's: Anima's LLM adapter reads its ids): the
+        vocabulary and its scores, the Precompiled normalizer's charsmap, its added special tokens as control tokens
+        (<unk> the unknown one), the space before the text and the whitespace runs collapsed as T5's spiece.model
+        has them (Metaspace with a prefix space, nmt_nfkc's remove_extra_whitespaces).  No </s> is added."""
+        import base64
+        d = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+        m = d["model"]
+        if m.get("type", "Unigram") != "Unigram" or "vocab" not in m:
+            raise ValueError(f"{path}: not a unigram tokenizer.json")
+        tokens = [p[0] for p in m["vocab"]]
+        scores = [float(p[1]) for p in m["vocab"]]
+        unk = int(m.get("unk_id") or 0)
+        types = [NORMAL] * len(tokens)
+        for a in d.get("added_tokens") or ():
+            if a.get("special") and 0 <= int(a["id"]) < len(types):
+                types[int(a["id"])] = CONTROL
+        types[unk] = UNKNOWN
+        norm = d.get("normalizer") or {}
+        steps = norm.get("normalizers", [norm]) if norm.get("type") == "Sequence" else [norm]
+        charsmap = b""
+        for st in steps:
+            if st and st.get("type") == "Precompiled" and st.get("precompiled_charsmap"):
+                charsmap = base64.b64decode(st["precompiled_charsmap"])
+        return cls(tokens, scores, types, charsmap, True, True, {"tokenizer.ggml.unknown_token_id": unk})
+
     def write_dir(self, out: pathlib.Path) -> dict:
         """The files from_dir reads back: unigram.json (the tokens and their scores), token_type.json, charsmap.bin,
         and vocab.json (token -> id, which the server checks for)."""

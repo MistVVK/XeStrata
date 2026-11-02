@@ -66,7 +66,7 @@ EXTS = (".safetensors", ".gguf")
 MAX_HEADER = 64 << 20              # the longest header read (a safetensors' JSON is a file's tensors; a GGUF's too)
 TAG = re.compile(r"<lora:([^<>:]+)(?::([^<>:]+))?(?::([^<>:]+))?>", re.IGNORECASE)
 FAMILY_NAMES = {"qwen-image": "Qwen-Image-2.1", "moss-image": "MOSS-Image", "mage-flow": "Mage-Flow",
-                "hunyuan-image-3": "HunyuanImage 3.0"}
+                "hunyuan-image-3": "HunyuanImage 3.0", "anima": "Anima"}
 
 # The weights adapters may take, by the name a file's key is left with after split_key: the DiTs' target tables
 # (src/image/qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's build_lora_targets write these names).  "{b}" is a block's
@@ -88,6 +88,21 @@ _MAGE_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.add_q_proj", "attn.
                 "txt_mlp.net.2", "img_mod.1", "txt_mod.1")
 _MAGE_OUTSIDE = ("img_in", "txt_in", "time_text_embed.timestep_embedder.linear_1",
                  "time_text_embed.timestep_embedder.linear_2", "norm_out.linear", "proj_out")
+# Anima's (src/image/anima_dit.cpp's build_lora_targets): the blocks' attentions, MLP and modulations, the LLM
+# adapter's, and the parts outside them.  sd-scripts' keys reach here with every underscore a dot, and these names hold
+# underscores: each is matched dotted too (the engine compares both ways)
+_ANIMA_BLOCKS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.output_proj",
+                 "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.output_proj",
+                 "mlp.layer1", "mlp.layer2", "adaln_modulation_self_attn.1", "adaln_modulation_self_attn.2",
+                 "adaln_modulation_cross_attn.1", "adaln_modulation_cross_attn.2", "adaln_modulation_mlp.1",
+                 "adaln_modulation_mlp.2")
+_ANIMA_ADAPTER = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "cross_attn.q_proj",
+                  "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.o_proj", "mlp.0", "mlp.2")
+_ANIMA_OUTSIDE = ("x_embedder.proj.1", "t_embedder.1.linear_1", "t_embedder.1.linear_2", "final_layer.linear",
+                  "final_layer.adaln_modulation.1", "final_layer.adaln_modulation.2", "llm_adapter.out_proj")
+_ANIMA = (_ANIMA_OUTSIDE + tuple("blocks.{b}." + n for n in _ANIMA_BLOCKS) +
+          tuple("llm_adapter.blocks.{b}." + n for n in _ANIMA_ADAPTER))
+_ANIMA_BIASED = ("llm_adapter.out_proj", "llm_adapter.blocks.{b}.mlp.0", "llm_adapter.blocks.{b}.mlp.2")
 TARGETS: dict[str, tuple[str, ...]] = {
     "qwen-image": ("img_in", "time_text_embed.timestep_embedder.linear_1",
                    "time_text_embed.timestep_embedder.linear_2", "modulation.1", "norm_out.linear", "proj_out",
@@ -95,6 +110,7 @@ TARGETS: dict[str, tuple[str, ...]] = {
     "moss-image": (_MOSS_OUTSIDE + tuple("text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS) +
                    tuple("layers.{b}." + n for n in _MOSS_BLOCKS)),
     "mage-flow": (_MAGE_OUTSIDE + tuple("transformer_blocks.{b}." + n for n in _MAGE_BLOCKS)),
+    "anima": _ANIMA + tuple(n.replace("_", ".") for n in _ANIMA),
 }
 
 # The weights that add a bias of their own, where a bias's delta (diff_b, or b_norm beside w_norm) goes: Mage-Flow's
@@ -106,6 +122,7 @@ _BIASED_NAMES: dict[str, tuple[str, ...]] = {
                    "video_head_modulation", "text_embedder.proj") + tuple(
                        "text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS),
     "mage-flow": TARGETS["mage-flow"],
+    "anima": _ANIMA_BIASED + tuple(n.replace("_", ".") for n in _ANIMA_BIASED),
 }
 
 
@@ -319,8 +336,28 @@ def _glora_shapes(want: dict[str, tuple[int, int]], have: dict[str, tuple[int, .
 
 
 def is_text_encoder(key: str) -> bool:
-    """A weight of the text encoder rather than the DiT (the engine refuses these when it binds a set)."""
+    """A weight of the text encoder rather than the DiT (image_lora's lora_is_text_encoder_key)."""
     return key.startswith(("lora_te", "text_encoder", "te."))
+
+
+# The models whose text encoder takes adapters (src/image/qi_text.cpp's set_loras: Qwen3-VL's and Qwen3's layers;
+# moss_text.cpp's: Qwen3.5-9B's, its GDN's projections too),
+# and its weights as image_lora's lora_text_encoder_name writes a key: the prefixes off, every underscore a dot
+TEXT_ENCODER_FAMILIES = ("qwen-image", "mage-flow", "anima", "moss-image")
+_TE_NAME = re.compile(r"^layers\.\d+\.(self\.attn\.[qkvo]\.proj|mlp\.(gate|up|down)\.proj|"
+                      r"linear\.attn\.(in\.proj\.(qkv|z|a|b)|out\.proj))$")
+
+
+def text_encoder_name(key: str) -> str:
+    """A text encoder's key as the engine names its weight ("lora_te_layers_0_self_attn_q_proj" ->
+    "layers.0.self.attn.q.proj")."""
+    for p in ("lora_te1_", "lora_te2_", "lora_te_", "text_encoders.", "text_encoder.", "te."):
+        if key.startswith(p):
+            key = key[len(p):]
+            break
+    key = key.replace("_", ".")
+    at = key.find("layers.")
+    return key[at:] if at > 0 and key[at - 1] == "." else key
 
 
 def is_training_aid(key: str) -> bool:
@@ -331,7 +368,7 @@ def is_training_aid(key: str) -> bool:
 def kind_of(name: str) -> str:
     """The kind of weight a target's name is, a block's without its number: "transformer_blocks.7.attn.to_q" ->
     "attn.to_q", "layers.3.proj.q" -> "proj.q", "text_embedder.blocks.1.qkv" -> "qkv", "modulation.1" as it is."""
-    return re.sub(r"^(?:transformer_blocks|layers|text_embedder\.blocks)\.\d+\.", "", name)
+    return re.sub(r"^(?:transformer_blocks|layers|text_embedder\.blocks|blocks|llm_adapter\.blocks)\.\d+\.", "", name)
 
 
 def encode_path(path: str) -> str:
@@ -536,7 +573,18 @@ class Folder:
         rank = 0
         for key, roles in sorted(weights.items()):
             if is_text_encoder(key):
-                return f"{key}: a text encoder's weight, which the image engine applies not yet"
+                if self.family not in TEXT_ENCODER_FAMILIES:
+                    return f"{key}: a text encoder's weight, which the image engine applies not yet for this model"
+                if not _TE_NAME.match(text_encoder_name(key)):
+                    return f"{key} is not one of this image model's text encoder's weights"
+                te_form = form_of(roles)
+                if te_form not in ("lora", "lokr", "loha", "diff") or "dora_scale" in roles or \
+                        "diff_b" in roles or "b_norm" in roles or "set_weight" in roles:
+                    return f"{key}: the text encoder takes a plain LoRA, a LoKr, a LoHa or a whole delta"
+                if te_form == "lora" and roles.get("lora_A") is not None and len(roles["lora_A"]) == 2:
+                    rank = max(rank, roles["lora_A"][0])
+                targets.add("text_encoder." + re.sub(r"^layers\.\d+\.", "", text_encoder_name(key)))
+                continue
             # a bias's delta (ComfyUI's .diff_b, or .b_norm beside the weight's w_norm, which .diff_b overrides): the
             # engine adds it where the DiT adds the weight's own bias, and only the weights that add one take it
             bias = roles.get("diff_b", roles.get("b_norm"))

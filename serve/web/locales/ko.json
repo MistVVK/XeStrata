@@ -325,6 +325,7 @@
   "img.rowCount": {"other": "{n}장"},
   "img.rowEdit": "편집 {size}",
   "img.rowImage": "이미지 {size}",
+  "img.sampler": "샘플러",
   "img.seed": "시드",
   "img.seedRandom": "무작위",
   "img.size": "크기",

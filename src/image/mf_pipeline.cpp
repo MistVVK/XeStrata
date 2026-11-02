@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/flow_sampler.hpp"
 #include "strata/image/qi_dit.hpp"
 
 #include <algorithm>
@@ -625,7 +626,12 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        d.sample(x, h, w, sigmas, guided ? r.cfg : 1.0f, step, ls.after(s_), peek);
+        if (r.sampler == "er_sde")   // ComfyUI's er_sde (MageTrail's author's sampler) over the same forward
+            flow_sample(s_, [&](const float* xx, float sigma, int nn, float* o) { d.forward(xx, sigma, h, w, nn, o); },
+                        x, n, guided ? 2 : 1, sigmas, guided ? r.cfg : 1.0f, true, 6.0f, r.seed, step, ls.after(s_),
+                        peek);
+        else
+            d.sample(x, h, w, sigmas, guided ? r.cfg : 1.0f, step, ls.after(s_), peek);
         d.set_refs(nullptr, {});
         const auto t2 = clock::now();
         if (stage) stage("decode");

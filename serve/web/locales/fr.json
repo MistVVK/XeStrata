@@ -337,6 +337,7 @@
   "img.rowCount": {"one": "{n} image", "other": "{n} images"},
   "img.rowEdit": "Modification {size}",
   "img.rowImage": "Image {size}",
+  "img.sampler": "Échantillonneur",
   "img.seed": "Graine",
   "img.seedRandom": "aléatoire",
   "img.size": "Taille",

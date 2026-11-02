@@ -325,6 +325,7 @@
   "img.rowCount": {"one": "{n} Bild", "other": "{n} Bilder"},
   "img.rowEdit": "Bearbeitung {size}",
   "img.rowImage": "Bild {size}",
+  "img.sampler": "Sampler",
   "img.seed": "Seed",
   "img.seedRandom": "zufällig",
   "img.size": "Größe",

@@ -64,6 +64,12 @@ struct QiRequest {
     // and of the negative prompt's); empty: the image engine encodes the ids itself
     std::vector<float> te, neg_te;
     int64_t te_rows = 0, neg_te_rows = 0;
+    // Anima's: the prompt's T5 ids and their weights (the LLM adapter's queries and the prompt's emphasis), and the
+    // negative prompt's; the other models leave them
+    std::vector<int32_t> t5_ids, neg_t5_ids;
+    std::vector<float> t5_weights, neg_t5_weights;
+    // the sampler: "euler" or "er_sde" (Anima's and Mage-Flow's; empty: the model's own)
+    std::string sampler;
     // the adapters the DiT's products add (image_lora.hpp), each file read once with the strength its delta is scaled
     // by, applied in this order: a set that changes starts the context again (the prefix's K and V were the other
     // set's).  A model that applies none refuses the request rather than make another image.

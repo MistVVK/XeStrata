@@ -325,6 +325,7 @@
   "img.rowCount": {"other": "{n} 枚"},
   "img.rowEdit": "編集 {size}",
   "img.rowImage": "画像 {size}",
+  "img.sampler": "サンプラー",
   "img.seed": "シード",
   "img.seedRandom": "ランダム",
   "img.size": "大きさ",

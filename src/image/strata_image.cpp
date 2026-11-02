@@ -5,7 +5,7 @@
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
 //                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
-//                [--ref IMAGE]... [--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] --out IMAGE.rgba | --serve)
+//                [--ref IMAGE]... [--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora S:F]... --out IMAGE.rgba | --serve)
 //   strata-image --dit DIT.safetensors ... [--dit-q8 auto|0|1] [--edit-dit EDIT_DIT.safetensors --vision MMPROJ.gguf]
 //                [--dit-keep 0|1]
 //
@@ -29,6 +29,11 @@
 // --shift (5) its schedule's, --uncond-skip the blocks the negative pass skips (22; none), skip-layer guidance with
 // --slg-layers and --slg-scale, both active from --slg-start to --slg-stop (shares of the steps, 0 and 1), and --te /
 // --neg-te the chat engine's states (its ENCODE files) in place of encoding the ids.
+// Anima's DiT is a safetensors file with its LLM adapter (anima_dit.hpp), with Wan 2.1's VAE (--vae, ComfyUI's
+// qwen_image_vae.safetensors) and Qwen3-0.6B-Base's GGUF (--text): its prompt's Qwen3 ids as --ids (no chat form),
+// the T5 tokenizer's ids and their weights (--t5, --t5-weights: the LLM adapter's queries, the prompt's emphasis),
+// guidance with --neg-ids, --neg-t5, --neg-t5-weights and --cfg, --steps and --shift (30, 3) its schedule's, and
+// --sampler er_sde (the default) or euler.
 //
 // One image: --ids, the prompt in the model's chat form, tokenized (the server's tokenizer); --drop, the leading ids of
 // the system turn; --budget-mib, the VRAM the engine may take (default: the free VRAM); --repeat, the image again N
@@ -63,6 +68,8 @@
 //                            <step> <path> before the next STEP, its RGBA8 rows at <out path>.p<index>
 //                            MOSS-Image's SHIFT:, USKIP:<blocks|none>, SLG:<blocks>, SLGSCALE:, SLGSTART:, SLGSTOP:
 //                            as the options, and TE:<path>, NEGTE:<path> the chat engine's states
+//                            Anima's T5:<ids>, T5W:<weights>, NEGT5:<ids>, NEGT5W:<weights> (commas) and
+//                            SAMPLER:<euler|er_sde> (Mage-Flow's too)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
@@ -86,6 +93,7 @@
 // warm_up_request.
 
 #include "strata/core/gpu.hpp"
+#include "strata/image/anima_pipeline.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
 #include "strata/image/qi_image_io.hpp"
@@ -124,6 +132,14 @@ std::vector<int32_t> parse_ids(const std::string& s) {
     for (std::string tok; std::getline(ss, tok, ',');)
         if (!tok.empty()) ids.push_back((int32_t) std::stol(tok));
     return ids;
+}
+
+std::vector<float> parse_floats(const std::string& s) {
+    std::vector<float> v;
+    std::stringstream ss(s);
+    for (std::string tok; std::getline(ss, tok, ',');)
+        if (!tok.empty()) v.push_back(std::stof(tok));
+    return v;
 }
 
 // the sampler's sigmas, commas: two or more, from at most 1 down to 0, falling
@@ -245,6 +261,11 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word.rfind("SLGSCALE:", 0) == 0) r.slg_scale = std::stof(word.substr(9));
         else if (word.rfind("SLGSTART:", 0) == 0) r.slg_start = std::stof(word.substr(9));
         else if (word.rfind("SLGSTOP:", 0) == 0) r.slg_stop = std::stof(word.substr(8));
+        else if (word.rfind("T5:", 0) == 0) r.t5_ids = parse_ids(word.substr(3));
+        else if (word.rfind("T5W:", 0) == 0) r.t5_weights = parse_floats(word.substr(4));
+        else if (word.rfind("NEGT5:", 0) == 0) r.neg_t5_ids = parse_ids(word.substr(6));
+        else if (word.rfind("NEGT5W:", 0) == 0) r.neg_t5_weights = parse_floats(word.substr(7));
+        else if (word.rfind("SAMPLER:", 0) == 0) r.sampler = word.substr(8);
         else if (word.rfind("TE:", 0) == 0) read_states(word.substr(3), r.te, r.te_rows);
         else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
         else if (word.rfind("LORA:", 0) == 0) read_lora(word, r, loras);
@@ -377,7 +398,7 @@ void no_loras(si::ImagePipeline& p) {
 // the pipelines whose DiT's products add the adapters a request names (image_lora.hpp)
 bool takes_loras(si::ImagePipeline& p) {
     return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MossPipeline*>(&p) != nullptr ||
-           dynamic_cast<si::MfPipeline*>(&p) != nullptr;
+           dynamic_cast<si::MfPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
 }
 
 int serve(si::ImagePipeline& p) {
@@ -525,6 +546,9 @@ int main(int argc, char** argv) {
     try {
         std::string dit, vae, text, vision, ratio_head, out, ids;
         std::vector<std::string> ref_paths;
+        std::vector<int> block_map;   // --lora-block-map: an expanded Anima's release blocks
+        bool lora_bake = true;        // --lora-bake 0: Anima's adapters added to each product, not baked in
+        Loras cli_loras;              // --lora's files
         si::QiRequest r;
         uint64_t budget = 0;
         int repeat = 1;
@@ -567,6 +591,15 @@ int main(int argc, char** argv) {
             else if (a == "--slg-scale") r.slg_scale = std::stof(val());
             else if (a == "--slg-start") r.slg_start = std::stof(val());
             else if (a == "--slg-stop") r.slg_stop = std::stof(val());
+            else if (a == "--t5") r.t5_ids = parse_ids(val());
+            else if (a == "--t5-weights") r.t5_weights = parse_floats(val());
+            else if (a == "--neg-t5") r.neg_t5_ids = parse_ids(val());
+            else if (a == "--neg-t5-weights") r.neg_t5_weights = parse_floats(val());
+            else if (a == "--sampler") r.sampler = val();
+            else if (a == "--lora") read_lora("LORA:" + val(), r, cli_loras);   // STRENGTH:PATH, as IMG's LORA:
+            else if (a == "--lora-block-map")
+                for (const int32_t b : parse_ids(val())) block_map.push_back((int) b);
+            else if (a == "--lora-bake") lora_bake = std::stoi(val()) != 0;
             else if (a == "--te") read_states(val(), r.te, r.te_rows);
             else if (a == "--neg-te") read_states(val(), r.neg_te, r.neg_te_rows);
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
@@ -586,13 +619,14 @@ int main(int argc, char** argv) {
         const bool safetensors = dit.size() > 12 && dit.compare(dit.size() - 12, 12, ".safetensors") == 0;
         const bool hunyuanimage3 = safetensors && si::hunyuanimage3_is_dit_file(dit);
         const bool moss = !hunyuanimage3 && si::moss_is_dit(dit);
-        const bool mage = safetensors && !hunyuanimage3 && !moss;
+        const bool anima = safetensors && !hunyuanimage3 && !moss && si::anima_is_dit(dit);
+        const bool mage = safetensors && !hunyuanimage3 && !moss && !anima;
         const bool need_text = !hunyuanimage3;
         if (dit.empty() || vae.empty() || (need_text && text.empty()) ||
             (!serving && ((out.empty() && !ratio) || (ids.empty() && r.te_rows == 0)))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
-                         "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] --out IMAGE.rgba | --serve) "
+                         "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora S:F]... --out IMAGE.rgba | --serve) "
                          "[--dit-q8 auto|0|1] [--edit-dit F] "
                          "[--dit-keep 0|1]\n",
                          argv[0]);
@@ -607,6 +641,11 @@ int main(int argc, char** argv) {
                          "B,...] [--slg-scale F] [--slg-start F] [--slg-stop F] [--te F] [--neg-te F] [--init IMAGE] "
                          "[--strength F] [--mask IMAGE]\n",
                          argv[0]);
+            std::fprintf(stderr, "       %s: Anima (--dit its safetensors, --vae Wan 2.1's, --text Qwen3-0.6B-Base's "
+                         "GGUF) takes --t5 I --t5-weights W [--neg-ids I --neg-t5 I --neg-t5-weights W] [--cfg C] "
+                         "[--steps N] [--shift S] [--sampler er_sde|euler] [--init IMAGE] [--strength F] "
+                         "[--mask IMAGE]\n",
+                         argv[0]);
             return 2;
         }
         std::unique_ptr<si::ImagePipeline> pipe;
@@ -619,6 +658,12 @@ int main(int argc, char** argv) {
             auto m = std::make_unique<si::MossPipeline>();
             if (!m->open(dit, vae, text, err, dit_q8)) throw std::runtime_error(err);
             pipe = std::move(m);
+        } else if (anima) {
+            auto a = std::make_unique<si::AnimaPipeline>();
+            if (!a->open(dit, vae, text, err, dit_q8)) throw std::runtime_error(err);
+            a->set_lora_block_map(block_map);
+            a->set_lora_bake(lora_bake);
+            pipe = std::move(a);
         } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
             if (!m->open(dit, vae, text, err, dit_q8, edit_dit, vision, dit_keep)) throw std::runtime_error(err);

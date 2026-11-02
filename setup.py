@@ -4090,8 +4090,11 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     (setup_images).  A text encoder the chat model's own file (shared_text_quant, `chat_gguf`) keeps that size: its
     RAM is the chat model's."""
     QI = _qimage()
-    _, dit, enc = QI.IMAGE_MODELS[choice]
+    user = choice.startswith(QI.ANIMA_USER)   # a derivative of Anima in its folder: the release's files but its DiT
+    _, dit, enc = ("", "anima-base", "anima-stock") if user else QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
+    if user:
+        label = choice
     q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
     asked = size or a.image_quant or QI.default_quant(dit)
     hunyuan = QI.is_hunyuanimage3(dit)
@@ -4106,7 +4109,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
                  "(--image-dit-q8 auto|on|off)")
         asked = QI.dit_quants(dit)[-1]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
-    tasked = "" if hunyuan else QI.DEFAULT_TEXT_QUANT       # HunyuanImage 3.0 has no text encoder
+    tasked = "" if hunyuan else QI.default_text_quant(dit)   # HunyuanImage 3.0 has no text encoder
     shared = shared_text_quant(QI, dit, enc, chat_gguf)
     if shared:
         tasked = shared
@@ -4142,15 +4145,18 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
         "POST /v1/images/generations)")
     if enc:
         tfile = QI.FILES[QI.text_file(enc, tquant)]
-        base = "Qwen3.5-9B" if QI.is_moss(dit) else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}"
+        base = ("Qwen3.5-9B" if QI.is_moss(dit) else "Qwen3-0.6B-Base" if QI.is_anima(dit)
+                else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}")
         say(f"  Text encoder: {Path(tfile[1]).name} ({tfile[0]}"
             + (f", {base} with its refusal direction removed)" if enc.endswith("uncensored") else ")")
             + (", the chat model's own file" if shared == tquant else ""))
     else:
         say(f"  Prompt: the model's own tokenizer ({QI.FILES['hunyuanimage3-tokenizer'][1]}) and its system prompt")
     say("  " + QI.license_note(dit))
-    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8,
-            "names": QI.file_names(quant, enc, tquant, dit)}
+    names = QI.file_names(quant, enc, tquant, dit)
+    if user:   # its DiT is the user's file, not one to fetch
+        names = names[1:]
+    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8, "names": names}
 
 
 def ask_images(cfg_path: Path) -> str | None:
@@ -4175,8 +4181,8 @@ def ask_images(cfg_path: Path) -> str | None:
     say("  choose, and a request that names none gets the default.")
     for i, c in enumerate(plain, 1):
         _, dit, enc = QI.IMAGE_MODELS[c]
-        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
-        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
+        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
+        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
         say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
             f"~{need:.0f} GB of RAM)")
     # a model set up for the first time: SETUP_DEFAULT; set up again: what it has (none included)
@@ -4271,7 +4277,21 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in QI.parse_choices(a.images)]
+    choices = QI.parse_choices(a.images)
+    if any(QI.is_anima(QI.IMAGE_MODELS[c][1]) for c, _ in choices if c in QI.IMAGE_MODELS):
+        # the derivatives the user put in Anima's folder: models of their own beside the ones asked for
+        user = QI.anima_user_dits(models_dir)
+        for name, path in user.items():
+            if all(c != name for c, _ in choices):
+                ok(f"{name}: a derivative of Anima in {path.parent}, set up as an image model of its own")
+                choices.append((name, None))
+    for c, _ in choices:
+        if c.startswith(QI.ANIMA_USER):
+            path = models_dir / QI.ANIMA_DIR / (c[len(QI.ANIMA_USER):] + ".safetensors")
+            why = QI.anima_header(path) if path.is_file() else "no such file"
+            if why:
+                fail(f"{c}: {path}: {why}", f"put the derivative's DiT (.safetensors) in {path.parent}")
+    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in choices]
     names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
@@ -6564,10 +6584,10 @@ def describe() -> dict:
     for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
         if choice.endswith("-uncensored"):
             continue
-        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
+        names = QI.file_names(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit)
         images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
-                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
+                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit), 1),
                        "edits": dit in QI.MF_EDIT or not QI.engine_quantized(dit),
                        "license": QI.license_note(dit),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,

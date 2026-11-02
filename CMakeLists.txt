@@ -725,6 +725,7 @@ if(STRATA_ENABLE_XE)
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
+                           src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
                            src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp
                            src/image/qi_sdpa.cpp src/image/hunyuanimage3_file.cpp
                            src/image/hunyuanimage3_host.cpp src/image/hunyuanimage3_kernels.cpp

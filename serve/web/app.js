@@ -2255,8 +2255,14 @@ $("img-model").onchange = () => {
   imgDefaults();
   imgMaskSetup();
 };
+// the prompt a model starts with (its quality tags, defaults.prompt_start): put in while the field is empty or still
+// holds the previous model's
+let imgPromptStart = "";
 function imgDefaults() {
   const d = imgModel().defaults || {}, edits = imgModel().edits;
+  const p = $("img-prompt"), start = d.prompt_start || "";
+  if (!p.value.trim() || p.value.trim() === imgPromptStart) p.value = start;
+  imgPromptStart = start;
   // an image: an edit's references, or (a model without edits) the one image img2img starts from; its strength
   // (how much of the schedule runs from it) beside it, the model's default as the placeholder
   $("img-ref-l").textContent = edits ? tr("img.edit", "Edit an image (optional)") : tr("img.img2img", "Start from an image (optional, img2img)");
@@ -2272,6 +2278,11 @@ function imgDefaults() {
   $("img-cfg-l").textContent = token ? tr("img.guidance", "Guidance") : tr("img.guidanceCfg", "Guidance (CFG)");
   $("img-cfg").placeholder = d.guidance > 1 || token ? String(d.guidance) : tr("img.off", "off");
   $("img-bg-f").hidden = !d.transparency;
+  // the samplers the model takes (Anima's, Mage-Flow's without edits), its own first
+  const samplers = d.samplers || [];
+  $("img-sampler-f").hidden = samplers.length < 2;
+  $("img-sampler").replaceChildren(...samplers.map(x => new Option(x, x)));
+  if (d.sampler) $("img-sampler").value = d.sampler;
   imgCount();
   imgFormat();
   imgNegHint();
@@ -2926,6 +2937,7 @@ $("img-form").onsubmit = async (ev) => {
   if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
   if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
   if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
+  if (!$("img-sampler-f").hidden && $("img-sampler").value) body.sampler = $("img-sampler").value;
   if (refs.length && $("img-strength").value !== "") body.strength = Number($("img-strength").value);
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;

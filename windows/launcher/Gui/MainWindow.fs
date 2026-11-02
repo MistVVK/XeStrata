@@ -118,7 +118,7 @@ let private imageRunOptions () =
             0
     let control =
         stack 10.0 [
-            field "Mage-Flow and MOSS-Image: the image model on the GPU" ditQ8
+            field "Mage-Flow, MOSS-Image and Anima: the image model on the GPU" ditQ8
             field "Mage-Flow: the image model not in use (the generation's or the edit's)" ditKeep
             ssdOffload
             field "The text model while an image is made" policy

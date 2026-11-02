@@ -325,6 +325,7 @@
   "img.rowCount": {"other": "{n} 张"},
   "img.rowEdit": "编辑 {size}",
   "img.rowImage": "图片 {size}",
+  "img.sampler": "采样器",
   "img.seed": "种子",
   "img.seedRandom": "随机",
   "img.size": "尺寸",

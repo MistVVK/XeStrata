@@ -48,6 +48,12 @@ none of.  Its weights are under the Tencent Hunyuan Community
 License Agreement, which does not apply in the European Union, the United Kingdom or South Korea:
 https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
 
+Anima ("family": "anima", "schedule": "anima"): its prompt as ComfyUI tokenizes it (anima_tokens: the emphasis
+"(words:weight)" read, the Qwen3 ids of each part with a weight of 1, the T5 tokenizer's ids with the part's weight and
+</s> at the end), the T5 ids and weights going to the engine as T5:/T5W: (and NEGT5:/NEGT5W:), no system turn; its
+steps (30; Turbo's config 10) on its schedule's shift 3, the sampler er_sde (the model card's) or euler, guidance at a
+scale above 1 (4; Turbo's 1, none) with ANIMA_NEG as its negative prompt by default.  The web page's prompt starts
+with its quality tags (prompt_start; none for the Aesthetic model, whose training dropped them).
 MOSS-Image ("family": "moss-image", "schedule": "moss"): its prompt in its pipeline's chat form (MOSS_PROMPT_HEAD,
 all of it the DiT's, at most MOSS_MAX_IDS ids), the steps asked for (default 50) on its static shift (shift, default
 5; the engine builds the sigmas), guidance at any scale but 1 (default 3) with negative_prompt (default empty), the
@@ -117,6 +123,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import functools
 import hashlib
 import json
 import math
@@ -183,6 +190,8 @@ MF_EDIT_REF = "Image {i}: <|vision_start|><|image_pad|><|vision_end|>"
 MF_MAX_REFS = 3                    # the edit models' training takes up to three references
 MF_SHIFT = 6.0                     # Mage-Flow's static time shift
 MF_NEG = " "                       # its pipeline's negative prompt when none is given
+MAGETRAIL_QUALITY = "masterpiece, best quality, very aesthetic, aesthetic"   # its README's, after the tags
+MF_SAMPLERS = ("euler", "er_sde")  # Mage-Flow's own Euler first; ComfyUI's er_sde on request (without edits)
 HUNYUANIMAGE3_STEPS = 8            # HunyuanImage 3.0 Instruct-Distil's own (its generation_config's diff_infer_steps)
 HUNYUANIMAGE3_GUIDANCE = 2.5       # its guidance token's default (diff_guidance_scale)
 HUNYUANIMAGE3_MAX_REFS = 3         # its edits' reference images at most (each about 5,000 tokens at 1024x1024)
@@ -200,6 +209,15 @@ MOSS_NEG = ""
 MOSS_UNCOND_SKIP = [22]
 MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
 MOSS_SHIFT_MAX = 20.0
+ANIMA_STEPS = 30                   # the model card's 30 to 50 (Turbo: 8 to 12, its config's 10), CFG 4 to 5 (Turbo 1)
+ANIMA_CFG = 4.0
+ANIMA_SHIFT = 3.0                  # ComfyUI's sampling_settings for the model
+ANIMA_SAMPLERS = ("er_sde", "euler")
+ANIMA_NEG = ("worst quality, low quality, score_1, score_2, score_3, 6 fingers, 6 toes, ai-generated, bad eyes, "
+             "bad pupils, bad iris, bad hands, bad fingers, watermark, patreon logo")
+ANIMA_QUALITY = "masterpiece, best quality, score_7, safe, "
+ANIMA_PAD = 151643                 # Qwen3's <|endoftext|>: ComfyUI's one token for an empty prompt
+T5_END = 1                         # T5's </s>
 # a layout (the prompt as MOSS-Image's JSON of boxes): its summary's fields and an item's
 MOSS_SUMMARY_KEYS = ("caption", "meta", "canvas", "palette")
 MOSS_ITEM_KEYS = ("label", "caption", "text", "bbox", "tags", "palette")
@@ -267,8 +285,11 @@ def model_defaults(cfg: dict) -> dict:
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
     moss = cfg.get("family") == "moss-image"
+    anima = cfg.get("family") == "anima"
     if cfg.get("schedule") == "base":
         steps, least, fixed = int(cfg.get("steps") or 40), 2, False
+    elif anima:   # Anima: any count on its shift
+        steps, least, fixed = int(cfg.get("steps") or ANIMA_STEPS), 1, False
     elif cfg.get("schedule") == "mage":
         steps, least, fixed = int(cfg.get("steps") or 4), 1, False
     elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: any count on the engine's own shift
@@ -284,13 +305,22 @@ def model_defaults(cfg: dict) -> dict:
            "formats": output_formats(),
            "guidance": (float(cfg.get("guidance") or HUNYUANIMAGE3_GUIDANCE) if hunyuan
                         else float(cfg.get("cfg_scale") or 1.0) if mage
-                        else float(cfg.get("cfg_scale") or MOSS_CFG) if moss else 1.0),
+                        else float(cfg.get("cfg_scale") or MOSS_CFG) if moss
+                        else float(cfg.get("cfg_scale") or ANIMA_CFG) if anima else 1.0),
            "guidance_token": hunyuan,
-           "negative_prompt": MF_NEG if mage else MOSS_NEG if moss else None,
+           "negative_prompt": MF_NEG if mage else MOSS_NEG if moss else ANIMA_NEG if anima else None,
+           # what the web page's prompt starts as (its model's quality tags); serve adds nothing to a prompt
+           "prompt_start": (MAGETRAIL_QUALITY if mage and str(cfg.get("model_name", "")).startswith("magetrail")
+                            else (cfg.get("prompt_start", ANIMA_QUALITY) or "") if anima else ""),
            "transparency": cfg.get("transparency") is not False,
            "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
+    if anima:
+        out.update(shift=float(cfg.get("shift") or ANIMA_SHIFT), samplers=list(ANIMA_SAMPLERS),
+                   sampler=cfg.get("sampler") or ANIMA_SAMPLERS[0])
+    elif mage and not can_edit(cfg):   # Mage-Flow's Euler, er_sde on request (MageTrail's author uses either)
+        out.update(samplers=list(MF_SAMPLERS), sampler=cfg.get("sampler") or MF_SAMPLERS[0])
     if moss:
         out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
                    slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True,
@@ -395,7 +425,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
         steps = _int_field(req, "steps", 2, MAX_STEPS, QUALITY_STEPS.get(quality or "auto") or dflt["steps"])
     elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
-    elif cfg.get("schedule") in ("hunyuanimage3", "moss"):   # the count on the engine's own sigmas (its shift)
+    elif cfg.get("schedule") in ("hunyuanimage3", "moss", "anima"):   # the count on the engine's own sigmas
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
     else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
         _int_field(req, "steps", 1, MAX_STEPS, None)
@@ -415,6 +445,13 @@ def parse_request(req: dict, cfg: dict) -> dict:
         job["loras"] = loras
     if unknown:
         job["lora_unknown"] = list(dict.fromkeys(unknown))   # a name in both prompts said once
+    if "samplers" in dflt:   # Anima's, Mage-Flow's without edits
+        sampler = req.get("sampler")
+        if sampler not in (None, "") and sampler not in dflt["samplers"]:
+            raise ImageRequestError(f"sampler: {' or '.join(dflt['samplers'])}")
+        job["sampler"] = sampler or dflt["sampler"]
+    elif req.get("sampler") not in (None, ""):
+        raise ImageRequestError("sampler: this image model has its own (Anima and Mage-Flow without edits take one)")
     if cfg.get("family") == "moss-image":
         job.update(moss_request(req, cfg))
         if req.get("layout") is not None:
@@ -666,7 +703,7 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
             scale = float((cfg or {}).get("guidance") or HUNYUANIMAGE3_GUIDANCE)
         out["guidance"] = float(scale)
         return out
-    if (cfg or {}).get("family") in ("mage-flow", "moss-image"):
+    if (cfg or {}).get("family") in ("mage-flow", "moss-image", "anima"):
         dflt = model_defaults(cfg or {})
         scale = out.get("true_cfg_scale", out.get("guidance_scale", dflt["guidance"]))
         if scale > 1 or (scale != 1 and (cfg or {}).get("family") == "moss-image"):
@@ -970,6 +1007,76 @@ def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> l
     return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
 
 
+def anima_weights(text: str) -> list[tuple[str, float]]:
+    """ComfyUI's emphasis (sd1_clip.token_weights): the text's parts and their weights, "(words)" 1.1 times its
+    surroundings' (nested, multiplied), "(words:2)" 2, "\\(" and "\\)" a plain parenthesis."""
+    text = text.replace("\\)", "\0\1").replace("\\(", "\0\2")
+
+    def parse(string: str) -> list[str]:
+        out, cur, level = [], "", 0
+        for ch in string:
+            if ch == "(":
+                if level == 0:
+                    if cur:
+                        out.append(cur)
+                    cur = "("
+                else:
+                    cur += ch
+                level += 1
+            elif ch == ")":
+                level -= 1
+                if level == 0:
+                    out.append(cur + ")")
+                    cur = ""
+                else:
+                    cur += ch
+            else:
+                cur += ch
+        if cur:
+            out.append(cur)
+        return out
+
+    def weights(string: str, w: float) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for x in parse(string):
+            weight = w
+            if len(x) >= 2 and x[0] == "(" and x[-1] == ")":
+                x = x[1:-1]
+                at = x.rfind(":")
+                weight *= 1.1
+                if at > 0:
+                    try:
+                        weight = float(x[at + 1:])
+                        x = x[:at]
+                    except ValueError:
+                        pass
+                out += weights(x, weight)
+            else:
+                out.append((x, w))
+        return out
+
+    return [(t.replace("\0\1", ")").replace("\0\2", "("), w) for t, w in weights(text, 1.0)]
+
+
+def anima_tokens(tok, t5, text: str) -> tuple[list[int], list[int], list[float]]:
+    """Anima's prompt as ComfyUI's AnimaTokenizer makes it: each part (anima_weights) tokenized on its own, the Qwen3
+    ids (their weights all 1: the text encoder reads them plainly; one <|endoftext|> for an empty prompt) and the T5
+    ids with the part's weight, then T5's </s>."""
+    ids: list[int] = []
+    t5_ids: list[int] = []
+    t5_w: list[float] = []
+    for part, w in anima_weights(text):
+        if not part:
+            continue
+        ids += tok.encode(part)
+        more = t5.encode(part)
+        t5_ids += more
+        t5_w += [w] * len(more)
+    t5_ids.append(T5_END)
+    t5_w.append(1.0)
+    return ids or [ANIMA_PAD], t5_ids, t5_w
+
+
 def hunyuanimage3_buckets(cfg: dict) -> list[dict]:
     """HunyuanImage 3.0's resolution buckets (ratio_index, height, width, tokens_h, tokens_w, ratio), from the config's
     "resolutions" parameters (tools/image/qimage.py's hunyuanimage3_buckets builds the table; the run config keeps the
@@ -1048,13 +1155,18 @@ def mage_sigmas(steps: int, shift: float = MF_SHIFT) -> list[float]:
     return out + [0.0]
 
 
-def load_tokenizer(path: str, family: str = "qwen-image"):
-    """The prompt's tokenizer (tools/strata_tokenizer.py): HunyuanImage 3.0's own `tokenizer.json` (a byte-level BPE,
-    from_hf) or Qwen3-VL's, from the text encoder's GGUF."""
+def _tokenizer_module():
     tools = str(Path(__file__).resolve().parent.parent / "tools")
     if tools not in sys.path:
         sys.path.insert(0, tools)
     import strata_tokenizer
+    return strata_tokenizer
+
+
+def load_tokenizer(path: str, family: str = "qwen-image"):
+    """The prompt's tokenizer (tools/strata_tokenizer.py): HunyuanImage 3.0's own `tokenizer.json` (a byte-level BPE,
+    from_hf) or Qwen3-VL's (Anima's Qwen3's), from the text encoder's GGUF."""
+    strata_tokenizer = _tokenizer_module()
     if family == "hunyuan-image-3":
         return strata_tokenizer.Tokenizer.from_hf(path)
     return strata_tokenizer.Tokenizer.from_gguf(path)
@@ -1214,6 +1326,10 @@ class ImageEngine:
             cmd += ["--edit-dit", str(self.cfg["edit_model"])]
         if self.cfg.get("dit_keep") is False:
             cmd += ["--dit-keep", "0"]
+        if self.cfg.get("lora_bake") is False:   # the adapters added to each product instead of baked into the weights
+            cmd += ["--lora-bake", "0"]
+        if self.cfg.get("lora_block_map"):   # Anima-2.9B: the release's adapters bound to its blocks
+            cmd += ["--lora-block-map", ",".join(str(int(b)) for b in self.cfg["lora_block_map"])]
         return cmd + ["--serve"]
 
     def alive(self) -> bool:
@@ -1407,8 +1523,8 @@ class ImageGen:
                              "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
         # the ids the DiT does not take: the leading system turn's (HunyuanImage 3.0's DiT reads all of its own)
-        self.drop = (0 if self.family in ("hunyuan-image-3", "moss-image") else MF_DROP if self.family == "mage-flow"
-                     else DROP)
+        self.drop = (0 if self.family in ("hunyuan-image-3", "moss-image", "anima")
+                     else MF_DROP if self.family == "mage-flow" else DROP)
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
@@ -1422,6 +1538,7 @@ class ImageGen:
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
                                   self._say)
         self.tok = None
+        self.t5 = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last: dict | None = None              # the last job's figures (/v1/status)
@@ -1516,6 +1633,8 @@ class ImageGen:
         if self.family == "hunyuan-image-3":
             return ("exe", "diffusion_model", "vae", "tokenizer", "system_prompt") + \
                 (("vision",) if self.cfg.get("vision") else ())
+        if self.family == "anima":   # its LLM adapter's queries come from the T5 tokenizer
+            return ("exe", "diffusion_model", "vae", "llm", "t5_tokenizer")
         return ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
 
     def missing(self) -> list[str]:
@@ -1576,6 +1695,15 @@ class ImageGen:
                 job["ref_buckets"] = [hunyuanimage3_bucket(self.cfg, *image_dims(r)) for r in job.get("refs") or ()]
                 job["ids"] = hunyuanimage3_ids(self.tok, model_prompt(job), bucket, self._base_size(),
                                                self.system_text(), job["ref_buckets"])
+            elif self.family == "anima":
+                if self.t5 is None:
+                    _tokenizer_module()   # tools/ on the path
+                    import strata_unigram
+                    self.t5 = strata_unigram.UnigramTokenizer.from_hf_json(self.cfg["t5_tokenizer"])
+                job["ids"], job["t5"], job["t5_w"] = anima_tokens(self.tok, self.t5, model_prompt(job))
+                if job.get("cfg"):
+                    neg_parts = anima_tokens(self.tok, self.t5, job["negative_prompt"])
+                    job["neg_ids"], job["neg_t5"], job["neg_t5_w"] = neg_parts
             else:
                 ids = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
                 neg = None
@@ -1640,10 +1768,22 @@ class ImageGen:
 
     @staticmethod
     def _cfg_words(job: dict) -> str:
-        """IMG's guidance words: the negative prompt's ids and the scale (none without guidance)."""
+        """IMG's guidance words: the negative prompt's ids and the scale (none without guidance); Anima's its T5 ids and
+        weights too."""
         if not job.get("cfg"):
             return ""
-        return f" NEG:{','.join(str(i) for i in job['neg_ids'])} CFG:{job['cfg']:g}"
+        words = f" NEG:{','.join(str(i) for i in job['neg_ids'])} CFG:{job['cfg']:g}"
+        if "neg_t5" in job:
+            words += (f" NEGT5:{','.join(str(i) for i in job['neg_t5'])}"
+                      f" NEGT5W:{','.join(f'{w:g}' for w in job['neg_t5_w'])}")
+        return words
+
+    @staticmethod
+    def _anima_words(job: dict) -> str:
+        """Anima's words of IMG: its steps and shift (the engine makes the sigmas), the sampler, its T5 ids and
+        weights."""
+        return (f" STEPS:{job['steps']} SHIFT:{ANIMA_SHIFT!r} SAMPLER:{job.get('sampler') or ANIMA_SAMPLERS[0]}"
+                f" T5:{','.join(str(i) for i in job['t5'])} T5W:{','.join(f'{w:g}' for w in job['t5_w'])}")
 
     def stage(self, job: dict) -> None:
         """An edit's reference images, img2img's image and a mask into files the engine reads (job["ref_paths"],
@@ -1756,7 +1896,9 @@ class ImageGen:
                 # HunyuanImage 3.0's sigmas are the engine's own (from the step count): its step count and the
                 # guidance token's scale go instead
                 guide = (f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else
-                         self._moss_words(job) if self.family == "moss-image" else "")
+                         self._moss_words(job) if self.family == "moss-image" else
+                         self._anima_words(job) if self.family == "anima" else
+                         f" SAMPLER:{job['sampler']}" if job.get("sampler") else "")
                 for i in range(first, job["n"]):
                     if i > first and pause is not None and pause():
                         break
@@ -2052,11 +2194,10 @@ OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "backgr
 FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))")
 TOOLS: list[dict[str, Any]] = [
     {"name": "generate_image",
-     "description": "Make an image from a description with the image model on this computer. "
-                    "Describe it in detail: the subject, the setting, the style, the light, and any text it shows in "
-                    "quotes. The image is shown to the user; the result says where it is.",
+     "description": "Make an image with the image model on this computer. The image is shown to the user; the "
+                    "result says where it is.",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "the image's description"},
+         "prompt": {"type": "string", "description": "the image's prompt"},
          "size": {"type": "string",
                   "description": "WIDTHxHEIGHT, e.g. 1024x1024, 1536x1024 (wide), 1024x1536 (tall)"},
          "seed": {"type": "integer", "description": "the same seed and prompt make the same image"}},
@@ -2065,8 +2206,8 @@ TOOLS: list[dict[str, Any]] = [
      "description": "Change an image, or make a new one from it (its subject, its style): the conversation's last "
                     "image (one the user attached or one made here) unless `image` names another (a "
                     "/v1/images/files/... link from an earlier result). The new image is shown to the user. An image "
-                    "model without edits draws the prompt over the image instead (img2img): describe the whole "
-                    "picture there.",
+                    "model without edits draws the prompt over the image instead (img2img): the prompt then says "
+                    "what the whole picture shows.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what to change, or what to make from the image"},
          "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
@@ -2077,6 +2218,20 @@ TOOLS: list[dict[str, Any]] = [
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
 ]
+
+SKILLS = Path(__file__).resolve().parent / "image_skills"
+
+
+@functools.cache
+def skill(name: str) -> str:
+    """serve/image_skills/<name>.md without its license comment: "" when there is none.  common.md goes into every
+    image tool's description; a model's own (magetrail.md, by its name without -uncensored), else its family's
+    (anima.md), into those it is offered in."""
+    try:
+        text = (SKILLS / f"{name}.md").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+    return re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.S).strip()
 
 
 class ImageTools:
@@ -2132,17 +2287,21 @@ class ImageTools:
             if not gens or t["name"] in exclude:
                 continue
             t = dict(t)
+            rules: dict[str, list[str]] = {}
+            for g in gens:
+                own = g.model.removesuffix("-uncensored")
+                rules.setdefault(own if skill(own) else g.family, []).append(g.model)
+            t["description"] = "\n\n".join([t["description"], skill("common")] + [
+                f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
             moss = [g.model for g in gens if g.family == "moss-image"]
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])
-                only = "" if len(moss) == len(gens) else f" (only {', '.join(moss)} reads one)"
                 params["properties"] = {**params["properties"], "layout": {
                     "type": "object",
-                    "description": "where things and text go, when that matters (a poster, a sign, several panels)"
-                                   + only + "; the prompt is then a short description of the whole image",
+                    "description": f"where things and text go ({', '.join(moss)})",
                     "properties": {
                         "summary": {"type": "object", "properties": {"caption": {
-                            "type": "string", "description": "the whole image: its scene, style and colours"}}},
+                            "type": "string", "description": "the whole image"}}},
                         "items": {"type": "array", "items": {"type": "object", "properties": {
                             "label": {"type": "string", "enum": list(MOSS_LABELS)},
                             "caption": {"type": "string", "description": "how it looks"},
@@ -2156,7 +2315,8 @@ class ImageTools:
             if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
                 about = _qimage().ABOUT
                 choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
-                lines = "; ".join(f"{g.model}: {about.get(choice.get(g.model, ''), '')}".rstrip(": ") for g in gens)
+                lines = "; ".join(f"{g.model}: {about.get(choice.get(g.model, ''), '') or self._about(g)}".rstrip(": ")
+                                  for g in gens)
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "model": {
                     "type": "string", "enum": [g.model for g in gens],
@@ -2165,6 +2325,13 @@ class ImageTools:
                 t["parameters"] = params
             out.append(t)
         return out
+
+    @staticmethod
+    def _about(g) -> str:
+        """A model the catalog does not describe: a derivative of Anima the user put in its folder."""
+        if g.family == "anima":
+            return f"a derivative of Anima ({Path(str(g.cfg.get('diffusion_model', ''))).name})"
+        return ""
 
     def routes(self) -> dict:
         return {t["name"]: (None, t["name"]) for t in self.template_tools()}

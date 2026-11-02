@@ -30,10 +30,15 @@ Text and images take turns on one GPU and share its VRAM. What happens to the te
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50 (CFG) | OpenMOSS's 5B model. For text in images and a layout set with boxes (`layout`); the prompt can be expanded (`enhance`). No edits (img2img and masks work) |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50 (CFG) | The base model, before its tuning |
 | `moss-image-uncensored`, `moss-image-base-uncensored` | The two above | 50 (CFG) | With HauhauCS's Qwen3.5-9B, its refusals removed, as the text encoder |
+| `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30 (CFG) | CircleStone Labs' 2B model. For anime-style illustrations drawn from Danbooru tags and sentences. No edits (img2img and masks work) |
+| `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30 (CFG) | Tuned to a consistent, polished style |
+| `anima-turbo` | [Anima-Turbo](https://huggingface.co/circlestone-labs/Anima) | 10 | Distilled for speed (no CFG) |
+| `anima-2.9b` | [Anima-2.9B](https://huggingface.co/Gazingstars123/Anima-2.9B) | 30 (CFG) | Gazingstars123's Anima with its blocks grown from 28 to 40 (a preview) |
+| `anima:<name>` | A derivative of Anima | 30 (CFG) | A derivative put in the data folder's `models/anima` (see "Anima's derivatives" below) |
 
 In this document "Qwen-Image-2.1" means both Turbo and the base model; what holds for one of them only says "Turbo" or "the base model".
 
-- **The text encoder** reads the prompt: Qwen3-VL-8B for Qwen-Image-2.1, Qwen3-VL-4B for Mage-Flow and MageTrail, Qwen3.5-9B for MOSS-Image.
+- **The text encoder** reads the prompt: Qwen3-VL-8B for Qwen-Image-2.1, Qwen3-VL-4B for Mage-Flow and MageTrail, Qwen3.5-9B for MOSS-Image, Qwen3-0.6B-Base (mradermacher's GGUF) for Anima.
   HunyuanImage 3.0 has none: its image model reads the prompt itself. XeStrata builds the prompt's word ids from the model's own `tokenizer.json` and the system prompt the model uses by default (the `en_unified.txt` setup wrote out of `system_prompt.py`, 5,674 characters).
 - **`-uncensored`** after the name (`qwen-image-turbo-uncensored`, `mage-flow-turbo-uncensored` and so on) takes a text encoder with the refusal direction removed:
   AtomicChat's Qwen3-VL-8B for Qwen-Image-2.1, huihui-ai's Qwen3-VL-4B (noctrex's GGUF) for Mage-Flow and MageTrail. The image model and the VAE stay the same.
@@ -47,6 +52,11 @@ In this document "Qwen-Image-2.1" means both Turbo and the base model; what hold
   Its VAE is the Flux2 VAE its author uses (as Black Forest Labs publishes it with FLUX.2-klein-4B).
 - **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024). With the size `auto`, or none, the model chooses the aspect ratio itself from the prompt (and an edit's reference images), as Tencent's `image_size="auto"` does; the choice takes 4 to 13 seconds on a B70.
   The weights are Tencent's two quantizations (w4a8 and int8). It draws from the prompt at once, not the way Tencent runs it by default (the model reasoning and rewriting the prompt before it draws).
+- **Anima:** the prompt can be Danbooru tags (`1girl, solo, silver hair, ...`) or sentences. The web page's prompt field starts with the quality tags (`masterpiece, best quality, score_7, safe`; none for Aesthetic). The server adds nothing to a prompt.
+  `(words:weight)` emphasis is read as ComfyUI reads it. The sampler is er_sde by default; Euler can be chosen.
+  The VAE is Wan 2.1's (the one in Anima's repository). There is no uncensored text encoder.
+- **Anima's derivatives:** a fine-tune of Anima as safetensors (ComfyUI's single file, or without the prefix) put in the data folder's `models/anima` is told apart as Anima's by its header, and setup sets it up as the image model `anima:<the file's name without the extension>` when it installs an Anima model. It shares the release's VAE and text encoder.
+  `--images anima:<name>` names one as well. A file not in Anima's form (a LoRA and the like) is left out, with the reason.
 - **Masks and strength:** every model takes a mask (the part to draw again) and a strength (how much to change the image). Neither is the model's own: both bring the latent back to the image's during the sampling, a way that works with any model (as diffusers and ComfyUI do).
   A model with edits takes its first reference image as the image; a model without edits (MageTrail, Mage-Flow without its edit model) starts from one image, img2img.
 
@@ -85,6 +95,7 @@ Qwen-Image-2.1's image model comes in three sizes (`--image-quant`).
 
 Mage-Flow comes in one size (bf16): a 21.9 GB download, about 16 GB of RAM (12 GB with `--image-dit-keep off`).
 MageTrail comes in one size too: a 10.4 GB download, about 10 GB of RAM.
+Anima's image model also comes in one size (bf16): a 5.6 GB download (7.3 GB for 2.9B), about 8 GB of RAM (10 GB for 2.9B). Its text encoder is F16, lowered to Q8_0 when the RAM is short.
 The Flux2 VAE takes about 4.3 GB of VRAM at 1024x1024; where that does not fit, it reads the image in tiles (slower, and the colors may shift slightly).
 
 HunyuanImage 3.0 comes in Tencent's two quantizations (`--image-quant`; w4a8 by default).
@@ -100,7 +111,7 @@ A GPU that does not hold the weights that always stay in VRAM (about 6.7 GB; wit
 - **The download** is the image model (for Mage-Flow, the generation and edit models), the VAE, the text encoder (Q8_0) and the picture reader for edits (none for MageTrail) together (for HunyuanImage 3.0, its tokenizer and system prompt instead of a text encoder, and the SigLIP2 shard for its edits).
 - **The RAM** is needed besides the text model's: the files' sizes plus about 2 GB for the engine itself.
 - **When it does not fit,** setup lowers the text encoder first, to Q6_K, Q5_K and Q4_K, until it fits the RAM the text model leaves, and then the image model, to Q6_K and Q4_K_M (with the image model lowered, the text encoder is the largest that fits beside it).
-  Mage-Flow lowers only its text encoder, HunyuanImage 3.0 only its image model (int8 to w4a8).
+  Mage-Flow and Anima lower only their text encoder, HunyuanImage 3.0 only its image model (int8 to w4a8).
   Setup's screen, the server's start-up and the web page say so when it lowered them.
   With `--image-ssd-offload on` nothing is lowered: the sizes chosen are installed, and what does not fit the RAM is read from the SSD (slower).
 - **VRAM:** the engine streams the layers that do not fit the VRAM from the RAM, so the GPU's memory does not choose the size; more VRAM is faster.
@@ -114,7 +125,7 @@ Setup's options (given to `xestrata --setup`):
 | `--images <model>`, `no` | — | Installs the image model; `no` removes image generation |
 | `--image-quant Q8_0\|Q6_K\|Q4_K_M`, `w4a8\|int8` | `Q8_0` (`w4a8` for HunyuanImage 3.0) | The size of the image model (three for Qwen-Image-2.1, Tencent's two quantizations for HunyuanImage 3.0; no effect on Mage-Flow) |
 | `--image-ssd-offload on\|off` | `off` | `on`: the sizes are not lowered when the RAM is short |
-| `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow's image model in 8 bits or not. `auto` keeps 16 bits when it fits the VRAM with the text encoder, 8 bits when it does not |
+| `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow's, MOSS-Image's and Anima's image model in 8 bits or not. `auto` keeps 16 bits when it fits the VRAM with the text encoder, 8 bits when it does not |
 | `--image-dit-keep on\|off` | `on` | Keeps Mage-Flow's image model not in use (the generation or the edit one) in RAM in 8 bits. `off` uses about 4.4 GB less RAM and reads it from the file again at each switch |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | What happens to the text model while an image is made ([below](#sharing-the-gpus-memory)); given together with `--images` |
 | `--image-gpu auto\|same\|<PCI>` | `auto` | The GPU that makes the images: `auto` the one with the most VRAM of the GPUs the text model does not take and that are not the processor's own (else the text model's GPU), `same` the text model's GPU, a PCI address (as `--check` lists it) that GPU; given together with `--images` |
@@ -135,7 +146,8 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `daemon_idle_s` | 1800 | The seconds an image engine no server is connected to waits before it ends |
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
-| `lora_dir` | `loras` beside the image model's file | The folder the LoRA files go in (setup writes the data folder's `models/loras`; the four models share one folder, and each one's listing is narrowed to what its DiT takes. [LoRA](#lora-adapters)) |
+| `lora_bake` | `true` | Anima's plain LoRAs on its blocks baked into the weights (`false`: the delta added to each product. [LoRA](#lora-adapters)) |
+| `lora_dir` | `loras` beside the image model's file | The folder the LoRA files go in (setup writes the data folder's `models/loras`; every model shares one folder, and each one's listing is narrowed to what its DiT takes. [LoRA](#lora-adapters)) |
 
 HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters), `vision` (the shard with SigLIP2) and `ratio_head` (what it chooses its size with; without it `auto` is 1024x1024); its `max_refs` defaults to 3.
 
@@ -150,6 +162,8 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
   The number goes up to what fits in `budget_s` at the size and steps chosen (`max_n` at most), with the estimated time beside it.
   The format is JPEG XL by default (quality 100, lossless) when the browser shows it and the server writes it, PNG otherwise. The format and quality chosen are kept in the browser.
 - A negative prompt (what the image should not have), the steps and the CFG strength can be given too. Left empty, they are the model's defaults (the API's), which the fields show greyed out.
+  For Anima and MageTrail, the prompt field starts with the model's quality tags (they can be removed).
+- Anima and Mage-Flow without edits (MageTrail and the like) let the sampler be chosen too (er_sde or Euler).
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
   With HunyuanImage 3.0 the guidance is one token, so the field is Guidance and there is no negative prompt field.
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
@@ -189,11 +203,12 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out. HunyuanImage 3.0 makes the image at the bucket (of its 37) whose shape is nearest, and the answer's `size` is that one; with `auto` or none, at the bucket the model chooses |
 | `n` | 1 | 1 to `max_n` (16); a number that does not fit in `budget_s` is refused with the estimated time. Image i uses the seed `seed + i` |
 | `seed` | random | 0 to 2^62 |
-| `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow, HunyuanImage 3.0 and MOSS-Image (8 by default for HunyuanImage 3.0, 50 for MOSS-Image); Turbo stays at 8 |
+| `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow, HunyuanImage 3.0, MOSS-Image and Anima (8 by default for HunyuanImage 3.0, 50 for MOSS-Image, 30 for Anima, 10 for Anima-Turbo); Turbo stays at 8 |
 | `quality` | `auto` | The steps of Qwen-Image-2.1's base model: `low` 20, `medium` (`standard`) 30, `high`, `hd` and `auto` the default 40 (`steps`, when given, wins). Mage-Flow and HunyuanImage 3.0 do not use it |
-| `negative_prompt` | none (one space for Mage-Flow, empty for MOSS-Image) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
+| `negative_prompt` | none (one space for Mage-Flow, empty for MOSS-Image, a list of low quality, broken hands and the like for Anima) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
+| `sampler` | `er_sde` for Anima, `euler` for Mage-Flow | The sampler: `er_sde` or `euler`. Only Anima and Mage-Flow without edits (MageTrail and the like) take it; other models answer 400 |
 | `lora` | none | The adapters to apply ([LoRA](#lora-adapters)): `{"name", "scale"}` in a list, or one alone. `scale` is -2 to 2 (1 when left out). 4 at most |
-| `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow, HunyuanImage 3.0 and MOSS-Image | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow and MOSS-Image take `true_cfg_scale`, else `guidance_scale` (3 by default for MOSS-Image). HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
+| `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow, HunyuanImage 3.0, MOSS-Image and Anima | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow, MOSS-Image and Anima take `true_cfg_scale`, else `guidance_scale` (3 by default for MOSS-Image, 4 for Anima, 1 for Anima-Turbo). HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
 | `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png, webp or jxl only); `opaque` flattens the alpha onto white. Mage-Flow and HunyuanImage 3.0 refuse `transparent` |
 | `output_format` | `png` | `png`, `jpeg`, `webp`, `jxl` (JPEG XL; only with libjxl's cjxl) |
 | `output_compression` | 100 | 0 to 100: jpeg's, webp's and jxl's quality (jxl's 100 is lossless) |
@@ -274,11 +289,11 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 ## LoRA (adapters)
 
 An image model can apply a LoRA that ComfyUI and the like distribute, each time it makes an image.
-The models that take one are Qwen-Image-2.1 (Turbo and the base model), MOSS-Image, Mage-Flow and MageTrail. HunyuanImage 3.0 takes none (a request with `lora`, or a prompt's tag, is a 400).
+The models that take one are Qwen-Image-2.1 (Turbo and the base model), MOSS-Image, Mage-Flow, MageTrail and Anima (its derivatives too). HunyuanImage 3.0 takes none (a request with `lora`, or a prompt's tag, is a 400).
 
 ### Where they go and the listing
 
-- Setup writes `"lora_dir"` in the config's `"images"` (the data folder's `models/loras`). The four models share the one folder, and each one's listing is narrowed to what its DiT takes. Create the folder when it is not there.
+- Setup writes `"lora_dir"` in the config's `"images"` (the data folder's `models/loras`). Every model shares the one folder, and each one's listing is narrowed to what its DiT takes. Create the folder when it is not there.
   The files are `.safetensors` and `.gguf`, and subfolders are read too (a name is its path there, `style/gouache`).
 - The folder is read again at once when it changes, and a listing is kept up to 10 seconds. The server need not be stopped.
 - `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
@@ -330,8 +345,10 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 - An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT on it is refused.
 - A LoHa's rank is `hada_w1_b`'s rows, and the metadata's `lora_alpha` is divided by that rank (as ComfyUI does); a file whose `lora_alpha` has nothing to do with its rank changes the strength.
 - A file with `use_rslora` is refused (its strength is alpha / √rank, not alpha / rank). PEFT's `rank_pattern` is not read: alpha alone.
-- A file with a text encoder's weight (`lora_te_`, `text_encoder.`, `te.`) is not applied: text encoder LoRAs are not done. The API has no `scale_text` field, and one sent is ignored as `style` and `user` are.
-- sd-scripts' `lora_unet_` names are read, but they name none of these models' weights.
+- A file with text encoder weights (keys such as `lora_te_`, `text_encoder.`, `te.`) applies those to the text encoder (Qwen-Image-2.1, Mage-Flow, MageTrail, MOSS-Image, Anima). The strength is the image model's; the API has no `scale_text` field (one sent is ignored as `style` and `user` are).
+  A request that applies one to the text encoder makes the prompt's states again with that set. When MOSS-Image's text encoder is the chat model's own file, the image engine reads the prompt itself for those requests only.
+- sd-scripts' `lora_unet_` names are applied to Anima's weights (they name none of the other models' weights).
+- Anima-2.9B takes the LoRAs made for the official Anima (2B): they skip the 12 blocks 2.9B added and apply to the original 28.
 
 ### Quantized weights and memory
 
@@ -340,6 +357,8 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 - The adapters are kept in VRAM (A/B and GLoRA's factors in FP16; a DoRA's coefficients, a bias and an OFT's rotation in FP32). `strata.lora_mib` says how much, and an image whose budget they do not fit is refused with the VRAM it needs. A rank-64 Qwen-Image-2.1 LoRA's A/B is about 320 MiB.
 - From the second image of the same set the bound adapters are used as they are (and each file is read once). A new set makes Qwen-Image-2.1 rebuild the prompt's prefix (the text's rows and K and V), and MOSS-Image rebuild the context it read the text embeddings into; the same set keeps them.
 - A layer an adapter takes is slower by the delta's products. In MOSS-Image's W8A8 blocks, making the 16-bit rows the delta's input needs adds to it.
+- Anima bakes the plain LoRAs on its blocks (without a DoRA, OFT, GLoRA, `set_weight` or bias delta) into the weights (the config's `"lora_bake"`, on by default). The delta is added to the weights once, so a step is as fast as a request without adapters. 8-bit weights are quantized again after it, so the image differs slightly from adding the delta to each product.
+  A new set reads the blocks from the original weights again and bakes them anew; taking the adapters off gives the image of a request without them again (bit for bit). `"lora_bake": false` adds the delta to each product, as the other models do.
 
 ## Sharing the GPU's memory
 
@@ -408,6 +427,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`strata-image.log`) |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention` (setup) | Without cuDNN, the attention on NVIDIA GPUs runs on XeStrata's own kernel. The command shown installs it, which is faster |
+| `anima:<name>: not Anima's DiT ...` (setup) | The file in `models/anima` is not in Anima's form. LoRAs go in `models/loras` |
 | `lora: ...` (400) | The name is not listed, the strength is out of range, or more than 4 are named. The message says which |
 | `lora_rejected: image engine: ...` (400) | The engine cannot apply the adapter: the key and the reason (a weight that adds no bias, rsLoRA, MageTrail's modulation, a DoRA, OFT, GLoRA or set_weight overlapping another's rows and the like) follow ([LoRA](#lora-adapters)) |
 | `strata.lora_unknown` | A prompt's tag named a file the listing has not, and the image was made without it |
@@ -423,4 +443,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
   Read [Tencent's license](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE), its Acceptable Use Policy included, before you use the images.
   The quantized files are the ones PedroMarinhoDev publishes for ComfyUI.
 - MOSS-Image's weights (SFT and Base) are under Apache 2.0, published by OpenMOSS (MOSI. AI). Its VAE is the one in MOSS-Image's repository.
-- The text encoders (Qwen3-VL, and AtomicChat's and huihui-ai's versions; Qwen3.5-9B and HauhauCS's version) are under their own licenses.
+- Anima's weights (Base, Aesthetic, Turbo) are under CircleStone Labs' non-commercial license and NVIDIA's Open Model License of Cosmos-Predict2, which it is built on. The model may not be used commercially (the images it makes may). Read [Anima's page](https://huggingface.co/circlestone-labs/Anima) before using it.
+  Anima-2.9B (Gazingstars123's) and the derivatives are under their publishers' licenses.
+  The VAE is Wan 2.1's, in Anima's repository; it and T5's `tokenizer.json` (google-t5/t5-base), which splits the prompt for the adapter, are under Apache 2.0.
+- The text encoders (Qwen3-VL, and AtomicChat's and huihui-ai's versions; Qwen3.5-9B and HauhauCS's version; Qwen3-0.6B-Base) are under their own licenses.

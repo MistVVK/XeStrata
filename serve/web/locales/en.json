@@ -372,6 +372,7 @@
   },
   "img.rowEdit": "Edit {size}",
   "img.rowImage": "Image {size}",
+  "img.sampler": "Sampler",
   "img.seed": "Seed",
   "img.seedRandom": "random",
   "img.shift": "Shift",

@@ -30,10 +30,15 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集はできない（img2img とマスクは使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
 | `moss-image-uncensored`、`moss-image-base-uncensored` | 上の 2 つ | 50（CFG） | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
+| `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
+| `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | 決まった整った画風に調整した版 |
+| `anima-turbo` | [Anima-Turbo](https://huggingface.co/circlestone-labs/Anima) | 10 | 速さのために蒸留した版（CFG なし） |
+| `anima-2.9b` | [Anima-2.9B](https://huggingface.co/Gazingstars123/Anima-2.9B) | 30（CFG） | Gazingstars123 が Anima のブロックを 28 から 40 に増やした版（試作） |
+| `anima:<名前>` | Anima の派生モデル | 30（CFG） | データのフォルダーの `models/anima` に置いた派生モデル（下の「Anima の派生モデル」） |
 
 この文書で「Qwen-Image-2.1」は Turbo と元のモデルの両方を指し、片方だけのことは「Turbo」「元のモデル」と書きます。
 
-- **文の読み手**: プロンプトを読むモデルです。Qwen-Image-2.1 は Qwen3-VL-8B、Mage-Flow と MageTrail は Qwen3-VL-4B、MOSS-Image は Qwen3.5-9B を使います。
+- **文の読み手**: プロンプトを読むモデルです。Qwen-Image-2.1 は Qwen3-VL-8B、Mage-Flow と MageTrail は Qwen3-VL-4B、MOSS-Image は Qwen3.5-9B、Anima は Qwen3-0.6B-Base（mradermacher の GGUF）を使います。
   HunyuanImage 3.0 は文の読み手が無く、画像のモデルがプロンプトを自分で読みます。XeStrata はその単語の列（ids）を、モデル自身の `tokenizer.json` と、モデルが既定で使うシステム文（setup が `system_prompt.py` から書き出した `en_unified.txt`、5,674 文字）から組みます。
 - **`-uncensored`**: 名前の後ろに付けると（`qwen-image-turbo-uncensored`、`mage-flow-turbo-uncensored` など）、文の読み手を拒否の方向を取り除いたものに替えます。
   Qwen-Image-2.1 は AtomicChat の Qwen3-VL-8B、Mage-Flow と MageTrail は huihui-ai の Qwen3-VL-4B（noctrex の GGUF）です。画像のモデルと VAE はそのままです。
@@ -47,6 +52,11 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
   VAE は作者が使っている Flux2 VAE（Black Forest Labs が FLUX.2-klein-4B で公開しているもの）です。
 - **HunyuanImage 3.0**: 編集は参照画像を 3 枚まで受けます（モデル自身の読み方で、参照画像を VAE の潜在と SigLIP2 の特徴の両方にしてプロンプトの前に置きます）。透明な背景はありません。大きさは、モデルの決めた 37 の大きさ（バケット）のうち、頼んだ大きさに縦横比がいちばん近いもので作ります（512x512 は 1024x1024 になります）。大きさを `auto` にするか付けないと、モデル自身がプロンプト（編集では参照画像も）から縦横比を選びます（Tencent の実装の `image_size="auto"` と同じ）。選ぶのに B70 で 4〜13 秒かかります。
   重みは Tencent の量子化した 2 つ（w4a8 と int8）から選びます。Tencent の既定の動かし方（描く前にモデルが推論とプロンプトの書き直しをする）ではなく、プロンプトからすぐ描きます。
+- **Anima**: プロンプトは Danbooru のタグ（`1girl, solo, silver hair, ...`）と文のどちらでも書けます。Web のページのプロンプトの欄には、初めから品質のタグ（`masterpiece, best quality, score_7, safe`。Aesthetic にはありません）が入っています。サーバーはプロンプトに何も足しません。
+  `(語:強さ)` の強調は ComfyUI と同じに読みます。サンプラーは既定が er_sde で、Euler も選べます。
+  VAE は Wan 2.1 の VAE（Anima のリポジトリにあるもの）です。文の読み手の非検閲版はありません。
+- **Anima の派生モデル**: Anima を微調整したモデルの safetensors（ComfyUI の 1 つのファイルの形でも、接頭辞のない形でも）をデータのフォルダーの `models/anima` に置くと、setup がヘッダーを読んで Anima の派生モデルと見分け、Anima のモデルを入れるときに `anima:<拡張子を除いたファイル名>` の画像のモデルとして一緒に設定します。VAE と文の読み手は公式のものを共有します。
+  `--images anima:<名前>` で名指すこともできます。Anima の形でないファイル（LoRA など）は、理由を示して使いません。
 - **マスクと strength**: どのモデルも、マスク（描き直す部分）と strength（元の画像からどれだけ変えるか）を受けます。どちらもモデル自身の機能ではなく、生成の途中で潜在を元の画像のものに戻す、モデルによらないやり方です（diffusers と ComfyUI と同じ）。
   編集のあるモデルでは、1 枚目の参照画像が元の画像になります。編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）は、1 枚の画像から始める img2img になります。
 
@@ -85,6 +95,7 @@ Qwen-Image-2.1 の画像のモデルは 3 つの大きさから選べます（`-
 
 Mage-Flow は大きさが 1 つ（bf16）で、ダウンロードは 21.9 GB、RAM の目安は 16 GB（`--image-dit-keep off` で 12 GB）です。
 MageTrail も大きさが 1 つで、ダウンロードは 10.4 GB、RAM の目安は 10 GB です。
+Anima も画像のモデルは大きさが 1 つ（bf16）で、ダウンロードは 5.6 GB（2.9B は 7.3 GB）、RAM の目安は 8 GB（2.9B は 10 GB）です。文の読み手は F16 で、RAM が足りないときは Q8_0 に下げます。
 Flux2 VAE は 1024×1024 で約 4.3 GB の VRAM を使い、入らないときは画像をタイルに分けて読みます（遅くなり、色味がわずかに変わることがあります）。
 
 HunyuanImage 3.0 は Tencent の 2 つの量子化から選べます（`--image-quant`、既定は w4a8）。
@@ -100,7 +111,7 @@ w4a8 は 4 ビットの重みと 8 ビットの活性（Tencent が ComfyUI 向�
 - **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手（MageTrail にはありません）の合計です（HunyuanImage 3.0 は文の読み手の代わりに tokenizer とシステム文、編集のための SigLIP2 のシャード）。
 - **RAM の目安**: 文章のモデルとは別に要る量です。ファイルの大きさに、エンジン自身の約 2 GB を足したものです。
 - **足りないとき**: setup は、文章のモデルの残す RAM に入るまで、まず文の読み手を Q6_K、Q5_K、Q4_K の順に下げ、それでも入らなければ画像のモデルを Q6_K、Q4_K_M に下げます（画像のモデルを下げたときは、文の読み手をその横に入る中で最も大きいものにします）。
-  Mage-Flow では文の読み手だけを、HunyuanImage 3.0 では画像のモデル（int8 を w4a8 へ）だけを下げます。
+  Mage-Flow と Anima では文の読み手だけを、HunyuanImage 3.0 では画像のモデル（int8 を w4a8 へ）だけを下げます。
   下げたときは、setup の画面、サーバーの起動時の表示、Web のページがそのことを知らせます。
   `--image-ssd-offload on` なら下げずに選んだ大きさのまま入れ、RAM に入らない分は SSD から読みます（遅くなります）。
 - **VRAM**: VRAM に入らない層は、エンジンが RAM から流し込みます。そのため GPU のメモリでは大きさを選ばず、VRAM が大きいほど速くなります。
@@ -114,7 +125,7 @@ setup のオプションです（`xestrata --setup` に付けます）。
 | `--images <モデル>`、`no` | — | 画像のモデルを入れる。`no` で画像の設定を消す |
 | `--image-quant Q8_0\|Q6_K\|Q4_K_M`、`w4a8\|int8` | `Q8_0`（HunyuanImage 3.0 は `w4a8`） | 画像のモデルの大きさ（Qwen-Image-2.1 は 3 つ、HunyuanImage 3.0 は Tencent の量子化 2 つ。Mage-Flow には効きません） |
 | `--image-ssd-offload on\|off` | `off` | `on` で、RAM が足りなくても大きさを下げない |
-| `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow の画像のモデルを 8 ビットにするか。`auto` は、文の読み手と一緒に VRAM に全部入るときは 16 ビットのまま、入らないときは 8 ビット |
+| `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow、MOSS-Image、Anima の画像のモデルを 8 ビットにするか。`auto` は、文の読み手と一緒に VRAM に全部入るときは 16 ビットのまま、入らないときは 8 ビット |
 | `--image-dit-keep on\|off` | `on` | Mage-Flow の使っていない方（生成用か編集用）の画像のモデルを 8 ビットで RAM に残す。`off` で RAM が約 4.4 GB 減り、差し替えのたびにファイルから読み直す |
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | 画像を作るときの文章のモデルの扱い（[下](#gpu-のメモリの分け合い)）。`--images` と一緒に指定します |
 | `--image-gpu auto\|same\|<PCI>` | `auto` | 画像を作る GPU。`auto` は文章のモデルが使っていない、CPU 内蔵でない GPU のうち VRAM の最も大きいもの（なければ文章のモデルと同じ GPU）、`same` は文章のモデルと同じ GPU、PCI のアドレス（`--check` に出るもの）はその GPU。`--images` と一緒に指定します |
@@ -135,7 +146,8 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `daemon_idle_s` | 1800 | どのサーバーもつながっていない画像のエンジンが終わるまでの秒数 |
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
-| `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。4 つのモデルで 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
+| `lora_bake` | `true` | Anima のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
+| `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
 
 HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guidance`（2.5）・`resolutions`（大きさのバケットのパラメータ）・`vision`（SigLIP2 の入ったシャード）・`ratio_head`（大きさを選ぶ重み。ないと `auto` は 1024x1024 になります）が入り、`max_refs` の既定は 3 です。
 
@@ -150,6 +162,8 @@ HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guida
   枚数は、選んだ大きさとステップ数で `budget_s` の時間に収まる数まで（`max_n` が上限）で、横に見積もりの時間が出ます。
   形式の既定は、ブラウザーが JPEG XL を表示でき、サーバーが書けるときは JPEG XL（画質 100、可逆）、そうでなければ PNG です。選んだ形式と画質はブラウザーに残ります。
 - ネガティブのプロンプト（画像に入れたくないもの）、ステップ数、CFG の強さも指定できます。空欄ならモデルの既定（API と同じ）で、欄にその値が薄く出ます。
+  Anima と MageTrail では、プロンプトの欄に初めからそのモデルの品質のタグが入っています（消しても構いません）。
+- Anima と、編集のない Mage-Flow（MageTrail など）では、サンプラー（er_sde か Euler）も選べます。
   ステップ数は Turbo（8 で固定）では出ません。ネガティブのプロンプトは CFG を 1 より大きくしたときだけ効き、効かないときは欄の下にそのことが出ます。
   HunyuanImage 3.0 では、ガイダンスは 1 個のトークンなので、欄は Guidance になり、ネガティブのプロンプトの欄は出ません。
 - Qwen-Image-2.1 では、透明な背景も選べます。
@@ -189,11 +203,12 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `size` | `auto`（1024x1024） | `幅x高さ`。一辺 256〜2048。16 の倍数でない大きさ（1920x1080 など）は、16 の倍数に切り上げて作り、真ん中を切り出します。HunyuanImage 3.0 は、縦横比がいちばん近いバケット（37 の大きさ）で作り、応答の `size` はその大きさです。`auto` か付けないときは、モデルが選んだバケットで作ります |
 | `n` | 1 | 1〜`max_n`（16）。`budget_s` に収まらない数は、見積もりの時間を添えて断ります。i 枚目は種 `seed + i` で作ります |
 | `seed` | ランダム | 0〜2^62 |
-| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow、HunyuanImage 3.0、MOSS-Image は 1〜100（HunyuanImage 3.0 の既定は 8、MOSS-Image は 50）。Turbo は 8 のままです |
+| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow、HunyuanImage 3.0、MOSS-Image、Anima は 1〜100（HunyuanImage 3.0 の既定は 8、MOSS-Image は 50、Anima は 30、Anima-Turbo は 10）。Turbo は 8 のままです |
 | `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら）。Mage-Flow と HunyuanImage 3.0 では使いません |
-| `negative_prompt` | なし（Mage-Flow は空白 1 文字、MOSS-Image は空） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
+| `negative_prompt` | なし（Mage-Flow は空白 1 文字、MOSS-Image は空、Anima は品質の低さや手の崩れなどを並べたもの） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
+| `sampler` | Anima は `er_sde`、Mage-Flow は `euler` | サンプラー: `er_sde` か `euler`。Anima と、編集のない Mage-Flow（MageTrail など）だけが受け、ほかのモデルでは 400 です |
 | `lora` | なし | 当てるアダプター（[LoRA](#loraアダプター)）: `{"name", "scale"}` の配列か、その 1 つ。`scale` は -2〜2 で、省略すると 1。4 本まで |
-| `true_cfg_scale`、`guidance_scale` | Mage-Flow、HunyuanImage 3.0、MOSS-Image は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow と MOSS-Image は `true_cfg_scale`、なければ `guidance_scale`（MOSS-Image の既定は 3）。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
+| `true_cfg_scale`、`guidance_scale` | Mage-Flow、HunyuanImage 3.0、MOSS-Image、Anima は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow、MOSS-Image、Anima は `true_cfg_scale`、なければ `guidance_scale`（MOSS-Image の既定は 3、Anima は 4、Anima-Turbo は 1）。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
 | `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow と HunyuanImage 3.0 は `transparent` を断ります |
 | `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
 | `output_compression` | 100 | 0〜100。jpeg、webp、jxl の画質（jxl の 100 は可逆） |
@@ -274,11 +289,11 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 ## LoRA（アダプター）
 
 画像のモデルに、ComfyUI などが配っている LoRA を、画像を作るたびに当てられます。
-当てられるのは Qwen-Image-2.1（Turbo と元のモデル）、MOSS-Image、Mage-Flow、MageTrail です。HunyuanImage 3.0 は当てられません（`lora` を付けた要求も、プロンプトのタグも 400 です）。
+当てられるのは Qwen-Image-2.1（Turbo と元のモデル）、MOSS-Image、Mage-Flow、MageTrail、Anima（派生モデルも）です。HunyuanImage 3.0 は当てられません（`lora` を付けた要求も、プロンプトのタグも 400 です）。
 
 ### 置き場所と一覧
 
-- setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーを 4 つのモデルが共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
+- setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーをどのモデルも共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
   ファイルは `.safetensors` と `.gguf` で、サブフォルダーも読めます（名前は `style/gouache` のように道になります）。
 - フォルダーは 10 秒まで覚え、フォルダーが更新されるとすぐ読み直します。サーバーを止める必要はありません。
 - `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
@@ -330,8 +345,10 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、そこに当たる OFT は断ります。
 - LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります（ComfyUI と同じ）。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
 - `use_rslora` のファイルは断ります（強さが alpha / √rank で、alpha / rank と違うため）。PEFT の `rank_pattern` は読まず、alpha だけを使います。
-- 文章エンコーダーの重み（`lora_te_`・`text_encoder.`・`te.`）を含むファイルは当てません。文章エンコーダー向けの LoRA はやらないことにしたためです。API に `scale_text` の欄はなく、送っても `style` や `user` と同じ知らない欄として無視します。
-- sd-scripts の `lora_unet_` の名前は読みますが、これらのモデルの重みの名前には当たりません。
+- 文の読み手の重み（`lora_te_`・`text_encoder.`・`te.` などのキー）を含むファイルは、その分を文の読み手に当てます（Qwen-Image-2.1、Mage-Flow、MageTrail、MOSS-Image、Anima）。強さは画像のモデルの側と同じで、API に `scale_text` の欄はありません（送っても `style` や `user` と同じ知らない欄として無視します）。
+  文の読み手に当てた要求は、プロンプトの状態をその組で作り直します。MOSS-Image でチャットのモデルと同じファイルを文の読み手にしているときは、アダプターを当てた要求だけ、画像のエンジンが自分でプロンプトを読みます。
+- sd-scripts の `lora_unet_` の名前は、Anima の重みの名前に当てます（ほかのモデルの重みの名前には当たりません）。
+- Anima-2.9B には、公式の Anima（2B）向けの LoRA を当てられます。2.9B が足した 12 のブロックを飛ばして、元の 28 のブロックに当てます。
 
 ### 量子化した重みとメモリ
 
@@ -340,6 +357,8 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - アダプターは VRAM に置きます（A/B と GLoRA の因子は FP16、DoRA の係数・バイアス・OFT の回転は FP32）。要る量は `strata.lora_mib` に出て、画像の予算に入らないときは要る VRAM を添えて断ります。rank 64 の Qwen-Image-2.1 の LoRA の A/B で約 320 MiB です。
 - 同じ組の 2 枚目からは、結んだアダプターをそのまま使います（ファイルも 1 度だけ読みます）。組が変わると、Qwen-Image-2.1 はプロンプトの前置き（文の行と K・V）を作り直し、MOSS-Image はテキスト埋め込みを通した文脈を作り直します。同じ組なら残ります。
 - アダプターの当たる層は、差分の積の分だけ遅くなります。MOSS-Image の W8A8 のブロックでは、差分の入力に要る 16 ビットの行を作る分も加わります。
+- Anima は、ブロックに当てる素の LoRA（DoRA・OFT・GLoRA・`set_weight`・バイアスの差分を含まないもの）を、重みに焼き込みます（設定の `"lora_bake"`、既定で有効）。差分を一度だけ重みに足すので、1 ステップはアダプターを当てない要求と同じ速さです。8 ビットの重みは足した後に量子化し直すので、積のたびに足すときと画像がわずかに違います。
+  組が変わるとブロックを元の重みから読み直して焼き直し、外すとアダプターを当てない要求と同じ画像（ビット単位）に戻ります。`"lora_bake": false` で、ほかのモデルと同じく積のたびに差分を足します。
 
 ## GPU のメモリの分け合い
 
@@ -408,6 +427,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 | `the image engine did not start ...`、`the image engine ended` | 画像のエンジンが起動しないか、止まりました。表示にあるログ（`strata-image.log`）を見てください |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | RAM が足りないので、setup が大きさを下げました（[大きさとメモリ](#大きさとメモリ)） |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention`（setup） | cuDNN がないので、NVIDIA の GPU の注意を XeStrata のカーネルで計算します。示されたコマンドで入れると速くなります |
+| `anima:<名前>: not Anima's DiT ...`（setup） | `models/anima` のファイルが Anima の形ではありません。LoRA は `models/loras` に置きます |
 | `lora: ...`（400） | 名前が一覧にないか、強さが範囲外か、4 本を超えています。メッセージに理由が続きます |
 | `lora_rejected: image engine: ...`（400） | エンジンがアダプターを当てられません。キーと理由（バイアスを足さない重み、rsLoRA、MageTrail の変調、同じ行に重なった DoRA・OFT・GLoRA・set_weight など）が続きます（[LoRA](#loraアダプター)） |
 | `strata.lora_unknown` | プロンプトのタグの名前が一覧になく、タグを外して画像を作りました |
@@ -423,4 +443,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
   量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
-- 文の読み手（Qwen3-VL、AtomicChat と huihui-ai の版、Qwen3.5-9B と HauhauCS の版）には、それぞれのライセンスが適用されます。
+- Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
+  Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
+  VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。
+- 文の読み手（Qwen3-VL、AtomicChat と huihui-ai の版、Qwen3.5-9B と HauhauCS の版、Qwen3-0.6B-Base）には、それぞれのライセンスが適用されます。

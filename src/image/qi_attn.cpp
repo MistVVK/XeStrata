@@ -194,9 +194,10 @@ struct AttnKernel {
         sycl::group_barrier(sg);
         for (int64_t j0 = 0; j0 < keys; j0 += CH) {
             const uint16_t* kc0 = k16 + j0 * row + h * D;
-            if constexpr (P == 0 || P == 1) {
+            if constexpr (P == 0) {
                 // Intel's: the next chunk's keys and values into L1 while this one is worked, in blocks of 32 rows x
-                // 32 columns shared out over the work-group's sub-groups (they read the same chunks)
+                // 32 columns shared out over the work-group's sub-groups (they read the same chunks).  Not on the
+                // 8-wide path: its GPUs' compiler takes no joint_matrix prefetch (the A380, IGC 2.28, 2026-11-02)
                 const int64_t jn = j0 + CH;
                 if (jn + CH <= keys) {
                     constexpr int PR = 32, PC = 32, NB = (CH / PR) * (D / PC);

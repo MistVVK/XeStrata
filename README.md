@@ -31,7 +31,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
   For the image models, Enter installs three: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image.
   Whatever is installed is used at one address, `http://127.0.0.1:8095`:
   the browser app (Chat, Images, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image API (vLLM-Omni-compatible); asked in the chat, it makes images as well.
-- The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0 and MOSS-Image, and each goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models).
+- The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0, MOSS-Image and Anima, and each goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models).
 
 ## About XeStrata
 
@@ -151,7 +151,7 @@ Each model's own license applies to its files.
 
 ### Image generation (optional)
 
-A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0 or OpenMOSS's MOSS-Image) can be installed with the text model: choose it in `xestrata --setup`'s questions, or name it, as in `xestrata --setup --images qwen-image-turbo`.
+A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image or CircleStone Labs' Anima) can be installed with the text model: choose it in `xestrata --setup`'s questions, or name it, as in `xestrata --setup --images qwen-image-turbo`.
 The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
 Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
 
@@ -395,7 +395,7 @@ permission under GPL section 7, what goes in, and how to report).
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
-   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, and Qwen3-VL and Qwen3.5-9B as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
+   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, CircleStone Labs' Anima with Wan 2.1's VAE, and Qwen3-VL, Qwen3.5-9B and Qwen3-0.6B-Base as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.
 - **Parts it uses:**

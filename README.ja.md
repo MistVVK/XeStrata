@@ -31,7 +31,7 @@ Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows に�
   画像を作るモデルは、Enter を押せば Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つを入れます。
   入れたものは、どれも同じアドレス `http://127.0.0.1:8095` で使えます。
   ブラウザの画面（Chat、Images、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作ります。
-- 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（BETA のモデルとはまだ組み合わせられません）。
+- 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image、Anima から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（BETA のモデルとはまだ組み合わせられません）。
 
 ## XeStrata とは
 
@@ -147,7 +147,7 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は setup のメニューにはな�
 
 ### 画像の生成（任意）
 
-文章のモデルと一緒に、画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image）を入れられます。`xestrata --setup` の質問で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。
+文章のモデルと一緒に、画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、CircleStone Labs の Anima）を入れられます。`xestrata --setup` の質問で選ぶか、`xestrata --setup --images qwen-image-turbo` のように指定します。
 画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
@@ -379,7 +379,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
-   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、文の読み手の Qwen3-VL と Qwen3.5-9B（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
