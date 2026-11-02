@@ -2225,13 +2225,17 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 SKILLS = Path(__file__).resolve().parent / "image_skills"
+# how a model's prompt is written, by its name without -uncensored, else its family: booru.md's Danbooru tags, else
+# natural.md's sentences
+PROMPT_STYLE = {"anima": "booru", "magetrail": "booru"}
+STYLE_NAME = {"booru": "Danbooru tags", "natural": "natural language"}
 
 
 @functools.cache
 def skill(name: str) -> str:
     """serve/image_skills/<name>.md without its license comment: "" when there is none.  common.md goes into every
-    image tool's description; a model's own (magetrail.md, by its name without -uncensored), else its family's
-    (anima.md), into those it is offered in."""
+    image tool's description; the prompt style's (booru.md or natural.md, PROMPT_STYLE) into those its models are
+    offered in; then a model's own (magetrail.md, by its name without -uncensored), else its family's (anima.md)."""
     try:
         text = (SKILLS / f"{name}.md").read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -2292,12 +2296,17 @@ class ImageTools:
             if not gens or t["name"] in exclude:
                 continue
             t = dict(t)
+            styles: dict[str, list[str]] = {}
             rules: dict[str, list[str]] = {}
             for g in gens:
                 own = g.model.removesuffix("-uncensored")
+                styles.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", []).append(g.model)
                 rules.setdefault(own if skill(own) else g.family, []).append(g.model)
-            t["description"] = "\n\n".join([t["description"], skill("common")] + [
-                f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
+            t["description"] = "\n\n".join(
+                [t["description"], skill("common")]
+                + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
+                   for name, models in styles.items() if (text := skill(name))]
+                + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
             moss = [g.model for g in gens if g.family == "moss-image"]
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])

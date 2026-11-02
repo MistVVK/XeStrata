@@ -281,6 +281,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
+- 道具の説明には、渡す画像のモデルごとのプロンプトの書き方が入り、チャットのモデルはそれに沿ってプロンプトを書きます。Anima と MageTrail は Danbooru のタグ、ほかのモデルは英語の文で、そのうえにモデルごとの決まりがあります。書き方は `serve/image_skills/` にあります（共通の `common.md`、タグの `booru.md`、文の `natural.md`、モデルや系統ごとのファイル）。
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。

@@ -4,11 +4,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 # Anima
 
-- Write in English: translate the user's words, do not expand them.
 - Start the prompt with `masterpiece, best quality, score_7, safe,` except with anima-aesthetic.
-- Use Danbooru tags, sentences, or both.
-- Separate tags with a comma and a space: `1girl, looking at viewer`.
-- Spaces, not underscores, inside a tag: `long hair`. Score tags and emoticons keep theirs: `score_9`, `^_^`.
+- Score tags keep their underscores: `score_9`.
 - A space between a number and a noun: `2 dogs`. `1girl`, `2girls` and `1boy` stay as they are.
 - Order: quality, meta, year, rating; then `1girl`, `1boy` and the like; character; series; artist; other tags and
   sentences.
