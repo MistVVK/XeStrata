@@ -157,7 +157,8 @@ def strata(m: dict, out: list, lab: str):
                              ("gpu_temp_celsius", "temp", "GPU temperature (hardware.gpu_temp)."),
                              ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
         for g in gpus:                                   # a family's samples together, one per card
-            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
+            role = "+".join(g.get("roles") or ())        # what the card does: text, image, helper (gpu_roles)
+            metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"' + (f',role="{role}"' if role else ""))
     guard = m.get("loop_guard") or {}
     for key, help_ in (("detected", "Loops the loop guard saw in answers (loop_guard.detected)."),
                        ("penalised", "Loops broken with a short repetition penalty (loop_guard.penalised)."),

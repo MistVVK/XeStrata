@@ -337,7 +337,7 @@ class Sampler:
 
     def __init__(self, gpu_pci: str | None):
         from serve.telemetry import Telemetry
-        self.t = Telemetry(gpu_pci=gpu_pci)
+        self.t = Telemetry(gpus=[{"pci": gpu_pci, "roles": ["text"]}])
         self.tag: str | None = None
         self.rows: dict[str, list] = {}
         self.stop = False

@@ -44,9 +44,6 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
     <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark" data-i18n-title="theme.title" data-i18n-label="theme.label">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
 
 <main>
@@ -252,7 +249,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         </div>
         <div class="state-card__row"><span id="state-label" data-i18n="mon.waiting">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
+        <!-- an image job on a card of its own, beside the chat's state above (/metrics engine.image_gpu) -->
+        <div class="state-card__image" id="state-image" hidden>
+          <div class="state-card__row"><span id="state-image-label"></span><span class="muted" id="state-image-detail"></span></div>
+          <div class="st-progress"><div class="st-progress__bar" id="state-image-bar" style="width:0%"></div></div>
+        </div>
       </div>
+
+      <!-- a model on several cards, or the images on a card of their own: the GPU cards below show the one chosen here -->
+      <div class="st-tabs gpu-tabs" id="gpu-tabs" role="tablist" aria-label="GPUs" data-i18n-label="gpu.tabs" hidden></div>
 
       <div class="metrics" id="metrics">
         <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
@@ -321,6 +326,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card">
         <span class="card-title" data-i18n="about.engineTitle">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>
+        <div class="cfg-actions"><button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button></div>
       </div>
       <div class="st-card">
         <span class="card-title" data-i18n="update.title">Updates</span>

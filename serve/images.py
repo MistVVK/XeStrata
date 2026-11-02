@@ -2105,6 +2105,7 @@ class ImageModels:
         self.separate = separate     # `env` names a card no text engine of the server takes (the policy separate)
         # the text engine's helper card, when the jobs run there (server.image_helper_card): closed for each job
         self.helper_card = ""
+        self.gpu_pci: str | None = None   # the card of its own (separate), as the server's image_env named it
         self.helper_jobs = 0
         self.helper_lock = threading.Lock()
         self.gens: dict[str, ImageGen] = {}

@@ -3440,6 +3440,50 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     return out, True, f"image GPU: {want} (separate from the text model's)"
 
 
+def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_serve: dict | None = None,
+              image_pci: str | None = None, helper_card: str = "") -> list[dict]:
+    """The cards the server's engines run on and what each does, the Monitor's tabs (serve/telemetry.py's `gpus`):
+    [{"pci", "roles", "stage", "replica"}], the text engine's cards first.  "roles": "text" (the text engine; with
+    "prefill" or "decode" under split serving), "helper" (a layer split's later card holding a helper expert cache,
+    image_helper_card), "image" (the image engine).  "stage": a layer split's card number, "replica": the replica's.
+    `gpu_pci`: the text engine's first card (None: the one the engine takes); `groups`: the replicas' cards;
+    `split_serve`: split serving's two; `image_pci`: the image engine's card of its own (image_env's), None when the
+    jobs share the text model's; `helper_card`: image_helper_card's."""
+    cards: list[dict] = []
+
+    def add(pci, role, **more):
+        key = str(pci).lower() if pci else None
+        card = next((c for c in cards if (c["pci"] or "").lower() == (key or "")), None)
+        if card is None:
+            card = {"pci": pci or None, "roles": []}
+            cards.append(card)
+        if role not in card["roles"]:
+            card["roles"].append(role)
+        card.update({k: v for k, v in more.items() if v is not None})
+
+    if groups:
+        for r, g in enumerate(groups):
+            for st, p in enumerate(g):
+                add(p, "text", replica=r, stage=st if len(g) > 1 else None)
+    elif split_serve:
+        add(split_serve.get("prefill_gpu"), "text")
+        add(split_serve.get("prefill_gpu"), "prefill")
+        add(split_serve.get("decode_gpu"), "text")
+        add(split_serve.get("decode_gpu"), "decode")
+    else:
+        later = [] if os.environ.get("STRATA_LAYER_SPLIT") == "off" else list(cfg.get("split_pci") or [])
+        stages = [p for p in later if not (helper_card and str(p).lower() == helper_card)]
+        add(gpu_pci, "text", stage=0 if stages else None)
+        for p in later:
+            if p in stages:
+                add(p, "text", stage=stages.index(p) + 1)
+            else:
+                add(p, "helper")
+    if cfg.get("images"):
+        add(helper_card or image_pci or cards[0]["pci"], "image")
+    return cards
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -3712,6 +3756,7 @@ class Service:
         self.engine_failure: dict | None = None   # issue #10: the last engine that died in a request, for the web app
         self.gpu_pci: str | None = None      # the engine's card (the Monitor reads it)
         self.split_pci: list | None = None   # a layer split's other cards (the Monitor reads them too)
+        self.gpu_roles: list | None = None   # every engine's cards and their roles (gpu_roles; the Monitor's tabs)
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
         self.status_lock = threading.Lock()
         self.mcp: McpHub | None = None                   # serve/mcp.py's McpHub when MCP servers are configured
@@ -4282,12 +4327,14 @@ class Service:
         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
-            # an image job's seconds are no tok/s: the speed history has a gap there, not zeros
-            self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_running() else self._tok_s(),
+            cards = getattr(self, "gpu_roles", None) or gpu_roles({"split_pci": getattr(self, "split_pci", None)},
+                                                                  getattr(self, "gpu_pci", None))
+            # an image job's seconds on the text model's card are no tok/s: the speed history has a gap there, not
+            # zeros; a job on a card of its own runs beside the chat, whose speed goes on
+            self.telemetry = Telemetry(extra=lambda: {"tok_s": None if self._image_shares_text() else self._tok_s(),
                                                       "tok_s_mean": self._tok_s_mean(),
                                                       "prefill_tok_s_mean": self._prefill_tok_s_mean()},
-                                       gpu_pci=getattr(self, "gpu_pci", None),
-                                       split_pci=getattr(self, "split_pci", None))
+                                       gpus=cards)
             if getattr(self, "engine", None) is not None and hasattr(self.engine, "gpu_busy"):
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on
                 # a slow card keeps the GPU at work while the host thread sleeps)
@@ -4295,6 +4342,19 @@ class Service:
 
     def _image_running(self) -> bool:
         return self.images is not None and self.images.job is not None
+
+    def image_gpu_mode(self) -> str:
+        """Where the image jobs run beside the chat: "separate" (a card of their own: they run at the same time),
+        "helper" (the text model's second card, its helper expert cache closed for each job: the chat goes on, on the
+        first) or "shared" (the text model's card: they take turns); "" without images."""
+        if self.images is None:
+            return ""
+        if getattr(self.images, "helper_card", ""):
+            return "helper"
+        return "separate" if getattr(self.images, "separate", False) else "shared"
+
+    def _image_shares_text(self) -> bool:
+        return self._image_running() and self.image_gpu_mode() == "shared"
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
@@ -4473,6 +4533,11 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = (self.telemetry.snapshot() if getattr(self, "telemetry", None)
                else {"now": {}, "history": {}, "static": {}})
+        engine["image_gpu"] = self.image_gpu_mode()
+        if tel["now"].get("gpus"):                      # what each card does right now (the Monitor's tabs light it)
+            doing = {"text": live["state"] in ("reading", "generating"), "image": image is not None}
+            tel["now"] = dict(tel["now"], gpus=[dict(g, active=[r for r in g.get("roles") or () if doing.get(r)])
+                                                for g in tel["now"]["gpus"]])
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
         return {"engine": engine, "live": live, "requests": rows[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
@@ -9957,6 +10022,7 @@ def main() -> int:
                 print(f"[strata] {said}", flush=True)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
             svc.images.helper_card = image_helper_card(cfg)
+            svc.images.gpu_pci = ienv.get("STRATA_GPU_PCI") if separate else None   # the Monitor's image card
         except ValueError as e:
             raise SystemExit(f"[strata] config: {e}")
         gone = svc.images.missing()
@@ -10087,6 +10153,9 @@ def main() -> int:
     svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
     if a.engine == "strata" and split_serve:            # split serving: the decode card, and the prefill card beside it
         svc.gpu_pci, svc.split_pci = split_serve["decode_gpu"], [split_serve["prefill_gpu"]]
+    strata = a.engine == "strata"
+    svc.gpu_roles = gpu_roles(cfg, svc.gpu_pci, groups if strata else None, split_serve if strata else None,
+                              getattr(svc.images, "gpu_pci", None), getattr(svc.images, "helper_card", ""))
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
     try:                                                # the user's settings: the keys every model shares (runconfig)

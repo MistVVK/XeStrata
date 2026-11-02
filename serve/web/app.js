@@ -66,12 +66,10 @@ async function copyText(text, btn) {
 function setTheme(t, save) {
   document.documentElement.dataset.theme = t;
   if (save) try { localStorage.setItem("xestrata.theme", t); } catch (e) { /* ignore */ }
-  $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
   refreshPreviews();                                  // the preview frames carry the page's colours
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
-$("theme-btn").onclick = flipTheme;
 $("dark-toggle").onclick = flipTheme;
 setTheme(document.documentElement.dataset.theme || "light", false);
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
@@ -84,7 +82,7 @@ let tab = "chat";
 let noteShown = false;
 function showTab(name) {
   tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
-  for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") {
     $("img-prompt").focus();
@@ -99,7 +97,7 @@ function showTab(name) {
   if (tab === "about") { loadConfig(); loadUpdate(); }
   if (lastMetrics) render(lastMetrics);
 }
-for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
+for (const b of document.querySelectorAll(".st-header .st-tab")) b.onclick = () => showTab(b.dataset.tab);
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 
 // ------------------------------------------------------------------ server access
@@ -322,36 +320,43 @@ function fitHeader() {
 }
 window.addEventListener("resize", fitHeader);
 
-// ------------------------------------------------------------------ Load / Unload (POST /load, /unload: the header button)
+// ------------------------------------------------------------------ Load / Unload (POST /load, /unload: About's button)
 // Metrics stay "unloaded" until the engine is READY, so a turn or an image job on this page has to paint Loading itself.
 // modelOp covers the button's own POST, which returns before the next poll can agree.
 let modelOp = null;
 let imageBusy = false;
-function pageBusy() { return busy != null || imageBusy; }
+// where the image jobs run (/metrics engine.image_gpu): "separate" (a card of their own) and "helper" (the text model's
+// second card, its helper expert cache closed for the job) beside the chat, "shared" on the text model's card in turn
+function imageGpu() { return (lastMetrics && lastMetrics.engine && lastMetrics.engine.image_gpu) || "shared"; }
+const imageBeside = () => imageGpu() === "separate" || imageGpu() === "helper";
+// an image job holds the text model's Load / Unload, unless it runs on a card of its own: on the text model's card it has
+// the GPU's turn, on the helper card the engine's helper
+const imageHoldsModel = () => imageGpu() !== "separate";
+function pageBusy() { return busy != null || (imageBusy && imageHoldsModel()); }
 // live.image (the image engine's job, on the metrics) is the job a refresh can see. imageBusy is this page's POST before
-// that job is published. A chat phase already on the metrics wins, because Stop still stops that reply.
+// that job is published. On a shared card a chat phase already on the metrics wins, because Stop still stops that reply.
 function imageLive(live) {
   if (live && live.image) return true;
   const state = live && live.state;
-  if (state === "reading" || state === "generating") return false;
+  if (!imageBeside() && (state === "reading" || state === "generating")) return false;
   return imageBusy;
 }
+const imageBlocksModel = (live) => imageHoldsModel() && imageLive(live);
 function paintLive() { if (lastMetrics) render(lastMetrics); }
 function turnBlocksUnload(live) {
   const state = (live && live.state) || "";
-  return pageBusy() || imageLive(live) || state === "reading" || state === "generating" || (live && live.queued > 0);
+  return pageBusy() || imageBlocksModel(live) || state === "reading" || state === "generating" || (live && live.queued > 0);
 }
 function setModelButton(text, title, disabled) {
   const btn = $("unload-btn");
   btn.textContent = text; btn.title = title; btn.disabled = disabled;
-  fitHeader();
 }
 function modelButton(live) {
   if (modelOp === "load") return setModelButton(tr("model.loading", "Loading…"), tr("model.loadingTitle", "The model is loading"), true);
   if (modelOp === "unload") return setModelButton(tr("model.unloading", "Unloading…"), tr("model.unloadingTitle", "The model is unloading"), true);
   const state = (live && live.state) || "";
   const metricsBusy = state === "reading" || state === "generating" || (live && live.queued > 0);
-  const imageNow = imageLive(live);
+  const imageNow = imageBlocksModel(live);
   const unload = tr("model.unload", "Unload");
   if (state === "unloaded") {
     // an image job runs on its own engine beside the unloaded text model: Load waits until it has finished
@@ -369,9 +374,9 @@ $("unload-btn").onclick = async () => {
   const live = (lastMetrics && lastMetrics.live) || {};
   const loading = live.state === "unloaded";
   const busyCopy = (sample, stillLoading) => stillLoading
-    ? (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
-    : (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
-  if (loading ? pageBusy() || imageLive(live) : turnBlocksUnload(live)) {
+    ? (imageBlocksModel(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
+    : (imageBlocksModel(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
+  if (loading ? pageBusy() || imageBlocksModel(live) : turnBlocksUnload(live)) {
     toast("warn", tr("model.busy", "Model is busy"), busyCopy(live, loading));
     return;
   }
@@ -384,7 +389,7 @@ $("unload-btn").onclick = async () => {
   }
   const now = (lastMetrics && lastMetrics.live) || {};
   const loadingNow = loading;
-  if (loadingNow ? pageBusy() || imageLive(now) : turnBlocksUnload(now)) {
+  if (loadingNow ? pageBusy() || imageBlocksModel(now) : turnBlocksUnload(now)) {
     modelOp = null;
     if (lastMetrics) render(lastMetrics); else modelButton(now);
     toast("warn", tr("model.busy", "Model is busy"), busyCopy(now, loadingNow));
@@ -427,7 +432,7 @@ $("unload-btn").onclick = async () => {
           if (m && m.live) { sample = m.live; lastMetrics = m; }
         }
       } catch (e) { /* the 409 body has no phase */ }
-      toast("warn", tr("model.busy", "Model is busy"), imageLive(sample)
+      toast("warn", tr("model.busy", "Model is busy"), imageBlocksModel(sample)
         ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
     } else if (status === "unsupported") {
       toast("error", tr("model.unsupported", "Unload is not available"), "");
@@ -449,21 +454,25 @@ function render(m) {
   // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
   // model (it has its own engine), so only a chat turn here counts as a load.
   const localLoad = live.state === "unloaded" && busy != null;
+  // an image job on another card beside a chat turn: the pill says both (the turn's, then the image's)
+  const chatOn = live.state === "reading" || live.state === "generating";
+  const beside = imageBeside() && chatOn;
+  const withImage = (text) => (beside && live.image ? `${text} | ${tr("img.pill", "Image · {step}", {step: imageStep(live.image)})}` : text);
   if (modelOp === "load") {
     setPill("idle", tr("model.loading", "Loading…"));
   } else if (modelOp === "unload") {
     setPill("idle", tr("model.unloading", "Unloading…"));
-  } else if (live.image) {
+  } else if (live.image && !beside) {
     setPill("generating", tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else if (localLoad) {
     setPill("idle", tr("model.loading", "Loading…"));
-  } else if (imageLive(live)) {
+  } else if (imageLive(live) && !beside) {
     setPill("reading", tr("pill.image", "Generating image…"));
   } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt"));
+    setPill("reading", withImage(pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt")));
   } else if (live.state === "generating") {
-    setPill("generating", tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)}));
+    setPill("generating", withImage(tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)})));
   } else if (live.state === "unloaded") {
     setPill("idle", tr("pill.unloaded", "Unloaded"));
   } else {
@@ -546,28 +555,115 @@ function phaseText(phase) {
                  "reading the prompt": () => tr("pill.reading", "Reading prompt")};
   return known[phase] ? known[phase]() : phase[0].toUpperCase() + phase.slice(1);
 }
+// ------------------------------------------------------------------ the GPU tabs (a model on several cards, the images on their own)
+// hardware.gpus: every card the server's engines run on, with its roles (server.py gpu_roles) and what it does now (active)
+let gpuTab = String(store.get("gpu-tab", "all"));
+const ROLES = {text: () => tr("gpu.text", "Text"), image: () => tr("gpu.image", "Image"), helper: () => tr("gpu.helper", "Helper"),
+               prefill: () => tr("gpu.prefill", "Prefill"), decode: () => tr("gpu.decode", "Decode")};
+const ROLE_TITLES = {helper: () => tr("gpu.helperTitle", "A helper expert cache of the text model; closed while an image job runs on this card")};
+const total = (v) => (v.length ? v.reduce((x, y) => x + y, 0) : null);
+// every card together: the load's mean, the memory's, power's and link traffic's sum, the hottest temperature
+const GPU_FOLD = {util: (v) => (v.length ? total(v) / v.length : null), mem_used: total, mem_total: total, power: total, power_limit: total,
+                  pcie_rx_mb: total, temp: (v) => (v.length ? Math.max(...v) : null), mem_temp: (v) => (v.length ? Math.max(...v) : null)};
+const GPU_SERIES = ["util", "mem_used", "temp", "power", "pcie_rx_mb"];
+function gpuFold(rows) {
+  const out = {};
+  for (const [k, f] of Object.entries(GPU_FOLD)) out[k] = f(rows.map((r) => r[k]).filter((x) => x != null));
+  return out;
+}
+// the readings and the history the GPU cards show: {g, hist, cards, one (the tab's card), all (the All tab)}
+function gpuView(hw, h) {
+  const cards = hw.gpus || [];
+  if (cards.length < 2) {                      // one card (or an older server): the flat readings
+    const g = {};
+    for (const k of [...Object.keys(GPU_FOLD), "pcie_gen", "pcie_gen_max", "pcie_own_gen", "pcie_width", "temp_may_be_stale"]) g[k] = hw[`gpu_${k}`];
+    const hist = Object.fromEntries(GPU_SERIES.map((k) => [k, h[`gpu_${k}`]]));
+    return {g, hist, cards, one: null, all: false};
+  }
+  const hs = h.gpus || [];
+  const one = cards.find((c) => String(c.index) === gpuTab);
+  if (one) return {g: one, hist: hs[cards.indexOf(one)] || {}, cards, one, all: false};
+  const g = gpuFold(cards);
+  const gen = (c) => c.pcie_gen_max || c.pcie_gen || 99;
+  const slow = cards.filter((c) => c.pcie_gen_max || c.pcie_gen).sort((x, y) => gen(x) - gen(y))[0] || {};   // the slowest link
+  Object.assign(g, {pcie_gen: slow.pcie_gen, pcie_gen_max: slow.pcie_gen_max, pcie_own_gen: slow.pcie_own_gen, pcie_width: slow.pcie_width,
+                    temp_may_be_stale: cards.every((c) => c.temp == null || c.temp_may_be_stale)});
+  const hist = {};
+  for (const k of GPU_SERIES) {
+    const n = Math.max(0, ...hs.map((x) => (x[k] || []).length));
+    hist[k] = Array.from({length: n}, (_, i) => GPU_FOLD[k](hs.map((x) => (x[k] || [])[i]).filter((v) => v != null)));
+  }
+  return {g, hist, cards, one: null, all: true};
+}
+// what a card does right now, for its GPU card's line: the chat's prefill or decode, the image job's step
+function gpuDoing(c, live) {
+  const on = c.active || [];
+  const out = [];
+  if (on.includes("text") && live.state === "reading") {
+    out.push(live.prompt_total ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct: Math.round((100 * live.prompt_read) / live.prompt_total)})
+                               : tr("pill.reading", "Reading prompt"));
+  } else if (on.includes("text") && live.state === "generating") {
+    out.push(tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)}));
+  }
+  if (on.includes("image") && live.image) out.push(tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
+  return out.join(" · ");
+}
+function gpuBadges(c) {
+  const on = c.active || [];
+  const badge = (text, lit, title) => `<span class="st-badge${lit ? " st-badge--generating on" : ""}"${title ? ` title="${esc(title)}"` : ""}>${esc(text)}</span>`;
+  const out = (c.roles || []).map((r) => badge(ROLES[r] ? ROLES[r]() : r, on.includes(r), ROLE_TITLES[r] ? ROLE_TITLES[r]() : ""));
+  if (c.stage != null) out.push(badge(tr("gpu.stage", "Stage {n}", {n: c.stage + 1}), false, tr("gpu.stageTitle", "Its share of the layers")));
+  if (c.replica != null) out.push(badge(tr("gpu.replica", "Replica {n}", {n: c.replica + 1}), false, ""));
+  return out.join("");
+}
+let gpuTabsStamp = "";
+function renderGpuTabs(cards) {
+  const el = $("gpu-tabs");
+  el.hidden = cards.length < 2;
+  if (cards.length < 2) return;
+  const stamp = JSON.stringify([cards.map((c) => [c.index, c.name, c.pci, c.roles, c.active, c.stage, c.replica]), gpuTab, document.documentElement.lang]);
+  if (stamp === gpuTabsStamp) return;          // rebuilt only when it changes, so a focused tab keeps its focus
+  gpuTabsStamp = stamp;
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.gpu : null;
+  const tab = (key, label, badges, title) => `<button class="st-tab" role="tab" type="button" data-gpu="${esc(key)}" aria-selected="${gpuTab === key}"${
+    title ? ` title="${esc(title)}"` : ""}><span>${esc(label)}</span>${badges}</button>`;
+  el.innerHTML = tab("all", tr("gpu.all", "All GPUs"), "", "") +
+    cards.map((c) => tab(String(c.index), `GPU ${c.index}`, gpuBadges(c), [c.name, c.pci].filter(Boolean).join(" · "))).join("");
+  for (const b of el.querySelectorAll("[data-gpu]")) {
+    b.onclick = () => { gpuTab = b.dataset.gpu; store.set("gpu-tab", gpuTab); paintLive(); };
+    if (b.dataset.gpu === focused) b.focus({preventScroll: true});
+  }
+}
+
+// an image job's line on the state card: [label, detail, progress %]
+function imageState(img) {
+  const label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
+  const detail = [tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}), img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
+                  `${fmt(img.elapsed_s, 0)} s`, img.size,
+                  img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
+    .filter(Boolean).join(" · ");
+  return [label, detail, 100 * (img.progress || 0)];
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   for (const m of METRICS) $(`ml-${m.key}`).textContent = m.label();
-  // model state
+  // model state. An image job on a card of its own (or the helper card) runs beside the chat: the row under it says
+  // its state, and the state above stays the chat's. On the text model's card the job takes the state in its turn.
   // A local turn keeps metrics on "unloaded" for the whole engine start.
-  const imageNow = imageLive(live);
+  const beside = imageBeside();
+  const image = beside ? null : live.image;
+  const imageNow = !beside && imageLive(live);
   const starting = modelOp === "load" || (busy != null && live.state === "unloaded");
-  const on = !modelOp && live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
+  const on = !modelOp && live.queued > 0 ? "queued" : image ? "generating" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) {
-    const lit = (b.dataset.s === on || (!live.image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
+    const lit = (b.dataset.s === on || (!image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
     b.classList.toggle("on", lit);
   }
   const prog = $("state-progress");
   let label = tr("mon.waiting", "Waiting for a request"), detail = "", pct = 0;
-  if (live.image) {
-    const img = live.image;
-    label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
+  if (image) {
+    [label, detail, pct] = imageState(image);
     delete prog.dataset.tone;
-    pct = 100 * (img.progress || 0);
-    detail = [tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}), img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
-              `${fmt(img.elapsed_s, 0)} s`, img.size,
-              img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
-      .filter(Boolean).join(" · ");
   } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
     label = tr("mon.loading", "Loading");
     delete prog.dataset.tone;
@@ -611,9 +707,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
+  const side = beside && (live.image || imageBusy);
+  $("state-image").hidden = !side;
+  if (side) {
+    const [l, d, p] = live.image ? imageState(live.image) : [tr("img.generating", "Generating image"), "", 0];
+    $("state-image-label").textContent = `${tr("gpu.image", "Image")} · ${l}`;
+    $("state-image-detail").textContent = d;
+    $("state-image-bar").style.width = `${p}%`;
+  }
 
   // the eight cards
-  if (live.image) {   // an image job: its seconds a step, not a decode rate
+  if (image) {   // an image job in the text model's turn: its seconds a step, not a decode rate
     setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
               tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else {
@@ -623,37 +727,44 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   }
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  if (live.image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
+  if (image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
   else setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
                  live.state === "reading" ? tr("mon.prefillNow", "Prefill now") : live.state === "generating" ? tr("mon.prefillThis", "Prefill this request")
                  : last ? tr("mon.prefillLast", "Prefill last request") : tr("mon.prefill", "Prefill"));
   spark("sp-speed", h.tok_s, undefined, true);
   spark("sp-prefill", h.prefill_tok_s_mean);
-  // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
-  const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
-  const multi = (hw.gpus || []).length > 1;
-  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
-            multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || "");
-  spark("sp-gpu", h.gpu_util, 100);
-  setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
-            multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
-                  : eng.expert_slots ? tr("mon.expertsCached", "{n} experts cached", {n: fmt(eng.expert_slots)}) : "");
-  spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  // the GPU cards: the one card, or the tab chosen above them (every card together, or one of them; issue #112)
+  const {g, hist, cards, one, all: allCards} = gpuView(hw, h);
+  renderGpuTabs(cards);
+  const per = (f) => cards.map((c) => `GPU ${c.index} ${f(c)}`).join(" · ");
+  setMetric("gpu", g.util == null ? null : fmt(g.util), "%",
+            allCards ? per((c) => (c.util == null ? "–" : `${fmt(c.util)}%`)) : one ? gpuDoing(one, live) || one.name || "" : st.gpu_name || "");
+  spark("sp-gpu", hist.util, 100);
+  // the expert cache's slots are the text model's first card's
+  const firstText = !one || ((one.roles || []).includes("text") && !one.stage);
+  setMetric("vram", g.mem_used == null ? null : gb(g.mem_used), g.mem_total ? `/ ${gb(g.mem_total, 0)} GB` : "GB",
+            allCards ? per((c) => (c.mem_used == null ? "–" : `${gb(c.mem_used)} GB`))
+                : firstText && eng.expert_slots ? tr("mon.expertsCached", "{n} experts cached", {n: fmt(eng.expert_slots)}) : "");
+  spark("sp-vram", hist.mem_used, g.mem_total);
   // an idle GPU on the xe driver may report its last temperature, not its present one (Battlemage's hwmon): dimmed
-  const stale = Boolean(hw.gpu_temp_may_be_stale) && hw.gpu_temp != null;
-  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+  const stale = Boolean(g.temp_may_be_stale) && g.temp != null;
+  setMetric("temp", g.temp == null ? null : fmt(g.temp), "°C",
             stale ? tr("mon.tempStale", "GPU idle (the reading may be old)")
-            : multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
-            : hw.gpu_mem_temp == null ? "" : `VRAM ${fmt(hw.gpu_mem_temp)} °C`);
+            : allCards ? per((c) => (c.temp == null ? "–" : `${fmt(c.temp)}°`))
+            : g.mem_temp == null ? "" : `VRAM ${fmt(g.mem_temp)} °C`);
   $("mv-temp").classList.toggle("is-stale", stale);
-  spark("sp-temp", h.gpu_temp, 90);
-  setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? tr("mon.powerLimit", "of {n} W limit", {n: fmt(hw.gpu_power_limit)}) : "");
-  spark("sp-power", h.gpu_power, hw.gpu_power_limit);
-  const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
-  setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
-            hw.gpu_pcie_rx_mb == null ? "" : tr("mon.toGpu", "to GPU {rate} MB/s", {rate: fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)}) +
-            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · ${tr("mon.nowGen", "now Gen{n}", {n: hw.gpu_pcie_own_gen})}` : ""));
-  spark("sp-pcie", h.gpu_pcie_rx_mb);
+  spark("sp-temp", hist.temp, 90);
+  setMetric("power", g.power == null ? null : fmt(g.power), "W",
+            allCards ? per((c) => (c.power == null ? "–" : `${fmt(c.power)} W`))
+            : g.power_limit ? tr("mon.powerLimit", "of {n} W limit", {n: fmt(g.power_limit)}) : "");
+  spark("sp-power", hist.power, g.power_limit);
+  const link = (c) => c.pcie_gen_max || c.pcie_gen;
+  const gen = link(g);
+  setMetric("pcie", gen ? `Gen${gen}` : null, g.pcie_width ? `x${g.pcie_width}` : "",
+            allCards ? per((c) => (link(c) ? `Gen${link(c)}${c.pcie_width ? ` x${c.pcie_width}` : ""}` : "–"))
+            : (g.pcie_rx_mb == null ? "" : tr("mon.toGpu", "to GPU {rate} MB/s", {rate: fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)})) +
+              (g.pcie_own_gen && gen && g.pcie_own_gen < gen ? ` · ${tr("mon.nowGen", "now Gen{n}", {n: g.pcie_own_gen})}` : ""));
+  spark("sp-pcie", hist.pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", !st.threads ? ""
             : st.cores ? tr("mon.coresThreads", "{cores} cores · {threads} threads", {cores: st.cores, threads: st.threads})
             : tr("mon.threads", "{threads} threads", {threads: st.threads}));
@@ -684,8 +795,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const ramPct = hw.ram_total ? (100 * hw.ram_used) / hw.ram_total : 0;
   $("ram-bar").style.width = `${ramPct}%`;
   if (ramPct > 92) $("ram-progress").dataset.tone = "danger"; else delete $("ram-progress").dataset.tone;
-  $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
-  $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
+  $("temp-text").textContent = g.temp == null ? "–" : `${fmt(g.temp)} °C`;     // the GPU tab's card, or the hottest
+  $("temp-bar").style.width = g.temp == null ? "0%" : `${Math.min(100, g.temp)}%`;
 
   // recent requests
   const body = $("req-body");

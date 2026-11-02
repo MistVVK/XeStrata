@@ -14,7 +14,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .card-title { font-weight: var(--st-fw-bold); font-size: var(--st-fs-base); color: var(--st-ink); }
 .st-header { position: relative; z-index: 2; flex: none; }
 .st-header .st-tabs { margin-left: var(--st-s-4); }
-#unload-btn { flex: none; height: 32px; padding: 0 12px; min-width: 7.75rem; }
+#unload-btn { min-width: 7.75rem; }   /* About: Load and Unloading… keep one width */
 .st-header--clip #pill-text { display: none; }
 
 /* ---------------------------------------------------------------- chat */
@@ -105,6 +105,12 @@ main { flex: 1; min-height: 0; display: flex; }
 .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--st-s-4); }
+.state-card__image { display: flex; flex-direction: column; gap: var(--st-s-3); padding-top: var(--st-s-3);
+                     border-top: 1px solid var(--st-line); }
+.gpu-tabs { align-self: flex-start; max-width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+.gpu-tabs .st-tab { flex: none; height: auto; min-height: 36px; padding: 6px 12px; gap: 6px; }
+.gpu-tabs .st-badge { height: 20px; padding: 0 8px; font-weight: var(--st-fw-medium); opacity: .55; }
+.gpu-tabs .st-badge.on { opacity: 1; }
 .metric-card { padding: var(--st-s-4) var(--st-s-5); }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__value.is-stale { opacity: .45; }   /* an idle xe GPU's temperature may be its last one */
@@ -198,21 +204,18 @@ main { flex: 1; min-height: 0; display: flex; }
 @media (max-width: 900px) {
   .monitor-row { grid-template-columns: minmax(0, 1fr); }
 }
-/* The tab strip keeps a width it can scroll. The pill's text hides only when the header row overflows (fitHeader in app.js).
-   Load / Unload (PR #3550) sits in the row: 9rem of tabs plus its 7.75rem fit from 458px; below that the tighter floors keep
-   it and the theme button in the viewport. */
+/* The tab strip keeps a width it can scroll. The pill's text hides only when the header row overflows (fitHeader in app.js). */
 @media (max-width: 955px) {
   .st-header { padding: 0 var(--st-s-3); gap: var(--st-s-2); }
-  .st-header__brand, #theme-btn, #pill, #unload-btn { flex: none; }
+  .st-header__brand, #pill { flex: none; }
   .st-header .st-tabs { margin-left: 0; flex: 1 1 auto; min-width: 9rem; overflow-x: auto; }
   .st-tab { padding: 0 10px; }
   .st-tab .st-icon { display: none; }
 }
 @media (max-width: 457px) {
-  #unload-btn { min-width: 0; padding: 0 8px; }
   .st-header .st-tabs { min-width: 5.5rem; }
 }
-/* the name plus "Unloading…" still overflows at 374px in Firefox 158 */
+/* the narrowest phones: the name gives its room to the tabs */
 @media (max-width: 382px) {
   .st-header__brand { display: none; }
   .st-header .st-tabs { min-width: 4.75rem; }
@@ -231,8 +234,23 @@ main { flex: 1; min-height: 0; display: flex; }
   .st-composer__bar { flex-wrap: wrap; }
   .tool-call__pre, .st-code pre, .table-wrap { max-width: 100%; }
 }
+/* phones: the Monitor's cards two to a row and smaller, so its state, GPUs and requests fit in a few screens */
 @media (max-width: 560px) {
-  .metrics { grid-template-columns: minmax(0, 1fr); }
+  .monitor { gap: var(--st-s-3); }
+  .monitor .st-card { padding: var(--st-s-3) var(--st-s-4); }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--st-s-2); }
+  .monitor .metric-card { padding: var(--st-s-3); }
+  .metric-card .st-metric { gap: 6px; }
+  .metric-card .st-metric__label { font-size: var(--st-fs-xs); }
+  .metric-card .st-metric__value, .speed-values .st-metric__value { font-size: 22px; }
+  .metric-card .st-metric__value small { font-size: var(--st-fs-xs); }
+  .metric-card .st-metric__sub { font-size: 11px; overflow-wrap: anywhere; }
+  .metric-card .st-metric__spark { height: 20px; }
+  .speed-values > div { gap: 4px; }
+  .badges .st-badge:not(.on) { display: none; }      /* only the state the model is in */
+  .state-card__row { flex-direction: column; gap: 2px; }
+  .ctx-gauge { width: 96px; margin: 0 auto; }
+  .gpu-tabs .st-tab { min-height: 36px; }
 }
 @media (max-width: 480px) {
   .st-header { padding: 0 var(--st-s-2); gap: 6px; }

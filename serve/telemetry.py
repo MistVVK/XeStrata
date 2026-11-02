@@ -574,26 +574,35 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_pci=None, split_pci=None):
-        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_pci`: the PCI address
-        of the card the engine runs on (setup's gpu_pci), or None for the card _gpu chooses; `split_pci`: a layer
-        split's other cards (setup's split_pci), read beside it."""
+    # a card's readings kept as a history of their own (history["gpus"]), for the Monitor's tab of that card
+    CARD_SERIES = ("util", "mem_used", "temp", "power", "pcie_rx_mb")
+
+    def __init__(self, extra=None, gpus=None):
+        """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpus`: the cards to read,
+        [{"pci": address or None, "roles": [...], ...}] (serve.server's gpu_roles: the text engine's cards and the
+        image engine's), numbered in that order; None: the one card _gpu chooses, the text engine's.  The flat gpu_*
+        readings and their history are the text engine's cards' (the frozen-engine check reads them, and an image
+        job on a card of its own must not hide a frozen text engine); "gpus" has every card's, the keys of its entry
+        in `gpus` beside them."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
-        self.gpus = [(i, _gpu(pci)) for i, pci in enumerate([gpu_pci, *(split_pci or [])])]
-        self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
-        self.gpu = self.gpus[0][1]
+        cards = gpus or [{"pci": None, "roles": ["text"]}]
+        found = [(i, c, _gpu(c.get("pci"))) for i, c in enumerate(cards)]
+        self.gpus = [x for x in found if x[2].ok()] or found[:1]
+        self.gpu = self.gpus[0][2]
+        self.text = [x for x in self.gpus if "text" in (x[1].get("roles") or ())] or self.gpus[:1]
+        self.card_hist = [collections.defaultdict(lambda: collections.deque(maxlen=HISTORY)) for _ in self.gpus]
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
         except ImportError:
             self.ps = None
         self.fallback = _CpuRamFallback()
-        self.names = [g.name() for _, g in self.gpus]
+        self.names = [g.name() for _, _, g in self.gpus]
         self.static = {
-            "gpu_name": " + ".join(g.name() or "?" for _, g in self.gpus) if self.gpu.ok() else None,
+            "gpu_name": " + ".join(n or "?" for n in self.names) if self.gpu.ok() else None,
             "gpu_count": len(self.gpus),
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
@@ -624,11 +633,12 @@ class Telemetry:
     def sample(self):
         s = {}
         if self.gpu.ok():
-            reads = [(i, g.read()) for i, g in self.gpus]
-            g = dict(reads[0][1])
-            if len(reads) > 1:
+            reads = [g.read() for _, _, g in self.gpus]
+            text = [r for r, x in zip(reads, self.gpus) if x in self.text]
+            g = dict(text[0])
+            if len(text) > 1:
                 def vals(k):
-                    return [r[k] for _, r in reads if r.get(k) is not None]
+                    return [r[k] for r in text if r.get(k) is not None]
                 for k in ("mem_used", "mem_total", "power", "power_limit", "pcie_rx_mb", "pcie_tx_mb"):
                     v = vals(k)
                     g[k] = sum(v) if v else None
@@ -638,11 +648,10 @@ class Telemetry:
                 g["temp"] = max(t) if t else None
                 t = vals("mem_temp")
                 g["mem_temp"] = max(t) if t else None
-                s["gpus"] = [{"index": i, "name": n, "util": r.get("util"), "mem_used": r.get("mem_used"),
-                              "mem_total": r.get("mem_total"), "temp": r.get("temp"), "mem_temp": r.get("mem_temp"),
-                              "power": r.get("power")}
-                             for (i, r), n in zip(reads, self.names)]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            s["gpus"] = [{"index": i, **{k: v for k, v in c.items() if k != "pci"}, "pci": c.get("pci") or
+                          getattr(dev, "pci", None), "name": n, **r}
+                         for (i, c, dev), n, r in zip(self.gpus, self.names, reads)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -686,9 +695,15 @@ class Telemetry:
                           "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
+                for h, card in zip(self.card_hist, s.get("gpus") or ()):
+                    for k in self.CARD_SERIES:
+                        v = card.get(k)
+                        h[k].append(round(v, 2) if isinstance(v, float) else v)
             self._stop.wait(1.0)
 
     def snapshot(self):
         with self.lock:
-            return {"now": dict(self.now), "history": {k: list(v) for k, v in self.hist.items()},
-                    "static": dict(self.static)}
+            history: dict = {k: list(v) for k, v in self.hist.items()}
+            if self.now.get("gpus"):
+                history["gpus"] = [{k: list(v) for k, v in h.items()} for h in self.card_hist]
+            return {"now": dict(self.now), "history": history, "static": dict(self.static)}

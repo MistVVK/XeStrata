@@ -613,6 +613,10 @@ The app has three tabs:
   Chats stay in your browser.
 - **Monitor**: what the model is doing (prefill, with progress, or decode, at how many tokens/s);
   GPU load, VRAM, temperature, power and PCIe traffic; CPU, RAM and disk; the context in use; the last requests.
+  With the model split across several GPUs, or the images on a GPU of their own, tabs above the GPU cards switch
+  between all the GPUs together and each one, and their marks say what each GPU does (text, images, helper, its share
+  of the layers, prefill / decode).
+  With the images on a GPU of their own, the text's state and the image job's are on lines of their own.
   Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
   start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
   restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
@@ -1429,8 +1433,10 @@ An svg is shown as a picture.
 For an HTML page there is also a warning button, **Run scripts**: after you confirm, that one block runs with scripts, still with no way to the page and no network, until you close the preview.
 It can still use your CPU, and it is code the model wrote.
 
-**Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`).
-It asks before unloading and is off while an answer is being written or an image is made.
+**Load / Unload** in About loads the model or frees the GPU (`POST /load`, `POST /unload`).
+It asks before unloading and is off while an answer is being written or an image is made (an image made on a GPU of
+its own leaves it on).
+The light or dark theme is switched in About > Settings.
 
 **Language.** About > Settings lists the page's languages: English, German, French, Spanish, Japanese, Korean, Portuguese, Russian and Chinese.
 The default, **Automatic**, takes the first of the browser's languages (`navigator.languages`) the page has (the region dropped when the whole tag is not one: `ja-JP` is `ja`, `pt-BR` is `pt`), else English.
