@@ -346,6 +346,18 @@ public:
     /// restores around it.  The state is reset first and left as the prompt leaves it.  False with the reason, also
     /// when the device cannot lend the prompt's buffers.
     bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
+    /// An image model's text encoder's adapters (MossText): after each of a dense model's block products in encode,
+    /// `after` adds what the adapters change from the product's FP16 input x16 to its output y (row stride ldy); while
+    /// one is set the products take their FP16 inputs (not the int8 ones, which leave no FP16 copy).  The chat's
+    /// engine sets none.
+    struct ProductHook {
+        enum Which { kQkv, kZ, kAlpha, kBeta, kSsmOut, kQ, kK, kV, kO, kGate, kUp, kDown };
+        virtual ~ProductHook() = default;
+        virtual void after(int64_t layer, Which which, const uint16_t* x16, int64_t T, float* y, int64_t ldy) = 0;
+    };
+    void set_product_hook(ProductHook* hook) { hook_ = hook; }
+    /// The rows and columns of layer `layer`'s product `which` (false: the layer has none of that kind).
+    bool product_shape(int64_t layer, ProductHook::Which which, int64_t& n_out, int64_t& n_in) const;
 
     /// A streamed encoder's (PlainOptions::stream_blocks) block matrices on the device, block by block: begin(l) gives
     /// block l's region for work about to be queued on stream(), end(l) says that work is queued.
@@ -500,6 +512,7 @@ private:
     /// its own, as long as its tier lends the buffers for)
     float* hand_host_ = nullptr;
     float* enc_out_ = nullptr;   ///< encode's rows (host): prompt_chunks writes every row there, normed, no logits
+    ProductHook* hook_ = nullptr;   ///< an encoder's adapters (set_product_hook)
     bool in_ram_ = false;              ///< the experts in pinned RAM (an arena), else read in place
     bool level_zero_ = false;
     uint64_t total_b_ = 0;             ///< the GPU's memory

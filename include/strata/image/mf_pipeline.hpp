@@ -100,6 +100,7 @@ private:
     uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_, last_neg_ids_;
+    std::string te_lora_;   // the text encoder's adapters the kept states were made with (lora_key_of)
     std::vector<float> last_states_, last_neg_states_;
 };
 

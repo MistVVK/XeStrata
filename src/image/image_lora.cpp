@@ -34,6 +34,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -48,6 +49,7 @@
 #include <cstring>
 #include <thread>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
 
 namespace strata::image {
@@ -1037,6 +1039,70 @@ uint64_t LoraFile::host_bytes() const {
     return n;
 }
 
+std::shared_ptr<const LoraFile> LoraFile::share(bool text) const {
+    auto out = std::make_shared<LoraFile>();
+    out->path_ = path_;
+    out->meta_ = meta_;
+    for (const LoraEntry& e : entries_)
+        if (lora_is_text_encoder_key(e.key) == text) out->entries_.push_back(e);
+    return out;
+}
+
+bool lora_is_text_encoder_key(const std::string& k) {
+    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
+}
+
+std::string lora_text_encoder_name(const std::string& key) {
+    std::string s = key;
+    for (const char* p : {"lora_te1_", "lora_te2_", "lora_te_", "text_encoders.", "text_encoder.", "te."})
+        if (s.rfind(p, 0) == 0) {
+            s.erase(0, std::strlen(p));
+            break;
+        }
+    std::replace(s.begin(), s.end(), '_', '.');
+    // a model's own wrappers before its layers (ComfyUI's qwen3_06b.transformer.model., Qwen3-VL's language_model.)
+    const size_t at = s.find("layers.");
+    if (at != std::string::npos && at > 0 && s[at - 1] == '.') s.erase(0, at);
+    return s;
+}
+
+std::string lora_key_of(const std::vector<LoraUse>& loras) {
+    std::string key;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        char num[32];
+        std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
+        key += u.file->path() + ":" + num + ";";
+    }
+    return key;
+}
+
+void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::vector<LoraUse>& te) {
+    struct Kept {
+        std::shared_ptr<const LoraFile> file, dit, te;
+    };
+    static std::mutex mu;
+    static std::vector<Kept> kept;   // the last files' shares (a request names a handful)
+    dit.clear();
+    te.clear();
+    std::lock_guard<std::mutex> lock(mu);
+    for (const LoraUse& u : in) {
+        if (!u.file) continue;
+        auto it = std::find_if(kept.begin(), kept.end(), [&](const Kept& k) { return k.file == u.file; });
+        if (it == kept.end()) {
+            bool any_te = false, any_dit = false;
+            for (const LoraEntry& e : u.file->entries()) (lora_is_text_encoder_key(e.key) ? any_te : any_dit) = true;
+            Kept k{u.file, any_dit ? (any_te ? u.file->share(false) : u.file) : nullptr,
+                   any_te ? u.file->share(true) : nullptr};
+            if (kept.size() >= 16) kept.erase(kept.begin());
+            kept.push_back(k);
+            it = kept.end() - 1;
+        }
+        if (it->dit) dit.push_back({it->dit, u.scale});
+        if (it->te) te.push_back({it->te, u.scale});
+    }
+}
+
 std::unique_ptr<LoraFile> LoraFile::open(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot open " + path);
@@ -1572,6 +1638,99 @@ bool LoraLayer::has_oft() const {
     for (const LoraPart& p : parts)
         if (p.oft) return true;
     return false;
+}
+
+bool LoraLayer::bakeable() const {
+    if (parts.empty()) return false;
+    for (const LoraPart& p : parts)
+        if (p.dora || p.oft || p.glora || p.replaces || !p.entry || !p.entry->plain() || p.entry->has_bias())
+            return false;
+    return true;
+}
+
+void LoraLayer::bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gemm, float* tmp, uint16_t* at16,
+                     void* stream) const {
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    for (const LoraPart& p : parts) {
+        const LoraDeviceEntry& e = *p.entry;
+        const int64_t r = e.rank(), rows = std::min(p.n, n - p.row0);
+        if (rows <= 0 || p.scale == 0.0f || e.cols() != k) continue;
+        // A^T [k][r], then delta [rows][k] = B's rows . A (the product's weight is A^T)
+        const uint16_t* a = e.a();
+        q.parallel_for(sycl::range<1>((size_t) (k * r)), [=](sycl::id<1> id) {
+            const auto i = static_cast<int64_t>(id[0]);
+            const int64_t c = i / r, j = i - c * r;
+            at16[i] = a[j * k + c];
+        });
+        gemm.f16(e.b() + p.src_row * r, at16, tmp, rows, k, r);
+        const float s = p.scale;
+        if (type == 1) {
+            auto* w16 = static_cast<uint16_t*>(w) + p.row0 * k;
+            q.parallel_for(sycl::range<1>((size_t) (rows * k)), [=](sycl::id<1> id) {
+                const auto i = static_cast<int64_t>(id[0]);
+                const float v = strata::kernels::f32_from_f16(w16[i]) + s * tmp[i];
+                w16[i] = strata::kernels::f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
+            });
+        } else if (type == -8) {
+            // a work-group a row: the delta's row turned in local memory (Sylvester's butterflies within each group of
+            // kQiRotate, times 1 / 16, as the weights were), added to the row's values, quantized again
+            auto* w8 = static_cast<int8_t*>(w);
+            float* sw = reinterpret_cast<float*>(static_cast<uint8_t*>(w) + n * k);
+            const int64_t row0 = p.row0;
+            constexpr int64_t G = kQiRotate, L = 256;
+            q.submit([&](sycl::handler& h) {
+                sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) k), h);
+                h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * L)), sycl::range<1>((size_t) L)),
+                               [=](sycl::nd_item<1> it) {
+                    const auto rr = static_cast<int64_t>(it.get_group_linear_id());
+                    const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                    const int64_t row = row0 + rr;
+                    for (int64_t c = lane; c < k; c += L) v[c] = s * tmp[rr * k + c];
+                    for (int64_t m = 1; m < G; m <<= 1) {
+                        sycl::group_barrier(it.get_group());
+                        for (int64_t i = lane; i < k / 2; i += L) {   // pair i: group g, its j in the half below m
+                            const int64_t g = i / (G / 2), o = i - g * (G / 2), lo = (o / m) * 2 * m + o % m;
+                            const int64_t j = g * G + lo;
+                            const float x = v[j], y = v[j + m];
+                            v[j] = x + y;
+                            v[j + m] = x - y;
+                        }
+                    }
+                    sycl::group_barrier(it.get_group());
+                    const float d0 = sw[row];
+                    float amax = 0.f;
+                    for (int64_t c = lane; c < k; c += L) {
+                        const float u = (float) w8[row * k + c] * d0 + v[c] * (1.f / 16.f);
+                        v[c] = u;
+                        amax = sycl::fmax(amax, sycl::fabs(u));
+                    }
+                    amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+                    const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+                    for (int64_t c = lane; c < k; c += L) w8[row * k + c] = (int8_t) sycl::round(v[c] * id);
+                    if (lane == 0) sw[row] = d;
+                });
+            });
+        } else if (type == 8) {   // Q8_0: 32 values a block, its FP16 scale then the values
+            auto* w8 = static_cast<uint8_t*>(w);
+            const int64_t nb = k / 32, row0 = p.row0;
+            q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> id) {
+                const auto i = static_cast<int64_t>(id[0]);
+                const int64_t rr = i / nb, bl = i - rr * nb;
+                uint8_t* blk = w8 + ((row0 + rr) * nb + bl) * 34;
+                const float d0 = strata::kernels::f32_from_f16((uint16_t) (blk[0] | (blk[1] << 8)));
+                float u[32], amax = 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    u[j] = (float) (int8_t) blk[2 + j] * d0 + s * tmp[rr * k + bl * 32 + j];
+                    amax = sycl::fmax(amax, sycl::fabs(u[j]));
+                }
+                const float d = amax / 127.f, id2 = amax > 0.f ? 1.f / d : 0.f;
+                const uint16_t dh = strata::kernels::f16_from_f32(d);
+                blk[0] = (uint8_t) (dh & 0xff);
+                blk[1] = (uint8_t) (dh >> 8);
+                for (int j = 0; j < 32; ++j) blk[2 + j] = (uint8_t) (int8_t) sycl::round(u[j] * id2);
+            });
+        }
+    }
 }
 
 bool LoraLayer::has_glora() const {

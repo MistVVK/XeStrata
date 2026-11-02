@@ -171,6 +171,96 @@ void QiText::set_final_norm(bool on) {
     final_norm_ = on;
 }
 
+void QiText::lora_add(const W& w, const uint16_t* x16, int64_t T, float* y, int64_t ldy) {
+    if (w.lora == nullptr) return;
+    if (lora_f32_ == nullptr || T > lora_t_) {
+        gpu::stream_sync(s_);
+        release(allocs_, lora_f32_);
+        release(allocs_, lora16_);
+        lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
+        lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
+        lora_t_ = T;
+    }
+    w.lora->add(x16, T, y, ldy, 0, w.n, nullptr, gemm_, lora_f32_, lora16_, s_);
+}
+
+uint64_t QiText::lora_bytes() const {
+    uint64_t n = 0;
+    for (const auto& l : lora_layers_) n += l->bytes();
+    return n + (uint64_t) lora_t_ * (uint64_t) lora_cols_ * 6;
+}
+
+bool QiText::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
+    const std::string key = lora_key_of(loras);
+    if (key == lora_key_) return true;
+    auto unbind = [this] {   // the set bound before (its layers and scratch)
+        for (Layer& l : layers_)
+            for (W* w : {&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down}) w->lora = nullptr;
+        gpu::stream_sync(s_);
+        lora_layers_.clear();
+        lora_files_.clear();
+        lora_key_.clear();
+        release(allocs_, lora_f32_);
+        release(allocs_, lora16_);
+        lora_f32_ = nullptr;
+        lora16_ = nullptr;
+        lora_cols_ = lora_t_ = 0;
+    };
+    unbind();
+    if (key.empty()) return true;
+    // the encoder's weights by their names, dotted as lora_text_encoder_name writes a key
+    std::vector<std::pair<std::string, W*>> slots;
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        Layer& l = layers_[i];
+        const std::string p = "layers." + std::to_string(i) + ".";
+        for (auto [name, w] : std::vector<std::pair<const char*, W*>>{
+                 {"self.attn.q.proj", &l.q}, {"self.attn.k.proj", &l.k}, {"self.attn.v.proj", &l.v},
+                 {"self.attn.o.proj", &l.o}, {"mlp.gate.proj", &l.gate}, {"mlp.up.proj", &l.up},
+                 {"mlp.down.proj", &l.down}})
+            slots.emplace_back(p + name, w);
+    }
+    auto fail = [&](const std::string& why) {
+        err = why;
+        unbind();
+        return false;
+    };
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        for (const LoraEntry& e : u.file->entries()) {
+            const std::string name = lora_text_encoder_name(e.key);
+            auto it = std::find_if(slots.begin(), slots.end(), [&](const auto& s) { return s.first == name; });
+            if (it == slots.end())
+                return fail("image engine: " + u.file->path() + ": " + e.key + ": the text encoder has no such weight");
+            W& w = *it->second;
+            if (e.kind == LoraKind::oft || e.kind == LoraKind::glora || e.kind == LoraKind::bias || !e.dora.empty() ||
+                !e.bias.empty() || e.replaces)
+                return fail("image engine: " + u.file->path() + ": " + e.key +
+                            ": the text encoder takes a plain LoRA, a LoKr, a LoHa or a whole delta");
+            if (e.rows != w.n || e.cols != w.k)
+                return fail("image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
+                            std::to_string(e.rows) + ", not the text encoder's " + std::to_string(w.k) + " x " +
+                            std::to_string(w.n));
+            const float scale = u.scale * e.scale();
+            if (scale == 0.0f) continue;
+            auto dev = std::make_shared<LoraDeviceEntry>();
+            if (!dev->upload(e, s_, err)) return fail(err);
+            if (w.lora == nullptr) {
+                lora_layers_.push_back(std::make_unique<LoraLayer>());
+                w.lora = lora_layers_.back().get();
+            }
+            LoraPart part;
+            part.entry = dev;
+            part.n = w.n;
+            part.scale = scale;
+            w.lora->parts.push_back(std::move(part));
+            lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
+        }
+        lora_files_.push_back(u.file);
+    }
+    lora_key_ = key;
+    return true;
+}
+
 std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::vector<Image>& images) {
     const auto T = (int64_t) ids.size();
     if (T == 0) return {};
@@ -228,6 +318,9 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
         gemm_.native(h16_, l.q.type, w(l.q), q_, T, l.q.n, l.q.k);
         gemm_.native(h16_, l.k.type, w(l.k), k_, T, l.k.n, l.k.k);
         gemm_.native(h16_, l.v.type, w(l.v), v_, T, l.v.n, l.v.k);
+        lora_add(l.q, h16_, T, q_, l.q.n);
+        lora_add(l.k, h16_, T, k_, l.k.n);
+        lora_add(l.v, h16_, T, v_, l.v.n);
         qi_text_qk_rope16(q_, k_, v_, f(l.qn), f(l.kn), T, heads_, kv_heads_, head_dim_, theta_, q16_, k16_, v16_, s_,
                           dpos, sec_h_, sec_w_);
         // the attention through a GPU maker's kernel where one takes it causal (K and V repeated to a query head each,
@@ -245,12 +338,16 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
             qi_to_f16(a_, T * heads_ * head_dim_, h16_, s_);
         }
         gemm_.native(h16_, l.o.type, w(l.o), h_, T, l.o.n, l.o.k);
+        lora_add(l.o, h16_, T, h_, l.o.n);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);
         qi_rms_norm16(x_, f(l.ffn_norm), T, C_, h16_, s_);
         gemm_.native(h16_, l.gate.type, w(l.gate), gu_, T, l.gate.n, l.gate.k, 2 * inter_);
         gemm_.native(h16_, l.up.type, w(l.up), gu_ + inter_, T, l.up.n, l.up.k, 2 * inter_);
+        lora_add(l.gate, h16_, T, gu_, 2 * inter_);
+        lora_add(l.up, h16_, T, gu_ + inter_, 2 * inter_);
         qi_swiglu16(gu_, T, inter_, h16_, s_);
         gemm_.native(h16_, l.down.type, w(l.down), h_, T, l.down.n, l.down.k);
+        lora_add(l.down, h16_, T, h_, l.down.n);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);
         layers_stream_.end(li);
         size_t k = 0;   // DeepStack: after layer li, the images' tokens get their block li

@@ -4,13 +4,23 @@
 
 #include "strata/image/moss_text.hpp"
 
+#include "strata/artifact/model_spec.hpp"
+#include "strata/core/gpu.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
+#include <iterator>
+#include <map>
+#include <stdexcept>
 
 namespace strata::image {
+
+namespace gpu = strata::gpu;
 
 // The engine's blocks from the layer stream: block l is layer l
 struct MossText::Source : core::PlainModel::BlockSource {
@@ -19,8 +29,144 @@ struct MossText::Source : core::PlainModel::BlockSource {
     void end(int l) override { layers->end(l); }
 };
 
+// The adapters after the blocks' products (PlainModel::ProductHook): a layer's product's deltas, by the layer and the
+// product
+struct MossText::Hook : core::PlainModel::ProductHook {
+    std::map<std::pair<int64_t, int>, std::unique_ptr<LoraLayer>> layers;
+    std::vector<std::shared_ptr<const LoraFile>> files;
+    std::string key;
+    prefill::Gemm gemm;
+    bool gemm_ready = false;
+    int64_t cols = 0, cap_t = 0;
+    float* f32 = nullptr;
+    uint16_t* f16 = nullptr;
+    void* stream = nullptr;
+    ~Hook() override { free_scratch(); }
+    void free_scratch() {
+        if (f32 != nullptr || f16 != nullptr) gpu::stream_sync(stream);
+        gpu::free(f32);
+        gpu::free(f16);
+        f32 = nullptr;
+        f16 = nullptr;
+        cap_t = 0;
+    }
+    void after(int64_t layer, Which which, const uint16_t* x16, int64_t T, float* y, int64_t ldy) override {
+        const auto it = layers.find({layer, (int) which});
+        if (it == layers.end()) return;
+        if (T > cap_t) {
+            free_scratch();
+            if (!gpu::alloc_device(&f32, (size_t) (T * cols) * 4) || !gpu::alloc_device(&f16, (size_t) (T * cols) * 2))
+                throw std::runtime_error(std::string("MOSS-Image's text encoder's adapters: GPU memory: ") +
+                                         gpu::last_error());
+            cap_t = T;
+        }
+        int64_t n_rows = 0;
+        for (const LoraPart& p : it->second->parts) n_rows = std::max(n_rows, p.row0 + p.n);
+        it->second->add(x16, T, y, ldy, 0, n_rows, nullptr, gemm, f32, f16, stream);
+    }
+};
+
 MossText::MossText() = default;
 MossText::~MossText() { close(); }
+
+const std::string& MossText::lora_key() const {
+    static const std::string none;
+    return hook_ ? hook_->key : none;
+}
+
+bool MossText::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
+    const std::string key = lora_key_of(loras);
+    if (key == lora_key()) return true;
+    if (model_) model_->set_product_hook(nullptr);
+    hook_.reset();
+    if (key.empty()) return true;
+    if (!model_) {
+        err = "MOSS-Image's text encoder is not open";
+        return false;
+    }
+    using H = core::PlainModel::ProductHook;
+    static const std::pair<const char*, H::Which> kNames[] = {
+        {"linear.attn.in.proj.qkv", H::kQkv}, {"linear.attn.in.proj.z", H::kZ}, {"linear.attn.in.proj.a", H::kAlpha},
+        {"linear.attn.in.proj.b", H::kBeta},  {"linear.attn.out.proj", H::kSsmOut}, {"self.attn.q.proj", H::kQ},
+        {"self.attn.k.proj", H::kK},          {"self.attn.v.proj", H::kV},          {"self.attn.o.proj", H::kO},
+        {"mlp.gate.proj", H::kGate},          {"mlp.up.proj", H::kUp},              {"mlp.down.proj", H::kDown}};
+    const ModelSpec& s = model_->spec();
+    // llama.cpp's converter puts the GDN's value heads from grouped (by key head) to tiled order where the key heads
+    // are fewer: head (g, r) of HK x (HV / HK) goes to r HK + g
+    const int64_t HK = s.ssm_n_group, HV = s.ssm_dt_rank, dk = s.ssm_d_state, dv = HV > 0 ? s.ssm_d_inner / HV : 0;
+    const bool reorder = HK > 0 && HV > 0 && HK != HV;
+    auto tiled = [&](int64_t i, int64_t hd) {   // the GGUF's index of the file's index i (head size hd)
+        const int64_t r_per = HV / HK, head = i / hd, d = i % hd, g = head / r_per, r = head % r_per;
+        return (r * HK + g) * hd + d;
+    };
+    auto h = std::make_unique<Hook>();
+    h->stream = model_->stream();
+    if (!h->gemm.init(h->stream, 0, err)) return false;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        for (const LoraEntry& e0 : u.file->entries()) {
+            const std::string name = lora_text_encoder_name(e0.key);
+            int64_t layer = -1;
+            const char* rest = nullptr;
+            if (name.rfind("layers.", 0) == 0) {
+                const size_t dot = name.find('.', 7);
+                if (dot != std::string::npos) {
+                    layer = std::atoll(name.substr(7, dot - 7).c_str());
+                    rest = name.c_str() + dot + 1;
+                }
+            }
+            const auto* hit = rest == nullptr ? nullptr
+                                              : std::find_if(std::begin(kNames), std::end(kNames),
+                                                             [&](const auto& n) { return std::strcmp(n.first, rest) == 0; });
+            int64_t rows = 0, cols = 0;
+            if (hit == nullptr || hit == std::end(kNames) || !model_->product_shape(layer, hit->second, rows, cols)) {
+                err = "image engine: " + u.file->path() + ": " + e0.key + ": MOSS-Image's text encoder has no such weight";
+                return false;
+            }
+            if ((e0.kind != LoraKind::lora && e0.kind != LoraKind::diff) || !e0.dora.empty() || !e0.bias.empty() ||
+                e0.replaces || e0.rows != rows || e0.cols != cols) {
+                err = "image engine: " + u.file->path() + ": " + e0.key + ": MOSS-Image's text encoder takes a plain "
+                      "LoRA or a whole delta of its weight's " + std::to_string(cols) + " x " + std::to_string(rows);
+                return false;
+            }
+            LoraEntry e = e0;   // the GDN's value heads in the GGUF's order
+            const H::Which w = hit->second;
+            if (reorder && (w == H::kQkv || w == H::kZ || w == H::kAlpha || w == H::kBeta || w == H::kSsmOut)) {
+                const int64_t first = w == H::kQkv ? 2 * HK * dk : 0, hd = (w == H::kAlpha || w == H::kBeta) ? 1 : dv;
+                const bool by_cols = w == H::kSsmOut;
+                const int64_t n = by_cols ? cols : rows, inner = e.kind == LoraKind::lora ? e.rank : (by_cols ? rows : cols);
+                if (by_cols) {   // the columns: lora's a [rank][cols], a delta's [rows][cols]
+                    std::vector<uint16_t>& m = e.kind == LoraKind::lora ? e.a : e.delta;
+                    const std::vector<uint16_t> src = m;
+                    for (int64_t r = 0; r < inner; ++r)
+                        for (int64_t c = 0; c < n; ++c) m[(size_t) (r * n + tiled(c, hd))] = src[(size_t) (r * n + c)];
+                } else {          // the rows: lora's b [rows][rank], a delta's [rows][cols]
+                    std::vector<uint16_t>& m = e.kind == LoraKind::lora ? e.b : e.delta;
+                    const std::vector<uint16_t> src = m;
+                    for (int64_t r = first; r < n; ++r)
+                        std::copy_n(src.begin() + r * inner, inner, m.begin() + (first + tiled(r - first, hd)) * inner);
+                }
+            }
+            const float scale = u.scale * e.scale();
+            if (scale == 0.0f) continue;
+            auto dev = std::make_shared<LoraDeviceEntry>();
+            if (!dev->upload(e, h->stream, err)) return false;
+            auto& layer_ptr = h->layers[{layer, (int) w}];
+            if (!layer_ptr) layer_ptr = std::make_unique<LoraLayer>();
+            LoraPart part;
+            part.entry = dev;
+            part.n = rows;
+            part.scale = scale;
+            layer_ptr->parts.push_back(std::move(part));
+            h->cols = std::max(h->cols, lora_scratch_cols(e));
+        }
+        h->files.push_back(u.file);
+    }
+    h->key = key;
+    hook_ = std::move(h);
+    model_->set_product_hook(hook_.get());
+    return true;
+}
 
 bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget) {
     close();
@@ -66,6 +212,8 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
 
 // the layer stream first: it waits for the model's stream (its compute stream), which the model destroys with itself
 void MossText::close() {
+    if (model_) model_->set_product_hook(nullptr);
+    hook_.reset();
     layers_.reset();
     source_.reset();
     model_.reset();

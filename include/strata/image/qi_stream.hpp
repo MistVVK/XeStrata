@@ -84,6 +84,10 @@ public:
     /// Frees the streamed layers' homes (the engine's cache let go: their RAM back for the other engines); taken again
     /// as the layers stream.
     void drop_homes();
+    /// Every layer copied from its source again at its next use, and prepare_ run on it again (the weights it rewrote
+    /// otherwise kept in the resident copies, the homes and the slots): those freed or forgotten, the budget and the
+    /// slots' memory kept.
+    void reload();
 
     /// Where a streamed layer's copy reads from (the header's comment).
     enum class Source { relay, home, file };

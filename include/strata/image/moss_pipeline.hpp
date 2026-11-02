@@ -103,6 +103,8 @@ private:
     uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_, last_neg_ids_;
+    std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens
+    std::string te_lora_;             // those the kept states were made with (lora_key_of)
     std::vector<float> last_states_, last_neg_states_;
     std::vector<float> ctx_states_[2];   // the states the DiT's contexts were set from
 };

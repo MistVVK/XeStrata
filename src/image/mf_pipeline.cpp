@@ -257,7 +257,14 @@ uint64_t MfPipeline::held() const {
 
 void MfPipeline::use_loras(const QiRequest& r) {
     std::string err;
-    if (!dit().set_loras(r.loras, err)) throw LoraRejected(err);
+    std::vector<LoraUse> dit_part, te;
+    lora_split(r.loras, dit_part, te);
+    if (!dit().set_loras(dit_part, err) || !te_->set_loras(te, err)) throw LoraRejected(err);
+    if (te_->lora_key() != te_lora_) {   // the states kept were the encoder's with the other adapters
+        last_ids_.clear();
+        last_neg_ids_.clear();
+        te_lora_ = te_->lora_key();
+    }
 }
 
 void MfPipeline::fit(uint64_t reserve) {

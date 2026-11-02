@@ -6,6 +6,7 @@
 // states, before the final norm (Qwen-Image) or after it (Mage-Flow), the DiT's context (the rows after the system turn).
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -58,6 +59,14 @@ public:
     uint64_t layers_vram() const { return layers_stream_.vram(); }
     void drop_layers() { layers_stream_.drop(); }
     void drop_layer_homes() { layers_stream_.drop_homes(); }
+    /// The adapters' text encoder entries (lora_split's `te`: sd-scripts' lora_te_layers_N_..., ComfyUI's and
+    /// diffusers' names of the layers' q, k, v, o, gate, up and down projections) added to the layers' products from
+    /// the next encode: a plain LoRA, a LoKr, a LoHa or a whole delta (a DoRA, an OFT, a GLoRA or a bias's delta is
+    /// refused, as a key the encoder has no weight for), false with err and nothing bound.  The same set again changes
+    /// nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    const std::string& lora_key() const { return lora_key_; }
+    uint64_t lora_bytes() const;
     /// The working buffers an encode of T tokens takes; drop_activations frees them (grown again on use).
     uint64_t activation_bytes(int64_t T) const;
     void drop_activations();
@@ -67,7 +76,16 @@ private:
         int type = 0;
         int64_t n = 0, k = 0;
         const void* d = nullptr;
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none)
     };
+    // a product's output y (row stride ldy) plus the weight's adapters' deltas of the input x16
+    void lora_add(const W& w, const uint16_t* x16, int64_t T, float* y, int64_t ldy);
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_cols_ = 0, lora_t_ = 0;
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
     struct Layer {
         W q, k, v, o, gate, up, down;   // d: the offset within the layer's region (LayerStream)
         uint64_t attn_norm = 0, ffn_norm = 0, qn = 0, kn = 0;

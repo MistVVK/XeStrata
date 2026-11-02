@@ -765,6 +765,30 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
 }
 
+bool PlainModel::product_shape(int64_t layer, ProductHook::Which which, int64_t& n_out, int64_t& n_in) const {
+    if (layer < 0 || layer >= (int64_t) blocks_.size()) return false;
+    const Block& b = blocks_[(size_t) layer];
+    const W* w = nullptr;
+    switch (which) {
+    case ProductHook::kQkv: w = b.recurrent ? &b.qkv : nullptr; break;
+    case ProductHook::kZ: w = b.recurrent ? &b.z : nullptr; break;
+    case ProductHook::kAlpha: w = b.recurrent ? &b.alpha : nullptr; break;
+    case ProductHook::kBeta: w = b.recurrent ? &b.beta : nullptr; break;
+    case ProductHook::kSsmOut: w = b.recurrent ? &b.ssm_out : nullptr; break;
+    case ProductHook::kQ: w = b.recurrent ? nullptr : &b.q; break;
+    case ProductHook::kK: w = b.recurrent ? nullptr : &b.k; break;
+    case ProductHook::kV: w = b.recurrent ? nullptr : &b.v; break;
+    case ProductHook::kO: w = b.recurrent ? nullptr : &b.o; break;
+    case ProductHook::kGate: w = dense_ ? &b.sh_gate : nullptr; break;
+    case ProductHook::kUp: w = dense_ ? &b.sh_up : nullptr; break;
+    case ProductHook::kDown: w = dense_ ? &b.sh_down : nullptr; break;
+    }
+    if (w == nullptr || w->n_out <= 0) return false;
+    n_out = w->n_out;
+    n_in = w->n_in;
+    return true;
+}
+
 bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err) {
     if (!dense_ || !next_.empty() || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
         err = "plain model: encode takes 1 .. max_cells tokens of a dense model on one GPU";
@@ -948,8 +972,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // a dense product from float rows x (ldx a row) in int8 below dense_native_rows_ rows where the weight is the int8
     // products'; false: the caller takes Gemm::native from the FP16 copy
     const bool dense_on = dense_int8_env() && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
+    // an encoder's adapters (set_product_hook): the products from their FP16 inputs, each followed by the hook
+    const bool hooked = hook_ != nullptr && enc_out_ != nullptr;
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
-        return T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
+        return !hooked && T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
@@ -1088,6 +1114,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 }
                 if (!is_mtp) bind_block(l);   // a streamed block's matrices
                 const Block& b = is_mtp ? mtp_ : blocks_[(size_t) l];
+                auto hook = [&](ProductHook::Which which, const W& w, const uint16_t* x, float* y, int64_t ldy = 0) {
+                    if (hooked && !is_mtp) hook_->after(l - lb_, which, x, T, y, ldy > 0 ? ldy : w.n_out);
+                };
                 const int64_t pa = is_mtp ? p0 + 1 : p0;   // the rows' first position
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
                 f16(P.hn, T, N);
@@ -1101,6 +1130,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     part(0);   // the norm and its FP16 copy
                     proj_hn(b.qkv, P.qkv);
                     proj_hn(b.z, P.z);
+                    hook(ProductHook::kQkv, b.qkv, P.x16, P.qkv);
+                    hook(ProductHook::kZ, b.z, P.x16, P.z);
                     part(5);
                     for (const auto& [w, y] : {std::pair<const W*, float*>{&b.alpha, P.ab}, {&b.beta, P.ab + HV}}) {
                         if (w->type == 0)   // F32 (Qwen3.6), from the FP32 rows as the router
@@ -1108,6 +1139,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                                              w->n_out, T, cs);
                         else
                             proj(*w, y, T, 2 * HV);
+                        hook(w == &b.alpha ? ProductHook::kAlpha : ProductHook::kBeta, *w, P.x16, y, 2 * HV);
                     }
                     part(6);
                     prefill::gdn_gates(P.ab, b.dt, b.a, P.gate, P.beta, T, cs, HK, HV);
@@ -1120,12 +1152,16 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     // its sums in FP16 as proj_hn's)
                     gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
                               dense_half_sums_);
+                    hook(ProductHook::kSsmOut, b.ssm_out, P.y16, P.mix);
                     part(9);
                 } else {
                     const int64_t a = b.attn;
                     proj_hn(b.q, P.qfull);
                     proj_hn(b.k, P.kraw);
                     proj_hn(b.v, P.vcur);
+                    hook(ProductHook::kQ, b.q, P.x16, P.qfull);
+                    hook(ProductHook::kK, b.k, P.x16, P.kraw);
+                    hook(ProductHook::kV, b.v, P.x16, P.vcur);
                     // the norm and RoPE take at most 65535 rows a launch: the chunk's heads in token slices
                     auto norm_rope = [&](const float* in, int64_t in_row, const float* gamma, float* out, int64_t heads,
                                          const int32_t* pos) {
@@ -1168,6 +1204,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     if (!dense(b.o, ao, NH * HD, P.mix, T)) {
                         f16(ao, T, NH * HD);
                         proj(b.o, P.mix, T, 0, dense_half_sums_);   // averages of V's rows: in FP16's range as well
+                        hook(ProductHook::kO, b.o, P.x16, P.mix);
                     }
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
@@ -1178,7 +1215,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     f16(P.hn, T, N);
                     proj_hn(b.sh_gate, P.sh_gate);
                     proj_hn(b.sh_up, P.sh_up);
-                    if (T < dense_native_rows_ && dense_int8_ok(b.sh_down)) {
+                    hook(ProductHook::kGate, b.sh_gate, P.x16, P.sh_gate);
+                    hook(ProductHook::kUp, b.sh_up, P.x16, P.sh_up);
+                    if (!hooked && T < dense_native_rows_ && dense_int8_ok(b.sh_down)) {
                         // the SwiGLU in FP32 rows for the int8 product: the chunk as one row (the kernel is
                         // element-wise, and takes at most 8 rows)
                         k::native_swiglu_f32(P.sh_gate, P.sh_up, P.sh_gate, (int) (FS * T), 1, cs);
@@ -1188,6 +1227,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         // its sums in FP16 too where they were measured faster, as llama.cpp's cuBLAS products of FP16
                         // weights take every product's (its default precision): the SwiGLU's rows are in FP16 already
                         proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
+                        hook(ProductHook::kDown, b.sh_down, P.x16, P.moe_out);
                     }
                     k::add_inplace(P.x, P.moe_out, T * N, cs);
                     steer(b, T, P.x, cs);

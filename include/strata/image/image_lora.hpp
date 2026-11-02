@@ -179,6 +179,8 @@ public:
     std::string meta(const std::string& key) const;
     /// What the entries hold on the host.
     uint64_t host_bytes() const;
+    /// A copy holding the text encoder's entries (`text`) or the others, the same path and metadata.
+    std::shared_ptr<const LoraFile> share(bool text) const;
 
 private:
     std::string path_;
@@ -192,6 +194,19 @@ struct LoraUse {
     std::shared_ptr<const LoraFile> file;
     float scale = 1.0f;
 };
+
+/// A key a text encoder's weight has: sd-scripts' lora_te (lora_te1_, lora_te2_), diffusers' text_encoder., te.
+bool lora_is_text_encoder_key(const std::string& key);
+/// The text encoder's own name of such a key with its dots for underscores ("lora_te_layers_0_self_attn_q_proj" and
+/// "text_encoder.model.layers.0.self_attn.q_proj" -> "layers.0.self.attn.q.proj"): the prefixes off, sd-scripts'
+/// underscores and the file's dots alike, which a text encoder compares with its own names written the same way.
+std::string lora_text_encoder_name(const std::string& key);
+/// The adapters split by the part they change: `dit` the files' DiT entries, `te` their text encoder's (a file with
+/// none of one part is left out of that list; a file of both, a copy of each share).  The copies are kept for the same
+/// files, so a request's split is the last one's when its files are.
+void lora_split(const std::vector<LoraUse>& in, std::vector<LoraUse>& dit, std::vector<LoraUse>& te);
+/// A set's key: its files' paths and strengths in order ("" for none), what a part compares to know the set changed.
+std::string lora_key_of(const std::vector<LoraUse>& loras);
 
 /// The bytes the adapters take on the GPU: their entries' tensors (FP16), and the products' scratch of T rows (T times
 /// the most values an entry's delta holds a row, FP32 and FP16 each): what a request's budget puts beside the model.
@@ -224,6 +239,8 @@ public:
     /// shapes are the file's own and were checked when it was read).
     bool upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef = nullptr);
     void release();
+    /// A plain LoRA's (A and B): the form a weight's bake folds in.
+    bool plain() const { return kind_ == LoraKind::lora && rank_ > 0 && a_ != nullptr && b_ != nullptr; }
     const uint16_t* a() const { return a_; }
     const uint16_t* b() const { return b_; }
     int64_t rank() const { return rank_; }
@@ -324,6 +341,16 @@ public:
     bool has_glora() const;
     /// The GPU memory the parts' entries hold (and the base product's factors).
     uint64_t bytes() const;
+
+    /// True where every part is a plain LoRA's (no DoRA, OFT, GLoRA, set_weight or bias delta): their deltas can be
+    /// folded into the weight once (bake) instead of added to each product.
+    bool bakeable() const;
+    /// The weight [n][k] at `w` on the stream's GPU plus the parts' deltas (scale B A over each part's rows), in place:
+    /// `type` 1 FP16, -8 W8A8's (each group of kQiRotate of a row times the normalized Hadamard matrix, the rows'
+    /// int8 values then their n scales: the delta turned the same way, the rows quantized again), 8 Q8_0 (its blocks
+    /// quantized again).  `tmp` holds n * k floats, `at16` k * the largest rank values.  bakeable() layers only.
+    void bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gemm, float* tmp, uint16_t* at16,
+              void* stream) const;
 
     /// The base product's factors over all of the weight's rows, 1 where no DoRA part changes the row: made from the
     /// parts (`rows`: the weight's rows), on the GPU once the DiT has bound them all.  null: no part is a DoRA's.

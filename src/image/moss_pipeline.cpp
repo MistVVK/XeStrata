@@ -192,7 +192,15 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
 void MossPipeline::use_loras(const QiRequest& r) {
     std::string err;
     const std::string before = dit_->lora_key();
-    if (!dit_->set_loras(r.loras, err)) throw LoraRejected(err);
+    std::vector<LoraUse> dit;
+    lora_split(r.loras, dit, te_loras_);
+    if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
+    if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
+    if (lora_key_of(te_loras_) != te_lora_) {   // the states kept were the encoder's with the other adapters
+        last_ids_.clear();
+        last_neg_ids_.clear();
+        te_lora_ = lora_key_of(te_loras_);
+    }
     if (dit_->lora_key() != before) {   // the contexts' text rows were made with the other adapters' weights
         ctx_states_[0].clear();
         ctx_states_[1].clear();
@@ -419,6 +427,7 @@ bool MossPipeline::open_text() {
             te_measure_ = 1;
         }
     }
+    if (!t->set_loras(te_loras_, err)) throw LoraRejected(err);
     te_ = std::move(t);
     te_set_ = te_->layers_vram();
     std::fprintf(stderr, "image engine: MOSS-Image's text encoder open: %d blocks resident (%llu MiB), %llu MiB besides\n",
@@ -512,8 +521,12 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     const std::vector<float> sigmas = strength_sigmas(full, r.strength);
     const auto t0 = clock::now();
     const int n = guided ? 2 : 1;
-    const int64_t rows0 = r.te_rows > 0 ? r.te_rows : (int64_t) r.ids.size();
-    const int64_t rows1 = guided ? (r.neg_te_rows > 0 ? r.neg_te_rows : (int64_t) r.neg_ids.size()) : 0;
+    // the chat engine's states have no text encoder adapters: with some, the image engine encodes the ids itself
+    std::vector<LoraUse> dit_part, te_part;
+    lora_split(r.loras, dit_part, te_part);
+    const bool own = !te_part.empty();
+    const int64_t rows0 = r.te_rows > 0 && !own ? r.te_rows : (int64_t) r.ids.size();
+    const int64_t rows1 = guided ? (r.neg_te_rows > 0 && !own ? r.neg_te_rows : (int64_t) r.neg_ids.size()) : 0;
     ensure_open(want_q8(h * w, n, std::max(rows0, rows1)));
     MossDit& d = *dit_;
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
@@ -526,7 +539,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     if (stage) stage("text");
     bool cached = true;
     const std::vector<float>* st[2] = {&r.te, &r.neg_te};
-    if (r.te_rows == 0) {
+    if (r.te_rows == 0 || own) {
         if (r.ids != last_ids_) {
             encode(r.ids, last_states_);
             last_ids_ = r.ids;
@@ -534,7 +547,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         }
         st[0] = &last_states_;
     }
-    if (guided && r.neg_te_rows == 0) {
+    if (guided && (r.neg_te_rows == 0 || own)) {
         if (r.neg_ids != last_neg_ids_) {
             encode(r.neg_ids, last_neg_states_);
             last_neg_ids_ = r.neg_ids;

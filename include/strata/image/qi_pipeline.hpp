@@ -104,6 +104,7 @@ private:
     uint64_t te_want_ = 0;   // the encoder's layers the plan gives them: taken when it encodes (te_layers)
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_;
+    std::string te_lora_;   // the text encoder's adapters the kept states were made with (lora_key_of)
     std::vector<float> last_neg_states_;   // the last negative prompt's states (guidance), for the same ids again
     std::vector<int32_t> last_neg_ids_;   // the last prompt, and its text states (host)
     std::vector<float> last_states_;

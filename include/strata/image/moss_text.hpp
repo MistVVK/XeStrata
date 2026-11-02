@@ -9,6 +9,7 @@
 // come in a file (read_states).
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 
 #include <cstdint>
@@ -38,6 +39,12 @@ public:
     /// [ids.size()][hidden()] floats (host); empty with `err` on a failure.
     std::vector<float> encode(const std::vector<int32_t>& ids, std::string& err);
     int64_t hidden() const;
+    /// The adapters' text encoder entries (lora_split's `te`: Qwen3.5's names, sd-scripts' lora_te_layers_N_... or
+    /// the model's own) added after the blocks' products from the next encode: a plain LoRA or a whole delta (the GDN
+    /// weights' value heads in the GGUF's order, the order llama.cpp's converter wrote them in, the entries' rows or
+    /// columns put in it as they are bound); another form, or a key the encoder has no weight for, false with err.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    const std::string& lora_key() const;
 
     /// The blocks' bytes (in the file) and the two slots a streamed walk takes at least.
     uint64_t layer_bytes() const { return layers_ != nullptr ? layers_->total() : 0; }
@@ -54,6 +61,8 @@ public:
 
 private:
     struct Source;
+    struct Hook;
+    std::unique_ptr<Hook> hook_;
     std::unique_ptr<LayerStream> layers_;
     std::unique_ptr<Source> source_;
     std::unique_ptr<core::PlainModel> model_;

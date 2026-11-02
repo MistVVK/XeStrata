@@ -90,6 +90,20 @@ void LayerStream::drop_homes() {
     homes_pending_ = streaming_;   // taken again at the next streamed layer
 }
 
+void LayerStream::reload() {
+    drop_homes();
+    for (Layer& l : layers_) {
+        if (l.d != nullptr) gpu::free(l.d);
+        l.d = nullptr;
+        l.loaded = false;
+    }
+    for (Slot& s : slots_) {
+        s.layer = -1;
+        s.issued = false;
+        s.prepared = false;
+    }
+}
+
 void LayerStream::free_homes(int lo, int hi) {
     for (int i = lo; i < hi; ++i) {
         Layer& l = layers_[(size_t) i];
