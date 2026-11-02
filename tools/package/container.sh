@@ -49,6 +49,9 @@ intel_key=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUC
 # oneMKL's series (setup.py's ONEMKL_SERIES: the newest whose SYCL library runs on intel/llvm 7.1.1's runtime); the
 # packages suggest the package of the library the engine links, so this series
 mkl_series=$(sed -n 's/^ONEMKL_SERIES = "\(.*\)"$/\1/p' "$src/setup.py")
+# shellcheck disable=SC1091   # /src/tools/package/reuse.sh, in the container
+. "$src/tools/package/reuse.sh"
+pkg_cache "$distro"
 case "$distro" in
   ubuntu*)
     export DEBIAN_FRONTEND=noninteractive
@@ -123,6 +126,7 @@ EOF
       hipblas-common-devel
     ;;
 esac
+lap tools
 # build.sh's compiler cache (/ccache, CCACHE_DIR), shared by the packages of a distribution: every compile of
 # intel/llvm, the image encoders and the engine goes through it.  ccache uses an object only for the same
 # preprocessed source (with -fsycl the device side's too), flags and compiler, so the CUDA versions' adapters stay
@@ -142,13 +146,18 @@ curl -fsSL -o /tmp/llama.zip "https://github.com/ggml-org/llama.cpp/archive/$com
 unzip -q /tmp/llama.zip -d /tmp/llama
 mv "/tmp/llama/llama.cpp-$commit" "$src/third_party/main/llama.cpp"
 llama=$src/third_party/main/llama.cpp
+lap llama.cpp
 
-# intel/llvm, with its CUDA target for the contrib packages
+# intel/llvm, with its CUDA target for the contrib packages (or the one an earlier build on this PC kept: reuse.sh)
+key=$(llvm_key "$license" "$cuda_ver")
+llvm_restore "$distro-$variant" "$llvm" "$key"
 if [ "$license" = contrib ]; then
   python3 "$src/tools/intel_llvm_build.py" --contrib --yes ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
 else
   python3 "$src/tools/intel_llvm_build.py" --yes ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
 fi
+llvm_keep "$distro-$variant" "$llvm" "$key"
+lap intel-llvm
 
 # the image encoders: any AVX2 CPU, and Vulkan's (free: Mesa's drivers)
 jobs=${XESTRATA_JOBS:-$(nproc)}
@@ -162,6 +171,8 @@ for enc in cpu vulkan; do
   mkdir -p /build/vision
   cp "/build/vision-$enc/bin/strata-vision" "/build/vision/strata-vision-$enc"
 done
+
+lap encoders
 
 # the engine
 set -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
@@ -178,6 +189,7 @@ cmake -G Ninja -S "$src" -B /build/engine "$@"
 targets="strata strata-image onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
+lap engine
 
 # What the package depends on (Python's modules, and the libraries the engine links), recommends and suggests.  A GPU
 # maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver and AMD's
@@ -248,12 +260,18 @@ cmake -DSTRATA_PACKAGE_DEPENDS="$depends" -DSTRATA_PACKAGE_RECOMMENDS="$recommen
 cd /build/engine
 cpack -G "$generator"
 find . -maxdepth 1 \( -name '*.deb' -o -name '*.rpm' \) -exec cp {} /out/ \;
+lap package
 
+# shellcheck disable=SC2154   # reuse, laps and llvm_reused: reuse.sh's
 {
   echo "commit: $XESTRATA_COMMIT"
   echo "image: $XESTRATA_IMAGE"
   echo "variant: $variant ($license${cuda_path:+, CUDA $cuda_ver})"
   echo "intel/llvm: $(sed -n 's/.*"tag": "\(.*\)".*/\1/p' "$llvm/install/XESTRATA.json")"
+  echo "intel/llvm toolchain: $([ -n "$llvm_reused" ] && echo "reused $llvm_reused" || echo built)"
+  echo "reuse: $([ "$reuse" = 1 ] && echo "the packages and intel/llvm of earlier builds" ||
+    echo "none (XESTRATA_PKG_CLEAN=1)")"
+  echo "time:$laps"
   echo "llama.cpp: $commit"
   echo "jobs: ${XESTRATA_JOBS:-default}"
   [ -z "${CCACHE_DIR:-}" ] || ccache --print-stats | awk -F'\t' '/^(direct|preprocessed)_cache_hit\t/ { h += $2 }

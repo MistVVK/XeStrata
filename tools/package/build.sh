@@ -22,10 +22,12 @@
 # (the MSVC CRT and Windows SDK xwin fetches, NuGet's packages) are kept in build/pkg-cache/windows/; it shares the
 # Ubuntu packages' compiler cache.
 #
-# The one thing kept between builds is the compiler cache, build/pkg-ccache/<distro>/ (ccache, one per distribution
-# as their compilers differ; at most XESTRATA_CCACHE_MAX, default 30G): a package built after another of the same
-# distribution takes most of intel/llvm's and the engine's objects from it.  Deleting the folder makes the next
-# build compile everything again.
+# Kept between builds: the compiler cache, build/pkg-ccache/<distro>/ (ccache, one per distribution as their
+# compilers differ; at most XESTRATA_CCACHE_MAX, default 30G), from which a package built after another of the same
+# distribution takes most of intel/llvm's and the engine's objects; and in build/pkg-cache/<distro>/, the packages apt
+# and dnf fetched and intel/llvm's finished toolchains, one per variant and what decides it (tools/package/reuse.sh).
+# XESTRATA_PKG_CLEAN=1 leaves out the second (a release's builds: .claude/skills/release/scripts/build-packages.sh):
+# the build tools are fetched and intel/llvm is built again.  Deleting a folder makes the next build start without it.
 set -eu
 
 usage() {
@@ -78,6 +80,7 @@ git archive --format=tar "$rev" | podman run --rm -i --pull=missing \
   -e CCACHE_MAXSIZE="${XESTRATA_CCACHE_MAX:-30G}" \
   -e XESTRATA_DISTRO="$distro" -e XESTRATA_VARIANT="$variant" -e XESTRATA_COMMIT="$rev" \
   -e XESTRATA_IMAGE="$image" -e XESTRATA_JOBS="${XESTRATA_JOBS:-}" \
+  -e XESTRATA_PKG_CLEAN="${XESTRATA_PKG_CLEAN:-}" \
   "$image" sh -c "mkdir -p /src && tar -x -C /src && exec sh /src/tools/package/$script"
 echo "built in $out:"
 ls -l "$out"

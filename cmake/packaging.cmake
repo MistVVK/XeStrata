@@ -217,6 +217,9 @@ set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/MistVVK/XeStrata")
 set(CPACK_PACKAGING_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 set(CPACK_STRIP_FILES ON)
 
+# compressed on every thread: the engine's files are a few GB (the deb's zstd; the rpm's payload above, at level 19)
+set(CPACK_THREADS 0)
+set(CPACK_DEBIAN_COMPRESSION_TYPE zstd)
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_NAME ${STRATA_PACKAGE_NAME})
 set(CPACK_DEBIAN_PACKAGE_RELEASE ${XESTRATA_REVISION})
@@ -254,7 +257,8 @@ list(JOIN _pkg_not_required "|" _pkg_not_required)
 set(CPACK_RPM_SPEC_MORE_DEFINE
 "%global __provides_exclude_from ^${_pkg_engine_abs}/.*$
 %global __requires_exclude ^(${_pkg_not_required})
-%define _build_id_links none")
+%define _build_id_links none
+%define _binary_payload w19T0.zstdio")
 if(STRATA_PACKAGE_RECOMMENDS)
   set(CPACK_RPM_PACKAGE_RECOMMENDS "${STRATA_PACKAGE_RECOMMENDS}")
 endif()

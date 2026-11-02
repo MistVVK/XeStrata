@@ -351,7 +351,7 @@ def main() -> None:
 
     archive = a.out / f"{top_name}.7z"
     archive.unlink(missing_ok=True)
-    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
+    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-mmt=on", "-bd", str(archive), top_name], cwd=a.out, check=True,
                    stdout=subprocess.DEVNULL)
     say(f"{archive} ({archive.stat().st_size / 2**20:.0f} MiB)")
 

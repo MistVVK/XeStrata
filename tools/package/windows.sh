@@ -26,6 +26,9 @@ jxl_sha256=3025d7e308390796d20492322e606bc92decaee7b6bc99d3f7547870ae5db7de
 # never in the 7z), of the version whose DLLs the engine then loads (mkl_sycl_blas.6.dll): setup.py's ONEMKL_SERIES
 mkl_ver=$(sed -n 's/^ONEMKL_SERIES = "\(.*\)"$/\1/p' "$src/setup.py").0
 
+# shellcheck disable=SC1091   # /src/tools/package/reuse.sh, in the container
+. "$src/tools/package/reuse.sh"
+pkg_cache ubuntu
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 # llvm-21 and lld-21: llvm-lib, llvm-rc, llvm-mt, llvm-ml and lld-link, which intel/llvm does not install; clang-21
@@ -70,6 +73,7 @@ dpkg -L nvidia-cuda-dev libcu++-dev | sed -n 's|^/usr/include/||p' |
 # Windows' import libraries and the headers for rocBLAS and hipBLASLt (oneMath's rocBLAS backend, which loads them
 # where the user installed them)
 sh "$src/tools/package/win_rocm.sh" /build/rocmwin
+lap tools
 
 # build.sh's compiler cache, shared with the Ubuntu packages (container.sh)
 if [ -n "${CCACHE_DIR:-}" ]; then
@@ -85,8 +89,15 @@ unzip -q /tmp/llama.zip -d /tmp/llama
 mv "/tmp/llama/llama.cpp-$commit" "$src/third_party/main/llama.cpp"
 llama=$src/third_party/main/llama.cpp
 
-# intel/llvm: the contrib toolchain for this machine, then the SYCL runtime for Windows with its tools
+lap llama.cpp
+
+# intel/llvm: the contrib toolchain for this machine, then the SYCL runtime for Windows with its tools (or the ones an
+# earlier build on this PC kept: reuse.sh)
+key=$(llvm_key contrib "$cuda_ver" windows)
+llvm_restore windows-contrib "$src/.tools/intel-llvm-contrib" "$key"
+host_reused=$llvm_reused
 python3 "$src/tools/intel_llvm_build.py" --contrib --yes ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
+llvm_keep windows-contrib "$src/.tools/intel-llvm-contrib" "$key"
 
 # the MSVC CRT and the Windows SDK (not free software: Microsoft's license, accepted here; never in the 7z)
 mkdir -p /cache/xwin /build
@@ -98,7 +109,11 @@ echo "$(cat "/build/$xwin_tar.sha256")  /build/$xwin_tar" | sha256sum -c
 tar -xzf "/build/$xwin_tar" -C /build
 "/build/xwin-$xwin_ver-x86_64-unknown-linux-musl/xwin" --accept-license --cache-dir /cache/xwin --arch x86_64 \
   splat --copy --output /build/xwin   # copied: /cache is another file system
+wkey=$(llvm_key contrib "$cuda_ver" windows "$xwin_ver")
+llvm_restore windows-sycl "$src/.tools/intel-llvm-win" "$wkey"
 python3 "$src/tools/intel_llvm_build.py" --windows --xwin /build/xwin ${XESTRATA_JOBS:+--jobs "$XESTRATA_JOBS"}
+llvm_keep windows-sycl "$src/.tools/intel-llvm-win" "$wkey"
+lap intel-llvm
 sycl=$src/.tools/intel-llvm-win/install
 
 # oneMKL for Windows, unpacked from its wheels' Library/ folders: the headers, the import libraries and the CMake
@@ -129,6 +144,7 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" \
   -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin
 cmake --build /build/engine --target strata strata-device strata-image onemath_backend_libs -j "$jobs"
+lap engine
 # the image encoder on the CPU (tools/vision, llama.cpp's mtmd), with the same toolchain (#24: the config pointed to
 # it and the package had none); the Vulkan one is Linux's only
 cmake -G Ninja -S "$src/tools/vision" -B /build/vision -DCMAKE_BUILD_TYPE=Release \
@@ -137,12 +153,14 @@ cmake -G Ninja -S "$src/tools/vision" -B /build/vision -DCMAKE_BUILD_TYPE=Releas
   -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DLLAMA_DIR="$llama" -DSTRATA_PORTABLE=ON
 cmake --build /build/vision --target strata-vision -j "$jobs"
 cp /build/vision/bin/strata-vision.exe /build/engine/strata-vision-cpu.exe
+lap encoders
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget
 for p in Gui Cli; do
   dotnet publish "$src/windows/launcher/$p/$p.fsproj" -c Release -r win-x64 --self-contained false -o /build/launcher
 done
+lap launchers
 
 # Python's embeddable distribution and the Windows wheels of requirements.txt (the build helpers are in
 # requirements-build.txt), colorama, which tqdm takes on Windows, and pip, with which the user adds the GPU makers'
@@ -170,13 +188,20 @@ python3 "$src/tools/package/windows_bundle.py" --src "$src" --engine /build/engi
   --wheels /build/wheels --llama "$llama" --jxl "/build/jxl-$jxl_ver/x64-windows-static" --rocm /build/rocmwin --version "$version" --cuda-archs "$archs" \
   --hip-archs "$hip_archs" --mkl-version "$mkl_ver" --out /build/out
 cp /build/out/*.7z /out/
+lap package
 
+# shellcheck disable=SC2154   # reuse, laps and llvm_reused: reuse.sh's
 {
   echo "commit: $XESTRATA_COMMIT"
   echo "image: $XESTRATA_IMAGE"
   echo "variant: windows $variant (contrib, CUDA $cuda_ver)"
   echo "intel/llvm: $(sed -n 's/.*"tag": "\(.*\)".*/\1/p' "$sycl/XESTRATA.json") (Windows, cross-built)"
   echo "xwin: $xwin_ver"
+  echo "intel/llvm toolchains: contrib $([ -n "$host_reused" ] && echo "reused $host_reused" || echo built)," \
+    "Windows SYCL $([ -n "$llvm_reused" ] && echo "reused $llvm_reused" || echo built)"
+  echo "reuse: $([ "$reuse" = 1 ] && echo "the packages and intel/llvm of earlier builds" ||
+    echo "none (XESTRATA_PKG_CLEAN=1)")"
+  echo "time:$laps"
   echo "oneMKL (linked against, not carried): $mkl_ver"
   echo "python: $python_ver"
   echo "libjxl: $jxl_ver"

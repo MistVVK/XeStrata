@@ -371,8 +371,12 @@ tools/package/build.sh fedora44 cuda13.4
   with the HIP target, and the CUDA target for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
-  The one thing kept between builds is the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G):
-  a second package of the same distribution takes most of intel/llvm's and the engine's objects from it. Deleting the folder makes the next build compile everything again.
+  Kept between builds: the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G),
+  from which a second package of the same distribution takes most of intel/llvm's and the engine's objects.
+  `build/pkg-cache/<distro>/` also keeps the packages apt and dnf fetched and the finished intel/llvm toolchains (used while the version, the patches, the base image and the CUDA and ROCm packages stay the same).
+  `XESTRATA_PKG_CLEAN=1` leaves those two out: the build tools are fetched and intel/llvm is built again (a release's builds do this).
+  Deleting a folder makes the next build start without it.
+  The packages are compressed on every thread (the deb with zstd, the rpm with zstd 19).
   `XESTRATA_JOBS=16 tools/package/build.sh …` sets how many files compile at once (default: the threads; intel/llvm links as many at once as the free RAM allows).
 - **No GPU needed**: the container gets no GPU and nothing of this PC's.
   CMake values that come from this PC's GPUs or CPU (`auto` for `STRATA_CUDA_ARCHS`, `STRATA_HIP_ARCHS`, `STRATA_ONEMKL`, `STRATA_CUDA_PATH` and

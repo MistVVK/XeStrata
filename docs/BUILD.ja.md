@@ -373,8 +373,12 @@ tools/package/build.sh fedora44 cuda13.4
   コンテナの中でビルドの道具とディストリビューションの ROCm を入れ、intel/llvm（`tools/intel_llvm_build.py`、HIP のターゲット付き、cuda の版では CUDA のターゲットも）、
   画像のエンコーダー（CPU と Vulkan）、エンジンをビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
-  ビルドの間に残すのはコンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）だけで、
-  同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。フォルダを消すと、次は全部コンパイルし直します。
+  ビルドの間には、コンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）を残し、
+  同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。
+  `build/pkg-cache/<distro>/` には、apt と dnf が取ったパッケージと、できあがった intel/llvm も残します（版・パッチ・ベースのイメージ・CUDA と ROCm の版が同じ間だけ使います）。
+  `XESTRATA_PKG_CLEAN=1` を付けると後の 2 つを使わず、ビルドの道具を取り直して intel/llvm も作り直します（リリースのビルドはこれです）。
+  フォルダを消すと、次はそれなしで始めます。
+  パッケージは全部のスレッドで圧縮します（deb は zstd、rpm は zstd 19）。
   `XESTRATA_JOBS=16 tools/package/build.sh …` のように、同時にコンパイルするファイルの数を決められます（既定はスレッドの数。intel/llvm のリンクは、空いている RAM に収まる数まで）。
 - **GPU なしでビルドできます**: コンテナには GPU も手元の PC のものも渡しません。
   手元の GPU や CPU から決まる CMake の値（`STRATA_CUDA_ARCHS`、`STRATA_HIP_ARCHS`、`STRATA_ONEMKL`、`STRATA_CUDA_PATH`、`STRATA_CUDA_PTX` の `auto`、
