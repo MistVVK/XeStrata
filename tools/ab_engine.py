@@ -45,7 +45,8 @@ def post(port: int, prompt: str, max_tokens: int) -> dict:
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps({"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens,
-                         "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}).encode(),
+                         "temperature": 0, "chat_template_kwargs": {"enable_thinking": False},
+                         "script_guard": "off"}).encode(),  # never the script guard in a measurement
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=1800) as r:
         return json.loads(r.read())

@@ -897,6 +897,7 @@ const CFG_HELP = {
   fit_max_tokens: () => tr("about.cfgFit", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
   anthropic_thinking: () => tr("about.cfgAnthropic", "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
   effort_position: () => tr("about.cfgEffort", "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+  script_guard: () => tr("about.cfgScript", "Keep other languages' characters out of the answers of requests that name none: ja, en (English and the like: no CJKV), ko, zh-cn or zh-tw; off: as the model writes"),
   aliases: () => tr("about.cfgAliases", "Other model names the server lists and answers to (comma-separated)"),
   idle_unload_s: () => tr("about.cfgIdle", "Unload the model after this many seconds without requests (0 or empty: never)"),
   lazy_load: () => tr("about.cfgLazy", "Start without loading the model; the first request loads it (text only)"),
@@ -1099,8 +1100,16 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true, math: true, chatList: true, chatEdit: true, whileBusy: "wait", segments: true, segmentLimit: ""};
+                  mcp: true, math: true, chatList: true, chatEdit: true, whileBusy: "wait", segments: true, segmentLimit: "",
+                  script: "", scriptContext: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
+// the script guard (serve/script_guard.py): "" follows the page's language until the user picks one - its own mode for
+// Japanese, Korean and Chinese (the page's Chinese is Simplified), off for Vietnamese, en for every other
+const scriptChoice = (s) => s.script || ({ja: "ja", ko: "ko", zh: "zh-cn", vi: "off"})[StrataI18n.lang] || "en";
+function scriptGuard(s) {
+  const lang = scriptChoice(s);
+  return lang === "off" || s.scriptContext !== false ? lang : {lang, allow_context: false};
+}
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
@@ -1727,6 +1736,7 @@ async function generateReply(opts = {}) {
   const body = {model: health.model, messages: [], stream: true};
   const effort = thinkingEffort(settings);
   if (effort) body.reasoning_effort = effort;
+  body.script_guard = scriptGuard(settings);
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1993,6 +2003,10 @@ function loadDrawer(s = settings) {
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
   $("s-math").setAttribute("aria-checked", String(!!s.math));
+  const script = scriptChoice(s);
+  for (const b of $("s-script").children) b.setAttribute("aria-checked", String(b.dataset.v === script));
+  $("s-scriptctx").setAttribute("aria-checked", String(s.scriptContext !== false));
+  $("script-ctx-row").hidden = script === "off";
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
@@ -2025,6 +2039,7 @@ function sharedDefaults(s) {
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
+  if (s.script) d.script_guard = scriptGuard(s);      // only a choice of the user's, as the values above
   return d;
 }
 async function saveShared(on, s) {
@@ -2088,8 +2103,12 @@ function outputs() {
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
 for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+for (const b of $("s-script").children) b.onclick = () => {
+  for (const x of $("s-script").children) x.setAttribute("aria-checked", String(x === b));
+  $("script-ctx-row").hidden = b.dataset.v === "off";        // the switch under it is kept as it was while hidden
+};
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
 // going on past the context is what keeps a long chat going: switching it off asks first
@@ -2109,7 +2128,9 @@ $("s-apply").onclick = async () => {
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
-              whileBusy: segValue("s-busy") || "wait", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim()};
+              whileBusy: segValue("s-busy") || "wait", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),
+              // the language's own choice stays "": it follows a later change of the page's language
+              script: segValue("s-script") === scriptChoice({}) ? "" : segValue("s-script"), scriptContext: checked("s-scriptctx")};
   store.set("sampling", settings);
   // the chat's memory, edited here: kept on the last message, so a rewind past it takes the edit back too (segments.js)
   const memory = $("s-memory").value;

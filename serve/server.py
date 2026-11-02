@@ -79,6 +79,7 @@ from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
 from serve import loop_guard  # noqa: E402
+from serve import script_guard  # noqa: E402
 from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
                               extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
 from serve import responses as responses_api  # noqa: E402
@@ -3107,7 +3108,8 @@ def layer_split_value(cfg: dict) -> str:
 def vram_elastic_on(cfg: dict) -> bool:
     """#533: the expert cache in segments it gives back and maps again (--vram-elastic): the config's "vram_elastic",
     else on when something borrows the VRAM between requests - image generation, or a GPU vision encoder.  The engine
-    keeps one allocation where it cannot (a runtime without virtual memory, a layer split, the resident low-RAM mode)."""
+    keeps one allocation where it cannot (a runtime without virtual memory, a layer split, the resident low-RAM
+    mode)."""
     v = cfg.get("vram_elastic")
     if isinstance(v, bool):
         return v
@@ -3644,6 +3646,11 @@ class Service:
         # the start (the JSON /metrics and its Prometheus form)
         self.loop_guard = True
         self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
+        # the script guard (serve/script_guard.py): the server's default ("script_guard" / STRATA_SCRIPT_GUARD; None:
+        # off) and what it did since the start
+        self.script_guard: dict | str | None = None
+        self.script_guard_counts = {"requests": 0, "rewinds": 0, "passed": 0}
+        self.script_guard_unsupported = False            # said once: this engine takes no logit_bias
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
         self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
@@ -4338,6 +4345,7 @@ class Service:
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(rows), "totals": totals, "hardware": tel["now"],
                 "loop_guard": dict(self.loop_guard_counts, on=bool(self.loop_guard)),
+                "script_guard": dict(self.script_guard_counts, default=script_guard_name(self.script_guard)),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
                 "engine_failure": self.engine_failure}
@@ -4846,6 +4854,24 @@ class Service:
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
+    def _script_guard(self, sampling, ids):
+        """This request's script guard (serve/script_guard.py), None when off: its own "script_guard" (the body's, the
+        header's or the shared settings') when it has one, else the server's."""
+        want = (sampling or {}).get("script_guard")
+        want = self.script_guard if want is None else want
+        if not isinstance(want, dict):
+            return None
+        info = getattr(self.engine, "info", {}) or {}
+        if info.get("logit_bias") != 1 or getattr(self.engine, "batch", 0):
+            if not self.script_guard_unsupported:
+                self.script_guard_unsupported = True
+                print("[strata] script guard: not applied - this engine takes no logit_bias (an older engine, or "
+                      "\"parallel\" batch slots)", flush=True)
+            return None
+        with self.status_lock:
+            self.script_guard_counts["requests"] += 1
+        return script_guard.Guard(script_guard.vocab(self.tok, want["lang"]), ids, want["allow_context"])
+
     def _guard_pieces(self):
         """A fresh token-text reader for the loop guard's markers (a character split across tokens whole)."""
         return Detokenizer(self.tok).push
@@ -4925,6 +4951,8 @@ class Service:
         guard = loop_guard.ToolSafeGuard(parser.state == "reasoning", pieces=self._guard_pieces,
                                          can_close=not harmony) if self._loop_guard_on(sampling) else None
         guard_stopped = False                           # the guard ended the answer (a loop that came back)
+        # the script guard (serve/script_guard.py): its bias applies from where the thinking ends
+        sg = self._script_guard(sampling, ids)
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -5060,6 +5088,11 @@ class Service:
                             # after a loop the rest of the reply routes the experts exactly: the engine's
                             # STRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
                             smp_call = {**(smp_call or {}), "strata_route_prior": False}
+                        if sg is not None:
+                            # (the thinking may have been closed by the server: a budget's wrap-up, the loop guard)
+                            sg.active = sg.active or parser.state not in ("reasoning", "rcall")
+                            sg.restart = False
+                            smp_call, n_call = sg.sampling(smp_call, n_call)
                         n_pass = n
                         gen = self.engine.generate(prompt, n_call, smp_call, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, n_call, smp_call, cancel)
@@ -5099,7 +5132,25 @@ class Service:
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
+                                was_pending = detok.pending()
                                 piece = detok.push(t)
+                                if sg is not None and sg.active:
+                                    if piece and sg.banned(piece):
+                                        start = sg.leak(was_pending, len(raw_ids) - 1, len(seg))
+                                        with self.status_lock:
+                                            self.script_guard_counts["passed" if start is None else "rewinds"] += 1
+                                        if start is not None:
+                                            # spelt in byte tokens, none of them sent yet: they are dropped and the
+                                            # engine writes this place again with the first of them banned
+                                            drop = len(raw_ids) - start
+                                            sg.ban_next, sg.restart = raw_ids[start], True
+                                            del raw_ids[start:], seg[-drop:]
+                                            n -= drop
+                                            detok = Detokenizer(self.tok)
+                                            break
+                                        print(f"[strata] script guard: let {piece!r} through at {n} tokens (after "
+                                              f"{sg.rewinds} rewinds, or part of it was sent)", flush=True)
+                                    sg.follow(was_pending, piece, detok.pending(), len(raw_ids) - 1)
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
@@ -5145,6 +5196,10 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                                if (sg is not None and not sg.active and parser.state not in ("reasoning", "rcall")
+                                        and not parser.buf and not detok.pending()):
+                                    sg.active = sg.restart = True   # the thinking is over: the answer with the bias
+                                    break
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -5204,6 +5259,12 @@ class Service:
                             raise EngineNonFinite(f"the model's output became non-finite (NaN) after {n} tokens "
                                                   "(upstream Strata #879); the engine has dropped its cached state - "
                                                   "send the request again")
+                        if (sg is not None and (sg.restart or sg.one_token) and act is None and finish == "length"
+                                and n < max_new and not cancel.is_set()
+                                and not (wrap or opens or repeated or looped or one_done)
+                                and recover_prompt is None and (stops is None or stops.hit is None)):
+                            prompt = prompt + seg       # the script guard's pass: the answer's, a rewind, one token
+                            continue
                         if stream is not None and act is not None and not cancel.is_set():
                             g = stream.guard
                             # a loop: its repeats the client did not get are gone (never in seg); the engine goes on
@@ -7346,6 +7407,10 @@ def make_handler(svc: Service):
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    # the script guard for a client that cannot add a field to the body; the body's own field wins
+                    sg_header = self.headers.get("X-XeStrata-Script-Guard")
+                    if sg_header and isinstance(req, dict) and req.get("script_guard") is None:
+                        req["script_guard"] = script_guard.parse(sg_header, "X-XeStrata-Script-Guard")
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -7618,7 +7683,9 @@ def make_handler(svc: Service):
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None},
                      "models_autoload": hasattr(svc.engine, "restart"),
-                     "is_sleeping": not svc.loaded()}
+                     "is_sleeping": not svc.loaded(),
+                     # XeStrata's: the script guard of a request that names none (serve/script_guard.py)
+                     "script_guard": script_guard_name(svc.shared.get("script_guard") or svc.script_guard)}
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -8891,7 +8958,14 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
 
 
 SHARED_KEYS = ("reasoning_effort", "reasoning_budget_tokens", "temperature", "top_p", "top_k", "seed", "max_tokens",
-               "experimental_speed_projection")
+               "experimental_speed_projection", "script_guard")
+
+
+def script_guard_name(value) -> str:
+    """A script guard setting as /props and /metrics show it: "off", "ja", or "ja" with ", allow_context: false"."""
+    if not isinstance(value, dict):
+        return "off"
+    return value["lang"] + ("" if value["allow_context"] else ", allow_context: false")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -8929,6 +9003,8 @@ def clean_shared_defaults(d) -> dict:
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise ValueError("experimental_speed_projection: true or false")
+        elif key == "script_guard":
+            value = script_guard.parse(value)
         else:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p") else value
@@ -9128,6 +9204,8 @@ def check_request_sampling(req) -> None:
             req["loop_guard"] = bool(guard)
         else:
             raise ValueError("loop_guard: true or false")
+    if (req or {}).get("script_guard") is not None:  # the script guard for this request (serve/script_guard.py)
+        req["script_guard"] = script_guard.parse(req["script_guard"])
 
 
 def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: list[str], lazy: bool):
@@ -9784,6 +9862,14 @@ def main() -> int:
     except (OSError, ValueError) as e:
         print(f"[strata] WARNING: {svc.settings_path} cannot be read ({e}); started without it", flush=True)
         user_settings = {}
+    try:                                                # the script guard: the model's config over the settings'
+        svc.script_guard = script_guard.setting(
+            {"script_guard": runconfig.effective(cfg, user_settings, "script_guard")}, os.environ)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}") from None
+    if isinstance(svc.script_guard, dict):
+        print(f"[strata] script guard: {script_guard_name(svc.script_guard)} for every request that names none "
+              "(a request's \"script_guard\": \"off\" turns it off for that request)", flush=True)
     searcher = None
     try:                                                # web search: the engine and its address (search.py)
         searcher = runconfig.check("search_engine", runconfig.effective(cfg, user_settings, "search_engine"),

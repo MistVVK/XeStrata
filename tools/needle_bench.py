@@ -55,8 +55,9 @@ def haystack(n_chars: int) -> str:
 
 
 def ask(url: str, key: str, prompt: str, timeout: float) -> tuple[str, int, float]:
+    # never the script guard in a measurement
     body = {"model": "strata", "max_tokens": 40, "temperature": 0,
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {"enable_thinking": False}, "script_guard": "off",
             "messages": [{"role": "user", "content": prompt}]}
     headers = {"Content-Type": "application/json"}
     if key:

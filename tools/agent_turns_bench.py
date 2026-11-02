@@ -134,8 +134,9 @@ def turns() -> list[tuple[str, list[dict]]]:
 
 
 def post(port: int, messages: list[dict], max_tokens: int, seed: int) -> dict:
+    # never the script guard in a measurement
     body = {"messages": messages, "tools": TOOLS, "max_tokens": max_tokens, "temperature": 1.0, "top_p": 0.95,
-            "top_k": 20, "seed": seed, "reasoning_effort": "high"}
+            "top_k": 20, "seed": seed, "reasoning_effort": "high", "script_guard": "off"}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=3600) as r:

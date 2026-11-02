@@ -141,7 +141,8 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
          timeout: float = 3600) -> dict:
     """One streamed chat request -> {first, total, text, usage, timings, err}.  `first` is the seconds to the first
     non-empty content or reasoning piece (keep-alive pings and empty deltas ignored)."""
-    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages}
+    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages,
+            "script_guard": "off"}  # never the script guard in a measurement
     if tools:
         body["tools"] = tools
     if not think:

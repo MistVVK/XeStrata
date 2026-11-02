@@ -557,8 +557,11 @@ def free_port() -> int:
 def usage_post(port: int, body: dict, timeout: float = 1200, temperature: float = TEMPERATURE) -> tuple:
     """One streamed chat completion: (the assistant message, time to the first token, the server's timings)."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", method="POST",
+                                 # never the script guard (serve/script_guard.py): the config setup wrote may ask
+                                 # for it, and it changes the answers; upstream's server ignores the field
                                  data=json.dumps({"model": "bench", "stream": True, "max_tokens": USAGE_MAX_TOKENS,
-                                                  **usage_sampling(temperature), **body}).encode(),
+                                                  "script_guard": "off", **usage_sampling(temperature),
+                                                  **body}).encode(),
                                  headers={"Content-Type": "application/json"})
     t0, first, text, timings = time.monotonic(), None, "", None
     calls: dict[int, dict] = {}

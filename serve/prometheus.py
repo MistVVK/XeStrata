@@ -164,6 +164,11 @@ def strata(m: dict, out: list, lab: str):
                        ("thinking_closed", "Loops in the thinking that closed it (loop_guard.thinking_closed)."),
                        ("stopped", "Answers the loop guard ended, a loop that came back (loop_guard.stopped).")):
         metric(f"loop_guard_{key}_total", "counter", help_, guard.get(key))
+    sguard = m.get("script_guard") or {}
+    for key, help_ in (("requests", "Requests the script guard applied to (script_guard.requests)."),
+                       ("rewinds", "Banned characters spelt in byte tokens and written again (script_guard.rewinds)."),
+                       ("passed", "Banned characters let through (script_guard.passed).")):
+        metric(f"script_guard_{key}_total", "counter", help_, sguard.get(key))
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))

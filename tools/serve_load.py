@@ -42,7 +42,8 @@ def prompt_for(i: int, words: int, nonce: str = "") -> str:
 
 
 def one(url, key, model, i, words, max_tokens, res, extra, think, nonce=""):
-    body = {"model": model, "stream": True, "max_tokens": max_tokens, "temperature": 0,
+    # never the script guard in a measurement
+    body = {"model": model, "stream": True, "max_tokens": max_tokens, "temperature": 0, "script_guard": "off",
             "messages": [{"role": "user", "content": prompt_for(i, words, nonce)}]}
     if not think:
         body["reasoning_effort"] = "none"

@@ -4822,6 +4822,44 @@ def folder_size(path: Path) -> int:
     return total
 
 
+def script_guard_setup(a) -> None:
+    """The script guard (serve/script_guard.py) for every model, by --script-guard or the question: the answers kept
+    free of other languages' characters (ja, en) or not (off), written to the settings (script_guard); a model's
+    config, the web page and a request's own "script_guard" go over it.  Asked as web search is: interactively, the
+    first time or with --setup.  The answer offered is the system's language's: its own mode for Japanese, Korean and
+    Chinese (zh-tw for Taiwan's and Hong Kong's), off for Vietnamese, en for any other."""
+    settings = load_settings()
+    want = a.script_guard
+    busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
+    if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
+            ("script_guard" not in settings or a.setup):
+        import locale                                   # the environment's on Linux, the system's on Windows
+        lang = (next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
+                or locale.getlocale()[0] or "").lower()
+        modes = ["ja", "en", "ko", "zh-cn", "zh-tw", "off"]
+        offered = settings.get("script_guard") if settings.get("script_guard") in modes else \
+            "ja" if lang.startswith(("ja", "japanese")) else "ko" if lang.startswith(("ko", "korean")) else \
+            "zh-tw" if lang.startswith(("zh_tw", "zh_hk", "zh-tw", "zh-hk", "chinese (traditional)")) else \
+            "zh-cn" if lang.startswith(("zh", "chinese")) else "off" if lang.startswith(("vi", "vietnamese")) else "en"
+        say()
+        say("  Other languages in the answers: the model sometimes mixes another language's characters into its")
+        say("  answer. XeStrata can keep them out (the thinking is left as it is):")
+        say("    ja: Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers")
+        say("    en: every CJK character (kanji, kana, Hangul) and Vietnamese letters out of answers in English and")
+        say("        the other languages that write none of them")
+        say("    ko: kana, the Han characters Korean does not use and Vietnamese letters out of Korean answers")
+        say("    zh-cn, zh-tw: kana, Hangul, Japanese-only forms, Vietnamese letters and the other script")
+        say("        (Traditional in zh-cn, Simplified in zh-tw) out of Chinese answers")
+        say("    off: as the model writes (to have it write another of these languages)")
+        say("  The web page's chat settings and a request's own \"script_guard\" go over this.")
+        want = ask("Keep other languages' characters out?", modes, offered, False)
+    if want is None:
+        return
+    save_settings({**load_settings(), "script_guard": want})
+    ok(f"other languages in the answers: {'kept out (' + want + ')' if want != 'off' else 'as the model writes'}"
+       " (every model; the server reads it when it starts)")
+
+
 def web_search_setup(a) -> None:
     """Web search (serve/search.py) for every model, by --web-search or the question: deepseek takes DeepSeek's search
     API with the user's API key (asked without echo, or the launcher's XESTRATA_DEEPSEEK_API_KEY; one already set is
@@ -6656,6 +6694,14 @@ def main() -> int:
                          "DeepSeek per search); no takes it out. A SearXNG-compatible server of your own is its "
                          "address as search_url in settings.json. Without it setup asks the first time, and with "
                          "--setup")
+    ap.add_argument("--script-guard", choices=["ja", "en", "ko", "zh-cn", "zh-tw", "off"],
+                    help="keep other languages' characters out of the answers of every model (serve/script_guard.py): "
+                         "ja keeps Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers, en every "
+                         "CJK character and Vietnamese letters out of English (and other non-CJKV) ones, ko kana and "
+                         "non-Korean Han characters out of Korean ones, zh-cn and zh-tw kana, Hangul, Japanese-only "
+                         "forms and the other Chinese script out of Chinese ones; off leaves them as the model "
+                         "writes. The web page and a request's own \"script_guard\" go over it. Without it setup asks "
+                         "the first time, and with --setup")
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
                     "mage-flow-base|magetrail|moss-image|moss-image-base[-uncensored]|hunyuan-image-3-distil|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
@@ -6913,6 +6959,7 @@ def main() -> int:
     if not (a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update)):
         move_checkout_configs()
         web_search_setup(a)
+        script_guard_setup(a)
     have = installed_configs()
     if a.update:                                       # #475: update.sh - never starts the model
         return update_install(have)

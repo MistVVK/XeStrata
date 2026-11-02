@@ -406,6 +406,17 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <div class="toggle-row"><span><span data-i18n="drawer.math">Render math</span><br><span class="muted small"
       data-i18n="drawer.mathNote">draw equations in answers as formulas (works offline)</span></span>
       <button class="st-toggle" id="s-math" role="switch" aria-checked="true" aria-label="Render math" data-i18n-label="drawer.math"></button></div>
+    <div class="st-field">
+      <label class="st-label" for="s-script"><span data-i18n="drawer.script">Keep other languages' characters out of answers</span></label>
+      <div class="seg seg--3" id="s-script" role="radiogroup" aria-label="Keep other languages' characters out of answers" data-i18n-label="drawer.script">
+        <button type="button" role="radio" data-v="off" data-i18n="drawer.scriptOff">Off</button><button type="button" role="radio" data-v="ja" data-i18n="drawer.scriptJa">Japanese</button><button type="button" role="radio" data-v="en" data-i18n="drawer.scriptEn">English etc. (non-CJKV)</button>
+        <button type="button" role="radio" data-v="ko" data-i18n="drawer.scriptKo">Korean</button><button type="button" role="radio" data-v="zh-cn" data-i18n="drawer.scriptZhCn">Chinese (Simplified)</button><button type="button" role="radio" data-v="zh-tw" data-i18n="drawer.scriptZhTw">Chinese (Traditional)</button>
+      </div>
+      <span class="muted small" data-i18n="drawer.scriptNote">The answer's language: the characters of the other CJKV languages are kept out (Japanese: Simplified Chinese, Hangul; English etc.: every CJK character; Korean: kana, Han characters Korean does not use; Chinese: kana, Hangul, Japanese-only forms and the other Chinese script), and Vietnamese letters. Turn it off to have the model write another of these languages. Does not affect the thinking.</span>
+    </div>
+    <div class="toggle-row" id="script-ctx-row"><span><span data-i18n="drawer.scriptContext">Allow the characters in the conversation</span><br><span class="muted small"
+      data-i18n="drawer.scriptContextNote">Text in another language pasted into the question can be quoted or translated in the answer</span></span>
+      <button class="st-toggle" id="s-scriptctx" role="switch" aria-checked="true" aria-label="Allow the characters in the conversation" data-i18n-label="drawer.scriptContext"></button></div>
     <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>

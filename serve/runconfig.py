@@ -33,11 +33,15 @@ EDITABLE = [
     ("sampling.top_k", ("sampling", "1..64"), "Default top_k for requests that send none (1-64)"),
     ("sampling.min_p", ("sampling", "0<=x<=1"), "Default min_p for requests that send none"),
     ("reasoning_budget_tokens", "int>=0", "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
-    ("fit_max_tokens", "bool", "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
+    ("fit_max_tokens", "bool",
+     "Shorten a max_tokens that does not fit the context (on by default); off: answer 400 like llama.cpp"),
     ("anthropic_thinking", ("enum", ["model", "on_request"]),
      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
     ("effort_position", ("enum", ["start", "end"]),
      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+    ("script_guard", ("enum", ["off", "ja", "en", "ko", "zh-cn", "zh-tw"]),
+     "Keep other languages' characters out of the answers of requests that name none: ja, en "
+     "(English and the like: no CJKV), ko, zh-cn or zh-tw; off: as the model writes"),
     ("aliases", "names", "Other model names the server lists and answers to (comma-separated)"),
     ("idle_unload_s", "num>=0", "Unload the model after this many seconds without requests (0 or empty: never)"),
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
@@ -56,7 +60,8 @@ EDITABLE = [
      "Web search with DeepSeek: its API key (write-only: never shown; the queries go to DeepSeek)"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
-GLOBAL = ("search_engine", "search_url", "deepseek_api_key")   # the keys settings.json may hold for every model
+# the keys settings.json may hold for every model
+GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "script_guard")
 GLOBAL_ONLY = ("deepseek_api_key",)                  # ... and the ones only it holds (a secret: one place)
 
 
