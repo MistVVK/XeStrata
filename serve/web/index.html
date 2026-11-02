@@ -99,8 +99,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <span class="composer-hint" id="composer-hint"></span>
             <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg><span data-i18n="composer.stop">Stop</span></button>
-            <button type="button" class="st-btn st-btn--icon" id="image-btn" title="Make an image from this message" aria-label="Make an image" data-i18n-title="composer.image" data-i18n-label="composer.imageLabel" hidden>
-              <svg class="st-icon"><use href="web/sprite.svg#i-image"/></svg></button>
+            <button type="button" class="st-btn image-toggle" id="image-btn" aria-pressed="false" title="Always make an image: while on, every answer makes or edits an image" data-i18n-title="composer.image" hidden>
+              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span class="image-toggle__label">Always image: off</span></button>
             <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send" data-i18n-label="composer.send">
               <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
           </div>

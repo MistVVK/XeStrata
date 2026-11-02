@@ -79,6 +79,7 @@ from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
 from serve import loop_guard  # noqa: E402
+from serve import debuglog  # noqa: E402
 from serve import script_guard  # noqa: E402
 from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
                               extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
@@ -3693,6 +3694,7 @@ class Service:
         # bounded I/O in memory; no headers or API keys
         self.api_requests: collections.deque[dict] = collections.deque(maxlen=100)
         self.request_trace = threading.local()
+        self.debug_log: debuglog.DebugLog | None = None   # the debug chat log (serve/debuglog.py), when on
         # the last finished requests, newest last (GET /metrics)
         self.history: collections.deque[dict] = collections.deque(maxlen=500)
         # since the server started (the Monitor's totals, issue #35)
@@ -4348,6 +4350,52 @@ class Service:
         self.request_trace.record = record
         return record
 
+    def debug_begin(self, path, req):
+        """This request's debug chat log record (serve/debuglog.py), or None when the log is off.  It goes with the
+        request on this thread (request_trace.debug): prepare() adds each prompt the engine reads to it, the tool
+        loop each round, the handler the answer."""
+        if self.debug_log is None:
+            return None
+        rec = {"id": uuid.uuid4().hex[:12], "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "path": path,
+               "request": req, "prompts": [], "tools": [], "reasoning": "", "output": "", "tool_calls": {}}
+        self.request_trace.debug = rec
+        return rec
+
+    def debug_end(self, rec) -> None:
+        """The record written once (the reply's thread, or the handler when no answer started)."""
+        if rec is not None and self.debug_log is not None and not rec.get("_written"):
+            rec["_written"] = True
+            rec["tool_calls"] = list(rec["tool_calls"].values())
+            self.debug_log.request({k: v for k, v in rec.items() if not k.startswith("_")})
+
+    def debug_prompt(self, ids, keys) -> None:
+        """The prompt the engine reads, for the debug chat log: each picture's image tokens as one marker."""
+        rec = getattr(self.request_trace, "debug", None)
+        if rec is None:
+            return
+        try:
+            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            parts: list[str] = []
+            run: list[int] = []
+            k = 0
+            i = 0
+            while i < len(ids):
+                if ids[i] == pad:
+                    j = i
+                    while j < len(ids) and ids[j] == pad:
+                        j += 1
+                    parts.append(self.tok.decode(run))
+                    key = keys[k] if keys and k < len(keys) else "?"
+                    parts.append(f"<|image_pad|>x{j - i} [picture {key}]")
+                    run, k, i = [], k + 1, j
+                else:
+                    run.append(ids[i])
+                    i += 1
+            parts.append(self.tok.decode(run))
+            rec["prompts"].append({"tokens": len(ids), "text": "".join(parts)})
+        except Exception as e:  # noqa: BLE001 - the log must not fail a request
+            rec["prompts"].append({"tokens": len(ids), "error": f"{type(e).__name__}: {e}"})
+
     def request_records(self, request_id=None):
         with self.status_lock:
             records = list(self.api_requests)
@@ -4797,6 +4845,7 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
+        self.debug_prompt(ids, getattr(self.embeddings, "keys", None))
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -5830,6 +5879,20 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             r = box["r"]
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+            dbg = getattr(svc.request_trace, "debug", None)
+            if dbg is not None:
+                made = []                                # the images the tool made, saved beside the log
+                log = cast(debuglog.DebugLog, svc.debug_log)
+                for u in r.get("images") or []:
+                    f = svc.images.file(u.rsplit("/", 1)[-1]) if isinstance(u, str) and svc.images is not None else None
+                    try:
+                        made.append(log.picture(f.read_bytes(), f.suffix[1:]) if f is not None else u)
+                    except OSError:
+                        made.append(u)
+                dbg["tools"].append({"round": rounds, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
+                                     "ms": r["ms"], "result": r.get("model_content", r["text"]),
+                                     **({"images": made} if made else {}),
+                                     **({"image": r["image"]} if r.get("image") else {})})
             # an MCP tool's pictures (mcp.image_results, upstream 7c9b6f3a2) reach the model only with a picture reader
             results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
             yield "mcp", {"event": "result", "id": c.id,
@@ -6847,6 +6910,7 @@ def make_handler(svc: Service):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 
         record = None                                       # #332: this request's monitor record, if kept
+        debug = None                                        # this request's debug chat log record, if kept
         watch_done = None                                   # #430 #431: stops this request's disconnect watcher
         body_read = False                                   # whether a handler took this request's body
         DRAIN_SECONDS = 5                                   # the longest an unread body is read and dropped
@@ -7283,6 +7347,7 @@ def make_handler(svc: Service):
                                  "thinking": getattr(svc.template, "thinking", None),
                                  # a streamed chat reply can be kept past its connection (strata_reply)
                                  "kept_replies": True,
+                                 "debug_chat_log": svc.debug_log is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -7417,6 +7482,19 @@ def make_handler(svc: Service):
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
                 return
+            if path == "/v1/strata/debug/chat":              # the web page's chat, for the debug chat log
+                if svc.debug_log is None:
+                    self._json(404, {"error": {"message": "the debug chat log is off"}})
+                    return
+                try:
+                    chat = json.loads(self._body() or b"{}")
+                except ValueError:
+                    chat = None
+                if not isinstance(chat, dict) or not svc.debug_log.chat(str(chat.get("id") or ""), chat):
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": "send a chat with its id"}})
+                    return
+                self._json(200, {"saved": True})
+                return
             if path.startswith("/v1/strata/replies/") and path.endswith("/cancel"):   # the web app's Stop
                 if not self._control_body():
                     return
@@ -7504,6 +7582,7 @@ def make_handler(svc: Service):
                     if sg_header and isinstance(req, dict) and req.get("script_guard") is None:
                         req["script_guard"] = script_guard.parse(sg_header, "X-XeStrata-Script-Guard")
                     self.record = svc.begin_request(path, req)
+                    self.debug = svc.debug_begin(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
@@ -7591,6 +7670,9 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+                if self.debug is not None and not self.debug.get("_streaming"):
+                    svc.debug_end(self.debug)            # no answer started: what there was
+                svc.request_trace.debug = None
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
@@ -8021,8 +8103,10 @@ def make_handler(svc: Service):
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
             are when the monitor is off)."""
-            if self.record is None:
+            if self.record is None and self.debug is None:
                 return items
+            if self.debug is not None:
+                self.debug["_streaming"] = True          # the reply's end writes it (_captured)
             return self._captured(items, api)
 
         def _captured(self, items, api):
@@ -8043,19 +8127,45 @@ def make_handler(svc: Service):
                             delta = event.get("delta", {})
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
                             usage, timings = event.get("usage"), None
-                        with svc.status_lock:
-                            for name, value in (("output", content), ("reasoning", reasoning)):
-                                if value:
-                                    combined = self.record[name] + value
-                                    self.record[name] = combined[:262144]
-                                    self.record[name + "_truncated"] |= len(combined) > 262144
-                            if usage:
-                                self.record["usage"] = usage
-                            if timings:
-                                self.record["timings"] = timings
+                        if self.record is not None:
+                            with svc.status_lock:
+                                for name, value in (("output", content), ("reasoning", reasoning)):
+                                    if value:
+                                        combined = self.record[name] + value
+                                        self.record[name] = combined[:262144]
+                                        self.record[name + "_truncated"] |= len(combined) > 262144
+                                if usage:
+                                    self.record["usage"] = usage
+                                if timings:
+                                    self.record["timings"] = timings
+                        if self.debug is not None:
+                            self._debug_item(item, api, content, reasoning, usage, timings)
                     yield item
+            except Exception as e:
+                if self.debug is not None:
+                    self.debug["error"] = f"{type(e).__name__}: {e}"
+                raise
             finally:
                 items.close()
+                svc.debug_end(self.debug)
+
+        def _debug_item(self, item, api, content, reasoning, usage, timings):
+            d = self.debug
+            d["output"] += content or ""
+            d["reasoning"] += reasoning or ""
+            if usage:
+                d["usage"] = usage
+            if timings:
+                d["timings"] = timings
+            if api == "openai":
+                choice = item["choices"][0]
+                for tc in choice.get("delta", {}).get("tool_calls") or []:
+                    one = d["tool_calls"].setdefault(tc.get("index", 0), {"name": "", "arguments": ""})
+                    fn = tc.get("function") or {}
+                    one["name"] += fn.get("name") or ""
+                    one["arguments"] += fn.get("arguments") or ""
+                if choice.get("finish_reason"):
+                    d["finish_reason"] = choice["finish_reason"]
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
@@ -8205,9 +8315,11 @@ def make_handler(svc: Service):
                 # one, and the handler's drop_embeddings() at its end leaves them to it
                 emb = (getattr(svc.embeddings, "path", None), getattr(svc.embeddings, "keys", None))
                 svc.embeddings.path = svc.embeddings.keys = None
+                dbg = getattr(svc.request_trace, "debug", None)   # ... and its debug chat log record
 
                 def make():                              # its events, one a line: what a read `from` counts
                     svc.embeddings.path, svc.embeddings.keys = emb
+                    svc.request_trace.debug = dbg
                     try:
                         for line in lines:
                             for event in line.split(b"\n\n"):
@@ -9640,6 +9752,10 @@ def main() -> int:
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
+    ap.add_argument("--debug-chat-log", action="store_true",
+                    help="write every chat request's prompt, tool rounds, answer and pictures, and the web page's "
+                         "chats, to the state folder's debug-chat-log/ (also \"debug_chat_log\": true in the config "
+                         "or the settings; off by default)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -9986,6 +10102,17 @@ def main() -> int:
     if isinstance(svc.script_guard, dict):
         print(f"[strata] script guard: {script_guard_name(svc.script_guard)} for every request that names none "
               "(a request's \"script_guard\": \"off\" turns it off for that request)", flush=True)
+    try:                                                # the debug chat log (debuglog.py): model over settings
+        on = a.debug_chat_log or runconfig.check(
+            "debug_chat_log", runconfig.effective(cfg, user_settings, "debug_chat_log"), cfg)
+        mib = runconfig.check("debug_chat_log_mib", runconfig.effective(cfg, user_settings, "debug_chat_log_mib"), cfg)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}") from None
+    if on:
+        svc.debug_log = debuglog.DebugLog(places.user_dir("state") / "debug-chat-log", mib or 1024)
+        print(f"[strata] debug chat log on: every chat request's prompt, tool rounds, answer and pictures, and the web "
+              f"page's chats, are written to {svc.debug_log.folder} (at most {mib or 1024:g} MiB)" +
+              ("" if svc.api_key else "; set an API key if others can reach this server"), flush=True)
     searcher = None
     try:                                                # web search: the engine and its address (search.py)
         searcher = runconfig.check("search_engine", runconfig.effective(cfg, user_settings, "search_engine"),

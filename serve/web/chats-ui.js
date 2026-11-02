@@ -6,13 +6,15 @@
 // the pure part is serve/web/history.js, the browser store is serve/web/chatstore.js.
 //
 // Both are opt-in (Chat settings > Chats) and off by default: off, the page keeps the one chat it always had, with "New chat"
-// clearing it (and an Undo). Nothing here goes to the server.
+// clearing it (and an Undo). Nothing here goes to the server, unless the server keeps a debug chat log (/health's
+// debug_chat_log): then each chat as saved here goes there too (sendDebugChat).
 //
 // This file is loaded before app.js and uses its globals when its functions run: $, esc, icon, node, toast, store, settings,
-// messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending.
+// messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending,
+// health, headers.
 // app.js calls initChats() once, from start().
 /* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy, pending, setBusy, renderChat,
-          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments */
+          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments, health, headers */
 /* exported initChats, setChatList, syncActions, renderParent */
 "use strict";
 
@@ -46,10 +48,25 @@ function setMessages(next) {
   if (chat) chat.messages = next;
 }
 function saveChat() {
-  if (!listOn) { store.set("chat", H.cleanMessages(messages)); return; }   // off: one chat, as before
+  if (!listOn) {                                                         // off: one chat, as before
+    store.set("chat", H.cleanMessages(messages));
+    sendDebugChat({id: "single", messages: H.cleanChat({messages}).messages});
+    return;
+  }
   chat.time = Date.now();
   chatStore.put(H.cleanChat(chat));
+  sendDebugChat(H.cleanChat(chat));
   renderSidebar();
+}
+// the server's debug chat log: a chat as this page keeps it, a second after its last change (one send per chat)
+const debugTimers = new Map();
+function sendDebugChat(c) {
+  if (!health.debug_chat_log || !c || !c.id) return;
+  clearTimeout(debugTimers.get(c.id));
+  debugTimers.set(c.id, setTimeout(() => {
+    debugTimers.delete(c.id);
+    fetch("v1/strata/debug/chat", {method: "POST", headers: headers(true), body: JSON.stringify(c)}).catch(() => {});
+  }, 1000));
 }
 function stillWriting() { toast("warn", tr("busy.stillWriting", "Still writing"), tr("busy.stopFirst", "Stop the answer first.")); }
 

@@ -1127,6 +1127,7 @@ if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg, cut, cutAfterTool}
+let imageAlways = store.get("chat_image_always", false) === true;   // the image switch (paintImageSwitch)
 let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
@@ -1214,8 +1215,25 @@ function imageToolHtml(t, k) {
   const urls = (t.images || []).filter((u) => typeof u === "string");
   const a = t.arguments, layout = t.tool === "generate_image" && a && (typeof a === "string" ? a.includes('"layout"') : a.layout);
   const open = layout && t.state === "done" ? `<button type="button" class="st-btn" data-tool-layout="${k}">${esc(tr("img.layoutToImages", "Open the layout in Images"))}</button>` : "";
+  const src = (u) => (t.copies && t.copies[u]) || u.replace(/^\//, "");   // the chat's own copy (keepToolCopies) first
   return urls.length || open ? `<div class="msg-images tool-images">${urls.map((u) =>
-    `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
+    `<a href="${esc(src(u))}" target="_blank" rel="noopener"><img src="${esc(src(u))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
+}
+// The images an answer's tools made, copied into the chat once it is written: the server keeps only its newest files
+// (images' keep_files, the MCP media folder), and a saved chat should still show them. Data URLs, as the pictures sent.
+async function keepToolCopies(m) {
+  const want = (m.tools || []).flatMap((t) => (t.images || []).map((im) => [t, typeof im === "string" ? im : im.url]))
+    .filter(([t, u]) => typeof u === "string" && !(t.copies && t.copies[u]) && (u.startsWith("/v1/images/files/") || safeToolMedia(u)));
+  for (const [t, u] of want) {
+    try {
+      const r = await fetch(u.replace(/^\//, ""), {headers: headers()});
+      if (!r.ok) continue;
+      const blob = await r.blob();
+      const url = await new Promise((ok, no) => { const fr = new FileReader(); fr.onload = () => ok(fr.result); fr.onerror = no; fr.readAsDataURL(blob); });
+      t.copies = {...t.copies, [u]: url};
+    } catch (e) { /* the server's file stays the only one */ }
+  }
+  return want.length > 0;
 }
 // Raster tool results are same-origin cached files; credentials stay in request headers.
 const mediaBlobs = new Map();
@@ -1230,13 +1248,14 @@ window.addEventListener("pageshow", (event) => { if (event.persisted) hydrateToo
 function safeToolMedia(url) { return typeof url === "string" && /^tool-media\/[0-9a-f]{64}\.(png|jpg|webp)$/.test(url); }
 function toolImages(t) {
   return (t.images || []).filter((im) => safeToolMedia(im.url)).map((im) =>
-    `<figure class="tool-image"><img data-tool-image="${esc(im.url)}" alt="Tool image" loading="lazy">` +
+    `<figure class="tool-image"><img data-tool-image="${esc(im.url)}"${t.copies && t.copies[im.url] ? ` data-copy="${esc(t.copies[im.url])}"` : ""} alt="Tool image" loading="lazy">` +
     `<figcaption><a class="st-btn" data-tool-download="${esc(im.url)}" download="${esc(im.name || "generated-image.png")}">Download image</a></figcaption></figure>`).join("");
 }
 function hydrateToolImages(root) {
   root.querySelectorAll("[data-tool-image]").forEach((img) => {
     const url = img.dataset.toolImage, epoch = mediaEpoch;
     if (!safeToolMedia(url)) return;
+    if (img.dataset.copy) { img.src = img.dataset.copy; img.closest("figure").querySelector("[data-tool-download]").href = img.dataset.copy; return; }
     if (!mediaBlobs.has(url)) mediaBlobs.set(url, fetch(url, {headers: headers()}).then((r) => {
       if (!r.ok) throw new Error("Image unavailable");
       return r.blob();
@@ -1575,11 +1594,13 @@ const loadingHint = () => modelLoading === "after_image"
   : tr("composer.loading", "The model is loading (a minute or two); the answer goes on then");
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = $("image-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  paintImageSwitch();
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
                                          : on && modelLoading ? loadingHint()
-                                         : on ? busyHint() : tr("composer.sendHint", "Ctrl+Enter: send");
+                                         : on ? busyHint() : imageAlways ? tr("composer.imageOnHint", "Ctrl+Enter: send (makes an image)")
+                                         : tr("composer.sendHint", "Ctrl+Enter: send");
   if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
   $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
   renderUndoBar();
@@ -1658,11 +1679,11 @@ function settlePending(cut, finished) {
 }
 
 // the message box (or a parked message, `payload`) becomes a user turn and a reply is asked for
-// image: the reply must make an image (the image button): strata_images' force
-async function send(payload, image = false) {
+// while the image switch is on, the reply must make or edit an image (strata_images' force)
+async function send(payload) {
   const own = !payload;
   const p = payload || {text: $("input").value.trim(), images: attachments.filter((a) => a.kind !== "file"),
-                        files: attachments.filter((a) => a.kind === "file"), image};
+                        files: attachments.filter((a) => a.kind === "file"), image: imageAlways};
   if (!p.text && !p.images.length && !p.files.length) return;
   if (panel) return;                                  // something is open above (an edit): finish it first
   if (busy) { park(p, own); return; }
@@ -1866,12 +1887,23 @@ async function generateReply(opts = {}) {
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
+  keepToolCopies(m).then((got) => { if (got && messages.includes(m)) saveChat(); });
   scrollDown();
   settlePending(cut, !m.stopped && !m.error);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
-$("image-btn").onclick = () => send(null, true);
+// the image switch: not a send button - while on, every answer sent makes or edits an image; kept here
+function paintImageSwitch() {
+  $("image-btn").setAttribute("aria-pressed", String(imageAlways));
+  $("image-btn").querySelector(".image-toggle__label").textContent = imageAlways ? tr("composer.imageLabelOn", "Always image: on")
+                                                                                 : tr("composer.imageLabelOff", "Always image: off");
+  $("composer").classList.toggle("image-always", imageAlways);
+  if (!busy && !$("input").disabled) $("composer-hint").textContent = imageAlways ? tr("composer.imageOnHint", "Ctrl+Enter: send (makes an image)")
+                                                                    : tr("composer.sendHint", "Ctrl+Enter: send");
+}
+$("image-btn").onclick = () => { imageAlways = !imageAlways; store.set("chat_image_always", imageAlways); paintImageSwitch(); };
+paintImageSwitch();
 $("stop-btn").onclick = () => { if (busy) stopReply(); };
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send(); }   // Enter alone: a new line

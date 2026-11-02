@@ -1025,12 +1025,12 @@ print(r.choices[0].message.content)
   選ぶと server が RPC に入れ替えを頼み、ページは `/health` が新しいモデルの名前を返すまで待って読み直します。
   入れ替えを頼めるのは、`/settings` と同じく XeStrata 自身のページの JSON だけです。
 - **ウェブのページのモデルの設定（upstream #564）**: About のタブの Model settings のカードで、`xestrata-<model>.json` のいくつかのキーを見て変えられます。
-  `sampling` の既定（temperature、top_p、top_k、min_p）、`reasoning_budget_tokens`、`fit_max_tokens`、`anthropic_thinking`、`effort_position`、`aliases`、`idle_unload_s`、`lazy_load`、`engine_silence_s`、`api_monitor`、`open_browser`、`--vram-reserve-mib` です。
+  `sampling` の既定（temperature、top_p、top_k、min_p）、`reasoning_budget_tokens`、`fit_max_tokens`、`anthropic_thinking`、`effort_position`、`aliases`、`idle_unload_s`、`lazy_load`、`engine_silence_s`、`api_monitor`、`debug_chat_log`、`debug_chat_log_mib`、`open_browser`、`--vram-reserve-mib` です。
   空の欄はそのキーを消します（既定に戻ります）。
   ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **すべてのモデルの設定**: いくつかのキーは、モデルごとの `xestrata-<model>.json` のほかに、ユーザーの設定（`~/.config/xestrata/settings.json`、Windows では `%APPDATA%\xestrata\settings.json`）にも書けて、すべてのモデルに効きます。
-  Web 検索の `search_engine`・`search_url`・`deepseek_api_key`・`tinyfish_api_key` です（[Web 検索](#web-検索)）。API キーの 2 つは settings.json にだけ置きます。
+  Web 検索の `search_engine`・`search_url`・`deepseek_api_key`・`tinyfish_api_key`（[Web 検索](#web-検索)）と、デバッグ用のチャットログの `debug_chat_log`・`debug_chat_log_mib`（[デバッグ用のチャットログ](#デバッグ用のチャットログ)）です。API キーの 2 つは settings.json にだけ置きます。
   モデルの設定にそのキーがあればそちらが勝ち、空の値（`""`）はそのモデルだけそのキーを切ります。
   Model settings のカードには、そのキーに「Every model」の欄が加わり、いま効いている値とその出どころも出ます。モデルの欄に `off` と書くと、そのモデルだけ切ります。
   `POST /config` は `{"set": {...}, "scope": "global"}` で settings.json を、`scope` なし（または `"model"`）でモデルの設定を変えます。settings.json のほかのキー（setup のもの）はそのまま残します。
@@ -1424,6 +1424,20 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 
 ---
 
+### デバッグ用のチャットログ
+
+会話を後から調べるためのログです。プロンプト・答え・絵をディスクに書くので、既定はオフです。
+`xestrata-<model>.json` か `~/.config/xestrata/settings.json` に `"debug_chat_log": true` を書く（または `serve/server.py --debug-chat-log`）と有効になり、起動のログにそう出ます。
+書く先は状態のフォルダーの `debug-chat-log/`（Linux では `~/.local/state/xestrata/debug-chat-log/`）です。
+
+- `requests-<日付>.jsonl`: チャットの要求 1 つにつき 1 行。要求の本文、エンジンが読んだプロンプト（チャットテンプレートを通した後の文字列。絵の画像トークンは `<|image_pad|>x<数> [picture <鍵>]` の 1 つにまとめます）、server の中で回した道具の呼び出しとモデルに返した結果、答え（思考・本文・道具の呼び出し）、usage と timings、エラー。
+- `img/`: 要求が送った絵と、道具が作った絵（ハッシュの名前で 1 つずつ）。要求の本文の data URL は、このファイルを指す `{"picture": "img/..."}` に置き換えます。
+- `chats/<chat id>.json`: Web のページがブラウザーに保存する会話の記録そのもの（絵・ファイル・作った画像の写しを含む）。オンのとき、ページは会話を保存するたびに送ります。
+
+フォルダーが `"debug_chat_log_mib"`（既定 1024）を超えたら、古い日のログと古い会話から消し、どこからも指されなくなった絵も消します。
+書けなかったときは server のログに一度だけ言い、要求はそのまま続けます。
+server がネットワークから届くなら、API キーを設定してください。
+
 ### Chat Completions と Messages の項目
 
 エラーは API の形で返ります。OpenAI の経路は `{"error": {"message", "type", "param", "code"}}`（ない `param`・`code` は `null`）、Anthropic の経路は `{"type": "error", "error": {"type", "message"}}` です。
@@ -1815,7 +1829,7 @@ HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、
 `stream: true` を付けると、OpenAI と同じく SSE で返します。`partial_images`（0〜3、既定 0）を付けると、サンプリングの途中で予測した仕上がり（x0 = x − σ v）を VAE で画像に戻し、`image_generation.partial_image`（編集は `image_edit.partial_image`）で 1 枚あたり最大その枚数だけ送ります（最後のステップの後には作らないので、ステップが少ないと減ります）。最後に画像ごとに `image_generation.completed`（`b64_json`・`usage`、ほかに `seed` と `strata` の数字）を送ります。イベントの `size` は、モデルが選んだ大きさ（`size: auto`）も含めて、作った画像の大きさです。multipart の編集の数の項目（`n`、`seed`、`steps`、`num_inference_steps`、`output_compression`、`partial_images`、`guidance_scale`、`true_cfg_scale`）と `stream` は、JSON の要求と同じく数と真偽値として読みます。ノイズは最初に 1 回だけ引くので、途中の画像を作っても最後の画像は変わりません。途中の画像の分だけ VAE の時間が増えます。HunyuanImage 3.0 は途中の画像を作らず、最後の画像だけを送ります。`stream` のない要求は `partial_images` を無視します。Web のページは、「途中の画像を表示」（既定はオフ）で `partial_images: 2` を送ります。
 `POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（10 枚まで。PNG・JPEG・GIF・BMP はそのまま、WebP などほかの形式は PNG に変えて読みます）を元に画像を作ります。`mask`（OpenAI と同じく、1 枚目の画像と同じ大きさのアルファ付き PNG）を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します（各ステップでマスクの外の潜在を元の画像のものに戻し、最後に元の画素と合成します）。参照画像は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024×1024 画素で読みます（diffusers の Qwen-Image-2.1 と同じ。Mage-Flow では、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます）。参照画像が多いほど時間とメモリがかかります（B70 の 1024×1024 で 3 枚は約 46 秒、10 枚は約 4 分）。参照画像のトークンの K と V のキャッシュ（1024×1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。それでも VRAM か RAM が足りない画像は、作り始める前にエラー（400）で断ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
 マスクと `strength`（0 より大きく 1 以下）はどのモデルでも受けます（`src/image/img_start.hpp`）。strength は diffusers の img2img と同じく、n ステップの表の先頭 floor(n (1 − strength)) を飛ばし、残りの最初の sigma s で元の画像の潜在 z0 とシードのノイズを (1 − s) z0 + s noise に混ぜて始めます（strength 1 は今までの生成や編集と同じ）。飛ばす数はサーバーの Python とエンジンの C++ がどちらも double で数えるので一致します。元の画像は、編集のあるモデルでは 1 枚目の参照画像、編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）では要求の 1 枚の画像（img2img、strength の既定は ComfyUI の公式の img2img の例の denoise の 0.87（1 − 1/ステップ数 を超えない）、マスクだけなら ComfyUI の KSampler の既定の 1）で、VAE のエンコーダで事後分布の平均の潜在にします（MageTrail は Flux2 VAE のエンコーダ）。
-会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。画像のモデルがいくつもあるときは、道具に `model`（入っているモデルの名前と、それぞれの向いていることの説明）が付き、モデルがユーザーの言葉に合うものを選びます（なしは既定のモデル。`edit_image` は編集のできるモデルが先で、編集のないモデルでは img2img になり、`strength` も受けます）。`"strata_images": {"model": "<名前>"}` なら、道具はそのモデルだけを使います。`"force": true` を加えると（Web のページでは送信ボタンの左の画像のボタン）、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます（`tool_choice` とは一緒に使えません）。Web のページは、入力欄の下の「Images」でこれを選びます。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。道具の `model` が入っている画像のモデルの名前なら、そのモデルだけを使います（OpenAI の `gpt-image-1` などは既定のモデルか、言葉で選ぶもの）。`input_image_mask`（`image_url` に data: か http(s) の URL。`file_id` は受けません）は、その道具の編集のマスクです（`/v1/images/edits` の `mask` と同じ形）。`stream` の要求で道具の `partial_images`（1〜3）があると、途中の画像を `response.image_generation_call.partial_image`（`partial_image_b64`・`partial_image_index`）で送ります。`moderation`・`input_fidelity` は受けて無視します。
+会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。画像のモデルがいくつもあるときは、道具に `model`（入っているモデルの名前と、それぞれの向いていることの説明）が付き、モデルがユーザーの言葉に合うものを選びます（なしは既定のモデル。`edit_image` は編集のできるモデルが先で、編集のないモデルでは img2img になり、`strength` も受けます）。`"strata_images": {"model": "<名前>"}` なら、道具はそのモデルだけを使います。`"force": true` を加えると（Web のページでは送信ボタンの左の「画像」の切り替えがオンの間）、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます（`tool_choice` とは一緒に使えません）。Web のページは、入力欄の下の「Images」でこれを選びます。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。道具の `model` が入っている画像のモデルの名前なら、そのモデルだけを使います（OpenAI の `gpt-image-1` などは既定のモデルか、言葉で選ぶもの）。`input_image_mask`（`image_url` に data: か http(s) の URL。`file_id` は受けません）は、その道具の編集のマスクです（`/v1/images/edits` の `mask` と同じ形）。`stream` の要求で道具の `partial_images`（1〜3）があると、途中の画像を `response.image_generation_call.partial_image`（`partial_image_b64`・`partial_image_index`）で送ります。`moderation`・`input_fidelity` は受けて無視します。
 大きさは一辺 256〜2048 ピクセルです。辺が 16 の倍数でない大きさ（1920×1080 など）は、16 の倍数に切り上げた大きさ（1920×1088）で作って真ん中を切り出し、Web のページはそのことを知らせます。
 画像のエンジンは最初の画像で起動して、そのまま残ります。エンジンはサーバーとは別のプロセスで、文章のモデルを替えても残り、どのサーバーもつながらなくなって 30 分（設定の `daemon_idle_s`）たつと終わります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
 設定の `"images"` の `"gpu_pci"`（setup の `--image-gpu`）が、サーバーの文章のエンジン（サーバーの GPU、層の分担、レプリカ、分けた serve のカード）のどれも使わない GPU を名指すと、画像はその GPU で作ります。その仕事はその GPU の順番だけを取り、サービスの順番待ちの列を取らないので、その間もチャットに答え、文章のモデルには何もしません（方針 `separate`）。MOSS-Image の文の読み手をチャットのエンジンで動かす間だけ、列を取ります。補助の GPU（`--expert-cache-device1..3` は装置の番号で名指す）か GPU を絞る環境変数（`ONEAPI_DEVICE_SELECTOR`・`ZE_AFFINITY_MASK`・`HIP_VISIBLE_DEVICES`）があるときは、文章のモデルの GPU を使います。文章のモデルが 2 枚使い、その 2 枚目を名指すときは、エンジンに `--split-roles helper` を渡して 2 枚目を補助のキャッシュにするか使わないかにさせ、補助なら画像の仕事の前に `HELPER off` で閉じ、後で `HELPER on` で開き直します（[IMAGE](IMAGE.ja.md)）。

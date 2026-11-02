@@ -280,7 +280,7 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 
 - `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
   `edit_image` changes the conversation's last image (one attached or one made in the conversation); it takes a `strength` too, and is img2img with a model without edits. One request calls the tools up to 4 times.
-- `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with the image button left of the send button. It does not go together with a `tool_choice`.
+- `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with every message while the "Image" switch left of the send button is on (it is a switch, not a send button). It does not go together with a `tool_choice`.
 - With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).

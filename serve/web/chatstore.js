@@ -2,9 +2,10 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/chatstore.js - the saved chats, kept in this browser (IndexedDB, database "xestrata", store "chats", one record per
-// chat). Ported from PR #1787 by Scotty-Hudson. A chat can be several megabytes and localStorage holds about 5 MB for the whole
-// page, so the chats live here and only small keys (which chat is open, the settings) stay in localStorage. Nothing goes to the
-// server: the server has no endpoint for chats and never sees a title.
+// chat, whole: its pictures, files and the copies of the tools' images too). Ported from PR #1787 by Scotty-Hudson. A chat can
+// be many megabytes and localStorage holds about 5 MB for the whole page, so the chats live here and only small keys (which chat
+// is open, the settings) stay in localStorage. Nothing goes to the server from here (only a server's debug chat log takes
+// the chats: chats-ui.js sendDebugChat).
 //
 // Where the browser will not keep it (a private window, a blocked or full store) the list lives in memory for the visit, and
 // onProblem(kind) tells the page once: "memory" (no store), "quota" (full), "failed" (a write the browser refused).

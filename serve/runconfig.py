@@ -48,6 +48,11 @@ EDITABLE = [
     ("engine_silence_s", "num>=0",
      "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+    ("debug_chat_log", "bool",
+     "Debug chat log: write every chat request's prompt, tool rounds, answer and pictures, and the web page's chats, "
+     "to the state folder's debug-chat-log/ (off by default)"),
+    ("debug_chat_log_mib", "num>=0",
+     "Debug chat log: the most MiB its folder keeps; the oldest go first (default 1024)"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
@@ -65,7 +70,8 @@ EDITABLE = [
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 # the keys settings.json may hold for every model
-GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "tinyfish_api_key", "script_guard")
+GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "tinyfish_api_key", "script_guard", "debug_chat_log",
+          "debug_chat_log_mib")
 GLOBAL_ONLY = ("deepseek_api_key", "tinyfish_api_key")   # ... and the ones only it holds (secrets: one place)
 
 

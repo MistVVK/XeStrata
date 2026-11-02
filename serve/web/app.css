@@ -77,6 +77,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer textarea { max-height: 40vh; }
 .st-btn--send { width: 42px; padding: 0; }
 .composer-hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin-right: var(--st-s-2); font-variant-numeric: tabular-nums; }
+/* the image switch: says its state; on, a tinted pill (not the send button's fill) and the box outlined */
+.image-toggle { height: 36px; gap: 6px; padding: 0 12px; border-radius: var(--st-r-pill); background: var(--st-surface);
+  color: var(--st-ink); border: 1.5px solid var(--st-line); font-size: var(--st-fs-sm); white-space: nowrap; flex: none; }
+.image-toggle:hover { border-color: var(--st-ink-muted); }
+.image-toggle[aria-pressed="true"] { background: var(--st-accent-tint); color: var(--st-accent-text); border: 2px solid var(--st-accent);
+  font-weight: 700; }
+.image-toggle[aria-pressed="true"]:hover { border-color: var(--st-accent-hover); }
+.st-composer.image-always { border-color: var(--st-accent); box-shadow: 0 0 0 1px var(--st-accent), var(--st-sh-bar); }
 .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
 .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 6px 0 10px; border-radius: var(--st-r-pill);

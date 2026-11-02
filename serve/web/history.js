@@ -27,10 +27,12 @@
     return first.split("\n")[0].trim().slice(0, TITLE_MAX) || untitled;
   }
 
-  // pictures and files are kept as their names only: a data URL would fill the browser's storage
+  // localStorage (the list off) holds about 5 MB for the whole page: pictures and files are kept as their names only
   const cleanMessages = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                                     files: (m.files || []).map((f) => ({name: f.name}))}));
-  const cleanChat = (c) => ({...c, messages: cleanMessages(c.messages)});
+  // IndexedDB (the saved-chats list) keeps a chat whole: the pictures and files sent and the copies of the images the
+  // tools made (keepToolCopies), so a chat read again shows them and sends them to the model as before
+  const cleanChat = (c) => ({...c, messages: c.messages.slice()});
 
   // "today" | "yesterday" | "week" | "month" | "older", by calendar days back from now
   function groupKey(t, now = Date.now()) {
