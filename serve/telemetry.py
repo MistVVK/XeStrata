@@ -6,8 +6,10 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: the Intel GPU on the xe or i915 driver, from Linux (temperature and power from hwmon, the PCIe link, the load
   of this user's processes from their DRM fdinfo) and its VRAM from Level Zero's sysman through ctypes, so no pip
-  package is needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, installed with
-  the driver) through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
+  package is needed.  An NVIDIA GPU (the contrib build): NVIDIA's NVML library (libnvidia-ml.so.1, nvml.dll on
+  Windows, installed with the driver) through ctypes: load, VRAM, temperature, power, PCIe link and throughput.
+  Windows has no sysfs: any other GPU there is read as Task Manager reads it, load and VRAM in use from the
+  performance counters, name, address, VRAM and temperature from the kernel's graphics interface (_WinGpu).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   Linux /proc and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -19,11 +21,13 @@ import ctypes
 import glob
 import os
 import platform
+import re
 import sys
 import threading
 import time
 
 HISTORY = 60
+WIN = sys.platform == "win32"
 
 
 # ------------------------------------------------------------------------------------------------ the Intel GPU
@@ -425,7 +429,7 @@ class _NvGpu:
     def __init__(self, pci=None):
         self.lib = self.dev = None
         self.pci = pci
-        for n in ("libnvidia-ml.so.1", "libnvidia-ml.so"):
+        for n in ("nvml.dll",) if WIN else ("libnvidia-ml.so.1", "libnvidia-ml.so"):
             try:
                 self.lib = ctypes.CDLL(n)
                 break
@@ -488,7 +492,7 @@ class _NvGpu:
         lim = self._uint("nvmlDeviceGetEnforcedPowerLimit")
         out["power_limit"] = lim / 1000.0 if lim is not None else None
         own = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")       # drops at idle (power saving)
-        link = _path_link(os.path.join(SYSFS, "bus", "pci", "devices", self.pci)) if self.pci else {}
+        link = _path_link(os.path.join(SYSFS, "bus", "pci", "devices", self.pci)) if self.pci and not WIN else {}
         if link.get("pcie_gen"):   # the link the card gets, as for AMD: the same meaning in every maker's panel
             out.update(link)
             out["pcie_own_gen"] = own
@@ -500,13 +504,250 @@ class _NvGpu:
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
         out["pcie_tx_mb"] = tx / 1024.0 if tx is not None else None
+        if WIN and out.get("util") is None and self.pci:
+            # a laptop's NVIDIA GPU at rest: NVML answers the load once, then NVML_ERROR_UNKNOWN (RTX 3050 Laptop,
+            # driver 555.99); Windows' counters still have it
+            if getattr(self, "win", None) is None:
+                self.win = _WinGpu(self.pci)
+            if self.win.ok():
+                out["util"] = self.win.read()["util"]
         return out
+
+
+# ------------------------------------------------------------------------------------------------ a GPU on Windows
+class _Luid(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
+
+
+class _KmtAdapterInfo(ctypes.Structure):          # D3DKMT_ADAPTERINFO
+    _fields_ = [("hAdapter", ctypes.c_uint32), ("AdapterLuid", _Luid), ("NumOfSources", ctypes.c_uint32),
+                ("bPrecisePresentRegionsPreferred", ctypes.c_int32)]
+
+
+class _KmtEnumAdapters2(ctypes.Structure):        # D3DKMT_ENUMADAPTERS2
+    _fields_ = [("NumAdapters", ctypes.c_uint32), ("pAdapters", ctypes.POINTER(_KmtAdapterInfo))]
+
+
+class _KmtQuery(ctypes.Structure):                # D3DKMT_QUERYADAPTERINFO
+    _fields_ = [("hAdapter", ctypes.c_uint32), ("Type", ctypes.c_int32), ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", ctypes.c_uint32)]
+
+
+class _KmtAddress(ctypes.Structure):              # D3DKMT_ADAPTERADDRESS
+    _fields_ = [("BusNumber", ctypes.c_uint32), ("DeviceNumber", ctypes.c_uint32), ("FunctionNumber", ctypes.c_uint32)]
+
+
+class _KmtSegments(ctypes.Structure):             # D3DKMT_SEGMENTSIZEINFO
+    _fields_ = [("DedicatedVideoMemorySize", ctypes.c_uint64), ("DedicatedSystemMemorySize", ctypes.c_uint64),
+                ("SharedSystemMemorySize", ctypes.c_uint64)]
+
+
+class _KmtRegistry(ctypes.Structure):             # D3DKMT_ADAPTERREGISTRYINFO
+    _fields_ = [("AdapterString", ctypes.c_wchar * 260), ("BiosString", ctypes.c_wchar * 260),
+                ("DacType", ctypes.c_wchar * 260), ("ChipType", ctypes.c_wchar * 260)]
+
+
+class _KmtPerf(ctypes.Structure):                 # D3DKMT_ADAPTER_PERFDATA
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32), ("MemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequency", ctypes.c_uint64), ("MaxMemoryFrequencyOC", ctypes.c_uint64),
+                ("MemoryBandwidth", ctypes.c_uint64), ("PCIEBandwidth", ctypes.c_uint64), ("FanRPM", ctypes.c_uint32),
+                ("Power", ctypes.c_uint32), ("Temperature", ctypes.c_uint32), ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+# KMTQUERYADAPTERINFOTYPE (d3dkmthk.h)
+KMT_SEGMENT_SIZE, KMT_ADDRESS, KMT_REGISTRY, KMT_PERF = 3, 6, 8, 62
+
+
+def _kmt_query(gdi, handle, kind, out):
+    q = _KmtQuery(handle, kind, ctypes.cast(ctypes.byref(out), ctypes.c_void_p), ctypes.sizeof(out))
+    try:
+        return gdi.D3DKMTQueryAdapterInfo(ctypes.byref(q)) == 0
+    except (AttributeError, OSError):
+        return False
+
+
+def _kmt_adapters():
+    """The GPUs Windows' graphics kernel lists that have a PCI address (not its software renderer), each
+    {"handle", "luid" (high, low), "pci" ("0000:01:00.0", as the engine writes it), "name", "vram" (dedicated bytes)};
+    [] where gdi32 does not have the call."""
+    try:
+        gdi = ctypes.WinDLL("gdi32")
+        e = _KmtEnumAdapters2()
+        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0 or not e.NumAdapters:
+            return []
+        arr = (_KmtAdapterInfo * e.NumAdapters)()
+        e.pAdapters = arr
+        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0:
+            return []
+    except (AttributeError, OSError):
+        return []
+    found: list[dict] = []
+    for a in arr[:e.NumAdapters]:
+        addr, seg, reg = _KmtAddress(), _KmtSegments(), _KmtRegistry()
+        luid = (a.AdapterLuid.HighPart & 0xFFFFFFFF, a.AdapterLuid.LowPart)
+        if not _kmt_query(gdi, a.hAdapter, KMT_ADDRESS, addr) or addr.BusNumber == 0xFFFFFFFF or \
+                any(f["luid"] == luid for f in found):     # the software renderer answers with no bus
+            continue
+        _kmt_query(gdi, a.hAdapter, KMT_SEGMENT_SIZE, seg)
+        _kmt_query(gdi, a.hAdapter, KMT_REGISTRY, reg)
+        found.append({"handle": a.hAdapter, "luid": luid, "name": reg.AdapterString.strip() or None,
+                      "pci": f"0000:{addr.BusNumber:02x}:{addr.DeviceNumber:02x}.{addr.FunctionNumber:x}",
+                      "vram": seg.DedicatedVideoMemorySize, "gdi": gdi})
+    return found
+
+
+class _PdhValue(ctypes.Structure):                # PDH_FMT_COUNTERVALUE, read as a double
+    _fields_ = [("CStatus", ctypes.c_uint32), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhItem(ctypes.Structure):                 # PDH_FMT_COUNTERVALUE_ITEM_W
+    _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _PdhValue)]
+
+
+class _Pdh:
+    """Every GPU's load and dedicated memory in use from Windows' performance counters, the ones Task Manager shows:
+    the load of an adapter is that of its busiest engine (the sum over the processes of each engine's share), as
+    Task Manager's GPU column.  Collected at most twice a second for all the cards together."""
+    PATHS = ("\\GPU Engine(*)\\Utilization Percentage", "\\GPU Adapter Memory(*)\\Dedicated Usage")
+    ENGINE = re.compile(r"luid_0x([0-9a-f]+)_0x([0-9a-f]+)_phys_(\d+)_eng_(\d+)", re.I)
+    ADAPTER = re.compile(r"luid_0x([0-9a-f]+)_0x([0-9a-f]+)", re.I)
+    MORE_DATA = 0x800007D2
+    FORMAT = 0x00000200 | 0x00008000             # PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+
+    def __init__(self):
+        self.lib = None
+        self.lock = threading.Lock()
+        self.at = 0.0
+        self.util: dict = {}
+        self.used: dict = {}
+        try:
+            lib = ctypes.WinDLL("pdh")
+            lib.PdhGetFormattedCounterArrayW.restype = ctypes.c_uint32
+            q = ctypes.c_void_p()
+            if lib.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
+                return
+            self.counters = []
+            for path in self.PATHS:
+                c = ctypes.c_void_p()
+                if lib.PdhAddEnglishCounterW(q, path, None, ctypes.byref(c)) != 0:
+                    return
+                self.counters.append(c)
+            lib.PdhCollectQueryData(q)                # a rate needs two collections: the first one is the start
+            self.lib, self.query = lib, q
+        except (AttributeError, OSError):
+            self.lib = None
+
+    def _array(self, counter):
+        size, count = ctypes.c_uint32(0), ctypes.c_uint32(0)
+        get = self.lib.PdhGetFormattedCounterArrayW
+        if get(counter, self.FORMAT, ctypes.byref(size), ctypes.byref(count), None) != self.MORE_DATA:
+            return []
+        buf = ctypes.create_string_buffer(size.value)
+        if get(counter, self.FORMAT, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+            return []
+        items = ctypes.cast(buf, ctypes.POINTER(_PdhItem * count.value)).contents
+        return [(i.szName or "", i.FmtValue.doubleValue) for i in items if i.FmtValue.CStatus in (0, 1)]
+
+    def read(self, luid):
+        """(load %, dedicated memory in use in bytes) of the adapter `luid` (high, low), None for one not read."""
+        if self.lib is None:
+            return None, None
+        with self.lock:
+            if time.time() - self.at >= 0.5:
+                self.at = time.time()
+                try:
+                    if self.lib.PdhCollectQueryData(self.query) == 0:
+                        engines: dict = {}
+                        for name, v in self._array(self.counters[0]):
+                            m = self.ENGINE.search(name)
+                            if m:
+                                key = (int(m[1], 16), int(m[2], 16))
+                                eng = engines.setdefault(key, {})
+                                eng[(m[3], m[4])] = eng.get((m[3], m[4]), 0.0) + v
+                        self.util = {k: min(100.0, max(e.values())) for k, e in engines.items()}
+                        used: dict = {}
+                        for name, v in self._array(self.counters[1]):
+                            m = self.ADAPTER.search(name)
+                            if m:
+                                key = (int(m[1], 16), int(m[2], 16))
+                                used[key] = used.get(key, 0.0) + v
+                        self.used = used
+                except (AttributeError, OSError):
+                    pass
+            u = self.used.get(luid)
+            return self.util.get(luid, 0.0 if self.used else None), int(u) if u is not None else None
+
+
+class _WinGpu:
+    """A GPU on Windows of any maker, with _XeGpu's interface: its name, address, VRAM and temperature from the
+    graphics kernel (D3DKMT, gdi32), its load and VRAM in use from the performance counters (_Pdh).  The temperature
+    is there where the driver reports it (WDDM 2.4's adapter performance data); power is not (Windows gives it as a
+    share of the card's limit only).  `pci` is the card's address as the engine writes it ("0000:01:00.0"); without
+    one, the first card with memory of its own."""
+    adapters: list | None = None
+    pdh: _Pdh | None = None
+
+    def __init__(self, pci=None):
+        self.a = None
+        if _WinGpu.adapters is None:
+            _WinGpu.adapters = _kmt_adapters() if WIN else []
+        for a in _WinGpu.adapters:
+            if (a["pci"] == str(pci).lower()) if pci else a["vram"] > 0:
+                self.a = a
+                break
+        if self.a is not None:
+            self.pci = self.a["pci"]
+            if _WinGpu.pdh is None:
+                _WinGpu.pdh = _Pdh()
+
+    def ok(self):
+        return self.a is not None
+
+    def name(self):
+        return f"{self.a['name'] or 'GPU'} at {self.pci}" if self.ok() else None
+
+    def read(self):
+        out = {"util": None, "mem_used": None, "mem_total": self.a["vram"] or None, "temp": None}
+        if _WinGpu.pdh is not None:
+            out["util"], out["mem_used"] = _WinGpu.pdh.read(self.a["luid"])
+        perf = _KmtPerf()
+        if _kmt_query(self.a["gdi"], self.a["handle"], KMT_PERF, perf) and perf.Temperature:
+            out["temp"] = perf.Temperature / 10.0
+        out["pcie_rx_mb"] = out["pcie_tx_mb"] = None   # no counters for the link's traffic
+        return out
+
+
+class _NvPciInfo(ctypes.Structure):   # nvmlPciInfo_t
+    _fields_ = [("busIdLegacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                ("device", ctypes.c_uint), ("pciDeviceId", ctypes.c_uint), ("pciSubSystemId", ctypes.c_uint),
+                ("busId", ctypes.c_char * 32)]
+
+
+def nvidia_pci(index):
+    """The PCI address ("0000:09:00.0", as sysfs writes it) of the NVIDIA GPU nvidia-smi numbers `index` (NVML numbers
+    them the same way), or None without NVML or that card: the config's "gpu" names the cards so."""
+    n = _NvGpu(None)
+    if n.lib is None:
+        return None
+    h = ctypes.c_void_p()
+    info = _NvPciInfo()
+    try:
+        if n.lib.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(index), ctypes.byref(h)) != 0 or \
+                n.lib.nvmlDeviceGetPciInfo_v3(h, ctypes.byref(info)) != 0:
+            return None
+    except (AttributeError, OSError):
+        return None
+    return f"{info.domain:04x}:{info.bus:02x}:{info.device:02x}.0"
 
 
 def _gpu(pci=None):
     """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the AMD one (amdgpu),
     else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last: it is
-    most often the processor's graphics beside the card the engine runs on."""
+    most often the processor's graphics beside the card the engine runs on.  On Windows: the NVIDIA one through NVML,
+    else any maker's through _WinGpu."""
+    if WIN:
+        n = _NvGpu(pci)
+        return n if n.ok() else _WinGpu(pci)
     g = _XeGpu(pci, ("xe", "i915") if pci else ("xe",))
     if g.ok():
         return g

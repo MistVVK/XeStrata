@@ -3446,7 +3446,8 @@ def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_
     [{"pci", "roles", "stage", "replica"}], the text engine's cards first.  "roles": "text" (the text engine; with
     "prefill" or "decode" under split serving), "helper" (a layer split's later card holding a helper expert cache,
     image_helper_card), "image" (the image engine).  "stage": a layer split's card number, "replica": the replica's.
-    `gpu_pci`: the text engine's first card (None: the one the engine takes); `groups`: the replicas' cards;
+    `gpu_pci`: the text engine's first card (None: the one the engine takes; the config's "gpu" numbers, when they
+    name the cards, come first); `groups`: the replicas' cards;
     `split_serve`: split serving's two; `image_pci`: the image engine's card of its own (image_env's), None when the
     jobs share the text model's; `helper_card`: image_helper_card's."""
     cards: list[dict] = []
@@ -3472,6 +3473,13 @@ def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_
         add(split_serve.get("decode_gpu"), "decode")
     else:
         later = [] if os.environ.get("STRATA_LAYER_SPLIT") == "off" else list(cfg.get("split_pci") or [])
+        numbered = gpu_list(cfg)
+        if len(numbered) > 1 or (numbered and not gpu_pci):
+            # "gpu": the cards by nvidia-smi's numbers (the CUDA engine's layer split), their addresses from NVML
+            from serve.telemetry import nvidia_pci
+            found = [nvidia_pci(i) for i in numbered]
+            if all(found):
+                gpu_pci, later = found[0], found[1:]
         stages = [p for p in later if not (helper_card and str(p).lower() == helper_card)]
         add(gpu_pci, "text", stage=0 if stages else None)
         for p in later:
