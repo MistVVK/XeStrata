@@ -3383,12 +3383,31 @@ def image_helper_card(cfg: dict) -> str:
     return want
 
 
+def gpu_files_missing(pci: str) -> str:
+    """The card at this PCI address when its device files are not here (setup's gpu_files_missing): a container is
+    given the host's config, whose image GPU can be a card the container was not passed.  "" when they are, or the
+    card is not one sysfs knows (Windows)."""
+    dev = Path("/sys/bus/pci/devices") / pci
+    try:
+        vendor = (dev / "vendor").read_text().strip()
+    except OSError:
+        return ""
+    if vendor == "0x10de":
+        need = ["/dev/nvidiactl"]
+    else:
+        need = [f"/dev/dri/{r.name}" for r in sorted((dev / "drm").glob("renderD*"))][:1] or ["a render node"]
+        need += ["/dev/kfd"] if vendor == "0x1002" else []
+    gone = [p for p in need if not Path(p).exists()]
+    return "its device files are not here: " + ", ".join(gone) if gone else ""
+
+
 def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     """The image engine's environment, from the text engine's (`env`, child_env) -> (it, whether the image jobs have a
     card of their own (images_api.ImageModels' separate), the line the log says of it).  The "images" section's
     "gpu_pci" (setup --image-gpu) is that card unless a text engine of the server takes it: the server's card, a layer
-    split's, the replicas' and a split serve's.  A helper GPU (--expert-cache-device1..3, by device number) or an
-    environment that narrows the GPUs the runtime lists leaves the jobs on the text engine's card."""
+    split's, the replicas' and a split serve's.  A helper GPU (--expert-cache-device1..3, by device number), an
+    environment that narrows the GPUs the runtime lists, or a card whose device files are not here (gpu_files_missing)
+    leaves the jobs on the text engine's card."""
     want = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
     if not want:
         return env, False, ""
@@ -3408,7 +3427,7 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
         a.startswith("--expert-cache-device") for a in args) else
            f"{next(k for k in SELECT_ENV if env.get(k))} narrows the GPUs" if any(env.get(k) for k in SELECT_ENV)
            else "the text model takes it" if want in text else
-           "no text card is named (the engine takes the first)" if not text else "")
+           "no text card is named (the engine takes the first)" if not text else gpu_files_missing(want))
     if why:
         return env, False, f"image GPU: {want} is not used ({why}); the image jobs share the text model's card"
     out = dict(env, STRATA_GPU_PCI=want)
@@ -5828,9 +5847,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         if rounds >= max_rounds:
             finalizing = True
             tools = None
-            system_end = next((index for index, message in enumerate(messages)
-                               if message.get("role") not in ("system", "developer")), len(messages))
-            messages.insert(system_end, {"role": "system", "content": (
+            # a user turn after the results, not a system message: the chat templates take a system message only at
+            # the start ("System message must be at the beginning"), as _late_system_to_user turns a client's late one
+            messages.append({"role": "user", "content": (
                 f"The tool-use limit of {max_rounds} rounds has been reached. No tools are available for this final "
                 "reply. Answer the user's original request in their language using the results already obtained. "
                 "Explain any gaps in the available evidence. Do not request or emit further tool calls.")})
@@ -8182,14 +8201,20 @@ def make_handler(svc: Service):
             lines = self._openai_sse(chunks, req.get("stream_options"))
             if rid is not None:                              # kept: made on its own thread, read from the reply
                 reply = REPLIES.open(rid, cancel)
+                # the request's image embeddings, which prepare() keeps for its own thread: run() reads them on this
+                # one, and the handler's drop_embeddings() at its end leaves them to it
+                emb = (getattr(svc.embeddings, "path", None), getattr(svc.embeddings, "keys", None))
+                svc.embeddings.path = svc.embeddings.keys = None
 
                 def make():                              # its events, one a line: what a read `from` counts
+                    svc.embeddings.path, svc.embeddings.keys = emb
                     try:
                         for line in lines:
                             for event in line.split(b"\n\n"):
                                 if event and not event.startswith(b":"):   # a keep-alive is _stream_reply's own
                                     reply.put(event + b"\n\n")
                     finally:
+                        svc.drop_embeddings()            # when the reply ended before run() took them
                         reply.finish()
                 threading.Thread(target=make, daemon=True, name="strata-reply").start()
                 self._sse()

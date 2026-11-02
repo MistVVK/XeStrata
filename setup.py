@@ -2154,11 +2154,34 @@ def gpus_from_engine():
     return found
 
 
+def gpu_files_missing(g) -> str | None:
+    """A card sysfs lists but whose device files are not here, in plain words (None: they are).  A container sees the
+    host's sysfs whole, every GPU in it, but only the device files it was given: the compose files pass /dev/dri, and
+    NVIDIA's (/dev/nvidia*) only with compose.nvidia.yaml.  Windows and WSL list the cards from the engine or
+    nvidia-smi, which reach them."""
+    if g.get("driver") not in ("xe", "i915", "nvidia", "amdgpu"):
+        return None
+    need = [g.get("render") or ("/dev/nvidiactl" if g.get("vendor") == "nvidia" else "a render node")]
+    if g.get("vendor") == "amd":
+        need.append("/dev/kfd")
+    gone = [p for p in need if not Path(p).exists()]
+    if not gone:
+        return None
+    where = ("not passed into this container" if Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+             else "missing")
+    hint = (": add compose.nvidia.yaml (docs/BUILD.md#podman)" if where != "missing" and g.get("vendor") == "nvidia"
+            else ": add compose.amd.yaml (docs/BUILD.md#podman)" if where != "missing" and g.get("vendor") == "amd"
+            else " (nvidia-smi says why)" if g.get("vendor") == "nvidia" else "")
+    return f"its device files are {where} ({', '.join(gone)}){hint}"
+
+
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can).  What the card can do (16-wide sub-groups,
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    if (missing := gpu_files_missing(g)) is not None:
+        return missing
     cc = g.get("cc") or ""
     if g.get("vendor") == "nvidia" and re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < 60:
         # Maxwell and older (upstream #3218 builds sm_52 in its experimental build): NVIDIA's SYCL runtime reports FP16,
