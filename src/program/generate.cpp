@@ -28,6 +28,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/grammar.hpp"
+#include "strata/core/script_guard.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
@@ -8984,7 +8985,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
                         "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d experts_ram=%s "
-                        "igc_workaround=%s grammar=%d engine=" STRATA_VERSION "\n",
+                        "igc_workaround=%s grammar=%d script_table=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -8995,7 +8996,8 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.elastic() ? 1 : 0, o.batch,
                         o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
-                        igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0);
+                        igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0,
+                        o.batch == 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -10461,6 +10463,8 @@ int main(int argc, char** argv) {
             std::vector<int32_t> req_allowed;
             // route_prior=0|1: STRATA_ROUTE_PRIOR for this request (serve turns it off after a loop; absent: on as started)
             bool req_route_prior = true;
+            // script_table=, script_allow=, script_pending=: the script guard's (src/core/script_guard.cpp)
+            std::string req_script, req_script_allow, req_script_pending;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -10474,6 +10478,9 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
+                    else if (key == "script_table") req_script = tok.substr(eq + 1);
+                    else if (key == "script_allow") req_script_allow = tok.substr(eq + 1);
+                    else if (key == "script_pending") req_script_pending = tok.substr(eq + 1);
                     else if (key == "cvec") req_cvec = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "prefill") req_prefill_only = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
@@ -10533,6 +10540,17 @@ int main(int argc, char** argv) {
                 if (o.batch > 0) { std::printf("ERR grammar: continuous batching is not supported\n"); continue; }
                 if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
                 grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
+            }
+            static strata::core::ScriptGuard script;   // one request at a time (not with --batch), as the grammar
+            script.stop();
+            if (!req_script.empty()) {
+                if (o.batch > 0) { std::printf("ERR script_table: continuous batching is not supported\n"); continue; }
+                if (!script.start(req_script, req_script_allow, req_script_pending, (int) n_vocab, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    continue;
+                }
+                script.apply_bans(req_bias, (int) n_vocab);
+                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) script.words());
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -12288,6 +12306,7 @@ int main(int argc, char** argv) {
                         strata::core::progress_beat();
                         ++produced_n;
                         if (sfx_on) sfx.append(outp[(size_t) i]);
+                        script.commit(outp.data() + i, 1);   // (these windows run with no mask; serve's rewind is left)
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
@@ -12527,8 +12546,12 @@ int main(int argc, char** argv) {
                     grammar.stop();
                     if (!ver.set_allowed(nullptr, 0, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 }
-                if (grammar.active()) {   // row t samples only what the grammar allows after the window's drafts 1..t
-                    if (!ver.set_allowed(grammar_rows.data(), T, err)) {
+                // row t samples only what the grammar allows after the window's drafts 1..t; the script guard takes
+                // out what would complete a banned character the rows are in the middle of (most windows: none)
+                bool masked = grammar.active();
+                if (script.active()) masked = script.fill(window.data(), T, grammar_rows.data(), masked) || masked;
+                if (masked || script.active()) {
+                    if (!ver.set_allowed(masked ? grammar_rows.data() : nullptr, T, err)) {
                         std::printf("ERR %s\n", err.c_str());
                         return 1;
                     }
@@ -12571,6 +12594,7 @@ int main(int argc, char** argv) {
                     grammar.stop();
                     if (!ver.set_allowed(nullptr, 0, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 }
+                script.commit(outv.data(), a + 1);
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window) {

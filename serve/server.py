@@ -1536,6 +1536,12 @@ class StrataEngine:
         grammar = sampling.get("strata_grammar")
         if isinstance(grammar, dict):
             keys += " grammar=" + base64.b64encode(json.dumps(grammar, ensure_ascii=False).encode()).decode("ascii")
+        # the script guard's table (serve/script_guard.py; src/core/script_guard.hpp), its path in hex (spaces)
+        sgt = sampling.get("strata_script")
+        if isinstance(sgt, dict):
+            keys += " script_table=" + str(sgt["table"]).encode().hex()
+            keys += f" script_allow={sgt['allow']}" if sgt.get("allow") else ""
+            keys += f" script_pending={sgt['pending']}" if sgt.get("pending") else ""
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -4870,7 +4876,14 @@ class Service:
             return None
         with self.status_lock:
             self.script_guard_counts["requests"] += 1
-        return script_guard.Guard(script_guard.vocab(self.tok, want["lang"]), ids, want["allow_context"])
+        voc = script_guard.vocab(self.tok, want["lang"])
+        table = None
+        if info.get("script_table") == 1 and voc.n_vocab and voc.token_chars:   # the engine bans and masks itself
+            try:
+                table = voc.table(places.user_dir("state") / "script-tables")
+            except OSError as e:
+                print(f"[strata] script guard: cannot write its table ({e}); the server applies it", flush=True)
+        return script_guard.Guard(voc, ids, want["allow_context"], table)
 
     def _guard_pieces(self):
         """A fresh token-text reader for the loop guard's markers (a character split across tokens whole)."""
@@ -5092,7 +5105,7 @@ class Service:
                             # (the thinking may have been closed by the server: a budget's wrap-up, the loop guard)
                             sg.active = sg.active or parser.state not in ("reasoning", "rcall")
                             sg.restart = False
-                            smp_call, n_call = sg.sampling(smp_call, n_call)
+                            smp_call, n_call = sg.sampling(smp_call, n_call, raw_ids)
                         n_pass = n
                         gen = self.engine.generate(prompt, n_call, smp_call, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, n_call, smp_call, cancel)

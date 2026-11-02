@@ -20,14 +20,21 @@ kana, Hangul and the forms only Japanese writes (in JIS X 0208 and in neither GB
 "zh-cn" the traditional forms (in Big5, not in GB2312: 這, 說, 國), "zh-tw" the simplified ones (in GB2312, not in
 Big5: 这, 说, 国).  Every language but "en" also bans the letters only Vietnamese writes.
 
-A byte-level vocabulary can still spell a banned character in byte tokens, which no single token's bias stops.  The
-server sees the character as it completes, before it is sent: the tokens that spell it are dropped and the engine
-writes that place again with the first of them banned for one token (at most REWIND_MAX times an answer; after that,
-or when part of it has gone out already, it is let through and counted).
+A byte-level vocabulary can still spell a banned character in byte tokens, which no single token's bias stops.  An
+engine that says script_table=1 stops it itself: the server writes the vocabulary's table once (Vocab.table, read by
+src/core/script_guard.cpp) and names it on the GEN line in place of the bans' logit_bias, and the engine bans, after the
+bytes of a character the reply has begun, the tokens that would complete a banned one.  Where that is not so (an older
+engine, --pipeline-windows 2's windows) the server sees the character as it completes, before it is sent: the tokens
+that spell it are dropped and the engine writes that place again with the first of them banned for one token (at most
+REWIND_MAX times an answer; after that, or when part of it has gone out already, it is let through and counted).
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import threading
+from collections import defaultdict
+from pathlib import Path
 
 from serve import logit_bias as bias_api
 
@@ -87,6 +94,17 @@ def _banned(lang: str) -> frozenset:
     return frozenset(out)
 
 
+def begun(raw: bytes) -> bytes:
+    """The bytes of the character `raw` ends in the middle of (b"": none)."""
+    for back in range(1, min(4, len(raw)) + 1):
+        c = raw[-back]
+        if c & 0xC0 == 0x80:
+            continue
+        need = 4 if c >= 0xF0 else 3 if c >= 0xE0 else 2 if c >= 0xC0 else 1
+        return raw[-back:] if back < need else b""
+    return b""
+
+
 def parse(value, where="script_guard"):
     """A request's, the header's, a shared setting's or the config's value -> "off" or {"lang", "allow_context"};
     None for no value.  ValueError for anything else."""
@@ -119,11 +137,14 @@ class Vocab:
     """One tokenizer's banned tokens for one language: each with the banned characters it holds."""
 
     def __init__(self, tok, lang: str):
+        self.lang = lang
+        self.n_vocab = len(getattr(tok, "tokens", ()))
         self.chars = _banned(lang)
         self.token_chars: dict[int, frozenset] = {}
+        self.partial: dict[int, bytes] = {}             # the tokens that split a character: their bytes
         token_bytes = getattr(tok, "token_bytes", None)
         if token_bytes is not None:
-            for i in range(len(getattr(tok, "tokens", ()))):
+            for i in range(self.n_vocab):
                 try:
                     raw = token_bytes(i)
                 except (KeyError, IndexError):          # a token outside the byte alphabet: never one to ban
@@ -132,7 +153,44 @@ class Vocab:
                 hit = frozenset(c for c in raw.decode("utf-8", "ignore") if c in self.chars)
                 if hit:
                     self.token_chars[i] = hit
+                if raw and (raw[0] & 0xC0 == 0x80 or begun(raw)):
+                    self.partial[i] = raw
         self.bias = {i: BAN for i in self.token_chars}
+        self._table: str | None = None
+        self._table_lock = threading.Lock()
+
+    def table(self, folder: Path) -> str:
+        """The engine's table (src/core/script_guard.hpp has the format) in `folder`, written once: its path."""
+        with self._table_lock:
+            if self._table is not None:
+                return self._table
+            lines = [f"xestrata-script-table 1 {self.n_vocab}"]
+            lines += [f"k {i} " + ",".join(f"{ord(c):x}" for c in sorted(cs))
+                      for i, cs in sorted(self.token_chars.items())]
+            lines += [f"t {i} {raw.hex()}" for i, raw in sorted(self.partial.items())]
+            starts = defaultdict(list)                  # a token's first continuation bytes -> the tokens
+            for i, raw in sorted(self.partial.items()):
+                run = 0
+                while run < min(3, len(raw)) and raw[run] & 0xC0 == 0x80:
+                    run += 1
+                for k in range(1, run + 1):
+                    starts[raw[:k]].append(i)
+            for ch in sorted(self.chars):
+                code = ch.encode()
+                for split in range(1, len(code)):       # the begun bytes, and the tokens that complete them as `ch`
+                    ids = starts.get(code[split:])
+                    if ids:
+                        lines.append(f"b {code[:split].hex()} {ord(ch):x} " + ",".join(map(str, ids)))
+            text = "\n".join(lines) + "\n"
+            name = f"{self.lang}-{hashlib.sha256(text.encode()).hexdigest()[:16]}.txt"
+            path = folder / name
+            if not path.exists():                       # written whole under another name, then moved in place
+                folder.mkdir(parents=True, exist_ok=True)
+                tmp = folder / f".{name}.{os.getpid()}.tmp"
+                tmp.write_text(text, encoding="ascii")
+                os.replace(tmp, path)
+            self._table = str(path)
+            return self._table
 
 
 _vocabs: dict = {}                                       # (id(tok), lang) -> (tok, Vocab): built once, on first use
@@ -150,8 +208,9 @@ def vocab(tok, lang: str) -> Vocab:
 class Guard:
     """One request's guard.  `active`: the answer is being written (the bias applies); the server sets it."""
 
-    def __init__(self, voc: Vocab, prompt_ids, allow_context: bool):
+    def __init__(self, voc: Vocab, prompt_ids, allow_context: bool, table: str | None = None):
         self.voc = voc
+        self.table = table                              # the engine's table (it bans and masks itself), or None
         self.seen: frozenset = frozenset()
         if allow_context:
             self.seen = frozenset().union(*(voc.token_chars[i] for i in set(prompt_ids) if i in voc.token_chars))
@@ -167,19 +226,31 @@ class Guard:
     def banned(self, text: str) -> bool:
         return any(c in self.voc.chars and c not in self.seen for c in text)
 
-    def sampling(self, smp: dict | None, n_call: int):
-        """The pass's sampling and token count: the request's logit_bias with the bans over it, in the answer."""
+    def sampling(self, smp: dict | None, n_call: int, reply_ids=()):
+        """The pass's sampling and token count in the answer: the engine's table and what it needs (the code points the
+        conversation holds, the bytes of a character `reply_ids` end in the middle of), or the request's logit_bias
+        with the bans over it."""
         self.one_token = False
         if not self.active:
             return smp, n_call
         own = (smp or {}).get("logit_bias")
-        bias = self.bias
-        if own or self.ban_next is not None:
-            bias = {**bias_api.normalize(own), **bias}
-            if self.ban_next is not None:
-                bias[self.ban_next] = BAN
-                self.ban_next, self.one_token, n_call = None, True, min(n_call, 1)
-        return {**(smp or {}), "logit_bias": bias}, n_call
+        out = {**(smp or {})}
+        if self.table is not None:
+            state = b""
+            for t in list(reply_ids)[-8:]:              # (a character is 4 bytes at most)
+                raw = self.voc.partial.get(t)
+                state = begun(state + raw) if raw is not None else b""
+            out["strata_script"] = {"table": self.table, "pending": state.hex(),
+                                    "allow": ",".join(f"{ord(c):x}" for c in sorted(self.seen & self.voc.chars))}
+        bans = self.bias if self.table is None else {}  # (with the table, the engine adds them)
+        if self.ban_next is not None:
+            bias = {**bias_api.normalize(own), **bans, self.ban_next: BAN}
+            self.ban_next, self.one_token, n_call = None, True, min(n_call, 1)
+        else:
+            bias = {**bias_api.normalize(own), **bans} if own else bans   # (the same object: its engine key is kept)
+        if bias:
+            out["logit_bias"] = bias
+        return out, n_call
 
     def follow(self, was_pending: bool, piece: str, still_pending: bool, index: int) -> None:
         """After a token that was let through: where the bytes the detokenizer now holds began, and whether that

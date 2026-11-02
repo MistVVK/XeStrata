@@ -328,11 +328,19 @@ public:
     /// A request's constraints on the picks (serve's logit_bias, grammar and penalties, the sampler's chain): a bias
     /// over the vocabulary (empty: none); the grammar's mask for the next pick, (n_vocab + 31) / 32 words (null:
     /// any); the tokens the penalties count, the last ones before the next pick (the sampler's penalty_last_n of them;
-    /// none: no penalties).  A window's every row takes the same ones, so a request with them decodes a token a window.
-    /// On the last stage, which picks.
+    /// none: no penalties).  A window's every row takes the same mask and history, so a request with them decodes a
+    /// token a window; the bias is the same for every row, and a spec window takes it.  On the last stage, which picks.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
     bool set_allowed(const uint32_t* row, std::string& err);
     bool set_history(const int32_t* tokens, int n, std::string& err);
+    /// A mask for each of a window's T rows, (n_vocab + 31) / 32 words each (null: any).
+    bool set_allowed_rows(const uint32_t* rows, int T, std::string& err);
+    /// What spec_step calls with each window (win[0] the pending token, then the drafts) before it reads it, to set
+    /// the rows' masks (set_allowed_rows): the script guard's (src/core/script_guard.cpp); empty: none.  Not on
+    /// --pipeline-windows 2's windows (spec_step_pl), which run with no mask.
+    void set_window_masks(std::function<bool(const int32_t* win, int T, std::string& err)> f) {
+        tail().window_masks_ = std::move(f);
+    }
     /// --spec-window min-p's floor for this request (setup's calibration, spec_min_p=); < 0: the engine's own rule
     void set_spec_min_p(double p) { for (PlainModel* st : chain()) st->req_spec_min_p_ = p; }
     /// The PCIe share of the missed experts for this request (setup's calibration, pcie_frac=); < 0: the engine's own
@@ -1036,6 +1044,7 @@ private:
     int32_t* hist_dev_ = nullptr;       ///< max_t rows of hist_len_ tokens
     int hist_len_ = 0, hist_cap_ = 0;
     bool bias_on_ = false, allowed_on_ = false;
+    std::function<bool(const int32_t*, int, std::string&)> window_masks_;   ///< set_window_masks
     double req_spec_min_p_ = -1.0;
     /// the split as the load set it up, for set_pcie_frac to come back to
     PcieSplitTimes* pcie_split_own_ = nullptr;

@@ -21,6 +21,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/grammar.hpp"
+#include "strata/core/script_guard.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
@@ -953,7 +954,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::printf("INFO logit_bias=1 context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld spec=%d "
                     "vram_free_mib=%lld arena_mib=%lld spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld "
                     "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_elastic=%d batch_slots=%zu "
-                    "batch_groups=%d slot_cache=%d experts_ram=%s igc_workaround=%s grammar=%d cvec=%s engine=" STRATA_VERSION
+                    "batch_groups=%d slot_cache=%d experts_ram=%s igc_workaround=%s grammar=%d script_table=1 "
+                    "cvec=%s engine=" STRATA_VERSION
                     "\n",
                     (long long) ctx, opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16",
                     (long long) model.slots(), (long long) (model.tier_bytes() >> 20), model.drafts() + 1,
@@ -1183,9 +1185,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // log-probability and the K likeliest, from the logits before the sampler), allowed= (those ids instead of
         // the K), grammar=<base64 JSON> (the reply follows it, src/core/grammar.cpp), logit_bias=, the penalties,
         // spec_min_p= (the drafts' floor).  route_prior=0 asks for exact routing, which these models always do.
+        // script_table=, script_allow=, script_pending=: the script guard's (src/core/script_guard.cpp)
         int req_logprobs = -1;
         std::vector<int32_t> req_allowed;
-        std::string req_grammar, req_bias_text;
+        std::string req_grammar, req_bias_text, req_script, req_script_allow, req_script_pending;
         bool req_bias = false;
         double req_spec_min_p = -1.0, req_pcie_frac = -1.0;
         bool req_cvec = true;             // cvec=0|1: a loaded control vector for this request (on when absent)
@@ -1218,6 +1221,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(val.c_str(), nullptr, 10), -1L, 20L);
             else if (key == "grammar") req_grammar = val;
             else if (key == "logit_bias") { req_bias_text = val; req_bias = true; }
+            else if (key == "script_table") req_script = val;
+            else if (key == "script_allow") req_script_allow = val;
+            else if (key == "script_pending") req_script_pending = val;
             else if (key == "cvec") req_cvec = std::strtol(val.c_str(), nullptr, 10) != 0;
             else if (key == "aux_cpus") strata::aux_cpus::set_enabled(std::strtol(val.c_str(), nullptr, 10) != 0);
             else if (key == "prefill") req_prefill = std::strtol(val.c_str(), nullptr, 10) != 0;
@@ -1323,6 +1329,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
             grammar_row.resize((size_t) grammar.words());
         }
+        static strata::core::ScriptGuard script;   // one request at a time, as the grammar
+        script.stop();
+        if (!req_script.empty()) {
+            if (!script.start(req_script, req_script_allow, req_script_pending, (int) V, cerr)) {
+                std::printf("ERR %s\n", cerr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            script.apply_bans(bias, (int) V);
+            grammar_row.resize(std::max(grammar_row.size(), (size_t) script.words()));
+        }
         if (!model.set_logit_bias(bias, cerr) || !model.set_allowed(nullptr, cerr) || !model.set_history(nullptr, 0, cerr)) {
             std::printf("ERR %s\n", cerr.c_str());
             std::fflush(stdout);
@@ -1333,7 +1350,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const bool penalties = sp.penalty_last_n > 0 &&
                                (sp.penalty_repeat != 1.0f || sp.penalty_freq != 0.0f || sp.penalty_present != 0.0f);
         // a request with any of them decodes a token a window (each pick its own mask, history and logits)
-        const bool constrained = !bias.empty() || grammar.active() || penalties || req_logprobs >= 0;
+        // (a bias is the same for every row of a spec window, and the script guard sets each window's masks)
+        const bool constrained = grammar.active() || penalties || req_logprobs >= 0;
         std::vector<int32_t> seen(ids.begin(), ids.end());   // what the penalties count: the prompt, then the reply
         std::vector<float> lrow(req_logprobs >= 0 ? (size_t) V : 0);   // the logits the next pick comes from
         // before a pick after the window that reads `fed`
@@ -1342,20 +1360,22 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 const size_t k = std::min(seen.size(), (size_t) sp.penalty_last_n);
                 if (!model.set_history(seen.data() + seen.size() - k, (int) k, cerr)) return false;
             }
+            bool masked = false;
             if (grammar.active()) {
-                if (!grammar.fill(&fed, 1, grammar_row.data())) {
+                masked = grammar.fill(&fed, 1, grammar_row.data());
+                if (!masked) {
                     std::fprintf(stderr, "strata (%s): the grammar failed: the rest of this reply is not constrained\n",
                                  arch.c_str());
                     grammar.stop();
-                    return model.set_allowed(nullptr, cerr);
                 }
-                return model.set_allowed(grammar_row.data(), cerr);
             }
-            return true;
+            if (script.active()) masked = script.fill(&fed, 1, grammar_row.data(), masked) || masked;
+            return model.set_allowed(masked ? grammar_row.data() : nullptr, cerr);
         };
         // after it: the grammar takes the token
         auto picked = [&](int32_t y) -> bool {
             seen.push_back(y);
+            script.commit(&y, 1);
             if (grammar.active() && !grammar.commit(&y, 1)) {
                 std::fprintf(stderr, "strata (%s): the grammar refused a token its mask allowed: the rest of this reply "
                                      "is not constrained\n", arch.c_str());
@@ -1927,6 +1947,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         if (spec && !req_prefill && !model.spec_start(next, (int64_t) live.size(), err)) ok = false;
         std::vector<int32_t> pend;
         size_t at = 0;
+        std::vector<uint32_t> script_rows;   // the script guard's masks for a spec window's rows
+        if (spec && script.active())
+            model.set_window_masks([&](const int32_t* win, int T, std::string& e) {
+                script_rows.resize(std::max(script_rows.size(), (size_t) T * (size_t) script.words()));
+                return model.set_allowed_rows(script.fill(win, T, script_rows.data(), false) ? script_rows.data()
+                                                                                              : nullptr, T, e);
+            });
         int64_t reply_ck = (int64_t) live.size();   // --reply-checkpoint-every: where the last one was taken
         if (ok && !req_prefill && !picked(next)) {
             err = cerr;
@@ -1974,6 +2001,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     break;
                 }
                 if (lookup) sfx.append(out.data(), (size_t) n_emit);
+                script.commit(out.data(), n_emit);
                 live.push_back(next);
                 pend.assign(out.begin(), out.begin() + n_emit);
                 at = 0;
@@ -1997,6 +2025,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 break;
             }
         }
+        model.set_window_masks({});   // (it holds this request's locals)
         // --pipeline-windows 2: a guessed window ahead of the reply is given back before the state is used again
         if (ok && spec && !model.spec_end(err)) ok = false;
         if (!ok) {

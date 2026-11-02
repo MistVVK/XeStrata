@@ -423,7 +423,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
-                                   src/core/grammar.cpp)
+                                   src/core/grammar.cpp src/core/script_guard.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
   # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release

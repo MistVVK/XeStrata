@@ -2177,6 +2177,29 @@ bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
     return true;
 }
 
+bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err) {
+    PlainModel& t = tail();
+    const OnDevice on(t.dev_);
+    t.allowed_on_ = rows != nullptr;
+    if (!t.allowed_on_) return true;
+    const size_t words = (size_t) (n_vocab_ + 31) / 32;
+    if (T < 1 || T > opt_.max_t) { t.allowed_on_ = false; err = "plain model: mask rows out of range"; return false; }
+    if (t.allowed_dev_ == nullptr) {
+        if (!strata::gpu::alloc_device(&t.allowed_dev_, words * (size_t) opt_.max_t * 4)) {
+            t.allowed_on_ = false;
+            err = std::string("plain model: the window's masks: ") + strata::gpu::last_error();
+            return false;
+        }
+        t.allocs_.push_back(t.allowed_dev_);
+    }
+    if (!strata::gpu::copy(t.allowed_dev_, rows, words * (size_t) T * 4)) {
+        t.allowed_on_ = false;
+        err = std::string("plain model: the window's masks: ") + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
 bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
     PlainModel& t = tail();
     const OnDevice on(t.dev_);
@@ -3469,8 +3492,9 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         return tail().spec_step(stop, limit, emitted, n_emit, logits, err, follow, ext, n_ext, match);
     }
     if (pipelined_spec()) {   // --pipeline-windows 2: a window's MTP drafts alone pipeline; else a pending guess goes
-        if (ext == nullptr && follow == nullptr && logits == nullptr)
-            return spec_step_pl(stop, limit, emitted, n_emit, err);
+        if (ext == nullptr && follow == nullptr && logits == nullptr)   // (no window masks: none left from before)
+            return (!window_masks_ || set_allowed_rows(nullptr, 0, err)) &&
+                   spec_step_pl(stop, limit, emitted, n_emit, err);
         if (!spec_end(err)) return false;
     }
     n_emit = 0;
@@ -3505,6 +3529,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         }
     }
     const int T = nd + 1;
+    if (window_masks_ && !window_masks_(win, T, err)) return false;
     const auto t0 = std::chrono::steady_clock::now();
     if (!root_->forward(win, T, cur_pos_, out, logits, err, true)) return false;
     const auto t1 = std::chrono::steady_clock::now();
