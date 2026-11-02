@@ -78,10 +78,18 @@ std::string name_list(const std::vector<std::string>& names) {
     return out;
 }
 
-// a name with its dots as underscores and back: sd-scripts' keys reach the table with every underscore a dot
-std::string dotted(std::string s) {
-    std::replace(s.begin(), s.end(), '_', '.');
-    return s;
+// A block's number in a key and where it ends: "blocks.7.attn.to_q" as the DiT names it, or "blocks_7_attn_to_q" as
+// sd-scripts' and the LyCORIS form's keys write it.  -1 for a key that names no block; `after` is the separator the
+// number ends at, so a remapped key keeps the spelling the file wrote.
+int anima_block_of(const std::string& k, size_t& after) {
+    if (k.size() < 8 || k.rfind("blocks", 0) != 0 || (k[6] != '.' && k[6] != '_')) return -1;
+    after = k.find_first_of("._", 7);
+    if (after == std::string::npos) return -1;
+    try {
+        return std::stoi(k.substr(7, after - 7));
+    } catch (const std::exception&) {
+        return -1;
+    }
 }
 
 // RMSNorm(x[t]) * w (eps 1e-6), times the row's factor where given (the T5 ids' weights)
@@ -1245,29 +1253,24 @@ bool AnimaDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     drop_kv();   // the kept keys and values were the other adapters' weights'
     if (key.empty()) return true;
     std::vector<std::string> unknown, text_encoder;
-    // a block's number in a key ("blocks.K." or sd-scripts' dotted "blocks.K."), -1 for none
-    auto block_of = [](const std::string& k) -> int {
-        if (k.rfind("blocks.", 0) != 0) return -1;
-        const size_t dot = k.find('.', 7);
-        if (dot == std::string::npos) return -1;
-        try {
-            return std::stoi(k.substr(7, dot - 7));
-        } catch (const std::exception&) {
-            return -1;
-        }
-    };
+    // a block's number in a key, in the DiT's own spelling or in sd-scripts' and the LyCORIS form's underscore one
+    // (anima_block_of reads both and says where the number ends)
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
         // the release's adapter on an expanded DiT: every block it names within the map's size
         bool remap = !block_map_.empty() && (int) block_map_.size() < (int) blocks_.size();
-        for (const LoraEntry& entry : u.file->entries())
-            if (block_of(entry.key) >= (int) block_map_.size()) remap = false;
+        for (const LoraEntry& entry : u.file->entries()) {
+            size_t after = 0;
+            if (anima_block_of(entry.key, after) >= (int) block_map_.size()) remap = false;
+        }
         for (const LoraEntry& raw : u.file->entries()) {
             LoraEntry moved;
             const LoraEntry* ep = &raw;
-            if (const int b = block_of(raw.key); remap && b >= 0) {
-                moved = raw;
-                moved.key = "blocks." + std::to_string(block_map_[(size_t) b]) + raw.key.substr(raw.key.find('.', 7));
+            size_t after = 0;
+            const int b = anima_block_of(raw.key, after);
+            if (remap && b >= 0) {
+                moved = raw;   // the block's number changes, the file's own spelling of the name does not
+                moved.key = raw.key.substr(0, 7) + std::to_string(block_map_[(size_t) b]) + raw.key.substr(after);
                 ep = &moved;
             }
             const LoraEntry& entry = *ep;
@@ -1275,10 +1278,10 @@ bool AnimaDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 text_encoder.push_back(entry.key);
                 continue;
             }
-            // the table's name as it is, or with its underscores dotted (sd-scripts' keys reach here dotted)
+            // the table's name as it is, or as sd-scripts' and the LyCORIS form's keys write it
             std::vector<const LoraSlot*> slots;
             for (const LoraSlot& s : lora_slots_)
-                if (s.name == entry.key || dotted(s.name) == entry.key) slots.push_back(&s);
+                if (lora_key_names(entry.key, s.name)) slots.push_back(&s);
             if (slots.empty()) {
                 unknown.push_back(entry.key);
                 continue;

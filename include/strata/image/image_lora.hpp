@@ -12,12 +12,13 @@
 // Kronecker product, w1 [out_l][in_m] and w2 [out_k][in_n]: the input's rows read in in_m groups of in_n, w2's product
 // of each group, then w1's over the groups (two products, the Kronecker product never made).
 //
-// A DoRA (dora_scale: the weight decomposed into its rows' norms and directions) keeps the weight it changes:
-// c = m / (|W| a row + eps) over the weight's output rows, and W' = W + s (c (W + alpha/rank * BA) - W), so a
-// product's output is y = [1 + s (c - 1)] (W x) + s c (alpha/rank BA x): the base product's rows scaled by
-// 1 + s (c - 1) (LoraPart::base, the DiT's product applies it where its output is in the input's units) and the
-// delta's rows by c (folded into B when the entry goes to the GPU).  eps is FP32's, whatever the file's tensors are
-// (LP64_IEC_559's 1.1920929e-07).
+// A DoRA (the weight decomposed into its rows' norms and directions) keeps the weight it changes.  Its magnitude m is
+// the file's `dora_scale`, the same vector under PEFT's name (`lora_magnitude_vector`, its `.default` form too) or
+// ai-toolkit's (`.magnitude`), or LyCORIS's rows' vector shaped [rows][1]: c = m / (|W| a row + eps) over the
+// weight's output rows, and W' = W + s (c (W + alpha/rank * BA) - W), so a product's output is
+// y = [1 + s (c - 1)] (W x) + s c (alpha/rank BA x): the base product's rows scaled by 1 + s (c - 1) (LoraPart::base,
+// the DiT's product applies it where its output is in the input's units) and the delta's rows by c (folded into B when
+// the entry goes to the GPU).  eps is FP32's, whatever the file's tensors are (LP64_IEC_559's 1.1920929e-07).
 //
 // A whole delta (diff, set_weight, w_norm) is the weight's own matrix: y[t] += s * Delta x[t] (LoraEntry::delta, on
 // the GPU as FP16, a product of its own).  A diff patches the weight as W += strength * diff; a set_weight, read as
@@ -197,6 +198,12 @@ struct LoraUse {
     float scale = 1.0f;
 };
 
+/// Whether a file's key names this weight: the name as the DiT writes it, or as sd-scripts' `lora_unet_` keys and the
+/// LyCORIS form's `lycoris_` keys write it - the DiT's name with every dot an underscore and its own underscores kept
+/// (`attn.to_q` reaches `attn_to_q`).  One table answers both: the DiT's own names, each also written in the underscore
+/// form.  serve/loras.py's kohya_name brings the same keys to the same
+/// names for the listing, so a file the listing shows is a file the DiT binds.
+bool lora_key_names(const std::string& key, const std::string& name);
 /// A key a text encoder's weight has: sd-scripts' lora_te (lora_te1_, lora_te2_), diffusers' text_encoder., te.
 bool lora_is_text_encoder_key(const std::string& key);
 /// The text encoder's own name of such a key with its dots for underscores ("lora_te_layers_0_self_attn_q_proj" and

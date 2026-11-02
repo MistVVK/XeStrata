@@ -400,7 +400,7 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `xestrata-engine`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
+- `xestrata-engine`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）、当てたファイルにあって当てられない鍵（`lora_ignored`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
@@ -531,7 +531,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - 1 回に重ねられるのは 4 本までです。同じ名前を 2 回書くと 400 です。
 - プロンプトのタグ `<lora:名前:強さ>` も読みます（肯定と否定の両方。強さは省略でき、省略すると 1.0 です）。タグはプロンプトから取り除き、名前が一覧にないときは、そのタグを外して画像を作り、応答の `strata.lora_unknown` とサーバーのログに名前を出します。`<lora:名前:強さ:強さ>` の 3 つ目は A1111 の文章エンコーダー側の強さで、読みません（タグは取り除きます）。タグだけのプロンプトは 400 です。
 - 欄とタグを合わせて 4 本までで、同じ名前は最初の 1 つだけを使います（欄、肯定のタグ、否定のタグの順）。
-- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`xestrata-engine` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）が入ります。
+- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`xestrata-engine` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）、`lora_ignored`（当てたファイルの鍵で、アダプターの Tensor を名乗らないために当てられなかったもの。ファイル名と本数と名前の先頭 6 個）が入ります。
 
 **Web**: Images のタブに LoRA の行が出ます（一覧が空のモデルでは出ません）。「LoRA を追加…」で一覧から選ぶと、選んだもののチップが出ます。チップの数値の欄で強さ（-2〜2、0.05 刻み）を変えられ、`trigger` を持つファイルには「トリガー」のボタンが出て、押すとその語をプロンプトの末尾に足します（タグは書きません）。× で外します。4 本で上限です。選んだものと強さはモデルごとにブラウザーが覚えます。
 
@@ -539,13 +539,13 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 ### 当てる形式
 
-ファイルのキーは、`diffusion_model.`・`transformer.`・`model.diffusion_model.` の接頭辞を外して、このモデルの重みの名前にします。PEFT・ai-toolkit などのよく使われる名前（`lora_A`/`lora_B`、`lora_down`/`lora_up`、`lora_A.default`）を読みます。
+ファイルのキーは、`diffusion_model.`・`transformer.`・`model.diffusion_model.` の接頭辞を外して、このモデルの重みの名前にします。PEFT・ai-toolkit などのよく使われる名前（`lora_A`/`lora_B`、`lora_down`/`lora_up`、`lora_A.default`）を読みます。sd-scripts の `lora_unet_` と LyCORIS 形の `lycoris_` は、重みの名前の点をすべて下線に書いてくるので、模型自身の名前で写し直します。自分の名前に下線を含む名前（`attn.to_q`・`img_mlp.net.0.proj`・`proj.ffn_up_gate`）も読めます。
 
 | 形式 | ファイルのテンソル | 当て方 |
 | --- | --- | --- |
-| LoRA・LoCon | `lora_A`/`lora_B`（下と上）と `.alpha` かメタデータの `lora_alpha` | 強さ × alpha / rank。alpha が無ければ 1 |
+| LoRA・LoCon | `lora_A`/`lora_B`（下と上）と `.alpha` かメタデータの `lora_alpha`（`transformer.lora_alpha` のように模型の名前を冠った鍵も） | 強さ × alpha / rank。alpha は `.alpha` テンソルが勝ち、メタデータは `.alpha` の無い重みにだけ効く。どちらも無ければ 1 |
 | LoKr | `lokr_w1`・`lokr_w2`（丸ごと、または 2 つの因子）と、線形の重みの Tucker の核 `lokr_t2` | 2 段の積。rank は w2 の因子、無ければ w1 の因子 |
-| DoRA | 素の LoRA と、重みの行の `dora_scale` | 行方向だけ。`c = dora_scale / 重みの行のノルム` で、土台とデルタの行を掛ける |
+| DoRA | 素の LoRA と、重みの行の大きさのベクトル（`dora_scale`、PEFT の `lora_magnitude_vector`、ai-toolkit の `.magnitude`。LyCORIS の `[行][1]` の形も） | 行方向だけ。`c = 大きさ / (重みの行のノルム + eps)` で、土台とデルタの行を掛ける |
 | 全体差分 | `.diff`・`.set_weight`・`.w_norm` | 差分を足す。`set_weight` は強さ 1 でその重みになり、その間は補間 |
 | LoHa | `hada_w1_a/b`・`hada_w2_a/b` と、線形の Tucker の核 | 2 組の積の要素ごとの積。rank は `hada_w1_b` の行 |
 | バイアスの差分 | `.diff_b`、または `.w_norm` の隣の `.b_norm` | 重みのバイアスに足す。alpha は掛からず、要求の強さだけ |
@@ -559,9 +559,11 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、そこに当たる OFT は断ります。
 - LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
 - `use_rslora` のファイルは断ります（強さが alpha / √rank で、alpha / rank と違うため）。PEFT の `rank_pattern` は読まず、alpha だけを使います。
+- メタデータに `lora_alpha` を 2 つ以上持つファイルも同じ作法で断ります。diffusers で文の読み手と transformer を 1 ファイルにまとめたものは成分ごとに鍵を写す（`text_encoder.lora_alpha` と `transformer.lora_alpha`）ため、画像の重みがどちらの alpha を取るのか決められません。値が同じなら読みます。すべての重みが自分の `.alpha` テンソルを持つファイルも読みます（メタデータはどの重みにも及ばないため）。
 - 文の読み手の重み（`lora_te_`・`text_encoder.`・`te.` などのキー）を含むファイルは、その分を文の読み手に当てます（Qwen-Image-2.1、Mage-Flow、MageTrail、MOSS-Image、Anima）。強さは画像のモデルの側と同じで、API に `scale_text` の欄はありません（送っても `style` や `user` と同じ知らない欄として無視します）。
   文の読み手に当てた要求は、プロンプトの状態をその組で作り直します。MOSS-Image でチャットのモデルと同じファイルを文の読み手にしているときは、アダプターを当てた要求だけ、画像のエンジンが自分でプロンプトを読みます。
-- sd-scripts の `lora_unet_` の名前は、Anima の重みの名前に当てます（ほかのモデルの重みの名前には当たりません）。
+- 形式が合うファイルでも、アダプターの Tensor を名乗らない鍵（PEFT の `base_layer.bias`、補助の射影、別の実験の sidecar）は当てません。その鍵はファイルの一覧には入らず、そのファイルを当てた要求の `xestrata-engine.lora_ignored` とサーバーのログに名前を出します（エンジンも同じことをログに書く）。
+- sd-scripts の `lora_unet_` と SimpleTuner の `lycoris_` の名前は、アダプターを当てるモデルすべて（Qwen-Image-2.1、Mage-Flow、MageTrail、MOSS-Image、Anima）に、その模型の重みの名前で当てます。どの重みにも当たらなかった名前は、ファイルが書いた名前のまま理由に出します。
 - Anima-2.9B には、公式の Anima（2B）向けの LoRA を当てられます。2.9B が足した 12 のブロックを飛ばして、元の 28 のブロックに当てます。
 
 ### 量子化した重みとメモリ
@@ -649,6 +651,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 | `lora: ...`（400） | 名前が一覧にないか、強さが範囲外か、4 本を超えています。メッセージに理由が続きます |
 | `lora_rejected: image engine: ...`（400） | エンジンがアダプターを当てられません。キーと理由（バイアスを足さない重み、rsLoRA、MageTrail の変調、同じ行に重なった DoRA・OFT・GLoRA・set_weight など）が続きます（[LoRA](#loraアダプター)） |
 | `strata.lora_unknown` | プロンプトのタグの名前が一覧になく、タグを外して画像を作りました |
+| `xestrata-engine.lora_ignored` | 当てたファイルに、アダプターの Tensor を名乗らない鍵がありました（`base_layer.bias` など）。それらは当てていません |
 
 ## ライセンス
 

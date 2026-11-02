@@ -12,6 +12,7 @@ shape from it).
 """
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import struct
@@ -186,6 +187,84 @@ class Listing(Tree):
         self.assertIn("columns", f.skipped["columns"], "a DoRA over the weight's columns is not the engine's")
         self.assertIn("DoRA", f.skipped["columns"])
         self.assertEqual(loras.field([{"name": "dora", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_doras_magnitude_under_pefts_and_ai_toolkits_names_is_the_same_magnitude(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        for name, key in (("peft", b + ".lora_magnitude_vector.default.weight"),
+                          ("peft-plain", b + ".lora_magnitude_vector.weight"),
+                          ("toolkit", b + ".magnitude")):
+            safetensors(self.d / f"{name}.safetensors", qwen_lora(extra={key: (256,)}))
+        f = self.folder()
+        self.assertEqual(sorted(e["name"] for e in f.listing()), ["peft", "peft-plain", "toolkit"], f.skipped)
+        for entry in f.listing():
+            self.assertNotIn(entry["name"], f.ignored, "the magnitude is a tensor of the adapter, not a left-out key")
+        safetensors(self.d / "lycoris.safetensors", qwen_lora(
+            extra={b + ".dora_scale": (256, 1)}))   # LyCORIS writes the rows' vector [rows][1]
+        f = self.folder()
+        self.assertEqual(sorted(e["name"] for e in f.listing()), ["lycoris", "peft", "peft-plain", "toolkit"],
+                         f.skipped)
+
+    def test_a_magnitude_over_the_columns_is_refused_even_where_the_rows_would_fit(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"   # this weight's rows are its columns: 256 and 256
+        safetensors(self.d / "square-columns.safetensors", qwen_lora(extra={b + ".dora_scale": (1, 256)}))
+        f = self.folder()
+        self.assertEqual(f.listing(), [])
+        self.assertIn("over the weight's columns", f.skipped["square-columns"],
+                      "a [1][cols] magnitude says which way it runs; a square weight must not read it as the rows")
+        safetensors(self.d / "shape.safetensors", qwen_lora(
+            extra={"transformer.transformer_blocks.0.attn.to_q.dora_scale": (7, 9)}))
+        self.assertIn("neither the weight's rows nor its columns", self.folder().skipped["shape"])
+
+    def test_rslora_is_refused_by_either_name_and_a_plain_metadata_alpha_is_not(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        for name, field in (("kohya", "use_rslora"), ("diffusers", "transformer.use_rslora")):
+            safetensors(self.d / f"{name}.safetensors", qwen_lora(extra={b + ".alpha": (1,)}),
+                        {"lora_adapter_metadata": '{"%s": true, "lora_alpha": 8, "rank": 4}' % field})
+        f = self.folder()
+        self.assertEqual(f.listing(), [])
+        for name in ("kohya", "diffusers"):
+            self.assertIn("rsLoRA", f.skipped[name], f.skipped)
+        safetensors(self.d / "alpha.safetensors", qwen_lora(),
+                    {"lora_adapter_metadata": '{"transformer.lora_alpha": 8, "use_rslora": false}'})
+        self.assertEqual([e["name"] for e in self.folder().listing()], ["alpha"])
+        # one field a component in the same metadata (diffusers' packed save): the transformer's rsLoRA is read even
+        # where a text encoder's false comes first in the sorted keys (the engine's json_true does the same)
+        safetensors(self.d / "packed.safetensors", qwen_lora(),
+                    {"lora_adapter_metadata": '{"text_encoder.rank": 4, "text_encoder.use_rslora": false, '
+                                              '"transformer.rank": 4, "transformer.use_rslora": true}'})
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["alpha"], f.skipped)
+        self.assertIn("rsLoRA", f.skipped["packed"], f.skipped)
+
+    def test_metadata_that_names_two_different_alphas_is_refused(self):
+        # diffusers' pack_weights writes one metadata field a component into the same "lora_adapter_metadata", so a
+        # file that carries a text encoder's and a transformer's adapter holds two alphas; the engine reads one alpha
+        # for the weights that keep no ".alpha" of their own, so which one those take is not said (review2's FIX-1).
+        two = '{"text_encoder.lora_alpha": 8, "text_encoder.rank": 4, "transformer.lora_alpha": 64, ' \
+              '"transformer.rank": 4}'
+        every = {f"transformer.transformer_blocks.{b}.{n}.alpha": (1,)
+                 for b in (0, 1) for n in ("attn.to_q", "attn.to_out.0", "img_mlp.gate_layer", "img_mlp.proj",
+                                           "img_mlp.out")}
+        safetensors(self.d / "two-alphas.safetensors", qwen_lora(), {"lora_adapter_metadata": two})
+        safetensors(self.d / "two-alphas-tensor.safetensors", qwen_lora(extra=every),
+                    {"lora_adapter_metadata": two})   # every weight says its own alpha: the file is this model's
+        safetensors(self.d / "same-alphas.safetensors", qwen_lora(),
+                    {"lora_adapter_metadata": '{"text_encoder.lora_alpha": 16, "transformer.lora_alpha": 16}'})
+        safetensors(self.d / "one-alpha.safetensors", qwen_lora(),
+                    {"lora_adapter_metadata": '{"transformer.lora_alpha": 16}'})
+        f = self.folder()
+        self.assertEqual(sorted(e["name"] for e in f.listing()),
+                         ["one-alpha", "same-alphas", "two-alphas-tensor"], f.skipped)
+        self.assertIn("different lora_alpha values", f.skipped["two-alphas"], f.skipped)
+
+    def test_keys_that_hold_no_tensor_of_the_adapter_are_said(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        safetensors(self.d / "peft.safetensors", qwen_lora(extra={
+            b + ".base_layer.bias": (256,), "transformer.format_version": (1,)}))
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["peft"], "the file is still this model's")
+        self.assertEqual(set(f.ignored["peft"]), {b + ".base_layer.bias", "transformer.format_version"},
+                         "said, never dropped in silence")
 
     def test_a_loha_is_listed_with_its_factors_rank(self):
         b = "transformer.transformer_blocks.0."
@@ -406,6 +485,88 @@ class Listing(Tree):
                       "Qwen-Image-2.1's weights are not MOSS-Image's")
         use = loras.field([{"name": "moss"}], f)[0]
         self.assertEqual(use["name"], "moss")
+
+
+def underscore_form(tensors: dict[str, tuple[int, ...]], prefix: str = "lora_unet_") -> dict[str, tuple[int, ...]]:
+    """The same tensors as an sd-scripts file (`lora_unet_`) or a LyCORIS one (`lycoris_`) writes them: the weight's
+    name with every dot an underscore, the role's own suffix and `.weight` as they stand in the dot form."""
+    out: dict[str, tuple[int, ...]] = {}
+    for raw, shape in tensors.items():
+        key, role, _ = loras.split_key(raw)
+        tail = ".weight" if raw.endswith(".weight") else ""
+        suffix = next(s for s, r in loras.ROLES if r == role and raw[: len(raw) - len(tail)].endswith(s))
+        out[f"{prefix}{key.replace('.', '_')}{suffix}{tail}"] = shape
+    return out
+
+
+class Underscores(Tree):
+    """sd-scripts' `lora_unet_` keys and the LyCORIS form's `lycoris_` ones (the survey's problems 1 and 2): the same
+    weights a dot-form file names, with every dot of the model's own name written as an underscore.  MageTrail shares
+    Mage-Flow's table, so these three tables cover the four models."""
+
+    FAMILIES = (("qwen-image", qwen_lora), ("mage-flow", mage_lora), ("moss-image", moss_lora))
+
+    def test_sd_scripts_and_lycoris_names_read_as_the_dot_form(self):
+        for family, make in self.FAMILIES:
+            dot = make(blocks=(0,))
+            safetensors(self.d / f"{family}-dot.safetensors", dot)
+            safetensors(self.d / f"{family}-unet.safetensors", underscore_form(dot, "lora_unet_"))
+            safetensors(self.d / f"{family}-lyco.safetensors", underscore_form(dot, "lycoris_"))
+            f = self.folder(family)
+            entries = {e["name"]: e for e in f.listing()}
+            self.assertEqual(sorted(entries), [f"{family}-dot", f"{family}-lyco", f"{family}-unet"], f.skipped)
+            want = (entries[f"{family}-dot"]["rank"], entries[f"{family}-dot"]["targets"])
+            for other in (f"{family}-unet", f"{family}-lyco"):
+                self.assertEqual((entries[other]["rank"], entries[other]["targets"]), want,
+                                 f"{family}: {other} names the same weights, every dot an underscore")
+
+    def test_the_other_forms_under_the_underscore_prefixes(self):
+        # a LoHa and a LoKr (LyCORIS' own forms, sd-scripts' and SimpleTuner's names) and a DoRA's magnitude in
+        # LyCORIS' [rows][1] shape: each lists as the dot form of the very same tensors does
+        loha = {"transformer.transformer_blocks.0.attn.to_q.hada_w1_a.weight": (256, 8),
+                "transformer.transformer_blocks.0.attn.to_q.hada_w1_b.weight": (8, 256),
+                "transformer.transformer_blocks.0.attn.to_q.hada_w2_a.weight": (256, 4),
+                "transformer.transformer_blocks.0.attn.to_q.hada_w2_b.weight": (4, 256),
+                "transformer.transformer_blocks.0.attn.to_q.alpha": (1,)}
+        lokr = {"transformer.layers.0.proj.ffn_up_gate.lokr_w1_a": (16, 8),   # the name's own underscores too
+                "transformer.layers.0.proj.ffn_up_gate.lokr_w1_b": (8, 16),
+                "transformer.layers.0.proj.ffn_up_gate.lokr_w2": (16, 16)}
+        dora = mage_lora(blocks=(0,),
+                         extra={"diffusion_model.transformer_blocks.0.attn.to_q.dora_scale": (256, 1)})
+        for family, tensors, prefix in (("qwen-image", loha, "lora_unet_"), ("moss-image", lokr, "lycoris_"),
+                                        ("mage-flow", dora, "lora_unet_")):
+            fields = [(e["rank"], e["targets"]) for e in self._both_forms(family, tensors, prefix)]
+            self.assertEqual(fields[0], fields[1], f"{family}: {prefix} reads as the dot form ({fields})")
+
+    def _both_forms(self, family: str, tensors: dict, prefix: str) -> list[dict]:
+        """The folder's one entry, once from the dot form and once from the underscore form of the same tensors."""
+        out = []
+        for tensors_, name in ((tensors, "dot"), (underscore_form(tensors, prefix), "under")):
+            safetensors(self.d / f"{name}.safetensors", tensors_)
+            f = self.folder(family)
+            self.assertEqual([e["name"] for e in f.listing()], [name], f.skipped)
+            out.append(f.listing()[0])
+            (self.d / f"{name}.safetensors").unlink()
+        return out
+
+    def test_an_underscore_name_the_model_has_not_is_said_as_the_file_wrote_it(self):
+        safetensors(self.d / "moss-on-qwen.safetensors", {
+            "lora_unet_layers_3_proj_ffn_up_gate.lora_down.weight": (4, 128),
+            "lora_unet_layers_3_proj_ffn_up_gate.lora_up.weight": (256, 4)})
+        f = self.folder("qwen-image")
+        self.assertEqual(f.listing(), [])
+        self.assertIn("layers_3_proj_ffn_up_gate", f.skipped["moss-on-qwen"],
+                      "the name no table answers, said as the file wrote it")
+
+    def test_animas_kohya_names_read_as_the_models_own_names(self):
+        # Anima's names were the ones that read, through a table that held each name dotted as well; the underscore
+        # table answers them by the real names, so a listing's kinds read as the DiT writes them
+        names = ("self_attn_q_proj", "cross_attn_v_proj", "mlp_layer1", "adaln_modulation_mlp_2")
+        safetensors(self.d / "anima-kohya.safetensors", {
+            **{f"lora_unet_blocks_0_{n}.lora_down.weight": (8, 256) for n in names},
+            **{f"lora_unet_blocks_0_{n}.lora_up.weight": (256, 8) for n in names}})
+        self.assertEqual([e["targets"] for e in self.folder("anima").listing()],
+                         [["adaln_modulation_mlp.2", "cross_attn.v_proj", "mlp.layer1", "self_attn.q_proj"]])
 
 
 class Requests(Tree):
@@ -669,6 +830,19 @@ class Job(Tree):
         self.assertEqual(job["prompt"], "a  cat")
         self.assertEqual(job["lora_unknown"], ["nope"])
         self.assertNotIn("loras", job, "nothing is applied")
+
+    def test_an_ignored_key_of_an_applied_file_is_said(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        safetensors(self.d / "peft-side.safetensors", qwen_lora(blocks=(0,), extra={b + ".base_layer.bias": (256,)}))
+        job = images.parse_request({"prompt": "a cat", "size": "256x256", "lora": [{"name": "peft-side"}]}, self.cfg)
+        self.assertNotIn("ignored", job["loras"][0], "the listing's shape is unchanged")
+        self.gen.log = io.StringIO()   # the log says the names too, at one key (review2's FIX-2)
+        _, figures = self.gen.run(job)
+        self.assertEqual(figures["lora_ignored"], [{"name": "peft-side", "n": 1, "keys": [b + ".base_layer.bias"]}],
+                         "the key is said in the response and the log, not dropped in silence")
+        line = self.gen.log.getvalue()
+        self.assertIn(f"lora peft-side: 1 of its keys hold no adapter tensor and were left out ({b}.base_layer.bias)",
+                      line)
 
     def test_the_refusals(self):
         with self.assertRaises(images.ImageRequestError):

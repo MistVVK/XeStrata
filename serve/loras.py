@@ -5,13 +5,16 @@ prompt tags checked against them (the image engine reads and applies them: src/i
 
 The files are read by their headers only (a safetensors' JSON, a GGUF's metadata and tensor infos): each tensor's name
 and shape and the file's string metadata.  A key is brought to the DiT's name the way the engine brings it (split_key:
-the file's prefix off, ".weight" off, the role's suffix off), and a file is this model's when every weight it changes
-is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
-build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
-name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
-dora_scale over the weight's rows: the weight's rows' norms rescaled), a whole weight's difference (diff, set_weight,
-w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
-constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input
+the file's prefix off, ".weight" off, the role's suffix off; sd-scripts' and the LyCORIS form's names, which write
+every dot as an underscore, by the model's own names - kohya_name, and the engine's lora_key_names), and a file is
+this model's when every weight it changes is one the DiT's products take (TARGETS: the names of qi_dit.cpp's,
+moss_dit.cpp's and mf_dit.cpp's build_lora_targets, written here a second time; the record's check sets them
+against the probe's `map` on the models, name for name), in a form the engine applies today: a plain LoRA, LoKr or
+LoHa (a DoRA: a plain LoRA with a magnitude over the weight's rows, the weight's rows' norms rescaled - `dora_scale`,
+or the same vector as PEFT writes it (`lora_magnitude_vector`, its `.default` form too) or as ai-toolkit writes it
+(`.magnitude`), and LyCORIS's [rows][1] shape too), a whole weight's difference (diff, set_weight, w_norm), or an
+OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the constraint on the
+block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input
 its factors make, beside a plain form's pair), and no text encoder's weight.  A bias's delta (diff_b, or b_norm beside
 w_norm) goes with any of them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all
 do; MOSS-Image's outside its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it
@@ -27,6 +30,12 @@ A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health
   trigger   its trigger words (modelspec.trigger_phrase, ss_trigger_words, ...), else None
   targets   the kinds of weights it changes ("attn.to_q", "img_mlp.gate_layer", "modulation.1")
   size_mib  the file's size
+
+A file's keys that name no tensor of an adapter (PEFT's `base_layer.bias`, an auxiliary projector, a sidecar) are not
+dropped in silence: the scan keeps them in Folder.ignored, a request that applies such a file says them in its
+response's xestrata-engine (lora_ignored) and in the log, and so does the engine (image_lora.cpp, to its stderr).
+A file whose metadata says rsLoRA is not listed: its scale is alpha / sqrt(rank), which the engine does not apply
+(docs).
 
 A request's adapters come from the "lora" field - a list of {"name", "scale"} or one such object (vLLM-Omni's shape), a
 name alone, or one of those as JSON text (a multipart form's field) - and from the prompt's tags, <lora:name:0.8> in
@@ -89,8 +98,8 @@ _MAGE_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.add_q_proj", "attn.
 _MAGE_OUTSIDE = ("img_in", "txt_in", "time_text_embed.timestep_embedder.linear_1",
                  "time_text_embed.timestep_embedder.linear_2", "norm_out.linear", "proj_out")
 # Anima's (src/image/anima_dit.cpp's build_lora_targets): the blocks' attentions, MLP and modulations, the LLM
-# adapter's, and the parts outside them.  sd-scripts' keys reach here with every underscore a dot, and these names hold
-# underscores: each is matched dotted too (the engine compares both ways)
+# adapter's, and the parts outside them.  These names hold underscores of their own, which is what the underscore
+# table (_KOHYA, kohya_name) is for: sd-scripts' keys reach this model with every dot an underscore.
 _ANIMA_BLOCKS = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.output_proj",
                  "cross_attn.q_proj", "cross_attn.k_proj", "cross_attn.v_proj", "cross_attn.output_proj",
                  "mlp.layer1", "mlp.layer2", "adaln_modulation_self_attn.1", "adaln_modulation_self_attn.2",
@@ -110,7 +119,7 @@ TARGETS: dict[str, tuple[str, ...]] = {
     "moss-image": (_MOSS_OUTSIDE + tuple("text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS) +
                    tuple("layers.{b}." + n for n in _MOSS_BLOCKS)),
     "mage-flow": (_MAGE_OUTSIDE + tuple("transformer_blocks.{b}." + n for n in _MAGE_BLOCKS)),
-    "anima": _ANIMA + tuple(n.replace("_", ".") for n in _ANIMA),
+    "anima": _ANIMA,
 }
 
 # The weights that add a bias of their own, where a bias's delta (diff_b, or b_norm beside w_norm) goes: Mage-Flow's
@@ -122,7 +131,7 @@ _BIASED_NAMES: dict[str, tuple[str, ...]] = {
                    "video_head_modulation", "text_embedder.proj") + tuple(
                        "text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS),
     "mage-flow": TARGETS["mage-flow"],
-    "anima": _ANIMA_BIASED + tuple(n.replace("_", ".") for n in _ANIMA_BIASED),
+    "anima": _ANIMA_BIASED,
 }
 
 
@@ -136,9 +145,11 @@ _BIASED = {family: tuple(_target_pattern(n) for n in names) for family, names in
 
 # A file's key -> the DiT's weight and the tensor's role, as the engine reads them (src/image/image_lora.cpp's
 # split_key): the longest prefix first, ".weight" off every form but PEFT's bare lora_A and lora_B, then the role's
-# suffix, longest first too.  sd-scripts' keys write the module's dots as underscores (lora_unet_...), and these models
-# name no weight that way.
-PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_")
+# suffix, longest first too.  sd-scripts' keys (`lora_unet_`) and the LyCORIS form's (`lycoris_`) write a weight's
+# name with every dot an underscore; those two prefixes leave the name for kohya_name below to bring to the model's
+# own (the engine matches the same two forms against its target table, image_lora's lora_key_names).
+PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_", "lycoris_")
+UNDERSCORE_PREFIXES = ("lora_unet_", "lycoris_")
 ROLES = (
     (".lora_A.default", "lora_A"), (".lora_B.default", "lora_B"),
     (".lora.down", "lora_A"), (".lora.up", "lora_B"),
@@ -146,6 +157,9 @@ ROLES = (
     (".lora_down", "lora_A"), (".lora_up", "lora_B"),
     (".lora_mid", "lora_mid"), (".lora_linear_layer.down", "lora_A"), (".lora_linear_layer.up", "lora_B"),
     (".alpha", "alpha"), (".dora_scale", "dora_scale"),
+    # PEFT's and ai-toolkit's names for the same thing (a DoRA's magnitude, over the weight's rows)
+    (".lora_magnitude_vector.default", "dora_scale"), (".lora_magnitude_vector", "dora_scale"),
+    (".magnitude", "dora_scale"),
     (".lokr_w1_a", "lokr_w1_a"), (".lokr_w1_b", "lokr_w1_b"), (".lokr_w2_a", "lokr_w2_a"), (".lokr_w2_b", "lokr_w2_b"),
     (".lokr_w1", "lokr_w1"), (".lokr_w2", "lokr_w2"), (".lokr_t2", "lokr_t2"),
     (".hada_w1_a", "hada_w1_a"), (".hada_w1_b", "hada_w1_b"), (".hada_w2_a", "hada_w2_a"), (".hada_w2_b", "hada_w2_b"),
@@ -166,13 +180,13 @@ class LoraError(ValueError):
     """A request's adapters that cannot be taken (the image endpoint's 400)."""
 
 
-def split_key(raw: str) -> tuple[str, str]:
-    """A key as a file writes it -> (the DiT's weight's name, the tensor's role); ("", "") for a key of no role (a
-    file's own: a quantization's, a config's)."""
-    s, kohya = raw, False
+def split_key(raw: str) -> tuple[str, str, bool]:
+    """A key as a file writes it -> (the weight's name, the tensor's role, whether the name is one's dots are written
+    as underscores); ("", "", False) for a key of no role (a file's own: a quantization's, a config's)."""
+    s, under = raw, False
     for p in PREFIXES:
         if s.startswith(p):
-            kohya = p == "lora_unet_"
+            under = p in UNDERSCORE_PREFIXES
             s = s[len(p):]
             break
     if s.endswith(".weight"):
@@ -182,9 +196,50 @@ def split_key(raw: str) -> tuple[str, str]:
         if s.endswith(suffix):
             s, role = s[: -len(suffix)], r
             break
-    if kohya:
-        s = s.replace("_", ".")
-    return s, role
+    return s, role, under
+
+
+def _kohya_forms(name: str) -> list[tuple[str, str]]:
+    """A weight's underscore-written name as the chances of finding it in the table: itself, and itself with each
+    run of digits standing for a block's number (`transformer_blocks_12_attn_to_q` as
+    `transformer_blocks_{b}_attn_to_q`).  A name's own digits stay where they are (`img_mlp_net_0_proj`,
+    `modulation_1`), so trying each run once is enough and no pattern scan is needed."""
+    parts = re.split(r"(\d+)", name)
+    got = [(name, "")]
+    for i in range(1, len(parts), 2):
+        got.append(("".join("{b}" if j == i else p for j, p in enumerate(parts)), parts[i]))
+    return got
+
+
+# The underscore form of every weight a DiT takes, made from the model's own names (each name's dots written as
+# underscores, not the file's underscores read back as dots).  A name's own underscores stay underscores
+# (`attn.to_q`, `proj.ffn_up_gate`, `img_mlp.net.0.proj`), which a blanket turn of the file's underscores into dots
+# missed: that read only names with no underscore at all (Anima's names were matched both ways for it).
+_KOHYA = {family: {n.replace(".", "_"): n for n in names} for family, names in TARGETS.items()}
+
+
+def kohya_name(name: str, family: str) -> str:
+    """The weight a key left by `lora_unet_` or `lycoris_` names (every dot an underscore), as `family` names it;
+    "" when that model names no such weight (the engine answers the same way, lora_key_names)."""
+    table = _KOHYA.get(family) or {}
+    for chance, block in _kohya_forms(name):
+        got = table.get(chance)
+        if got is not None:
+            return got.replace("{b}", block)
+    return ""
+
+
+def dora_way(shape: tuple[int, ...], rows: int, cols: int) -> str:
+    """Which way a DoRA's magnitude runs: "rows" (what the engine scales), "columns", or "" (neither).  LyCORIS and
+    PEFT write the rows' vector as [rows][1] and the columns' as [1][cols], so a 1 says which; a bare [n] takes n,
+    and a square weight's magnitude reads as the rows."""
+    if len(shape) == 1:
+        return "rows" if shape[0] == rows else ("columns" if shape[0] == cols else "")
+    if len(shape) == 2 and shape[1] == 1 and shape[0] == rows:
+        return "rows"
+    if len(shape) == 2 and shape[0] == 1 and shape[1] == cols:
+        return "columns"
+    return ""
 
 
 def form_of(roles) -> str:
@@ -489,6 +544,39 @@ def _recommended(meta: dict[str, str]) -> float:
     return 1.0
 
 
+def _peft_meta(meta: dict[str, str]) -> dict:
+    """PEFT's and diffusers' adapter metadata (the JSON string they keep in "lora_adapter_metadata"), as a dict.
+    Its keys carry the model's own prefix ("transformer.lora_alpha"), so they are looked up by their end."""
+    raw = meta.get("lora_adapter_metadata") or ""
+    if not raw:
+        return {}
+    try:
+        got = json.loads(raw)
+    except ValueError:
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _meta_flag(peft: dict, key: str) -> bool:
+    """Whether PEFT's metadata says `key` (a diffusers-form file names it "transformer.use_rslora")."""
+    for name, value in peft.items():
+        if (name == key or name.endswith("." + key)) and value is True:
+            return True
+    return False
+
+
+def _meta_alphas(peft: dict) -> list[float]:
+    """Every lora_alpha the PEFT metadata keeps: PEFT's plain one, and the one a diffusers file gives each component
+    ("text_encoder.lora_alpha" beside "transformer.lora_alpha", as its _pack_dict_with_prefix writes them)."""
+    got: list[float] = []
+    for name, value in peft.items():
+        if name == "lora_alpha" or name.endswith(".lora_alpha"):
+            v = _finite(value)
+            if v is not None:
+                got.append(v)
+    return got
+
+
 def _trigger(meta: dict[str, str]) -> str | None:
     for key in TRIGGER_KEYS:
         v = (meta.get(key) or "").strip()
@@ -514,6 +602,7 @@ class Folder:
         self._by_name: dict[str, dict] = {}
         self._by_path: dict[str, dict] = {}
         self.skipped: dict[str, str] = {}   # a file that is not this model's, and why (a request's error says so)
+        self.ignored: dict[str, list[str]] = {}   # an adapter's keys that hold no role: said, never applied silently
         self._mtime: int | None = None
         self._read = 0.0
         self._scan(force=True)
@@ -549,10 +638,13 @@ class Folder:
                 made.append(entry)
         # the same stem twice (a.safetensors beside a.gguf): each keeps its extension
         repeated = collections.Counter(x["name"] for x in made)
-        self._listing, self._by_name, self._by_path = [], {}, {}
+        self._listing, self._by_name, self._by_path, self.ignored = [], {}, {}, {}
         for entry in made:
+            left = entry.pop("ignored", [])
             if repeated[entry["name"]] > 1:
                 entry = {**entry, "name": entry["path"]}
+            if left:
+                self.ignored[entry["name"]] = left   # a request says them (images.py: xestrata-engine.lora_ignored)
             self._listing.append(entry)
             self._by_name[entry["name"]] = entry
             self._by_path[entry["path"]] = entry
@@ -562,13 +654,33 @@ class Folder:
         """One file's listing entry, or why this model does not take it."""
         tensors, meta = read_header(path)
         weights: dict[str, dict[str, tuple[int, ...]]] = {}
+        ignored: list[str] = []
+        under: dict[str, str] = {}   # an underscore name resolved once, not once a tensor of that weight
         for raw, shape in tensors.items():
-            key, role = split_key(raw)
-            if not role or is_training_aid(key):
+            key, role, underscore = split_key(raw)
+            if not role:   # the file's own (a quantization's, a config's) or one this engine applies not yet
+                ignored.append(raw)
+                continue
+            if underscore:   # sd-scripts' and the LyCORIS form's names, brought to this model's
+                if key not in under:
+                    under[key] = kohya_name(key, self.family) or key
+                key = under[key]
+            if is_training_aid(key):   # trained beside the adapter, not one of the model's weights
+                ignored.append(raw)
                 continue
             weights.setdefault(key, {})[role] = shape
         if not weights:
             return "it holds no adapter tensors"
+        peft = _peft_meta(meta)
+        if _meta_flag(peft, "use_rslora"):
+            return ("the adapter is rsLoRA (use_rslora), whose scale is alpha / sqrt(rank), not the plain "
+                    "alpha / rank the image engine applies")
+        alphas = set(_meta_alphas(peft))
+        # a weight without its own ".alpha" is the one that would take the metadata's, so a file whose weights all
+        # carry an ".alpha" needs no answer here either (the engine's rule, apply_peft_metadata, is the same one)
+        if len(alphas) > 1 and any("alpha" not in roles for roles in weights.values()):
+            return (f"its metadata names {len(alphas)} different lora_alpha values (a text encoder's and a "
+                    "transformer's in one file): which one the image weights take is not said")
         targets: set[str] = set()
         rank = 0
         for key, roles in sorted(weights.items()):
@@ -647,16 +759,17 @@ class Folder:
                     return f"{key}: lora_A and lora_B must be matrices"
                 if b[1] != a[0]:
                     return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
-                if "dora_scale" in roles and tuple(roles["dora_scale"]) != (b[0],):
-                    # the engine's DoRA scales the weight's output rows, c = dora_scale / (|W| a row + eps)
-                    if tuple(roles["dora_scale"]) == (a[1],):
-                        return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA "
-                                f"does not take (it scales a product's rows)")
+                way = dora_way(roles["dora_scale"], b[0], a[1]) if "dora_scale" in roles else "rows"
+                if way == "columns":   # the engine's DoRA scales a product's rows, c = dora_scale / (|W| a row + eps)
+                    return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA "
+                            f"does not take (it scales a product's rows)")
+                if way != "rows":
                     return f"{key}: dora_scale is neither the weight's rows nor its columns"
                 rank = max(rank, a[0])
             targets.add(kind_of(key))
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
-                "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1)}
+                "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1),
+                "ignored": sorted(ignored)}
 
     def listing(self) -> list[dict]:
         """This model's adapters, each a listing entry (a copy: a caller may not change the kept one)."""

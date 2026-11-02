@@ -7,8 +7,9 @@
 // (or `x.lora_B.weight` and `x.lora_A.weight`, `x.lora.up.weight` and `x.lora.down.weight`, or the bare
 // `x.lora_B`/`x.lora_A` of PEFT's own saves), with `x.alpha` and `x.dora_scale` beside them.  A file's prefix says
 // whose names they are: `transformer.` for diffusers' saves, `diffusion_model.` and `model.diffusion_model.` for
-// the dot form's (the DiT's names with points between them) and a GGUF's.  What is left is the DiT's own name, which
-// the DiT's target table matches.
+// the dot form's (the DiT's names with points between them) and a GGUF's, and `lora_unet_` (sd-scripts) or
+// `lycoris_` (LyCORIS, SimpleTuner) for the files that write a name with every dot an underscore.  What is left is the
+// DiT's own name, which the DiT's target table matches in either spelling (lora_key_names).
 //
 // A LoHa (LyCORIS) writes one weight's delta as the element-wise product of two low-rank products,
 // (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core (hada_t1, hada_t2) where the
@@ -64,8 +65,11 @@ bool ends_with(const std::string& s, const std::string& suffix) {
 void strip_suffix(std::string& s, const std::string& suffix) { s.erase(s.size() - suffix.size()); }
 
 // The prefixes a file's keys may carry; the first that matches is dropped (`model.diffusion_model.` before
-// `diffusion_model.`, so the longest is listed first).
-const char* const kPrefixes[] = {"model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_"};
+// `diffusion_model.`, so the longest is listed first).  `lora_unet_` (sd-scripts, LyCORIS' kohya form) and
+// `lycoris_` (LyCORIS' own, SimpleTuner's) leave a weight's name with every dot written as an underscore, which
+// lora_key_names matches against the DiT's own names.
+const char* const kPrefixes[] = {"model.diffusion_model.", "diffusion_model.", "transformer.", "lora_unet_",
+                                 "lycoris_"};
 
 // The suffixes that say which tensor of a weight a key is; the role is the name here, the key is what is left.  The
 // first that matches wins, so a longer suffix is listed before its prefix (`lora_A.default` before `lora_A`).
@@ -81,6 +85,8 @@ const RoleSuffix kRoles[] = {
     {".lora_mid", "lora_mid"},       {".lora_linear_layer.down", "lora_A"},
     {".lora_linear_layer.up", "lora_B"},
     {".alpha", "alpha"},             {".dora_scale", "dora_scale"},
+    {".lora_magnitude_vector.default", "dora_scale"},   // PEFT's and ai-toolkit's names for the same magnitude
+    {".lora_magnitude_vector", "dora_scale"},          {".magnitude", "dora_scale"},
     {".lokr_w1_a", "lokr_w1_a"},     {".lokr_w1_b", "lokr_w1_b"},
     {".lokr_w2_a", "lokr_w2_a"},     {".lokr_w2_b", "lokr_w2_b"},
     {".lokr_w1", "lokr_w1"},         {".lokr_w2", "lokr_w2"},
@@ -95,13 +101,13 @@ const RoleSuffix kRoles[] = {
     {".reshape_weight", "reshape_weight"},
 };
 
-// A key as the file writes it -> the DiT's name and the role (empty: not one of the forms' tensors).
+// A key as the file writes it -> the DiT's name as the file spells it and the role (empty: not one of the forms'
+// tensors).  An underscore form keeps its underscores: only the DiT's own names answer it (lora_key_names), so a
+// name's own underscores (`attn.to_q`) are not mistaken for dots.
 void split_key(const std::string& raw, std::string& key, std::string& role) {
     std::string s = raw;
-    bool kohya = false;
     for (const char* p : kPrefixes) {
         if (s.rfind(p, 0) == 0) {
-            kohya = std::strcmp(p, "lora_unet_") == 0;
             s.erase(0, std::strlen(p));
             break;
         }
@@ -115,8 +121,6 @@ void split_key(const std::string& raw, std::string& key, std::string& role) {
             break;
         }
     }
-    if (kohya)   // sd-scripts' keys: the module's dots written as underscores (these models name none this way)
-        std::replace(s.begin(), s.end(), '_', '.');
     key = s;
 }
 
@@ -220,13 +224,27 @@ private:
     GgufFile g_;
 };
 
-// The metadata's first number after "key" (PEFT writes alpha and rank there as JSON, its keys prefixed with the
-// model's, e.g. "transformer.lora_alpha": 64).
-bool json_number(const std::string& s, const std::string& key, double& out) {
-    const std::string pat = "\"" + key + "\"";
-    size_t at = s.find(pat);
+// Where a metadata key's value starts: the key written plain ("lora_alpha") or with the model's own prefix
+// ("transformer.lora_alpha"), as diffusers' _pack_dict_with_prefix and PEFT's pipeline saves write it.  npos: no such
+// key at or after `from`.
+size_t meta_value_at(const std::string& s, const std::string& key, size_t from) {
+    const std::string pat = key + "\"";
+    size_t at = s.find(pat, from);
     while (at != std::string::npos) {
-        size_t i = at + pat.size();
+        if (at >= 1 && (s[at - 1] == '"' || s[at - 1] == '.')) return at + pat.size();
+        at = s.find(pat, at + 1);
+    }
+    return std::string::npos;
+}
+
+// Every number the metadata keeps under `key`, plain or prefixed: PEFT writes alpha and rank there as JSON.  A
+// diffusers file that packs several adapters in one writes one metadata field a component
+// ("text_encoder.lora_alpha" beside "transformer.lora_alpha"), so the same name can appear more than once.
+std::vector<double> json_numbers(const std::string& s, const std::string& key) {
+    std::vector<double> got;
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = at;
         while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
         if (i < s.size() && s[i] == ':') {
             ++i;
@@ -234,25 +252,28 @@ bool json_number(const std::string& s, const std::string& key, double& out) {
             const char* b = s.c_str() + i;
             char* e = nullptr;
             const double v = std::strtod(b, &e);
-            if (e != b) {
-                out = v;
-                return true;
-            }
+            if (e != b) got.push_back(v);
         }
-        at = s.find(pat, at + 1);
+        at = meta_value_at(s, key, at + 1);
     }
-    return false;
+    return got;
 }
 
+// Whether the metadata says `key` true under any of its names (plain, or a component's prefix).  A packed file holds
+// one field a component, so `text_encoder.use_rslora` and `transformer.use_rslora` can both be in it: serve/loras.py
+// refuses the file when any of them is true, and the engine refuses it the same way.
 bool json_true(const std::string& s, const std::string& key) {
-    const std::string pat = "\"" + key + "\"";
-    const size_t at = s.find(pat);
-    if (at == std::string::npos) return false;
-    size_t i = s.find(':', at + pat.size());
-    if (i == std::string::npos) return false;
-    ++i;
-    while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
-    return s.compare(i, 4, "true") == 0;
+    size_t at = meta_value_at(s, key, 0);
+    while (at != std::string::npos) {
+        size_t i = s.find(':', at);
+        if (i != std::string::npos) {
+            ++i;
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+            if (s.compare(i, 4, "true") == 0) return true;
+        }
+        at = meta_value_at(s, key, at + 1);
+    }
+    return false;
 }
 
 /// The host's threads for one deltas' making: as many as the machine has, up to 16 (the image engine's other host rows
@@ -890,15 +911,17 @@ LoraEntry make_entry(Group& g, const std::string& path) {
             throw std::runtime_error(path_key_what(path, e.key, std::string("a dora_scale on ") +
                                                                    (e.kind == LoraKind::oft ? "an OFT" : "a GLoRA") +
                                                                    ": the engine's DoRA is the plain form's"));
-        if (d->v.size() == (size_t) e.rows) {
-            e.dora = d->v;
-            e.dora_over_rows = true;
-        } else if (d->v.size() == (size_t) e.cols) {
-            e.dora = d->v;
-            e.dora_over_rows = false;
-        } else {
+        // Which way the magnitude runs, from its shape and not its element count: LyCORIS and PEFT write the rows as
+        // [rows][1] and the columns as [1][cols], so a 1 says which; a bare [n] takes n, and a weight whose rows are
+        // its columns (a square one) reads as the rows.
+        const int64_t n = (int64_t) d->v.size();
+        bool rows = false, cols = false;
+        if (d->shape.size() == 2 && d->shape[0] == 1) cols = n == e.cols;   // [1][cols]: over the columns
+        else if (d->shape.size() != 2 || d->shape[1] == 1) rows = n == e.rows;   // [rows] or [rows][1]: the rows
+        if (!rows && !cols)
             throw std::runtime_error(path_and(path, e.key) + ": dora_scale is neither the rows nor the columns");
-        }
+        e.dora = d->v;
+        e.dora_over_rows = rows;
     }
     if (role("lora_mid") != nullptr)
         throw std::runtime_error(path_and(path, e.key) +
@@ -954,10 +977,14 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
     std::sort(names.begin(), names.end());
     std::vector<Group> groups;
     std::map<std::string, size_t> index;
+    std::vector<std::string> left_out;   // keys that name no tensor of an adapter: said, never dropped in silence
     for (const std::string& raw : names) {
         std::string key, role;
         split_key(raw, key, role);
-        if (role.empty()) continue;   // a key of the file's own (a quantization's, a config's)
+        if (role.empty()) {   // a key of the file's own (a quantization's, a config's) or one the engine reads not yet
+            left_out.push_back(raw);
+            continue;
+        }
         if (key.empty()) throw std::runtime_error(path_key_what(path, raw, "a tensor with no weight's name"));
         if (is_training_aid(key)) {
             std::fprintf(stderr, "image engine: %s: %s: a training aid, not a LoRA tensor: left out\n", path.c_str(),
@@ -977,6 +1004,13 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
         }
         roles.emplace(role, rd.get(raw));
     }
+    if (!left_out.empty()) {   // the same names serve/loras.py kept and the response says: the first 6 and the count
+        std::string names;
+        for (size_t i = 0; i < left_out.size() && i < 6; ++i) names += (i ? ", " : "") + left_out[i];
+        if (left_out.size() > 6) names += ", ...";
+        std::fprintf(stderr, "image engine: %s: %zu of its keys hold no adapter tensor and were left out (%s)\n",
+                     path.c_str(), left_out.size(), names.c_str());
+    }
     std::vector<LoraEntry> entries;
     entries.reserve(groups.size());
     for (Group& g : groups) entries.push_back(make_entry(g, path));
@@ -984,7 +1018,9 @@ std::vector<LoraEntry> read_entries(Reader& rd, const std::string& path) {
 }
 
 // The scale a PEFT-form file keeps in its metadata ("lora_adapter_metadata": a JSON string), where no ".alpha"
-// tensor says it: alpha / rank.  rsLoRA's scale is another one (alpha / sqrt(rank)) and is refused.
+// tensor says it: alpha / rank.  rsLoRA's scale is another one (alpha / sqrt(rank)) and is refused, and so is a file
+// that names two different alphas: the engine reads one alpha for a file's weights, so which one the image's are
+// under is not said (diffusers writes a text encoder's and a transformer's one in the same field).
 void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::string, std::string>& meta) {
     std::string json;
     for (const auto& [k, v] : meta)
@@ -993,16 +1029,47 @@ void apply_peft_metadata(std::vector<LoraEntry>& entries, const std::map<std::st
     if (json_true(json, "use_rslora"))
         throw std::runtime_error("the adapter is rsLoRA (use_rslora), whose scale is not the plain alpha / rank: not "
                                  "supported yet");
-    double alpha = 0;
-    if (!json_number(json, "lora_alpha", alpha)) return;
+    const std::vector<double> alphas = json_numbers(json, "lora_alpha");
+    size_t distinct = 0;   // how many different values those names hold: a file of one component holds one
+    for (size_t i = 0; i < alphas.size(); ++i) {
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j)
+            if (alphas[j] == alphas[i]) {
+                seen = true;
+                break;
+            }
+        if (!seen) ++distinct;
+    }
+    // Only a weight without its own ".alpha" takes the metadata's one, so a file whose weights all carry an ".alpha"
+    // needs no answer here (the ".alpha" wins as it does below).
+    bool from_meta = false;
+    for (const LoraEntry& e : entries)
+        if (!e.alpha_set) from_meta = true;
+    if (distinct > 1 && from_meta)
+        throw std::runtime_error("its metadata names " + std::to_string(distinct) + " different lora_alpha values "
+                                 "(a text encoder's and a transformer's in one file): which one the image weights "
+                                 "take is not said: not supported yet");
+    if (alphas.empty()) return;
     for (LoraEntry& e : entries) {
         if (e.alpha_set) continue;   // the file's own ".alpha" wins
-        e.alpha = (float) alpha;
+        e.alpha = (float) alphas.front();
         e.alpha_set = true;
     }
 }
 
 }  // namespace
+
+bool lora_key_names(const std::string& key, const std::string& name) {
+    if (key == name) return true;
+    // The same name as sd-scripts' `lora_unet_` and the LyCORIS form's `lycoris_` keys write it: every dot an
+    // underscore, the name's own underscores kept.  The DiT's names answer in their own form, each written in the
+    // underscore form too; serve/loras.py's kohya_name brings the same keys to the same names for the listing.  A
+    // dotted key holds a dot and an underscore form holds none, so the two readings never meet in the middle.
+    if (key.size() != name.size() || key.find('.') != std::string::npos) return false;
+    for (size_t i = 0; i < name.size(); ++i)
+        if (key[i] != (name[i] == '.' ? '_' : name[i])) return false;
+    return true;
+}
 
 const char* lora_kind_name(LoraKind k) {
     switch (k) {

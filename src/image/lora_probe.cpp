@@ -80,7 +80,7 @@ int list(const std::string& path) {
                           e.oft.stages > 1 ? (" x " + std::to_string(e.oft.stages)).c_str() : "");
         std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s%s%s\n", e.key.c_str(),
                     strata::image::lora_kind_name(e.kind), (long long) e.rank, "in/out", (long long) e.cols,
-                    (long long) e.rows, e.scale(), e.dora.empty() ? "" : " dora",
+                    (long long) e.rows, e.scale(), e.dora.empty() ? "" : (e.dora_over_rows ? " dora" : " dora(cols)"),
                     e.delta.empty() ? "" : (e.replaces ? " set_weight" : " diff"),
                     e.bias.empty() ? "" : " +bias", e.extra.empty() ? "" : " +tensors", oft);
     }
@@ -946,7 +946,7 @@ int map(const std::string& dit_path, const std::string& lora_path, float scale) 
     for (const auto& entry : f->entries()) {
         const si::QiDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 t = &c;
                 break;
             }
@@ -1074,7 +1074,7 @@ int moss_map(const std::string& dit_path, const std::string& lora_path, float sc
     for (const auto& entry : f->entries()) {
         const si::MossDit::LoraTarget* g = nullptr;
         for (const auto& c : groups)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 g = &c;
                 break;
             }
@@ -1204,7 +1204,7 @@ int mf_map(const std::string& dit_path, const std::string& lora_path, float scal
     for (const auto& entry : f->entries()) {
         const si::MfDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == entry.key) {
+            if (si::lora_key_names(entry.key, c.name)) {
                 t = &c;
                 break;
             }

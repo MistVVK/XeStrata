@@ -2848,6 +2848,18 @@ class ImageGen:
         params = self.cfg.get("resolutions")
         return int((params or {}).get("base_size") or 1024)
 
+    def _lora_ignored(self, job: dict) -> list[dict]:
+        """The applied adapters' keys that name no tensor of the model (PEFT's `base_layer.bias`, an auxiliary
+        projector, a flow-map sidecar): the response's xestrata-engine.lora_ignored and the log say them (up to 6
+        names, and the count), as serve/loras.py's Folder.ignored kept them at the last scan."""
+        got = lora_api.folder(self.cfg).ignored
+        out = []
+        for use in job.get("loras") or ():
+            keys = got.get(use["name"]) or []
+            if keys:
+                out.append({"name": use["name"], "n": len(keys), "keys": keys[:6]})
+        return out
+
     def _say(self, text: str) -> None:
         print(f"[xestrata] {text}", flush=True)
         if self.log is not None:
@@ -3471,6 +3483,13 @@ class ImageGen:
             figures.update(lora_n=int(parts[-1].get("lora_n") or 0), lora_mib=parts[-1].get("lora_mib"))
         if job.get("lora_unknown"):
             figures["lora_unknown"] = list(job["lora_unknown"])
+        ignored = self._lora_ignored(job)   # keys of an applied file that hold no role: said, not applied in silence
+        if ignored:
+            figures["lora_ignored"] = ignored
+            for one in ignored:
+                names = ", ".join(one["keys"]) + (", ..." if one["n"] > len(one["keys"]) else "")
+                self._say(f"lora {one['name']}: {one['n']} of its keys hold no adapter tensor and were left out"
+                          f" ({names})")
         if first + len(images) == job["n"]:
             self.totals["jobs"] += 1
         self.totals["images"] += len(images)

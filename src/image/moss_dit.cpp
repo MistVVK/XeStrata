@@ -855,7 +855,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             // the slots of the entry's name: one weight, or the weights a fused one is split into
             std::vector<const LoraSlot*> slots;
             for (const LoraSlot& s : lora_slots_)
-                if (s.name == entry.key) slots.push_back(&s);
+                if (lora_key_names(entry.key, s.name)) slots.push_back(&s);
             if (slots.empty()) {
                 unknown.push_back(entry.key);
                 continue;

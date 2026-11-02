@@ -708,7 +708,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             const LoraSlot* slot = nullptr;
             for (const LoraSlot& s : lora_slots_)
-                if (s.name == entry.key) {
+                if (lora_key_names(entry.key, s.name)) {
                     slot = &s;
                     break;
                 }

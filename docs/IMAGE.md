@@ -400,7 +400,7 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`; `lora` (each adapter's `name` and `scale`) when adapters were applied.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `xestrata-engine`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
+- `xestrata-engine`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`), the names a prompt's tag left out (`lora_unknown`) and the keys of an applied file that name no adapter tensor (`lora_ignored`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
@@ -531,7 +531,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - Up to 4 stack at once. A name given twice is a 400.
 - The prompt's tags `<lora:name:strength>` are read too (in the positive and the negative prompt; the strength may be left out, and is 1.0 then). A tag is taken out of the prompt; when the listing has not the name, that tag is left out of the image and the name is said in the answer's `strata.lora_unknown` and the server's log. A tag's third field (`<lora:name:strength:strength>`) is A1111's text encoder's strength: it is not read (the tag is taken out). A prompt that is only a tag is a 400.
 - The field and the tags together take 4 at most, and a name twice uses the first only (the field, then the positive prompt's tags, then the negative prompt's).
-- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `xestrata-engine` has `lora_n` (their count), `lora_mib` (the VRAM they take) and `lora_unknown` (the names a tag left out).
+- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `xestrata-engine` has `lora_n` (their count), `lora_mib` (the VRAM they take), `lora_unknown` (the names a tag left out) and `lora_ignored` (the keys of an applied file that name no adapter tensor, so were not applied: its name, how many, and up to six of them).
 
 **The web page:** the Images tab has a LoRA row (not for a model whose listing is empty). "Add a LoRA…" adds one from the listing, which shows as a chip: its strength can be changed in the chip's number field (-2 to 2, steps of 0.05), a file with `trigger` words has a "Trigger" button that puts them at the end of the prompt (it writes no tag), and × takes it off. 4 at most, and the browser keeps each model's choice and strengths.
 
@@ -539,13 +539,13 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 ### The forms applied
 
-A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` taken off, and is the DiT's weight's name. PEFT's, ai-toolkit's and the other common names (`lora_A`/`lora_B`, `lora_down`/`lora_up`, `lora_A.default`) are read.
+A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` taken off, and is the DiT's weight's name. PEFT's, ai-toolkit's and the other common names (`lora_A`/`lora_B`, `lora_down`/`lora_up`, `lora_A.default`) are read. sd-scripts' keys (`lora_unet_`) and the LyCORIS form's (`lycoris_`) write the weight's name with every dot an underscore; the model's own names answer them, so a name holding underscores of its own (`attn.to_q`, `img_mlp.net.0.proj`, `proj.ffn_up_gate`) reads too.
 
 | Form | The file's tensors | How it is applied |
 | --- | --- | --- |
-| LoRA, LoCon | `lora_A`/`lora_B` (down and up), and `.alpha` or the metadata's `lora_alpha` | strength × alpha / rank; alpha 1 when there is none |
+| LoRA, LoCon | `lora_A`/`lora_B` (down and up), and `.alpha` or the metadata's `lora_alpha` (its prefixed name too, `transformer.lora_alpha`) | strength × alpha / rank. A weight's `.alpha` tensor wins; the metadata reaches only the weights without one. Neither: 1 |
 | LoKr | `lokr_w1` and `lokr_w2` (whole, or each from two factors), and a linear weight's Tucker core `lokr_t2` | two products; the rank is w2's factors', else w1's |
-| DoRA | a plain LoRA and the weight's rows' `dora_scale` | rows only: `c = dora_scale / the weight's row norms`, which scales the base's rows and the delta's |
+| DoRA | a plain LoRA and the weight's rows' magnitude: `dora_scale`, PEFT's `lora_magnitude_vector` or ai-toolkit's `.magnitude` (LyCORIS's `[rows][1]` shape too) | rows only: `c = the magnitude / (the weight's row norms + eps)`, which scales the base's rows and the delta's |
 | A whole difference | `.diff`, `.set_weight`, `.w_norm` | the difference is added; at a strength of 1 `set_weight` is that weight, and between, an interpolation |
 | LoHa | `hada_w1_a/b` and `hada_w2_a/b`, and a linear Tucker core | the element-wise product of two products; the rank is `hada_w1_b`'s rows |
 | A bias's delta | `.diff_b`, or `.b_norm` beside `.w_norm` | added to the weight's bias; alpha is not applied, only the request's strength |
@@ -559,9 +559,11 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 - An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT on it is refused.
 - A LoHa's rank is `hada_w1_b`'s rows, and the metadata's `lora_alpha` is divided by that rank; a file whose `lora_alpha` has nothing to do with its rank changes the strength.
 - A file with `use_rslora` is refused (its strength is alpha / √rank, not alpha / rank). PEFT's `rank_pattern` is not read: alpha alone.
+- A file whose metadata names two different `lora_alpha` values is refused, as rsLoRA is: a diffusers file that packs a text encoder's and a transformer's adapters in one writes one of these per component (`text_encoder.lora_alpha`, `transformer.lora_alpha`), and which one the image's weights take is not said. The same value under two names is read, and so is a file whose weights all carry a `.alpha` tensor of their own (the metadata reaches none of them).
 - A file with text encoder weights (keys such as `lora_te_`, `text_encoder.`, `te.`) applies those to the text encoder (Qwen-Image-2.1, Mage-Flow, MageTrail, MOSS-Image, Anima). The strength is the image model's; the API has no `scale_text` field (one sent is ignored as `style` and `user` are).
   A request that applies one to the text encoder makes the prompt's states again with that set. When MOSS-Image's text encoder is the chat model's own file, the image engine reads the prompt itself for those requests only.
-- sd-scripts' `lora_unet_` names are applied to Anima's weights (they name none of the other models' weights).
+- A file of an applied form may still hold keys that name no adapter tensor (PEFT's `base_layer.bias`, an auxiliary projector, a sidecar of another experiment). They are not applied: the request that uses the file says them in its response's `xestrata-engine.lora_ignored` and in the log, and the engine says them in its log too.
+- sd-scripts' `lora_unet_` names and SimpleTuner's `lycoris_` names are applied to every model that takes adapters (Qwen-Image-2.1, Mage-Flow, MageTrail, MOSS-Image, Anima), each by its own weight names. A file of these forms whose name no weight answers is refused with the name as the file wrote it.
 - Anima-2.9B takes the LoRAs made for the official Anima (2B): they skip the 12 blocks 2.9B added and apply to the original 28.
 
 ### Quantized weights and memory
@@ -649,6 +651,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `lora: ...` (400) | The name is not listed, the strength is out of range, or more than 4 are named. The message says which |
 | `lora_rejected: image engine: ...` (400) | The engine cannot apply the adapter: the key and the reason (a weight that adds no bias, rsLoRA, MageTrail's modulation, a DoRA, OFT, GLoRA or set_weight overlapping another's rows and the like) follow ([LoRA](#lora-adapters)) |
 | `strata.lora_unknown` | A prompt's tag named a file the listing has not, and the image was made without it |
+| `xestrata-engine.lora_ignored` | An applied file holds keys that name no adapter tensor (`base_layer.bias` and the like); those were not applied |
 
 ## Licenses
 
