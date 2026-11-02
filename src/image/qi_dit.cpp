@@ -43,6 +43,12 @@ template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = fal
     return p;
 }
 
+void release(std::vector<void*>& owned, void* p) {
+    if (p == nullptr) return;
+    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
+    gpu::free(p);
+}
+
 void put(void* d, const void* h, size_t bytes) {
     if (!gpu::copy(d, h, bytes)) throw std::runtime_error(std::string("image engine: copy: ") + gpu::last_error());
 }
@@ -244,32 +250,14 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
                             (uint64_t) w->n * w->row_bytes >= (uint64_t) w->n * (uint64_t) w->k + 4 * (uint64_t) w->n;
                     w8_ = w8_ || w->w8;
                 }
-            blocks_stream_.set_prepare([this](int i, uint8_t* d) {
-                const Block& b = blocks_[(size_t) i];
-                for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
-                    if (!w->w8) continue;
-                    auto* p = d + reinterpret_cast<uintptr_t>(w->d);
-                    if (w->type == kTypeF16)   // already FP16: the values the dequantization would write
-                        gpu::copy_async(gemm_.scratch(), p, (size_t) (w->n * w->k) * 2, s_);
-                    else
-                        kernels::dequant_f16(w->type, p, 0, w->n, w->k, gemm_.scratch(), s_);
-                    qi_rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
-                               reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
-                }
-            });
         } else if (kernels::q8_mma_usable(core::Runtime::get().stream(s_))) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
                     w->packed = w->type == 8 && w->n % 128 == 0 && w->k % 256 == 0;
                     packed_ = packed_ || w->packed;
                 }
-            blocks_stream_.set_prepare([this](int i, uint8_t* d) {
-                sycl::queue& q = core::Runtime::get().stream(s_);
-                const Block& b = blocks_[(size_t) i];
-                for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down})
-                    if (w->packed) kernels::q8_mma_repack(q, d + reinterpret_cast<uintptr_t>(w->d), w->n, w->k);
-            });
         }
+        install_prepare();
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
@@ -309,10 +297,37 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
     return static_cast<int8_t*>(xq_);
 }
 
+// A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8) or for q8_mma_gemm (packed), and
+// the adapters baked in (set_loras); none of it where nothing is to be done (the stream then copies them as they are)
+void QiDit::install_prepare() {
+    if (!w8_ && !packed_ && !baked_any_) {
+        blocks_stream_.set_prepare(nullptr);
+        return;
+    }
+    blocks_stream_.set_prepare([this](int i, uint8_t* d) {
+        sycl::queue& q = core::Runtime::get().stream(s_);
+        const Block& b = blocks_[(size_t) i];
+        for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
+            auto* p = d + reinterpret_cast<uintptr_t>(w->d);
+            if (w->w8) {
+                if (w->type == kTypeF16)   // already FP16: the values the dequantization would write
+                    gpu::copy_async(gemm_.scratch(), p, (size_t) (w->n * w->k) * 2, s_);
+                else
+                    kernels::dequant_f16(w->type, p, 0, w->n, w->k, gemm_.scratch(), s_);
+                qi_rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
+                           reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
+            } else if (w->packed) {
+                kernels::q8_mma_repack(q, p, w->n, w->k);
+            }
+            if (w->baked) w->lora->bake(w->w8 ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
+        }
+    });
+}
+
 bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_t ldy, int64_t row0, int64_t rows,
                     bool same_input, bool defer) {
     if (rows < 0) rows = w.n;
-    LoraLayer* lora = w.lora;
+    LoraLayer* lora = w.baked ? nullptr : w.lora;
     if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     if (ldy <= 0) ldy = rows;
     // a DoRA's factor of the weight's rows row0 .. row0 + rows - 1: the base product's, then the delta's own
@@ -1085,6 +1100,23 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             return false;
         }
     if (lora_glora_cols_ > 0) lora_glora_scratch();   // a GLoRA's own path's buffers, once every part is bound
+    if (lora_bake_) {   // the blocks' plain LoRAs folded into their weights as the blocks come back to the GPU
+        int64_t nk = 0, kr = 0;
+        for (Block& b : blocks_)
+            for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down})
+                if (w->lora != nullptr && w->lora->bakeable() && (w->w8 ? -8 : w->type == 1 ? 1 : w->type == 8 && !w->packed ? 8 : 0) != 0) {
+                    w->baked = true;
+                    nk = std::max(nk, w->n * w->k);
+                    for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
+                }
+        if (nk > 0) {
+            bake_tmp_ = alloc<float>(allocs_, nk);
+            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            baked_any_ = true;
+            blocks_stream_.reload();   // the queued work drained before the prepare changes
+            install_prepare();
+        }
+    }
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
@@ -1215,7 +1247,20 @@ uint64_t QiDit::lora_bytes() const {
 
 void QiDit::drop_loras() {
     const bool had = !lora_key_.empty();
-    for (LoraSlot& s : lora_slots_) s.w->lora = nullptr;
+    for (LoraSlot& s : lora_slots_) {
+        s.w->lora = nullptr;
+        s.w->baked = false;
+    }
+    if (baked_any_) {   // the weights as the file has them again: the blocks copied anew, without the bake
+        baked_any_ = false;
+        blocks_stream_.reload();
+        install_prepare();
+        for (void** p : {reinterpret_cast<void**>(&bake_tmp_), reinterpret_cast<void**>(&bake_at16_)})
+            if (*p != nullptr) {
+                release(allocs_, *p);
+                *p = nullptr;
+            }
+    }
     lora_layers_.clear();
     lora_files_.clear();
     lora_key_.clear();

@@ -146,7 +146,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `daemon_idle_s` | 1800 | The seconds an image engine no server is connected to waits before it ends |
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
-| `lora_bake` | `true` | Anima's plain LoRAs on its blocks baked into the weights (`false`: the delta added to each product. [LoRA](#lora-adapters)) |
+| `lora_bake` | `true` | The plain LoRAs on the DiT's blocks baked into the weights (`false`: the delta added to each product. [LoRA](#lora-adapters)) |
 | `lora_dir` | `loras` beside the image model's file | The folder the LoRA files go in (setup writes the data folder's `models/loras`; every model shares one folder, and each one's listing is narrowed to what its DiT takes. [LoRA](#lora-adapters)) |
 
 HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters), `vision` (the shard with SigLIP2) and `ratio_head` (what it chooses its size with; without it `auto` is 1024x1024); its `max_refs` defaults to 3.
@@ -357,8 +357,9 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 - The adapters are kept in VRAM (A/B and GLoRA's factors in FP16; a DoRA's coefficients, a bias and an OFT's rotation in FP32). `strata.lora_mib` says how much, and an image whose budget they do not fit is refused with the VRAM it needs. A rank-64 Qwen-Image-2.1 LoRA's A/B is about 320 MiB.
 - From the second image of the same set the bound adapters are used as they are (and each file is read once). A new set makes Qwen-Image-2.1 rebuild the prompt's prefix (the text's rows and K and V), and MOSS-Image rebuild the context it read the text embeddings into; the same set keeps them.
 - A layer an adapter takes is slower by the delta's products. In MOSS-Image's W8A8 blocks, making the 16-bit rows the delta's input needs adds to it.
-- Anima bakes the plain LoRAs on its blocks (without a DoRA, OFT, GLoRA, `set_weight` or bias delta) into the weights (the config's `"lora_bake"`, on by default). The delta is added to the weights once, so a step is as fast as a request without adapters. 8-bit weights are quantized again after it, so the image differs slightly from adding the delta to each product.
-  A new set reads the blocks from the original weights again and bakes them anew; taking the adapters off gives the image of a request without them again (bit for bit). `"lora_bake": false` adds the delta to each product, as the other models do.
+- The plain LoRAs on the DiT's blocks (without a DoRA, OFT, GLoRA, `set_weight` or bias delta) are baked into the weights (the config's `"lora_bake"`, on by default). The delta is added to the weights once, so such a layer's products are as fast as a request's without adapters. 8-bit weights are quantized again after it, so the image differs slightly from adding the delta to each product.
+  A new set reads the blocks from the original weights again and bakes them anew; taking the adapters off gives the image of a request without them again (bit for bit). `"lora_bake": false` adds the delta to each product.
+  The layers that cannot be baked (Qwen-Image-2.1's Q6_K and Q4_K_M layers and its Q8_0 layers repacked for the matrix engines, the weights outside the blocks, the text encoders) take the delta in each product.
 
 ## Sharing the GPU's memory
 

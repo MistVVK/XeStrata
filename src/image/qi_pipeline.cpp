@@ -188,6 +188,7 @@ void QiPipeline::use_loras(const QiRequest& r) {
     std::string err;
     std::vector<LoraUse> dit, te;
     lora_split(r.loras, dit, te);
+    dit_->set_lora_bake(lora_bake_);
     if (!dit_->set_loras(dit, err) || !te_->set_loras(te, err)) throw LoraRejected(err);
     if (te_->lora_key() != te_lora_) {   // the states kept were the encoder's with the other adapters
         last_ids_.clear();

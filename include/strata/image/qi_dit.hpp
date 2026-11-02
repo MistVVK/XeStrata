@@ -100,6 +100,9 @@ public:
     void drop_blocks() { blocks_stream_.drop(); }
     /// Frees the streamed blocks' copies in RAM (LayerStream's homes).
     void drop_block_homes() { blocks_stream_.drop_homes(); }
+    /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
+    /// product: false keeps the weights as the file has them.
+    void set_lora_bake(bool on) { lora_bake_ = on; }
     /// Frees the activations (grown again on use).
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
@@ -139,6 +142,10 @@ public:
     void drop_loras();
 
 private:
+    bool lora_bake_ = true, baked_any_ = false;
+    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
+    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
+    void install_prepare();
     struct W {
         int type = 0;
         int64_t n = 0, k = 0;   // n rows of k
@@ -147,6 +154,7 @@ private:
         bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
         LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
+        bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
     };
     struct Block {
         W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)

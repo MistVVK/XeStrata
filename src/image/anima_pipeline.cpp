@@ -135,6 +135,7 @@ void AnimaPipeline::use_loras(const QiRequest& r) {
     const std::string before = dit_->lora_key();
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
+    dit_->set_lora_bake(lora_bake_);
     if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
     if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
     if (dit_->lora_key() != before) {   // the contexts were the adapter's with the other adapters' weights
@@ -167,7 +168,6 @@ void AnimaPipeline::ensure_open(bool q8) {
         if (!ok) throw std::runtime_error(err);
         d->set_block_budget(d->block_min());
         d->set_lora_block_map(block_map_);
-        d->set_lora_bake(lora_bake_);
         dit_ = std::move(d);
         dit_set_ = dit_->block_min();
         mlp_set_ = -1;

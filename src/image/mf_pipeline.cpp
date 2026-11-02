@@ -260,6 +260,7 @@ void MfPipeline::use_loras(const QiRequest& r) {
     std::string err;
     std::vector<LoraUse> dit_part, te;
     lora_split(r.loras, dit_part, te);
+    dit().set_lora_bake(lora_bake_);
     if (!dit().set_loras(dit_part, err) || !te_->set_loras(te, err)) throw LoraRejected(err);
     if (te_->lora_key() != te_lora_) {   // the states kept were the encoder's with the other adapters
         last_ids_.clear();

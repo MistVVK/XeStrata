@@ -348,7 +348,7 @@ public:
     /// The weight [n][k] at `w` on the stream's GPU plus the parts' deltas (scale B A over each part's rows), in place:
     /// `type` 1 FP16, -8 W8A8's (each group of kQiRotate of a row times the normalized Hadamard matrix, the rows'
     /// int8 values then their n scales: the delta turned the same way, the rows quantized again), 8 Q8_0 (its blocks
-    /// quantized again).  `tmp` holds n * k floats, `at16` k * the largest rank values.  bakeable() layers only.
+    /// quantized again); the 8-bit ones rounded with a fixed dither, as a delta under half a step would round away.  `tmp` holds n * k floats, `at16` k * the largest rank values.  bakeable() layers only.
     void bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gemm, float* tmp, uint16_t* at16,
               void* stream) const;
 

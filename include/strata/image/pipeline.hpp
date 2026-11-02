@@ -103,6 +103,9 @@ struct QiNeed {
 class ImagePipeline {
 public:
     virtual ~ImagePipeline() = default;
+    /// The DiT's plain LoRAs folded into its blocks' weights (the default) or added to each product (false: the
+    /// weights as the file has them), from the next request's adapters on.
+    void set_lora_bake(bool on) { lora_bake_ = on; }
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
     virtual void set_budget(uint64_t bytes) = 0;
     /// The budget in force: the one set, else the free VRAM's at open.
@@ -141,6 +144,9 @@ public:
     virtual std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
                                           const std::function<bool(int, int)>& step = {},
                                           const std::function<void(const char*)>& stage = {}) = 0;
+
+protected:
+    bool lora_bake_ = true;
 };
 
 /// The most the engine could have: a device's memory less the driver's margin, within STRATA_VRAM_LIMIT_MIB.

@@ -547,7 +547,7 @@ int main(int argc, char** argv) {
         std::string dit, vae, text, vision, ratio_head, out, ids;
         std::vector<std::string> ref_paths;
         std::vector<int> block_map;   // --lora-block-map: an expanded Anima's release blocks
-        bool lora_bake = true;        // --lora-bake 0: Anima's adapters added to each product, not baked in
+        bool lora_bake = true;        // --lora-bake 0: the adapters added to each product, not baked in
         Loras cli_loras;              // --lora's files
         si::QiRequest r;
         uint64_t budget = 0;
@@ -662,7 +662,6 @@ int main(int argc, char** argv) {
             auto a = std::make_unique<si::AnimaPipeline>();
             if (!a->open(dit, vae, text, err, dit_q8)) throw std::runtime_error(err);
             a->set_lora_block_map(block_map);
-            a->set_lora_bake(lora_bake);
             pipe = std::move(a);
         } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
@@ -674,6 +673,7 @@ int main(int argc, char** argv) {
             pipe = std::move(q);
         }
         si::ImagePipeline& p = *pipe;
+        p.set_lora_bake(lora_bake);
         if (budget > 0) p.set_budget(budget);
         if (serving) return serve(p);
         r.ids = parse_ids(ids);

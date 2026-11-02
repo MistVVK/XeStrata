@@ -1640,6 +1640,19 @@ bool LoraLayer::has_oft() const {
     return false;
 }
 
+namespace {
+
+// A uniform value in [0, 1) of a weight's (row, column), the same for each bake: the dither of a requantized weight
+inline float bake_dither(int64_t row, int64_t c) {
+    uint32_t h = (uint32_t) row * 0x9E3779B1u ^ (uint32_t) c * 0x85EBCA77u;
+    h ^= h >> 15;
+    h *= 0x2C1B3C6Du;
+    h ^= h >> 12;
+    return (float) (h >> 8) * (1.0f / 16777216.0f);
+}
+
+}  // namespace
+
 bool LoraLayer::bakeable() const {
     if (parts.empty()) return false;
     for (const LoraPart& p : parts)
@@ -1706,7 +1719,11 @@ void LoraLayer::bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gem
                     }
                     amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
                     const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-                    for (int64_t c = lane; c < k; c += L) w8[row * k + c] = (int8_t) sycl::round(v[c] * id);
+                    // dithered: the weight's values sit on its grid, and a delta under half a step rounds back to
+                    // them (a LoRA lost); floor(x + u) keeps the delta on average over a product's sums
+                    for (int64_t c = lane; c < k; c += L)
+                        w8[row * k + c] = (int8_t) sycl::clamp(sycl::floor(v[c] * id + bake_dither(row, c)), -127.f,
+                                                               127.f);
                     if (lane == 0) sw[row] = d;
                 });
             });
@@ -1727,7 +1744,9 @@ void LoraLayer::bake(int type, void* w, int64_t n, int64_t k, prefill::Gemm& gem
                 const uint16_t dh = strata::kernels::f16_from_f32(d);
                 blk[0] = (uint8_t) (dh & 0xff);
                 blk[1] = (uint8_t) (dh >> 8);
-                for (int j = 0; j < 32; ++j) blk[2 + j] = (uint8_t) (int8_t) sycl::round(u[j] * id2);
+                for (int j = 0; j < 32; ++j)   // dithered, as the W8A8 rows above
+                    blk[2 + j] = (uint8_t) (int8_t) sycl::clamp(
+                        sycl::floor(u[j] * id2 + bake_dither(row0 + rr, bl * 32 + j)), -127.f, 127.f);
             });
         }
     }

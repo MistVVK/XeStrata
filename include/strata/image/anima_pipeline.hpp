@@ -39,8 +39,6 @@ public:
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1);
     /// The release's blocks in an expanded DiT (AnimaDit::set_lora_block_map), for the adapters made for the release.
     void set_lora_block_map(std::vector<int> map) { block_map_ = std::move(map); }
-    /// The blocks' plain LoRAs folded into their weights (the default) or added to each product (set_lora_bake).
-    void set_lora_bake(bool on) { lora_bake_ = on; }
     void set_budget(uint64_t bytes) override;
     uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     void release(bool all = false) override;
@@ -75,7 +73,6 @@ private:
     std::unique_ptr<AnimaDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;
     std::vector<int> block_map_;
-    bool lora_bake_ = true;
     std::unique_ptr<QiVae> vae_, vae_size_;
     uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0;
     int64_t mlp_set_ = -1;

@@ -104,6 +104,9 @@ public:
     void drop_blocks() { blocks_stream_.drop(); }
     /// Frees the streamed blocks' copies in RAM (LayerStream's homes).
     void drop_block_homes() { blocks_stream_.drop_homes(); }
+    /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
+    /// product: false keeps the weights as the file has them.
+    void set_lora_bake(bool on) { lora_bake_ = on; }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks and the text's
     uint64_t text_bytes() const { return text_bytes_; }       // the text embedder's weights
     bool text_loaded() const { return text_loaded_; }
@@ -149,12 +152,17 @@ public:
     void drop_loras();
 
 private:
+    bool lora_bake_ = true, baked_any_ = false;
+    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
+    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
+    void install_prepare();
     struct W {
         int type = 0;            // 8 Q8_0, 1 F16, -8 W8A8's int8 rows and their scales
         int64_t n = 0, k = 0;    // n rows of k
         const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
         uint64_t row_bytes = 0;
         LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
+        bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
     };
     /// A weight and the rows of a file's entry it takes (a fused weight's range, or one of the three weights of the
     /// text embedder's qkv split).  `biased`: the weight adds a bias of its own rows, where an entry's bias's delta is

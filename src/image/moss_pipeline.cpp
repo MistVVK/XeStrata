@@ -194,6 +194,7 @@ void MossPipeline::use_loras(const QiRequest& r) {
     const std::string before = dit_->lora_key();
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
+    dit_->set_lora_bake(lora_bake_);
     if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
     if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
     if (lora_key_of(te_loras_) != te_lora_) {   // the states kept were the encoder's with the other adapters

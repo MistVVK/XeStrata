@@ -460,16 +460,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         }
         if (blocks_.empty()) throw std::runtime_error("image engine (Mage-Flow DiT): no transformer blocks");
         build_lora_targets();
-        if (!q8_)   // each block's weights, as they reach the GPU (resident, or a streamed slot): bf16 to FP16
-            blocks_stream_.set_prepare([this](int i, uint8_t* d) {
-                sycl::queue& q = q_of(s_);
-                const Block& b = blocks_[(size_t) i];
-                for (const W* w : {&b.imod, &b.tmod, &b.q, &b.k, &b.v, &b.tq, &b.tk, &b.tv, &b.o, &b.to, &b.imlp1,
-                                   &b.imlp2, &b.tmlp1, &b.tmlp2})
-                    if (w->type != kTypeF32)
-                        bf16_to_f16_inplace(reinterpret_cast<uint16_t*>(d + reinterpret_cast<uintptr_t>(w->d)),
-                                            w->n * w->k, q);
-            });
+        install_prepare();
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
@@ -537,13 +528,32 @@ std::pair<double, double> MfDit::time_forms(int64_t rows) const {
     return {f16, w8};
 }
 
+// Each block's weights, as they reach the GPU (resident, or a streamed slot): bf16 to FP16 (the FP16 blocks), and the
+// adapters baked in (set_loras); none of it for 8-bit blocks without baked adapters
+void MfDit::install_prepare() {
+    if (q8_ && !baked_any_) {
+        blocks_stream_.set_prepare(nullptr);
+        return;
+    }
+    blocks_stream_.set_prepare([this](int i, uint8_t* d) {
+        sycl::queue& q = q_of(s_);
+        const Block& b = blocks_[(size_t) i];
+        for (const W* w : {&b.imod, &b.tmod, &b.q, &b.k, &b.v, &b.tq, &b.tk, &b.tv, &b.o, &b.to, &b.imlp1, &b.imlp2,
+                           &b.tmlp1, &b.tmlp2}) {
+            uint8_t* wd = d + reinterpret_cast<uintptr_t>(w->d);
+            if (!q8_ && w->type != kTypeF32) bf16_to_f16_inplace(reinterpret_cast<uint16_t*>(wd), w->n * w->k, q);
+            if (w->baked) w->lora->bake(w->type, wd, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
+        }
+    });
+}
+
 MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                      const float* bias, bool same_input, bool defer) {
     MfOut out;
     out.f = y;
     out.C = w.n;
     if (T <= 0) return out;
-    LoraLayer* lora = w.lora;
+    LoraLayer* lora = w.baked ? nullptr : w.lora;
     if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     // a DoRA's factor of the weight's rows: the base product's, then the delta's own
     const float* col = lora != nullptr && lora->has_base() ? lora->base() : nullptr;
@@ -955,6 +965,23 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             return false;
         }
     if (lora_glora_cols_ > 0) lora_glora_scratch();   // a GLoRA's own path's buffers, once every part is bound
+    if (lora_bake_) {   // the blocks' plain LoRAs folded into their weights as the blocks come back to the GPU
+        int64_t nk = 0, kr = 0;
+        for (Block& b : blocks_)
+            for (W* w : {&b.imod, &b.tmod, &b.q, &b.k, &b.v, &b.tq, &b.tk, &b.tv, &b.o, &b.to, &b.imlp1, &b.imlp2, &b.tmlp1, &b.tmlp2})
+                if (w->lora != nullptr && w->lora->bakeable() && (w->type == 1 || w->type == 8 || w->type == -8 ? w->type : 0) != 0) {
+                    w->baked = true;
+                    nk = std::max(nk, w->n * w->k);
+                    for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
+                }
+        if (nk > 0) {
+            bake_tmp_ = alloc<float>(allocs_, nk);
+            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            baked_any_ = true;
+            blocks_stream_.reload();   // the queued work drained before the prepare changes
+            install_prepare();
+        }
+    }
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
@@ -1012,7 +1039,20 @@ uint64_t MfDit::lora_bytes() const {
 }
 
 void MfDit::drop_loras() {
-    for (LoraSlot& s : lora_slots_) s.w->lora = nullptr;
+    for (LoraSlot& s : lora_slots_) {
+        s.w->lora = nullptr;
+        s.w->baked = false;
+    }
+    if (baked_any_) {   // the weights as the file has them again: the blocks copied anew, without the bake
+        baked_any_ = false;
+        blocks_stream_.reload();
+        install_prepare();
+        for (void** p : {reinterpret_cast<void**>(&bake_tmp_), reinterpret_cast<void**>(&bake_at16_)})
+            if (*p != nullptr) {
+                release(allocs_, *p);
+                *p = nullptr;
+            }
+    }
     lora_layers_.clear();
     lora_files_.clear();
     lora_key_.clear();
