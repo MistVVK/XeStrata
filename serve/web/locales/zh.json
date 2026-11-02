@@ -94,6 +94,7 @@
   "chat.deleted": "聊天已删除",
   "chat.empty": "想问什么都可以",
   "chat.emptyModel": "{model} 运行在这台电脑上，不会向外发送任何内容。",
+  "chat.emptyModelSearch": "{model} 运行在这台电脑上。开启网页搜索时，搜索词会发送给搜索引擎，并会获取要读取的网页；除此之外不会向外发送任何内容。",
   "chat.image": "图片",
   "chat.interrupted": "已打断",
   "chat.interruptedLower": "已打断",

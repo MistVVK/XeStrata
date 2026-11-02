@@ -94,6 +94,7 @@
   "chat.deleted": "채팅을 삭제했습니다",
   "chat.empty": "무엇이든 물어보세요",
   "chat.emptyModel": "{model}은(는) 이 PC에서 실행됩니다. 밖으로 나가는 것은 없습니다.",
+  "chat.emptyModelSearch": "{model}은(는) 이 PC에서 실행됩니다. 웹 검색이 켜져 있으면 검색어가 검색 엔진으로 전송되고 읽을 페이지를 가져옵니다. 그 밖에는 밖으로 나가는 것이 없습니다.",
   "chat.image": "이미지",
   "chat.interrupted": "중단됨",
   "chat.interruptedLower": "중단됨",

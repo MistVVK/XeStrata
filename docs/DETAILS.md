@@ -1071,7 +1071,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Every other key of the file stays as it is, the earlier file is kept as `xestrata-<model>.json.bak`, and the model uses the change from its next start.
   Only XeStrata's own page can save (JSON, with the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not editable there.
 - **Settings for every model.** A few keys can be written, besides a model's `xestrata-<model>.json`, into the user's settings (`~/.config/xestrata/settings.json`, on Windows `%APPDATA%\xestrata\settings.json`), where they apply to every model.
-  These are the web search's `search_engine`, `search_url` and `deepseek_api_key` ([Web search](#web-search)); `deepseek_api_key` is held in settings.json only.
+  These are the web search's `search_engine`, `search_url`, `deepseek_api_key` and `tinyfish_api_key` ([Web search](#web-search)); the two API keys are held in settings.json only.
   A model's config that has the key wins, and an empty value (`""`) turns the key off for that model alone.
   The Model settings card gives such a key an "Every model" field, and shows the value in use and where it comes from; `off` in the model's field turns it off for that model alone.
   `POST /config` with `{"set": {...}, "scope": "global"}` changes settings.json, without `scope` (or with `"model"`) the model's config; settings.json's other keys (setup's) stay as they are.
@@ -1598,7 +1598,7 @@ echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"worke
 
 XeStrata lets a request that asks for it search the web.
 The model calls the `web_search` (search) and `fetch_page` (read a page's text) tools, and XeStrata runs them and returns the results.
-`search_engine` chooses the search engine: `searxng` (the default) is a SearXNG-compatible search server, `deepseek` is DeepSeek's search API.
+`search_engine` chooses the search engine: `searxng` (the default) is a SearXNG-compatible search server, `deepseek` is DeepSeek's search API, `tinyfish` is TinyFish's search API.
 
 **The search server** (`searxng`): anything that answers `GET /search?q=...&format=json`.
 
@@ -1608,15 +1608,20 @@ The model calls the `web_search` (search) and `fetch_page` (read a page's text) 
 **DeepSeek's search API** (`deepseek`): DeepSeek's [Search API](https://api-docs.deepseek.com/guides/search), with your own DeepSeek API key.
 DeepSeek bills USD 0.75 per 1,000 searches that find something (failures, empty results and timeouts are not billed). The search words go to DeepSeek.
 The key is `deepseek_api_key` in settings.json (one for every model, in a file only you can read). The web page's Model settings can only write it and never shows it ("Clear" removes it).
+
+**TinyFish's search API** (`tinyfish`): TinyFish's [Search API](https://docs.tinyfish.ai/search-api), with your own TinyFish API key.
+The texts of the pages found come with the same key from TinyFish's [Fetch API](https://docs.tinyfish.ai/fetch-api), in one request for all of them (when that fails, the snippets answer alone).
+It is free up to a daily allowance (12,000 searches and 1,000 pages, reset at 00:00 UTC); a search takes as many pages of it as it found (3, 5 or 8 by `search_context_size`). The search words and the addresses of the pages found go to TinyFish.
+The key is `tinyfish_api_key` in settings.json, kept as DeepSeek's is.
 A query is at most 128 characters; anything longer is cut. The pages' text comes with the search results, and `fetch_page` is read by XeStrata itself.
 
-**Setting it up with setup**: `xestrata --setup` asks once (and at each `--setup`) whether to use web search (`deepseek` for DeepSeek, `no`). The default is no, and without an answer nothing is done.
-With `deepseek` it asks for the API key without showing it (`--web-search deepseek`; the Windows launcher's Web search choice and key field).
+**Setting it up with setup**: `xestrata --setup` asks once (and at each `--setup`) whether to use web search (`deepseek` for DeepSeek, `tinyfish` for TinyFish, `no`). The default is no, and without an answer nothing is done.
+With `deepseek` and `tinyfish` it asks for the API key without showing it (`--web-search deepseek`, `--web-search tinyfish`; the Windows launcher's Web search choice and key field).
 `--web-search no` takes it out. A `search_url` you wrote yourself is left as it is.
 
 **Setting it yourself**: write the search server's address in `search_url` (for example `http://127.0.0.1:8888`).
 
-- For every model: `"search_url": "http://127.0.0.1:8888"` in `~/.config/xestrata/settings.json` (on Windows `%APPDATA%\xestrata\settings.json`; for DeepSeek `"search_engine": "deepseek"` and `"deepseek_api_key"`).
+- For every model: `"search_url": "http://127.0.0.1:8888"` in `~/.config/xestrata/settings.json` (on Windows `%APPDATA%\xestrata\settings.json`; for DeepSeek `"search_engine": "deepseek"` and `"deepseek_api_key"`, for TinyFish `"search_engine": "tinyfish"` and `"tinyfish_api_key"`).
 - For one model: the same key in `xestrata-<model>.json`. `"search_url": ""` turns the search off for that model alone.
 - The web page: the About tab's Model settings ([Settings for every model](#using-it)).
 
@@ -1634,7 +1639,9 @@ The web page's chat has a "Search: on / off" switch; on sends `web_search_option
 
 **Safeguards**: `fetch_page` reads public addresses only. It checks the address the name resolves to, connects to the address it checked, and checks every redirect the same way; pages on this PC or its network are not read.
 One result holds at most 24,000 characters, a page is read up to 2 MiB and for 15 seconds. When the search server does not answer or finds nothing, the model is told so and the answer goes on.
-`user_location` is not used.
+**The search's language and region** (TinyFish only): the country of the request's `user_location` (`web_search_options.user_location.approximate.country` in Chat Completions, the tool's `user_location.country` in Responses and Anthropic) goes to TinyFish as the region, and TinyFish chooses the language from it.
+Without `user_location`, the first language of the request's `Accept-Language` (with its region when it names one) goes. In the web page's chat, that is the browser's language setting.
+Without either, nothing goes, and TinyFish searches with its defaults (US, English). The SearXNG-compatible servers and DeepSeek are not told (DeepSeek's language control, `lang:`, keeps only pages in that language).
 
 ## Tools from MCP servers
 

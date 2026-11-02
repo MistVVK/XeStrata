@@ -3647,7 +3647,8 @@ class Service:
         self.config_lock = threading.Lock()
         self.settings_path = places.settings_path()     # the user's settings: GLOBAL keys for every model (runconfig)
         self.search_url: str | None = None              # web search: a SearXNG-compatible server's address
-        self.search_backend: search_api.Searxng | search_api.DeepSeek | None = None   # the engine (search.py)
+        # the web search's engine (search.py)
+        self.search_backend: search_api.Searxng | search_api.DeepSeek | search_api.TinyFish | None = None
         self.switcher: str | None = None                # the host's model swapper RPC (config model_switcher)
         self.port = 0                                   # the port this server listens on (the switcher's models)
         # #321: browser pages of these origins may call /v1/* (CORS; "*" = any page - only with an api_key that
@@ -8117,7 +8118,9 @@ def make_handler(svc: Service):
                 size = ws.get("search_context_size")
                 if size is not None and size not in search_api.CONTEXT:
                     raise ValueError('web_search_options.search_context_size is "low", "medium" or "high"')
-                search_tools = search_api.SearchTools(svc.search_backend, {"context": size})
+                search_tools = search_api.SearchTools(svc.search_backend, {
+                    "context": size,
+                    "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
                 more = search_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
                     extra += more
@@ -8452,7 +8455,8 @@ def make_handler(svc: Service):
                                                                                            dict) else None
                 self.search_tools = search_api.SearchTools(svc.search_backend, {
                     "context": spec.get("search_context_size"),
-                    "include": domains if isinstance(domains, list) else []})
+                    "include": domains if isinstance(domains, list) else [],
+                    "locale": search_api.locale(spec.get("user_location"), self.headers.get("Accept-Language"))})
                 offered = self.search_tools.template_tools(exclude={t["name"] for t in tools or []})
                 search_names = [t["name"] for t in offered]
                 tools = (tools or []) + offered
@@ -8604,7 +8608,8 @@ def make_handler(svc: Service):
                 uses = [t.get("max_uses") for t in hosted if isinstance(t.get("max_uses"), int)]
                 search_tools = search_api.SearchTools(svc.search_backend, {
                     "include": ws.get("allowed_domains"), "exclude": ws.get("blocked_domains"),
-                    "max_uses": sum(uses) if uses else None})
+                    "max_uses": sum(uses) if uses else None,
+                    "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
             if search_tools is not None:
@@ -9965,6 +9970,7 @@ def main() -> int:
     except ValueError as e:
         print(f"[strata] WARNING: web search is off: {e}", flush=True)
     deepseek_key = user_settings.get("deepseek_api_key")   # the settings' only (runconfig.GLOBAL_ONLY): never logged
+    tinyfish_key = user_settings.get("tinyfish_api_key")
     if searcher == "deepseek" and isinstance(deepseek_key, str) and deepseek_key.strip():
         svc.search_backend = search_api.DeepSeek(deepseek_key.strip())
         print("[strata] web search: DeepSeek's search API (for requests that ask for it; billed per search)",
@@ -9972,6 +9978,13 @@ def main() -> int:
     elif searcher == "deepseek":
         print(f"[strata] WARNING: web search is off: search_engine is deepseek, but {svc.settings_path} has no "
               "deepseek_api_key", flush=True)
+    elif searcher == "tinyfish" and isinstance(tinyfish_key, str) and tinyfish_key.strip():
+        svc.search_backend = search_api.TinyFish(tinyfish_key.strip())
+        print("[strata] web search: TinyFish's search API (for requests that ask for it; free up to a daily "
+              "allowance)", flush=True)
+    elif searcher == "tinyfish":
+        print(f"[strata] WARNING: web search is off: search_engine is tinyfish, but {svc.settings_path} has no "
+              "tinyfish_api_key", flush=True)
     elif searcher == "searxng" and svc.search_url:
         svc.search_backend = search_api.Searxng(svc.search_url)
         print(f"[strata] web search: {svc.search_url} (for requests that ask for it)", flush=True)

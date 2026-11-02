@@ -51,18 +51,22 @@ EDITABLE = [
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
-    ("search_engine", ("enum", ["searxng", "deepseek"]),
-     "Web search: searxng (the server at search_url) or deepseek (DeepSeek's search API, billed per search)"),
+    ("search_engine", ("enum", ["searxng", "deepseek", "tinyfish"]),
+     "Web search: searxng (the server at search_url), deepseek (DeepSeek's search API, billed per search) or "
+     "tinyfish (TinyFish's search API, free up to a daily allowance)"),
     ("search_url", "url",
      "Web search: the address of a SearXNG-compatible search server (http://127.0.0.1:8888); empty in a model's "
      "config: no search for that model"),
     ("deepseek_api_key", "secret",
      "Web search with DeepSeek: its API key (write-only: never shown; the queries go to DeepSeek)"),
+    ("tinyfish_api_key", "secret",
+     "Web search with TinyFish: its API key (write-only: never shown; the queries and the pages found go to "
+     "TinyFish)"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 # the keys settings.json may hold for every model
-GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "script_guard")
-GLOBAL_ONLY = ("deepseek_api_key",)                  # ... and the ones only it holds (a secret: one place)
+GLOBAL = ("search_engine", "search_url", "deepseek_api_key", "tinyfish_api_key", "script_guard")
+GLOBAL_ONLY = ("deepseek_api_key", "tinyfish_api_key")   # ... and the ones only it holds (secrets: one place)
 
 
 def _arg(cfg: dict, flag: str):

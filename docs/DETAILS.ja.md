@@ -1030,7 +1030,7 @@ print(r.choices[0].message.content)
   ファイルのほかのキーはそのまま残し、前のファイルを `xestrata-<model>.json.bak` に残し、モデルは次の起動から変更を使います。
   保存できるのは XeStrata 自身のページだけです（JSON、API キーがあればそれも。Chat の設定と同じ）。ネットワーク、キー、MCP、プログラムのキーは、そこでは変えられません。
 - **すべてのモデルの設定**: いくつかのキーは、モデルごとの `xestrata-<model>.json` のほかに、ユーザーの設定（`~/.config/xestrata/settings.json`、Windows では `%APPDATA%\xestrata\settings.json`）にも書けて、すべてのモデルに効きます。
-  Web 検索の `search_engine`・`search_url`・`deepseek_api_key` です（[Web 検索](#web-検索)）。`deepseek_api_key` は settings.json にだけ置きます。
+  Web 検索の `search_engine`・`search_url`・`deepseek_api_key`・`tinyfish_api_key` です（[Web 検索](#web-検索)）。API キーの 2 つは settings.json にだけ置きます。
   モデルの設定にそのキーがあればそちらが勝ち、空の値（`""`）はそのモデルだけそのキーを切ります。
   Model settings のカードには、そのキーに「Every model」の欄が加わり、いま効いている値とその出どころも出ます。モデルの欄に `off` と書くと、そのモデルだけ切ります。
   `POST /config` は `{"set": {...}, "scope": "global"}` で settings.json を、`scope` なし（または `"model"`）でモデルの設定を変えます。settings.json のほかのキー（setup のもの）はそのまま残します。
@@ -1550,7 +1550,7 @@ echo '{"model":"xestrata/xestrata","tools":"patch","context_limit":245000,"worke
 
 XeStrata は、求めたリクエストにだけ Web を検索させます。
 モデルは `web_search`（検索）と `fetch_page`（ページの本文を読む）のツールを使い、XeStrata がそれを実行して結果を返します。
-検索エンジンは `search_engine` で選びます。`searxng`（既定）は SearXNG 互換の検索サーバー、`deepseek` は DeepSeek の検索 API です。
+検索エンジンは `search_engine` で選びます。`searxng`（既定）は SearXNG 互換の検索サーバー、`deepseek` は DeepSeek の検索 API、`tinyfish` は TinyFish の検索 API です。
 
 **検索サーバー**（`searxng`）: `GET /search?q=...&format=json` に答えるものなら何でも使えます。
 
@@ -1560,15 +1560,20 @@ XeStrata は、求めたリクエストにだけ Web を検索させます。
 **DeepSeek の検索 API**（`deepseek`）: DeepSeek の [Search API](https://api-docs.deepseek.com/guides/search) を、自分の DeepSeek の API キーで使います。
 DeepSeek が、何か見つかった検索 1,000 件ごとに 0.75 米ドルを課金します（失敗・0 件・時間切れは課金されません）。検索語は DeepSeek に送られます。
 キーは settings.json の `deepseek_api_key`（すべてのモデルで 1 つ、本人だけが読めるファイル）に置きます。Web の Model settings では書き込みだけができ、値は表示しません（「Clear」で消します）。
+
+**TinyFish の検索 API**（`tinyfish`）: TinyFish の [Search API](https://docs.tinyfish.ai/search-api) を、自分の TinyFish の API キーで使います。
+見つかったページの文は、同じキーで TinyFish の [Fetch API](https://docs.tinyfish.ai/fetch-api) から 1 回の要求でまとめて取ります（取れなければ要約だけで答えます）。
+1 日の無料の枠（検索 12,000 回、ページ 1,000 件、UTC の 0 時に戻ります）までは無料で、1 回の検索は見つかったページの数（`search_context_size` で 3・5・8）だけページの枠を使います。検索語と見つかったページのアドレスは TinyFish に送られます。
+キーは settings.json の `tinyfish_api_key` に、DeepSeek のキーと同じように置きます。
 検索語は 128 字までで、それを超える分は切ります。ページの本文は検索の結果に入り、`fetch_page` は XeStrata が自分で読みます。
 
-**setup で用意する**: `xestrata --setup` は最初に一度（と `--setup` のたびに）「Web 検索を使うか」を尋ねます（`deepseek` は DeepSeek、`no`）。既定は「いいえ」で、答えなければ何もしません。
-`deepseek` なら、API キーを画面に出さずに尋ねます（`--web-search deepseek`。Windows のランチャーでは Web search の選択とキーの欄）。
+**setup で用意する**: `xestrata --setup` は最初に一度（と `--setup` のたびに）「Web 検索を使うか」を尋ねます（`deepseek` は DeepSeek、`tinyfish` は TinyFish、`no`）。既定は「いいえ」で、答えなければ何もしません。
+`deepseek` と `tinyfish` なら、API キーを画面に出さずに尋ねます（`--web-search deepseek`・`--web-search tinyfish`。Windows のランチャーでは Web search の選択とキーの欄）。
 `--web-search no` で外します。自分で書いた `search_url` はそのまま残します。
 
 **自分で設定する**: `search_url` に検索サーバーのアドレスを書きます（例 `http://127.0.0.1:8888`）。
 
-- すべてのモデルに: `~/.config/xestrata/settings.json`（Windows では `%APPDATA%\xestrata\settings.json`）に `"search_url": "http://127.0.0.1:8888"`（DeepSeek なら `"search_engine": "deepseek"` と `"deepseek_api_key"`）。
+- すべてのモデルに: `~/.config/xestrata/settings.json`（Windows では `%APPDATA%\xestrata\settings.json`）に `"search_url": "http://127.0.0.1:8888"`（DeepSeek なら `"search_engine": "deepseek"` と `"deepseek_api_key"`、TinyFish なら `"search_engine": "tinyfish"` と `"tinyfish_api_key"`）。
 - 1 つのモデルだけ: `xestrata-<model>.json` に同じキー。`"search_url": ""` はそのモデルだけ検索を切ります。
 - Web のページ: About のタブの Model settings（[すべてのモデルの設定](#api)）。
 
@@ -1586,7 +1591,9 @@ Web のページのチャットには「検索: オン／オフ」の切り替�
 
 **守り**: `fetch_page` が読むのは公開のアドレスだけです。名前を引いた後のアドレスで確かめ、確かめたアドレスにつなぎ、リダイレクト先も同じように確かめます。この PC や同じネットワークのページは読みません。
 1 回の結果は 24,000 字までで、ページは 2 MiB まで、15 秒で打ち切ります。検索サーバーが答えないときや何も見つからないときは、モデルにそう伝え、答えは続きます。
-`user_location` は使いません。
+**検索の言語と地域**（TinyFish だけ）: 要求の `user_location` の国（Chat Completions の `web_search_options.user_location.approximate.country`、Responses と Anthropic のツールの `user_location.country`）を TinyFish に地域として渡し、言語は TinyFish が国から決めます。
+`user_location` がなければ、要求の `Accept-Language` の最初の言語（地域があればそれも）を渡します。Web のページのチャットでは、ブラウザーの言語の設定がこれになります。
+どちらもなければ何も渡さず、TinyFish の既定（US・英語）で検索します。SearXNG 互換のサーバーと DeepSeek には渡しません（DeepSeek の言語の指定 `lang:` は、その言語のページに絞るためです）。
 
 ## MCP サーバーのツールを使う
 

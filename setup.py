@@ -4871,44 +4871,55 @@ def script_guard_setup(a) -> None:
        " (every model; the server reads it when it starts)")
 
 
+# the search APIs setup offers: name -> (who, the settings' key, the launcher's variable, the terms)
+WEB_SEARCH_APIS = {
+    "deepseek": ("DeepSeek", "deepseek_api_key", "XESTRATA_DEEPSEEK_API_KEY", "billed by DeepSeek per search"),
+    "tinyfish": ("TinyFish", "tinyfish_api_key", "XESTRATA_TINYFISH_API_KEY", "free up to TinyFish's daily allowance"),
+}
+
+
 def web_search_setup(a) -> None:
-    """Web search (serve/search.py) for every model, by --web-search or the question: deepseek takes DeepSeek's search
-    API with the user's API key (asked without echo, or the launcher's XESTRATA_DEEPSEEK_API_KEY; one already set is
-    kept), no takes out what setup set up.  Asked only interactively, and only the first time or with --setup;
-    unasked, nothing changes.  A search_url the user wrote by hand (their own SearXNG) is left as it is."""
+    """Web search (serve/search.py) for every model, by --web-search or the question: deepseek and tinyfish take
+    DeepSeek's or TinyFish's search API with the user's API key (asked without echo, or the launcher's
+    XESTRATA_DEEPSEEK_API_KEY / XESTRATA_TINYFISH_API_KEY; one already set is kept), no takes out what setup set up.
+    Asked only interactively, and only the first time or with --setup; unasked, nothing changes.  A search_url the
+    user wrote by hand (their own SearXNG) is left as it is."""
     settings = load_settings()
-    now = "deepseek" if settings.get("search_engine") == "deepseek" else "no"
+    now = settings["search_engine"] if settings.get("search_engine") in WEB_SEARCH_APIS else "no"
     want = a.web_search
     busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
     if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
             ("web_search" not in settings or a.setup):
         say()
         say("  Web search: the model can search the web when a request asks for it (the API's web search tools and")
-        say("  the web page's Search switch):")
+        say("  the web page's Search switch), with one of two search APIs:")
         say("    deepseek: DeepSeek's search API, with your DeepSeek API key. Billed by DeepSeek per search that finds")
         say("         something (USD 0.75 per 1,000); the search words go to DeepSeek.")
+        say("    tinyfish: TinyFish's search API, with your TinyFish API key. Free up to a daily allowance (12,000")
+        say("         searches, 1,000 pages read); the search words and the pages found go to TinyFish.")
         say(f"  A SearXNG-compatible server of your own: write its address as search_url in {settings_path()}.")
-        want = ask("Use web search?", ["deepseek", "no"], now, False)
+        want = ask("Use web search?", ["deepseek", "tinyfish", "no"], now, False)
     if want is None:
         return
     if want == "no":
-        if settings.get("search_engine") == "deepseek":
+        if settings.get("search_engine") in WEB_SEARCH_APIS:
             settings.pop("search_engine", None)
-            settings.pop("deepseek_api_key", None)
+            for api in WEB_SEARCH_APIS.values():
+                settings.pop(api[1], None)
             ok("web search: off")
         save_settings({**settings, "web_search": "no"})
         return
-    key = os.environ.get("XESTRATA_DEEPSEEK_API_KEY", "").strip()   # the launcher's, kept off its command line
+    who, field, env, terms = WEB_SEARCH_APIS[want]
+    key = os.environ.get(env, "").strip()               # the launcher's, kept off its command line
     if not key and not JSON_OUT and sys.stdin.isatty():
         import getpass
-        key = getpass.getpass("DeepSeek API key (not shown; Enter keeps the one set): ").strip()
-    key = key or str(settings.get("deepseek_api_key") or "")
+        key = getpass.getpass(f"{who} API key (not shown; Enter keeps the one set): ").strip()
+    key = key or str(settings.get(field) or "")
     if not key or any(c.isspace() for c in key) or len(key) < 8:
-        warn("web search: no DeepSeek API key was given; nothing changed")
+        warn(f"web search: no {who} API key was given; nothing changed")
         return
-    save_settings({**settings, "web_search": "deepseek", "search_engine": "deepseek", "deepseek_api_key": key})
-    ok("web search: DeepSeek's search API (billed by DeepSeek per search; the key is kept in "
-       f"{settings_path()}, readable by you only)")
+    save_settings({**settings, "web_search": want, "search_engine": want, field: key})
+    ok(f"web search: {who}'s search API ({terms}; the key is kept in {settings_path()}, readable by you only)")
 
 
 def remove_data() -> int:
@@ -6663,7 +6674,8 @@ def describe() -> dict:
                       "problem": gpu_problem(g)} for g in found],
             "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
             "images": images, "image_default": list(QI.SETUP_DEFAULT),
-            "web_search": ("deepseek" if load_settings().get("search_engine") == "deepseek" else None)}
+            "web_search": (load_settings()["search_engine"]
+                           if load_settings().get("search_engine") in WEB_SEARCH_APIS else None)}
 
 
 def main() -> int:
@@ -6699,12 +6711,13 @@ def main() -> int:
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
-    ap.add_argument("--web-search", choices=["deepseek", "no"],
+    ap.add_argument("--web-search", choices=["deepseek", "tinyfish", "no"],
                     help="web search for every model (serve's web search tools, the web page's Search switch): "
                          "deepseek uses DeepSeek's search API with your API key (asked without echo; billed by "
-                         "DeepSeek per search); no takes it out. A SearXNG-compatible server of your own is its "
-                         "address as search_url in settings.json. Without it setup asks the first time, and with "
-                         "--setup")
+                         "DeepSeek per search); tinyfish TinyFish's search API with your API key (asked without "
+                         "echo; free up to a daily allowance); no takes either out. A SearXNG-compatible server of "
+                         "your own is its address as search_url in settings.json. Without it setup asks the first "
+                         "time, and with --setup")
     ap.add_argument("--script-guard", choices=["ja", "en", "ko", "zh-cn", "zh-tw", "off"],
                     help="keep other languages' characters out of the answers of every model (serve/script_guard.py): "
                          "ja keeps Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers, en every "

@@ -128,7 +128,11 @@ let health = {model: "strata", images: false, max_context: 0};
 function renderEmptyChat() {
   $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
                                         : tr("composer.attach", "Attach a text file (or drop it here)");
-  $("chat-empty-sub").textContent = tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
+  // with the chat's web search on, the search words go to the search engine and the pages it reads are fetched
+  const searching = health.web_search && ($("chat-search").value || store.get("chat_search", "on")) !== "off";
+  $("chat-empty-sub").textContent = searching
+    ? tr("chat.emptyModelSearch", "{model} runs on this PC. With web search on, the search words go to the search engine and the pages it reads are fetched; nothing else leaves it.", {model: health.model})
+    : tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
 }
 async function loadHealth() {
   try {
@@ -2260,8 +2264,9 @@ function chatSearch() {
   sel.replaceChildren(new Option(tr("chatSearch.on", "Search: on"), "on"), new Option(tr("chatSearch.off", "Search: off"), "off"));
   sel.value = was === "off" ? "off" : "on";
   sel.hidden = !health.web_search;
+  renderEmptyChat();
 }
-$("chat-search").onchange = () => store.set("chat_search", $("chat-search").value);
+$("chat-search").onchange = () => { store.set("chat_search", $("chat-search").value); renderEmptyChat(); };
 function imgModels() {
   chatImages();
   chatSearch();

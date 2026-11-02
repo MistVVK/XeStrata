@@ -94,6 +94,7 @@
   "chat.deleted": "Conversation supprimée",
   "chat.empty": "Posez n’importe quelle question",
   "chat.emptyModel": "{model} tourne sur ce PC. Rien n’en sort.",
+  "chat.emptyModelSearch": "{model} tourne sur ce PC. Avec la recherche web activée, les mots de recherche vont au moteur de recherche et les pages lues sont téléchargées ; rien d’autre n’en sort.",
   "chat.image": "image",
   "chat.interrupted": "Interrompue",
   "chat.interruptedLower": "interrompue",

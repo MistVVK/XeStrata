@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""serve/search.py - web search for a request that asks for it, through one of two search engines.
+"""serve/search.py - web search for a request that asks for it, through one of three search engines.
 
 `search_engine` (the model's config, else the user's settings: serve/runconfig.py GLOBAL) chooses it:
 
@@ -9,9 +9,12 @@
   include_domains, exclude_domains) are sent as well; a server that does not know them ignores them, and the results
   are cut and filtered here too.
 - "deepseek": DeepSeek's search API (POST /v1/tools/search, billed per search that finds something), with the
-  user's `deepseek_api_key` from the settings.  The key is never logged nor written into a result.
+  user's `deepseek_api_key` from the settings.
+- "tinyfish": TinyFish's search API (free up to a daily allowance), with the user's `tinyfish_api_key` from the
+  settings; the results' page texts come from TinyFish's fetch API.
 
-Both give the same results ([{"url", "title", "content", "raw_content"?}]) and the same notes.
+An API key is never logged nor written into a result.  All three give the same results ([{"url", "title", "content",
+"raw_content"?}]) and the same notes.
 
 `SearchTools` is a hub run_with_mcp runs (template_tools, routes, call, settings), as the image tools are: the model
 calls web_search, and fetch_page for a page whose text the search did not bring.  Every source a call returned is
@@ -197,7 +200,7 @@ class Searxng:
     def __init__(self, base: str):
         self.base = base.rstrip("/")
 
-    def search(self, query: str, count: int, include=(), exclude=()) -> tuple[list[dict], list[str]]:
+    def search(self, query: str, count: int, include=(), exclude=(), locale=None) -> tuple[list[dict], list[str]]:
         return search(self.base, query, count, True, include, exclude), []
 
 
@@ -217,7 +220,8 @@ class DeepSeek:
     def __repr__(self) -> str:                           # never the key, in a log or a traceback
         return "DeepSeek(search API)"
 
-    def search(self, query: str, count: int, include=(), exclude=()) -> tuple[list[dict], list[str]]:
+    def search(self, query: str, count: int, include=(), exclude=(), locale=None) -> tuple[list[dict], list[str]]:
+        # `locale` is not used: DeepSeek's only language control (the query's lang:) filters, it does not prefer
         notes = []
         if len(query) > self.QUERY_CHARS:
             query = query[:self.QUERY_CHARS]
@@ -261,6 +265,85 @@ class DeepSeek:
         return out, notes
 
 
+class TinyFish:
+    """TinyFish's search API (docs.tinyfish.ai/search-api), with the results' page texts from its fetch API in one
+    request (docs.tinyfish.ai/fetch-api: up to 10 addresses, the text as Markdown).  Both are free up to a daily
+    allowance (12,000 searches, 1,000 fetched pages), so a search here takes `count` pages of it."""
+    name = "tinyfish"
+    SEARCH_URL = "https://api.search.tinyfish.ai"
+    FETCH_URL = "https://api.fetch.tinyfish.ai"
+    FETCH_URLS = 10
+    FETCH_PAGE_MS = 12000                                # each page's limit at TinyFish: the call waits a little more
+    ERRORS = {401: "TinyFish refused the API key (tinyfish_api_key in the settings)",
+              402: "the TinyFish account's daily allowance is used up and it has no balance left",
+              429: "TinyFish's search limit (requests per minute) was reached; try again later"}
+
+    def __init__(self, key: str):
+        self._key = key
+
+    def __repr__(self) -> str:                           # never the key, in a log or a traceback
+        return "TinyFish(search API)"
+
+    def _call(self, req: urllib.request.Request, what: str, timeout: float):
+        for attempt in (0, 1):                           # 429 and 5xx once more
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read(16 << 20))
+            except urllib.error.HTTPError as e:
+                if attempt == 0 and (e.code == 429 or e.code >= 500):
+                    time.sleep(1.0)
+                    continue
+                raise SearchError(self.ERRORS.get(e.code, f"TinyFish's {what} answered HTTP {e.code}")) from None
+            except (OSError, ValueError) as e:
+                raise SearchError(f"TinyFish's {what} cannot be reached ({getattr(e, 'reason', None) or e})") \
+                    from None
+        return None
+
+    def search(self, query: str, count: int, include=(), exclude=(), locale=None) -> tuple[list[dict], list[str]]:
+        params = {"query": query, **(locale or {})}      # location / language: TinyFish resolves the one not given
+        if include:
+            params["include_domains"] = ",".join(include)
+        if exclude:
+            params["exclude_domains"] = ",".join(exclude)
+        req = urllib.request.Request(f"{self.SEARCH_URL}?{urllib.parse.urlencode(params)}",
+                                     headers={"X-API-Key": self._key, "Accept": "application/json",
+                                              "User-Agent": AGENT})
+        got = self._call(req, "search", SEARCH_TIMEOUT_S)
+        out, have = [], set()
+        results = got.get("results") if isinstance(got, dict) else None
+        for r in results if isinstance(results, list) else []:
+            url = r.get("url") if isinstance(r, dict) else None
+            if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+                continue
+            if url in have or not _domain_ok(url, include, exclude):
+                continue
+            have.add(url)
+            out.append({"url": url, "title": str(r.get("title") or url), "content": str(r.get("snippet") or "")})
+            if len(out) >= count:
+                break
+        notes = []
+        if out:
+            try:
+                self._texts(out[:self.FETCH_URLS])
+            except SearchError as e:                     # the snippets still answer
+                notes.append(f"the pages' texts were not fetched: {e}")
+        return out, notes
+
+    def _texts(self, found: list[dict]) -> None:
+        """The pages' texts as raw_content, from one fetch request (a page TinyFish could not read keeps none)."""
+        body = json.dumps({"urls": [r["url"] for r in found], "format": "markdown",
+                           "per_url_timeout_ms": self.FETCH_PAGE_MS}).encode()
+        req = urllib.request.Request(self.FETCH_URL, body, {"X-API-Key": self._key, "Accept": "application/json",
+                                                            "Content-Type": "application/json", "User-Agent": AGENT})
+        got = self._call(req, "page fetch", self.FETCH_PAGE_MS / 1000 + 8)
+        by_url = {r["url"]: r for r in found}
+        results = got.get("results") if isinstance(got, dict) else None
+        for p in results if isinstance(results, list) else []:
+            r = by_url.get(p.get("url")) if isinstance(p, dict) else None
+            if r is not None and isinstance(p.get("text"), str) and p["text"].strip():
+                r["raw_content"] = p["text"]
+
+
 def search(base: str, query: str, count: int, raw: bool, include=(), exclude=(),
            timeout: float = SEARCH_TIMEOUT_S) -> list[dict]:
     """The search server's results for `query`: [{"url", "title", "content", "raw_content"?}], at most `count`."""
@@ -297,17 +380,45 @@ def search(base: str, query: str, count: int, raw: bool, include=(), exclude=(),
     return out
 
 
-class SearchTools:
-    """web_search and fetch_page for one request (the hub run_with_mcp runs).  `engine`: Searxng or DeepSeek.
-    `options`: the request's search settings - "context" (low / medium / high), "include" and "exclude" (domains),
-    "max_uses"."""
+def locale(user_location, accept_language: str | None) -> dict:
+    """Where the search is for: {"location": country, "language": code}, either or neither.  The request's
+    user_location (OpenAI's Chat {"approximate": {"country"}}, its Responses' and Anthropic's {"country"}) first, its
+    country alone; else the first language of Accept-Language (a browser's, as the web page's chat sends), with its
+    region when it names one."""
+    if isinstance(user_location, dict):
+        inner = user_location.get("approximate")
+        country = (inner if isinstance(inner, dict) else user_location).get("country")
+        if isinstance(country, str) and re.fullmatch(r"[A-Za-z]{2}", country):
+            return {"location": country.upper()}
+    best, best_q = None, 0.0
+    for part in (accept_language or "").split(","):
+        tag, _, q = part.strip().partition(";q=")
+        try:
+            weight = float(q) if q else 1.0
+        except ValueError:
+            continue
+        if tag and tag != "*" and weight > best_q:
+            best, best_q = tag, weight
+    subtags = (best or "").replace("_", "-").split("-")
+    if not re.fullmatch(r"[A-Za-z]{2,3}", subtags[0]):
+        return {}
+    region = next((t for t in subtags[1:] if re.fullmatch(r"[A-Za-z]{2}", t)), None)
+    return {"language": subtags[0].lower(), **({"location": region.upper()} if region else {})}
 
-    def __init__(self, engine: Searxng | DeepSeek, options: dict | None = None):
+
+class SearchTools:
+    """web_search and fetch_page for one request (the hub run_with_mcp runs).  `engine`: Searxng, DeepSeek or
+    TinyFish.
+    `options`: the request's search settings - "context" (low / medium / high), "include" and "exclude" (domains),
+    "max_uses", "locale" (locale() above)."""
+
+    def __init__(self, engine: Searxng | DeepSeek | TinyFish, options: dict | None = None):
         o = options or {}
         self.engine = engine
         self.count, self.chars = CONTEXT.get(o.get("context") or "medium", CONTEXT["medium"])
         self.include = [d for d in o.get("include") or [] if isinstance(d, str) and d]
         self.exclude = [d for d in o.get("exclude") or [] if isinstance(d, str) and d]
+        self.locale = o.get("locale") or {}
         self.max_uses = o.get("max_uses") if isinstance(o.get("max_uses"), int) and o["max_uses"] > 0 else None
         self.settings = {"max_rounds": 4}
         self.sources: list[dict] = []           # every result returned, in order, once per address
@@ -337,7 +448,7 @@ class SearchTools:
                 query = str(args.get("query") or "").strip()
                 if not query:
                     raise SearchError("web_search needs a query")
-                found, notes = self.engine.search(query, self.count, self.include, self.exclude)
+                found, notes = self.engine.search(query, self.count, self.include, self.exclude, self.locale)
                 if not found:
                     raise SearchError(f"nothing was found for {query!r}")
                 lines = [f"({n})" for n in notes]

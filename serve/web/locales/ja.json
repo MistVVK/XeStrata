@@ -94,6 +94,7 @@
   "chat.deleted": "チャットを削除しました",
   "chat.empty": "なんでも聞いてください",
   "chat.emptyModel": "{model} はこの PC で動いています。外部には何も送られません。",
+  "chat.emptyModelSearch": "{model} はこの PC で動いています。Web 検索がオンのときは、検索語が検索エンジンに送られ、読むページを取りに行きます。それ以外は外部に送られません。",
   "chat.image": "画像",
   "chat.interrupted": "中断しました",
   "chat.interruptedLower": "中断",

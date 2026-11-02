@@ -94,6 +94,7 @@
   "chat.deleted": "Chat excluído",
   "chat.empty": "Pergunte o que quiser",
   "chat.emptyModel": "{model} roda neste PC. Nada sai dele.",
+  "chat.emptyModelSearch": "{model} roda neste PC. Com a pesquisa na web ativada, as palavras de pesquisa vão para o mecanismo de busca e as páginas lidas são baixadas; nada mais sai dele.",
   "chat.image": "imagem",
   "chat.interrupted": "Interrompida",
   "chat.interruptedLower": "interrompida",

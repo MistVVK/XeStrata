@@ -523,14 +523,21 @@ type MainWindow() as this =
         let webSearch, webSearchValue =
             choice
                 [ "Off", "no"
-                  "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek", "deepseek" ]
-                (match d.WebSearch with "deepseek" -> 1 | _ -> 0)
-        let deepseekKey =
-            TextBox(PasswordChar = '*', MinWidth = 420.0,
-                    PlaceholderText = (if d.WebSearch = "deepseek" then "set (type to replace)" else "your DeepSeek API key"))
-        let deepseekField = field "DeepSeek API key (kept in your settings, never shown)" deepseekKey
-        deepseekField.IsVisible <- webSearchValue () = "deepseek"
-        webSearch.SelectionChanged.Add(fun _ -> deepseekField.IsVisible <- webSearchValue () = "deepseek")
+                  "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek", "deepseek"
+                  "TinyFish's search API: your API key, free up to a daily allowance (12,000 searches, 1,000 pages read); the search words and the pages found go to TinyFish", "tinyfish" ]
+                (match d.WebSearch with "deepseek" -> 1 | "tinyfish" -> 2 | _ -> 0)
+        // the search APIs' keys: (setup's --web-search value, its name, the box)
+        let apiKeys =
+            [ for id, who in [ "deepseek", "DeepSeek"; "tinyfish", "TinyFish" ] ->
+                  id, who,
+                  TextBox(PasswordChar = '*', MinWidth = 420.0,
+                          PlaceholderText = (if d.WebSearch = id then "set (type to replace)" else $"your {who} API key")) ]
+        let apiKeyFields =
+            [ for id, who, box in apiKeys -> id, field $"{who} API key (kept in your settings, never shown)" box ]
+        let showApiKey () =
+            for id, f in apiKeyFields do f.IsVisible <- webSearchValue () = id
+        showApiKey ()
+        webSearch.SelectionChanged.Add(fun _ -> showApiKey ())
         let webSearchField = field "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)" webSearch
         let imagesField = field "Image generation: models to make images with, besides the text model" images
         // the options setup takes without asking, under Advanced
@@ -645,14 +652,18 @@ type MainWindow() as this =
                         Result.Ok(if withImages then [ for name, v in imageValues () do yield! [ "--image-" + name; v ] ] else [])
                         serverArgs ()
                     ]
-                let key = trimmed deepseekKey
+                let api = apiKeys |> List.tryFind (fun (id, _, _) -> id = webSearchValue ())
+                let key = match api with Some (_, _, box) -> trimmed box | None -> ""
                 match advanced with
                 | Error why -> problem.Text <- why
-                | Result.Ok _ when webSearchValue () = "deepseek" && key = "" && d.WebSearch <> "deepseek" ->
-                    problem.Text <- "Web search with DeepSeek needs your DeepSeek API key."
+                | Result.Ok _ when api.IsSome && key = "" && d.WebSearch <> webSearchValue () ->
+                    let _, who, _ = api.Value
+                    problem.Text <- $"Web search with {who} needs your {who} API key."
                 | Result.Ok more ->
                     // the key reaches setup in its environment, never on its command line (process lists show that)
-                    Environment.SetEnvironmentVariable("XESTRATA_DEEPSEEK_API_KEY", (if key = "" then null else key))
+                    for id, _, box in apiKeys do
+                        let k = if webSearchValue () = id then trimmed box else ""
+                        Environment.SetEnvironmentVariable($"XESTRATA_{id.ToUpperInvariant()}_API_KEY", (if k = "" then null else k))
                     let args =
                         [ "--setup"; "--yes"; "--no-start"; "--family"; f.Id; "--model"; m.Id; "--data-dir"; dataDir.Text ]
                         @ questions
@@ -703,7 +714,7 @@ type MainWindow() as this =
                 projection
                 imagesField
                 webSearchField
-                deepseekField
+                yield! [ for _, f in apiKeyFields -> f :> Control ]
                 advanced
                 problem
                 actions [ button "Back" (fun () -> homePage d); install ]

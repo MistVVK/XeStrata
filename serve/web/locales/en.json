@@ -94,6 +94,7 @@
   "chat.deleted": "Chat deleted",
   "chat.empty": "Ask anything",
   "chat.emptyModel": "{model} runs on this PC. Nothing leaves it.",
+  "chat.emptyModelSearch": "{model} runs on this PC. With web search on, the search words go to the search engine and the pages it reads are fetched; nothing else leaves it.",
   "chat.image": "image",
   "chat.interrupted": "Interrupted",
   "chat.interruptedLower": "interrupted",

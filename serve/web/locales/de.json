@@ -94,6 +94,7 @@
   "chat.deleted": "Chat gelöscht",
   "chat.empty": "Fragen Sie, was Sie möchten",
   "chat.emptyModel": "{model} läuft auf diesem PC. Nichts verlässt ihn.",
+  "chat.emptyModelSearch": "{model} läuft auf diesem PC. Mit eingeschalteter Websuche gehen die Suchbegriffe an die Suchmaschine und die gelesenen Seiten werden abgerufen; sonst verlässt nichts den PC.",
   "chat.image": "Bild",
   "chat.interrupted": "Unterbrochen",
   "chat.interruptedLower": "unterbrochen",
