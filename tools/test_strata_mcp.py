@@ -160,6 +160,9 @@ class FakeRoot(unittest.TestCase):
         (self.root / "serve" / "server.py").write_text(FAKE_SERVER)
         self.env_backup = {k: os.environ.get(k) for k in ("XDG_CONFIG_HOME",)}
         os.environ["XDG_CONFIG_HOME"] = str(base / "config")
+        # the default port every status looks at: a free one, so a real server on 8095 is not taken for the tests'
+        self.default_port = M.DEFAULT_PORT
+        M.DEFAULT_PORT = free_port()
         self.strata = M.Strata(self.root)
         self.strata.python_override = sys.executable
         self.strata.health_timeout = 1.0
@@ -186,6 +189,7 @@ class FakeRoot(unittest.TestCase):
                 p.wait(5)
             except subprocess.TimeoutExpired:
                 pass
+        M.DEFAULT_PORT = self.default_port
         for k, v in self.env_backup.items():
             if v is None:
                 os.environ.pop(k, None)

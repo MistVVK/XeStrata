@@ -124,6 +124,10 @@ FALLBACK_FAMILIES = {
                                 "it writes", "tag": "huihui-unsloth-", "vision": False},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
+    "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",
+                          "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and "
+                                   "its safety filtering is reduced, so check what it writes",
+                          "tag": "ornith-uncensored-"},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "about": "32B, 3B active; Japanese and English, a thinking model",
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "

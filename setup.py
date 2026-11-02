@@ -104,6 +104,7 @@ HF_REVISIONS = {
     "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": "0bfdfe7f6c424de60481c26379c9d821469f75f1",         # 2026-10-11
+    "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF": "38ab997c00045ce9fb858b16d7d914193f9e9917",      # 2026-11-03
     "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": "044a4447c2da94b489484927355665b819eb3d4b",           # 2026-10-11
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
@@ -598,6 +599,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # "kv_bytes": its K/V cache's bytes a token (setup sizes the model and the context by the GPU's memory).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
+_ORNITH_UNC = "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF"
+_ORNITH_UNC_FILE = "Ornith-1.5-35B-A3B-CRACK-{}.gguf"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
 _QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
@@ -658,6 +661,24 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                                       "sha256": "69191d3d2c402f7c13950815bf20d826d7066c8d7f1bef4594cf70c13ea56ccc",
                                       "about": "3.5-bit GSQ-RCO by pfeifferj (as above)"},
                }},
+    # Ornith-1.5 with its refusals removed (dealignai's CRACK, which changes the attention's weights; the MTP layer is
+    # kept and changed alike), the official files' versions with their tensor types: only the weights differ
+    "ornith-uncensored": {
+        "title": "Ornith-1.5-35B-A3B (uncensored)", "by": "dealignai (MIT), from Ornith AI's Ornith-1.5-35B-A3B",
+        "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and its safety "
+                 "filtering is reduced, so check what it writes",
+        "tag": "ornith-uncensored-", "name": "ornith-1.5-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+        "profile": "expert-profile-ornith.bin",
+        "models": {
+            "Q4_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q4_K_M"), "size": 21713462848,
+                       "sha256": "f1e281f07c99aa9a731b47082c3d1bfc22e9477230330688a543e3d451319d76", "about": "4-bit"},
+            "Q5_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q5_K_M"), "size": 25347532352,
+                       "sha256": "ee3173b194460a19277d940bfd8fb6a5ca8da8c60294df291aa0b04f46ea9e9d", "about": "5-bit"},
+            "Q6_K": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q6_K"), "size": 29208731200,
+                     "sha256": "14bdc41c560941f5c0a4bd120cbd423ca010184819934ec1057b80d01b394124", "about": "6-bit"},
+            "Q8_0": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q8_0"), "size": 37802149152,
+                     "sha256": "f962dad770b0a388777ed3ab6791fb469bba5e2c6f2b903d6794c4659821451a", "about": "8-bit"},
+        }},
     "llmjp": {"title": "llm-jp-4.1-32b-a3b-thinking", "by": "LLM-jp (Apache-2.0)",
               "about": "32B, 3B active; Japanese and English, a thinking model", "tag": "llmjp-",
               "name": "llm-jp-4.1-32b-a3b-thinking", "max_context": 262144, "plain": True,
@@ -5053,7 +5074,9 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("xestrata-"):]
-    family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
+    # the longest tag: one family's can start another's (gyro- and gyro-coder-, qwen35- and qwen35-uncensored-)
+    family = max((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])),
+                 key=lambda f: len(FAMILIES[f]["tag"]), default="qwen")
     model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731

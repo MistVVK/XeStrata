@@ -359,6 +359,10 @@ Qwen3.5-9B keeps every weight in the GPU's VRAM.
   MoE of 35B with 3B active per token, context up to 256K. The official Q4_K_M to BF16, and pfeifferj's GSQ-RCO 3 and
   3.5 bits (a [community reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), not
   ISTA-DASLab's).
+  dealignai's version with its refusals removed,
+  [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF) (MIT, Q4_K_M, Q5_K_M,
+  Q6_K and Q8_0, with the tensor types of the same official versions), can be chosen too
+  (`--family ornith-uncensored`). It refuses far less, and its safety filtering is reduced, so check what it writes.
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)** (LLM-jp,
   Apache-2.0): a thinking model of 32B with 3B active per token, in Japanese and English, context up to 256K.
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
@@ -383,6 +387,10 @@ Qwen3.5-9B keeps every weight in the GPU's VRAM.
 | | **BF16** | 71.1 GB | 80 GB | 8 GB and up |
 | | **GSQ-RCO-3BIT** | 13.0 GB | 21 GB | 4 GB and up |
 | | GSQ-RCO-3.5BIT | 15.2 GB | 24 GB | 6 GB and up |
+| Ornith-1.5 (refusals removed) | Q4_K_M | 21.7 GB | 30 GB | 4 GB and up |
+| | Q5_K_M | 25.3 GB | 34 GB | 6 GB and up |
+| | Q6_K | 29.2 GB | 38 GB | 6 GB and up |
+| | Q8_0 | 37.8 GB | 46 GB | 6 GB and up |
 | llm-jp-4.1 | **Q4_K_M** | 21.5 GB | 30 GB | 4 GB and up |
 | | BF16 | 64.3 GB | 73 GB | 8 GB and up |
 | Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB and up |
@@ -408,6 +416,7 @@ The others are made of the same tensor types, checked on those files and in the 
 
 ```sh
 ./setup.sh --setup --family ornith --model Q4_K_M
+./setup.sh --setup --family ornith-uncensored --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
 ./setup.sh --setup --family qwen35 --model Q4_K_M
@@ -416,7 +425,7 @@ The others are made of the same tensor types, checked on those files and in the 
 ```
 
 The API works, with the thinking kept apart from the answer, streaming and tool calls.
-Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding; the GSQ-RCO versions and llm-jp have no MTP layer).
+Ornith's official versions (Q4_K_M to BF16) and the ones with its refusals removed, Qwen3.6 and GLM-5.3-Flash draft up to two tokens ahead with the model's MTP layer and check them in a window (speculative decoding; the GSQ-RCO versions and llm-jp have no MTP layer).
 Requests with a temperature take it too: each row of a window draws from a random number its position fixes, and a draft is kept only where it equals that draw, so the text is the one without drafts (Qwen3.6-35B-A3B on the B70, 400 tokens at temperature 0.8: decode 92.9 -> 131.7 tokens/s).
 With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
@@ -1324,8 +1333,9 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   A request's own fields always win.
   With no block at all, a request without sampling keys gets the sampling the model card recommends (upstream #2685).
   It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B and Qwen3.5-9B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5; HauhauCS's Qwen3.5-9B thinking 0.6 / 0.95 / 20, not thinking 0.7 / 0.8 / 20.
-  Ornith-1.5 takes its card's set for general tasks, 0.6, 0.95 and 20 (with or without thinking), GLM-5.3-Flash its
-  generation_config's temperature 1.0 and top_p 0.95.
+  Ornith-1.5 takes its card's set for general tasks, 0.6, 0.95 and 20 (with or without thinking), dealignai's
+  Ornith-1.5 its card's 1.0, 0.95 and 20 (with or without thinking), GLM-5.3-Flash its generation_config's temperature
+  1.0 and top_p 0.95.
   llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
@@ -2061,7 +2071,7 @@ The model files are not part of it; their licenses apply to them (below).
   Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
-  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
+  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,

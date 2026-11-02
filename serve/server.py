@@ -9738,6 +9738,9 @@ MODEL_CARD_SAMPLING = {
     # Ornith-1.5: the card's set for general tasks (its benchmarks ran at temperature 1.0)
     "ornith": {"thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                "instruct": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
+    # dealignai's Ornith-1.5 (CRACK): its card's one set, with or without thinking
+    "dealignai": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+                  "instruct": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}},
     # GLM-5.3-Flash: its generation_config.json
     "glm5": {"thinking": {"temperature": 1.0, "top_p": 0.95}, "instruct": {"temperature": 1.0, "top_p": 0.95}},
 }
@@ -9746,9 +9749,9 @@ MODEL_CARD_SAMPLING = {
 def card_family(cfg: dict) -> str | None:
     """Which MODEL_CARD_SAMPLING set a config's model takes: Qwen3.8-Flash-Next and its variants (Swift, Gyro: upstream
     gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B and Qwen3.5-9B ("qwen35moe"), HauhauCS's Qwen3.5-9B
-    ("hauhaucs"), Ornith-1.5 ("ornith"), GLM-5.3-Flash ("glm5"); None for llm-jp (its card names no sampling), which
-    stays greedy unless the request or the config's `sampling` block says otherwise.  By the model's name, as the
-    architecture alone does not tell Qwen3.6 from Ornith."""
+    ("hauhaucs"), Ornith-1.5 ("ornith"), dealignai's Ornith-1.5 ("dealignai"), GLM-5.3-Flash ("glm5"); None for
+    llm-jp (its card names no sampling), which stays greedy unless the request or the config's `sampling` block says
+    otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6 from Ornith."""
     name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
     if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
         return "qwen4exp"
@@ -9756,6 +9759,8 @@ def card_family(cfg: dict) -> str | None:
         return "hauhaucs"
     if name.startswith(("qwen3.6", "qwen3.5")):
         return "qwen35moe"
+    if name.startswith("ornith") and "uncensored" in name:
+        return "dealignai"
     if name.startswith("ornith"):
         return "ornith"
     if name.startswith("glm"):

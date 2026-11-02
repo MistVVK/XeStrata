@@ -101,7 +101,7 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM �
 | モデル | パラメーター | RAM の目安 | 向いていること |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 1,250 億 | 32〜62 GB | いちばん賢い。下の版と大きさから選びます |
-| **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | RAM の少ない PC 向け |
+| **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | RAM の少ない PC 向け。拒否を外した版もあります |
 | **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
 | **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 思考するモデル。RAM の少ない PC 向け |
 | **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
@@ -376,7 +376,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
    - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) と [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
-   - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
+   - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj、[拒否を外した版](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)は dealignai）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。

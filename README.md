@@ -104,7 +104,7 @@ To add another model later, run `xestrata --setup` too.
 | Model | Parameters | RAM (about) | Good for |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 125B | 32-62 GB | the smartest; choose from the versions and sizes below |
-| **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | a PC with less RAM |
+| **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | a PC with less RAM; also with its refusals removed |
 | **llm-jp-4.1** (BETA) | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
 | **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model; a PC with less RAM |
 | **Qwen3.5-9B** (BETA) | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
@@ -392,7 +392,7 @@ permission under GPL section 7, what goes in, and how to report).
    - UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF);
    - [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) and [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), by agentionai;
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai;
-   - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
+   - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj, the [version with its refusals removed](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF) by dealignai), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image, CircleStone Labs' Anima with Wan 2.1's VAE, and Qwen3-VL, Qwen3.5-9B and Qwen3-0.6B-Base as the text encoders ([IMAGE](docs/IMAGE.md#licenses)).
