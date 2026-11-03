@@ -304,6 +304,7 @@ v7.1.1 のビルドは開発機（28 スレッド）で 13 分かかり、3.5 GB
 setup.py は OS のパッケージを入れず、パッケージマネージャーも sudo も実行しません。
 setup.sh は、venv の使える Python 3 がないときだけ、それを `sudo apt-get`（Fedora では `sudo dnf`、Arch では `sudo pacman -S`）で入れます。
 ほかのパッケージは、先に自分で入れておきます。
+足りないものがあると、setup は最初の段で止まり、それを全部入れるコマンドを 1 回で出します（Intel の oneAPI や NVIDIA の CUDA のリポジトリがまだなければ、それを足すコマンドも先に出します）。
 
 次の表から、使うモードの共通の行と、PC にある GPU のメーカーの行（いくつでも）を選び、`sudo apt install`（Fedora は `sudo dnf install`、Arch は `sudo pacman -S`）の後ろに並べます。
 `./setup.sh --packages` は、この PC のディストリビューションと GPU、`--license` のモード（既定は contrib-llvm）に合わせて、その 1 行を出します。
@@ -311,7 +312,7 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 
 | 選択 | Ubuntu 26.04 | Fedora 44 | Arch |
 | --- | --- | --- | --- |
-| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
+| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
 | Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
 | Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | なし（oneMKL は Arch のリポジトリにありません） |
 | AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
@@ -333,8 +334,8 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 - Arch の ROCm の clang は `/opt/rocm/lib/llvm` にあり、その実行時の builtins（`libclang_rt.builtins`）も同じ `rocm-llvm` に入っています（AMD の行の `clang-21` と `libclang-rt-21-dev` にあたるものが 1 つのパッケージです）。
 - Arch の ROCm は AMD 自身の入れ方と同じ `/opt/rocm` にあります（CMake のパッケージは `/opt/rocm/lib/cmake`、ライブラリは `/opt/rocm/lib`）。
   CMake の既定の探索にも ld.so の既定にも入らないので、`cmake/StrataHip.cmake` が `/opt/rocm` を `CMAKE_PREFIX_PATH` に足し、setup は `/opt/rocm/lib` をエンジンのライブラリのフォルダーに記録します。
-- Arch では `opencl-headers` も入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
-  Ubuntu と Fedora のビルドではそのヘッダーが入っています（コンパイラーが連れてきます）が、Arch の clang は連れてきません。
+- どのディストリビューションでも `opencl-headers` を入れます。intel/llvm のビルドは SYCL の道具（`sycl-ls`）もインストールし、それは `sycl/detail/cl.h` から `CL/cl.h` を読みますが、そのターゲットには構成が取ってくる OpenCL のヘッダーの include が付きません（あれはランタイム自身のオブジェクトのものです）。
+  コンパイラーはこのヘッダーを連れてきません（入れたばかりの Fedora 44 にも、Arch にもありません）。
 - oneMKL は Arch のリポジトリにないので、要るなら Intel のオフラインインストーラーで入れます。
   contrib-llvm のモードは Intel の GPU の密な積を oneMKL に任せるので、Intel の GPU では oneMKL が要ります。
   入れない場合は free のモードを使います。intel/llvm をソースからビルドし、Intel の GPU の密な積は XeStrata 自身のカーネルが行います。

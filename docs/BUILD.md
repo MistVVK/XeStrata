@@ -301,6 +301,7 @@ The packages it needs are in [the table below](#packages) and in [DEVTOOLS.md](D
 setup.py installs no system packages and runs no package manager and no sudo.
 setup.sh installs Python 3 with venv through `sudo apt-get` (`sudo dnf` on Fedora, `sudo pacman -S` on Arch) only when there is none.
 Install the other packages first.
+When some are missing, setup stops at its first step with one command that installs them all (after the commands that add Intel's oneAPI repository or NVIDIA's CUDA one, where they are not added yet).
 
 From the table, take the common row of the mode you build and the rows of the GPU makers the PC has (any number of them), and put them after `sudo apt install` (`sudo dnf install` on Fedora, `sudo pacman -S` on Arch).
 `./setup.sh --packages` prints that line for this PC's distribution and GPUs and the mode of `--license` (contrib-llvm unless given).
@@ -308,7 +309,7 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 
 | Choice | Ubuntu 26.04 | Fedora 44 | Arch |
 | --- | --- | --- | --- |
-| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
 | Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
 | Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | none (oneMKL is not in Arch's repositories) |
 | AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
@@ -330,8 +331,8 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 - Arch's ROCm clang is in `/opt/rocm/lib/llvm`, and its runtime builtins (`libclang_rt.builtins`) are in the same `rocm-llvm` package (one package where the AMD row's `clang-21` and `libclang-rt-21-dev` are two).
 - Arch's ROCm lies under AMD's own tree, `/opt/rocm` (its CMake packages in `/opt/rocm/lib/cmake`, its libraries in `/opt/rocm/lib`).
   Neither CMake's default search nor ld.so's looks there, so `cmake/StrataHip.cmake` puts `/opt/rocm` on `CMAKE_PREFIX_PATH`, and setup records `/opt/rocm/lib` among the engine's library folders.
-- On Arch `opencl-headers` is installed as well: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
-  Ubuntu's and Fedora's builds have that header (their compilers bring it in); Arch's clang does not.
+- `opencl-headers` is installed on every distribution: intel/llvm's build installs the SYCL tools too, and `sycl-ls` includes `CL/cl.h` through `sycl/detail/cl.h` while its target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own objects).
+  No compiler brings that header in (a fresh Fedora 44 lacks it, as Arch does).
 - oneMKL is not in Arch's repositories: install Intel's offline installer for it if it is wanted.
   The contrib-llvm mode hands an Intel GPU's dense products to oneMKL, so it needs oneMKL for an Intel GPU.
   Without it, use the free mode: it builds intel/llvm from the source, and an Intel GPU's dense products are XeStrata's own kernels' work.

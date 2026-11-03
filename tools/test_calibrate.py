@@ -145,15 +145,19 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(b.count("--spec-min-p"), 1)
 
     def test_engine_args_are_the_servers(self):
-        # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts
-        helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
+        # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts.
+        # (the server's defaults that do not depend on "gpu", --session-save-reclaim among them, are off: those are
+        # serve/test_server.py's)
+        off = {"session_save_reclaim": False}
+        helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"},
+                  **off}
         self.assertEqual(CAL.engine_args(helper), helper["args"])                 # one stage + a helper card: no split
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": 1}), BASE)
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": [0, 2]}), BASE + ["--layer-split", "auto"])
-        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": "0,2", "layer_split": "18"}),
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": 1, **off}), BASE)
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": [0, 2], **off}), BASE + ["--layer-split", "auto"])
+        self.assertEqual(CAL.engine_args({"args": BASE, "gpu": "0,2", "layer_split": "18", **off}),
                          BASE + ["--layer-split", "18"])
         own = BASE + ["--layer-split", ""]                                       # the config's own value wins
-        self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1]}), own)
+        self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1], **off}), own)
 
     def test_run_measures_with_the_servers_args(self):
         with tempfile.TemporaryDirectory() as d:
@@ -167,7 +171,8 @@ class Calibrate(unittest.TestCase):
             fake = type("ST", (), {"Tokenizer": lambda *a: type("T", (), {"encode": lambda s, t, **k: [0]})()})
             try:
                 with mock.patch.dict(sys.modules, {"strata_tokenizer": fake}):
-                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0]}, start_engine=lambda a: None)
+                    CAL.run({"tokenizer": d, "args": list(BASE), "gpu": [0], "session_save_reclaim": False},
+                            start_engine=lambda a: None)
             finally:
                 CAL.measure = saved
         self.assertEqual(seen, [BASE])

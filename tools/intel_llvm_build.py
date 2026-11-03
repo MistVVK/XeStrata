@@ -147,6 +147,10 @@ PREREQUISITES = {
     "fedora": {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "g++": "gcc-c++", "ld.lld": "lld",
                "hwloc": "hwloc-devel",
                "zstd": "libzstd-devel", "opencl": "opencl-headers", "cuda": "cuda-toolkit-13-4",
+               # (NVIDIA's CUDA repository, which Fedora's own do not carry the toolkit of: setup.py's NVIDIA_REPO)
+               "cuda_repo": "sudo dnf config-manager addrepo \\\n"
+                            "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/"
+                            "x86_64/cuda-fedora44.repo",
                "how": "sudo dnf install "},
     "arch": {"git": "git", "cmake": "cmake", "ninja": "ninja", "g++": "base-devel", "ld.lld": "lld",
              "hwloc": "hwloc",
@@ -173,7 +177,7 @@ def missing_prerequisites() -> list:
         need.append(p["hwloc"])
     # intel/llvm's SYCL tools (sycl-ls, which the build installs) include CL/cl.h through sycl/detail/cl.h, and their
     # target gets no include for the OpenCL headers the configuration fetches (those belong to the runtime's own
-    # objects): Arch's clang does not bring the header in, Ubuntu's and Fedora's builds have it
+    # objects), and no distribution's compiler brings the header in (a fresh Fedora 44 lacks it as Arch does)
     if not Path("/usr/include/CL/cl.h").exists():
         need.append(p["opencl"])
     # the SYCL runtime reads zstd-compressed device images (oneMKL's, which oneMath calls in the contrib modes); without
@@ -238,7 +242,8 @@ def target_options(contrib: bool) -> list:
         if shutil.which("nvcc") is None and not Path("/usr/local/cuda/include/cuda.h").exists():
             p = PREREQUISITES[distro_family()]
             fail("the CUDA target needs NVIDIA's CUDA toolkit (not free software)",
-                 "install it: " + p["how"] + p["cuda"] +
+                 "install it:\n" + (f"  {p['cuda_repo']}\n" if "cuda_repo" in p else "") +
+                 "  " + p["how"] + p["cuda"] +
                  (" (Ubuntu: multiverse; Debian: non-free)" if distro_family() == "ubuntu" else ""))
         opts.append("--cuda")
     rocm = rocm_dirs()

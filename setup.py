@@ -1431,7 +1431,10 @@ def amd_elsewhere() -> str:
 # distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
 # optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in the
 # contrib mode only).  On Arch the
-# Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.
+# Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.  opencl-headers: intel/llvm's
+# SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they get no include for the OpenCL headers
+# the configuration fetches (those are the runtime's own objects'); no distribution's compiler brings the header in (a
+# fresh Fedora 44 lacks it as Arch does).
 # oneMKL's series the contrib mode takes, and only it (Intel's repositories carry several side by side): one whose SYCL
 # library runs on the SYCL runtime XeStrata builds with, which tools/intel_llvm_build.py's TAG fixes (2026.2's needs
 # functions intel/llvm v7.1.1's libsycl.so.9 lacked, sycl::detail::defaultAsyncHandler among them: v7.2.0).  Raised
@@ -1441,7 +1444,7 @@ ONEMKL_SERIES = "2026.2"
 PACKAGES = {
     "ubuntu": {
         "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
-                "spirv-headers mesa-vulkan-drivers libblosc2-dev",
+                "spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev",
         "intel": "libze1 libze-intel-gpu1 libigc2 libigdfcl2",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
@@ -1450,7 +1453,7 @@ PACKAGES = {
     },
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
-                "vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers blosc2-devel",
+                "vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel",
         "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
@@ -1462,9 +1465,6 @@ PACKAGES = {
         # (Intel's offline installer is the way to it), so an Intel GPU's dense products stay in XeStrata's own
         # kernels.  zstd's package has no libzstd.a, so
         # intel/llvm's build links the shared one (tools/intel_llvm_build.py).
-        # opencl-headers: intel/llvm's SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they
-        # get no include for the OpenCL headers the configuration fetches (those are the runtime's own objects'); Arch's
-        # clang does not bring the header in, Ubuntu's and Fedora's builds have it
         "base": "python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc "
                 "spirv-headers opencl-headers blosc2",
         "intel": "level-zero-loader intel-compute-runtime vulkan-intel",
@@ -1582,6 +1582,12 @@ INTEL_REPO = {
                "    'gpgkey=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB' \\\n"
                "    | sudo tee /etc/yum.repos.d/oneAPI.repo > /dev/null"),
 }
+# (Ubuntu's and Arch's own repositories carry the CUDA toolkit: multiverse, extra)
+NVIDIA_REPO = {
+    "fedora": "sudo dnf config-manager addrepo \\\n"
+              "    --from-repofile=https://developer.download.nvidia.com/compute/cuda/repos/fedora44/x86_64/"
+              "cuda-fedora44.repo",
+}
 
 
 def pkg_installed(name: str) -> bool:
@@ -1630,6 +1636,20 @@ def runtime_missing(makers: set) -> tuple:
 def runtime_commands(need: list, fast: list, repos: list) -> list:
     """The lines that install them: the repositories first, then the packages in one command."""
     return [f"  {r}" for r in repos] + ([f"  {install_cmd(need + fast)}"] if need or fast else [])
+
+
+def install_hint(packages: list) -> str:
+    """A message's commands that install these packages (PACKAGES' names), after adding the repositories of Intel's
+    (oneMKL) and NVIDIA's (the CUDA toolkit, on Fedora) that they come from and that are not added yet."""
+    d = distro_family()
+    repos = []
+    if any(n.startswith("intel-oneapi-") for n in packages) and d in INTEL_REPO and \
+            not repo_added("repos.intel.com/oneapi"):
+        repos.append(INTEL_REPO[d])
+    if any(n.startswith("cuda-") for n in packages) and d in NVIDIA_REPO and \
+            not repo_added("developer.download.nvidia.com/compute/cuda/repos"):
+        repos.append(NVIDIA_REPO[d])
+    return "\n".join(runtime_commands([], packages, repos))
 
 
 def igc_version() -> str | None:
@@ -2068,6 +2088,32 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     warn("faster with " + ", ".join(fast) + " (without them XeStrata's own kernels do the work):")
     for line in lines:
         say(line)
+
+
+def check_build_packages(makers: set, mode: str) -> None:
+    """Building from the source (Linux): stops at the start when the distribution packages the build needs for the
+    GPUs of `makers` and the mode (packages_for) are missing, with one command that installs them all, after the
+    repositories they come from - not one at a time where each is first needed.  A CUDA toolkit, oneMKL or ROCm
+    installed otherwise (NVIDIA's or Intel's installer, AMD's repository) is asked of the files, not of the package
+    names."""
+    d = distro_family()
+    # the build's own view: every NVIDIA GPU's code in the contrib mode (cuda_archs), every AMD GPU's (amd_archs),
+    # oneMKL for any Intel GPU (intel_gpu_present), not only the cards this run chose
+    makers = set(makers) | ({"nvidia"} if mode == "contrib" and cuda_archs() else set()) | \
+        ({"amd"} if amd_archs() else set()) | ({"intel"} if intel_gpu_present() else set())
+    names, _ = packages_for(d, makers, mode)
+    p = PACKAGES[d]
+    skip = set()
+    if cuda_toolkits():
+        skip |= set(p["nvidia"].split())
+    if mkl_root() is not None:
+        skip |= set(p["intel-contrib"].split())
+    if "amd" in makers:
+        skip |= set(p["amd"].split()) - set(rocm_missing())
+    missing = [n for n in names if n not in skip and not pkg_installed(n)]
+    if missing:
+        fail("building XeStrata here needs these packages: " + ", ".join(missing),
+             "install them, then run it again:\n" + install_hint(missing))
 
 
 def check_pdf() -> None:
@@ -3802,8 +3848,7 @@ INTEL_LLVM_DEFAULT = ROOT / ".tools" / "intel-llvm" / "install"
 INTEL_LLVM_CONTRIB = ROOT / ".tools" / "intel-llvm-contrib" / "install"
 FREE_HOW = ("intel/llvm's DPC++ 7 or later (free software): build it here: ./setup.sh --intel-llvm-build (13 minutes "
             "on 28 threads, 3.5 GB), or a distribution's package of version 7 or later")
-MKL_HOW = ("oneMKL (not free software; Intel's apt repository, set up as docs/BUILD.md#packages says): "
-           f"sudo apt install intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}")
+MKL_HOW = "oneMKL (not free software; Intel's oneAPI repository, docs/BUILD.md#packages): install it:\n"
 # Intel's repositories carry apt and dnf packages, not Arch's: on Arch the oneAPI packages come from Intel's offline
 # installer, if they are wanted at all (the free and contrib modes build intel/llvm from the source)
 ONEAPI_ARCH = ("Intel oneAPI is not in Arch's repositories (only apt's and dnf's): either install it with Intel's "
@@ -4052,7 +4097,7 @@ def contrib_compiler(a, st: dict) -> tuple:
     if comp["cuda_archs"] and not cuda_toolkits():
         fail("NVIDIA's CUDA toolkit is missing (the contrib build makes the NVIDIA GPUs' code with it, and their "
              "dense products go to its cuBLAS)",
-             "install it: " + install_cmd([PACKAGES[distro_family()]["nvidia"]]))
+             "install it:\n" + install_hint(PACKAGES[distro_family()]["nvidia"].split()))
     return comp, d
 
 
@@ -4097,7 +4142,8 @@ def choose_compiler(a, gpu: dict) -> dict:
             comp["license"], comp["onemkl"] = "contrib", intel_gpu_present()
     if comp["onemkl"] and mkl_root() is None:
         fail(f"--license {mode} hands the Intel GPU's dense matrix products to oneMKL, which is not installed",
-             ONEAPI_ARCH if distro_family() == "arch" else MKL_HOW)
+             ONEAPI_ARCH if distro_family() == "arch" else
+             MKL_HOW + install_hint(PACKAGES[distro_family()]["intel-contrib"].split()))
     comp["hip_archs"] = amd_archs()
     if comp["hip_archs"]:
         if missing := rocm_missing():
@@ -4125,10 +4171,13 @@ def choose_compiler(a, gpu: dict) -> dict:
         if probed == {}:
             # no compiler makes the engine run on a GPU its driver does not list (seen on openSUSE Leap 16, whose
             # compute-runtime 25.18 lists no Arc Pro B70)
+            missing = [n for n in PACKAGES[distro_family()]["intel"].split() if not pkg_installed(n)]
             fail(f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU at PCI {pci}" if pci else
                  f"the SYCL runtime of {Path(comp['cxx']).name} lists no GPU",
-                 "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is missing or too old for "
-                 "this GPU: install a newer one (docs/BUILD.md#packages) and run setup again")
+                 "the GPU's Level Zero driver (Intel's compute-runtime) is not installed: install it:\n" +
+                 install_hint(missing) if missing else
+                 "the GPU's Level Zero driver (libze-intel-gpu1, Intel's compute-runtime) is too old for this GPU: "
+                 "install a newer one (docs/BUILD.md#packages) and run setup again")
         xmx = has_xmx(probed)
         if not xmx and not allow_no_xmx:
             say(f"\n  {Path(comp['cxx']).name} ({compiler_version(comp['cxx'], comp['env'])}) gives this GPU no XMX "
@@ -5807,17 +5856,28 @@ def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
     libraries by its RPATH, so a config's other package's lib_dirs, missing here, are skipped."""
     if not PACKAGED:
         return cfg
-    eng = packaged_engine_dir()
-    changed = False
-    for part in (cfg, cfg.get("vision"), (cfg.get("vision") or {}).get("fallback")):
-        if isinstance(part, dict) and part.get("exe"):
-            new = str(eng / Path(part["exe"]).name)
-            if part["exe"] != new:
-                part["exe"] = new
-                changed = True
-    if changed:
+    if point_engine_parts(cfg, packaged_engine_dir()):
         write_config(cfg_path, cfg)
     return cfg
+
+
+def point_engine_parts(cfg: dict, eng: Path, parts: tuple = ("text", "vision", "images")) -> bool:
+    """Points the engines a config names ("exe": the text engine, the vision encoders, the image engine of "images" and
+    "image_models") at the folder `eng`, where one of that name is (on Linux the package's always has them all); True
+    when one changed.  `parts` picks which."""
+    vision = cfg.get("vision")
+    vision = vision if isinstance(vision, dict) else {}
+    found = [*((cfg,) if "text" in parts else ()),
+             *((vision, vision.get("fallback")) if "vision" in parts else ()),
+             *((cfg.get("images"), *(cfg.get("image_models") or [])) if "images" in parts else ())]
+    changed = False
+    for part in found:
+        if isinstance(part, dict) and part.get("exe"):
+            new = eng / Path(part["exe"]).name
+            if part["exe"] != str(new) and (PACKAGED or new.is_file()):
+                part["exe"] = str(new)
+                changed = True
+    return changed
 
 
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
@@ -6504,6 +6564,9 @@ def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
         if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
             nv["mmproj"] = mm
             kept.append("vision mmproj")
+    if "images" in kept or "image_models" in kept:
+        # (an earlier install's image engine: the package's, or another folder's build)
+        point_engine_parts(cfg, Path(cfg["exe"]).parent, ("images",))
     kept += carry_profile_args(old, cfg)
     return kept
 
@@ -7635,8 +7698,10 @@ def main() -> int:
     check_compaction(makers)
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
         check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
-    elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA
-        linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
+    elif not WIN:
+        check_build_packages(makers, license_mode(a))
+        if majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]:       # a contrib build: its CUDA
+            linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
     if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
         fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
              "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
