@@ -258,7 +258,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 - **GPU**: Intel、NVIDIA（Pascal 以降、cuda12.4 のパッケージと同じコード）、AMD（RDNA2 以降、[上の表](#amd-の-gpu)の Fedora 44 と Windows の列の gfx）です。AMD は Adrenalin 26.5.1 以降のドライバーが要ります（`amdhip64_7.dll`）。
 - **計算ライブラリ**: Intel の oneMKL、NVIDIA の cuBLAS と cuDNN、AMD の rocBLAS と hipBLASLt は 7z に入っていません。
   入っていなければ、setup が入れるかを聞き、答えが y なら 7z の Python に `pip install` で入れます。`--check` のときと 7z のフォルダーに書き込めないときは、入れるコマンドを示すだけです。なくても XeStrata 自身のカーネルで動きます。
-- **置き場所**: 7z のフォルダーに書き込むのは、上の計算ライブラリ（7z の `python\`）だけです。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。ウィンドウが思わぬエラーで止まったときは、理由を `%LOCALAPPDATA%\xestrata\state\launcher.log` に残します。
+- **置き場所**: 7z のフォルダーに書き込むのは、上の計算ライブラリ（7z の `python\`）だけです。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。ウィンドウが思わぬエラーで止まったときは、理由を `%LOCALAPPDATA%\xestrata\state\launcher.log` に残します。そこに何も残らずにウィンドウが落ちるときは、コマンドプロンプトから `xestrata.exe --software-render` で起動すると、GPU を使わずに描きます。
 - **更新**: 新しい 7z を別のフォルダーに展開して、そちらの `xestrata.exe` を起動します。設定とモデルはそのまま使います。計算ライブラリは新しい 7z の Python にはないので、setup がまた入れるかを聞きます。
 
 ## 使い方

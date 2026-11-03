@@ -56,4 +56,12 @@ let main argv =
     | None ->
         AppDomain.CurrentDomain.UnhandledException.Add(fun e -> logError "unhandled" e.ExceptionObject e.IsTerminating)
         Threading.Tasks.TaskScheduler.UnobservedTaskException.Add(fun e -> logError "unobserved task" e.Exception false)
-        AppBuilder.Configure<App>().UsePlatformDetect().StartWithClassicDesktopLifetime argv
+        let builder = AppBuilder.Configure<App>().UsePlatformDetect()
+        // --software-render: the window drawn by the CPU, not through the GPU's driver (#50: a crash on scrolling on an
+        // Arc 140V that no .NET handler caught, which this tells apart from one in the launcher's own code)
+        let builder =
+            if Array.contains "--software-render" argv then
+                builder.With(Win32PlatformOptions(RenderingMode = [| Win32RenderingMode.Software |]))
+            else
+                builder
+        builder.StartWithClassicDesktopLifetime(argv |> Array.filter ((<>) "--software-render"))
