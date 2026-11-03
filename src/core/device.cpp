@@ -740,6 +740,29 @@ bool xe_vram(const std::string& pci, uint64_t& total, uint64_t& used) {
     return false;
 }
 
+// Whether the render node of the card at the PCI address `pci` is the i915 driver's.
+bool i915_gpu(const std::string& pci) {
+#if defined(STRATA_XE_QUERY)
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator("/sys/bus/pci/devices/" + pci + "/drm", ec)) {
+        const std::string name = e.path().filename().string();
+        if (name.rfind("renderD", 0) != 0) continue;
+        const int fd = open(("/dev/dri/" + name).c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        char drv[16] = {};
+        drm_version ver{};
+        ver.name_len = sizeof(drv) - 1;
+        ver.name = drv;
+        const bool i915 = ioctl(fd, DRM_IOCTL_VERSION, &ver) == 0 && std::strcmp(drv, "i915") == 0;
+        close(fd);
+        return i915;
+    }
+#else
+    (void) pci;
+#endif
+    return false;
+}
+
 bool driver_free_memory(const sycl::device& d, uint64_t& free) {
     if (integrated_gpu(d) || !d.has(sycl::aspect::ext_intel_pci_address)) return false;
     std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
@@ -816,6 +839,19 @@ void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held) {
     const uint64_t used = std::max(total > free ? total - free : 0, held);
     total = lim;
     free = lim > used ? lim - used : 0;
+}
+
+uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
+    static std::mutex mu;
+    static std::vector<std::pair<std::string, bool>> seen;   // the driver of each card asked once
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = std::find_if(seen.begin(), seen.end(), [&](const auto& e) { return e.first == pci; });
+    if (it == seen.end()) it = seen.insert(seen.end(), {pci, i915_gpu(pci)});
+    // Measured on an A380 (6 GB, i915, compute-runtime 26.05, 2026-11-03): with the engine's own allocations counted, a
+    // cache that left 320 MiB of the 5783 lost its contents and one that left 440 MiB ran, and a probe filled 5120 MiB
+    // in 256 MiB blocks and read all of it back.  A sixteenth (361 MiB there) beside the engines' own reserves (the
+    // plain engine's 1/32, Qwen3.8's 700 MiB); a larger card's runtime takes more (its scratch grows with its units)
+    return it->second ? total / 16 : 0;
 }
 
 uint64_t max_alloc_bytes() {

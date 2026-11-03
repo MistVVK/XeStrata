@@ -422,18 +422,26 @@ bool mem_info(size_t* free_bytes, size_t* total_bytes) {
             g_error = "mem_info: the device does not report free memory (set ZES_ENABLE_SYSMAN=1)";
             return false;
         }
-        uint64_t total = d.get_info<sycl::info::device::global_mem_size>();
+        uint64_t total = d.get_info<sycl::info::device::global_mem_size>(), margin = 0;
         if (core::integrated_gpu(d)) core::apply_uma_limit(free);   // its memory is the system RAM
         else if (d.has(sycl::aspect::ext_intel_pci_address)) {
             std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
             for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
             core::apply_os_budget(pci, free);
+            margin = core::unreported_vram_margin(pci, total);
         }
         size_t held = 0;
         {
             std::lock_guard<std::mutex> lock(g_live_mu);
             if (auto it = g_live_on.find(rt().ordinal()); it != g_live_on.end()) held = it->second;
         }
+        // i915 reports an A380's free memory as all of its 5783 MiB however much is allocated (2026-11-03), so the
+        // expert cache was sized past the card, and i915 took the allocations past it and lost their contents (a GPU
+        // hang, a router reading garbage, OUT_OF_HOST_MEMORY at the next submission).  There the free memory is the
+        // total less what this process holds and the runtime's and the driver's own (unreported_vram_margin).  Not
+        // elsewhere: the B70 reports its total 1.7 GiB under its 32 GiB and its free memory from the 32 GiB, which
+        // the cache has used
+        if (margin > 0) free = std::min<uint64_t>(free, total > held + margin ? total - held - margin : 0);
         core::apply_vram_limit(free, total, held);
         if (free_bytes) *free_bytes = (size_t) free;
         if (total_bytes) *total_bytes = (size_t) total;

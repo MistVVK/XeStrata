@@ -1,0 +1,39 @@
+SPDX-FileCopyrightText: The LLVM project contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+amdgpu-global-offset-hostcall: a fix to intel/llvm v7.2.0, applied by tools/intel_llvm_build.py.
+
+A SYCL kernel that asks for a global id calls __spirv_BuiltInGlobalOffset, which the GlobalOffset pass
+replaces only in codegen (with a parameter of the kernel's _with_offset clone, or 0).  The AMDGPU attributor
+runs before that and took the call as an unknown callee, so every such kernel kept all the implicit inputs,
+the hostcall buffer among them: 14,304 of XeStrata 0.2.2's 32,556 AMD kernels (0 of 48,084 with v7.1.1).
+HIP refuses to launch a kernel with a hostcall buffer where the GPU has no PCIe atomics: a GPU passed through
+to a virtual machine, or in a slot behind a chipset, failed at its first kernel with hipErrorIllegalState
+(XeStrata's issues #40 and #54).  Fixed, the attributor takes the builtin as reading no implicit argument.
+---
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp b/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
+index 630ffad96e..fe2d4076b1 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUAttributor.cpp
+@@ -476,8 +476,19 @@ struct AAAMDAttributesFunction : public AAAMDAttributes {
+         addKnownBits(Attr.first);
+     }
+ 
+-    if (F->isDeclaration())
++    if (F->isDeclaration()) {
++      // Modified 2026 by MistVVK and the XeStrata contributors: SYCL's global
++      // offset builtin reads no implicit argument.  The GlobalOffset pass
++      // replaces its calls in codegen, after this pass, with a parameter of the
++      // kernel's _with_offset clone or 0.  Taken as an unknown callee, it kept
++      // the hostcall buffer and every other implicit input on each kernel that
++      // asks for a global id, and HIP refuses to launch a kernel with a
++      // hostcall buffer where the GPU has no PCIe atomics (a GPU passed through
++      // to a virtual machine, or behind a chipset).
++      if (F->getName() == "_Z27__spirv_BuiltInGlobalOffseti")
++        addKnownBits(ALL_ARGUMENT_MASK);
+       return;
++    }
+ 
+     // Ignore functions with graphics calling conventions, these are currently
+     // not allowed to have kernel arguments.

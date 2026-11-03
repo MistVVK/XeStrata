@@ -165,7 +165,11 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   修正後は、AMD 向けの libspirv がスカラーの型について 4 つの GroupNonUniform の shuffle を SubgroupShuffle*INTEL で定義します（`hip-group-shuffle`）。
   18 番目: HIP のアダプタは仮想メモリの呼び出し（`urVirtualMem*`・`urPhysicalMem*`）に全部 UNSUPPORTED を返し、対応なしと報告していたので、AMD の GPU では SYCL の `ext_oneapi_virtual_mem` がなく、`--vram-elastic` と `--kv-grow` が 1 つの割り当てに戻っていました。
   修正後は、CUDA のアダプタが CUDA の仮想メモリで実装するのと同じく HIP の仮想メモリ（`hipMemAddressReserve`・`hipMemCreate`・`hipMemMap` など）で実装し、対応の有無は HIP の `hipDeviceAttributeVirtualMemoryManagementSupported` のとおりに報告します（`hip-virtual-mem`）。
-  CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
+  19 番目: グローバルな ID を使う SYCL のカーネルは `__spirv_BuiltInGlobalOffset` を呼び、GlobalOffset のパスがそれをコード生成の段で（`_with_offset` の複製の引数か 0 に）置き換えます。
+  AMDGPU の属性推論はその前に走り、この呼び出しを中身の分からない関数と見なしたので、そうしたカーネルはどれも暗黙の引数を全部、hostcall のバッファーも含めて持っていました（XeStrata 0.2.2 の AMD 向けのカーネル 32,556 のうち 14,304。v7.1.1 では 48,084 のうち 0）。
+  HIP は、PCIe の atomic 操作が通らない GPU（仮想マシンに渡した GPU、チップセットの先のスロットの GPU）では hostcall のバッファーを持つカーネルを起動しないので、最初のカーネルが `hipErrorIllegalState` で止まっていました（XeStrata の issue #40 と #54）。
+  修正後は、属性推論がこの組み込み関数を暗黙の引数を読まないものとして扱います（`amdgpu-global-offset-hostcall`）。
+  CUDA の修正は contrib-llvm のツールチェーンにだけ、HIP の修正と `amdgpu-global-offset-hostcall` は HIP を持つ（または ROCm が入った今なら持つ）ツールチェーンにだけ、作り直しを求めます。
   `offload-bundle-arch` と `l0-static-graph` はどのツールチェーンにも作り直しを求めます。
 - スクリプトは、作業フォルダーの設定が今の設定の値（インストール先、libclc の対象など）と違えば、設定し直してからビルドします。
 - 開発機（Ubuntu 26.04、CUDA 12.4、ROCm 7.1）では、ランタイムのバックエンドが cuda・hip・level_zero・opencl になりました。

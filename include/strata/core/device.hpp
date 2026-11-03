@@ -50,6 +50,11 @@ void apply_uma_limit(uint64_t& free);
 /// A discrete GPU's free memory on Windows: at most what the OS's budget for this process leaves it
 /// (platform::gpu_local_memory_budget), for the GPU at the PCI address `pci`.  Elsewhere `free` stays as it is.
 void apply_os_budget(const std::string& pci, uint64_t& free);
+/// The VRAM to leave unused for the runtime's and the driver's own allocations, where the driver's free memory shows
+/// no use at all: i915 gives a process without CAP_PERFMON the whole VRAM as free (an A380's 5783 MiB however much is
+/// allocated), so the engine counts what it holds itself, and this is what that count lacks.  0 for a GPU whose report
+/// shows the use, and on Windows.  For the GPU at the PCI address `pci`, of `total` bytes.
+uint64_t unreported_vram_margin(const std::string& pci, uint64_t total);
 /// The device's largest allocation, under STRATA_MAX_ALLOC_MIB.
 uint64_t max_alloc_bytes();
 

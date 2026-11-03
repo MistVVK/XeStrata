@@ -165,7 +165,11 @@ python3 tools/intel_llvm_build.py --contrib --keep-build
   Fixed, AMD's libspirv defines the four GroupNonUniform shuffles for the scalar types with SubgroupShuffle*INTEL (`hip-group-shuffle`).
   Eighteenth, the HIP adapter answered every virtual memory call (`urVirtualMem*`, `urPhysicalMem*`) with UNSUPPORTED and reported no support, so SYCL's `ext_oneapi_virtual_mem` was not there on AMD GPUs, and `--vram-elastic` and `--kv-grow` fell back to one allocation.
   Fixed, the calls are implemented with HIP's virtual memory (`hipMemAddressReserve`, `hipMemCreate`, `hipMemMap` and the others) as the CUDA adapter implements them with CUDA's, and the support is reported as HIP's `hipDeviceAttributeVirtualMemoryManagementSupported` says (`hip-virtual-mem`).
-  The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones only a toolchain with HIP (or one that would have it, ROCm being installed now).
+  Nineteenth, a SYCL kernel that asks for a global id calls `__spirv_BuiltInGlobalOffset`, which the GlobalOffset pass replaces in codegen (with a parameter of the kernel's `_with_offset` clone, or 0).
+  The AMDGPU attributor runs before that and took the call as an unknown callee, so every such kernel kept all the implicit inputs, the hostcall buffer among them (14,304 of XeStrata 0.2.2's 32,556 AMD kernels; 0 of 48,084 with v7.1.1).
+  HIP launches no kernel with a hostcall buffer on a GPU without PCIe atomics (one passed through to a virtual machine, or in a slot behind a chipset), so the first kernel stopped with `hipErrorIllegalState` (XeStrata's issues #40 and #54).
+  Fixed, the attributor takes the builtin as reading no implicit argument (`amdgpu-global-offset-hostcall`).
+  The CUDA fixes ask only the contrib-llvm toolchain to be built again, the HIP ones and `amdgpu-global-offset-hostcall` only a toolchain with HIP (or one that would have it, ROCm being installed now).
   `offload-bundle-arch` and `l0-static-graph` ask every toolchain.
 - The script configures the build tree again when it was configured with other values of its options (the install folder, libclc's targets and others).
 - On the development machine (Ubuntu 26.04, CUDA 12.4, ROCm 7.1) the runtime's backends were cuda, hip, level_zero and opencl.
