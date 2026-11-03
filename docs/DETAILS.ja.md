@@ -613,6 +613,7 @@ Qwen3.8-Flash-Next の大きさの質問では、入っている大きさを `(i
 ./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --setup --ram-reserve-gib 16     ほかのプログラムのために RAM を 16 GiB 空けておく（記録される）
+./setup.sh --ple-io ram                     n-gram の表を RAM に置く（記録される。direct は SSD から読む、auto は setup が選ぶ）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
 ./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（15〜30 分、遅いカードではもっと）
 ./setup.sh --check                          この PC を調べるだけ
@@ -1940,7 +1941,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
-| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads in uninterruptible sleep (state D): 16 ...`（`blk_io_schedule` など、ドライブの待ち）がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます（Linux では SSD でも、RAM がモデルの分と表と 16 GB を超えれば付けます）。 |
+| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads in uninterruptible sleep (state D): 16 ...`（`blk_io_schedule` など、ドライブの待ち）がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります。`./setup.sh --ple-io ram`、パッケージでは `xestrata --ple-io ram` で記録されます）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます（Linux では SSD でも、RAM がモデルの分と表と 16 GB を超えれば付けます）。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |

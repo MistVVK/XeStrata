@@ -195,17 +195,21 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
             values[i] *= reciprocal;
             if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
         }
+        // The rows already picked are a bit mask, not -INFINITY stored back into `values`: IGC 2.38.2 drops every store
+        // of this kernel when it stores at a run-time index into the private array the butterfly just read (#45, Arc
+        // Pro B70: the routing table kept its old contents).  The picks, their order and the ties are the same.
+        int picked = 0;
         float selected = 0.0f, selected_sum = 0.0f;
         for (int rank = 0; rank < 10; ++rank) {
-            float best = values[0];
+            float best = -INFINITY;
             int expert = lane;
-            for (int i = 1; i < NPL; ++i) {
-                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            for (int i = 0; i < NPL; ++i) {
+                if (((picked >> i) & 1) == 0 && values[i] > best) { best = values[i]; expert = lane + i * 32; }
             }
             for (int mask = 16; mask; mask >>= 1)
                 better(best, expert, sycl::permute_group_by_xor(sg, best, mask), sycl::permute_group_by_xor(sg, expert, mask));
             if ((expert & 31) == lane) {
-                values[expert / 32] = -INFINITY;
+                picked |= 1 << (expert / 32);
                 ids[rank] = expert;
                 if (ids2 != nullptr) ids2[rank] = expert;
                 // Deliberately accumulate by WINNING EXPERT lane, not output rank.

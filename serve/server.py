@@ -2250,6 +2250,11 @@ class StrataEngine:
         free = [b for b in self.slot_order if not self.slot_busy[b]]
         if not free:
             return None
+        # #52: where the prompt's last message starts (its second-to-last <|im_start|>, before the reply's header).  A
+        # prompt that agrees with a slot up to there is a branch of that slot's chat (its last question replaced),
+        # provided what it shares holds two turns or more: a new chat that shares only the system prompt is not one.
+        turns = [i for i, t in enumerate(prompt) if t == self.TURN_ID]
+        last_msg = turns[-2] if len(turns) >= 4 else 0
 
         def held_prefix(b):
             # what of `prompt` the slot's cache serves: the slot's whole held stream (the prompt and what it decoded)
@@ -2264,7 +2269,10 @@ class StrataEngine:
             if len(h) < len(prompt) and prompt[:len(h)] == h:
                 return len(h)
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
-            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+            if 0 < k < len(prompt) and prompt[:k] == h[:k]:
+                return k
+            # a branch (#52): it went to the slot used longest ago, and overwrote the chat that slot held
+            return last_msg if 0 < last_msg <= len(h) and prompt[:last_msg] == h[:last_msg] else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):

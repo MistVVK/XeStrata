@@ -2315,8 +2315,10 @@ class ImageTools:
                     "type": "object",
                     "description": f"where things and text go ({', '.join(moss)})",
                     "properties": {
-                        "summary": {"type": "object", "properties": {"caption": {
-                            "type": "string", "description": "the whole image"}}},
+                        "summary": {"type": "object", "properties": {
+                            "caption": {"type": "string", "description": "the whole image"},
+                            "canvas": {"type": "string", "enum": list(MOSS_CANVASES),
+                                       "description": "one picture (default), panels, or a collage"}}},
                         "items": {"type": "array", "items": {"type": "object", "properties": {
                             "label": {"type": "string", "enum": list(MOSS_LABELS)},
                             "caption": {"type": "string", "description": "how it looks"},

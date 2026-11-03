@@ -134,20 +134,31 @@ def engine_lines(text: str) -> list[str]:
 def busy_engines() -> list[str]:
     """Strata engines or servers running now (any user's), which would share the GPU with the measurements."""
     found = []
-    for p in Path("/proc").iterdir():
-        if not p.name.isdigit() or int(p.name) == os.getpid():
-            continue
-        try:
-            argv = (p / "cmdline").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        words = [w.decode("utf-8", "replace") for w in argv if w]
-        if not words:
+    for pid, words in command_lines():
+        if pid == os.getpid() or not words:
             continue
         exe = os.path.basename(words[0])
-        if (exe.startswith("strata") and "--serve" in words) or any(w.endswith("serve/server.py") for w in words):
-            found.append(f"{p.name} {' '.join(words[:3])}")
+        if (exe.startswith("strata") and "--serve" in words) or \
+                any(w.replace("\\", "/").endswith("serve/server.py") for w in words):
+            found.append(f"{pid} {' '.join(words[:3])}")
     return found
+
+
+def command_lines() -> list[tuple[int, list[str]]]:
+    """Every process's id and command line: /proc on Linux, psutil on Windows (#48)."""
+    if C.WIN:
+        import psutil
+        return [(q.info["pid"], q.info["cmdline"] or []) for q in psutil.process_iter(["pid", "cmdline"])]
+    out = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            argv = (d / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        out.append((int(d.name), [w.decode("utf-8", "replace") for w in argv if w]))
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ the machine
@@ -217,6 +228,17 @@ CPU_ISA = ("avx2", "fma", "f16c", "avx_vnni", "avx512f", "avx512bw", "avx512vl",
 
 
 def cpu_facts() -> dict:
+    if sys.platform == "win32":  # #48: no /proc; the name from the registry, the ISA not read (the engine's log has it)
+        import psutil
+        import winreg
+        name: str | None
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                name = str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+        except OSError:
+            name = platform.processor() or None
+        return {"name": name, "isa": [], "threads": os.cpu_count(), "cores": psutil.cpu_count(logical=False),
+                "hybrid": None, "numa_nodes": None, "sockets": None}
     txt = read("/proc/cpuinfo", "") or ""
     flags = set((grab(r"^flags\s*:\s*(.*)$", txt, str) or "").split())
     cores = {(m[0], m[1]) for m in re.findall(r"^physical id\s*:\s*(\d+)\s*$[\s\S]*?^core id\s*:\s*(\d+)", txt, re.M)}
@@ -229,7 +251,9 @@ def cpu_facts() -> dict:
 
 
 def storage_of(path: Path) -> dict:
-    """The kind of disk a folder is on (NVMe, SATA SSD, HDD) and its model, from sysfs."""
+    """The kind of disk a folder is on (NVMe, SATA SSD, HDD) and its model, from sysfs (Linux only: none on Windows)."""
+    if C.WIN:
+        return {}
     try:
         st = os.stat(path)
         dev = Path(f"/sys/dev/block/{os.major(st.st_dev)}:{os.minor(st.st_dev)}").resolve()
@@ -259,7 +283,13 @@ def environment(cfg: dict, gpus: list[dict], data: Path) -> dict:
         build = json.loads((exe.parent / "BUILD.json").read_text())
     except (OSError, ValueError):
         build = {}
-    os_name = grab(r'^PRETTY_NAME="?([^"\n]*)', read("/etc/os-release", "") or "", str)
+    if C.WIN:
+        import psutil
+        os_name = f"Windows {platform.release()} ({platform.version()})"
+        ram = psutil.virtual_memory().total
+    else:
+        os_name = grab(r'^PRETTY_NAME="?([^"\n]*)', read("/etc/os-release", "") or "", str)
+        ram = int(grab(r"^MemTotal:\s+(\d+)", read("/proc/meminfo", "") or "", int) or 0) * 1024
     env = {k: v for k, v in {**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}.items()
            if k.startswith(("STRATA_", "ONEAPI_", "SYCL_", "UR_", "ZE_", "CUDA_", "HIP_", "ROCR_", "HSA_"))}
     args = cfg.get("args", [])
@@ -269,8 +299,9 @@ def environment(cfg: dict, gpus: list[dict], data: Path) -> dict:
                                         "gfx", "uma_gb") if k in g} for g in gpus],
         "drivers": drivers({g.get("vendor") for g in gpus}),
         "cpu": cpu_facts(),
-        "ram_gib": round(int(grab(r"^MemTotal:\s+(\d+)", read("/proc/meminfo", "") or "", int) or 0) / 2**20, 1),
+        "ram_gib": round(ram / 2**30, 1),
         "os": os_name,
+        "system": platform.system(),
         "data_disk": storage_of(data),
         "model": {"name": cfg.get("model_name"), "context": context_of(args), "kv": arg_of(args, "--kv"),
                   "images": "--vision" in args, "parallel": cfg.get("parallel"),
@@ -450,8 +481,11 @@ def summary_md(rec: dict) -> str:
                m["xestrata"].get("license"),
                f"{comp.get('id') or ''} {str(comp.get('version') or '').split(' build based')[0]}".strip()) if x)
            + ")",
-           f"- GPU: {gpu}", f"- CPU: {m['cpu']['name']} ({', '.join(m['cpu']['isa'])}), RAM {m['ram_gib']} GiB",
-           f"- OS: {m['os']}, Linux {m['drivers']['kernel']}; data folder on {m['data_disk'].get('kind') or '?'}",
+           f"- GPU: {gpu}",
+           f"- CPU: {m['cpu']['name']}" + (f" ({', '.join(m['cpu']['isa'])})" if m['cpu']['isa'] else "") +
+           f", RAM {m['ram_gib']} GiB",
+           f"- OS: {m['os']}, {m.get('system', 'Linux')} {m['drivers']['kernel']}; data folder on "
+           f"{m['data_disk'].get('kind') or '?'}",
            f"- Model: {m['model']['name']}, context {m['model']['context']}, KV {m['model']['kv']}"]
     hw = rec.get("hw") or {}
     if "ram_read_gb_s" in hw:
@@ -561,9 +595,16 @@ def xe_license(cfg: dict) -> str:
 
 
 def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, original: str | None = None,
-        say: Callable = print, rounds: int = C.ROUNDS, temperature: float = C.TEMPERATURE) -> Path:
-    """Measure; write records/bench-<time>/ and return its summary.md."""
+        say: Callable = print, rounds: int = C.ROUNDS, temperature: float = C.TEMPERATURE,
+        cards: list[str] | None = None) -> Path:
+    """Measure; write records/bench-<time>/ and return its summary.md.  `cards`: the GPUs' PCI addresses to run on
+    instead of the config's, the first one first (setup's --gpu / --gpus for this bench only; #49)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    if cards:
+        cfg = {k: v for k, v in cfg.items() if k not in ("gpu", "split_pci")}
+        cfg["gpu_pci"] = cards[0]
+        if len(cards) > 1:
+            cfg["split_pci"] = cards[1:]
     busy = busy_engines()
     if busy:
         raise BenchError("a Strata engine or server is running and would share the GPU with the measurements; stop "

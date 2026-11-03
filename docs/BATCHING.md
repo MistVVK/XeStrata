@@ -63,6 +63,7 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
 - **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the checkpoint at the prompt's last turn boundary).
   The next turn of that conversation goes to that slot and the engine copies its state back instead of reading the history again.
   This also works for a client that drops the reply's thinking from the history: the checkpoint matches up to the new turn.
+  A branch that replaces the last question goes to that slot too when the two turns or more before it match, and does not overwrite another conversation's slot.
   A new conversation takes an empty slot, else the one used longest ago;
   but a request with a `prompt_cache_key` (OpenAI's field, which Mainplane and the like send for each session) takes the slot a request with the same key used last first.
 - A client that disconnects stops its slot (`BSTOP`); the others go on.

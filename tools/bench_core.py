@@ -42,6 +42,7 @@ from typing import Callable
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
+WIN = os.name == "nt"
 
 CORPUS = ROOT / "data" / "bench-corpus.json.xz"
 COMMIT = "58dbbe5"
@@ -639,8 +640,10 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
         return {"turns": [], "why": None}
     cpath.write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
     log = open(stem.with_name(stem.name + ".txt"), "w", encoding="utf-8")
+    group: dict = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WIN else {  # type: ignore[attr-defined]
+        "start_new_session": True}
     srv = subprocess.Popen(cmd, cwd=e.root, env=e.env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           start_new_session=True)
+                           **group)
     turns, why = [], None
     try:
         end = time.monotonic() + 900
@@ -672,15 +675,20 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
         why = str(err)
     finally:
         try:
-            try:
-                os.killpg(srv.pid, signal.SIGTERM)
-                srv.wait(timeout=120)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
-                    os.killpg(srv.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            if WIN:                            # the whole tree at once, as setup's end_process_group (#48)
+                subprocess.run(["taskkill", "/PID", str(srv.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60)
                 srv.wait()
+            else:
+                try:
+                    os.killpg(srv.pid, signal.SIGTERM)
+                    srv.wait(timeout=120)
+                except (ProcessLookupError, subprocess.TimeoutExpired):
+                    try:
+                        os.killpg(srv.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    srv.wait()
             end_group(srv.pid, f"{label or e.arm}: its server's")
         finally:
             log.close()
@@ -697,8 +705,18 @@ GROUP_END = 120   # s: for the processes left in a run's group to end, and again
 
 def group_left(pgid: int) -> list[str]:
     """The processes of process group `pgid` that still run, as "PID name" (zombies left out: they hold no memory,
-    and one a container's init does not reap would stay for good)."""
+    and one a container's init does not reap would stay for good).  Windows has no process groups: the processes
+    descended from `pgid` by their parent ids (which outlive a parent that ended), the root among them (#48)."""
     left = []
+    if WIN:
+        import psutil
+        procs = list(psutil.process_iter(["pid", "ppid", "name"]))
+        tree, grew = {pgid}, True
+        while grew:
+            more = {p.info["pid"] for p in procs if p.info["ppid"] in tree} - tree
+            grew = bool(more)
+            tree |= more
+        return [f"{p.info['pid']} {p.info['name']}" for p in procs if p.info["pid"] in tree and p.is_running()]
     for p in Path("/proc").iterdir():
         if not p.name.isdigit():
             continue
@@ -727,10 +745,18 @@ def end_group(pgid: int, what: str) -> None:
                                  "was stopped, and keeps its GPU memory: the next run would start beside it, so the "
                                  "measurements stop here. The GPU's driver log (sudo dmesg) may say why; a reboot "
                                  "frees the GPU")
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if WIN:
+                import psutil
+                for pid in (int(x.split()[0]) for x in left):
+                    try:
+                        psutil.Process(pid).kill()
+                    except psutil.Error:
+                        pass
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             killed = True
             deadline = time.monotonic() + GROUP_END
         time.sleep(1)

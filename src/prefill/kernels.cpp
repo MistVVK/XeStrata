@@ -98,17 +98,20 @@ void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout
         for (int i = 0; i < REG; ++i) { v[i] = sycl::exp(v[i] - mx); sum += v[i]; }
         const float rcp = 1.0f / warp_sum(sg, sum);
         for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (sycl::isnan(v[i])) v[i] = -FLT_MAX; }
+        // the picked rows as a bit mask, not -INFINITY stored back into v: IGC 2.38.2 drops this kernel's stores
+        // otherwise (#45, as top10_token in src/kernels/xe/router.cpp)
+        int picked = 0;
         float selected = 0.0f, selected_sum = 0.0f;
         for (int rank = 0; rank < 10; ++rank) {
-            float best = v[0];
+            float best = -INFINITY;
             int ex = lane;
-            for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+            for (int i = 0; i < REG; ++i) if (((picked >> i) & 1) == 0 && v[i] > best) { best = v[i]; ex = lane + i * 32; }
             for (int m = 16; m; m >>= 1) {
                 const float ob = sycl::permute_group_by_xor(sg, best, m);
                 const int oi = sycl::permute_group_by_xor(sg, ex, m);
                 if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
             }
-            if ((ex & 31) == lane) { v[ex / 32] = -INFINITY; selected_sum += best; }
+            if ((ex & 31) == lane) { picked |= 1 << (ex / 32); selected_sum += best; }
             if (lane == 0) ids[t * 10 + rank] = ex;
             if (rank == lane) selected = best;
         }

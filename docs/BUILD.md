@@ -115,7 +115,7 @@ On such a GPU cuBLAS computes BF16 products without the tensor cores, and the ow
 The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
 With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
 `STRATA_BF16_TC=0` turns it off.
-`tools/xmx_probe.cpp` asks every GPU the same without building the engine.
+`tools/xmx_probe.cpp` asks every GPU, without building the engine, whether it reports FP16 and BF16 matrix engines in the XMX kernels' shape or in `mma_gemm`'s Intel one (8 x 8 x 16).
 
 Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prefill path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
 The weights are read in their GGUF blocks and the activations rounded to int8, a scale for each 32 values.

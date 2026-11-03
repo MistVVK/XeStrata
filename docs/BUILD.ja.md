@@ -117,7 +117,7 @@ oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さ�
 変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
 RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
 `STRATA_BF16_TC=0` で止まります。
-`tools/xmx_probe.cpp` は、エンジンをビルドせずに、同じ問い合わせをすべての GPU にします。
+`tools/xmx_probe.cpp` は、エンジンをビルドせずに、FP16 と BF16 の行列エンジンを XMX のカーネルの形か `mma_gemm` の Intel の形（8 x 8 x 16）で報告するかを、すべての GPU に問い合わせます。
 
 prefill の経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
 重みは GGUF のブロックのまま読み、活性は 32 値ごとに int8 に丸めます。

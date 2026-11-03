@@ -5460,20 +5460,28 @@ def calibrate_config(cfg_path: Path) -> bool:
 
 
 def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None, rounds: int,
-                 temperature: float) -> int:
-    """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is."""
+                 temperature: float, gpu: int | list | None = None) -> int:
+    """Measure the model `cfg_path` sets up (tools/bench.py) and say where the record is.  `gpu`: --gpu N or --gpus
+    (#49), the cards this bench runs on instead of the config's; the config is not changed."""
     sys.path.insert(0, str(ROOT / "tools"))
     BENCH = importlib.import_module("bench")           # tools/bench.py (to mypy, `bench` is the records' folder)
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     found = gpus()
-    pcis = [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])]
+    cards = None
+    if gpu is not None:
+        sel = gpu if isinstance(gpu, list) else [gpu]
+        check_gpus(sel, found)
+        cards = [next(x for x in found if x["index"] == i)["pci"] for i in sel]
+    pcis = cards or [cfg.get("gpu_pci"), *(cfg.get("split_pci") or [])]
     chosen = ([x for p in pcis if p for x in found if x["pci"] == p] or [gpu_info()]) if found else []
+    if cards:
+        ok("GPU" + ("s" if len(chosen) > 1 else "") + ": " + " + ".join(gpu_name(x) for x in chosen) + " (this bench)")
     say()
     say(f"  Measuring {cfg.get('model_name', cfg_path.stem)} on this PC: the engine is started many times, about "
         f"{20 * rounds} minutes" + (" and more with --bench-verbose" if verbose else "") +
         (f", twice that with upstream {original}" if original else "") + ". The PC is busy meanwhile.")
     try:
-        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds, temperature)
+        md = BENCH.run(cfg_path, data, chosen, verbose, original, say, rounds, temperature, cards)
     except (BENCH.BenchError, BENCH.C.EngineLeft) as e:
         fail(str(e))
     say()
@@ -5574,6 +5582,66 @@ def saved_draft_vocab(cfg_path: Path) -> str | None:
     except (OSError, ValueError, AttributeError):
         return None
     return v if v in DRAFT_VOCABS else None
+
+
+PLE_IO = ("auto", "direct", "ram")   # --ple-io: how the engine reads the n-gram table; auto lets setup choose (#49)
+
+
+def saved_ple_io(cfg_path: Path) -> str | None:
+    """How a model's config was told to read its n-gram table (--ple-io direct or ram), or None (auto): a setup run
+    again without the flag keeps it."""
+    try:
+        v = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("ple_io")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return v if v in ("direct", "ram") else None
+
+
+def ple_io_auto(ple: Path, model: str, ram: float, low_ram: bool) -> bool:
+    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine's default
+    reads (direct), which the engine may still lock in RAM itself where the RAM can spare the table."""
+    if str(ROOT / "tools") not in sys.path:
+        sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+
+    def table_gb() -> float:
+        tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
+        size = getattr(tensor, "expected_bytes", lambda: None)()
+        return size / 1e9 if size else 28.8
+
+    disk = rotational_disk(ple)                        # upstream #605
+    if disk:
+        gb = table_gb()
+        if ram >= MODELS[model]["ram_gb"] + gb + 4:
+            ok(f"the model is on a rotational disk ({disk}): its {gb:.0f} GB n-gram table is kept in RAM "
+               "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes")
+            return True
+        warn(f"the model is on a rotational disk ({disk}): its n-gram table is read from it at random, which can "
+             f"stall prompts for minutes. An SSD is recommended; with ~{gb:.0f} GB more RAM, --ple-io ram keeps the "
+             "table in RAM instead")
+        return False
+    if low_ram or WIN or wsl_version() != 0:
+        return False
+    # upstream b25b30970: on an SSD too, a PC with RAM to spare keeps the n-gram table in RAM, so a new prompt's first
+    # chunk does not wait for its table rows (65,536 random SSD reads at 4K tokens).  upstream (RTX PRO 5000, Linux,
+    # NVMe): prompt 4K -18%, 20K -9%, decode +0.8%; the B70 (IQ3_XXS 4K, 2026-10-20): prompt +1.9%, decode the same.
+    # Measured on Linux only (Windows locks pages otherwise, WSL pins little), and only with 16 GB to spare beyond the
+    # model's own need: a smaller PC keeps reading from the SSD.
+    gb = table_gb()
+    if ram >= MODELS[model]["ram_gb"] + gb + 16:
+        ok(f"{ram:.0f} GB of RAM: the {gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new prompt does not "
+           "wait for its rows from the SSD; --ple-io direct reads it from the SSD instead")
+        return True
+    return False
+
+
+def set_ple_io(args: list, choice: str | None) -> None:
+    """The config's args with `--ple-io choice` (direct or ram), or without --ple-io (None)."""
+    while "--ple-io" in args[:-1]:
+        i = args.index("--ple-io")
+        del args[i:i + 2]
+    if choice:
+        args += ["--ple-io", choice]
 
 
 # the draft head's VRAM per subset (IQ3_S: the largest)
@@ -5711,6 +5779,24 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
             args += ["--vram-reserve-mib", str(reserve)]
         write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
+    ple_io = keep.pop("ple_io", None)                  # #49: how the engine reads the n-gram table, in the args
+    if ple_io is not None:
+        args = cfg["args"]
+        if "--ple-gguf" not in args[:-1]:
+            warn(f"--ple-io does nothing for {cfg.get('model_name', cfg_path.stem)}: it has no n-gram table")
+        else:
+            cfg.pop("ple_io", None)
+            if ple_io == "auto":                       # setup's own choice again, from the RAM and the disk
+                model = choices_from_config(cfg_path)["model"]
+                low_ram = "--resident-experts" in args or "--mmap-experts" in args
+                use_ram = model in MODELS and \
+                    ple_io_auto(Path(args[args.index("--ple-gguf") + 1]), model, usable_ram_gb(), low_ram)
+                set_ple_io(args, "ram" if use_ram else None)
+            else:
+                cfg["ple_io"] = ple_io
+                set_ple_io(args, ple_io)
+            write_config(cfg_path, cfg)
+            ok(f"saved for this model: the n-gram table's reads --ple-io {ple_io}")
     if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
         cfg.update(keep)
         write_config(cfg_path, cfg)
@@ -6084,7 +6170,7 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
-                        "draft_vocab", "vision"})
+                        "draft_vocab", "ple_io", "vision"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
@@ -6932,6 +7018,10 @@ def main() -> int:
                     help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
                          "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
                          "English, code and French (French answers draft more)")
+    ap.add_argument("--ple-io", choices=PLE_IO,
+                    help="how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole "
+                         "table in RAM (faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, "
+                         "auto = setup chooses by the RAM and the disk (default)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), "
                          "then start the model; usually not needed, the engine and setup fit them by themselves "
@@ -7095,7 +7185,7 @@ def main() -> int:
                  f"install it first: xestrata --setup --model {model}")
         update_installed_engine()
         return bench_config(bench_cfgs[0], data, a.bench_verbose, a.original_strata, a.bench_rounds,
-                            round(a.bench_temperature, 1))
+                            round(a.bench_temperature, 1), run_gpu)
     if a.calibrate and (a.setup or a.check or not have):    # upstream #2036: said, not dropped
         why = "--setup" if a.setup else "--check" if a.check else "no model is installed yet"
         warn(f"--calibrate does nothing with {why}: it tunes a model that is already installed. Run "
@@ -7122,7 +7212,7 @@ def main() -> int:
                                        a.yes)) - 1]
             return start(run_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
         update_installed_engine()
         pick_cfg = have[0]
         if len(have) > 1:
@@ -7136,13 +7226,14 @@ def main() -> int:
                  + ("keeps" if a.no_start else "starts with") + " the default settings")
         return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                                           keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                                                "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                                                "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser,
+                                                "ple_io": a.ple_io})
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         update_installed_engine()
         if len(have) == 1:
             return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
@@ -7151,7 +7242,7 @@ def main() -> int:
         if pick <= len(have):
             return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
                          keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser, "ple_io": a.ple_io})
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -7663,33 +7754,13 @@ def main() -> int:
         args += ["--kv", kv]
     if low_ram:   # the experts from the model files: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
-    disk = rotational_disk(ple)                        # upstream #605
-    if disk:
-        tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
-        size = getattr(tensor, "expected_bytes", lambda: None)()
-        table_gb = size / 1e9 if size else 28.8
-        if ram >= MODELS[model]["ram_gb"] + table_gb + 4:
-            args += ["--ple-io", "ram"]
-            ok(f"the model is on a rotational disk ({disk}): its {table_gb:.0f} GB n-gram table is kept in RAM "
-               "(--ple-io ram) - read from the disk at random, it can stall prompts for minutes")
-        else:
-            warn(f"the model is on a rotational disk ({disk}): its n-gram table is read from it at random, which can "
-                 f"stall prompts for minutes. An SSD is recommended; with ~{table_gb:.0f} GB more RAM, "
-                 "--ple-io ram in the config's args keeps the table in RAM instead")
-    elif not low_ram and not WIN and wsl_version() == 0:
-        # upstream b25b30970: on an SSD too, a PC with RAM to spare keeps the n-gram table in RAM, so a new prompt's
-        # first chunk does not wait for its table rows (65,536 random SSD reads at 4K tokens).  upstream (RTX PRO 5000,
-        # Linux, NVMe): prompt 4K -18%, 20K -9%, decode +0.8%; the B70 (IQ3_XXS 4K, 2026-10-20): prompt +1.9%, decode
-        # the same.  Measured on Linux only (Windows locks pages otherwise, WSL pins little), and only with 16 GB to
-        # spare beyond the model's own need: a smaller PC keeps reading from the SSD.
-        tensor = next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)
-        size = getattr(tensor, "expected_bytes", lambda: None)()
-        table_gb = size / 1e9 if size else 28.8
-        if ram >= MODELS[model]["ram_gb"] + table_gb + 16:
-            args += ["--ple-io", "ram"]
-            ok(f"{ram:.0f} GB of RAM: the {table_gb:.0f} GB n-gram table is kept in RAM (--ple-io ram), so a new "
-               "prompt does not wait for its rows from the SSD; remove --ple-io ram from the config's args to read it "
-               "from the SSD instead")
+    # a setup run again without --ple-io keeps the choice this model's config was given before
+    ple_io = a.ple_io or saved_ple_io(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    if ple_io != "auto":
+        set_ple_io(args, ple_io)
+        ok(f"the n-gram table: --ple-io {ple_io}, as chosen (--ple-io auto lets setup choose)")
+    elif ple_io_auto(ple, model, ram, low_ram):
+        set_ple_io(args, "ram")
     # KV streaming: from 64K up the whole KV cache lives in RAM and only the part the attention reads (32K positions
     # per layer) stays in VRAM; the VRAM it frees holds more experts (+6% at 128K, +23% at 262K with Q2_0). It
     # costs ~13.7 KB of RAM per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with K8V4, 7.5 KB with 4-bit, so
@@ -7771,6 +7842,8 @@ def main() -> int:
     replicas_config(a, cfg)
     if draft_vocab:
         cfg["draft_vocab"] = draft_vocab
+    if ple_io != "auto":
+        cfg["ple_io"] = ple_io
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
