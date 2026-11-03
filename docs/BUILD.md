@@ -508,4 +508,5 @@ services:
 
 - **SELinux** (Fedora and others): the container runs with `label=disable`, so the host's folders are not relabeled; only the build labels `container/` to read it (`relabel=shared`).
 - **memlock**: a rootless container cannot go above the host user's limit. When setup says the limit is too low, raise it on the host.
+- **seccomp**: Podman's default seccomp profile denies io_uring. compose runs the container with that profile plus one entry allowing io_uring's three system calls (`third_party/main/containers-common/seccomp-io_uring.json`): the engine pins its expert arena with io_uring for an Intel GPU (#42). The profile's path is relative to `container/`, so `podman compose` runs there.
 - **Stopping**: `podman compose down`. `init`'s PID 1 passes the signal to setup and the server, and the engine gets up to 60 seconds to stop.

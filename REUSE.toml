@@ -129,6 +129,11 @@ path = ["third_party/main/katex/**"]
 SPDX-FileCopyrightText = "2013-2020 Khan Academy and other contributors"
 SPDX-License-Identifier = "MIT"
 
+[[annotations]]
+path = ["third_party/main/containers-common/**"]
+SPDX-FileCopyrightText = ["The containers/common authors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "Apache-2.0"
+
 # non-free: material made from or copied from the Qwen3.8-Flash-Next model (the READMEs carry their own header)
 [[annotations]]
 path = ["third_party/nonfree/qwen3.8-flash-next/**", "third_party/nonfree/experimental-speed-projection/**"]

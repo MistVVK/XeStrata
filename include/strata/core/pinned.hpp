@@ -46,7 +46,7 @@ struct PinnedArena {
     uint64_t capacity = 0;
     PageBacking backing = PageBacking::NormalPages;
     std::string note;              // why the backing is what it is, for the startup print
-    uint64_t locked_bytes = 0;     // explicitly mlocked bytes; registration does not use mlock
+    uint64_t locked_bytes = 0;     // mlocked bytes (hold_in_place); registration does not use mlock
     uint64_t registered_bytes = 0; // bytes registered for device copies (the whole arena, or the constructor throws)
     uint64_t slice_bytes = 0;      // 0: one registration covers the arena
     int registered_slices = 0;
@@ -107,6 +107,12 @@ struct PinnedArena {
     /// `ram_available` (issue #10): the RAM available now, read before each layer; a layer moves only while it leaves
     /// STRATA_HOST_USM_RESERVE_MIB (default 1024) of it.
     bool to_host_usm(uint64_t pad, std::string& err, const std::function<uint64_t()>& ram_available = {});
+    /// #42: keeps the filled mapping's pages where they are while a Level Zero GPU has it registered for copies (an xe
+    /// or i915 userptr): memory compaction moving one page made the driver map the whole registration again for the
+    /// GPU, and with the IOMMU translating that ran past the driver's limit and faulted the copy engine.  Locked in RAM
+    /// where vm.compact_unevictable_allowed is 0, else (a private mapping) pinned with io_uring's fixed buffers; a
+    /// shared mapping (memfd) is moved even when pinned.  Says which in `note` (when `say`); Linux only.
+    void hold_in_place(bool say = true);
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }   // one mapping only: null for host USM blocks
     /// The byte at arena offset `off` (one mapping, or the host USM block of the layer that holds it).
@@ -115,6 +121,10 @@ struct PinnedArena {
 
 private:
     void unmap(bool file_view);   // the mapping, if any; `file_view`: it maps the shared backing file
+    bool release_hold();          // hold_in_place's lock or pins, gone; true when there was one
+#if !defined(_WIN32)
+    int pin_ring_ = -1;           // the io_uring whose fixed buffers pin the mapping (hold_in_place)
+#endif
     int shared_fd_ = -1;
     bool shared_locked_ = false;
     std::vector<uint8_t> shared_missing_;

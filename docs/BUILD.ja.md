@@ -508,4 +508,5 @@ services:
 
 - **SELinux**（Fedora など）: ホストのフォルダーのラベルを書き換えないよう、コンテナは `label=disable` で動かします。ビルドのときだけ、`container/` を読めるようにラベルを付けます（`relabel=shared`）。
 - **memlock**: rootless のコンテナは、ホストのユーザーの上限を超えられません。setup が上限が足りないと言ったら、ホストで上げます。
+- **seccomp**: Podman の既定の seccomp のプロファイルは io_uring を禁じています。compose は、それに io_uring の 3 つのシステムコールを許す項目を足したプロファイル（`third_party/main/containers-common/seccomp-io_uring.json`）でコンテナを動かします。エンジンは、Intel の GPU のためにエキスパートのアリーナを io_uring で固定します（#42）。プロファイルのパスは `container/` から見たものなので、`podman compose` は `container/` で実行します。
 - **止め方**: `podman compose down` です。`init` の PID 1 が止める合図を setup とサーバーに渡し、エンジンが止まるのを最大 60 秒待ちます。

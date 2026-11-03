@@ -4108,6 +4108,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
+    a->hold_in_place();   // filled: locking or pinning it now does not zero it before the load (#42)
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;

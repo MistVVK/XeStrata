@@ -494,9 +494,11 @@ What the engine requires of the GPU and the host, and the rules it keeps.
   Level Zero refuses a single USM allocation above `max_mem_alloc_size` (32.5 GB on the B70), and every model's arena but the Coder's is larger.
   The registration is split into pieces no larger than the device's largest allocation, ending at layer starts.
   Past that size the UHD 770 (4 GiB) registered without an error and copied wrong bytes.
-  `registered_bytes` is the whole capacity, and `locked_bytes` counts explicit `mlock` bytes (zero).
-  Neither `mlock` nor a hugetlbfs pool is used; transparent huge pages back the arena.
-  The B70 measurements registered a 47.46 GiB arena under an 8 MiB memlock limit, with `VmLck` 0.
+  `registered_bytes` is the whole capacity. No hugetlbfs pool is used; transparent huge pages back the arena.
+  The registration needs no memlock limit (the B70 registered a 47.46 GiB arena under an 8 MiB limit).
+  Level Zero's registration (an xe or i915 userptr) follows the pages instead of pinning them, so when memory compaction moves one page, the driver maps the whole registration again for the GPU at the next copy (#42).
+  The filled arena is therefore locked with `mlock` (`locked_bytes`) where `vm.compact_unevictable_allowed` is 0, else pinned with io_uring's fixed buffers.
+  A shared arena (memfd) is moved even when pinned, so only `mlock` with `vm.compact_unevictable_allowed=0` holds it. Both need a memlock limit as large as the arena.
 - **Following the device**: kernels take what the device reports.
   A work-group of 1024 work-items only where the device takes one (the UHD 770 takes 512).
   FP64 only where the device has it; on the UHD 770 and the Arc A series those kernels sum in FP32.

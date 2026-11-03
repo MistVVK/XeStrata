@@ -32,8 +32,11 @@
 
 #define STRATA_FSEEK64(f, o) _fseeki64((f), (long long) (o), SEEK_SET)
 #else
+#include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/file.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #define STRATA_FSEEK64(f, o) fseeko((f), (off_t) (o), SEEK_SET)
@@ -648,6 +651,13 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
                   " as well, whose runtime cannot register this one's host USM";
             return false;
         }
+    // hold_in_place's lock or pins go first (the move gives each layer's pages back), and come back when the move
+    // fails and leaves the mapping as it was
+    struct Rehold {
+        PinnedArena* a;
+        bool on;
+        ~Rehold() { if (on && a->layer_base.empty()) a->hold_in_place(false); }
+    } rehold{this, release_hold()};
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
         for (auto& o : other_reg_) {
@@ -789,6 +799,92 @@ bool PinnedArena::register_on(int device, std::string& err) {
     return true;
 }
 
+#if !defined(_WIN32)
+namespace {
+// vm.compact_unevictable_allowed: 1 (the default) lets compaction move mlocked pages too; -1 when it cannot be read
+int compact_unevictable_allowed() {
+    std::FILE* f = std::fopen("/proc/sys/vm/compact_unevictable_allowed", "r");
+    if (f == nullptr) return -1;
+    char line[16] = {0};
+    const bool read = std::fgets(line, sizeof line, f) != nullptr;
+    std::fclose(f);
+    return read && (line[0] == '0' || line[0] == '1') ? line[0] - '0' : -1;
+}
+
+// [p, p + bytes) pinned for the long term as io_uring's fixed buffers (pin_user_pages with FOLL_LONGTERM, as an RDMA or
+// CUDA registration pins them): compaction does not take such anonymous pages.  The ring holds the pins until closed;
+// -1 and `why` when the kernel or a container's seccomp refuses io_uring, or RLIMIT_MEMLOCK is too low for the pins.
+int pin_with_io_uring(void* p, uint64_t bytes, std::string& why) {
+    io_uring_params prm{};
+    const int fd = (int) syscall(__NR_io_uring_setup, 1, &prm);
+    if (fd < 0) { why = std::string("io_uring: ") + std::strerror(errno); return -1; }
+    constexpr uint64_t kBuffer = 1ull << 30;   // a fixed buffer holds 1 GiB at most
+    std::vector<iovec> v;
+    for (uint64_t off = 0; off < bytes; off += kBuffer)
+        v.push_back(iovec{(uint8_t*) p + off, (size_t) std::min(kBuffer, bytes - off)});
+    if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS, v.data(), (unsigned) v.size()) != 0) {
+        why = std::string("io_uring's fixed buffers: ") + std::strerror(errno);
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+}  // namespace
+#endif
+
+void PinnedArena::hold_in_place(bool say) {
+#if defined(_WIN32)
+    (void) say;
+#else
+    if (map_ == nullptr || !layer_base.empty() || locked_bytes > 0 || pin_ring_ >= 0) return;
+    // CUDA's and HIP's registrations pin the pages themselves; Level Zero's (an xe or i915 userptr) follows them instead
+    auto level_zero = [](int d) { return Runtime::at(d).device().get_backend() == sycl::backend::ext_oneapi_level_zero; };
+    bool lz = !reg_.empty() && level_zero(owner_);
+    for (const auto& o : other_reg_) lz = lz || level_zero(o.first);
+    if (!lz) return;
+    const int cua = compact_unevictable_allowed();
+    std::string why;
+    if (cua == 0) {
+        if (mlock(base, (size_t) capacity) == 0) {
+            locked_bytes = capacity;
+            if (say) {
+                const std::string no = "; no mlock";   // the constructors' word, no longer true
+                if (note.size() >= no.size() && note.compare(note.size() - no.size(), no.size(), no) == 0)
+                    note.erase(note.size() - no.size());
+                note += "; locked in RAM, where compaction leaves it (vm.compact_unevictable_allowed=0)";
+            }
+            return;
+        }
+        why = std::string("mlock: ") + std::strerror(errno);
+    }
+    if (!shared()) {
+        std::string pin_why;
+        pin_ring_ = pin_with_io_uring(base, capacity, pin_why);
+        if (pin_ring_ >= 0) {
+            if (say) note += "; pinned with io_uring's fixed buffers, which compaction leaves in place";
+            return;
+        }
+        why += (why.empty() ? "" : ", ") + pin_why;
+    } else if (cua != 0) {
+        why = "a shared mapping is moved even when pinned";
+    }
+    if (say)
+        note += "; memory compaction can move it, and the GPU's driver then maps all of it again (" + why +
+                "; vm.compact_unevictable_allowed=0 with RLIMIT_MEMLOCK for it locks it in place, #42)";
+#endif
+}
+
+bool PinnedArena::release_hold() {
+#if defined(_WIN32)
+    return false;
+#else
+    const bool held = locked_bytes > 0 || pin_ring_ >= 0;
+    if (pin_ring_ >= 0) { close(pin_ring_); pin_ring_ = -1; }
+    if (locked_bytes > 0) { munlock(base, (size_t) locked_bytes); locked_bytes = 0; }
+    return held;
+#endif
+}
+
 void PinnedArena::unmap(bool file_view) {
     if (map_ != nullptr) {
 #if defined(_WIN32)
@@ -803,6 +899,7 @@ void PinnedArena::unmap(bool file_view) {
 }
 
 PinnedArena::~PinnedArena() {
+    release_hold();
     const bool file_view = shared();
     if (shared_fd_ >= 0) close_file(shared_fd_);
 #if defined(_WIN32)

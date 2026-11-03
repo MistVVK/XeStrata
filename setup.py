@@ -1756,6 +1756,35 @@ def check_iommu(pcis: list) -> None:
     say("  and restart the PC")
 
 
+def check_compaction(makers: set) -> None:
+    """#42: says, without stopping, what keeps an Intel GPU's view of the expert arena in place.  The arena is ordinary
+    memory registered for the GPU's copies, which the xe or i915 driver follows rather than pins: when memory
+    compaction moves one of its pages, the driver maps the whole registration again at the next copy, and with the IOMMU
+    translating that ran past the driver's limit and faulted the copy engine (a B70, Linux 7.0).  The engine locks the
+    arena in RAM where vm.compact_unevictable_allowed is 0 (compaction then leaves locked pages alone), else pins it
+    with io_uring where it can (not a shared arena: the one image generation on the same card keeps, or a layer split's
+    in separate engines), and either needs RLIMIT_MEMLOCK for it."""
+    if WIN or "intel" not in makers or wsl_version() != 0:
+        return
+    in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+    try:
+        cua = Path("/proc/sys/vm/compact_unevictable_allowed").read_text().strip()
+    except OSError:
+        cua = ""
+    if cua == "1":
+        warn("memory compaction may move the expert arena under the Intel GPU (vm.compact_unevictable_allowed is 1), "
+             "and each move makes its driver map all of it again: with the IOMMU translating that can stall or fault "
+             "the GPU's copies. Letting compaction leave locked memory alone (the engine locks the arena) avoids it" +
+             (", on the host (a container shares the host's setting):" if in_container else ":"))
+        say("  echo 'vm.compact_unevictable_allowed = 0' | sudo tee /etc/sysctl.d/90-xestrata.conf")
+        say("  sudo sysctl --system")
+    if memlock_gib() != float("inf"):
+        warn(f"this user may lock only {memlock_gib():.2f} GiB of RAM (ulimit -l), too little to keep the expert arena "
+             "in place for the Intel GPU: raise the memlock limit for your user (memlock in /etc/security/limits.conf, "
+             "or DefaultLimitMEMLOCK in systemd's user.conf) and log in again" +
+             (", on the host" if in_container else ""))
+
+
 def check_level_zero(makers: set, yes: bool = False, explicit: bool = False) -> None:
     """When the Level Zero driver is older than the build that fixed it refusing device memory while the VRAM is
     free (intel/compute-runtime #916; XeStrata #34 and #15: every allocation on the card can fail that way after a
@@ -7281,6 +7310,7 @@ def main() -> int:
     makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
     amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
     check_iommu([x["pci"] for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x.get("pci")])
+    check_compaction(makers)
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
         check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
     elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA
