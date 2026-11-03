@@ -46,7 +46,18 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-bubble table { border-collapse: collapse; margin: 0 0 var(--st-s-3); font-size: var(--st-fs-md); display: block; max-width: 100%; overflow-x: auto; }
 .st-bubble th, .st-bubble td { border: 1px solid var(--st-line); padding: 6px 10px; text-align: left; }
 .msg-images { display: flex; flex-wrap: wrap; gap: var(--st-s-2); justify-content: flex-end; }
+.msg-images { max-width: 100%; }
 .msg-images img { max-width: 220px; max-height: 180px; border-radius: var(--st-r-md); border: 1px solid var(--st-line); }
+.msg-images img.msg-image { cursor: zoom-in; }
+/* an attachment's preview (previewAttachment): the picture or the file's text over the page */
+.attach-preview { max-width: min(92vw, 1100px); max-height: 90vh; padding: 0; border: 1px solid var(--st-line);
+                  border-radius: var(--st-r-md); background: var(--st-surface); color: var(--st-ink); }
+.attach-preview::backdrop { background: rgb(0 0 0 / 60%); }
+.attach-preview__head { display: flex; align-items: center; gap: var(--st-s-2); padding: 6px 6px 6px 14px; border-bottom: 1px solid var(--st-line); }
+.attach-preview__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--st-fs-sm); }
+.attach-preview__body img { display: block; max-width: min(92vw, 1100px); max-height: calc(90vh - 52px); margin: 0 auto; }
+.attach-preview__body pre { margin: 0; padding: 12px 14px; max-height: calc(90vh - 52px); overflow: auto; white-space: pre-wrap;
+                            overflow-wrap: anywhere; font: var(--st-fs-xs)/1.5 var(--st-font-mono); }
 .tool-images { justify-content: flex-start; margin: var(--st-s-2) 0; }
 .tool-images img { max-width: min(100%, 512px); max-height: 512px; }
 .st-msg .st-collapse { width: 100%; }
@@ -89,7 +100,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 6px 0 10px; border-radius: var(--st-r-pill);
         background: var(--st-surface-2); border: 1px solid var(--st-line); font-size: var(--st-fs-xs); color: var(--st-ink-soft); }
-.chip .st-btn--icon { width: 22px; height: 22px; border-radius: 50%; }
+/* a long name is cut short to the room there is, on the message box's row or in a message (the chip keeps its full name as
+   its title) */
+.chip { max-width: 100%; min-width: 0; }
+.chip .st-icon { flex: none; }
+.chip__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.chip__name { border: 0; padding: 0; background: transparent; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
+.chip .st-btn--icon { width: 22px; height: 22px; border-radius: 50%; flex: none; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- monitor */
@@ -364,6 +382,10 @@ main { flex: 1; min-height: 0; display: flex; }
                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-item:hover .chat-item__title { color: var(--st-ink); }
 .chat-item.on .chat-item__title { color: var(--st-ink); font-weight: var(--st-fw-bold); }
+/* an answer is being written in that chat: a dot before its title, blinking as the answer's cursor does */
+.chat-item--writing .chat-item__title::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+                                                border-radius: 50%; background: var(--st-accent); vertical-align: 1px;
+                                                animation: blink 1s steps(2) infinite; }
 .chat-item__actions { display: flex; gap: 2px; flex: none; opacity: 0; }          /* the buttons come up on hover or focus */
 .chat-item:hover .chat-item__actions, .chat-item:focus-within .chat-item__actions { opacity: 1; }
 .chat-item__actions .st-btn--icon { width: 30px; height: 30px; }

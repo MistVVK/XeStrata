@@ -10,12 +10,13 @@
 // debug_chat_log): then each chat as saved here goes there too (sendDebugChat).
 //
 // This file is loaded before app.js and uses its globals when its functions run: $, esc, icon, node, toast, store, settings,
-// messages, attachments, busy, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending,
+// messages, attachments, busy, replies, pending, setBusy, renderChat, renderAttachments, autosize, generateReply, releasePending,
 // health, headers.
 // app.js calls initChats() once, from start().
-/* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy, pending, setBusy, renderChat,
-          renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments, health, headers */
-/* exported initChats, setChatList, syncActions, renderParent */
+/* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy:writable, replies, pending, setBusy,
+          renderChat, renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments, health,
+          headers */
+/* exported initChats, setChatList, syncActions, renderParent, saveChatOf, resumeReplies */
 "use strict";
 
 const H = StrataHistory;
@@ -57,6 +58,26 @@ function saveChat() {
   chatStore.put(H.cleanChat(chat));
   sendDebugChat(H.cleanChat(chat));
   renderSidebar();
+}
+// the chat an answer is written in (generateReply's home), on the screen or not: with the list on, another chat may be open
+function saveChatOf(home) {
+  if (home.messages === messages) { saveChat(); return; }
+  if (!home.chat) return;                                                // the single chat is the one on the screen
+  home.chat.time = Date.now();
+  chatStore.put(H.cleanChat(home.chat));
+  sendDebugChat(H.cleanChat(home.chat));
+  renderSidebar();
+}
+// The answers a page closed while it read them (their strata_reply id kept in the message): read again from the server,
+// which keeps each one until the page has read it, up to 12 hours.  Once a load, after /health.
+function resumeReplies() {
+  if (!health.kept_replies) return;
+  const homes = listOn ? chats.map((c) => ({id: c.id, chat: c, messages: c.messages, cache: c.id}))
+                       : [{id: "single", chat: null, messages, cache: chatId || "chat"}];
+  for (const home of homes) {
+    const m = home.messages.find((x) => x.role === "assistant" && x.rid);
+    if (m && !replies.has(home.id)) generateReply({home, resume: m});
+  }
 }
 // the server's debug chat log: a chat as this page keeps it, a second after its last change (one send per chat)
 const debugTimers = new Map();
@@ -111,9 +132,11 @@ function groupName(key) {
 }
 function chatItem(c) {
   const t = H.chatTitle(c, untitled());
-  const row = node("div", `chat-item${c.id === chatId ? " on" : ""}`);
+  const writing = replies.has(c.id);                    // an answer is being written there
+  const row = node("div", `chat-item${c.id === chatId ? " on" : ""}${writing ? " chat-item--writing" : ""}`);
   row.dataset.id = c.id;
-  row.innerHTML = `<button class="chat-item__title" data-open-chat title="${esc(t)}">${esc(t)}</button>` +
+  const label = writing ? `${t} · ${tr("sidebar.writing", "writing an answer")}` : t;
+  row.innerHTML = `<button class="chat-item__title" data-open-chat title="${esc(label)}">${esc(t)}</button>` +
     `<span class="chat-item__actions">` +
     `<button class="st-btn st-btn--icon" data-rename aria-label="${esc(tr("sidebar.rename", "Rename this chat"))}" title="${esc(tr("sidebar.renameShort", "Rename"))}">${icon("edit")}</button>` +
     `<button class="st-btn st-btn--icon" data-delete aria-label="${esc(tr("sidebar.delete", "Delete this chat"))}" title="${esc(tr("sidebar.deleteShort", "Delete"))}">${icon("trash")}</button>` +
@@ -139,15 +162,18 @@ function renderSidebar() {
   $("sidebar-foot").textContent = tr("sidebar.foot", {one: "{n} chat · kept in this browser", other: "{n} chats · kept in this browser"}, {n: chats.length});
 }
 
+// a chat on the screen; an answer still being written in it (replies) is the page's busy again
 function showChat(c) {
   clearUndo();
   chat = c; chatId = c.id; messages = c.messages;
+  busy = replies.get(c.id) || null;
   store.set("chatId", chatId);
   chatStore.put(H.cleanChat(chat));       // renderChat renders the list, so the write here does not render it again
   renderChat();
+  setBusy(!!busy);
 }
+// another chat, while an answer may be written in this one: that answer goes on, in its own chat
 function openChat(id) {
-  if (busy) { stillWriting(); return; }
   const c = chats.find((x) => x.id === id);
   if (!c || c === chat) return;
   releasePending();
@@ -155,7 +181,6 @@ function openChat(id) {
   showChat(c);
 }
 function startChat() {
-  if (busy) { stillWriting(); return; }
   if (!messages.length && !chat.parent) { $("input").focus(); return; }          // already a fresh chat
   releasePending();
   closePanel();
@@ -167,7 +192,7 @@ function startChat() {
         {label: tr("undo", "Undo"), run: () => openChat(prev)});
 }
 function deleteChat(c) {
-  if (busy && c.id === chatId) { stillWriting(); return; }
+  if (replies.has(c.id)) { stillWriting(); return; }
   const i = chats.indexOf(c), wasOpen = c.id === chatId;
   if (i < 0) return;                                // the list only ever passes a chat it holds
   chats.splice(i, 1);

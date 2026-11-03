@@ -5,7 +5,7 @@
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 /* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
           clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen, chatId,
-          StrataSegments */
+          chat, saveChatOf, resumeReplies, StrataSegments */
 // serve/web/i18n.js, math.js, preview.js, segments.js and chats-ui.js, loaded before this file
 "use strict";
 
@@ -332,7 +332,7 @@ const imageBeside = () => imageGpu() === "separate" || imageGpu() === "helper";
 // an image job holds the text model's Load / Unload, unless it runs on a card of its own: on the text model's card it has
 // the GPU's turn, on the helper card the engine's helper
 const imageHoldsModel = () => imageGpu() !== "separate";
-function pageBusy() { return busy != null || (imageBusy && imageHoldsModel()); }
+function pageBusy() { return replies.size > 0 || (imageBusy && imageHoldsModel()); }
 // live.image (the image engine's job, on the metrics) is the job a refresh can see. imageBusy is this page's POST before
 // that job is published. On a shared card a chat phase already on the metrics wins, because Stop still stops that reply.
 function imageLive(live) {
@@ -453,7 +453,7 @@ function render(m) {
   // the header pill. modelOp and a local load win over "N queued": with parallel requests, queued stays up through
   // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
   // model (it has its own engine), so only a chat turn here counts as a load.
-  const localLoad = live.state === "unloaded" && busy != null;
+  const localLoad = live.state === "unloaded" && replies.size > 0;
   // an image job on another card beside a chat turn: the pill says both (the turn's, then the image's)
   const chatOn = live.state === "reading" || live.state === "generating";
   const beside = imageBeside() && chatOn;
@@ -653,7 +653,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const beside = imageBeside();
   const image = beside ? null : live.image;
   const imageNow = !beside && imageLive(live);
-  const starting = modelOp === "load" || (busy != null && live.state === "unloaded");
+  const starting = modelOp === "load" || (replies.size > 0 && live.state === "unloaded");
   const on = !modelOp && live.queued > 0 ? "queued" : image ? "generating" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) {
     const lit = (b.dataset.s === on || (!image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
@@ -664,7 +664,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   if (image) {
     [label, detail, pct] = imageState(image);
     delete prog.dataset.tone;
-  } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
+  } else if (modelOp === "load" || (replies.size > 0 && live.state === "unloaded")) {
     label = tr("mon.loading", "Loading");
     delete prog.dataset.tone;
     detail = tr("mon.loadingDetail", "The model is loading.");
@@ -1237,7 +1237,9 @@ if (settings.defaults_v !== 2) settings.math = settings.chatList = settings.chat
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
-let busy = null;                      // {controller, msg, cut, cutAfterTool}
+let busy = null;                      // the open chat's answer being written: {controller, msg, cut, cutAfterTool, rid, home}
+// every chat's answer being written, by chat (generateReply's home.id): another chat can be opened or started meanwhile
+const replies = new Map();
 let imageAlways = store.get("chat_image_always", false) === true;   // the image switch (paintImageSwitch)
 let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
@@ -1256,21 +1258,20 @@ function msgEl(m, i) {
     if (m.files && m.files.length) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
-      for (const f of m.files) {
-        const c = document.createElement("span");
-        c.className = "chip";
-        c.innerHTML = icon("attach", "st-icon st-icon--sm");
-        c.append(f.name);
-        wrap.appendChild(c);
-      }
+      for (const f of m.files) wrap.appendChild(attachChip(f, "attach"));
       el.appendChild(wrap);
     }
     if (m.images && m.images.length) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }
-        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || tr("chat.image", "image")); wrap.appendChild(c); }
+        if (!im.url) { wrap.appendChild(attachChip(im, "image")); continue; }
+        const img = document.createElement("img");
+        img.src = im.url; img.alt = im.name || tr("chat.image", "image"); img.title = img.alt;
+        img.className = "msg-image"; img.tabIndex = 0;
+        img.onclick = () => previewAttachment({kind: "image", ...im});
+        img.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); img.onclick(); } };
+        wrap.appendChild(img);
       }
       el.appendChild(wrap);
     }
@@ -1543,16 +1544,16 @@ $("chat").addEventListener("toggle", (e) => {
 // The messages of the current segment as the API takes them (segments.js): its system note and the exchanges it carries,
 // then its messages, each as it was sent before, so the prompt only grows. `partial`: the answer being written goes too,
 // as far as it got (a round that called the page's own tools goes on).
-function apiMessages(partial) {
-  const start = StrataSegments.segmentStart(messages), seg = messages[start] && messages[start].segment;
+function apiMessages(partial, msgs = messages, live = busy && busy.msg) {
+  const start = StrataSegments.segmentStart(msgs), seg = msgs[start] && msgs[start].segment;
   const out = seg ? [{role: "system", content: seg.system}, ...seg.carry] : [];
-  for (const m of messages.slice(start)) {
+  for (const m of msgs.slice(start)) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m) + (m.ctx ? `\n\n${m.ctx}` : "");
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
         ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
-    } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
+    } else if (m !== live) {                           // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
     } else if (partial) {
       out.push(...assistantMessages(m, true));
@@ -1608,9 +1609,9 @@ function assistantMessages(m, partial) {
 // ---- segments (segments.js): one chat that goes on past the context, with no summary
 const PAGE_ROUNDS = 8;                 // rounds of the page's own tools in one turn
 // the record of the current segment, or null (a chat from before segments: it goes on as it was until a handoff)
-function segmentNow() {
-  const i = StrataSegments.segmentStart(messages);
-  return (messages[i] && messages[i].segment) || null;
+function segmentNow(msgs = messages) {
+  const i = StrataSegments.segmentStart(msgs);
+  return (msgs[i] && msgs[i].segment) || null;
 }
 // the room an answer keeps: what the settings ask for, else a tenth of the context (2K to 16K)
 function answerReserve() {
@@ -1625,8 +1626,8 @@ function segmentLimit() {
   const auto = ctx - answerReserve() - Math.floor(ctx / 20);
   return Math.max(1024, +settings.segmentLimit > 0 ? Math.min(+settings.segmentLimit, auto) : auto);
 }
-function lastUserIndex() {
-  for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "user") return i;
+function lastUserIndex(msgs = messages) {
+  for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === "user") return i;
   return -1;
 }
 function lastAnswerBefore(i) {
@@ -1634,10 +1635,10 @@ function lastAnswerBefore(i) {
   return null;
 }
 // the record that makes user message i start segment k
-function newSegment(k, i, limit) {
-  const S = StrataSegments, memory = S.memoryAt(messages, i);
+function newSegment(k, i, limit, msgs = messages) {
+  const S = StrataSegments, memory = S.memoryAt(msgs, i);
   return {k, limit, system: S.systemNote(k, limit) + (memory ? `\n\nYour memory:\n${memory}` : ""),
-          carry: k > 1 ? S.carryFrom(messages, i, userText) : [],
+          carry: k > 1 ? S.carryFrom(msgs, i, userText) : [],
           tools: S.TOOLS.map((t) => t.function.name).filter((n) => k > 1 || !n.startsWith("history_"))};
 }
 // A message sent: a new chat starts segment 1; one that would take the segment past its limit (the last answer's
@@ -1654,12 +1655,12 @@ function placeSegment(i) {
 }
 // a turn the server refused as too long: its message starts the next segment, or, starting one already, carries one
 // exchange fewer; false when there is nothing left to take
-function handOffAt(i) {
+function handOffAt(i, msgs = messages) {
   if (!settings.segments || i < 0) return false;
-  const u = messages[i], limit = segmentLimit();
+  const u = msgs[i], limit = segmentLimit();
   if (!limit) return false;
   if (!u.segment) {
-    u.segment = newSegment(StrataSegments.segmentAt(messages, i - 1) + 1, i, limit);
+    u.segment = newSegment(StrataSegments.segmentAt(msgs, i - 1) + 1, i, limit, msgs);
     delete u.ctx;
     return true;
   }
@@ -1669,7 +1670,7 @@ function handOffAt(i) {
 // what the next turn needs of an answer that ended: the segment's tokens after it, and whether its thinking goes back
 // (segments.js keepThinking: its thinking against what would be read again without it, the answer and its tools'
 // results at the answer's own characters a token)
-function settleTurn(m, usage) {
+function settleTurn(m, usage, msgs = messages) {
   m.v = 2;
   m.used = (usage.prompt_tokens || 0) + (usage.completion_tokens || 0);
   if (!settings.segments) return;
@@ -1677,7 +1678,7 @@ function settleTurn(m, usage) {
   const chars = (m.reasoning || "").length + (m.text || "").length;
   const perToken = usage.completion_tokens > 0 && chars > 0 ? chars / usage.completion_tokens : 3;
   const results = (m.tools || []).reduce((n, t) => n + (t.result ? t.result.length : 0), 0);
-  const seg = segmentNow();
+  const seg = segmentNow(msgs);
   m.keep = StrataSegments.keepThinking({thinking, after: (usage.completion_tokens - thinking) + results / perToken,
                                         used: m.used, limit: seg ? seg.limit : segmentLimit()});
 }
@@ -1855,18 +1856,30 @@ async function readReply(r, rid, signal, onData) {
   }
 }
 // Stop (and an interjection): the server ends the reply too, then this page's connection is closed
-function stopReply() {
-  if (busy.rid) fetch(`v1/strata/replies/${busy.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
-  busy.controller.abort();
+function stopReply(b = busy) {
+  if (b.rid) fetch(`v1/strata/replies/${b.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+  b.controller.abort();
 }
+// a kept reply this page has read to its end (or given up on): the server lets it go (else it keeps it 12 hours)
+function replyRead(rid) {
+  if (rid) fetch(`v1/strata/replies/${rid}/ack`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+}
+// The answer goes to the chat it was asked in (`home`: its id, the chat record when the list is on, its messages), on the
+// screen or not: another chat can be opened or started while it is written.  `opts.resume`: an answer a closed page left
+// unread (its strata_reply id kept in the message, rid), read again from the server's start of it.
 async function generateReply(opts = {}) {
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
-  messages.push(m);
-  renderChat();
-  const el = $("chat").lastElementChild;
+  const home = opts.home || {id: chat ? chat.id : "single", chat, messages, cache: chatId || "chat"};
+  const msgs = home.messages, shown = () => msgs === messages;
+  const m = opts.resume || {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  if (!opts.resume) msgs.push(m);
+  const elOf = () => (shown() ? $("chat").querySelector(`.st-msg[data-i="${msgs.indexOf(m)}"]`) : null);
+  if (shown()) renderChat();
   const controller = new AbortController();
-  busy = {controller, msg: m, cut: false, cutAfterTool: false};
-  setBusy(true);
+  const me = {controller, msg: m, cut: false, cutAfterTool: false, home};
+  replies.set(home.id, me);
+  if (shown()) busy = me;
+  setBusy(!!busy);
+  renderSidebar();
   paintLive();
 
   const body = {model: health.model, messages: [], stream: true};
@@ -1891,22 +1904,46 @@ async function generateReply(opts = {}) {
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
-  const seg = segmentNow();                                  // null: a chat from before segments, or segments off
+  // the time the server's tools ran (an image made, a search), which tok/s leaves out: the model wrote nothing meanwhile
+  let toolMs = 0;
+  const toolSince = new Map();
+  const paint = () => { frame = 0; const el = elOf(); if (el) { updateAssistant(el, m, true); scrollDown(); } };
+  const seg = segmentNow(msgs);                              // null: a chat from before segments, or segments off
   if (seg) {
     body.tools = StrataSegments.TOOLS.filter((t) => seg.tools.includes(t.function.name));
-    body.prompt_cache_key = `${chatId || "chat"}-${seg.k}`;  // the same slot again for this chat (BATCHING.md)
+    body.prompt_cache_key = `${home.cache}-${seg.k}`;        // the same slot again for this chat (BATCHING.md)
   }
   try {
     // a round that called the page's own tools goes on in another request, with their results
     for (let round = 0; ; round++) {
-      body.messages = apiMessages(round > 0);
       const own = [];
-      // kept past its connection (a tab put to sleep, a network that dropped): the rest is read again below
-      busy.rid = health.kept_replies ? replyId() : null;
-      if (busy.rid) body.strata_reply = {id: busy.rid};
-      const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                     signal: controller.signal});
+      let r;
+      if (round === 0 && opts.resume) {
+        // the round the closed page was reading: what it had before that round stays, the round is read from its start
+        const base = m.ridBase || {};
+        me.rid = m.rid;
+        m.text = (m.text || "").slice(0, base.text || 0);
+        m.reasoning = (m.reasoning || "").slice(0, base.reasoning || 0);
+        if (m.tools) m.tools = m.tools.slice(0, base.tools || 0);
+        for (const k of ["error", "stopped", "meta", "limit"]) delete m[k];
+        if (!frame) frame = requestAnimationFrame(paint);
+        r = await fetch(`v1/strata/replies/${me.rid}?from=0`, {headers: headers(), signal: controller.signal});
+        if (r.status === 404) throw replyError(tr("chat.replyLost", "The server no longer has this answer (it was restarted, or the answer waited more than 12 hours)."));
+      } else {
+        body.messages = apiMessages(round > 0, msgs, m);
+        // kept past its connection (a tab put to sleep, a network that dropped, the page closed): the rest is read again
+        // below, or, when the page is opened again, from the id kept in the message (resumeReplies)
+        const prev = me.rid;
+        me.rid = health.kept_replies ? replyId() : null;
+        if (me.rid) {
+          body.strata_reply = {id: me.rid};
+          Object.assign(m, {rid: me.rid, ridBase: {text: m.text.length, reasoning: m.reasoning.length, tools: (m.tools || []).length}});
+          saveChatOf(home);
+        }
+        replyRead(prev);                                       // the round before, kept in the message just now
+        r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
+                                                signal: controller.signal});
+      }
       if (!r.ok) {
         let msg = `HTTP ${r.status}`;
         try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
@@ -1914,16 +1951,19 @@ async function generateReply(opts = {}) {
         overflow = r.status === 400 && /exceeds the context window/.test(msg);
         throw new Error(msg);
       }
-      await readReply(r, busy.rid, controller.signal, (data) => {
+      await readReply(r, me.rid, controller.signal, (data) => {
           if (data === "[DONE]") return;
           let j;
           try { j = JSON.parse(data); } catch (e) { return; }
           if (j.error) throw replyError(j.error.message || tr("toast.engineError", "the engine reported an error"));
           if (j.usage) usage = j.usage;
           if (j.strata_mcp) {
-            onTool(m, j.strata_mcp);
+            const x = j.strata_mcp;
+            if (x.event === "call") { if (!firstAt) firstAt = performance.now(); toolSince.set(x.id, performance.now()); }
+            else if (x.event === "result" && toolSince.has(x.id)) { toolMs += performance.now() - toolSince.get(x.id); toolSince.delete(x.id); }
+            onTool(m, x);
             // an interjection waited for a running tool: it has its result now, so the answer can stop
-            if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; stopReply(); }
+            if (me.cutAfterTool && !me.cut && !(m.tools || []).some((t) => t.state === "running")) { me.cut = true; stopReply(me); }
           }
           const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
           const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
@@ -1948,14 +1988,14 @@ async function generateReply(opts = {}) {
           if (!frame) frame = requestAnimationFrame(paint);
       });
       const calls = own.filter((c) => c && StrataSegments.TOOL_NAMES.has(c.name));
-      if (!calls.length || busy.cut || round >= PAGE_ROUNDS) break;
+      if (!calls.length || me.cut || round >= PAGE_ROUNDS) break;
       const room = usage ? usage.prompt_tokens + usage.completion_tokens : 0;
       for (const c of calls) {
         let a = {};
         try { a = JSON.parse(c.args || "{}"); } catch (e) { a = {}; }
         const t = {id: c.id, name: c.name, tool: c.name, arguments: a, round: `page-${round}`, at: m.text.length, rat: m.reasoning.length,
                    page: true, ok: true, state: "done"};
-        t.result = StrataSegments.runTool(messages, StrataSegments.segmentStart(messages), c.name, a) +
+        t.result = StrataSegments.runTool(msgs, StrataSegments.segmentStart(msgs), c.name, a) +
                    (seg ? `\n${StrataSegments.roomLine(room, seg.limit)}` : "");
         m.tools = m.tools || [];
         m.tools.push(t);
@@ -1964,17 +2004,19 @@ async function generateReply(opts = {}) {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else if (overflow && handOffAt(lastUserIndex())) handoff = true;
+    else if (overflow && handOffAt(lastUserIndex(msgs), msgs)) handoff = true;
     else { m.error = e.message || String(e); toast("error", tr("toast.requestFailed", "The request failed"), m.error, 6000); }
   }
-  const cut = busy.cut;                                      // an interjection ended it: kept as written, marked interrupted
+  const cut = me.cut;                                        // an interjection ended it: kept as written, marked interrupted
   if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
-  if (usage) settleTurn(m, usage);
+  if (usage) settleTurn(m, usage, msgs);
   const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
-    const secs = (performance.now() - firstAt) / 1000;
+    for (const t0 of toolSince.values()) toolMs += performance.now() - t0;   // a tool still running when it stopped
+    // a resumed answer was read in one go (resumeReplies): its speed is not known here
+    const secs = opts.resume ? 0 : (performance.now() - firstAt - toolMs) / 1000;
     m.meta = tr("chat.tokens", "{n} tokens", {n: fmt(n)}) + (secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "") + (m.stopped ? ` · ${ended}` : "") +
              (projectionLoaded() ? (settings.esp ? ` · ${tr("chat.projectionOn", "projection on")}` : ` · ${tr("chat.projectionOff", "projection off")}`) : "");
   } else if (m.stopped) {
@@ -1985,20 +2027,28 @@ async function generateReply(opts = {}) {
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
   if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "tool limit reached ({n} rounds, mcp.max_rounds)", {n: m.limit})}`;
   if (seg && m.used) m.meta = `${m.meta || ""} · ${tr("chat.context", "context {n} of {limit}", {n: fmt(m.used), limit: fmt(seg.limit)})}`;
-  busy = null;
-  setBusy(false);
+  replies.delete(home.id);
+  if (busy === me) busy = null;
+  setBusy(!!busy);
+  delete m.rid;
+  delete m.ridBase;
   if (handoff) {                                     // the turn did not fit: it starts the next segment and runs again
     if (frame) cancelAnimationFrame(frame);
-    messages.splice(messages.indexOf(m), 1);
-    saveChat();
-    renderChat();
-    return generateReply(opts);
+    msgs.splice(msgs.indexOf(m), 1);
+    saveChatOf(home);
+    replyRead(me.rid);
+    if (shown()) renderChat();
+    return generateReply({...opts, home, resume: null});
   }
   paintLive();
   if (frame) cancelAnimationFrame(frame);
-  updateAssistant(el, m, false);
-  saveChat();
-  keepToolCopies(m).then((got) => { if (got && messages.includes(m)) saveChat(); });
+  const el = elOf();
+  if (el) updateAssistant(el, m, false);
+  saveChatOf(home);
+  replyRead(me.rid);                                 // kept in the chat now: the server lets it go
+  renderSidebar();
+  keepToolCopies(m).then((got) => { if (got && msgs.includes(m)) saveChatOf(home); });
+  if (!shown()) return;
   scrollDown();
   settlePending(cut, !m.stopped && !m.error);
 }
@@ -2093,15 +2143,60 @@ function userText(m) {
   const files = (m.files || []).filter((f) => f.text != null);
   return [m.text, ...files.map(fileBlock)].filter((s) => s).join("\n\n");
 }
+// an attachment as a chip: its name cut short to the room there is (the whole name on hover), and a button that previews
+// it while the page has it (a picture's data, a file's text; a chat kept by name only has neither)
+function attachChip(a, kind) {
+  const c = document.createElement("span"), name = a.name || tr("chat.image", "image");
+  c.className = "chip";
+  c.title = name;
+  c.innerHTML = icon(kind, "st-icon st-icon--sm");
+  const can = a.url || typeof a.text === "string";
+  const n = document.createElement(can ? "button" : "span");
+  n.className = "chip__name";
+  n.textContent = name;
+  if (can) {
+    n.type = "button";
+    n.setAttribute("aria-label", tr("file.show", "Show {name}", {name}));
+    n.onclick = () => previewAttachment({kind: a.url ? "image" : "file", ...a});
+  }
+  c.appendChild(n);
+  return c;
+}
+// a picture at its size (to the window's), or a file's text, over the page; Escape, the button or a click outside closes it
+function previewAttachment(a) {
+  let d = $("attach-preview");
+  if (!d) {
+    d = document.createElement("dialog");
+    d.id = "attach-preview";
+    d.className = "attach-preview";
+    d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span>` +
+      `<button type="button" class="st-btn st-btn--icon" data-preview-close><svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div><div class="attach-preview__body"></div>`;
+    d.querySelector("[data-preview-close]").onclick = () => d.close();
+    d.addEventListener("click", (e) => { if (e.target === d) d.close(); });   // the backdrop: outside the box
+    d.addEventListener("close", () => { d.querySelector(".attach-preview__body").innerHTML = ""; });
+    document.body.appendChild(d);
+  }
+  const name = a.name || tr("chat.image", "image");
+  d.querySelector(".attach-preview__name").textContent = name;
+  d.querySelector("[data-preview-close]").setAttribute("aria-label", tr("close", "Close"));
+  const body = d.querySelector(".attach-preview__body");
+  if (a.kind === "image") {
+    const img = document.createElement("img");
+    img.src = a.url; img.alt = name;
+    body.appendChild(img);
+  } else {
+    const pre = document.createElement("pre");
+    pre.textContent = a.text;
+    body.appendChild(pre);
+  }
+  d.showModal();
+}
 function renderAttachments() {
   const box = $("attachments");
   box.hidden = !attachments.length;
   box.innerHTML = "";
   attachments.forEach((a, i) => {
-    const c = document.createElement("span");
-    c.className = "chip";
-    c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
-    c.append(a.name);
+    const c = attachChip(a, a.kind === "file" ? "attach" : "image");
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", tr("file.remove", "Remove"));
     x.innerHTML = icon("trash");
@@ -2361,7 +2456,7 @@ async function start() {
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
   thinkingButtons();   // the four of before until /health says the model's own
-  loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  loadHealth().then(() => resumeReplies()).then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
   poll();
   setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

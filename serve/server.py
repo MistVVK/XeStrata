@@ -363,12 +363,14 @@ class Reply:
     """A streamed chat reply kept apart from its connection (strata_reply): its SSE lines as they were made, so that a
     client whose connection broke (a browser that put the tab to sleep, a network that dropped for a moment) reads the
     rest again, and the answer, an image job's included, is not cancelled with the connection.  It is cancelled only
-    by its own cancel (POST /v1/strata/replies/<id>/cancel: the web app's Stop)."""
+    by its own cancel (POST /v1/strata/replies/<id>/cancel: the web app's Stop).  The client says when it has read it
+    (POST /v1/strata/replies/<id>/ack): `read_by_client`."""
 
     def __init__(self, cancel: threading.Event):
         self.cancel = cancel
         self.lines: list[bytes] = []
         self.done = False
+        self.read_by_client = False
         self.ended_at: float | None = None
         self.cond = threading.Condition()
 
@@ -391,10 +393,11 @@ class Reply:
 
 
 class Replies:
-    """The replies kept for their clients: a finished one for KEEP_S, at most MAX of them (the oldest finished go
-    first; one still running is never dropped)."""
-    KEEP_S = 600.0
-    MAX = 32
+    """The replies kept for their clients: a finished one until its client has read it (ack), for KEEP_S at most - a
+    page closed while it was written gets it when it is opened again, up to 12 hours later - and at most MAX of them
+    (the oldest finished go first; one still running is never dropped)."""
+    KEEP_S = 12 * 3600.0
+    MAX = 256
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -404,7 +407,7 @@ class Replies:
         with self.lock:
             now = time.time()
             for k, r in list(self.items.items()):
-                if r.done and r.ended_at is not None and now - r.ended_at > self.KEEP_S:
+                if r.done and (r.read_by_client or (r.ended_at is not None and now - r.ended_at > self.KEEP_S)):
                     del self.items[k]
             ended = sorted((r.ended_at or 0, k) for k, r in self.items.items() if r.done)
             while len(self.items) >= self.MAX and ended:
@@ -417,7 +420,23 @@ class Replies:
 
     def get(self, rid: str) -> Reply | None:
         with self.lock:
-            return self.items.get(rid)
+            r = self.items.get(rid)
+            if r is not None and r.done and r.ended_at is not None and time.time() - r.ended_at > self.KEEP_S:
+                del self.items[rid]
+                return None
+            return r
+
+    def ack(self, rid: str) -> bool:
+        """The client has the reply: a finished one goes now, one still running when it finishes.  False when there is
+        none."""
+        with self.lock:
+            r = self.items.get(rid)
+            if r is None:
+                return False
+            r.read_by_client = True
+            if r.done:
+                del self.items[rid]
+            return True
 
 
 REPLIES = Replies()
@@ -7585,6 +7604,14 @@ def make_handler(svc: Service):
                     return
                 reply.cancel.set()
                 self._json(200, {"cancelled": not reply.done})
+                return
+            if path.startswith("/v1/strata/replies/") and path.endswith("/ack"):      # the web app has read it
+                if not self._control_body():
+                    return
+                if not REPLIES.ack(path[len("/v1/strata/replies/"):-len("/ack")]):
+                    self._json(404, {"error": {"message": "no such reply"}})
+                    return
+                self._json(200, {"released": True})
                 return
             if path == "/update":                            # About's "Check now": ask GitHub again
                 if self._control_body() and self._own_page("a check for a new release can be asked"):

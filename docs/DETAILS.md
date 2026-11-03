@@ -1442,6 +1442,8 @@ Every switch below is **off by default**; with all of them off the page behaves 
   The chats live in this browser's IndexedDB; a picture or file is kept by name only. Nothing goes to the server.
   In a private window, or when the browser's storage is full, the list stays in memory and the page says so once.
   Turning it on keeps the chat on the screen as the first one in the list; turning it off keeps that chat as the single chat.
+  While an answer is being written, another chat can be opened or a new one started: the answer goes on in its own chat, which the list marks with a dot.
+  When the browser is closed, the server writes the answer on and keeps it, and the same browser gets it in its chat when the page is opened again. The server lets an answer go once it is delivered, and an undelivered one after 12 hours; a restart of the server loses them.
 - **Edit and rewind messages.** Under each message: **Regenerate** (a new answer to the same question), **Edit answer** (correct its text; the old thinking and tool calls go and no request is sent) and **Rewind to here**.
   Rewind asks what you want.
   On your message, **Edit and send again here** hides it and the messages after it and puts it in the box; on an answer, **Continue from here** hides the messages after it.
