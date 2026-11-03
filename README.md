@@ -262,7 +262,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 - **GPUs:** Intel, NVIDIA (from Pascal on, the code of the cuda12.4 package) and AMD (RDNA2 and later, the gfx of the "Fedora 44 and Windows" column [above](#amd-gpus)). AMD needs Adrenalin 26.5.1 or a later driver (`amdhip64_7.dll`).
 - **Math libraries:** Intel's oneMKL, NVIDIA's cuBLAS and cuDNN, and AMD's rocBLAS and hipBLASLt are not in the 7z.
   Where they are missing, setup asks whether to install them and, on a y, installs them into the 7z's Python with `pip install`. With `--check`, and where the 7z's folder cannot be written, it only shows the command. Without them XeStrata's own kernels do the work.
-- **Where things go:** the only things written into the 7z's folder are the math libraries above (in the 7z's `python\`). The settings go to `%APPDATA%\xestrata`, the logs and the rest to `%LOCALAPPDATA%\xestrata`, the models to the data folder (by default `%LOCALAPPDATA%\xestrata\data`).
+- **Where things go:** the only things written into the 7z's folder are the math libraries above (in the 7z's `python\`). The settings go to `%APPDATA%\xestrata`, the logs and the rest to `%LOCALAPPDATA%\xestrata`, the models to the data folder (by default `%LOCALAPPDATA%\xestrata\data`). When the window stops on an unexpected error, it leaves why in `%LOCALAPPDATA%\xestrata\state\launcher.log`.
 - **Updates:** unpack the new 7z into a folder of its own and start its `xestrata.exe`. The settings and the models carry over. The math libraries are not in the new 7z's Python, so setup asks again whether to install them.
 
 ## Using it
