@@ -113,6 +113,7 @@ HF_REVISIONS = {
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
 }
 
 
@@ -339,6 +340,16 @@ MODELS: dict[str, dict[str, Any]] = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
+    # AtomicChat's AD files (ATOMICCHAT_FILES): IQ3_S gate/up experts in layers 0-3 and 40-47, IQ2_S in the others, IQ4_NL
+    # downs (50.6 GB, IQ3_S's size), Q8_0 dense weights; the n-gram table Q5_1 (4.27) or Q8_0 (5.00), the rest of the
+    # download.  The RAM as Gyro's ("arena_gb" + LOW_RAM_HEADROOM_GB).  Their AD-3.84bpw is not here: its downs are
+    # MXFP4, which the expert kernels do not read
+    "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
+                   "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
+                   "file": "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
+    "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
+                   "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
+                   "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -447,6 +458,22 @@ SWIFT_FILES = {
 # huihui-ai's abliterated copies (uncensored) of Swift 1.5's IQ2_XS and IQ3_XXS and of Unsloth's UD-IQ4_XS,
 # UD-Q4_K_XL and Q8_0: the same file names, shards and sizes as those (Q8_0: 32 bytes more in shards 2 to 6), other
 # weights.  The picture readers are the originals' files.  name -> (bytes, sha256) at the pinned revision.
+# AtomicChat's AD files at the pinned revision (the Hub's LFS pointers): name -> (bytes, sha256).  The two sizes' shard
+# 2 (experts of the last layers) is the same file
+ATOMICCHAT_FILES = {
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00001-of-00003.gguf":
+        (44866868384, "11f1dcede7c9cd2a431b7b45b52dc7a72c24a38ae36d39cd3ba6242b364fef39"),
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00002-of-00003.gguf":
+        (11258338528, "1facceac7841b180b2f18b0be49af7321114084312289e44edd2164cf291b966"),
+    "Qwen3.8-Flash-Next-AD-4.27bpw-Q4_K_M-M64-00003-of-00003.gguf":
+        (38400184512, "7e3e597431774c0d1aef6cd6f72f6a55afa179e86538745087dc7fff6eb647e8"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00001-of-00003.gguf":
+        (44866868384, "99312afa27161c1b6498a45cae07ad12f6a567f2251c08b6c49114dd87015d0c"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00002-of-00003.gguf":
+        (11258338528, "1facceac7841b180b2f18b0be49af7321114084312289e44edd2164cf291b966"),
+    "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-00003-of-00003.gguf":
+        (54400261312, "290aab4357f46f61717e1caca3724dd1b722939b60e38a057e351e46dc95f901"),
+}
 HUIHUI_FILES = {
     "Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf":
         (10946624, "2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2"),
@@ -589,6 +616,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
                        "sha256": HUIHUI_FILES,
                        "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; huihui-ai's abliterated copy): "
                                   + HUIHUI_URL},
+    # AtomicChat's AD quantizations (ATOMICCHAT_FILES, the sizes AD-4.27bpw and AD-5.00bpw): after the regular
+    # families, never the default.  Images: the original's vision encoder (the same base model)
+    "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)", "by": "AtomicChat's AD quantizations",
+                   "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
+                            "at 5 or 8 bits; 94 and 110 GB downloads",
+                   "hf": hf("AtomicChat/Qwen3.8-Flash-Next-GGUF"), "file": "", "shards": 3, "tag": "atomicchat-",
+                   "name": "qwen3.8-flash-next-atomicchat", "vision": True, "pack_args": ["--compat-bf16"],
+                   "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                   "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": ATOMICCHAT_FILES,
+                   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
+                              "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
 # architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or its
@@ -789,6 +827,7 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": ATOMICCHAT_FILES,
 }
 for _fam in PLAIN_FAMILIES.values():                 # the other models' files, from their own tables
     for _d in _fam["models"].values():
@@ -3309,6 +3348,234 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
+def published_pin(name: str) -> tuple | None:
+    """The pinned (bytes, SHA-256) of a published model file by its name (REPO_PINS), or None."""
+    pins = {d[name] for d in REPO_PINS.values() if name in d}
+    return next(iter(pins)) if len(pins) == 1 else None
+
+
+def gguf_dir_renamed(shards: list, fam: dict, model: str) -> None:
+    """--gguf-dir: a shard found under another name than the published one (gguf_dir_shards) must be the published
+    file, its size and then its SHA-256: another model named like a size (a fine-tune's IQ3_XXS) was installed as that
+    size, its pack and config over the official one's.  Such a model goes in with --gguf."""
+    for i, s in enumerate(shards, 1):
+        pub = model_file(fam, model, i)
+        if s.name == pub or not s.exists():
+            continue
+        pin = published_pin(pub)
+        hint = (f"a model of your own goes in under a name of its own: {SETUP_CMD} --setup --gguf {shards[0]} "
+                "--name <a name>")
+        if pin is None or s.stat().st_size != pin[0]:
+            fail(f"{s.name} is not {fam['title']} {model}'s file ({pub}" +
+                 (f", {pin[0]:,} bytes)" if pin else ")"), hint)
+        size, sha = pin
+        verify_sha256(s, size, sha, own=True, other=hint)
+
+
+CUSTOM = "custom"                                      # the family of a model from the user's own files (--gguf)
+# the architectures the plain engine runs (plain_generate.cpp) besides Qwen3.8-Flash-Next's qwen4exp
+PLAIN_ARCHS = ("qwen35moe", "qwen35", "qwen3moe", "glm5-next", "glm5next")   # the last: GLM's other spelling
+
+
+def custom_id(name: str) -> str:
+    """--name's model id: custom-<the name in lower case, letters, digits, dots and hyphens>, the config's tag."""
+    slug = re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-.")[:48].strip("-.")
+    if not slug:
+        fail(f"--name {name!r} has no letters or digits", "give the model a name, e.g. --name my-model")
+    return "custom-" + slug
+
+
+def model_firsts(folder: Path) -> list[Path]:
+    """The models' first files in a folder: each .gguf that is not split or is the first shard of a split one, the
+    picture readers (mmproj*.gguf) aside."""
+    def first(p: Path) -> bool:
+        m = SHARD_NAME.search(p.name)
+        return not p.name.lower().startswith("mmproj") and (m is None or m.group(1) == "00001")
+    return sorted(p for p in folder.glob("*.gguf") if first(p))
+
+
+def gguf_files(path: Path) -> list[Path]:
+    """--gguf's shards: a .gguf file (any shard of a split model: all of them, named as the first one), or a folder
+    with one model's files (its picture reader, mmproj*.gguf, aside)."""
+    if path.is_dir():
+        firsts = model_firsts(path)
+        if len(firsts) != 1:
+            what = "no model file (.gguf) in this folder" if not firsts else \
+                "several models in this folder (" + ", ".join(p.name for p in firsts) + ")"
+            fail(f"--gguf {path}: {what}",
+                 "give the model's file (its first shard for a split one) instead of the folder")
+        path = firsts[0]
+    if not path.is_file():
+        fail(f"--gguf {path}: no such file")
+    m = SHARD_NAME.search(path.name)
+    if m is None or int(m.group(2)) < 1:
+        return [path]
+    stem, total = path.name[:m.start()], int(m.group(2))
+    return [path.with_name("%s-%05d-of-%05d.gguf" % (stem, i, total)) for i in range(1, total + 1)]
+
+
+def expert_profile_for(layers: int, experts: int) -> str | None:
+    """A profile in data/ (expert-profile*.bin, the experts most routed first) made for a model of this many MoE
+    layers and experts, which the engine takes (read_expert_profile refuses another shape); None: none is."""
+    for p in sorted((ROOT / "data").glob("expert-profile*.bin")):
+        try:
+            with open(p, "rb") as f:
+                head = f.read(16)
+        except OSError:
+            continue
+        if len(head) == 16 and head[:4] == b"STRP" and struct.unpack("<3I", head[4:]) == (1, layers, experts):
+            return p.name
+    return None
+
+
+def custom_info(shards: list, mid: str) -> dict:
+    """What setup needs of a model in the user's own files, from their headers (nothing is read past them): the
+    architecture, the files (size and time, to tell a changed file), the sizes setup's tables give its own models
+    (the download, the experts, the RAM by the Gyro rule: the experts and LOW_RAM_HEADROOM_GB), the context, the
+    expert profile of its shape, and a dense model's K/V bytes a token.  Kept in its config ("custom")."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        heads = [GGUFFile(s) for s in shards]
+    except (OSError, ValueError, struct.error) as e:
+        fail(f"cannot read {shards[0]} as a GGUF model file ({e})", "give a whole .gguf file")
+    meta = heads[0].metadata
+    arch = str(meta.get("general.architecture") or "")
+    if arch != "qwen4exp" and arch not in PLAIN_ARCHS:
+        fail(f"{shards[0].name} is a {arch or 'model without an architecture'}: XeStrata runs Qwen3.8-Flash-Next "
+             "(qwen4exp) and the models of " + ", ".join(PLAIN_ARCHS[:-1]) + " only")
+
+    def key(k: str, default=0):
+        v = meta.get(f"{arch}.{k}", default)
+        return v if isinstance(v, (int, float)) else max(v) if isinstance(v, list) and v else default
+    tensors = [t for g in heads for t in g.tensors]
+    experts = [t for t in tensors if re.match(r"blk\.\d+\.ffn_(gate|up|down)_exps\.", t.name)]
+    layers = len({t.name.split(".")[1] for t in experts if ".ffn_gate_exps." in t.name})
+    n_expert = int(key("expert_count"))
+    arena = sum(t.expected_bytes() or 0 for t in experts) / 1e9
+    total = sum(s.stat().st_size for s in shards)
+    info = {"name": mid, "arch": arch, "title": str(meta.get("general.name") or shards[0].stem),
+            "files": [{"path": str(s.resolve()), "size": s.stat().st_size, "mtime": int(s.stat().st_mtime)}
+                      for s in shards],
+            "download_gb": round(total / 1e9, 1), "arena_gb": round(arena, 1),
+            "ram_gb": round(arena + LOW_RAM_HEADROOM_GB, 1), "plain": arch != "qwen4exp",
+            "profile": expert_profile_for(layers, n_expert) if layers else None,
+            "max_context": max([c for c in CONTEXTS if c <= int(key("context_length", 262144))] or [CONTEXTS[0]])}
+    if arch == "qwen35":                               # dense: every weight in VRAM, its K/V a token beside them
+        attn = int(key("block_count")) // max(1, int(key("full_attention_interval", 4)))
+        info.update(dense=True, kv_bytes=attn * 2 * int(key("attention.head_count_kv")) *
+                    int(key("attention.key_length")) * 2)
+    return info
+
+
+def register_custom(info: dict) -> str:
+    """Puts a model from the user's own files (its config's "custom") into this run's tables, as setup's own sizes
+    are, so every rule that reads them (the RAM, the low-RAM mode, the pack) takes it; returns its family dict's
+    title.  Never at import: tools that list the tables (tools/strata_mcp.py) see setup's own models only.  A Qwen3.8
+    model is a size of family CUSTOM; a plain one is family CUSTOM with this one size, the family that setup_plain
+    reads."""
+    mid = info["name"]
+    about = f"your own files ({info['title']}, {info['download_gb']:.0f} GB)"
+    if not info.get("plain"):
+        MODELS[mid] = {"about": about, "download_gb": info["download_gb"], "ram_gb": info["ram_gb"],
+                       "arena_gb": info["arena_gb"], "families": (CUSTOM,), "shards": len(info["files"]),
+                       "file": Path(info["files"][0]["path"]).name, "vision": True, "custom": True}
+        FAMILIES[CUSTOM] = {**FAMILIES["qwen"], "title": info["title"], "by": "your own files", "about": about,
+                            "tag": "", "name": "qwen3.8-flash-next", "pack_args": ["--compat-bf16"],
+                            "profile": info.get("profile") or "expert-profile.bin", "custom": True}
+        return FAMILIES[CUSTOM]["title"]
+    first = Path(info["files"][0]["path"])
+    FAMILIES[CUSTOM] = {"title": info["title"], "by": "your own files", "about": about, "tag": "",
+                        "name": info["arch"], "max_context": info["max_context"], "plain": True, "custom": True,
+                        "arch": info["arch"], "profile": info.get("profile"), "dense": info.get("dense", False),
+                        "kv_bytes": info.get("kv_bytes", 0),
+                        "models": {mid: {"file": first.name, "size": sum(f["size"] for f in info["files"]),
+                                         "parts": [{"path": Path(f["path"]).name, "size": f["size"], "sha256": None}
+                                                   for f in info["files"]],
+                                         "about": about, "tested": True, "custom": True}}}
+    return info["title"]
+
+
+def inspect_with_engine(src: Path, code: int) -> int:
+    """--inspect of files on this PC: after the headers' reading (tools/strata_inspect.py, exit `code`), the installed
+    engine's verdict where there is one, which decides (its kernels are what runs the model)."""
+    eng = packaged_engine_dir()
+    try:
+        meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return code
+    if not src.exists() or not (eng / EXE).is_file():
+        return code
+    try:
+        if src.is_dir():
+            firsts = model_firsts(src)
+            if len(firsts) != 1:
+                return code                            # several variants: strata_inspect listed them
+            src = firsts[0]
+        libs = list(meta.get("lib_dirs", []))
+        if meta.get("license") == "contrib" and not WIN:
+            libs += nvidia_lib_dirs(data_folder_path(None, load_settings()))
+        got = engine_check(eng / EXE, libs, src)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"The engine could not check it: {e}")
+        return code
+    if got is None:
+        return code
+    if got.get("ok"):
+        print(f"The engine: it runs these types ({got.get('arch')}). {SETUP_CMD} --setup --gguf {src} --name <a name> "
+              "installs it from these files")
+        return 0
+    print("The engine: it cannot run this model:\n  " + "\n  ".join(got.get("problems") or ["no reason given"]))
+    return 2
+
+
+def custom_of(cfg_path: Path) -> dict | None:
+    """The "custom" block of an installed model's config (a model from the user's own files), or None."""
+    try:
+        got = json.loads(cfg_path.read_text(encoding="utf-8-sig")).get("custom")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return got if isinstance(got, dict) and got.get("name") and got.get("files") else None
+
+
+def engine_check(exe: Path, lib_dirs: list, gguf: Path) -> dict | None:
+    """The engine's own verdict on the model in `gguf` (strata --check-model: its headers against the engine's
+    kernels, no GPU opened), its JSON line; None from an engine without the check (an older one would start the model
+    instead).  Raises OSError when the engine gives no verdict."""
+    try:
+        if b"--check-model" not in exe.read_bytes():
+            return None
+    except OSError:
+        return None
+    env = dict(os.environ)
+    if lib_dirs:
+        var = "PATH" if WIN else "LD_LIBRARY_PATH"
+        env[var] = os.pathsep.join([*lib_dirs, env.get(var, "")])
+    r = subprocess.run([str(exe), "--check-model", str(gguf)], env=env, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=600)
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        raise OSError((r.stderr.strip() or f"exit code {r.returncode}")[-600:]) from None
+
+
+def check_model(exe: Path, lib_dirs: list, gguf: Path) -> dict:
+    """engine_check, and setup stops with the engine's reasons when it cannot run the model."""
+    try:
+        got = engine_check(exe, lib_dirs, gguf)
+    except (OSError, subprocess.SubprocessError) as e:
+        fail(f"the engine could not check {gguf.name}: {e}")
+    if got is None:
+        fail(f"this engine ({exe}) cannot check a model's files", f"update XeStrata ({SETUP_CMD} --update)")
+    if not got.get("ok"):
+        why = got.get("problems") or ["no reason given"]
+        if not got.get("readable"):
+            fail(f"cannot read {gguf.name}: {why[0]}", "give whole model files (a download cut short is refused)")
+        fail(f"XeStrata cannot run {gguf.name}:\n       " + "\n       ".join(why[:8]) +
+             (f"\n       ({len(why) - 8} more)" if len(why) > 8 else ""))
+    return got
+
+
 def _hash_file(s: Path, size: int) -> str:
     h = hashlib.sha256()
     seen, last = 0, 0.0
@@ -3327,11 +3594,12 @@ def _hash_file(s: Path, size: int) -> str:
     return h.hexdigest()
 
 
-def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) -> None:
+def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, other: str | None = None) -> None:
     """A shard's size and SHA-256 against the pinned values (the Unsloth file); the result is kept in its finish mark,
     so the minutes of hashing 111 GB happen once.  A wrong file is deleted, so the next run downloads it again.
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
-    piece by piece and only the damaged pieces are written again, then it is checked a second time."""
+    piece by piece and only the damaged pieces are written again, then it is checked a second time.  `other`: what the
+    person can do instead when their own file (`own`) is not the published one."""
     m = s.with_name(s.name + ".done")
     if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
         return
@@ -3356,8 +3624,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
     if digest != sha:
         if own:
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
-                 "it may be damaged or another version; your file was left as it is. "
-                 "Copy the whole published file into the folder")
+                 "it may be damaged or another version; your file was left as it is. " +
+                 (other or "Copy the whole published file into the folder"))
         s.unlink(missing_ok=True)
         m.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({digest}, expected {sha}): deleted",
@@ -5103,10 +5371,13 @@ def choices_from_config(cfg_path: Path) -> dict:
     """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("xestrata-"):]
+    custom = cfg.get("custom") if isinstance(cfg.get("custom"), dict) else None
     # the longest tag: one family's can start another's (gyro- and gyro-coder-, qwen35- and qwen35-uncensored-)
     family = max((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])),
                  key=lambda f: len(FAMILIES[f]["tag"]), default="qwen")
-    model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
+    # the size as the tables name it (unsloth-ud-iq4_xs: UD-IQ4_XS; gyro-gyro-m: Gyro-M, which upper() lost)
+    model = tag[len(FAMILIES[family]["tag"]):]
+    model = next((m for m in FAMILIES[family].get("models", MODELS) if m.lower() == model.lower()), model.upper())
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -5115,7 +5386,10 @@ def choices_from_config(cfg_path: Path) -> dict:
     reserve = int(rv) if rv.isdigit() else None
     rr = val("--ram-reserve-mib") or ""
     esp_path = esp.rsplit(":", 1)[0] if esp else None
-    return {"family": family, "model": model if model in FAMILIES[family].get("models", MODELS) else None,
+    if custom is not None:                             # a model of the user's own files (--gguf): custom-NAME
+        family, model = CUSTOM, str(custom.get("name") or tag)
+    return {"family": family, "model": model if family == CUSTOM or model in FAMILIES[family].get("models", MODELS)
+            else None,
             "context": int(ctx) if (ctx := val("--max-context")) else None,
             "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
@@ -6199,7 +6473,7 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
-                        "draft_vocab", "ple_io", "vision"})
+                        "draft_vocab", "ple_io", "vision", "custom"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
 
@@ -6440,9 +6714,11 @@ def replicas_config(a, cfg: dict) -> None:
 
 def plain_kv_takes(family: str) -> tuple:
     """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
-    forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only."""
-    return ("fp16",) if family == "glm53" else ("fp16", "int8") if family == "llmjp" else \
-        ("fp16", "int8", "q4_0", "k8v4")
+    forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own files: by its
+    architecture, as the family of that architecture."""
+    arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
+    return ("fp16",) if family == "glm53" or arch in ("glm5-next", "glm5next") else \
+        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else ("fp16", "int8", "q4_0", "k8v4")
 
 
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
@@ -6475,7 +6751,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                 f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
-        say(f"  {i}) {m:15s} {d['about']}; download {gb:.0f} GB" + ("" if d.get("tested") else "   [untested]") + fit)
+        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") +
+            ("" if d.get("tested") else "   [untested]") + fit)
     if dense:   # the largest that fits the GPU, else the smallest
         fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
         rec = str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
@@ -6484,6 +6761,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
+    own = bool(a.gguf_dir or d.get("custom"))          # the person's own files: never downloaded or marked
     if not d.get("tested"):
         warn(f"{model} has not been run with this release (its tensor types are checked with the tested files)")
     if not dense and ram + vram < d["size"] / 1e9 + 8:
@@ -6530,10 +6808,12 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     parts = plain_parts(d)
     names_of = [Path(x["path"]).name for x in parts]   # side by side in one folder: the engine finds them by name
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
+    if d.get("custom"):
+        models_dir = Path(a.custom["files"][0]["path"]).parent
 
     def all_there(folder: Path) -> bool:
-        return all((folder / n).exists() and (done(folder / n) or a.gguf_dir) for n in names_of)
-    if not a.gguf_dir and not all_there(models_dir):
+        return all((folder / n).exists() and (done(folder / n) or own) for n in names_of)
+    if not own and not all_there(models_dir):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             if all_there(r / "models" / tag):
                 models_dir = r / "models" / tag
@@ -6544,7 +6824,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     left = 0 if have else d["size"] / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
-    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or own)):
         left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
         fail(f"not enough free disk space in {models_dir}: need ~{left:.0f} GB, {free_gb(models_dir):.0f} GB free",
@@ -6554,16 +6834,21 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
              "Setup goes on and should fit")
 
     llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
+    if d.get("custom"):                                # the engine's verdict before anything is made
+        check_model(eng / EXE, lib_dirs, gguf)
+        ok(f"the engine runs {gguf.name}")
 
     # ---- 5. the model file
-    step(5, f"downloading {fam['title']} {model}")
+    step(5, f"downloading {fam['title']} {model}" if not d.get("custom") else f"the model files of {fam['title']}")
     if not have:
         say(f"  The model file{'s go' if len(parts) > 1 else ' goes'} in {models_dir} (a copy you already have: put "
             f"it there with its name, {', '.join(names_of)}, or use --gguf-dir <its folder>)")
     for x, n in zip(parts, names_of):
-        if not ((models_dir / n).exists() and (done(models_dir / n) or a.gguf_dir)):
+        if d.get("custom"):                            # what setup read of them; the engine checked the rest
+            continue
+        if not ((models_dir / n).exists() and (done(models_dir / n) or own)):
             download(hf(d["repo"]) + x["path"], models_dir / n)
-        verify_sha256(models_dir / n, x["size"], x["sha256"], own=bool(a.gguf_dir))
+        verify_sha256(models_dir / n, x["size"], x["sha256"], own=own)
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
     if mm is not None and mmproj is not None:
@@ -6690,6 +6975,8 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     cfg_path = CONF / f"xestrata-{tag.lower()}.json"
     CONF.mkdir(parents=True, exist_ok=True)
     STATE.mkdir(parents=True, exist_ok=True)
+    if getattr(a, "custom", None):                     # a model of the user's own files: what setup read of them
+        cfg["custom"] = a.custom
     cal = saved_calibration(cfg) if tune else None
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
@@ -6748,7 +7035,8 @@ def describe() -> dict:
     offered, and which of step 2's other questions (the pictures, the KV cache, the speed projection, a RAM budget)
     each family and size asks.  It reports only: nothing is made, moved or saved.  The front end passes its choices
     back as setup's options (--family, --model, --context, --vision, --kv, ..., and --images; an installed model's
-    image models through tools/image/install.py)."""
+    image models through tools/image/install.py).  With --gguf, the family of those files (CUSTOM) and what setup read
+    of them ("custom"); the engine's verdict comes at the install."""
     ram = usable_ram_gb()                              # the fits with --ram-reserve-gib given with --describe
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
@@ -6836,7 +7124,9 @@ def describe() -> dict:
             "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
             "images": images, "image_default": list(QI.SETUP_DEFAULT),
             "web_search": (load_settings()["search_engine"]
-                           if load_settings().get("search_engine") in WEB_SEARCH_APIS else None)}
+                           if load_settings().get("search_engine") in WEB_SEARCH_APIS else None),
+            # --describe --gguf PATH: what setup read of those files (their family, CUSTOM, is in "families")
+            "custom": getattr(ARGS, "custom", None)}
 
 
 def main() -> int:
@@ -6849,9 +7139,12 @@ def main() -> int:
         warn("WSL 2 has not been tested: XeStrata may work there, or not. If you get it working (or fix what stops "
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=[*FAMILIES, CUSTOM],
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5; custom = a model installed with --gguf")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models])))
+    models = list(dict.fromkeys([*MODELS, *plain_models]))
+    ap.add_argument("--model", metavar="{" + ",".join(models) + ",custom-NAME}",
+                    help="the size; custom-NAME: a model installed with --gguf --name NAME")
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -6962,6 +7255,13 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--gguf", metavar="PATH",
+                    help="install a model from GGUF files already on this PC, nothing downloaded: its .gguf file (the "
+                         "first shard of a split one) or its folder; Qwen3.8-Flash-Next (qwen4exp) or a model of the "
+                         "architectures the other models have (qwen35moe, qwen35, qwen3moe, glm5-next). Setup reads "
+                         "its headers and asks the engine whether it runs them, and stops with the reason if not")
+    ap.add_argument("--name", help="with --gguf: the model's name (default: its file's); it is installed as "
+                                   "custom-NAME (--model custom-NAME for --bench, --calibrate and a start)")
     ap.add_argument("--inspect", nargs="+", metavar=("SOURCE", "VARIANT"),
                     help="what a GGUF is and whether XeStrata runs it, from its headers only (no download): a file, a "
                          "folder, a URL, ms:owner/repo (ModelScope) or hf:owner/repo, and optionally a variant name")
@@ -7094,10 +7394,18 @@ def main() -> int:
     if a.image_text_encoder is not None:
         fail("--image-text-encoder was removed: --images names the text encoder",
              "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")
+    if a.model and a.model not in models and not a.model.startswith("custom-"):
+        ap.error(f"argument --model: invalid choice: {a.model!r} (choose from {', '.join(models)}, or custom-NAME)")
+    if a.gguf and (a.family or a.model or a.gguf_dir or a.inspect):
+        ap.error("--gguf installs the model in those files: give it without --family, --model, --gguf-dir and "
+                 "--inspect")
+    if a.name and not a.gguf:
+        ap.error("--name names a model installed with --gguf, e.g. --gguf model.gguf --name my-model")
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
-        sys.exit(subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode)
+        code = subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode
+        sys.exit(inspect_with_engine(Path(a.inspect[0]).expanduser(), code) if len(a.inspect) == 1 else code)
     global ARGS
     ARGS = a
     if a.vision_tokens is not None and a.vision_tokens < 1:
@@ -7130,6 +7438,19 @@ def main() -> int:
         return remove_data()
     if a.check_update:
         return check_update()
+    a.custom = None
+    if a.gguf:                                         # a model from the user's own files: its headers decide
+        shards = gguf_files(Path(a.gguf).expanduser())
+        check_shards(shards)
+        mid = custom_id(a.name or SHARD_NAME.sub("", shards[0].name).removesuffix(".gguf"))
+        old = custom_of(CONF / f"xestrata-{mid}.json")
+        if (CONF / f"xestrata-{mid}.json").exists() and \
+                (old is None or [f["path"] for f in old.get("files", [])] != [str(x.resolve()) for x in shards]):
+            fail(f"a model named {mid} is installed from other files",
+                 "give this one another --name (or set that one up again from its own files)")
+        a.custom = custom_info(shards, mid)
+        register_custom(a.custom)
+        a.family, a.model = CUSTOM, mid
     if a.describe:
         emit(describe())
         return 0
@@ -7203,13 +7524,14 @@ def main() -> int:
             fail("no model is installed yet", "run setup without --bench first, then --bench")
         # the model the release table and the upstream merges measure, so a record compares with theirs; --model and
         # --family pick another installed one (a PC with less RAM)
-        family, model = a.family or "qwen", a.model or "IQ3_XXS"
+        family = a.family or (CUSTOM if (a.model or "").startswith("custom-") else "qwen")
+        model = a.model or "IQ3_XXS"
         bench_cfgs = [c for c in have if (ch := choices_from_config(c))["family"] == family and ch["model"] == model]
         if not bench_cfgs:
             installed = "; ".join(f"xestrata --bench --model {ch['model']}" +
-                                  (f" --family {ch['family']}" if ch["family"] != "qwen" else "")
+                                  (f" --family {ch['family']}" if ch["family"] not in ("qwen", CUSTOM) else "")
                                   for c in have if (ch := choices_from_config(c))["model"])
-            fail(f"{FAMILIES[family]['title']} {model} is not installed",
+            fail(f"{FAMILIES[family]['title'] if family in FAMILIES else 'your model'} {model} is not installed",
                  f"measure an installed model: {installed}" if installed else
                  f"install it first: xestrata --setup --model {model}")
         update_installed_engine()
@@ -7396,7 +7718,16 @@ def main() -> int:
 
     # ---- 2. the questions
     step(2, "your choices")
-    fams = list(FAMILIES)
+    if a.custom is None and (a.family == CUSTOM or (a.model or "").startswith("custom-")):
+        # an installed model of the user's own files set up again from them (--setup --model custom-NAME)
+        old = custom_of(CONF / f"xestrata-{a.model}.json") if a.model else None
+        if old is None:
+            fail(f"{a.model or '--family custom'}: no model of your own files is installed under that name",
+                 f"install one with {SETUP_CMD} --setup --gguf <its .gguf file> --name <a name>")
+        a.custom = custom_info([Path(f["path"]) for f in old["files"]], a.model)
+        register_custom(a.custom)
+        a.family = CUSTOM
+    fams = [f for f in FAMILIES if f != CUSTOM]
     # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
@@ -7445,7 +7776,8 @@ def main() -> int:
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, vram) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, vram):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {d['download_gb']:.0f} GB") +
+            f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
@@ -7626,13 +7958,19 @@ def main() -> int:
         ok("experimental speed projection: " + ("ON (experimental)" if esp else "off"))
     elif esp_choice.lower() not in ("", "off", "no", "n", "0"):
         warn(f"the experimental speed projection cannot be used with {fam['title']}: left off")
+    own = bool(a.gguf_dir or a.custom)                 # the person's own files: never downloaded, deleted or marked
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = gguf_dir_shards(models_dir, fam, model) if a.gguf_dir else \
         [models_dir / model_file(fam, model, i) for i in range(1, model_shards(fam, model) + 1)]
+    if a.custom:
+        shards = [Path(f["path"]) for f in a.custom["files"]]
+        models_dir = shards[0].parent
     problem = gguf_dir_problem(models_dir, shards[0], fam, model) if a.gguf_dir else None
     if problem:                                        # upstream #444: files XeStrata cannot run, or another choice's
         fail(*problem)
-    if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
+    if a.gguf_dir:
+        gguf_dir_renamed(shards, fam, model)
+    if not own and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
             if all(c.exists() and done(c) for c in cand):
@@ -7640,16 +7978,16 @@ def main() -> int:
                 ok(f"model files found in {models_dir}")
                 break
     for s in shards:   # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b)
-        if s.exists() and not done(s) and whole_shard(s):
+        if not a.custom and s.exists() and not done(s) and whole_shard(s):
             try:
                 mark(s, "whole (checked against its own tensor directory)")
             except OSError as e:                       # a read-only folder (--gguf-dir on a share): still whole
                 warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
-    have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
+    have_model = all(s.exists() and (done(s) or own) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
     # .part files already on the disk count
     on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
-    to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    to_fetch = 0 if own or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
     # upstream ed15a3d0: count only what step 6 will still write - the AVX-512 Q2_0 conversion when its pack is not
     # there yet, a new MTP draft layer only when none is
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
@@ -7668,6 +8006,9 @@ def main() -> int:
              "Setup goes on and should fit; free up space if it stops")
 
     llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
+    if a.custom:                                       # the engine's verdict before anything is made
+        check_model(eng / EXE, lib_dirs, shards[0])
+        ok(f"the engine runs {shards[0].name}")
     # #24: a package takes only the image encoders it carries (the Windows 7z has the CPU one, no Vulkan one)
     if PACKAGED and vision == "gpu" and not (eng / VEXE[enc]).exists():
         warn("this package has no GPU image encoder: images are read on the CPU")
@@ -7677,8 +8018,8 @@ def main() -> int:
         vision = "none"
 
     # ---- 5. the model files
-    step(5, f"downloading {fam['title']} {model}")
-    if not a.gguf_dir:
+    step(5, f"downloading {fam['title']} {model}" if not own else f"the model files of {fam['title']}")
+    if not own:
         missing = [s.name for s in shards if not (s.exists() and done(s))]
         if missing:                                    # #495: files downloaded by hand go here, or --gguf-dir
             say(f"  The model files go in {models_dir}")
@@ -7712,14 +8053,14 @@ def main() -> int:
     for s in shards:                                   # the experimental Unsloth file: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
             pin_size, pin_sha = fam["sha256"][s.name]
-            verify_sha256(s, pin_size, pin_sha, own=bool(a.gguf_dir))
+            verify_sha256(s, pin_size, pin_sha, own=own)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
     if not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
-        if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
-            mmproj = Path(a.gguf_dir) / fam["mmproj"]
+        if not mmproj.exists() and own and (models_dir / fam["mmproj"]).exists():
+            mmproj = models_dir / fam["mmproj"]
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
@@ -7741,11 +8082,24 @@ def main() -> int:
         if not (pack / "tokenizer" / "vocab.json").exists():
             run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]),
                  "--out", str(pack)], env=env)   # writes <pack>/tokenizer/
-    elif not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
-        # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
-        # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
-        run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
-             *fam.get("pack_args", [])], env=env)
+    else:
+        # the files the pack was made from: another model's files under the same tag (--gguf-dir, files replaced by
+        # hand) made a pack whose dense weights were the old model's beside the new one's experts
+        src = [{"name": s.name, "size": s.stat().st_size, "mtime": int(s.stat().st_mtime)} for s in shards]
+        try:
+            made = json.loads((pack / "source.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            made = None
+        if made != src or not (pack / "native_experts.txt").exists() or \
+                not (pack / "tokenizer" / "vocab.json").exists():
+            # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
+            # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
+            (pack / "source.json").unlink(missing_ok=True)
+            if made is not None and made != src:       # another model's: its tokenizer too (iq_pack keeps one)
+                shutil.rmtree(pack / "tokenizer", ignore_errors=True)
+            run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
+                 *fam.get("pack_args", [])], env=env)
+            (pack / "source.json").write_text(json.dumps(src, indent=1), encoding="utf-8")
     ok(f"model prepared: {pack}")
     mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"

@@ -185,6 +185,21 @@ type MainWindow() as this =
         }
         |> ignore
 
+    let pickFile (title: string) (target: TextBox) =
+        task {
+            let top = TopLevel.GetTopLevel this
+            let gguf = FilePickerFileType("GGUF model files", Patterns = [| "*.gguf" |])
+            let! picked =
+                top.StorageProvider.OpenFilePickerAsync(
+                    FilePickerOpenOptions(Title = title, AllowMultiple = false, FileTypeFilter = [| gguf |])
+                )
+            if picked.Count > 0 then
+                match picked[0].TryGetLocalPath() with
+                | null -> ()
+                | path -> target.Text <- path
+        }
+        |> ignore
+
     // ---------------------------------------------------------------------------------------------- the update
     let checkUpdate () =
         task {
@@ -448,13 +463,59 @@ type MainWindow() as this =
                     actions [
                         button "Inspect a model file ..." (fun () -> inspectPage d)
                         button "Remove XeStrata's data ..." removeData
-                        (if installed.IsEmpty then accentButton else button) "Install a model ..." (fun () -> choosePage d)
+                        button "Install from files on this PC ..." (fun () -> ownFilesPage d)
+                        (if installed.IsEmpty then accentButton else button) "Install a model ..." (fun () -> choosePage d None)
                     ]
             ]
         )
 
-    and choosePage (d: Describe) =
-        let families = ListBox(ItemsSource = d.Families, MaxHeight = 260.0)
+    /// A model in GGUF files already on this PC (setup --gguf): setup reads their headers (--describe --gguf) and the
+    /// install page then asks setup's questions for that model; the engine's verdict comes at the install.
+    and ownFilesPage (d: Describe) =
+        let file = TextBox(PlaceholderText = "the model's .gguf file (the first one of a split model)", MinWidth = 420.0)
+        let name = TextBox(PlaceholderText = "(optional) a name for it; default: the file's", MinWidth = 260.0)
+        let problem = coloured failBrush ""
+        let go = accentButton "Next" ignore
+        go.Click.Add(fun _ ->
+            match trimmed file with
+            | "" -> problem.Text <- "Choose the model's .gguf file."
+            | path ->
+                go.IsEnabled <- false
+                problem.Text <- ""
+                task {
+                    let! messages, _ =
+                        Setup.collect ([ "--describe"; "--gguf"; path ] @ (match trimmed name with "" -> [] | n -> [ "--name"; n ]))
+                    let found = messages |> List.tryPick (function Described d when not (isNull (box d.Custom)) -> Some d | _ -> None)
+                    ui (fun () ->
+                        go.IsEnabled <- true
+                        match found with
+                        | Some own -> choosePage own (Some(path, trimmed name))
+                        | None ->
+                            problem.Text <-
+                                messages
+                                |> List.choose (function Fail(t, h) -> Some(if String.IsNullOrEmpty h then t else t + " " + h) | _ -> None)
+                                |> String.concat "\n"
+                            if problem.Text = "" then problem.Text <- "setup could not read this file.")
+                }
+                |> ignore)
+        show (
+            stack 14.0 [
+                heading "Install from files on this PC"
+                muted "A model in GGUF files you already have, nothing downloaded: Qwen3.8-Flash-Next, or a model of the architectures XeStrata's other models have (Qwen3.5 and Qwen3.6 MoE, Qwen3.5 dense, Qwen3 MoE, GLM-5.3). Setup reads the file's headers, and the engine checks that it runs its types before anything is installed."
+                field "The model file" (row 8.0 [ file; button "Browse ..." (fun () -> pickFile "The model's GGUF file" file) ])
+                field "Name (it is installed as custom-NAME)" name
+                problem
+                actions [ button "Back" (fun () -> homePage d); go ]
+            ]
+        )
+
+    /// The install page; `own`: the model in the user's own files (--gguf PATH, --name NAME) instead of a family's.
+    and choosePage (d: Describe) (own: (string * string) option) =
+        let families =
+            ListBox(
+                ItemsSource = (if own.IsSome then d.Families |> Array.filter (fun f -> f.Id = "custom") else d.Families |> Array.filter (fun f -> f.Id <> "custom")),
+                MaxHeight = 260.0
+            )
         families.ItemTemplate <-
             FuncDataTemplate<Family>(fun f _ ->
                 stack 2.0 [
@@ -664,11 +725,15 @@ type MainWindow() as this =
                     for id, _, box in apiKeys do
                         let k = if webSearchValue () = id then trimmed box else ""
                         Environment.SetEnvironmentVariable($"XESTRATA_{id.ToUpperInvariant()}_API_KEY", (if k = "" then null else k))
+                    let which =
+                        match own with
+                        | Some(path, name) -> [ "--gguf"; path ] @ (if name = "" then [] else [ "--name"; name ])
+                        | None -> [ "--family"; f.Id; "--model"; m.Id ]
                     let args =
-                        [ "--setup"; "--yes"; "--no-start"; "--family"; f.Id; "--model"; m.Id; "--data-dir"; dataDir.Text ]
+                        [ "--setup"; "--yes"; "--no-start" ] @ which @ [ "--data-dir"; dataDir.Text ]
                         @ questions
                         @ (if gpus.Length > 0 then [ "--gpu"; string gpus[max 0 gpuBox.SelectedIndex].Index ] else [])
-                        @ (if String.IsNullOrWhiteSpace ggufDir.Text then [] else [ "--gguf-dir"; ggufDir.Text ])
+                        @ (if own.IsSome || String.IsNullOrWhiteSpace ggufDir.Text then [] else [ "--gguf-dir"; ggufDir.Text ])
                         @ more
                     installPage (f.Title + " " + m.Id) args
             | _ -> ())
@@ -689,8 +754,9 @@ type MainWindow() as this =
                         field "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and the image models' sizes are chosen with that much less; slower when the experts are then read from the SSD)" ramReserve
                         field "Requests decoded together (each takes VRAM from the expert cache)" parallelBox
                         field "With a layer split: independent engines, each on an equal group of the GPUs" replicas
-                        field "Where the model files come from" source
-                        field "Where the model files go" (row 8.0 [ modelsDir; button "Browse ..." (fun () -> pickFolder "Model files folder" modelsDir) ])
+                        if own.IsNone then
+                            field "Where the model files come from" source
+                            field "Where the model files go" (row 8.0 [ modelsDir; button "Browse ..." (fun () -> pickFolder "Model files folder" modelsDir) ])
                         moveData
                         rememberData
                         noWarmup
@@ -707,7 +773,8 @@ type MainWindow() as this =
                 field "Context: how much text the model sees at once (longer takes more VRAM)" contexts
                 if gpus.Length > 1 then field "GPU" gpuBox
                 field "Data folder: where the model files go (tens of GB)" (row 8.0 [ dataDir; button "Browse ..." (fun () -> pickFolder "Data folder" dataDir) ])
-                field "Model files you already have" (row 8.0 [ ggufDir; button "Browse ..." (fun () -> pickFolder "Model files" ggufDir) ])
+                if own.IsNone then
+                    field "Model files you already have" (row 8.0 [ ggufDir; button "Browse ..." (fun () -> pickFolder "Model files" ggufDir) ])
                 pictures
                 kvField
                 ropeField

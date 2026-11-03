@@ -12,6 +12,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/platform/thread_name.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
@@ -3549,7 +3550,7 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
 }
 
 bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
-                             int64_t n_embd, int64_t n_ff, std::string& err) {
+                             int64_t n_embd, int64_t n_ff, std::string& err, bool folded_ok) {
     using namespace strata::kernels::cpu;
     static const char* roles[3] = {"gate", "up", "down"};
     if (moe_blocks.empty() || n_expert <= 0 || n_embd <= 0 || n_ff <= 0) {
@@ -3558,7 +3559,7 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
     }
     try {
         const strata::GgufModel model = strata::GgufModel::open(gguf);
-        if (model.shard(0).metadata().count("prism.hadamard.version")) {   // APR: hadamard.txt comes with a pack only
+        if (!folded_ok && model.shard(0).metadata().count("prism.hadamard.version")) {   // APR: hadamard.txt comes with a pack only
             err = "experts from the GGUF: its experts are Hadamard-folded (prism.hadamard); make a pack with "
                   "tools/iq_pack.py";
             return false;
@@ -3629,6 +3630,26 @@ bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>
         err = std::string("experts from the GGUF: ") + e.what();
         return false;
     }
+}
+
+std::vector<std::string> native_layer_problems(bool mixed_gu) {
+    using namespace strata::kernels::cpu;
+    std::vector<std::string> out;
+    const ExpertLayout& lay = expert_layout();
+    for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+        const NativeFmt& f = lay.fmt[(size_t) l];
+        const std::string at = "MoE layer " + std::to_string(l) + " (block " + std::to_string(lay.block_of(l)) + ")";
+        const int up = f.up_type >= 0 ? f.up_type : f.gu_type;
+        if (!mixed_gu && native_mixed_gu(f)) {
+            out.push_back(at + " has gate and up of different types (" + strata::ggml_type_name((uint32_t) f.gu_type) +
+                          ", " + strata::ggml_type_name((uint32_t) up) + "), which this engine's experts do not take");
+        } else if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) {
+            out.push_back(at + "'s experts are " + strata::ggml_type_name((uint32_t) f.gu_type) + "/" +
+                          strata::ggml_type_name((uint32_t) up) + "/" + strata::ggml_type_name((uint32_t) f.d_type) +
+                          " (gate/up/down), which this engine has no GPU kernels for");
+        }
+    }
+    return out;
 }
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {

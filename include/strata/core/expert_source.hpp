@@ -1102,8 +1102,15 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
 /// MoE layer i (the model's block moe_blocks[i]), the gate / up / down types, the blob, and the tensors' files and
 /// offsets in the shards of `gguf`'s model (any of its shards).  Gate and up are [n_embd, n_ff, n_expert], down
 /// [n_ff, n_embd, n_expert].  A FileExpertSource reads it with set_gguf(`gguf`) and no experts.bin.
+/// `folded_ok`: take Hadamard-folded experts (prism.hadamard) too, whose layout a check reads (--check-model) though
+/// only a pack can run them.
 bool expert_layout_from_gguf(const std::string& gguf, const std::vector<int64_t>& moe_blocks, int64_t n_expert,
-                             int64_t n_embd, int64_t n_ff, std::string& err);
+                             int64_t n_embd, int64_t n_ff, std::string& err, bool folded_ok = false);
+/// What keeps the process-wide expert layout's layers off the GPU, a line a layer (empty: nothing): types
+/// native_expert_supported has no kernels for, or (`mixed_gu` false: Qwen3.8's experts, which take one gate/up type)
+/// a gate and up of different types.  Both engines check it at startup, before anything is allocated (upstream
+/// efeffd8): an unsupported type would only fail inside the first window.  --check-model reports it.
+std::vector<std::string> native_layer_problems(bool mixed_gu);
 LoadStats load_experts_gguf(const std::string& gguf, uint8_t* dst,
                           const strata::kernels::cpu::ExpertLayout& lay, int threads);
 

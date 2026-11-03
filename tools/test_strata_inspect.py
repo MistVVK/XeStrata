@@ -42,7 +42,7 @@ class Verdict(unittest.TestCase):
 
     def test_other_architecture(self):
         fp = self.fp("qwen/Q2_0")
-        fp["arch"] = "qwen3moe"
+        fp["arch"] = "llama"                                  # neither Qwen3.8-Flash-Next nor the plain engine's
         self.assertEqual(SI.verdict(fp, self.table)[0], "no")
 
     def test_expert_type_without_kernel(self):

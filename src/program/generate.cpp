@@ -1944,6 +1944,94 @@ double bench_ssd_read_gbps(const std::string& path, double* gib_read) {
     return done.load() > 0 ? (double) (done.load() * kBlock) / s / 1e9 : -1.0;
 }
 
+// `strata --check-model GGUF`: whether this engine runs the model in GGUF (any of its shards), read from its headers
+// alone with no GPU opened - setup's --gguf asks it before it packs or installs anything.  Its architecture and shape,
+// each MoE layer's expert types against the kernels (native_layer_problems: the check both engines make at startup)
+// and Qwen3.8's PLE table type, as one JSON line: {"ok", "arch", "experts": [{"types", "blocks"}], "ple",
+// "problems"}.  0: it runs; 1: it does not (the problems say why); 2: the file could not be read.
+int check_model(const std::string& gguf) {
+    const auto quote = [](const std::string& v) {
+        std::string q = "\"";
+        for (const char c : v) {
+            if (c == '"' || c == '\\') q += '\\';
+            if ((unsigned char) c < 0x20) q += ' ';
+            else q += c;
+        }
+        return q + "\"";
+    };
+    std::vector<std::string> problems;
+    std::string arch, ple, experts;
+    try {
+        const strata::GgufModel model = strata::GgufModel::open(gguf);
+        for (size_t i = 0; i < model.size(); ++i)   // a truncated shard (a download cut short); unknown sizes pass
+            for (const strata::TensorInfo& t : model.shard(i).tensors())
+                if (strata::tensor_payload_bytes(t) != 0 && !model.in_bounds(t, i))
+                    throw std::runtime_error(t.name + " runs past the end of " + model.shard(i).path() +
+                                             " (a truncated file?)");
+        strata::ModelSpec s;
+        std::string err;
+        const bool spec_ok = strata::read_model_spec(model.shard(0), s, err);
+        arch = s.arch_name;
+        if (!spec_ok) {
+            problems.push_back(err);
+        } else {
+            const bool q38 = s.arch == strata::ModelArch::Qwen4Exp;
+            strata::core::ModelGeometry g;
+            if (q38 && !strata::core::geometry_from_spec(s, g, err)) problems.push_back(err);
+            std::vector<int64_t> blocks;
+            for (int64_t l = 0; l < s.n_layer; ++l)
+                if (s.layer_routes(l)) blocks.push_back(l);
+            // the plain engine's MTP layer (PlainModel's model_mtp_); Qwen3.8's MTP is a pack of its own
+            const bool q35 = s.arch == strata::ModelArch::Qwen35Moe || s.arch == strata::ModelArch::Qwen35;
+            if (!blocks.empty() && q35 && s.n_nextn == 1 &&
+                model.find("blk." + std::to_string(s.n_layer) + ".nextn.eh_proj.weight") != nullptr)
+                blocks.push_back(s.n_layer);
+            if (!blocks.empty()) {
+                if (!strata::core::expert_layout_from_gguf(gguf, blocks, s.n_expert, s.n_embd, s.n_ff_exp, err, q38)) {
+                    problems.push_back(err);
+                } else {
+                    for (const std::string& p : strata::core::native_layer_problems(!q38)) problems.push_back(p);
+                    // the layers grouped by their types, in the order they first appear
+                    const auto& lay = strata::kernels::cpu::expert_layout();
+                    std::vector<std::pair<std::string, std::string>> groups;
+                    for (int64_t l = 0; l < (int64_t) lay.fmt.size(); ++l) {
+                        const auto& f = lay.fmt[(size_t) l];
+                        const std::string t = std::string(strata::ggml_type_name((uint32_t) f.gu_type)) + "/" +
+                                              strata::ggml_type_name((uint32_t) (f.up_type >= 0 ? f.up_type
+                                                                                                : f.gu_type)) +
+                                              "/" + strata::ggml_type_name((uint32_t) f.d_type);
+                        auto it = std::find_if(groups.begin(), groups.end(), [&](const auto& e) { return e.first == t; });
+                        if (it == groups.end()) it = groups.insert(groups.end(), {t, std::string()});
+                        it->second += (it->second.empty() ? "" : ",") + std::to_string(lay.block_of(l));
+                    }
+                    for (const auto& e : groups)
+                        experts += std::string(experts.empty() ? "" : ",") + "{\"types\":" + quote(e.first) +
+                                   ",\"blocks\":[" + e.second + "]}";
+                }
+            }
+            if (q38) {   // the PLE table's type, which PleTable::open looks up in ple_formats()
+                const strata::TensorInfo* t = model.find("per_layer_token_embd.weight");
+                if (t == nullptr) {
+                    problems.push_back("per_layer_token_embd.weight (the PLE table) is not in the model's shards");
+                } else {
+                    ple = t->type_name();
+                    if (strata::kernels::ple_format_for_type(t->type_name()) == nullptr)
+                        problems.push_back("the PLE table is " + ple + ", not " + strata::kernels::ple_format_list());
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        std::printf("{\"ok\":false,\"readable\":false,\"problems\":[%s]}\n", quote(e.what()).c_str());
+        return 2;
+    }
+    std::string list;
+    for (const std::string& p : problems) list += (list.empty() ? "" : ",") + quote(p);
+    std::printf("{\"ok\":%s,\"readable\":true,\"arch\":%s,\"experts\":[%s],\"ple\":%s,\"problems\":[%s]}\n",
+                problems.empty() ? "true" : "false", quote(arch).c_str(), experts.c_str(), quote(ple).c_str(),
+                list.c_str());
+    return problems.empty() ? 0 : 1;
+}
+
 // `strata --hw-bench [--native GGUF | --pack DIR]`: the RAM with the expert pool's threads (every physical core, as
 // the pool and the host thread take them) and with one, the PCIe copies each way, every GPU's and every pair's
 // (hw_bench_gpus), the SSD under the model (the native GGUF, else the pack's largest file).
@@ -2406,6 +2494,8 @@ int main(int argc, char** argv) {
         }
         return a == "--hw-bench" ? hw_bench(pack, native) : kernel_bench(pack);
     }
+    for (int i = 1; i + 1 < argc; ++i)   // setup's --gguf: whether the model runs here, no GPU opened
+        if (std::strcmp(argv[i], "--check-model") == 0) return check_model(argv[i + 1]);
     // a model with one residual stream (Ornith-1.5): plain_generate.cpp runs it
     if (const int r = strata::program::plain_main(argc, argv); r >= 0) return r;
     Options o;
@@ -3196,22 +3286,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        // Every layer's formats must have GPU expert kernels and a prompt-path dequantizer, checked here, before
-        // anything is allocated (upstream efeffd8): an unsupported type would only fail inside the first verify window.
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
-            const auto& f = lay.fmt[(size_t) l];
-            if (strata::kernels::cpu::native_mixed_gu(f)) {   // this engine's experts take one gate/up type
-                std::fprintf(stderr, "strata generate: layer %lld has gate and up of different types\n", (long long) l);
-                return 1;
-            }
-            if (!strata::kernels::native_expert_supported(f.gu_type, f.d_type, f.n_embd, f.n_ff)) {
-                std::fprintf(stderr, "strata generate: layer %lld's experts are %s/%s (ggml types %d/%d), which this "
-                                     "engine has no GPU kernels for\n", (long long) l,
-                             strata::ggml_type_name((uint32_t) f.gu_type), strata::ggml_type_name((uint32_t) f.d_type),
-                             f.gu_type, f.d_type);
-                return 1;
-            }
+        const std::vector<std::string> bad = strata::core::native_layer_problems(false);
+        if (!bad.empty()) {
+            std::fprintf(stderr, "strata generate: %s\n", bad.front().c_str());
+            return 1;
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;

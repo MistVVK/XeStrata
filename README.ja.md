@@ -97,6 +97,7 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 **迷ったら、`xestrata --setup` の質問で Enter を押してください。** 元の Qwen3.8-Flash-Next の **Q2_0** を選び、RAM が 60 GB 以上なら **IQ3_XXS** を選びます（Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
 RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルが選べます。
 あとから別のモデルを足すときも `xestrata --setup` を実行します。
+表にないモデルでも、GGUF のファイルが手元にあれば `xestrata --setup --gguf <ファイル> --name <名前>` で入れられます（Qwen3.8-Flash-Next と、下の BETA のモデルと同じアーキテクチャのもの。[DETAILS](docs/DETAILS.ja.md#手元の-gguf-から入れる--gguf)）。
 
 | モデル | パラメーター | RAM の目安 | 向いていること |
 | --- | --- | ---: | --- |
@@ -128,6 +129,7 @@ BETA のモデルは、画像の生成にまだ対応していません。画像
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い。IQ3_S より良い |
 | Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | RAM 64 GB の PC では遅い。さらに良い |
 | Unsloth（実験的） | **UD-Q5_K_XL**、**UD-Q6_K_XL**、**Q8_0** | 158〜188 GB | 108〜136 GB | RAM の多い PC 向け。Q8_0 が元のモデルにいちばん近い |
+| AtomicChat | **AD-4.27bpw**、**AD-5.00bpw** | 94・110 GB | 61 GB | IQ3_S と同じくらいの速さと品質 |
 
 - **元のモデル**: Qwen の [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を、ISTA-DASLab が[圧縮](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)したものです。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。
@@ -138,6 +140,8 @@ BETA のモデルは、画像の生成にまだ対応していません。画像
   UD-Q4_K_XL より大きなものは実験的で、XeStrata では動かしていません。
 - **[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)**: Swift 1.5（IQ2_XS、IQ3_XXS）と Unsloth（UD-IQ4_XS、UD-Q4_K_XL、Q8_0）から拒否の方向を取り除いた版です。
   安全のための抑えも弱まっているので、書いたものを確かめてください。
+- **[AtomicChat](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF)**: AtomicChat による量子化です。エキスパートは IQ3_S と同じくらいの大きさで、n-gram の表が 5 ビット（AD-4.27bpw）か 8 ビット（AD-5.00bpw）です。2 つの答えの品質はほぼ同じです。
+  AD-3.84bpw は、エキスパートの一部が XeStrata のカーネルにない形式（MXFP4）なので入れられません。
 
 モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
 **省 RAM モード**で動きます（[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
@@ -247,7 +251,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ### Windows
 
 1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
-1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
@@ -376,6 +380,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
    - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) と [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
+   - AtomicChat による [AD-4.27bpw と AD-5.00bpw](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj、[拒否を外した版](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)は dealignai）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。

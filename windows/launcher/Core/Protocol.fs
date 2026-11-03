@@ -80,6 +80,14 @@ type Installed =
       /// its image models as --images names them, the default first (empty: none)
       Images: string[] }
 
+/// What setup read of the model files given with --describe --gguf (setup.py's custom_info).
+type CustomModel =
+    { /// its model id, custom-NAME
+      Name: string
+      Arch: string
+      Title: string
+      DownloadGb: float }
+
 type Describe =
     { Version: string
       Packaged: bool
@@ -95,7 +103,9 @@ type Describe =
       /// the image models a model set up for the first time is offered (--images names, the default first)
       ImageDefault: string[]
       /// web search for every model as setup set it up: "deepseek", "tinyfish", or null (none)
-      WebSearch: string }
+      WebSearch: string
+      /// with --gguf: what setup read of those files (their family, "custom", is in Families), else null
+      Custom: CustomModel }
 
 type Update =
     { Current: string

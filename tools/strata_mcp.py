@@ -96,6 +96,10 @@ FALLBACK_MODELS = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "vision": True},
+    "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
+                   "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
+    "AD-5.00bpw": {"about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
+                   "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "vision": True},
 }
 FALLBACK_FAMILIES = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "about": "the original model", "tag": ""},
@@ -122,6 +126,9 @@ FALLBACK_FAMILIES = {
                        "about": "Qwen3.8-Flash-Next with its refusals removed (abliteration), as Unsloth's 4- and "
                                 "8-bit files: far fewer refusals, and its safety filtering is reduced, so check what "
                                 "it writes", "tag": "huihui-unsloth-", "vision": False},
+    "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)",
+                   "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
+                            "at 5 or 8 bits; 94 and 110 GB downloads", "tag": "atomicchat-"},
     "ornith": {"title": "Ornith-1.5-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community "
                                                        "GSQ-RCO 3 and 3.5 bits", "tag": "ornith-"},
     "ornith-uncensored": {"title": "Ornith-1.5-35B-A3B (uncensored)",

@@ -32,6 +32,9 @@ import quantscope as qs  # noqa: E402
 
 FINGERPRINTS = ROOT / "data" / "gguf_fingerprints.json"
 ARCH = "qwen4exp"                                       # Qwen3.8-Flash-Next's general.architecture
+# the architectures of XeStrata's other models, which the plain engine runs (setup.py's PLAIN_ARCHS)
+PLAIN_ARCHS = ("qwen35moe", "qwen35", "qwen3moe", "glm5-next", "glm5next")
+OWN = "setup --gguf installs it from files on this PC once the engine has checked its types"
 
 # the files setup installs: (family, model, ModelScope repository, file name prefix) - for --fingerprints
 KNOWN = [
@@ -50,7 +53,11 @@ KNOWN = [
     ("unsloth", "UD-Q5_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q5_K_XL/"),
     ("unsloth", "UD-Q6_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q6_K_XL/"),
     ("unsloth", "Q8_0", "unsloth/Qwen3.8-Flash-Next-GGUF", "Q8_0/"),
+    ("atomicchat", "AD-4.27bpw", "AtomicChat/Qwen3.8-Flash-Next-GGUF", "Qwen3.8-Flash-Next-AD-4.27bpw-"),
+    ("atomicchat", "AD-5.00bpw", "AtomicChat/Qwen3.8-Flash-Next-GGUF", "Qwen3.8-Flash-Next-AD-5.00bpw-"),
 ]
+# the repositories KNOWN reads from Hugging Face (not on ModelScope)
+HF_ONLY = {"AtomicChat/Qwen3.8-Flash-Next-GGUF"}
 
 
 def read_headers(files: list) -> tuple[str | None, list[dict]]:
@@ -98,10 +105,15 @@ def load_fingerprints(path: Path = FINGERPRINTS) -> dict:
 def verdict(fp: dict, table: dict) -> tuple[str, str]:
     """(kind, sentence): kind is "known" (a file setup installs, under any name), "layout" (the same routed-expert
     layout as one: a fine-tune made with the same recipe, untested), "no" (Strata cannot run it) or "untested"
-    (naming the tensors whose quantization no file Strata runs has for them)."""
+    (naming the tensors whose quantization no file Strata runs has for them).  A model of the other models'
+    architectures is "untested": the engine's kernels decide (setup's --inspect of a file asks it)."""
     known = {k: v for k, v in table.items() if not k.startswith("_")}
+    if fp["arch"] in PLAIN_ARCHS:
+        return "untested", (f"a model of architecture {fp['arch']}, which XeStrata's other models have (Ornith-1.5, "
+                            "Qwen3.6-35B-A3B, Qwen3.5-9B, llm-jp-4.1, GLM-5.3-Flash): " + OWN)
     if fp["arch"] != ARCH:
-        return "no", f"not Qwen3.8-Flash-Next (architecture {fp['arch']!r}): Strata runs only that model"
+        return "no", (f"not a model XeStrata runs (architecture {fp['arch']!r}): it runs Qwen3.8-Flash-Next "
+                      f"({ARCH}) and the architectures " + ", ".join(PLAIN_ARCHS))
     exact = [k for k, v in known.items() if v["expert_bytes"] == fp["expert_bytes"] and v["bytes"] == fp["bytes"]
              and v["tensors"] == fp["tensors"]]
     if exact:
@@ -110,8 +122,8 @@ def verdict(fp: dict, table: dict) -> tuple[str, str]:
     same = [k for k, v in known.items() if v["expert_bytes"] == fp["expert_bytes"]]
     if same:
         return "layout", ("the routed experts are stored exactly as in " + " / ".join(same) +
-                          ", but the file is not one setup knows (a fine-tune with the same recipe?): it may run as "
-                          "that size; not tested")
+                          ", but the file is not one setup knows (a fine-tune with the same recipe?): not tested; " +
+                          OWN)
     runs = set().union(*(v["expert_bytes"] for v in known.values()))
     other = sorted(set(fp["expert_bytes"]) - runs)
     if other:
@@ -121,8 +133,8 @@ def verdict(fp: dict, table: dict) -> tuple[str, str]:
     new = [f"{r} {'/'.join(t for t in ts if t not in seen.get(r, []))}" for r, ts in fp.get("roles", {}).items()
            if any(t not in seen.get(r, []) for t in ts)]
     head = ("its routed experts use only quantizations Strata runs (" + ", ".join(fp["expert_bytes"]) +
-            "), but this file is not one setup installs: not tested (and setup still refuses the GGUF names "
-            "it lists as unsupported, such as UD-Q2_K_XL: this is a header reading, not a promise that it runs)")
+            "), but this file is not one setup installs: not tested (" + OWN + "; this is a header reading, not a "
+            "promise that it runs)")
     if new:
         return "untested", head + ". Stored differently from every file Strata runs: " + ", ".join(new)
     return "untested", head + "; every tensor uses a quantization some file Strata runs has for it"
@@ -132,7 +144,7 @@ def make_fingerprints(out: Path) -> None:
     listing, table = {}, {}
     for fam, model, repo, prefix in KNOWN:
         if repo not in listing:
-            listing[repo] = qs.list_hub("ms", repo)
+            listing[repo] = qs.list_hub("hf" if repo in HF_ONLY else "ms", repo)
         files = sorted((f for f in listing[repo] if f.name.startswith(prefix) and f.name.endswith(".gguf")),
                        key=lambda f: f.name)
         table[f"{fam}/{model}"] = {**fingerprint(*read_headers(files)), "files": [f.name for f in files], "repo": repo}

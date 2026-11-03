@@ -1130,12 +1130,10 @@ bool PlainModel::open_experts(std::string& err) {
         if (!expert_layout_from_gguf(opt_.gguf, blocks, E, s.n_embd, s.n_ff_exp, err)) return false;
     }
     const auto& lay = k::cpu::expert_layout();
-    for (int64_t l : moe_local_)
-        if (!k::native_expert_supported(lay.fmt[(size_t) l].gu_type, lay.fmt[(size_t) l].d_type, s.n_embd, s.n_ff_exp,
-                                        lay.fmt[(size_t) l].up_type)) {
-            err = "plain model: the GPU has no expert kernel for MoE layer " + std::to_string(l) + "'s types";
-            return false;
-        }
+    if (const std::vector<std::string> bad = native_layer_problems(true); !bad.empty()) {
+        err = "plain model: " + bad.front();
+        return false;
+    }
     // the RAM tier: every expert loaded into pinned RAM when the host has the room (the GPU reads them over PCIe and
     // the pool from RAM), else the GGUF read in place through the page cache.  The room is the resident copy's (#11,
     // resident_pin_fits): the pinned experts and 8 GiB beside them

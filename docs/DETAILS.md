@@ -722,6 +722,29 @@ ModelScope serves a repository's current files (no pinned revision), so each fil
 The published SHA-256 is ModelScope's own statement: a changed upstream repository would carry its own hash.
 Setup says so when you choose it.
 
+When a file in `--gguf-dir` is not under its published name (renamed, or taken from somewhere else), setup checks its size and SHA-256 against the published file's.
+It stops when they differ, so another model with a size's name in its own (a fine-tune's `IQ3_XXS`) is not installed as that size.
+Such a model goes in with `--gguf`, below.
+
+### Installing from your own GGUF files (`--gguf`)
+
+A model setup does not list can be installed from GGUF files you have; nothing is downloaded.
+
+```sh
+xestrata --setup --gguf ~/models/My-Model-Q4_K_M-00001-of-00003.gguf --name my-model
+```
+
+- **What goes in**: Qwen3.8-Flash-Next (`qwen4exp`), and models of the other models' architectures (`qwen35moe`: Ornith-1.5, Qwen3.6-35B-A3B; `qwen35`: Qwen3.5-9B; `qwen3moe`: llm-jp-4.1; `glm5-next`: GLM-5.3-Flash).
+- **What to give**: a `.gguf` file (any one of a split model's, all of them in the same folder), or a folder with one model only. Without `--name`, the file's name is used.
+- **What is checked**: setup reads the headers and asks the engine whether it runs them (`strata --check-model <file>`, which opens no GPU).
+  When the headers cannot be read (a file cut short too), the architecture is another, or the experts or the PLE table are stored in a type the engine's kernels do not take, setup stops with the reason for each layer and makes nothing.
+- **What is made**: the config (`xestrata-custom-<name>.json`) and the pack, under the name `custom-<name>`: apart from setup's sizes, so it never writes over an official one.
+  A start, `--bench` and `--calibrate` take `--model custom-<name>`.
+  `--setup --model custom-<name>` sets it up again from the same files; another model's files under the same name are refused.
+- **Qwen3.8-Flash-Next**: the MTP draft layer and the picture reader are the other sizes' (downloaded when they are not here; a `mmproj-Qwen3.8-Flash-Next-BF16.gguf` beside the model is used).
+  The parts stored as Q8_0 and the like become the BF16 the engine reads (`--compat-bf16`).
+- Only the types are checked against the engine: the answers are as good as the file.
+
 ### Tuning for your PC (`--calibrate`)
 
 These engine settings depend on the PC more than on the model; the calibration measures the three other than the
