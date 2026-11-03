@@ -207,8 +207,12 @@ Names and contents follow sd-scripts' MOSS-Image (`library/strategy_moss_image.p
 
 - The latent cache holds the **VAE's raw output**. The 2×2 packing and the normalization (BatchNorm or statistics) happen when training reads it, as sd-scripts'
   MOSS-Image does.
+  Mage-VAE's raw output **is already packed** (its encoder turns a 16 x 16 patch into one token's 128 values), so Mage-Flow's `latents` are
+  `[128][h][w]` with h, w the bucket's side over 16, and nothing is left for the reader to fold in. The 32-channel 1/8 raw output that does need the
+  packing and the batch norm is a Flux2 VAE's (MOSS-Image and MageTrail).
 - Our own engine makes the values (the VAE is `xestrata-image`'s encoder; the text follows each model's reader through the same `text_states` path). Their match is
   checked against the inference goldens (card 4).
+- `original_size` and `crop_ltrb` are what preprocessing decided: the bucket is the shrink to the budget floored to the step, and `crop_ltrb` the centre window of the size that covers it (`tools/image/mf_pre.py` decides). The trainer reads them and does not re-pick a size.
 - The empty prompt's embedding (`uncond_*`) is always written: MOSS-Image's negative is empty, and adding a dropout later needs no re-caching.
 - The model's part of the name is `mf` (Mage-Flow and MageTrail — their VAEs differ, so their latents are not shared), `moss`, `qi`.
 - SimpleTuner keeps one `.pt` per image for the latents and one per prompt for the text embeddings, in a separate cache folder, named by a SHA-256 hash
@@ -277,6 +281,25 @@ The data is the data folder's `records/2026-11-02-lora-train-data/` (`<data>`: L
 - Each caption is one English line, `<trigger word>, <description>`, in `NN.txt` beside the image with the same number. Preprocessing reads these files as they are.
 - MageTrail reads tags as well as sentences (`serve/skills/magetrail/SKILL.md`), but v1 gives it the same English sentences as the other three.
 - Sample images check with: a style — the trigger word plus a subject that is not in the data; a character — the trigger word plus new clothes and a new scene (as the data's README asks).
+
+The physical check (card 3, 2026-11-03; the script is the data folder's
+`records/2026-11-02-lora-train-data/scripts/verify_data.py` and its output is `verify-2026-11-03.log`, 334 items all ok)
+read both folders:
+
+- style 30 (all `.jpg`; real size 1792x2400 × 29 and 1696x2528 × 1), character 18 (13 `.png` and 5 `.jpg`; real size
+  1792x2400 × 12, 2752x1536 × 4 and 1696x2528 × 2). The numbers run 1..30 and 1..18 with no gaps, every image has its
+  `NN.txt`, the 48 files are all distinct (sha256) and every one opens. **The extensions are mixed, so preprocessing
+  must not fix on `.jpg`.**
+- All 48 captions are one ASCII English line of `<trigger word>, <description>`. The style words (glass and the rest,
+  13 of them) and the character's unchanging features (teal, bob, bangs and the rest, 12) appear 0 times in the
+  description part, and `a girl` is in all 18 character captions. Every content word of a description is in that
+  image's `prompts.jsonl` prompt: the captions add no word the request did not have.
+- `prompts.jsonl` has 48 rows with the fields `file`, `prompt`, `size`, `model`, `session`, `record` and `call`, and
+  `model` is `qwen-image-3.0-pro` in every row. Its `size` is **what was asked for** (1024x1024 and so on), not the
+  real size: the buckets come from the real one.
+- The two sheets were approved by eye on 2026-11-02 (session `758dcad7`, record 462). The 18 images that had text in
+  them were remade as the data's README says, and only those rows carry the ending "No text, letters, numbers, signs
+  or logos anywhere in the image." in their prompt (style 09 and 19; 16 character rows).
 
 ## The checks
 

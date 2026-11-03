@@ -845,6 +845,8 @@ if(STRATA_ENABLE_XE)
                            src/image/cnet_prep.cpp src/image/qi_control.cpp src/image/cnet_depth.cpp
                            src/image/cnet_edges.cpp src/image/cnet_pose.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
+                           src/image/mf_train.cpp
+                           src/image/mf_train_block.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
                            src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
@@ -1226,6 +1228,14 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-seedvr2-probe PRIVATE strata_image)
   add_executable(strata-image-sam3-track-probe src/image/sam3_track_probe.cpp)
   target_link_libraries(strata-image-sam3-track-probe PRIVATE strata_image)
+  # the learning side's ops (src/image/mf_train.cpp), one at a time on the GPU, against
+  # tools/image/mf_train_ref.py's NumPy gradients
+  add_executable(strata-image-mf-train-probe src/image/mf_train_probe.cpp)
+  target_link_libraries(strata-image-mf-train-probe PRIVATE strata_image)
+  # the learning preprocessing's own tool (docs/LORA_TRAIN.md "The latent and text-embedding disk caches"):
+  # Mage-VAE's encoder and the text states on the inference's path, one image at a time, for tools/image/mf_pre.py
+  add_executable(strata-image-mf-pre src/image/mf_pre.cpp)
+  target_link_libraries(strata-image-mf-pre PRIVATE strata_image)
   add_executable(strata-image-moss-text-probe src/image/moss_text_probe.cpp)
   target_link_libraries(strata-image-moss-text-probe PRIVATE strata_image)
   add_executable(strata-image-moss-dit-probe src/image/moss_dit_probe.cpp)
@@ -1236,6 +1246,30 @@ if(STRATA_ENABLE_XE)
   add_executable(moss_dit_parity src/image/moss_dit_parity.cpp)
   target_link_libraries(moss_dit_parity PRIVATE strata_image)
   add_test(NAME moss_dit_parity COMMAND moss_dit_parity)
+  if(TARGET strata-image-mf-train-probe)
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME mf_train_parity
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_ref.py
+               --probe $<TARGET_FILE:strata-image-mf-train-probe>
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-train)
+      set_tests_properties(mf_train_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # one block against torch autograd: the same interpreter as the case above, and the script exits 77 where it
+      # has no torch, so the test is always registered and skips by itself (an env-var condition here was dropped by
+      # every reconfigure that ninja ran without it, and the suite quietly lost the test)
+      add_test(NAME mf_block_parity
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_torch_ref.py
+               --probe $<TARGET_FILE:strata-image-mf-train-probe>
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-block)
+      set_tests_properties(mf_block_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # the preprocessing's host side and the cache shape, no GPU and no models: the bucket rule against SPEC's three
+      # worked sizes, the cover and crop bookkeeping, and the two .npz files read back through the stub tool.  The
+      # engine's own values are AMD's (tools/image/mf_pre.py --golden against the inference goldens, records' §)
+      add_test(NAME mf_pre_cache
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_pre.py --selftest)
+      set_tests_properties(mf_pre_cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    endif()
+  endif()
   add_executable(strata-image-hunyuanimage3-probe src/image/hunyuanimage3_probe.cpp)
   target_link_libraries(strata-image-hunyuanimage3-probe PRIVATE strata_image)
   add_executable(strata-image-vision-probe src/image/qi_vision_probe.cpp)

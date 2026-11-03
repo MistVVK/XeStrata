@@ -188,7 +188,11 @@ v1 のデータは 1792×2400 前後なので、たとえば 1792×2400 → 864�
 | 文埋め込み | `<画像>_<模型>_te.npz` | `prompt_embeds`、`attn_mask`、`uncond_embeds`、`uncond_mask`、`caption_dropout_rate` | bf16 のビットを uint16、mask は int32、dropout の値は F32 |
 
 - latent は**VAE の生出力**を置きます。DiT 向けの詰め（2×2）と正規化（BatchNorm や統計）は学習の時に掛けます（sd-scripts の MOSS-Image と同じ順序）。
+  ただし **Mage-VAE の生出力は詰め済み**です（エンコーダが 16x16 の面を 1 トークンの 128 値に直します）。なので Mage-Flow の
+  `latents` は `[128][h][w]`（h, w は桶の辺を 16 で割った数）で、読み手に残る仕事はありません。生出力が 32 通道の 1/8 で、そこで詰めと
+  BatchNorm を掛けるのは Flux2 VAE（MOSS-Image と MageTrail）側です。
 - 値を作るのは当方のエンジンです（VAE は `xestrata-image` のエンコーダ、文は各模型の読み手の `text_states` と同じ道）。前処理の一致は推論の golden との突き合わせで確かめます（カード 4）。
+- `original_size` と `crop_ltrb` は前処理が決めた値です: 桶は予算への縮小を刻みで切り下げたもの、`crop_ltrb` はその桶を覆う大きさに縮んだ像の内の中央の窓（`tools/image/mf_pre.py` が決める）。学習はそれを読む側で、大きさを選び直しません。
 - 空のプロンプトの埋め込み（`uncond_*`）も必ず置きます。MOSS-Image の negative は空で、後で dropout を足すときに再生成がいらないためです。
 - 模型の接頭辞は `mf`（Mage-Flow・MageTrail。VAE が違うので latent は共用しません）・`moss`・`qi`。
 - SimpleTuner は latent も文埋め込みも `.pt` を 1 枚 1 ファイルで別めのキャッシュ・フォルダーに置き、名前は SHA-256 の hash です（`simpletuner/helpers/caching/vae.py`、`text_embeds.py`）。v1 は sd-scripts の形（画像の隣に `.npz`）にします（名前が見えるので 1 枚ずつ見直せるため）。
@@ -253,6 +257,21 @@ DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。
 - キャプションは英文 1 行の `<トリガー語>, <説明>`（`NN.txt`。画像と同じ番号）。前処理はこのファイルをそのまま読みます。
 - MageTrail はタグでも文でも読めますが（`serve/skills/magetrail/SKILL.md`）、v1 は他の 3 模型と同じ英文の文を使います。
 - サンプル生成での確かめは、画風が**トリガー語 + データに無い題材**、キャラクターが**トリガー語 + 新しい服と場面**（データの README の注意どおり）。
+
+現物確認（カード 3、2026-11-03。台本はデータフォルダの `records/2026-11-02-lora-train-data/scripts/verify_data.py`、
+生出力は同じ dir の `verify-2026-11-03.log` で、334 項目すべて ok）。上の 2 dir を機械で確かめました:
+
+- 画風 30 枚（すべて .jpg。実寸 1792x2400 × 29 と 1696x2528 × 1）、キャラクター 18 枚（.png 13 と .jpg 5。実寸
+  1792x2400 × 12・2752x1536 × 4・1696x2528 × 2）。番号は 1..30 と 1..18 で欠けがなく、画像と `NN.txt` は 1 対 1、
+  48 枚は sha256 が互いに違い、全部壊れずに開けます。**拡張子が混ざっているので、前処理は `.jpg` 単固定にしない。**
+- キャプションは 48 本とも英文 1 行の ASCII で `<トリガー語>, <説明>` の形。画風の語（glass など 13 語）とキャラの
+  不変の特徴の語（teal・bob・bangs・freckle など 12 語）は説明側に 0 件、`a girl` は 18 本すべてにあります。各説明の実詞は
+  `prompts.jsonl` のプロンプトにすべて揃っています（指示に無い語を足していない）。
+- `prompts.jsonl` は 48 行、列は `file`・`prompt`・`size`・`model`・`session`・`record`・`call` で、`model` は全部
+  `qwen-image-3.0-pro`。`size` は**頼んだ値**（1024x1024 など）で実寸とは違うこと。桶は実寸から決めます。
+- 一覧 2 枚（`style-stained-glass-sheet.jpg`・`character-teal-bob-sheet.jpg`）の目視承認は 2026-11-02（セッション
+  `758dcad7` の記録 462）。文字の入っていた 18 枚の作り直しはデータの README のとおりで、作り直した行のプロンプトの
+  末尾にだけ「No text, letters, numbers, signs or logos anywhere in the image.」が付いています（画風 09・19、キャラ 16 枚）。
 
 ## 確かめの手順
 
