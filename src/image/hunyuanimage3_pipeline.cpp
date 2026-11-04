@@ -690,7 +690,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     std::vector<float> m;
     if (mask) {
         mask_px = crop_rgba8(r.mask, r.width, r.height);
-        m = latent_mask(mask_px, r.width, r.height, kDownsample);
+        m = request_latent_mask(r, mask_px, r.width, r.height, kDownsample);
     }
 
     const auto t1 = clock::now();

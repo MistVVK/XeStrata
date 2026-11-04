@@ -596,7 +596,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     try {
         if (mask) {
             mask_px = resize_nearest(r.mask, r.width, r.height);
-            ls.set_mask(latent_mask(mask_px, r.width, r.height, 16), tokens, Cl, h * w, true);
+            ls.set_mask(request_latent_mask(r, mask_px, r.width, r.height, 16), tokens, Cl, h * w, true);
         }
         gpu::copy(x, tokens.data(), (size_t) N * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time

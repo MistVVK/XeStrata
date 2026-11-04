@@ -2127,6 +2127,10 @@ The model files are not part of it; their licenses apply to them (below).
      [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
+   - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (GPL-3.0):
+     the steps and defaults of an edit's cut and putting back with a mask (`src/image/img_crop.cpp`, `serve/images.py`'s
+     `plan_crop`: InpaintCropImproved's and InpaintStitchImproved's mask hipass, hole fill, growth and blur, how the part
+     is widened and shaped, the edges' copies and the putting back). The code is written without copying theirs.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
   `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).

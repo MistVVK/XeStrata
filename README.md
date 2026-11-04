@@ -430,7 +430,9 @@ permission under GPL section 7, what goes in, and how to report).
      of the experts missing from VRAM the CPU computes and how many are read over PCIe; skipping the experts read from the
      SSD by their rank);
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
-     models merges).
+     models merges);
+   - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (an edit
+     with a mask: the painted part cut out, drawn enlarged and put back).
 - The parts are listed in [third_party/main/README.md](third_party/main/README.md); more in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License

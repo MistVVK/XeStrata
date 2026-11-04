@@ -69,6 +69,19 @@ std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_
     return m;
 }
 
+std::vector<float> request_latent_mask(const QiRequest& r, const std::vector<uint8_t>& px, int64_t W, int64_t H,
+                                       int64_t patch) {
+    if (r.mask_share.empty()) return latent_mask(px, W, H, patch);
+    if (r.mask_share.size() != (size_t) (W * H))
+        throw std::invalid_argument("image engine: the mask's share is not the image's size");
+    const int64_t w = W / patch, h = H / patch;
+    std::vector<float> m((size_t) (h * w), 0.f);
+    for (int64_t y = 0; y < h * patch; ++y)
+        for (int64_t x = 0; x < w * patch; ++x) m[(size_t) ((y / patch) * w + x / patch)] += r.mask_share[(size_t) (y * W + x)];
+    for (float& v : m) v /= (float) (patch * patch);
+    return m;
+}
+
 std::vector<uint8_t> rgba8(const std::vector<float>& planar, int64_t HW) {
     std::vector<uint8_t> img((size_t) (4 * HW));
     for (int64_t q = 0; q < HW; ++q)

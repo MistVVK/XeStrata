@@ -494,7 +494,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     std::vector<uint8_t> mask_px;
     if (mask) {
         mask_px = resize_nearest(r.mask, r.width, r.height);
-        ls.set_mask(latent_mask(mask_px, r.width, r.height, 16), noise, dit_->channels(), h * w, false);
+        ls.set_mask(request_latent_mask(r, mask_px, r.width, r.height, 16), noise, dit_->channels(), h * w, false);
     }
     try {
         gpu::copy(x, noise.data(), (size_t) n * 4);

@@ -108,6 +108,8 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
 [...]}, "transparency": false} - no "llm" (no text encoder).
   lora_dir: the folder of the LoRA adapters the model may apply (setup writes <data>/models/loras; serve/loras.py
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
+  crop_stitch: false draws an edit with a mask at the output's size, as before Crop and Stitch (plan_crop; a request's
+  crop_stitch overrides it)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
   sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
@@ -159,6 +161,15 @@ HELPER_REOPEN_S = 2.0              # an image job closed the text engine's helpe
 # ComfyUI's own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img), lowered for a model of few steps
 # (img2img_strength).  An edit's, and a mask's alone, is 1.0, the default denoise of ComfyUI's KSampler (nodes.py)
 STRENGTH_IMG2IMG = 0.87
+# Crop and Stitch (plan_crop, img_crop.hpp): the defaults of InpaintCropImproved (lquesada's ComfyUI node):
+# mask_blend_pixels, mask_hipass_filter and context_from_mask_extend_factor;
+# an edit with reference images beside the picture (a face from image 2) sees more around the part, the factor of
+# pixlstash's Qwen-Image-Edit 2511 workflow
+CROP_BLEND = 32
+CROP_HIPASS = 0.1
+CROP_FILL_REACH = 2   # the most the engine's hole fill reaches past the mask's box (crop_reach)
+CROP_CONTEXT = 1.2
+CROP_CONTEXT_REFS = 1.6
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -861,9 +872,13 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     takes them as its reference images (job["refs"]); one that does not (can_edit) takes one image as img2img's base
     image (job["init"]).  size "auto" (or none): the first image's shape at about 1024 x 1024 pixels, its sides
     multiples of SIZE_STEP.  `mask` (OpenAI's): a PNG of the first image's size whose transparent pixels are where it
-    changes, the rest kept as it is, as job["mask"].  strength (parse_strength): how much of the schedule runs from
-    the first image (job["strength"] and the steps it runs, job["steps_run"], when below 1); an edit's default 1, an
-    img2img's img2img_strength of its steps, or 1 with a mask."""
+    changes, the rest kept as it is, as job["mask"].  With a mask and the size left to it (none, "auto" or the first
+    image's own), the edit is Crop and Stitch's (crop_wanted; not with MOSS-Image's layout): job["crop"] its plan
+    (plan_crop), the image the first image's size (job["width"], job["height"]), drawn at the plan's (made_size); a
+    mask that changes nothing is job["crop"] {"empty": True} (the picture as it is).  strength
+    (parse_strength): how much of the schedule runs from the first image (job["strength"] and the steps it runs,
+    job["steps_run"], when below 1); an edit's default 1, an img2img's img2img_strength of its steps, or 1 with a
+    mask."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
     edits = can_edit(cfg)
@@ -890,8 +905,15 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         dims.append((w, h))
     if mask is not None:
         mask = check_mask(mask, dims[0])
-    if req.get("size") in (None, "auto") and not (hunyuan and cfg.get("ratio_head")):   # else the model chooses
-        w0, h0 = dims[0]
+    crop = None
+    w0, h0 = dims[0]
+    if (mask is not None and req.get("size") in (None, "auto", f"{w0}x{h0}") and req.get("layout") is None
+            and crop_wanted(req, cfg)):
+        crop = plan_crop(images[0], mask, cfg, CROP_CONTEXT_REFS if edits and len(images) > 1 else CROP_CONTEXT)
+        if crop is not None and not crop.get("empty"):
+            req = {**req, "size": "{}x{}".format(*crop["gen"])}
+    if ((crop is None or crop.get("empty")) and req.get("size") in (None, "auto")
+            and not (hunyuan and cfg.get("ratio_head"))):   # else the model chooses
         side = int(cfg.get("max_side") or 2048)
         tw = (1024 * 1024 * w0 / h0) ** 0.5
         th = tw * h0 / w0
@@ -907,6 +929,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
             strength = img2img_strength(job["steps"])
     if mask is not None:
         job["mask"] = mask
+    if crop is not None:   # the image at the first image's size, drawn at the plan's
+        job["crop"] = crop
+        job["width"], job["height"] = w0, h0
     if strength is not None and strength < 1:
         run = strength_run(job["steps"], strength)
         if run < 1:
@@ -938,6 +963,125 @@ def check_mask(data: bytes, size: tuple[int, int]) -> bytes:
     return out.getvalue()
 
 
+def crop_share(mask: bytes) -> Any:
+    """An OpenAI mask (a PNG, transparent where the picture changes) as its edit share: float32 [H][W], 1 - alpha."""
+    import io
+    import numpy as np
+    from PIL import Image
+    a = np.asarray(Image.open(io.BytesIO(mask)).convert("RGBA"), dtype=np.float32)[..., 3]
+    return 1.0 - a / 255.0
+
+
+def crop_reach(blend: int) -> int:
+    """How far past the mask's box the engine's mask reaches (img_crop.hpp): its hole fill's 2 pixels (the closing at
+    the picture's edges; InpaintCropImproved's, checked against scipy), the growth's window's half, ceil(blend / 4 *
+    1.5 + 1) // 2, and the Gaussian's cut, int(4 sigma + 0.5) of sigma blend / 8.  The box planned on the server holds
+    every pixel at which the engine's mask is above 0."""
+    if blend <= 0:
+        return CROP_FILL_REACH
+    return CROP_FILL_REACH + math.ceil(blend / 4 * 1.5 + 1) // 2 + int(4 * (blend * 0.5 / 4) + 0.5)
+
+
+def crop_gen_size(cfg: dict, w: float, h: float) -> tuple[int, int]:
+    """The size the model draws a box of w x h at: HunyuanImage 3.0's bucket nearest its shape; the others' about
+    1024 x 1024 pixels in its shape, sides multiples of 32 that an edit's reference keeps as they are (ref_size's
+    fixed point: the reference and the latent the same size), within max_side."""
+    if cfg.get("family") == "hunyuan-image-3":
+        b = hunyuanimage3_bucket(cfg, max(1, round(w)), max(1, round(h)))
+        return int(b["width"]), int(b["height"])
+    side = int(cfg.get("max_side") or 2048)
+    ratio = w / h
+    tw0 = (1024 * 1024 * ratio) ** 0.5
+    best, score = None, None
+    for i in range(-3, 4):
+        for j in range(-3, 4):
+            gw, gh = round(tw0 / 32) * 32 + 32 * i, round(tw0 / ratio / 32) * 32 + 32 * j
+            if not (MIN_SIDE <= gw <= side and MIN_SIDE <= gh <= side) or ref_size(gw, gh) != (gw, gh):
+                continue
+            s = (abs(math.log(gw / gh / ratio)), abs(gw * gh - 1024 * 1024))
+            if score is None or s < score:
+                best, score = (gw, gh), s
+    if best is None:   # no fixed point near (a shape past the sides' bounds): the nearest in bounds
+        best = (min(side, max(MIN_SIDE, round(tw0 / 32) * 32)), min(side, max(MIN_SIDE, round(tw0 / ratio / 32) * 32)))
+    return best
+
+
+def _crop_to_shape(x: int, y: int, w: int, h: int, W: int, H: int, gw: int, gh: int) -> tuple[int, int, int, int]:
+    """InpaintCropImproved's crop_magic_im: the box grown on one side to the drawing's shape and kept inside the
+    picture where it fits, else centred on it (reaching past its edges)."""
+    target = gw / gh
+    if w / h < target:
+        nw = int(h * target)
+        nx = x - (nw - w) // 2
+        if nx < 0:
+            nx = 0 if nw <= W else -((nw - W) // 2)
+        elif nx + nw > W:
+            nx = W - nw if W - nw >= 0 else -((nw - W) // 2)
+        return nx, y, nw, h
+    nh = int(w / target)
+    ny = y - (nh - h) // 2
+    if ny < 0:
+        ny = 0 if nh <= H else -((nh - H) // 2)
+    elif ny + nh > H:
+        ny = H - nh if H - nh >= 0 else -((nh - H) // 2)
+    return x, ny, w, nh
+
+
+def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEXT,
+              blend: int = CROP_BLEND) -> dict | None:
+    """Crop and Stitch's plan of an edit with a mask (img_crop.hpp, the engine's part, which fills the mask's holes): the
+    box of the mask's values from CROP_HIPASS on (mask_hipass_filter), grown by the engine's reach (crop_reach), by
+    `context` around (context_from_mask_extend_factor) and to the drawing's shape (crop_gen_size, _crop_to_shape).  A
+    box the drawing would not enlarge is the whole picture's (drawn at the model's size and put back at the picture's,
+    its pixels outside the mask kept).  -> {"box": [x, y, w, h], "gen": [gw, gh], "blend", "size": [W, H], "whole":
+    the whole picture}; {"empty": True} for a mask that changes nothing; None for one that changes every pixel (the
+    edit as it was)."""
+    import numpy as np
+    W, H = image_dims(image)
+    m = crop_share(mask)
+    if m.shape != (H, W):
+        raise ImageRequestError(f"mask: {m.shape[1]}x{m.shape[0]}, not the image's {W}x{H}")
+    rows, cols = np.nonzero(np.any(m >= CROP_HIPASS, axis=1))[0], np.nonzero(np.any(m >= CROP_HIPASS, axis=0))[0]
+    if rows.size == 0:
+        return {"empty": True}
+    if bool(np.all(m >= 1.0)):
+        return None
+    reach = crop_reach(blend)
+    x0, y0 = max(0, int(cols[0]) - reach), max(0, int(rows[0]) - reach)
+    x1, y1 = min(W, int(cols[-1]) + 1 + reach), min(H, int(rows[-1]) + 1 + reach)
+    if context >= 1.01:   # batched_growcontextarea_m: half the growth each side, rounded half to even
+        gx, gy = round((x1 - x0) * (context - 1.0) / 2.0), round((y1 - y0) * (context - 1.0) / 2.0)
+        x0, y0, x1, y1 = max(0, x0 - gx), max(0, y0 - gy), min(W, x1 + gx), min(H, y1 + gy)
+    gw, gh = crop_gen_size(cfg, x1 - x0, y1 - y0)
+    x, y, w, h = _crop_to_shape(x0, y0, x1 - x0, y1 - y0, W, H, gw, gh)
+    whole = gw <= w   # the drawing would not enlarge the box: the whole picture instead
+    if whole:
+        gw, gh = crop_gen_size(cfg, W, H)
+        x, y, w, h = _crop_to_shape(0, 0, W, H, W, H, gw, gh)
+    return {"box": [x, y, w, h], "gen": [gw, gh], "blend": blend, "size": [W, H], "whole": whole}
+
+
+def crop_word(crop: dict) -> str:
+    """The engine's CROP: word of a plan_crop plan."""
+    x, y, w, h = crop["box"]
+    return f" CROP:{x},{y},{w},{h},{crop['blend']},{crop['size'][0]},{crop['size'][1]}"
+
+
+def crop_wanted(req: dict, cfg: dict) -> bool:
+    """Whether an edit with a mask is drawn by Crop and Stitch: the request's crop_stitch, else the config's (on by
+    default)."""
+    v = req.get("crop_stitch")
+    if v is None or v == "":
+        return cfg.get("crop_stitch") is not False
+    if isinstance(v, bool):
+        return v
+    if str(v).lower() in ("true", "on", "1"):
+        return True
+    if str(v).lower() in ("false", "off", "0"):
+        return False
+    raise ImageRequestError("crop_stitch: true or false")
+
+
 def ref_size(ref_w: int, ref_h: int) -> tuple[int, int]:
     """The size the engine works an edit's reference image at (qi_ref_size in src/image/qi_pipeline.cpp): diffusers'
     calculate_dimensions(1024 * 1024, its width over its height)."""
@@ -958,7 +1102,9 @@ def usage(job: dict) -> dict:
         refs = sum(b["tokens_h"] * b["tokens_w"] + HUNYUANIMAGE3_VIT_SLOTS for b in job.get("ref_buckets") or ())
         text -= block + refs
     else:
-        sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
+        sizes = [ref_size(*image_dims(r)) for r in job.get("refs") or ()]
+        if sizes and job.get("crop") and not job["crop"].get("empty"):   # Crop and Stitch's first, at the drawing's
+            sizes[0] = (mw, mh)
         refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
         if job.get("init"):   # img2img's image, read at the made size
             refs += block
@@ -968,10 +1114,23 @@ def usage(job: dict) -> dict:
 
 
 def made_size(job: dict) -> tuple[int, int]:
-    """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP."""
+    """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP; Crop and Stitch's, the
+    plan's drawing (the engine puts it back into the picture, job["width"] x job["height"])."""
+    if job.get("crop") and not job["crop"].get("empty"):
+        return job["crop"]["gen"][0], job["crop"]["gen"][1]
+
     def up(v) -> int:
         return -(-int(v) // SIZE_STEP) * SIZE_STEP
     return up(job["width"]), up(job["height"])
+
+
+def as_png(data: bytes) -> bytes:
+    """An image (PNG, JPEG, GIF or BMP) as an RGBA PNG, as png_rgba writes one."""
+    import io
+    from PIL import Image
+    out = io.BytesIO()
+    Image.open(io.BytesIO(data)).convert("RGBA").save(out, format="PNG", compress_level=1)
+    return out.getvalue()
 
 
 def png_rgba(rgba: bytes, width: int, height: int, made_w: int, made_h: int) -> bytes:
@@ -1820,6 +1979,7 @@ class ImageGen:
         base image (an edit's first reference) is counted by INIT:- when no mask or init image names it."""
         words = ("".join(f" REF:{p}" for p in job.get("ref_paths") or ())
                  + (f" MASK:{job['mask_path']}" if job.get("mask_path") else "")
+                 + (crop_word(job["crop"]) if job.get("crop") and not job["crop"].get("empty") else "")
                  + (f" INIT:{job['init_path']}" if job.get("init_path") else "")
                  + (f" TE:{job['te_path']}" if job.get("te_path") else "")
                  + (f" NEGTE:{job['neg_te_path']}" if job.get("neg_te_path") else ""))
@@ -1874,10 +2034,14 @@ class ImageGen:
         """Make `job`'s images (parse_request's dict) from image `first` -> (the PNG files' bytes in order, figures).
         The caller holds the GPU turn; `pause()` true after an image ends the call there (make_images gives the turn
         to the requests waiting for it).  ImageJobFailed when the engine fails, times out or the job is cancelled.
-        `preview(image, index, png)`: the job's partial images (partial_images), as the engine makes them."""
+        `preview(image, index, png)`: the job's partial images (partial_images), as the engine makes them.  Crop and
+        Stitch's images (job["crop"]) come back at the picture's size; a mask that changes nothing gives the picture
+        as it is, the engine not asked."""
         timeout = float(self.cfg.get("timeout_s") or 3600)
+        crop = job.get("crop") or {}
         t0 = time.monotonic()
-        images, parts = [], []
+        images: list[bytes] = []
+        parts: list[dict] = []
         work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
         try:
             with self.lock:
@@ -1889,6 +2053,8 @@ class ImageGen:
                 if job.get("choose_size"):
                     self._choose_size(job, timeout, cancel)
                 mw, mh = made_size(job)
+                # the engine's RGBA rows: the size made (cut to the size asked for), or Crop and Stitch's picture
+                rw, rh = (job["width"], job["height"]) if crop and not crop.get("empty") else (mw, mh)
                 ids = ",".join(str(i) for i in self.ids(job))
                 sched = self.cfg.get("schedule")
                 sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
@@ -1906,6 +2072,10 @@ class ImageGen:
                     if cancel is not None and cancel.is_set():
                         self.totals["failed"] += 1
                         raise ImageJobFailed("cancelled (the client left)")
+                    if crop.get("empty"):
+                        images.append(as_png(job["refs"][0] if job.get("refs") else job["init"]))
+                        parts.append({})
+                        continue
                     run = job.get("steps_run", job["steps"])
                     self.progress = (i * run, job["n"] * run)
                     self._live(image=i + 1, step=0, steps=run,
@@ -1916,7 +2086,7 @@ class ImageGen:
 
                     def peek(index, done, path, i=i):
                         try:
-                            png = png_rgba(Path(path).read_bytes(), job["width"], job["height"], mw, mh)
+                            png = png_rgba(Path(path).read_bytes(), job["width"], job["height"], rw, rh)
                             Path(path).unlink(missing_ok=True)
                         except OSError:
                             return
@@ -1938,7 +2108,7 @@ class ImageGen:
                         why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
                         self._say(f"image job failed: {why}")
                         raise (LoraRejected if isinstance(e, LoraRejected) else ImageJobFailed)(why) from e
-                    images.append(png_rgba(out.read_bytes(), job["width"], job["height"], mw, mh))
+                    images.append(png_rgba(out.read_bytes(), job["width"], job["height"], rw, rh))
                     parts.append(r)
                     self._measured(job, r)
         finally:
@@ -1965,8 +2135,11 @@ class ImageGen:
                       if job.get("bucket") is not None else {}),
                    **({"layout": True} if job.get("layout_prompt") else {}),
                    **({"enhance": job["enhanced"]} if job.get("enhanced") else {})}
-        if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
-            figures["made_size"] = f"{mw}x{mh}"
+        if (mw, mh) != (job["width"], job["height"]) and not crop.get("empty"):   # made larger and cut, or a part
+            figures["made_size"] = f"{mw}x{mh}"                                    # drawn larger: the web page says so
+        if crop:   # Crop and Stitch: the box drawn (on the picture, x y w h) or nothing to change
+            figures["crop"] = ({"empty": True} if crop.get("empty") else
+                               {"box": list(crop["box"]), "whole": bool(crop.get("whole"))})
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
             figures["requested_size"] = job["requested_size"]
         if job.get("loras"):                               # the IMAGE line's count and VRAM, and a tag's names left out

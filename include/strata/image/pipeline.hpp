@@ -37,6 +37,9 @@ struct QiRequest {
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
     QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
                                 // alpha 0 where the image changes); empty: none
+    std::vector<float> mask_share;   // with a mask, its edit share by pixel at width x height (Crop and Stitch's,
+                                     // img_crop.hpp): the sampler's mask is its mean over each latent position rather
+                                     // than the mask's rule (request_latent_mask); empty: the mask's rule
     QiRef init;                 // img2img's base image for a model without edits (img_start.hpp); empty: none
     double strength = 1.0;      // how much of the base image's schedule runs (diffusers' strength, 0 .. 1]: below 1,
                                 // the sampler starts from the base image's latent (img_start.hpp); 1 from noise.

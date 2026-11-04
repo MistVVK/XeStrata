@@ -58,6 +58,9 @@
 //                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
 //                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
+//                            CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height> Crop and Stitch (img_crop.hpp): the mask's
+//                            box of the base image drawn at <width> <height> and put back, the image at the base
+//                            image's own size (its partial images too), the IMAGE line's crop_s the steps' time;
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
 //                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
 //                            %XX'd, the word's whitespace being the line's);
@@ -73,7 +76,8 @@
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
-//                            prompt of n ids; LORA: the request's adapters (their A and B are fixed); TE: the states
+//                            prompt of n ids; LORA: the request's adapters (their A and B are fixed); CROP: as IMG's
+//                            (the first reference counted at the line's size, the steps' buffers added); TE: the states
 //                            come from the chat's engine (MOSS-Image: no text encoder counted)
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
@@ -96,6 +100,7 @@
 #include "strata/image/anima_pipeline.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
+#include "strata/image/img_crop.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/mf_pipeline.hpp"
 #include "strata/image/moss_pipeline.hpp"
@@ -103,6 +108,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -112,6 +118,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -238,11 +245,14 @@ void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
     r.loras.push_back({loras.get(decoded_path(path)), s});
 }
 
-// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...)
-std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras& loras) {
+// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...); CROP: sets `crop`
+// (null: refused)
+std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras& loras,
+                                 std::optional<si::CropBox>* crop = nullptr) {
     std::vector<si::QiRef> refs;
     for (std::string word; ls >> word;) {
         if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
+        else if (word.rfind("CROP:", 0) == 0 && crop != nullptr) *crop = si::parse_crop(word);
         else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
         else if (word.rfind("INIT:", 0) == 0) r.init = read_image(word.substr(5));
         else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(word.substr(9));
@@ -275,18 +285,25 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
     return refs;
 }
 
-// a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask`, NEG:<n> `n_neg`,
-// TE:<path> (the chat engine's states) `states`, and LORA:<strength>:<path> goes into `r.loras`
-std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg, bool& states,
-                                                   si::QiRequest& r, Loras& loras) {
+// a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask` (INIT: `init`
+// too), NEG:<n> `n_neg`, TE:<path> (the chat engine's states) `states`, CROP: `crop`, and LORA:<strength>:<path> goes
+// into `r.loras`
+std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, bool& init, int64_t& n_neg,
+                                                   bool& states, std::optional<si::CropBox>& crop, si::QiRequest& r,
+                                                   Loras& loras) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
         if (word.rfind("LORA:", 0) == 0) {
             read_lora(word, r, loras);
             continue;
         }
+        if (word.rfind("CROP:", 0) == 0) {
+            crop = si::parse_crop(word);
+            continue;
+        }
         if (word.rfind("MASK:", 0) == 0 || word.rfind("INIT:", 0) == 0) {
             mask = true;
+            init = init || word.rfind("INIT:", 0) == 0;
             continue;
         }
         if (word.rfind("TE:", 0) == 0 || word.rfind("NEGTE:", 0) == 0) {
@@ -438,11 +455,31 @@ int serve(si::ImagePipeline& p) {
                 ls >> r.width >> r.height >> r.seed >> r.drop >> out >> ids;
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
-                r.refs = read_refs(ls, r, loras);
+                std::optional<si::CropBox> crop;
+                r.refs = read_refs(ls, r, loras, &crop);
                 if (!r.loras.empty() && !takes_loras(p)) no_loras(p);
-                r.on_preview = [&out](int index, int done, const std::vector<uint8_t>& rgba) {
+                // Crop and Stitch (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
+                // own; the base image is the init image, else the first reference
+                std::unique_ptr<si::CropStitch> cs;
+                double crop_s = 0.0;   // its steps' time (the IMAGE line's crop_s)
+                const auto timed = [&crop_s](const auto& f) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    f();
+                    crop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                };
+                if (crop) {
+                    si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
+                    if (base == nullptr || r.mask.rgba.empty())
+                        throw std::invalid_argument("CROP: a mask and its base image (INIT: or the first REF:)");
+                    cs = std::make_unique<si::CropStitch>();
+                    timed([&] { cs->prepare(*base, r.mask, *crop, r.width, r.height); });
+                    *base = cs->crop();
+                    r.mask = cs->regen();
+                    r.mask_share = cs->share();
+                }
+                r.on_preview = [&out, &cs](int index, int done, const std::vector<uint8_t>& rgba) {
                     const std::string path = out + ".p" + std::to_string(index);
-                    write_file(path, rgba);
+                    write_file(path, cs ? cs->stitch(rgba) : rgba);
                     std::printf("PREVIEW %d %d %s\n", index, done, path.c_str());
                     std::fflush(stdout);
                 };
@@ -457,8 +494,15 @@ int serve(si::ImagePipeline& p) {
                     std::printf("STAGE %s\n", stage);
                     std::fflush(stdout);
                 });
-                write_file(out, img);
-                std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
+                if (cs) {
+                    std::vector<uint8_t> whole;
+                    timed([&] { whole = cs->stitch(img); });
+                    write_file(out, whole);
+                    std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s);
+                } else {
+                    write_file(out, img);
+                    std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
+                }
             } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
                 si::QiRequest r;
                 std::string ids;
@@ -473,14 +517,23 @@ int serve(si::ImagePipeline& p) {
                 int64_t w = 0, h = 0, n = 0;
                 ls >> w >> h >> n;
                 if (!ls) throw std::invalid_argument("NEED <width> <height> <n> [REF:<path>]... [MASK:<path>]");
-                bool mask = false, states = false;
+                bool mask = false, init = false, states = false;
                 int64_t n_neg = 0;
+                std::optional<si::CropBox> crop;
                 si::QiRequest lr;   // the request's adapters, which the need counts and nothing else uses
-                const auto sizes = ref_sizes(ls, mask, n_neg, states, lr, loras);
+                auto sizes = ref_sizes(ls, mask, init, n_neg, states, crop, lr, loras);
+                // Crop and Stitch: the first reference (the base image without an init image) is drawn from at the
+                // line's size, and the steps' buffers come before the drawing and after it, beside what is held
+                if (crop && !init && !sizes.empty()) sizes[0] = {w, h};
                 auto* moss = dynamic_cast<si::MossPipeline*>(&p);
                 if (moss != nullptr) moss->set_states_given(states);
-                const si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
+                si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
                 if (moss != nullptr) moss->set_states_given(false);
+                if (crop) {
+                    const uint64_t cb = si::CropStitch::bytes(crop->width, crop->height, crop->w, crop->h, w, h);
+                    nd.least += cb;
+                    nd.full += cb;
+                }
                 std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=%llu\n",
                             (unsigned long long) (nd.least >> 20), (unsigned long long) (nd.full >> 20),
                             (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20),
