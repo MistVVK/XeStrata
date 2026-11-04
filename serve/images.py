@@ -180,6 +180,9 @@ CROP_CONTEXT_REFS = 1.6
 # with the references at this strength (FaceDetailer's denoise): the same face swap kept image 2's face and drew its
 # eyes and mouth finer; 0.7 turned the hair grey
 CROP_REFINE_STRENGTH = 0.5
+# an outpaint's (extend) fade of the change into the image from each side that grows, in pixels: ImagePadForOutpaint's
+# feathering default
+EXTEND_FEATHER = 40
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -939,6 +942,13 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         if w < 16 or h < 16:
             raise ImageRequestError(f"image: {w}x{h} is too small")
         dims.append((w, h))
+    if req.get("extend") is not None:   # an outpaint: the canvas grown, its new area the mask
+        if mask is not None:
+            raise ImageRequestError("extend: not with a mask (extend the image, then edit the result with one)")
+        pads = parse_extend(req["extend"], *dims[0], int(cfg.get("max_side") or 2048))
+        images = list(images)
+        images[0], mask = extend_canvas(images[0], pads)
+        dims[0] = (dims[0][0] + pads[0] + pads[2], dims[0][1] + pads[1] + pads[3])
     if mask is not None:
         mask = check_mask(mask, dims[0])
     crop = None
@@ -1133,6 +1143,77 @@ def crop_word(crop: dict, ref: tuple[int, int] | None = None) -> str:
     x, y, w, h = crop["box"]
     word = f" CROP:{x},{y},{w},{h},{crop['blend']},{crop['size'][0]},{crop['size'][1]}"
     return word + (f",{ref[0]},{ref[1]}" if ref else "")
+
+
+def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
+    """An edit's `extend`, the canvas grown past the first image (w x h): {"left", "top", "right", "bottom"} in pixels,
+    or {"aspect": "W:H"} (the canvas grown on the two sides the shape asks for, evenly) -> (left, top, right, bottom);
+    ImageRequestError when it is not one of those, grows nothing, or passes `side` pixels a side."""
+    if isinstance(v, str):   # a form's field: its JSON
+        try:
+            v = json.loads(v)
+        except ValueError:
+            v = None
+    if not isinstance(v, dict):
+        raise ImageRequestError('extend: {"left", "top", "right", "bottom"} in pixels, or {"aspect": "W:H"}')
+    if "aspect" in v:
+        if set(v) != {"aspect"}:
+            raise ImageRequestError("extend: the aspect alone, or the pixels a side")
+        m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*[:x/]\s*(\d+(?:\.\d+)?)\s*", str(v["aspect"]))
+        if not m or float(m.group(1)) <= 0 or float(m.group(2)) <= 0:
+            raise ImageRequestError('extend.aspect: "W:H", e.g. "16:9"')
+        a = float(m.group(1)) / float(m.group(2))
+        nw, nh = max(w, round(h * a)), max(h, round(w / a))
+        pads = ((nw - w) // 2, (nh - h) // 2, nw - w - (nw - w) // 2, nh - h - (nh - h) // 2)
+    else:
+        if not set(v) <= {"left", "top", "right", "bottom"}:
+            raise ImageRequestError('extend: "left", "top", "right" and "bottom" in pixels')
+        try:
+            px = [int(v.get(k) or 0) for k in ("left", "top", "right", "bottom")]
+        except (TypeError, ValueError):
+            raise ImageRequestError("extend: whole pixels") from None
+        pads = (px[0], px[1], px[2], px[3])
+        if min(pads) < 0:
+            raise ImageRequestError("extend: 0 or more pixels a side")
+    if not any(pads):
+        raise ImageRequestError("extend: the canvas grows on no side")
+    if w + pads[0] + pads[2] > side or h + pads[1] + pads[3] > side:
+        raise ImageRequestError(f"extend: the canvas would pass {side} pixels a side (max_side)")
+    return pads
+
+
+def extend_canvas(data: bytes, pads: tuple[int, int, int, int], feather: int = EXTEND_FEATHER) -> tuple[bytes, bytes]:
+    """The first image grown by `pads` (left, top, right, bottom) for an outpaint, as ComfyUI's ImagePadForOutpaint
+    with InpaintCropImproved's extend_for_outpainting: the new area its edges' copies (a base the model continues
+    rather than grey), and the mask (OpenAI's alpha: 0 where the picture changes) the new area, faded into the image
+    over `feather` pixels from each side that grows ((1 - d / feather)^2 of the change at d pixels in) -> (the canvas,
+    the mask) as PNG."""
+    import io
+    import numpy as np
+    from PIL import Image
+    im = np.asarray(Image.open(io.BytesIO(data)).convert("RGBA"))
+    h, w = im.shape[:2]
+    left, t, r, b = pads
+    canvas = np.pad(im, ((t, b), (left, r), (0, 0)), mode="edge")
+    change = np.ones(canvas.shape[:2], np.float32)
+    inner = np.zeros((h, w), np.float32)
+    if feather > 0 and feather * 2 < h and feather * 2 < w:
+        ys, xs = np.arange(h, dtype=np.float32)[:, None], np.arange(w, dtype=np.float32)[None, :]
+        big = np.float32(max(h, w))
+        d = np.minimum.reduce([np.broadcast_to(ys if t else big, (h, w)),
+                               np.broadcast_to(h - ys if b else big, (h, w)),
+                               np.broadcast_to(xs if left else big, (h, w)),
+                               np.broadcast_to(w - xs if r else big, (h, w))])
+        inner = np.where(d < feather, ((feather - d) / feather) ** 2, 0).astype(np.float32)
+    change[t:t + h, left:left + w] = inner
+    mask = np.zeros(canvas.shape, np.uint8)
+    mask[..., 3] = np.round((1 - change) * 255).astype(np.uint8)
+    out = []
+    for a in (canvas, mask):
+        buf = io.BytesIO()
+        Image.fromarray(a, "RGBA").save(buf, format="PNG", compress_level=1)
+        out.append(buf.getvalue())
+    return out[0], out[1]
 
 
 def check_tool(cfg: dict, name: str) -> None:
@@ -2680,6 +2761,17 @@ TOOLS: list[dict[str, Any]] = [
                                    "the part again after the whole picture, finer, in about 1.6 times the time"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
+    {"name": "extend_image",
+     "description": "Grow an image past its edges (outpaint): the conversation's last image unless `image` names "
+                    "another; the new area drawn on, the image kept as it is. Pixels a side, or a shape.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "what the whole image shows, its new area too"},
+         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "left": {"type": "integer"}, "top": {"type": "integer"}, "right": {"type": "integer"},
+         "bottom": {"type": "integer"},
+         "aspect": {"type": "string", "description": "the shape to grow to instead of pixels, e.g. 16:9"},
+         "seed": {"type": "integer"}},
+         "required": ["prompt"]}},
 ]
 
 SKILLS = Path(__file__).resolve().parent / "image_skills"
@@ -2891,7 +2983,7 @@ class ImageTools:
     def template_tools(self, exclude=()) -> list[dict]:
         out = []
         for t in TOOLS:
-            gens = self._gens(t["name"] == "edit_image")
+            gens = self._gens(t["name"] in ("edit_image", "extend_image"))
             if not gens or t["name"] in exclude or t["name"] not in self.allowed:
                 continue
             # the user's boxes alone make a new image by them, as ComfyUI's MOSS-Image Layout Prompt does (the picture
@@ -3157,13 +3249,22 @@ class ImageTools:
                 req["strength"] = args["strength"]
             if name == "edit_image" and args.get("refine") not in (None, ""):
                 req["refine"] = args["refine"]
-            gens = self._gens(name == "edit_image")
+            if name == "extend_image":
+                req["extend"] = ({"aspect": args["aspect"]} if args.get("aspect") not in (None, "") else
+                                 {k: args[k] for k in ("left", "top", "right", "bottom")
+                                  if args.get(k) not in (None, "")})
+            gens = self._gens(name in ("edit_image", "extend_image"))
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
                 raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
             if name == "generate_image":
                 job = parse_request(req, gen.cfg)
+            elif name == "extend_image":
+                data = self._image(str(args.get("image") or ""))
+                if data is None:
+                    raise ImageRequestError("there is no image in the conversation to extend")
+                job = parse_edit_request(req, [self.normalize(data)], gen.cfg)
             elif name == "edit_image":
                 mask = self.mask
                 if self.user.get("image") is not None:   # the image the user painted over or drew boxes on
