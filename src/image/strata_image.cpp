@@ -115,6 +115,7 @@
 #include "strata/image/mf_pipeline.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
+#include "strata/image/yolo_detect.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -455,6 +456,57 @@ bool takes_loras(si::ImagePipeline& p) {
            dynamic_cast<si::MfPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
 }
 
+// The detectors the process has opened (yolo_detect.hpp), by their file: each opened once, its weights kept beside the
+// image model's (a few tens of MiB) until RELEASE ALL
+struct Detectors {
+    std::map<std::string, std::unique_ptr<si::YoloDetector>> open;
+    si::YoloDetector& get(const std::string& path) {
+        auto& d = open[path];
+        if (!d) {
+            auto n = std::make_unique<si::YoloDetector>();
+            std::string err;
+            if (!n->open(path, err)) {
+                open.erase(path);
+                throw std::runtime_error("detector: " + err);
+            }
+            d = std::move(n);
+        }
+        return *d;
+    }
+    void release(bool all) {
+        if (all) open.clear();
+        else
+            for (auto& d : open) d.second->drop_scratch();
+    }
+};
+
+// DETECT's answer: "DETECT n=<count> detect_s=<seconds> boxes=<x0>,<y0>,<x1>,<y1>,<score>,<class>;..." (the boxes on
+// the picture, highest score first), each mask (a segmentation head's, with `masks` given) written to <masks>.<i> as
+// width x height bytes, 255 inside.  The detection's buffers are freed after it (`keep`: kept for the next, a timing's
+// repeats): the image model's budget, fitted around what the engine holds, has no room for them
+std::string detect_line(si::YoloDetector& d, const si::QiRef& img, float conf, const std::string& masks,
+                        bool keep = false) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::vector<uint8_t>> mk;
+    const auto dets = d.detect(img, conf, masks.empty() ? nullptr : &mk);
+    if (!keep) d.drop_scratch();
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::string line = "DETECT n=" + std::to_string(dets.size());
+    char b[160];
+    std::snprintf(b, sizeof b, " detect_s=%.4f boxes=", secs);
+    line += b;
+    for (size_t i = 0; i < dets.size(); ++i) {
+        const auto& e = dets[i];
+        std::snprintf(b, sizeof b, "%s%.2f,%.2f,%.2f,%.2f,%.4f,%d", i ? ";" : "", e.x0, e.y0, e.x1, e.y1, e.score, e.cls);
+        line += b;
+    }
+    for (size_t i = 0; i < mk.size(); ++i) {
+        for (uint8_t& v : mk[i]) v = v ? 255 : 0;
+        write_file(masks + "." + std::to_string(i), mk[i]);
+    }
+    return line;
+}
+
 // An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image Lanczos-resized to the
 // line's size, then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
 // from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
@@ -524,6 +576,7 @@ std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0
 
 int serve(si::ImagePipeline& p) {
     Loras loras;   // the adapters' files, read once for the requests that name them
+    Detectors detectors;
     {
         // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead.  A model whose
@@ -631,6 +684,13 @@ int serve(si::ImagePipeline& p) {
                     write_file(out, img);
                     std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
                 }
+            } else if (op == "DETECT") {   // DETECT <weights> <picture> <threshold> [<masks>]
+                std::string weights, pic, masks;
+                float conf = 0.5f;
+                ls >> weights >> pic >> conf;
+                if (!ls) throw std::invalid_argument("DETECT <weights> <picture> <threshold> [<masks>]");
+                ls >> masks;
+                std::printf("%s\n", detect_line(detectors.get(weights), read_image(pic), conf, masks).c_str());
             } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
                 si::QiRequest r;
                 std::string ids;
@@ -693,6 +753,7 @@ int serve(si::ImagePipeline& p) {
                 std::string what;
                 ls >> what;
                 p.release(what == "ALL");
+                detectors.release(what == "ALL");
                 std::printf("RELEASE ok\n");
             } else if (!op.empty()) {
                 throw std::invalid_argument("unknown request " + op);
@@ -733,6 +794,18 @@ int main(int argc, char** argv) {
 #endif
     }
     try {
+        // --detect <weights> <picture> [<threshold> [<masks>]]: the detector alone, no image model (tools and checks)
+        if (argc >= 4 && std::string(argv[1]) == "--detect") {
+            Detectors d;
+            si::YoloDetector& det = d.get(argv[2]);
+            const si::QiRef img = read_image(argv[3]);
+            const float conf = argc >= 5 ? std::stof(argv[4]) : 0.5f;
+            const char* rep = std::getenv("STRATA_DETECT_REPEAT");   // a timing's repeats
+            const int repeat = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
+            for (int i = 0; i < std::max(1, repeat); ++i)
+                std::printf("%s\n", detect_line(det, img, conf, argc >= 6 ? argv[5] : "", i + 1 < repeat).c_str());
+            return 0;
+        }
         std::string dit, vae, text, vision, ratio_head, out, ids;
         std::vector<std::string> ref_paths;
         std::vector<int> block_map;   // --lora-block-map: an expanded Anima's release blocks

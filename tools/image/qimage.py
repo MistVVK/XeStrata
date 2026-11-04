@@ -100,6 +100,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "Gazingstars123/Anima-2.9B": "9f9cb502dbae7a616c3cc5a530633427fe735665",                       # 2026-11-02
     "mradermacher/Qwen3-0.6B-Base-GGUF": "b8b11a6dbbb14c739e25018f3f77abac860c28f4",               # 2026-11-02
     "google-t5/t5-base": "a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1",                               # 2026-11-02
+    "Bingsu/adetailer": "53cc19de382014514d9d4038601d261a7faa9b7b",                                # 2026-11-05
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -122,6 +123,7 @@ _Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
 _AN = "circlestone-labs/Anima"
 _AN29 = "Gazingstars123/Anima-2.9B"
 _Q306 = "mradermacher/Qwen3-0.6B-Base-GGUF"
+_AD = "Bingsu/adetailer"   # the Detailer's YOLOv8 detectors (fix_image)
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -275,6 +277,13 @@ FILES = {
                             "d7f3a9d59cc8de30bbc9f1feda8d1e1809b2aadd139b72a0342c769a14002b37"),
     "anima-t5-tokenizer": ("google-t5/t5-base", "tokenizer.json", 1_389_353,
                            "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"),
+    # the image tools' auxiliary weights (AUX), downloaded when a tool first needs them, not by setup
+    "yolo-face": (_AD, "face_yolov8m.pt", 52_026_019,
+                  "717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"),
+    "yolo-hand": (_AD, "hand_yolov8s.pt", 22_507_643,
+                  "70b540063fbc385736d8258970744a4afbc4cbf7932134bae3b24cdadeadec06"),
+    "yolo-person": (_AD, "person_yolov8m-seg.pt", 54_827_683,
+                    "c8ab26f517173b1fe8342d336a09f443eb61cb08dcbfc78d53fff4c2547ae81e"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -388,7 +397,21 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
-IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image")
+IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "fix_image")
+# The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
+# with ("yolo": tools/image/yolo_pt.py, a PyTorch checkpoint to safetensors; None: used as it is), the file the engine
+# reads, and the license shown when it is downloaded.  They live in AUX_DIR beside the image models' folders; the
+# server fetches one the first time a tool needs it (setup does not).
+AUX_DIR = "image-tools"
+_YOLO_LICENSE = ("Apache-2.0 by its publisher (Bingsu/adetailer, https://huggingface.co/Bingsu/adetailer); trained "
+                 "with Ultralytics YOLOv8, whose models Ultralytics holds to be under AGPL-3.0 by default "
+                 "(https://www.ultralytics.com/license)")
+AUX = {
+    "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
+    "yolo-hand": {"file": "yolo-hand", "convert": "yolo", "out": "hand_yolov8s.safetensors", "license": _YOLO_LICENSE},
+    "yolo-person": {"file": "yolo-person", "convert": "yolo", "out": "person_yolov8m-seg.safetensors",
+                    "license": _YOLO_LICENSE},
+}
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
 MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)
@@ -537,6 +560,12 @@ def parse_choices(value: str) -> list[tuple[str, str | None]]:
     return out
 
 
+def aux_note() -> str:
+    """What setup says of the image tools' weights, which it does not fetch (AUX)."""
+    return ("The image tools' weights are fetched by the server the first time a tool needs them (not now): "
+            f"fix_image's YOLOv8 detectors (face_yolov8m, hand_yolov8s, person_yolov8m-seg), {_YOLO_LICENSE}")
+
+
 def license_note(dit: str) -> str:
     name, _, repo = DITS[dit]
     if is_hunyuanimage3(dit):
@@ -642,6 +671,8 @@ def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
 
 
 def local_path(models_dir: Path, name: str) -> Path:
+    if name in AUX:
+        return Path(models_dir) / AUX_DIR / Path(FILES[name][1]).name
     if name.startswith("hunyuanimage3-"):
         folder = HUNYUANIMAGE3_DIR
     elif name.startswith("moss-sft-") or name.startswith("moss-base-"):   # a DiT's transformer folder, its own

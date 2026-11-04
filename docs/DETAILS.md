@@ -2102,7 +2102,7 @@ The model files are not part of it; their licenses apply to them (below).
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
   The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
-  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
+  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the Detailer's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
@@ -2135,6 +2135,16 @@ The model files are not part of it; their licenses apply to them (below).
      the steps and defaults of an edit's cut and putting back with a mask (`src/image/img_crop.cpp`, `serve/images.py`'s
      `plan_crop`: InpaintCropImproved's and InpaintStitchImproved's mask hipass, hole fill, growth and blur, how the part
      is widened and shaped, the edges' copies and the putting back). The code is written without copying theirs.
+   - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)'s FaceDetailer, by ltdrdata (GPL-3.0): the
+     Detailer's steps and defaults (`serve/images.py`'s `fix_regions`, `fix_crop` and `fix_images`: the score of 0.5,
+     the box grown by 10 pixels, the crop of three times it, `drop_size` 10, the parts `guide_size` skips, denoise 0.5,
+     the noise mask's blur of 20 pixels, largest first, one at a time). The code is written without copying theirs.
+   - The YOLOv8 detector (`src/image/yolo_detect.cpp`): its layers and shapes are built from the tensors' names and
+     shapes in the weights' file and the model configuration (its layer list) the file carries; the letterbox, the
+     distribution box head and the segmentation masks follow [MMYOLO](https://github.com/open-mmlab/mmyolo)'s (GPL-3.0)
+     YOLOv8 head and LetterResize, read, not copied. Ultralytics' code was neither read nor used. The `.pt` weights are
+     converted to safetensors by `tools/image/yolo_pt.py` (no torch, no Ultralytics: a reader that builds only the
+     types it allows).
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
   `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).

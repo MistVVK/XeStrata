@@ -7860,6 +7860,9 @@ def make_handler(svc: Service):
             # edits - unless the request is img2img's (a strength or a mask), which the default takes
             gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
             images_api.check_tool(gen.cfg, "edit_image")
+            for key, tool in (("fix", "fix_image"), ("upscale", "upscale_image"), ("extend", "extend_image")):
+                if req.get(key) is not None:
+                    images_api.check_tool(gen.cfg, tool)
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job, req.get("stream") is True, edit=True)
@@ -7889,6 +7892,13 @@ def make_handler(svc: Service):
             except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
                 self._json(400, {"error": {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
                                            "message": str(e)}})
+                return
+            except images_api.AuxPending as e:   # a tool's weights downloading (image_aux): ask again later
+                failed = any(d.get("status") == "failed" for d in e.downloads)
+                self._json(500 if failed else 503, {"error": {
+                    "type": "server_error", "code": "weights_download_failed" if failed else "weights_downloading",
+                    "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
+                                                     for d in e.downloads]}})
                 return
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",

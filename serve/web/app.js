@@ -3030,7 +3030,7 @@ function imgDefaults() {
   const refs = ($("img-ref").files || []).length > 0;
   $("img-strength-f").hidden = !refs;
   const one = ($("img-ref").files || []).length === 1;   // upscale and extend take the one image they grow
-  $("img-up-f").hidden = $("img-ext-f").hidden = !one;
+  $("img-up-f").hidden = $("img-ext-f").hidden = $("img-fix-f").hidden = !one;
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
@@ -3726,7 +3726,11 @@ $("img-form").onsubmit = async (ev) => {
       if ($("img-color").value !== "off") body.color_match = $("img-color").value;
       if (!$("img-refine-f").hidden && $("img-refine").checked) body.refine = true;
     }
-    if (!mask && refs.length === 1 && $("img-up").value) body.upscale = {scale: Number($("img-up").value)};
+    if (!mask && refs.length === 1 && $("img-fix").value) {   // the Detailer: the parts found and drawn again
+      body.fix = {parts: $("img-fix").value.split(",")};
+      if (body.strength !== undefined) body.fix.strength = body.strength;
+      delete body.size;
+    } else if (!mask && refs.length === 1 && $("img-up").value) body.upscale = {scale: Number($("img-up").value)};
     else if (!mask && refs.length === 1 && $("img-ext").value) body.extend = {aspect: $("img-ext").value};
     if (body.upscale || body.extend) delete body.size;   // the size is the grown image's
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";

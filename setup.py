@@ -4543,6 +4543,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
     else:
         say(f"  Prompt: the model's own tokenizer ({QI.FILES['hunyuanimage3-tokenizer'][1]}) and its system prompt")
     say("  " + QI.license_note(dit))
+    say("  " + QI.aux_note())
     names = QI.file_names(quant, enc, tquant, dit)
     if user:   # its DiT is the user's file, not one to fetch
         names = names[1:]

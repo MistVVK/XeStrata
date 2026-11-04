@@ -178,6 +178,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <select class="st-input" id="img-up"><option value="" data-i18n="img.upNone">None</option><option value="1.5">1.5&times;</option><option value="2">2&times;</option></select></label>
           <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-i18n="img.extend">Extend to</span>
             <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
+          <label class="st-field" id="img-fix-f" hidden title="Find faces, hands or people and draw each again, finer (a Detailer; strength 0.5, or the Strength field)" data-i18n-title="img.fixTitle"><span data-i18n="img.fix">Fix parts</span>
+            <select class="st-input" id="img-fix"><option value="" data-i18n="img.upNone">None</option><option value="face" data-i18n="img.fixFace">Faces</option><option value="face,hands" data-i18n="img.fixFaceHands">Faces and hands</option><option value="person" data-i18n="img.fixPerson">People</option></select></label>
           <label class="st-field" id="img-steps-f"><span data-i18n="img.steps">Steps</span>
             <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
           <label class="st-field" id="img-cfg-f"><span id="img-cfg-l">Guidance (CFG)</span>
