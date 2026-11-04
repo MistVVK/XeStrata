@@ -183,6 +183,8 @@ CROP_REFINE_STRENGTH = 0.5
 # an outpaint's (extend) fade of the change into the image from each side that grows, in pixels: ImagePadForOutpaint's
 # feathering default
 EXTEND_FEATHER = 40
+# Crop and Stitch's color match by default (color_match_mode): set by the images compared (C4)
+COLOR_MATCH = "off"
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -996,6 +998,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job["mask"] = mask
     if crop is not None:   # the image at the first image's size, drawn at the plan's
         job["crop"] = crop
+        job["color_match"] = color_match_mode(req, cfg)
         job["width"], job["height"] = w0, h0
         if moss and edits and len(images) > 1 and not crop.get("empty") and not crop["whole"]:   # CROP_REFINE_STRENGTH
             job["crop"] = crop_whole(cfg, w0, h0, crop["blend"])
@@ -1235,6 +1238,18 @@ def parse_flag(v, name: str) -> bool | None:
     if str(v).lower() in ("false", "off", "0"):
         return False
     raise ImageRequestError(f"{name}: true or false")
+
+
+def color_match_mode(req: dict, cfg: dict) -> str:
+    """Crop and Stitch's color match as the drawing goes back (the engine's COLOR:): the request's color_match, else
+    the config's, else COLOR_MATCH - "auto" by the part kept around the paint, "full" by the whole cut (ComfyUI's
+    ColorTransfer), "off"."""
+    v = req.get("color_match")
+    if v is None or v == "":
+        v = cfg.get("color_match") or COLOR_MATCH
+    if v not in ("auto", "full", "off"):
+        raise ImageRequestError('color_match: "auto", "full" or "off"')
+    return str(v)
 
 
 def crop_wanted(req: dict, cfg: dict) -> bool:
@@ -2268,6 +2283,8 @@ class ImageGen:
                  + (f" MASK:{job['mask_path']}" if job.get("mask_path") else "")
                  + (crop_word(job["crop"], ImageGen._crop_ref(job)) if job.get("crop") and not job["crop"].get("empty")
                     else "")
+                 + (f" COLOR:{job['color_match']}" if job.get("crop") and not job["crop"].get("empty")
+                    and job.get("color_match") else "")
                  + (" EDITFMT:aitk" if job.get("edit_format", "").startswith("ai-toolkit") else "")
                  + "".join(f" PIC:{p}" for p in job.get("pic_paths") or ())
                  + (f" INIT:{job['init_path']}" if job.get("init_path") else "")

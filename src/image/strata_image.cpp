@@ -65,7 +65,9 @@
 //                            box of the base image drawn at <width> <height> and put back, the image at the base
 //                            image's own size (its partial images too), the IMAGE line's crop_s the steps' time;
 //                            ,<ref_w>,<ref_h> after it: the first reference the box at that size beside the base
-//                            (an ai-toolkit MOSS-Image edit's; the base the drawing's init image);
+//                            (an ai-toolkit MOSS-Image edit's; the base the drawing's init image); COLOR:<off|auto|
+//                            full> the drawing's colors matched to the picture's as it goes back (off, the default;
+//                            auto by the part kept around the paint; full by the whole cut: CropStitch::stitch);
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
 //                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
 //                            %XX'd, the word's whitespace being the line's);
@@ -262,6 +264,11 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word.rfind("PIC:", 0) == 0) r.pictures.push_back(read_image(word.substr(4)));
         else if (word == "EDITFMT:aitk") r.refs_aitk = true;
         else if (word == "EDITFMT:moss") r.refs_aitk = false;
+        else if (word.rfind("COLOR:", 0) == 0) {
+            const std::string m = word.substr(6);
+            if (m != "off" && m != "auto" && m != "full") throw std::invalid_argument("COLOR:off|auto|full: " + word);
+            r.crop_color = m == "auto" ? 1 : m == "full" ? 2 : 0;
+        }
         else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
         else if (word.rfind("INIT:", 0) == 0) r.init = read_image(word.substr(5));
         else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(word.substr(9));
@@ -311,7 +318,7 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
             crop = si::parse_crop(word);
             continue;
         }
-        if (word.rfind("EDITFMT:", 0) == 0) continue;
+        if (word.rfind("EDITFMT:", 0) == 0 || word.rfind("COLOR:", 0) == 0) continue;
         if (word.rfind("PIC:", 0) == 0) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
             int64_t w = 0, h = 0;
             if (!si::image_size(word.substr(4), w, h)) throw std::invalid_argument("not an image: " + word);
@@ -501,9 +508,10 @@ int serve(si::ImagePipeline& p) {
                     r.mask = cs->regen();
                     r.mask_share = cs->share();
                 }
-                r.on_preview = [&out, &cs](int index, int done, const std::vector<uint8_t>& rgba) {
+                const int color = r.crop_color;
+                r.on_preview = [&out, &cs, color](int index, int done, const std::vector<uint8_t>& rgba) {
                     const std::string path = out + ".p" + std::to_string(index);
-                    write_file(path, cs ? cs->stitch(rgba) : rgba);
+                    write_file(path, cs ? cs->stitch(rgba, color) : rgba);
                     std::printf("PREVIEW %d %d %s\n", index, done, path.c_str());
                     std::fflush(stdout);
                 };
@@ -520,7 +528,7 @@ int serve(si::ImagePipeline& p) {
                 });
                 if (cs) {
                     std::vector<uint8_t> whole;
-                    timed([&] { whole = cs->stitch(img); });
+                    timed([&] { whole = cs->stitch(img, r.crop_color); });
                     write_file(out, whole);
                     std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s);
                 } else {

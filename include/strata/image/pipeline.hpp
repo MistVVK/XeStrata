@@ -39,6 +39,9 @@ struct QiRequest {
     // the text encoder sees, each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens:
     // its sides, multiples of 32, over 32 each), their tokens' rows from the vision encoder
     bool refs_aitk = false;
+    // Crop and Stitch's color match of the drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
+    // around the paint (the default's: the drawing's drift only), 2 the whole cut (ComfyUI's ColorTransfer)
+    int crop_color = 0;
     std::vector<QiRef> pictures;
     QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
                                 // alpha 0 where the image changes); empty: none

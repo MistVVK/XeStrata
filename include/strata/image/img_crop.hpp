@@ -52,8 +52,12 @@ public:
     /// mask (QiRequest::mask_share), as ComfyUI's noise mask is the cropped mask, so that the blurred edge follows the
     /// picture rather than being drawn anew and blended over it.
     const std::vector<float>& share() const { return share_; }
-    /// The drawing (RGBA8, gw x gh) put back into the picture -> the picture (RGBA8, at its own size).
-    std::vector<uint8_t> stitch(const std::vector<uint8_t>& made) const;
+    /// The drawing (RGBA8, gw x gh) put back into the picture -> the picture (RGBA8, at its own size).  `color`
+    /// (QiRequest::crop_color): the drawing's colors matched first, as ComfyUI's ColorTransfer does (reinhard_lab:
+    /// each Lab channel's mean and standard deviation): 1 by the pixels the blend mask keeps (the drawing's drift from
+    /// the picture there, which a change asked inside the paint does not move), 2 by the whole cut; none where too
+    /// few pixels or a flat channel give no statistics.
+    std::vector<uint8_t> stitch(const std::vector<uint8_t>& made, int color = 0) const;
     /// The VRAM the steps take at most, for a picture of width x height, a box of w x h, a drawing of gw x gh and a
     /// reference of rw x rh (none of it is held while the model draws).
     static uint64_t bytes(int64_t width, int64_t height, int64_t w, int64_t h, int64_t gw, int64_t gh, int64_t rw = 0,
