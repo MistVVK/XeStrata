@@ -2145,6 +2145,17 @@ The model files are not part of it; their licenses apply to them (below).
      YOLOv8 head and LetterResize, read, not copied. Ultralytics' code was neither read nor used. The `.pt` weights are
      converted to safetensors by `tools/image/yolo_pt.py` (no torch, no Ultralytics: a reader that builds only the
      types it allows).
+   - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors
+     (GPL-3.0), its `comfy_extras/nodes_cfg.py`, `nodes_apg.py` and `nodes_slg.py`: the image sampling's guidance
+     (`src/image/guidance.cpp`, `serve/images.py`'s `GUIDANCE_METHODS`), its formulas, where they apply (before or
+     after CFG, on the predicted image) and their defaults and ranges (CFGNorm's post-CFG form, CFGZeroStar, APG,
+     SkipLayerGuidanceDiT). Written without copying its code.
+   - [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon), by Jonseed (MIT), after
+     [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon), by muerrilla (MIT): Detail
+     Daemon's schedule (`make_detail_daemon_schedule`), its lookup and interpolation by sigma (`get_dd_schedule`),
+     and DetailDaemonSamplerNode's way of changing only the sigma given to the model, with its defaults
+     (`src/image/guidance.cpp`'s `detail_daemon_schedule` and `Guidance::model_sigma`). Written without copying its
+     code.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
   `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).

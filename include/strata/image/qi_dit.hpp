@@ -77,11 +77,13 @@ public:
     /// velocity neg + cfg * (cond - neg) of the two contexts' (diffusers' true_cfg_scale).
     /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
     /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
-    /// latent, on the sampler's stream; the sampling itself is not changed.
+    /// latent, on the sampler's stream; the sampling itself is not changed.  `guide` (if set and on): the guidance of
+    /// guidance.hpp, the steps then going by its denoised values (Euler's step from them).
     void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                 const std::function<bool(int, int)>& step = {},
                 const std::function<void(float*, float)>& after = {}, float cfg = 1.0f,
-                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
+                const GuidanceSpec* guide = nullptr);
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
@@ -180,6 +182,10 @@ private:
     /// the two side by side through each product, the attention one context at a time; out the first's velocity,
     /// out2 the other's.
     void forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2);
+    void sample_guided(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
+                       const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                       float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                       const GuidanceSpec& spec);
     void ensure(int64_t T, int64_t HW);
     void swap_context();   // the first context's state <-> other_'s
     /// The weights adapters may take, from the blocks and the weights outside them (open).
@@ -238,6 +244,7 @@ private:
     bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
+    const std::vector<int>* skip_ = nullptr;   // the blocks a forward with the prefix cached skips (skip layer guidance)
     int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;

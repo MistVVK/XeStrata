@@ -39,6 +39,7 @@
 // cannot be added to an int32 sum) and its rows' scale is the delta's input's, as the plain product's is.
 #pragma once
 
+#include "strata/image/guidance.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -118,10 +119,15 @@ public:
     /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
     /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
     /// latent, on the sampler's stream; the sampling itself is not changed.
+    /// `guide` (if set and on): the guidance of guidance.hpp, the steps then going by its denoised values.
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
                 const std::function<bool(int, int)>& step = {},
                 const std::function<void(float*, float)>& after = {},
-                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
+                const GuidanceSpec* guide = nullptr);
+    /// forward of context 0 alone with `blocks` skipped (their image and text rows past them as they came: ComfyUI's
+    /// double_block replaced by its input): skip layer guidance's pass.
+    void forward_skip(const float* x, float sigma, int64_t h, int64_t w, const std::vector<int>& blocks, float* out);
 
     int64_t hidden() const { return C_; }
     /// The time of `rows` image rows through the MLP's first product (the hidden width to the MLP's, a block's largest)
@@ -182,6 +188,11 @@ public:
     const float* block0_txt() const { return b0_txt_; }
 
 private:
+    void sample_guided(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
+                       const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                       const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                       const GuidanceSpec& spec);
+
     bool lora_bake_ = true, baked_any_ = false;
     float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
     uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
@@ -239,6 +250,7 @@ private:
     std::vector<void*> allocs_;
     uint64_t weight_bytes_ = 0;
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false;
+    const std::vector<int>* skip_ = nullptr;   // forward_skip's blocks
     int64_t C_ = 3072, F_ = 12288, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 2560;
     std::vector<int64_t> axes_{16, 56, 56};
     // the parts outside the blocks, FP16 on the GPU

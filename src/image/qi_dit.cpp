@@ -658,6 +658,12 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         Block& b = blocks_[(size_t) bi];
         const uint8_t* base = blocks_stream_.begin(bi);   // the block's weights on the GPU (resident or a slot)
+        // skip layer guidance's pass: the image's rows past the block as they came (the prefix's rows, cached, are
+        // the block's own: ComfyUI's Qwen-Image-2.1 replaces the block of the image's rows only)
+        if (prer && skip_ != nullptr && std::find(skip_->begin(), skip_->end(), bi) != skip_->end()) {
+            blocks_stream_.end(bi);
+            continue;
+        }
         auto at = [base](const QiDit::W& w) {
             QiDit::W r = w;
             r.d = base + reinterpret_cast<uintptr_t>(w.d);
@@ -1309,9 +1315,14 @@ void QiDit::drop_activations() {
 
 void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                    const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                   float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek) {
+                   float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                   const GuidanceSpec* guide) {
     const int64_t n = in_ch_ * H * W;
     const bool guided = cfg > 1.0f && other_.n_text > 0;
+    if (guide != nullptr && guide->any()) {
+        sample_guided(x, H, W, sigmas, step, after, guided ? cfg : 1.0f, peek, *guide);
+        return;
+    }
     float* v = alloc<float>(allocs_, n);
     float* vn = guided ? alloc<float>(allocs_, n) : nullptr;   // the negative prompt's velocity
     struct Free {
@@ -1361,6 +1372,74 @@ void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sig
     gpu::stream_sync(s_);
     allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) v), allocs_.end());
     gpu::free(v);
+}
+
+// the sampling with guidance.hpp's guidance: each step the model asked at its sigma (Detail Daemon's), the two
+// contexts' velocities (and skip layer guidance's pass) to the guided denoised values, Euler's step from them
+void QiDit::sample_guided(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
+                          const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                          float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                          const GuidanceSpec& spec) {
+    for (const int b : spec.slg_layers)
+        if (b < 0 || b >= (int) blocks_.size())
+            throw std::invalid_argument("image engine: skip layer guidance's block " + std::to_string(b) +
+                                        " is not one of the model's " + std::to_string(blocks_.size()));
+    const int64_t n = in_ch_ * H * W;
+    const bool guided = cfg > 1.0f && other_.n_text > 0;
+    Guidance g(spec, s_, n, in_ch_, false, cfg, sigmas);
+    std::vector<float*> mine;
+    struct Free {
+        QiDit& d;
+        std::vector<float*>& ps;
+        ~Free() {
+            gpu::stream_sync(d.s_);
+            for (float* p : ps) {
+                d.allocs_.erase(std::remove(d.allocs_.begin(), d.allocs_.end(), (void*) p), d.allocs_.end());
+                gpu::free(p);
+            }
+        }
+    } free_mine{*this, mine};
+    auto get = [&]() {
+        mine.push_back(alloc<float>(allocs_, n));
+        return mine.back();
+    };
+    float* v = get();
+    float* vn = guided ? get() : nullptr;   // the negative prompt's velocity
+    float* den = get();
+    float* k = !spec.slg_layers.empty() ? get() : nullptr;   // the skipping pass's
+    const int steps = (int) sigmas.size() - 1;
+    for (int i = 0; i < steps; ++i) {
+        const float s0 = sigmas[(size_t) i], s1 = sigmas[(size_t) i + 1], sm = g.model_sigma(s0);
+        if (guided && i > 0) {
+            forward_pair(x, sm * 1000.0f, H, W, v, vn);
+        } else {
+            forward(x, sm * 1000.0f, H, W, i > 0, v);
+        }
+        if (guided && i == 0) {
+            swap_context();
+            forward(x, sm * 1000.0f, H, W, false, vn);
+            swap_context();
+        }
+        const bool skipping = k != nullptr && g.skip_pass(sm);
+        if (skipping) {   // the prompt's context again, its prefix cached (by this step's pass if not before)
+            skip_ = &g.skip_layers();
+            try {
+                forward(x, sm * 1000.0f, H, W, true, k);
+            } catch (...) {
+                skip_ = nullptr;
+                throw;
+            }
+            skip_ = nullptr;
+        }
+        g.denoised(x, v, vn, skipping ? k : nullptr, sm, den);
+        guidance_euler(x, den, s0, s1, n, s_);
+        if (after) after(x, s1);
+        if (peek) peek(i + 1, [&](float* x0) { gpu::copy_async(x0, den, (size_t) n * 4, s_); });
+        if (step) {
+            gpu::stream_sync(s_);
+            if (!step(i + 1, steps)) throw QiStopped();
+        }
+    }
 }
 
 }  // namespace strata::image

@@ -211,6 +211,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `negative_prompt` | none (one space for Mage-Flow, empty for MOSS-Image, a list of low quality, broken hands and the like for Anima) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
 | `sampler` | `er_sde` for Anima, `euler` for Mage-Flow | The sampler: `er_sde` or `euler`. Only Anima and Mage-Flow without edits (MageTrail and the like) take it; other models answer 400 |
 | `lora` | none | The adapters to apply ([LoRA](#lora-adapters)): `{"name", "scale"}` in a list, or one alone. `scale` is -2 to 2 (1 when left out). 4 at most |
+| `guidance` | none | Sampling guidance ("Sampling guidance" below). Qwen-Image-2.1 and Mage-Flow only |
 | `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow, HunyuanImage 3.0, MOSS-Image and Anima | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow, MOSS-Image and Anima take `true_cfg_scale`, else `guidance_scale` (3 by default for MOSS-Image, 4 for Anima, 1 for Anima-Turbo). HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
 | `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png, webp or jxl only); `opaque` flattens the alpha onto white. Mage-Flow and HunyuanImage 3.0 refuse `transparent` |
 | `output_format` | `png` | `png`, `jpeg`, `webp`, `jxl` (JPEG XL; only with libjxl's cjxl) |
@@ -219,6 +220,27 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 Qwen-Image-2.1's CFG is diffusers' Qwen-Image-2.1 formula. It computes the prompt and the negative prompt both, so an image takes about twice as long at 1024x1024, about 1.5 times at 512x512.
 Other fields (`style`, `user`, `moderation` and the like) are accepted and not used.
+
+#### Sampling guidance (`guidance`)
+
+Qwen-Image-2.1 and Mage-Flow (MageTrail too) take the sampling methods of ComfyUI's nodes (in generations and edits alike).
+`guidance` is a list of names (`["detail_daemon"]`) or of objects with a name and parameters (`[{"name": "apg", "eta": 0.5}]`). None is applied unless asked for.
+
+| Name | ComfyUI's node | Parameters (default) | What it does |
+| --- | --- | --- | --- |
+| `cfg_norm` | CFGNorm | `strength` (1) | Shrinks the prediction after CFG so that at each position its size over the channels is no larger than the prompt's prediction. Needs CFG |
+| `cfg_zero_star` | CFGZeroStar | none | Scales the negative prediction by its projection on the prompt's before CFG. Needs CFG |
+| `apg` | APG | `eta` (1), `norm_threshold` (5), `momentum` (0) | Holds CFG's difference to a size of `norm_threshold` and scales its part parallel to the prompt's prediction by `eta` (less oversaturation). Needs CFG |
+| `skip_layer_guidance` | SkipLayerGuidanceDiT | `layers` (`[7, 8, 9]` on Qwen-Image-2.1, `[6]` on Mage-Flow: it has only 12 blocks, and three skipped wash its image out), `scale` (3), `start` (0.01), `end` (0.15), `rescaling_scale` (0) | Runs the prompt again with the `layers` blocks skipped and adds `scale` times the difference. `start` to `end` are shares of the schedule: the steps between them take one pass more. Works at CFG 1 too |
+| `detail_daemon` | Detail Daemon (Jonseed's DetailDaemonSamplerNode) | `detail_amount` (0.1), `start` (0.2), `end` (0.8), `bias` (0.5), `exponent` (1), `start_offset` (0), `end_offset` (0), `fade` (0), `smooth` (true), `cfg_scale_override` (0) | The sampler's sigmas and steps stay; only the sigma the model is given is made a little smaller, for more detail. How much smaller scales with the CFG scale (`cfg_scale_override`, or the request's CFG at 0; 1 without CFG). Works at CFG 1 too |
+
+- The three that need CFG get a 400 in a request without it (Qwen-Image-2.1 guides with a `true_cfg_scale` above 1 and a `negative_prompt`, Mage-Flow with a CFG scale above 1).
+  So does a model that takes none (HunyuanImage 3.0, MOSS-Image, Anima), a name given twice, an unknown parameter or a value out of its range. MOSS-Image has its own `slg_layers` and the rest.
+- Whatever the order of the names, they apply as APG (before CFG), CFG, CFGZero*, Skip Layer Guidance, CFGNorm; Detail Daemon applies to the sigma the model is given.
+- As ComfyUI's, the formulas work on the predicted image (x0 = x − sigma v), not on the velocity.
+  At each step of Qwen-Image-2.1 (Euler) and Mage-Flow (Euler and er_sde), the engine's result agrees with ComfyUI's node functions given the engine's inputs to a relative error of 2e-6 or less.
+- APG's `momentum` starts from 0 for each image, tile and redrawn part.
+- `/health` and `--describe` list the methods each image model takes and their parameters' ranges (`guidance_methods`). On the web page's image tab they are under "Sampling guidance".
 
 MOSS-Image also takes these fields, by its official pipeline's names (the other models do not use them).
 
@@ -307,6 +329,7 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image w
   `extend_image` draws past the edges of the conversation's last image (as "Extending" above: the pixels a side, or `aspect`).
   `upscale_image` draws the conversation's last image again larger and finer (as "Upscaling" above: `scale`, 2 by default).
   `fix_image` finds faces, hands or people in the conversation's last image and draws them again (as "Fixing parts" above: `parts` and `strength`). While its weights download it says so, and the chat's model calls it again later.
+  With Qwen-Image-2.1 and Mage-Flow, `generate_image` and `edit_image` take `guidance` too (a list of the names of "Sampling guidance" above); the three that need CFG are listed only where the model guides by default. When to use them is in `image_skill`'s `guidance`.
 - `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with every message while the "Image" switch left of the send button is on (it is a switch, not a send button). It does not go together with a `tool_choice`.
 - `strata_images` with `{"tools": [...]}` narrows the image tools of that request (a tool the config's `image_tools` leaves out cannot be asked for).
 - A chat model that reads pictures (a config with `vision`) is shown a small copy of the image it made (512 pixels on the longer side) as the tool's result, to check that it shows what was asked.

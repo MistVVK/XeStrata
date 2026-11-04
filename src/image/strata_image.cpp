@@ -82,6 +82,11 @@
 //                            as the options, and TE:<path>, NEGTE:<path> the chat engine's states
 //                            Anima's T5:<ids>, T5W:<weights>, NEGT5:<ids>, NEGT5W:<weights> (commas) and
 //                            SAMPLER:<euler|er_sde> (Mage-Flow's too)
+//                            Qwen-Image-2.1's and Mage-Flow's guidance (guidance.hpp): CFGNORM:<strength>, CFGZERO,
+//                            APG:<eta>,<norm_threshold>,<momentum>, DSLG:<blocks> with DSLGP:<scale>,<sigma_start>,
+//                            <sigma_end>,<rescaling_scale> (skip layer guidance, its window in the model's sigmas),
+//                            DD:<amount>,<start>,<end>,<bias>,<exponent>,<start_offset>,<end_offset>,<fade>,<smooth>,
+//                            <cfg_scale_override> (Detail Daemon)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
@@ -304,6 +309,44 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word.rfind("NEGT5:", 0) == 0) r.neg_t5_ids = parse_ids(word.substr(6));
         else if (word.rfind("NEGT5W:", 0) == 0) r.neg_t5_weights = parse_floats(word.substr(7));
         else if (word.rfind("SAMPLER:", 0) == 0) r.sampler = word.substr(8);
+        else if (word.rfind("CFGNORM:", 0) == 0) r.guide.cfgnorm = std::stof(word.substr(8));
+        else if (word == "CFGZERO") r.guide.zero_star = true;
+        else if (word.rfind("APG:", 0) == 0) {
+            const std::vector<float> v = parse_floats(word.substr(4));
+            if (v.size() != 3) throw std::invalid_argument("APG:<eta>,<norm_threshold>,<momentum>: " + word);
+            r.guide.apg = true;
+            r.guide.apg_eta = v[0];
+            r.guide.apg_norm_threshold = v[1];
+            r.guide.apg_momentum = v[2];
+        }
+        else if (word.rfind("DSLG:", 0) == 0) r.guide.slg_layers = parse_blocks(word.substr(5));
+        else if (word.rfind("DSLGP:", 0) == 0) {
+            const std::vector<float> v = parse_floats(word.substr(6));
+            if (v.size() != 4)
+                throw std::invalid_argument("DSLGP:<scale>,<sigma_start>,<sigma_end>,<rescaling_scale>: " + word);
+            r.guide.slg_scale = v[0];
+            r.guide.slg_sigma_start = v[1];
+            r.guide.slg_sigma_end = v[2];
+            r.guide.slg_rescale = v[3];
+        }
+        else if (word.rfind("DD:", 0) == 0) {
+            const std::vector<float> v = parse_floats(word.substr(3));
+            if (v.size() != 10)
+                throw std::invalid_argument("DD:<amount>,<start>,<end>,<bias>,<exponent>,<start_offset>,<end_offset>,"
+                                            "<fade>,<smooth 0|1>,<cfg_scale_override>: " + word);
+            si::GuidanceSpec& g = r.guide;
+            g.dd = true;
+            g.dd_amount = v[0];
+            g.dd_start = v[1];
+            g.dd_end = v[2];
+            g.dd_bias = v[3];
+            g.dd_exponent = v[4];
+            g.dd_start_offset = v[5];
+            g.dd_end_offset = v[6];
+            g.dd_fade = v[7];
+            g.dd_smooth = v[8] != 0.0f;
+            g.dd_cfg = v[9];
+        }
         else if (word.rfind("TE:", 0) == 0) read_states(word.substr(3), r.te, r.te_rows);
         else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
         else if (word.rfind("LORA:", 0) == 0) read_lora(word, r, loras);
@@ -507,6 +550,11 @@ std::string detect_line(si::YoloDetector& d, const si::QiRef& img, float conf, c
     return line;
 }
 
+// the pipelines whose sampling takes guidance.hpp's guidance (GUIDE words)
+bool takes_guidance(si::ImagePipeline& p) {
+    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr;
+}
+
 // An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image Lanczos-resized to the
 // line's size, then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
 // from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
@@ -617,6 +665,9 @@ int serve(si::ImagePipeline& p) {
                 std::optional<si::CropBox> crop;
                 r.refs = read_refs(ls, r, loras, &crop);
                 if (!r.loras.empty() && !takes_loras(p)) no_loras(p);
+                if (r.guide.any() && !takes_guidance(p))
+                    throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
+                                                "DSLG: or DD: (Qwen-Image-2.1's and Mage-Flow's sampling do)");
                 // Crop and Stitch (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
                 // own; the base image is the init image, else the first reference
                 std::unique_ptr<si::CropStitch> cs;

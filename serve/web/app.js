@@ -3049,6 +3049,7 @@ function imgDefaults() {
   imgFormat();
   imgNegHint();
   imgMossSetup();
+  imgGuideSetup();
   imgLoras();
 }
 // the adapters this image model applies (/health's image_models[].defaults.loras, serve/loras.py's listing): the ones
@@ -3409,6 +3410,27 @@ function imgLayoutWH() {
   const s = Math.sqrt(1024 * 1024 / (im.naturalWidth * im.naturalHeight));
   return [Math.max(256, Math.round(im.naturalWidth * s / 16) * 16), Math.max(256, Math.round(im.naturalHeight * s / 16) * 16)];
 }
+// the sampling guidance the model takes (its defaults' guidance_methods): each method's box and its main parameter
+const IMG_GUIDE = {detail_daemon: "detail_amount", skip_layer_guidance: "scale", apg: "eta", cfg_norm: "strength",
+                   cfg_zero_star: null};
+function imgGuideSetup() {
+  const g = (imgModel().defaults || {}).guidance_methods || {};
+  $("img-guide").hidden = !Object.keys(g).length;
+  for (const [name, param] of Object.entries(IMG_GUIDE)) {
+    $(`img-g-${name}-f`).hidden = !g[name];
+    if (g[name] && param) $(`img-g-${name}-v`).placeholder = String(g[name].params[param].default);
+  }
+}
+function imgGuideBody(body) {
+  if ($("img-guide").hidden) return;
+  const out = [];
+  for (const [name, param] of Object.entries(IMG_GUIDE)) {
+    if ($(`img-g-${name}-f`).hidden || !$(`img-g-${name}`).checked) continue;
+    const v = param ? $(`img-g-${name}-v`).value : "";
+    out.push(v !== "" ? {name, [param]: Number(v)} : name);
+  }
+  if (out.length) body.guidance = out;
+}
 function imgMossSetup() {
   const d = imgModel().defaults || {};
   $("img-moss").hidden = !d.layout;
@@ -3706,6 +3728,7 @@ $("img-form").onsubmit = async (ev) => {
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  imgGuideBody(body);
   const bad = imgMossBody(body);
   if (bad) { toast("error", tr("img.none", "No image"), bad, 8000); return; }
   const partial = $("img-partial").checked;

@@ -71,7 +71,9 @@ using namespace flow_sampler_detail;
 void flow_sample(void* s_, const FlowForward& forward, float* x, int64_t N, int n, const std::vector<float>& sigmas_in,
                  float cfg, bool er, float shift, uint64_t seed, const std::function<bool(int, int)>& step,
                  const std::function<void(float*, float)>& after,
-                 const std::function<void(int, const std::function<void(float*)>&)>& peek) {
+                 const std::function<void(int, const std::function<void(float*)>&)>& peek, Guidance* guide,
+                 const std::function<void(const float*, float, float*)>& skip_forward) {
+    const bool guiding = guide != nullptr && guide->on();
     std::vector<float> sig = sigmas_in;
     // er_sde's first sigma below 1 (offset_first_sigma_for_snr: the schedule's at 1e-4 of the way from the top)
     if (er && !sig.empty() && sig[0] >= 1.f) {
@@ -93,14 +95,23 @@ void flow_sample(void* s_, const FlowForward& forward, float* x, int64_t N, int 
     float* old_den = er ? get(N) : nullptr;
     float* old_dd = er ? get(N) : nullptr;
     float* noise = er ? get(N) : nullptr;
+    float* skipped = guiding && skip_forward && !guide->skip_layers().empty() ? get(N) : nullptr;   // skip layer guidance's pass
     auto lam = [](double s) { return s / (1.0 - s); };              // er_lambda: sigma / alpha
     auto scaler = [](double v) { return v * (std::exp(std::pow(v, 0.3)) + 10.0); };
     const int steps = (int) sig.size() - 1;
     try {
         for (int i = 0; i < steps; ++i) {
             const float s0 = sig[(size_t) i], s1 = sig[(size_t) i + 1];
-            forward(x, s0, n, out);
-            denoised(x, out, n == 2 ? out + N : nullptr, cfg, s0, N, den, s_);
+            if (guiding) {   // the model at its own sigma (Detail Daemon's), the step by the sampler's
+                const float sm = guide->model_sigma(s0);
+                forward(x, sm, n, out);
+                const bool skipping = skipped != nullptr && guide->skip_pass(sm);
+                if (skipping) skip_forward(x, sm, skipped);
+                guide->denoised(x, out, n == 2 ? out + N : nullptr, skipping ? skipped : nullptr, sm, den);
+            } else {
+                forward(x, s0, n, out);
+                denoised(x, out, n == 2 ? out + N : nullptr, cfg, s0, N, den, s_);
+            }
             if (peek) peek(i + 1, [&](float* x0) { gpu::copy_async(x0, den, (size_t) N * 4, s_); });
             if (!er || s1 == 0.f) {
                 euler(x, den, s0, s1, N, s_);

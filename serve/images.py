@@ -390,7 +390,13 @@ def model_defaults(cfg: dict) -> dict:
            # an edit with a mask: Crop and Stitch by default (crop_wanted), MOSS-Image's second pass on request
            "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg)),
            # the image tools a chat may use with it (and the Images API's operations): the config's image_tools
-           "tools": [t["name"] for t in TOOLS if cfg.get("image_tools") is None or t["name"] in cfg["image_tools"]]}
+           "tools": [t["name"] for t in TOOLS if cfg.get("image_tools") is None or t["name"] in cfg["image_tools"]],
+           # the sampling guidance it takes (guidance_request): each method's parameters as default, least and most,
+           # and whether it needs classifier-free guidance
+           "guidance_methods": {name: {"needs_cfg": name in GUIDANCE_NEEDS_CFG,
+                                       "params": {k: {"default": d, "min": lo, "max": hi}
+                                                  for k, (d, lo, hi) in guidance_defaults(cfg)[name].items()}}
+                                for name in guidance_methods(cfg)}}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
     if anima:
@@ -531,6 +537,9 @@ def parse_request(req: dict, cfg: dict) -> dict:
         job["sampler"] = sampler or dflt["sampler"]
     elif req.get("sampler") not in (None, ""):
         raise ImageRequestError("sampler: this image model has its own (Anima and Mage-Flow without edits take one)")
+    guide = guidance_request(req, cfg, job)
+    if guide:
+        job["guide"] = guide
     if cfg.get("family") == "moss-image":
         job.update(moss_request(req, cfg))
         if req.get("layout") is not None:
@@ -792,6 +801,164 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
     if out.get("true_cfg_scale", 1.0) > 1 and out.get("negative_prompt") is not None:
         out["cfg"] = out["true_cfg_scale"]
     return out
+
+
+# the sampling guidance of ComfyUI's nodes (the engine's guidance.hpp), by name: each method's parameters as
+# (default, least, most) - the nodes' own defaults and ranges.  The order a request lists them in does not matter: the
+# engine applies APG before CFG, then CFGZero*, skip layer guidance and CFGNorm, and Detail Daemon to the sigma the
+# model is asked at.  cfg_norm, cfg_zero_star and apg act on classifier-free guidance's two predictions: a request
+# without guidance (true_cfg_scale at 1, or no negative prompt for Qwen-Image-2.1) is refused them.
+GUIDANCE_METHODS: dict[str, dict[str, tuple]] = {
+    "cfg_norm": {"strength": (1.0, 0.0, 100.0)},
+    "cfg_zero_star": {},
+    "apg": {"eta": (1.0, -10.0, 10.0), "norm_threshold": (5.0, 0.0, 50.0), "momentum": (0.0, -5.0, 1.0)},
+    "skip_layer_guidance": {"layers": ([7, 8, 9], 0, 255), "scale": (3.0, 0.0, 10.0),
+                            "start": (0.01, 0.0, 1.0), "end": (0.15, 0.0, 1.0),
+                            "rescaling_scale": (0.0, 0.0, 10.0)},
+    "detail_daemon": {"detail_amount": (0.1, -5.0, 5.0), "start": (0.2, 0.0, 1.0), "end": (0.8, 0.0, 1.0),
+                      "bias": (0.5, 0.0, 1.0), "exponent": (1.0, 0.0, 10.0), "start_offset": (0.0, -1.0, 1.0),
+                      "end_offset": (0.0, -1.0, 1.0), "fade": (0.0, 0.0, 1.0), "smooth": (True, None, None),
+                      "cfg_scale_override": (0.0, 0.0, 100.0)},
+}
+GUIDANCE_NEEDS_CFG = ("cfg_norm", "cfg_zero_star", "apg")
+# Skip layer guidance's blocks by model where ComfyUI's node default (7, 8, 9, made for SD3's) does not suit it:
+# Mage-Flow has 12 blocks, and three of them skipped wash its image out (ComfyUI's as XeStrata's; block 10 alone does
+# too, 4 and 6 do not, 2026-11-05 on the B70); Qwen-Image-2.1 keeps the node's
+GUIDANCE_SLG_LAYERS = {"mage-flow": [6]}
+
+
+def guidance_defaults(cfg: dict) -> dict[str, dict[str, tuple]]:
+    """GUIDANCE_METHODS with this model's own defaults (GUIDANCE_SLG_LAYERS)."""
+    layers = GUIDANCE_SLG_LAYERS.get(cfg.get("family") or "")
+    if not layers:
+        return GUIDANCE_METHODS
+    slg = dict(GUIDANCE_METHODS["skip_layer_guidance"])
+    slg["layers"] = (list(layers),) + slg["layers"][1:]
+    return {**GUIDANCE_METHODS, "skip_layer_guidance": slg}
+
+
+def guidance_methods(cfg: dict) -> list[str]:
+    """The guidance methods this image model's sampling takes (model_defaults' guidance_methods): Qwen-Image-2.1's
+    and Mage-Flow's (MageTrail's too), each method checked against ComfyUI's node on that model's sampler; none for
+    the others (MOSS-Image keeps its own skip-layer guidance, slg_layers and the rest)."""
+    return list(GUIDANCE_METHODS) if cfg.get("family") in (None, "", "mage-flow") else []
+
+
+def chat_guidance_methods(cfg: dict) -> list[str]:
+    """The guidance methods a chat's call can use with this model (generate_image's and edit_image's guidance): the
+    chat's request leaves guidance's scale and negative prompt at the model's defaults, so those needing them
+    (GUIDANCE_NEEDS_CFG) only where the model guides by default (its scale above 1 and a negative prompt of its own)."""
+    dflt = model_defaults(cfg)
+    guided = dflt["guidance"] > 1 and dflt["negative_prompt"] is not None
+    return [m for m in guidance_methods(cfg) if guided or m not in GUIDANCE_NEEDS_CFG]
+
+
+def guidance_request(req: dict, cfg: dict, job: dict) -> list[dict]:
+    """The request's `guidance`, checked: a list of method names (guidance_methods) or {"name": ..., its parameters},
+    each with the parameters it leaves out at the node's defaults (guidance_defaults: GUIDANCE_METHODS, or a model's
+    own).  A method the model does not take, one named twice, an unknown parameter or one out of its range, and
+    cfg_norm, cfg_zero_star or apg without classifier-free guidance (`job` has no "cfg") are refused rather than left
+    out."""
+    v = req.get("guidance")
+    if v in (None, "", []):
+        return []
+    if isinstance(v, str):
+        text = v.strip()
+        try:
+            v = json.loads(text) if text[:1] in "[{" else [x.strip() for x in text.split(",") if x.strip()]
+        except ValueError:
+            raise ImageRequestError("guidance: a JSON list of method names or {\"name\": ...} objects") from None
+    if isinstance(v, dict):
+        v = [v]
+    if not isinstance(v, list):
+        raise ImageRequestError("guidance: a list of method names or {\"name\": ...} objects")
+    takes = guidance_methods(cfg)
+    out: list[dict] = []
+    for item in v:
+        name: Any
+        given: dict
+        if isinstance(item, str):
+            name, given = item, {}
+        elif isinstance(item, dict):
+            name, given = item.get("name"), {k: x for k, x in item.items() if k != "name"}
+        else:
+            name, given = None, {}
+        if name not in GUIDANCE_METHODS:
+            raise ImageRequestError("guidance: methods " + ", ".join(GUIDANCE_METHODS) + f" (not {name!r})")
+        if name not in takes:
+            raise ImageRequestError(f"guidance {name}: this image model takes none (Qwen-Image-2.1 and Mage-Flow do)")
+        if any(m["name"] == name for m in out):
+            raise ImageRequestError(f"guidance {name}: named twice")
+        if name in GUIDANCE_NEEDS_CFG and not job.get("cfg"):
+            raise ImageRequestError(f"guidance {name}: needs classifier-free guidance (true_cfg_scale above 1"
+                                    + (" with a negative_prompt" if not cfg.get("family") else "") + ")")
+        spec = guidance_defaults(cfg)[name]
+        unknown = sorted(set(given) - set(spec))
+        if unknown:
+            raise ImageRequestError(f"guidance {name}: no parameter {unknown[0]!r} (it takes "
+                                    + (", ".join(spec) or "none") + ")")
+        m: dict = {"name": name}
+        for key, (dflt, lo, hi) in spec.items():
+            if key == "layers":
+                layers = given.get(key, dflt)
+                if isinstance(layers, int) and not isinstance(layers, bool):
+                    layers = [layers]
+                if (not isinstance(layers, list) or not layers or len(layers) > 64
+                        or any(isinstance(b, bool) or not isinstance(b, int) or not lo <= b <= hi for b in layers)):
+                    raise ImageRequestError(f"guidance {name}.layers: a list of the model's block numbers, from 0")
+                m[key] = sorted(set(layers))
+            elif isinstance(dflt, bool):
+                b = given.get(key, dflt)
+                if not isinstance(b, bool):
+                    raise ImageRequestError(f"guidance {name}.{key}: true or false")
+                m[key] = b
+            else:
+                try:
+                    m[key] = _number(given, key, lo, hi, dflt)
+                except ImageRequestError as e:
+                    raise ImageRequestError(f"guidance {name}.{e}") from None
+        if m.get("start", 0.0) > m.get("end", 1.0) and name == "skip_layer_guidance":
+            raise ImageRequestError(f"guidance {name}: start at most end")
+        out.append(m)
+    return out
+
+
+def percent_sigma(cfg: dict, width: int, height: int, percent: float) -> float:
+    """The model's sigma at a share of its schedule, as ComfyUI's model_sampling.percent_to_sigma gives it (skip layer
+    guidance's window): Qwen-Image-2.1's exponential shift by its size's mu (base_sigmas', without the terminal
+    stretch; ModelSamplingFlux), Mage-Flow's static shift (ModelSamplingDiscreteFlow)."""
+    if percent <= 0.0:
+        return 1.0
+    if percent >= 1.0:
+        return 0.0
+    t = 1.0 - percent
+    if cfg.get("family") == "mage-flow":
+        return MF_SHIFT * t / (1.0 + (MF_SHIFT - 1.0) * t)
+    seq = (width // SIZE_STEP) * (height // SIZE_STEP)
+    mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)
+    return math.exp(mu) / (math.exp(mu) + (1.0 / t - 1.0))
+
+
+def guidance_words(job: dict, cfg: dict, width: int, height: int) -> str:
+    """The engine's words of a job's guidance (strata_image's CFGNORM:, CFGZERO, APG:, DSLG: and DSLGP:, DD:)."""
+    words = ""
+    for m in job.get("guide") or ():
+        name = m["name"]
+        if name == "cfg_norm":
+            words += f" CFGNORM:{m['strength']!r}"
+        elif name == "cfg_zero_star":
+            words += " CFGZERO"
+        elif name == "apg":
+            words += f" APG:{m['eta']!r},{m['norm_threshold']!r},{m['momentum']!r}"
+        elif name == "skip_layer_guidance":
+            words += (f" DSLG:{','.join(str(b) for b in m['layers'])} DSLGP:{m['scale']!r},"
+                      f"{percent_sigma(cfg, width, height, m['start'])!r},"
+                      f"{percent_sigma(cfg, width, height, m['end'])!r},{m['rescaling_scale']!r}")
+        elif name == "detail_daemon":
+            keys = ("detail_amount", "start", "end", "bias", "exponent", "start_offset", "end_offset", "fade")
+            words += (" DD:" + ",".join(repr(m[k]) for k in keys)
+                      + f",{1 if m['smooth'] else 0},{m['cfg_scale_override']!r}")
+    return words
 
 
 def model_prompt(job: dict) -> str:
@@ -2230,11 +2397,14 @@ class ImageGen:
     @staticmethod
     def _work(job: dict) -> tuple[float, float]:
         """One image's (steps, megapixels): the steps it runs (a strength's), a guided step two (MOSS-Image's
-        skip-layer guidance one more in its window), the size the engine makes."""
+        skip-layer guidance one more in its window, as is the guidance field's), the size the engine makes."""
         mw, mh = made_size(job)
         passes = 2 if job.get("cfg") else 1
         if job.get("slg_layers") and job.get("slg_scale"):
             passes += job.get("slg_stop", 1.0) - job.get("slg_start", 0.0)
+        for m in job.get("guide") or ():   # skip layer guidance's pass of the prompt alone, in its window
+            if m["name"] == "skip_layer_guidance" and m["scale"] > 0:
+                passes += m["end"] - m["start"]
         return job.get("steps_run", job["steps"]) * passes, round(mw * mh / 1e6, 3)
 
     def _measured(self, job: dict, r: dict) -> None:
@@ -2683,6 +2853,7 @@ class ImageGen:
                          self._moss_words(job) if self.family == "moss-image" else
                          self._anima_words(job) if self.family == "anima" else
                          f" SAMPLER:{job['sampler']}" if job.get("sampler") else "")
+                guide += guidance_words(job, self.cfg, mw, mh)
                 for i in range(first, job["n"]):
                     if i > first and pause is not None and pause():
                         break
@@ -3301,6 +3472,16 @@ class ImageTools:
                                      + ("edit_image redraws the painted part by them" if t["name"] == "edit_image" else
                                         "generate_image makes a new image by them")
                                      + "; the boxes and the size are set (a layout you write is replaced).")
+            guided = [g for g in gens if chat_guidance_methods(g.cfg)]
+            if t["name"] in ("generate_image", "edit_image") and guided:   # the sampling's guidance (C4)
+                methods = [m for m in GUIDANCE_METHODS if any(m in chat_guidance_methods(g.cfg) for g in guided)]
+                params = dict(t["parameters"])
+                params["properties"] = {**params["properties"], "guidance": {
+                    "type": "array", "items": {"type": "string", "enum": methods},
+                    "description": "sampling guidance, rarely needed (image_skill's guidance says when)"
+                                   + ("" if len(guided) == len(gens) else
+                                      f"; {', '.join(g.model for g in guided)} only")}}
+                t["parameters"] = params
             moss = [g.model for g in gens if g.family == "moss-image"]
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])
@@ -3370,6 +3551,9 @@ class ImageTools:
         for name in tools:
             if skill(f"tools/{name}"):
                 out[name] = ("tool", [])
+        if (any(t in tools for t in ("generate_image", "edit_image")) and skill("tools/guidance")
+                and any(chat_guidance_methods(g.cfg) for g in self._gens())):   # generate_image's, edit_image's
+            out["guidance"] = ("tool", [])
         return out
 
     def _skill_tool(self, tools: list[str]) -> dict:
@@ -3535,6 +3719,8 @@ class ImageTools:
                 req["strength"] = args["strength"]
             if name == "edit_image" and args.get("refine") not in (None, ""):
                 req["refine"] = args["refine"]
+            if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
+                req["guidance"] = args["guidance"]
             if name == "upscale_image":
                 req["upscale"] = {"scale": args["scale"]} if args.get("scale") not in (None, "") else {}
             if name == "fix_image":
@@ -3549,6 +3735,11 @@ class ImageTools:
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
                 raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
+            if req.get("guidance") not in (None, "", []) and not guidance_methods(gen.cfg):
+                takes = [g.model for g in gens if guidance_methods(g.cfg)]
+                raise ImageRequestError(f"guidance: {gen.model} takes none" + (
+                    f"; give model {' or '.join(takes)} for it, or leave guidance out" if takes else
+                    "; leave guidance out"))
             if name == "generate_image":
                 job = parse_request(req, gen.cfg)
             elif name in ("extend_image", "upscale_image", "fix_image"):

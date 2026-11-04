@@ -520,7 +520,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek);
+        dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide);
         dit_->drop_host_prefix();
         const auto t2 = clock::now();
         if (stage) stage("decode");

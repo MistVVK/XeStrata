@@ -213,6 +213,19 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           </div>
           <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
         </div>
+        <details class="st-collapse" id="img-guide" hidden><summary><span data-i18n="img.guide">Sampling guidance</span></summary>
+          <div class="st-collapse__body img-row">
+            <label class="img-check" id="img-g-detail_daemon-f" title="Detail Daemon: the model asked at a slightly lower noise level, for finer detail" data-i18n-title="img.gDetailTitle"><input type="checkbox" id="img-g-detail_daemon"> <span data-i18n="img.gDetail">Detail Daemon</span>
+              <input class="st-input" id="img-g-detail_daemon-v" type="number" min="-5" max="5" step="0.05" placeholder="0.1" aria-label="Detail amount" data-i18n-label="img.gDetailAmount"></label>
+            <label class="img-check" id="img-g-skip_layer_guidance-f" title="Skip Layer Guidance: another pass of the prompt with blocks 7, 8 and 9 skipped, early in the steps" data-i18n-title="img.gSlgTitle"><input type="checkbox" id="img-g-skip_layer_guidance"> <span data-i18n="img.gSlg">Skip Layer Guidance</span>
+              <input class="st-input" id="img-g-skip_layer_guidance-v" type="number" min="0" max="10" step="0.5" placeholder="3" aria-label="Scale" data-i18n-label="img.gScale"></label>
+            <label class="img-check" id="img-g-apg-f" title="APG: guidance's push held to a size and tilted away from the prompt's own direction (less oversaturation); needs CFG" data-i18n-title="img.gApgTitle"><input type="checkbox" id="img-g-apg"> <span>APG</span>
+              <input class="st-input" id="img-g-apg-v" type="number" min="-10" max="10" step="0.1" placeholder="1" aria-label="eta" data-i18n-label="img.gEta"></label>
+            <label class="img-check" id="img-g-cfg_norm-f" title="CFGNorm: the guided prediction no larger than the prompt's at each point; needs CFG" data-i18n-title="img.gNormTitle"><input type="checkbox" id="img-g-cfg_norm"> <span>CFGNorm</span>
+              <input class="st-input" id="img-g-cfg_norm-v" type="number" min="0" max="100" step="0.05" placeholder="1" aria-label="Strength" data-i18n-label="img.gStrength"></label>
+            <label class="img-check" id="img-g-cfg_zero_star-f" title="CFG-Zero*: the negative prompt's prediction scaled to the prompt's before guidance; needs CFG" data-i18n-title="img.gZeroTitle"><input type="checkbox" id="img-g-cfg_zero_star"> <span>CFG-Zero*</span></label>
+          </div>
+        </details>
         <div class="img-moss" id="img-moss" hidden>
           <div class="img-row">
             <label class="st-field" id="img-enhance-f"><span data-i18n="img.enhance">Write the prompt out</span>

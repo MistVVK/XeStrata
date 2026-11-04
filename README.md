@@ -432,9 +432,14 @@ permission under GPL section 7, what goes in, and how to report).
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges);
    - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (an edit
-     with a mask: the painted part cut out, drawn enlarged and put back).
+     with a mask: the painted part cut out, drawn enlarged and put back);
    - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)'s FaceDetailer, by ltdrdata (faces, hands
-     or people found and drawn again one by one).
+     or people found and drawn again one by one);
+   - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors (the CFGNorm,
+     CFGZeroStar, APG and SkipLayerGuidanceDiT nodes: the image sampling's guidance);
+   - [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon), by Jonseed, after
+     [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon), by muerrilla (the image sampling's
+     sigma given to the model made smaller by a schedule).
 - The parts are listed in [third_party/main/README.md](third_party/main/README.md); more in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
 
 ## License

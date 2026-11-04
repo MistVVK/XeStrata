@@ -4,6 +4,7 @@
 // Mage-Flow's MfPipeline): its VRAM budget, what an image needs, the image itself, and letting its cache go.
 #pragma once
 
+#include "strata/image/guidance.hpp"
 #include "strata/image/image_lora.hpp"
 
 #include <cstdint>
@@ -87,6 +88,9 @@ struct QiRequest {
     std::vector<float> t5_weights, neg_t5_weights;
     // the sampler: "euler" or "er_sde" (Anima's and Mage-Flow's; empty: the model's own)
     std::string sampler;
+    // the guidance ComfyUI's nodes add to the sampling (guidance.hpp: CFGNorm, CFGZero*, APG, skip layer guidance,
+    // Detail Daemon; strata_image's GUIDE words): Qwen-Image-2.1's and Mage-Flow's; the other models leave it
+    GuidanceSpec guide;
     // the adapters the DiT's products add (image_lora.hpp), each file read once with the strength its delta is scaled
     // by, applied in this order: a set that changes starts the context again (the prefix's K and V were the other
     // set's).  A model that applies none refuses the request rather than make another image.

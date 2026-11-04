@@ -1210,6 +1210,10 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const Block& b = blocks_[(size_t) bi];
         const uint8_t* base = blocks_stream_.begin(bi);
+        if (skip_ != nullptr && std::find(skip_->begin(), skip_->end(), bi) != skip_->end()) {
+            blocks_stream_.end(bi);
+            continue;
+        }
         auto f = [base](uint64_t off) { return reinterpret_cast<const float*>(base + off); };
         modulation(tsil, b.imod, base, mod_i_, f(b.b_imod));
         modulation(tsil, b.tmod, base, mod_t_, f(b.b_tmod));
@@ -1257,7 +1261,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
         gate_add(txt_, product(h16_, rs2_, b.tmlp2, base, a_, L, f(b.b_tmlp2), false, true), mod_t_ + 5 * C, L, C,
                  s_);
         blocks_stream_.end(bi);
-        if (bi == 0 && keep0_) {
+        if (bi == 0 && keep0_ && skip_ == nullptr) {
             gpu::copy_async(b0_img_, img_, (size_t) (HW * C) * 4, s_);
             gpu::copy_async(b0_txt_, txt_, (size_t) (ctx_[0].rows * C) * 4, s_);
         }
@@ -1276,9 +1280,26 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
     }
 }
 
+void MfDit::forward_skip(const float* x, float sigma, int64_t h, int64_t w, const std::vector<int>& blocks,
+                         float* out) {
+    skip_ = &blocks;
+    try {
+        forward(x, sigma, h, w, 1, out);
+    } catch (...) {
+        skip_ = nullptr;
+        throw;
+    }
+    skip_ = nullptr;
+}
+
 void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
                    const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                   const std::function<void(int, const std::function<void(float*)>&)>& peek) {
+                   const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                   const GuidanceSpec* guide) {
+    if (guide != nullptr && guide->any()) {
+        sample_guided(x, h, w, sigmas, cfg, step, after, peek, *guide);
+        return;
+    }
     const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
     const int64_t HW = h * w;
     float* out = alloc<float>(allocs_, n * HW * in_ch_);
@@ -1299,6 +1320,48 @@ void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sig
     }
     gpu::stream_sync(s_);
     release(allocs_, out);
+}
+
+// the sampling with guidance.hpp's guidance: each step the model asked at its sigma (Detail Daemon's), the contexts'
+// velocities (and skip layer guidance's pass) to the guided denoised values, Euler's step from them
+void MfDit::sample_guided(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
+                          const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                          const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                          const GuidanceSpec& spec) {
+    for (const int b : spec.slg_layers)
+        if (b < 0 || b >= (int) blocks_.size())
+            throw std::invalid_argument("image engine: skip layer guidance's block " + std::to_string(b) +
+                                        " is not one of the model's " + std::to_string(blocks_.size()));
+    const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
+    const int64_t N = h * w * in_ch_;
+    Guidance g(spec, s_, N, in_ch_, true, n == 2 ? cfg : 1.f, sigmas);
+    struct Free {
+        MfDit& d;
+        std::vector<float*> ps;
+        ~Free() {
+            gpu::stream_sync(d.s_);
+            for (float* p : ps) release(d.allocs_, p);
+        }
+    } mine{*this, {}};
+    auto get = [&](int64_t count) {
+        mine.ps.push_back(alloc<float>(allocs_, count));
+        return mine.ps.back();
+    };
+    float* out = get(n * N);
+    float* den = get(N);
+    float* k = !spec.slg_layers.empty() ? get(N) : nullptr;
+    const int steps = (int) sigmas.size() - 1;
+    for (int i = 0; i < steps; ++i) {
+        const float s0 = sigmas[(size_t) i], s1 = sigmas[(size_t) i + 1], sm = g.model_sigma(s0);
+        forward(x, sm, h, w, n, out);
+        const bool skipping = k != nullptr && g.skip_pass(sm);
+        if (skipping) forward_skip(x, sm, h, w, g.skip_layers(), k);
+        g.denoised(x, out, n == 2 ? out + N : nullptr, skipping ? k : nullptr, sm, den);
+        guidance_euler(x, den, s0, s1, N, s_);
+        if (after) after(x, s1);
+        if (peek) peek(i + 1, [&](float* x0) { gpu::copy_async(x0, den, (size_t) N * 4, s_); });
+        if (step && !step(i + 1, steps)) throw QiStopped();
+    }
 }
 
 }  // namespace strata::image

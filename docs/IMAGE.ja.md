@@ -211,6 +211,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `negative_prompt` | なし（Mage-Flow は空白 1 文字、MOSS-Image は空、Anima は品質の低さや手の崩れなどを並べたもの） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
 | `sampler` | Anima は `er_sde`、Mage-Flow は `euler` | サンプラー: `er_sde` か `euler`。Anima と、編集のない Mage-Flow（MageTrail など）だけが受け、ほかのモデルでは 400 です |
 | `lora` | なし | 当てるアダプター（[LoRA](#loraアダプター)）: `{"name", "scale"}` の配列か、その 1 つ。`scale` は -2〜2 で、省略すると 1。4 本まで |
+| `guidance` | なし | サンプリングのガイダンス（下の「サンプリングのガイダンス」）。Qwen-Image-2.1 と Mage-Flow だけが受けます |
 | `true_cfg_scale`、`guidance_scale` | Mage-Flow、HunyuanImage 3.0、MOSS-Image、Anima は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow、MOSS-Image、Anima は `true_cfg_scale`、なければ `guidance_scale`（MOSS-Image の既定は 3、Anima は 4、Anima-Turbo は 1）。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
 | `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow と HunyuanImage 3.0 は `transparent` を断ります |
 | `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
@@ -219,6 +220,27 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024x1024 で約 2 倍、512x512 では約 1.5 倍です。
 ほかの項目（`style`、`user`、`moderation` など）は受けて、使いません。
+
+#### サンプリングのガイダンス（`guidance`）
+
+Qwen-Image-2.1 と Mage-Flow（MageTrail も）は、ComfyUI のノードと同じサンプリングの工夫を受けます（生成と編集の両方）。
+`guidance` に名前の配列（`["detail_daemon"]`）か、名前とパラメーターのオブジェクトの配列（`[{"name": "apg", "eta": 0.5}]`）を付けます。どれも、付けなければ掛けません。
+
+| 名前 | ComfyUI のノード | パラメーター（既定） | 働き |
+| --- | --- | --- | --- |
+| `cfg_norm` | CFGNorm | `strength`（1） | CFG の後の予測を、位置ごとにチャンネル方向の大きさがプロンプトの予測を超えないように縮めます。CFG が要ります |
+| `cfg_zero_star` | CFGZeroStar | なし | ネガティブの予測を、プロンプトの予測への射影の係数で縮めてから CFG を掛けます。CFG が要ります |
+| `apg` | APG | `eta`（1）、`norm_threshold`（5）、`momentum`（0） | CFG の差の大きさを `norm_threshold` までに抑え、プロンプトの予測に平行な分を `eta` 倍にします（色の飽和を抑えます）。CFG が要ります |
+| `skip_layer_guidance` | SkipLayerGuidanceDiT | `layers`（Qwen-Image-2.1 は `[7, 8, 9]`、Mage-Flow は `[6]`。Mage-Flow はブロックが 12 しかなく、3 つ飛ばすと絵が白っぽく崩れます）、`scale`（3）、`start`（0.01）、`end`（0.15）、`rescaling_scale`（0） | `layers` のブロックを飛ばしたプロンプトをもう 1 回計算し、差の `scale` 倍を足します。`start`〜`end` はスケジュールの割合で、その間のステップだけ計算が 1 回分増えます。CFG 1 でも使えます |
+| `detail_daemon` | Detail Daemon（Jonseed の DetailDaemonSamplerNode） | `detail_amount`（0.1）、`start`（0.2）、`end`（0.8）、`bias`（0.5）、`exponent`（1）、`start_offset`（0）、`end_offset`（0）、`fade`（0）、`smooth`（true）、`cfg_scale_override`（0） | サンプラーの sigma と刻みはそのままで、モデルに渡す sigma だけを少し小さくして細部を足します。小さくする量は CFG の強さ倍です（`cfg_scale_override` が 0 なら要求の CFG、CFG なしは 1）。CFG 1 でも使えます |
+
+- CFG が要る 3 つは、CFG のない要求（Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるとき、Mage-Flow は CFG の強さが 1 より大きいときに CFG が掛かります）では 400 です。
+  受けないモデル（HunyuanImage 3.0、MOSS-Image、Anima）、同じ名前を 2 度、知らないパラメーター、範囲の外の値も 400 です。MOSS-Image は自分の `slg_layers` などを使います。
+- 名前の並びの順によらず、APG（CFG の前）→ CFG → CFGZero* → Skip Layer Guidance → CFGNorm の順に掛け、Detail Daemon はモデルに渡す sigma に掛かります。
+- 式は ComfyUI と同じく、速度ではなく予測した画像（x0 = x − sigma v）の上で計算します。
+  Qwen-Image-2.1（Euler）と Mage-Flow（Euler と er_sde）の各ステップで、エンジンの入力を ComfyUI のノードの関数に渡した結果と相対誤差 2e-6 以下で一致することを確かめています。
+- APG の `momentum` の積み上げは、1 枚・1 タイル・1 か所の描き直しごとに 0 から始めます。
+- 使える方式とパラメーターの範囲は、`/health` と `--describe` の画像のモデルごとの `guidance_methods` に出ます。Web の画像の画面では「サンプリングのガイダンス」の欄で選びます。
 
 MOSS-Image は、公式のパイプラインと同じ名前の項目も受けます（ほかのモデルでは使いません）。
 
@@ -307,6 +329,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
   `extend_image` は、会話の最後の画像の外側を描き足します（上の「描き足し」と同じ。引数は上下左右の画素か `aspect`）。
   `upscale_image` は、会話の最後の画像を大きく、細かく描き直します（上の「拡大」と同じ。引数は `scale`、既定は 2）。
   `fix_image` は、会話の最後の画像の顔・手・人物を見つけて描き直します（上の「部分を直す」と同じ。引数は `parts` と `strength`）。重みを取っている間は、その旨を返し、チャットのモデルは後で呼び直します。
+  Qwen-Image-2.1 と Mage-Flow では、`generate_image` と `edit_image` に `guidance`（上の「サンプリングのガイダンス」の名前の配列）も渡します。CFG の要る 3 つは、モデルの既定で CFG が掛かるときだけ並べます。使いどころは `image_skill` の `guidance` に書いてあります。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
 - `strata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
 - 画像を読めるチャットのモデル（`vision` の設定がある）には、作った画像の小さな写し（長い辺 512 ピクセル）を道具の結果として見せ、頼んだとおりかを確かめさせます。

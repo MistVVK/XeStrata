@@ -410,6 +410,8 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
    - lquesada による [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch)（マスク付きの編集で、塗った部分を切り出して拡大して描き直し、貼り戻すやり方）。
    - ltdrdata による [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack) の FaceDetailer（顔・手・人物を見つけて 1 か所ずつ描き直すやり方）。
+   - comfyanonymous と ComfyUI の貢献者による [ComfyUI](https://github.com/comfyanonymous/ComfyUI) の CFGNorm・CFGZeroStar・APG・SkipLayerGuidanceDiT のノード（画像のサンプリングのガイダンス）。
+   - Jonseed による [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon) と、その元の muerrilla による [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon)（画像のサンプリングで、モデルに渡す sigma を表で小さくするやり方）。
 - 部品の一覧は [third_party/main/README.md](third_party/main/README.md)、詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
 ## ライセンス
