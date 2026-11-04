@@ -32,6 +32,7 @@
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_text.hpp"
 #include "strata/image/pipeline.hpp"
+#include "strata/image/qi_vision.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -58,7 +59,9 @@ public:
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request.  `dit`: the transformer
     /// (its folder or a file), `vae`: the Flux2 VAE's safetensors, `text`: Qwen3.5-9B's GGUF.  `q8`: the DiT's blocks
     /// in 8 bits (1), FP16 (0) or by the budget (-1).
-    bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1);
+    /// `vision`: Qwen3.5-9B's mmproj (its ViT, Qwen3-VL's), for an ai-toolkit edit adapter's pictures (none: none).
+    bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1,
+              const std::string& vision = "");
 
     void set_budget(uint64_t bytes) override;
     uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
@@ -70,6 +73,9 @@ public:
                 int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) override;
     /// need() for a request whose states the chat's engine makes (the server's TE:): no text encoder counted
     void set_states_given(bool given) { states_given_ = given; }
+    /// need() for a request with the text encoder's pictures of these sizes (the server's PIC:): the vision encoder
+    /// counted
+    void set_pictures_given(std::vector<std::pair<int64_t, int64_t>> sizes) { pictures_ = std::move(sizes); }
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
                                   const std::function<bool(int, int)>& step = {},
                                   const std::function<void(const char*)>& stage = {}) override;
@@ -82,12 +88,15 @@ private:
     void use_loras(const QiRequest& r);
     bool want_q8(int64_t rows, int n, int64_t max_text);
     bool open_text();
-    void encode(const std::vector<int32_t>& ids, std::vector<float>& out);
+    void encode(const std::vector<int32_t>& ids, std::vector<float>& out,
+                const std::vector<MossText::Picture>& pictures = {});
     uint64_t text_fixed() const;
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
     /// An edit's reference image through the VAE's encoder at its own size -> its latent [h w][128] (device FP32, the
     /// caller's to free).
     float* encode_ref(const QiRef& f);
+    /// The pictures' rows through the vision encoder (opened for them and closed after), one block each.
+    std::vector<QiVisionOut> encode_pictures(const std::vector<QiRef>& pictures);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
@@ -96,6 +105,11 @@ private:
     mutable int64_t w8_rows_ = 0;
     bool base_encoder_ = false, states_given_ = false;
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
+    std::string vision_path_;
+    int32_t image_pad_ = -1;   // the text encoder's <|image_pad|> (its GGUF's vocabulary)
+    std::unique_ptr<QiVision> vision_size_;
+    std::vector<std::pair<int64_t, int64_t>> pictures_;   // set_pictures_given's
+    std::string last_pics_, last_neg_pics_;   // the pictures the kept states were made with (refs_key)
     std::unique_ptr<MossText> te_;
     std::unique_ptr<MossDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;   // the closed DiT's blocks in 8 bits (release(true)), for its next open

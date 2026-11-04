@@ -110,6 +110,9 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
   crop_stitch: false draws an edit with a mask at the output's size, as before Crop and Stitch (plan_crop; a request's
   crop_stitch overrides it)
+  MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll, armv5 and armv6) and
+  edit_adapter (the one used; XESTRATA_MOSS_EDIT over it: moss_edit_adapter); edit_format: an edit_lora's layout
+  (moss_edit_format)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
   sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
@@ -172,9 +175,10 @@ CROP_CONTEXT = 1.2
 CROP_CONTEXT_REFS = 1.6
 # MOSS-Image's edit with references besides the picture: its edit adapter matches them with the whole picture it was
 # trained beside, and a cut part alone takes their content (the face swap of 2026-11-04 drew image 2's body in place of
-# the face).  So the whole picture is edited first (its whole box: the part outside the mask kept), then the part cut
-# out of that and drawn again with the references at this strength (FaceDetailer's denoise): the same face swap kept
-# image 2's face and drew its eyes and mouth finer; 0.7 turned the hair grey
+# the face; ComfyUI's Inpaint Crop and Stitch did the same).  So the whole picture is edited in one pass (its whole
+# box: the part outside the mask kept), and with the request's refine the part is then cut out of that and drawn again
+# with the references at this strength (FaceDetailer's denoise): the same face swap kept image 2's face and drew its
+# eyes and mouth finer; 0.7 turned the hair grey
 CROP_REFINE_STRENGTH = 0.5
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
@@ -235,6 +239,17 @@ MOSS_SHIFT_MAX = 20.0
 MOSS_EDIT_STEPS = 30
 MOSS_EDIT_CFG = 5.0
 MOSS_MAX_REFS = 4
+# the layouts edit adapters are trained in, as ComfyUI's TextEncodeMOSSImageEdit has them (moss_edit_format): chinoll's
+# Moss-Image-Edit; ai-toolkit's (ostris), whose text encoder sees the references too (each as "Picture N:" before the
+# prompt, at most MOSS_PICTURE_PIXELS, the node's 384 x 384), their latents at most MOSS_AITK_REF_PIXELS (its
+# control_image_max_pixels, akhaliq's armV5's) and its steps and guidance MOSS-Image's own; and ai-toolkit's with its
+# kv_cache off (the references in the sequence at every step)
+MOSS_EDIT_FORMATS = ("moss-image-edit", "ai-toolkit", "ai-toolkit-no-kv")
+# the edit adapter setup's config names by default among its "edit_adapters" (tools/image/qimage.py says why); the
+# config's "edit_adapter" chooses another, and XESTRATA_MOSS_EDIT over it (moss_edit_adapter)
+MOSS_EDIT_DEFAULT = "chinoll"
+MOSS_PICTURE_PIXELS = 384 * 384
+MOSS_AITK_REF_PIXELS = 524288
 ANIMA_STEPS = 30                   # the model card's 30 to 50 (Turbo: 8 to 12, its config's 10), CFG 4 to 5 (Turbo 1)
 ANIMA_CFG = 4.0
 ANIMA_SHIFT = 3.0                  # ComfyUI's sampling_settings for the model
@@ -892,10 +907,11 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     changes, the rest kept as it is, as job["mask"].  With a mask and the size left to it (none, "auto" or the first
     image's own), the edit is Crop and Stitch's (crop_wanted; not with MOSS-Image's layout): job["crop"] its plan
     (plan_crop), the image the first image's size (job["width"], job["height"]), drawn at the plan's (made_size); a
-    mask that changes nothing is job["crop"] {"empty": True} (the picture as it is).  strength
-    (parse_strength): how much of the schedule runs from the first image (job["strength"] and the steps it runs,
-    job["steps_run"], when below 1); an edit's default 1, an img2img's img2img_strength of its steps, or 1 with a
-    mask."""
+    mask that changes nothing is job["crop"] {"empty": True} (the picture as it is); a MOSS-Image edit with references
+    besides the picture is drawn at the whole picture's plan, and with the request's refine its part cut out of that
+    and drawn again (job["refine"], CROP_REFINE_STRENGTH).  strength (parse_strength): how much of the schedule runs
+    from the first image (job["strength"] and the steps it runs, job["steps_run"], when below 1); an edit's default 1,
+    an img2img's img2img_strength of its steps, or 1 with a mask."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
     moss = cfg.get("family") == "moss-image"
@@ -940,16 +956,25 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     # Mage-Flow's edit model has its own steps; MOSS-Image's edits their steps and guidance (MOSS_EDIT_STEPS)
     if mage and edits:
         job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")})
-    elif moss and edits:
+    elif moss and edits:   # Moss-Image-Edit's steps and guidance; an ai-toolkit adapter's are MOSS-Image's own
         dflt = model_defaults(cfg)
-        job = parse_request(req, {**cfg, "steps": dflt["edit_steps"], "cfg_scale": dflt["edit_guidance"]})
+        fmt = moss_edit_format(cfg)
+        job = parse_request(req, {**cfg, "steps": dflt["edit_steps"], "cfg_scale": dflt["edit_guidance"]}
+                            if fmt == "moss-image-edit" else cfg)
+        job["edit_format"] = fmt
     else:
         job = parse_request(req, cfg)
     if edits:
         job["refs"] = list(images)
-        if moss:   # the references at about 1 MP (Crop and Stitch's first, the picture the engine cuts from, as it is)
+        # the references at about 1 MP (Crop and Stitch's first, the picture the engine cuts from, as it is: an
+        # ai-toolkit edit's cut again at the references' size beside the drawing's base, _crop_ref)
+        if moss:
             keep = 1 if crop is not None and not crop.get("empty") else 0
-            job["refs"] = job["refs"][:keep] + [moss_ref(r) for r in job["refs"][keep:]]
+            if job["edit_format"] == "moss-image-edit":
+                job["refs"] = job["refs"][:keep] + [moss_ref(r) for r in job["refs"][keep:]]
+            else:
+                job["refs"] = job["refs"][:keep] + [moss_ref(r, MOSS_AITK_REF_PIXELS, grow=False)
+                                                    for r in job["refs"][keep:]]
             job["edit_lora"] = cfg["edit_lora"]
     else:
         job["init"] = images[0]
@@ -962,8 +987,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job["width"], job["height"] = w0, h0
         if moss and edits and len(images) > 1 and not crop.get("empty") and not crop["whole"]:   # CROP_REFINE_STRENGTH
             job["crop"] = crop_whole(cfg, w0, h0, crop["blend"])
-            job["refine"] = {"crop": crop, "strength": CROP_REFINE_STRENGTH,
-                             "steps_run": strength_run(job["steps"], CROP_REFINE_STRENGTH)}
+            if parse_flag(req.get("refine"), "refine"):
+                job["refine"] = {"crop": crop, "strength": CROP_REFINE_STRENGTH,
+                                 "steps_run": strength_run(job["steps"], CROP_REFINE_STRENGTH)}
     if strength is not None and strength < 1:
         run = strength_run(job["steps"], strength)
         if run < 1:
@@ -1099,25 +1125,32 @@ def crop_whole(cfg: dict, W: int, H: int, blend: int = CROP_BLEND) -> dict:
             "whole": True}
 
 
-def crop_word(crop: dict) -> str:
-    """The engine's CROP: word of a plan_crop plan."""
+def crop_word(crop: dict, ref: tuple[int, int] | None = None) -> str:
+    """The engine's CROP: word of a plan_crop plan; `ref` the first reference's size beside the drawing's base (the box
+    cut at it: an ai-toolkit MOSS-Image edit's, moss_ref_size)."""
     x, y, w, h = crop["box"]
-    return f" CROP:{x},{y},{w},{h},{crop['blend']},{crop['size'][0]},{crop['size'][1]}"
+    word = f" CROP:{x},{y},{w},{h},{crop['blend']},{crop['size'][0]},{crop['size'][1]}"
+    return word + (f",{ref[0]},{ref[1]}" if ref else "")
 
 
-def crop_wanted(req: dict, cfg: dict) -> bool:
-    """Whether an edit with a mask is drawn by Crop and Stitch: the request's crop_stitch, else the config's (on by
-    default)."""
-    v = req.get("crop_stitch")
+def parse_flag(v, name: str) -> bool | None:
+    """A request's true or false (a form's "on", "1", "off", "0" too) -> None when it is not given."""
     if v is None or v == "":
-        return cfg.get("crop_stitch") is not False
+        return None
     if isinstance(v, bool):
         return v
     if str(v).lower() in ("true", "on", "1"):
         return True
     if str(v).lower() in ("false", "off", "0"):
         return False
-    raise ImageRequestError("crop_stitch: true or false")
+    raise ImageRequestError(f"{name}: true or false")
+
+
+def crop_wanted(req: dict, cfg: dict) -> bool:
+    """Whether an edit with a mask is drawn by Crop and Stitch: the request's crop_stitch, else the config's (on by
+    default)."""
+    v = parse_flag(req.get("crop_stitch"), "crop_stitch")
+    return cfg.get("crop_stitch") is not False if v is None else v
 
 
 def ref_size(ref_w: int, ref_h: int) -> tuple[int, int]:
@@ -1193,10 +1226,11 @@ def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> l
     an edit's MF_EDIT_HEAD, each reference "Image j: <pad>" before the instruction); MOSS-Image's in its pipeline's
     (the user's turn and the assistant's opened with <think>, MOSS_PROMPT_HEAD and MOSS_PROMPT_TAIL; Qwen3.5-9B's
     tokenizer)."""
-    if family == "moss-image":
-        text = MOSS_PROMPT_HEAD + prompt + MOSS_PROMPT_TAIL
-        at = len(MOSS_PROMPT_HEAD)
-        return tok.encode(text, parse_special=True, plain=[(at, at + len(prompt))])
+    if family == "moss-image":   # `refs`: an ai-toolkit edit's pictures, each "Picture N: <pad>" before the prompt
+        head = MOSS_PROMPT_HEAD + "".join(f"Picture {i + 1}: <|vision_start|><|image_pad|><|vision_end|>"
+                                          for i in range(refs))
+        text = head + prompt + MOSS_PROMPT_TAIL
+        return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
     if family == "mage-flow":
         head = MF_EDIT_HEAD + "".join(MF_EDIT_REF.format(i=i + 1) for i in range(refs)) if refs else MF_PROMPT_HEAD
     else:
@@ -1379,14 +1413,96 @@ def can_edit(cfg: dict) -> bool:
     return bool(cfg.get("vision")) and not (cfg.get("family") == "mage-flow" and not cfg.get("edit_model"))
 
 
-def moss_ref(data: bytes) -> bytes:
-    """A MOSS-Image edit's reference image at about 1024 x 1024 pixels in its shape, sides multiples of 16 (Lanczos;
-    MOSS_EDIT_STEPS' note), as a PNG; one already that size as it is."""
+def moss_edit_adapter(cfg: dict) -> dict:
+    """The config section's MOSS-Image edit adapter, chosen among its "edit_adapters" (setup's: {name: {"lora",
+    "format", "vision"}}) by XESTRATA_MOSS_EDIT, else its "edit_adapter", else MOSS_EDIT_DEFAULT -> the section's
+    fields for it (edit_lora, edit_format, vision: the text encoder's vision encoder where its layout needs one); {}
+    for a section without them (its edit_lora as it is).  ValueError for a name it has not, or a file not there."""
+    adapters = cfg.get("edit_adapters") or {}
+    if not adapters:
+        return {}
+    name = os.environ.get("XESTRATA_MOSS_EDIT") or cfg.get("edit_adapter") or MOSS_EDIT_DEFAULT
+    if name not in adapters:
+        raise ValueError(f"MOSS-Image's edit adapter {name!r} (XESTRATA_MOSS_EDIT or the config's \"edit_adapter\"): "
+                         f"one of {', '.join(adapters)}")
+    a = adapters[name]
+    for path in (a.get("lora"), a.get("vision")):
+        if path and not Path(path).is_file():
+            raise ValueError(f"MOSS-Image's edit adapter {name}: {path} is not there (run setup with --images again)")
+    return {"edit_adapter": name, "edit_lora": a["lora"], "edit_format": a.get("format") or "",
+            "vision": a.get("vision")}
+
+
+def moss_edit_format(cfg: dict) -> str:
+    """The layout of the config's MOSS-Image edit adapter (MOSS_EDIT_FORMATS): the config's "edit_format", else the
+    file's: Moss-Image-Edit's where its metadata's adapter_config says "moss-edit-lora", else ai-toolkit's (an
+    ai-toolkit file says only that it is ai-toolkit's, not how its references were laid out: its kv_cache on, the
+    default; SimpleTuner's edit adapters, its metadata's modelspec.architecture "moss_image-sft-edit/lora", are trained
+    in that layout as well)."""
+    fmt = cfg.get("edit_format")
+    if fmt:   # setup's edit_adapters say it; a config of its own may
+        if fmt not in MOSS_EDIT_FORMATS:
+            raise ImageRequestError(f'images "edit_format": {", ".join(MOSS_EDIT_FORMATS)}')
+        return fmt
+    return _adapter_format(cfg["edit_lora"])
+
+
+@functools.lru_cache(maxsize=8)
+def _adapter_format(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            meta = json.loads(f.read(n)).get("__metadata__") or {}
+        conf = json.loads(meta.get("adapter_config") or "{}")
+    except (OSError, ValueError, struct.error):
+        return "ai-toolkit"
+    return "moss-image-edit" if isinstance(conf, dict) and conf.get("format") == "moss-edit-lora" else "ai-toolkit"
+
+
+def moss_picture(data: bytes, box: list | None = None) -> bytes:
+    """A picture the text encoder of an ai-toolkit MOSS-Image edit sees, as ComfyUI's TextEncodeMOSSImageEdit makes it:
+    the image (or its `box`, x y w h, its parts past the edges the edges' copies) shrunk by area to at most
+    MOSS_PICTURE_PIXELS, then its sides rounded to multiples of 32 (bilinear; process_qwen2vl_images) -> a PNG."""
+    import io
+    from PIL import Image
+    im = Image.open(io.BytesIO(data)).convert("RGBA")
+    if box is not None:
+        x, y, w, h = box
+        if x < 0 or y < 0 or x + w > im.width or y + h > im.height:   # the edges copied past them
+            import numpy as np
+            a = np.asarray(im)
+            ys = np.clip(np.arange(y, y + h), 0, im.height - 1)
+            xs = np.clip(np.arange(x, x + w), 0, im.width - 1)
+            im = Image.fromarray(np.ascontiguousarray(a[ys][:, xs]), "RGBA")
+        else:
+            im = im.crop((x, y, x + w, y + h))
+    k = min(1.0, (MOSS_PICTURE_PIXELS / (im.width * im.height)) ** 0.5)
+    if k < 1.0:
+        im = im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))), Image.BOX)
+    w, h = (max(32, round(v / 32) * 32) for v in im.size)
+    if (w, h) != im.size:
+        im = im.resize((w, h), Image.BILINEAR)
+    out = io.BytesIO()
+    im.save(out, format="PNG", compress_level=1)
+    return out.getvalue()
+
+
+def moss_ref_size(w0: int, h0: int, pixels: int = 1024 * 1024, grow: bool = True) -> tuple[int, int]:
+    """The size moss_ref makes a w0 x h0 image."""
+    if not grow:
+        pixels = min(pixels, w0 * h0)
+    tw = (pixels * w0 / h0) ** 0.5
+    w, h = (max(SIZE_STEP, round(v / SIZE_STEP) * SIZE_STEP) for v in (tw, tw * h0 / w0))
+    return w, h
+
+
+def moss_ref(data: bytes, pixels: int = 1024 * 1024, grow: bool = True) -> bytes:
+    """A MOSS-Image edit's reference image at about `pixels` pixels in its shape (`grow` false: at most that many),
+    sides multiples of 16 (Lanczos; MOSS_EDIT_STEPS' note), as a PNG; one already that size as it is."""
     import io
     from PIL import Image
     w0, h0 = image_dims(data)
-    tw = (1024 * 1024 * w0 / h0) ** 0.5
-    w, h = (max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP) for v in (tw, tw * h0 / w0))
+    w, h = moss_ref_size(w0, h0, pixels, grow)
     if (w, h) == (w0, h0):
         return data
     out = io.BytesIO()
@@ -1730,6 +1846,8 @@ class ImageGen:
         if reload not in ("lazy", "eager"):
             raise ValueError(f'images "reload" must be lazy or eager, not {reload!r}')
         self.family = self.cfg.get("family") or "qwen-image"
+        if self.family == "moss-image":   # its edit adapter, as the config or the environment chooses
+            self.cfg.update(moss_edit_adapter(self.cfg))
         for k in self._file_keys():
             if not isinstance(self.cfg.get(k), str) or not self.cfg[k]:
                 raise ValueError(f'the config\'s "images" section needs "{k}" (run setup with --images again)')
@@ -1920,10 +2038,13 @@ class ImageGen:
                     neg_parts = anima_tokens(self.tok, self.t5, job["negative_prompt"])
                     job["neg_ids"], job["neg_t5"], job["neg_t5_w"] = neg_parts
             else:
-                ids = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
+                # MOSS-Image's references are pictures of the prompt only for an ai-toolkit adapter
+                refs = (len(job.get("refs") or ()) if self.family != "moss-image" or
+                        job.get("edit_format", "").startswith("ai-toolkit") else 0)
+                ids = prompt_ids(self.tok, model_prompt(job), refs, self.family)
                 neg = None
                 if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
-                    neg = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()), self.family)
+                    neg = prompt_ids(self.tok, job["negative_prompt"], refs, self.family)
                 if self.family == "moss-image":   # its pipeline's max_sequence_length
                     for what, x in (("prompt", ids), ("negative_prompt", neg or ())):
                         if len(x) > MOSS_MAX_IDS:
@@ -2003,7 +2124,8 @@ class ImageGen:
 
     def stage(self, job: dict) -> None:
         """An edit's reference images, img2img's image and a mask into files the engine reads (job["ref_paths"],
-        job["init_path"], job["mask_path"]); unstage removes them."""
+        job["init_path"], job["mask_path"]); an ai-toolkit MOSS-Image edit's pictures too (job["pic_paths"],
+        moss_picture: the first one Crop and Stitch's box of it); unstage removes them."""
         if (job.get("refs") or job.get("init")) and not job.get("ref_dir"):
             work = Path(tempfile.mkdtemp(prefix="refs-", dir=self.dir))
             job["ref_dir"] = str(work)
@@ -2012,6 +2134,13 @@ class ImageGen:
                 p = work / f"ref_{i}"
                 p.write_bytes(data)
                 job["ref_paths"].append(str(p))
+            if job.get("edit_format", "").startswith("ai-toolkit") and job.get("refs"):
+                crop = job.get("crop") or {}
+                job["pic_paths"] = []
+                for i, data in enumerate(job["refs"]):
+                    p = work / f"pic_{i}"
+                    p.write_bytes(moss_picture(data, crop.get("box") if i == 0 and crop.get("box") else None))
+                    job["pic_paths"].append(str(p))
             for key in ("init", "mask"):
                 if job.get(key):
                     p = work / key
@@ -2021,12 +2150,23 @@ class ImageGen:
     @staticmethod
     def unstage(job: dict) -> None:
         files = ("init_path", "mask_path", "te_path", "neg_te_path")
-        for p in (job.pop("ref_paths", []) or []) + [job.pop(k) for k in files if job.get(k)]:
+        for p in ((job.pop("ref_paths", []) or []) + (job.pop("pic_paths", []) or [])
+                  + [job.pop(k) for k in files if job.get(k)]):
             with contextlib.suppress(OSError):
                 os.unlink(p)
         if job.get("ref_dir"):
             with contextlib.suppress(OSError):
                 os.rmdir(job.pop("ref_dir"))
+
+    @staticmethod
+    def _crop_ref(job: dict) -> tuple[int, int] | None:
+        """An ai-toolkit MOSS-Image edit's first reference beside a Crop and Stitch drawing: the cut at the references'
+        size (MOSS_AITK_REF_PIXELS), as the other references are, where it is smaller than the drawing."""
+        if not (job.get("edit_format", "").startswith("ai-toolkit") and job.get("refs")):
+            return None
+        gw, gh = job["crop"]["gen"]
+        ref = moss_ref_size(gw, gh, MOSS_AITK_REF_PIXELS, grow=False)
+        return ref if ref != (gw, gh) else None
 
     @staticmethod
     def _refs_words(job: dict, need: bool = False) -> str:
@@ -2035,7 +2175,10 @@ class ImageGen:
         base image (an edit's first reference) is counted by INIT:- when no mask or init image names it."""
         words = ("".join(f" REF:{p}" for p in job.get("ref_paths") or ())
                  + (f" MASK:{job['mask_path']}" if job.get("mask_path") else "")
-                 + (crop_word(job["crop"]) if job.get("crop") and not job["crop"].get("empty") else "")
+                 + (crop_word(job["crop"], ImageGen._crop_ref(job)) if job.get("crop") and not job["crop"].get("empty")
+                    else "")
+                 + (" EDITFMT:aitk" if job.get("edit_format", "").startswith("ai-toolkit") else "")
+                 + "".join(f" PIC:{p}" for p in job.get("pic_paths") or ())
                  + (f" INIT:{job['init_path']}" if job.get("init_path") else "")
                  + (f" TE:{job['te_path']}" if job.get("te_path") else "")
                  + (f" NEGTE:{job['neg_te_path']}" if job.get("neg_te_path") else ""))
@@ -2054,8 +2197,7 @@ class ImageGen:
             self._ready()
             w, h = made_size(job)
             self.stage(job)
-            n = len(self.ids(job)) - self.drop_of(job)
-            neg = f" NEG:{len(job['neg_ids']) - self.drop_of(job)}" if job.get("cfg") else ""
+            n, neg = self._need_counts(job)
             got = self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}",
                                   "NEED", 600)
             if job.get("refine"):   # the second pass's too: the larger of each
@@ -2063,17 +2205,29 @@ class ImageGen:
                 self.stage(job2)
                 try:
                     w2, h2 = made_size(job2)
-                    two = self.engine.ask(f"NEED {w2} {h2} {n}{self._refs_words(job2, need=True)}{neg}"
+                    n2, neg2 = self._need_counts(job2)
+                    two = self.engine.ask(f"NEED {w2} {h2} {n2}{self._refs_words(job2, need=True)}{neg2}"
                                           f"{self._lora_words(job2)}", "NEED", 600)
                 finally:
                     self._unstage_refine(job2)
                 got = {k: max(v, two.get(k, v)) if k in ("least_mib", "full_mib") else v for k, v in got.items()}
             return got
 
+    def _need_counts(self, job: dict) -> tuple[int, str]:
+        """NEED's prompt ids after the system turn and its NEG: word, an ai-toolkit MOSS-Image edit's pictures counted
+        at their tokens (the engine widens each picture's <|image_pad|> to them, in both prompts)."""
+        sizes = [image_dims(Path(p).read_bytes()) for p in job.get("pic_paths") or ()]
+        wide = sum((pw // 32) * (ph // 32) - 1 for pw, ph in sizes)
+        n = len(self.ids(job)) - self.drop_of(job) + wide
+        if not job.get("cfg"):   # the negative prompt has the same pictures before it (ids)
+            return n, ""
+        return n, f" NEG:{len(job['neg_ids']) - self.drop_of(job) + wide}"
+
     def _refine_job(self, job: dict, picture: bytes | None = None) -> dict:
         """The second pass of a job with "refine" (CROP_REFINE_STRENGTH): its Crop and Stitch plan and strength, the
         first pass's `picture` as the first reference (the first image's until then), its own files staged."""
-        job2 = {k: v for k, v in job.items() if k not in ("ref_dir", "ref_paths", "mask_path", "init_path", "refine")}
+        job2 = {k: v for k, v in job.items()
+                if k not in ("ref_dir", "ref_paths", "pic_paths", "mask_path", "init_path", "refine")}
         job2.update(crop=job["refine"]["crop"], strength=job["refine"]["strength"],
                     steps_run=job["refine"]["steps_run"])
         if picture is not None:
@@ -2083,7 +2237,8 @@ class ImageGen:
     @staticmethod
     def _unstage_refine(job2: dict) -> None:
         """A second pass's own files removed (the text states' files are the first pass's: unstage would take them)."""
-        for p in (job2.get("ref_paths") or []) + [job2[k] for k in ("mask_path", "init_path") if job2.get(k)]:
+        for p in ((job2.get("ref_paths") or []) + (job2.get("pic_paths") or [])
+                  + [job2[k] for k in ("mask_path", "init_path") if job2.get(k)]):
             with contextlib.suppress(OSError):
                 os.unlink(p)
         if job2.get("ref_dir"):
@@ -2510,6 +2665,9 @@ TOOLS: list[dict[str, Any]] = [
          "strength": {"type": "number",
                       "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
                                      "default 1 for an edit, 0.87 for img2img (less with few steps)"},
+         "refine": {"type": "boolean",
+                    "description": "MOSS-Image, with a painted part and more images than the one edited: draw "
+                                   "the part again after the whole picture, finer, in about 1.6 times the time"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
 ]
@@ -2531,6 +2689,22 @@ def skill(name: str) -> str:
     except FileNotFoundError:
         return ""
     return re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.S).strip()
+
+
+def skill_when(name: str) -> str:
+    """A skill's "When:" line (when the chat's model reads it): its line in image_skill's index."""
+    m = re.search(r"^When: (.+)$", skill(name), flags=re.M)
+    return m.group(1).strip() if m else ""
+
+
+# image_skill's index, the skills of each kind in the order they are joined (a later kind wins where they differ): the
+# models' catalog (with several models), the prompt style's (booru.md, natural.md), a model's own or its family's, a
+# tool's (image_skills/tools/<tool>.md)
+SKILL_KINDS = ("catalog", "style", "model", "tool")
+SKILL_MODELS = "models"   # the catalog: what each image model offered is made for (the tools' "model" choice)
+SKILL_MODELS_WHEN = "choosing the image model: what each one is made for."
+SKILL_TOOL = "image_skill"
+SKILL_READ = " Before writing its prompt, read the skills it needs with image_skill."
 
 
 def fit_mask(mask: bytes, image: bytes) -> bytes:
@@ -2635,7 +2809,8 @@ class ImageTools:
     (template_tools, routes, call, settings)."""
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
-                 model: str | None = None, mask: bytes | None = None, user: dict | None = None):
+                 model: str | None = None, mask: bytes | None = None, user: dict | None = None,
+                 skills: str = "index"):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
         if model is not None:   # the request's own image model (strata_images {"model": ...}): that one alone
@@ -2654,6 +2829,11 @@ class ImageTools:
             if self.models is None and gen.family != "moss-image":
                 gen = moss[0]
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
+        # the skills: "index", the tools' short descriptions and image_skill, whose description carries common.md and
+        # the index of the rest, the chat's model reading those it needs (a chat that makes no image carries no more);
+        # "inline", every skill of the models offered in the tools' descriptions (the image button's request, which is
+        # an image's for certain, and the Responses route's image_generation tool)
+        self.skills = skills
         # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
         # background, over what the model's call says (size "auto": the call's)
         self.options = {k: v for k, v in (options or {}).items()
@@ -2692,17 +2872,15 @@ class ImageTools:
             if t["name"] == "edit_image" and self.user.get("layout") is not None and self.user.get("mask") is None:
                 continue
             t = dict(t)
-            styles: dict[str, list[str]] = {}
-            rules: dict[str, list[str]] = {}
-            for g in gens:
-                own = g.model.removesuffix("-uncensored")
-                styles.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", []).append(g.model)
-                rules.setdefault(own if skill(own) else g.family, []).append(g.model)
-            t["description"] = "\n\n".join(
-                [t["description"], skill("common")]
-                + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
-                   for name, models in styles.items() if (text := skill(name))]
-                + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
+            if self.skills == "inline":
+                styles, rules = self._skill_groups(gens)
+                t["description"] = "\n\n".join(
+                    [t["description"], skill("common")]
+                    + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
+                       for name, models in styles.items() if (text := skill(name))]
+                    + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
+            else:
+                t["description"] += SKILL_READ
             if t["name"] == "edit_image" and self.attached():
                 t["description"] += ("\n\nThe pictures the user attached to their last message go with the edit as "
                                      "reference images after the image it edits: the image edited is image 1, the "
@@ -2740,10 +2918,8 @@ class ImageTools:
                     "required": ["items"]}}
                 t["parameters"] = params
             if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
-                about = _qimage().ABOUT
-                choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
-                lines = "; ".join(f"{g.model}: {about.get(choice.get(g.model, ''), '') or self._about(g)}".rstrip(": ")
-                                  for g in gens)
+                lines = ("; ".join(self._model_lines(gens)) if self.skills == "inline" else
+                         f"image_skill's {SKILL_MODELS} says what each is made for")
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "model": {
                     "type": "string", "enum": [g.model for g in gens],
@@ -2751,7 +2927,89 @@ class ImageTools:
                                    f"({lines}); default {gens[0].model}"}}
                 t["parameters"] = params
             out.append(t)
+        if self.skills != "inline" and out and SKILL_TOOL not in exclude:
+            out.append(self._skill_tool([t["name"] for t in out]))
         return out
+
+    def _model_lines(self, gens: list) -> list[str]:
+        """Each model's name and what it is made for (the catalog's ABOUT, else _about)."""
+        about = _qimage().ABOUT
+        choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
+        return [f"{g.model}: {about.get(choice.get(g.model, ''), '') or self._about(g)}".rstrip(": ") for g in gens]
+
+    @staticmethod
+    def _skill_groups(gens: list) -> tuple[dict, dict]:
+        """The prompt styles and the model skills of `gens`: {skill: [model, ...]} each (a model's own skill, by its
+        name without -uncensored, else its family's)."""
+        styles: dict[str, list[str]] = {}
+        rules: dict[str, list[str]] = {}
+        for g in gens:
+            own = g.model.removesuffix("-uncensored")
+            styles.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", []).append(g.model)
+            rules.setdefault(own if skill(own) else g.family, []).append(g.model)
+        return styles, rules
+
+    def _skill_index(self, tools: list[str]) -> dict[str, tuple[str, list[str]]]:
+        """The skills the chat's model may read for this request: {name: (kind, the models it is for)}, the styles' and
+        the models' of the models offered, and the tools' of the tools offered (`tools`) - only those with a file."""
+        styles, rules = self._skill_groups(self._gens())
+        out: dict[str, tuple[str, list[str]]] = {}
+        if len(self._gens()) > 1:   # what each model is made for: the tools' model choice
+            out[SKILL_MODELS] = ("catalog", [])
+        for name, models in styles.items():
+            if skill(name):
+                out[name] = ("style", models)
+        for name, models in rules.items():
+            if skill(name):
+                out[name] = ("model", models)
+        for name in tools:
+            if skill(f"tools/{name}"):
+                out[name] = ("tool", [])
+        return out
+
+    def _skill_tool(self, tools: list[str]) -> dict:
+        """image_skill: its description common.md, which models take which prompt style, and the index (each skill's
+        name and its "When:" line); it reads the skills named, several at once."""
+        index = self._skill_index(tools)
+        lines = [f"- {name}: {SKILL_MODELS_WHEN if k == 'catalog' else skill_when(name)}"
+                 for kind in SKILL_KINDS for name, (k, _) in index.items() if k == kind]
+        # which models take which style, by their families (a model with a style of its own, MageTrail, by its name)
+        kinds: dict[str, list[str]] = {}
+        for g in self._gens():
+            own = g.model.removesuffix("-uncensored")
+            key = own if own in PROMPT_STYLE else g.family
+            names = kinds.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", [])
+            if key not in names:
+                names.append(key)
+        style = "; ".join(f"{STYLE_NAME[name]} for the {' and '.join(fams)} models" for name, fams in kinds.items())
+        text = ("Read the image skills a request needs before an image tool's call: the names, several at once (the "
+                "prompt style's, the image model's, the tool's).\n\n" + skill("common")
+                + (f"\n\nPrompts are written in {style}." if style else "") + "\n\nSkills:\n" + "\n".join(lines))
+        return {"name": SKILL_TOOL, "description": text,
+                "parameters": {"type": "object", "properties": {
+                    "names": {"type": "array", "items": {"type": "string", "enum": list(index)},
+                              "description": "the skills to read"}},
+                    "required": ["names"]}}
+
+    def _read_skills(self, arguments) -> dict:
+        """image_skill's call: the skills named, in the order of SKILL_KINDS (style, model, tool), each once."""
+        t0 = time.monotonic()
+        index = self._skill_index([t["name"] for t in self.template_tools(exclude={SKILL_TOOL})])
+        names = arguments.get("names") if isinstance(arguments, dict) else None
+        if isinstance(names, str):
+            names = [names]
+        if not isinstance(names, list) or not names or any(n not in index for n in names):
+            text = f"error: names: some of {', '.join(index)}"
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False,
+                    "ms": round((time.monotonic() - t0) * 1000), "server": None, "tool": SKILL_TOOL, "images": []}
+        picked = [n for kind in SKILL_KINDS for n in dict.fromkeys(names) if index[n][0] == kind]
+        body = "\n\n".join("# Image models\n\n" + "\n".join(f"- {line}" for line in self._model_lines(self._gens()))
+                           if index[n][0] == "catalog" else skill(n if index[n][0] != "tool" else f"tools/{n}")
+                           for n in picked)
+        if len(picked) > 1:
+            body = "Where these differ, the later one wins.\n\n" + body
+        return {"ok": True, "text": body, "chars": len(body), "truncated": False,
+                "ms": round((time.monotonic() - t0) * 1000), "server": None, "tool": SKILL_TOOL, "images": []}
 
     @staticmethod
     def _about(g) -> str:
@@ -2814,6 +3072,8 @@ class ImageTools:
         return None
 
     def call(self, name: str, arguments, cancel: threading.Event | None = None) -> dict:
+        if name == SKILL_TOOL:   # reading skills makes no image: not one of max_tool_calls' calls
+            return self._read_skills(arguments)
         t0 = time.monotonic()
         if self.max_calls is not None and self.calls >= self.max_calls:
             text = f"error: not run: this response may make {self.max_calls} image tool call(s) (max_tool_calls)"
@@ -2843,6 +3103,8 @@ class ImageTools:
                 req["layout"] = tidy_layout(layout, w, h)
             if name == "edit_image" and args.get("strength") not in (None, ""):
                 req["strength"] = args["strength"]
+            if name == "edit_image" and args.get("refine") not in (None, ""):
+                req["refine"] = args["refine"]
             gens = self._gens(name == "edit_image")
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
@@ -2994,6 +3256,8 @@ def text_states(svc, gen: ImageGen, job: dict) -> None:
     eng = getattr(svc, "engine", None)
     te = gen.cfg.get("llm")
     slots = getattr(eng, "batch", 0)
+    if job.get("pic_paths") or (job.get("edit_format", "").startswith("ai-toolkit") and job.get("refs")):
+        return   # its text encoder sees the pictures: the image engine's, with the vision encoder
     if (not te or eng is None or not hasattr(eng, "encode") or slots or not eng.alive()
             or not same_model_file(getattr(eng, "model_path", ""), te)):
         return

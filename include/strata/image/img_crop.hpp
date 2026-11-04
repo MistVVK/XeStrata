@@ -28,10 +28,13 @@ struct CropBox {
     int64_t x = 0, y = 0, w = 0, h = 0;   // the box on the picture, which may reach past its edges
     int64_t blend = 32;                    // mask_blend_pixels: the mask's growth and blur, in the picture's pixels
     int64_t width = 0, height = 0;         // the picture's size, as the server read it
+    // the first reference beside the drawing's base, the box at this size (an ai-toolkit MOSS-Image edit's, whose
+    // references are smaller than the drawing); 0: the base is the reference
+    int64_t ref_w = 0, ref_h = 0;
 };
 
-/// The IMG and NEED lines' CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height> -> the box; std::invalid_argument when the
-/// word is not that.
+/// The IMG and NEED lines' CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height>[,<ref_w>,<ref_h>] -> the box;
+/// std::invalid_argument when the word is not that.
 CropBox parse_crop(const std::string& word);
 
 class CropStitch {
@@ -43,15 +46,18 @@ public:
     /// The drawing's base image (the box at gw x gh) and its mask (alpha 0 where the model redraws, 255 elsewhere).
     const QiRef& crop() const { return crop_; }
     const QiRef& regen() const { return regen_; }
+    /// The box at the box's ref_w x ref_h (Lanczos, from the picture as the base is), when it asks for one.
+    const QiRef& ref() const { return ref_; }
     /// The drawing's edit share (the grown and blurred mask at gw x gh, before the blend mask's blur): the sampler's
     /// mask (QiRequest::mask_share), as ComfyUI's noise mask is the cropped mask, so that the blurred edge follows the
     /// picture rather than being drawn anew and blended over it.
     const std::vector<float>& share() const { return share_; }
     /// The drawing (RGBA8, gw x gh) put back into the picture -> the picture (RGBA8, at its own size).
     std::vector<uint8_t> stitch(const std::vector<uint8_t>& made) const;
-    /// The VRAM the steps take at most, for a picture of width x height, a box of w x h and a drawing of gw x gh (none
-    /// of it is held while the model draws).
-    static uint64_t bytes(int64_t width, int64_t height, int64_t w, int64_t h, int64_t gw, int64_t gh);
+    /// The VRAM the steps take at most, for a picture of width x height, a box of w x h, a drawing of gw x gh and a
+    /// reference of rw x rh (none of it is held while the model draws).
+    static uint64_t bytes(int64_t width, int64_t height, int64_t w, int64_t h, int64_t gw, int64_t gh, int64_t rw = 0,
+                          int64_t rh = 0);
 
 private:
     std::vector<uint8_t> base_;   // the picture, RGBA8
@@ -59,7 +65,7 @@ private:
     std::vector<float> share_;    // the edit share at gw x gh
     CropBox box_;
     int64_t gw_ = 0, gh_ = 0;
-    QiRef crop_, regen_;
+    QiRef crop_, regen_, ref_;
 };
 
 }  // namespace strata::image

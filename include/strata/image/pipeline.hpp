@@ -35,6 +35,11 @@ struct QiRequest {
     int64_t steps = 0;          // with no sigmas: the sampler's steps (0: the model's own).  HunyuanImage 3.0's
                                 // schedule is the shift of its own sampler; a fixed-schedule model leaves this.
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
+    // MOSS-Image's edits with an ai-toolkit adapter (its layout: MossDit::set_refs's text_start false): the pictures
+    // the text encoder sees, each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens:
+    // its sides, multiples of 32, over 32 each), their tokens' rows from the vision encoder
+    bool refs_aitk = false;
+    std::vector<QiRef> pictures;
     QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
                                 // alpha 0 where the image changes); empty: none
     std::vector<float> mask_share;   // with a mask, its edit share by pixel at width x height (Crop and Stitch's,

@@ -817,13 +817,17 @@ void MossDit::build_lora_targets() {
         add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, true);
         add(p + "ffn_down", b.down, 0, b.down.n, 0, true);
     }
-    // the 42 blocks: proj.q, proj.k, proj.v, proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
+    // the 42 blocks: proj.q, proj.k, proj.v (or one proj.qkv, its rows q's, k's and v's, as a trainer that fuses them
+    // writes it: ComfyUI cuts it the same way), proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const std::string p = "layers." + std::to_string(bi) + ".proj.";
         Block& b = blocks_[(size_t) bi];
         add(p + "q", b.q, 0, b.q.n, 0, false);
         add(p + "k", b.k, 0, b.k.n, 0, false);
         add(p + "v", b.v, 0, b.v.n, 0, false);
+        add(p + "qkv", b.q, 0, b.q.n, 0, false);
+        add(p + "qkv", b.k, 0, b.k.n, b.q.n, false);
+        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n, false);
         add(p + "o", b.o, 0, b.o.n, 0, false);
         add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0, false);
         add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0, false);
@@ -1191,19 +1195,21 @@ void rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(i
 
 // a context's tables: the image's rows (0, the text's length, row and column centred), then the text's (0, i, 0, 0)
 void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
-    if (c.rope_h == h && c.rope_w == w && c.rope_rows == c.rows) return;
+    // an ai-toolkit adapter's references (set_refs): the image's and the text's f moved back by the text's rows
+    const int64_t off = ref_rows_ > 0 && !ref_text_start_ ? -c.rows : 0;
+    if (c.rope_h == h && c.rope_w == w && c.rope_rows == c.rows && c.rope_off == off) return;
     const int64_t HW = h * w, L = c.rows;
     std::vector<float> cv, sv;
     rope_rows(HW + L, hd_, rope_base_, [&](int64_t r, float* p) {
         if (r < HW) {
             const int64_t y = r / w, x = r - y * w;
             p[0] = 0.f;
-            p[1] = (float) L;
+            p[1] = (float) (L + off);
             p[2] = (float) y - (float) (h - 1) / 2.f;
             p[3] = (float) x - (float) (w - 1) / 2.f;
         } else {
             p[0] = 0.f;
-            p[1] = (float) (r - HW);
+            p[1] = (float) (r - HW + off);
             p[2] = p[3] = 0.f;
         }
     }, cv, sv);
@@ -1217,6 +1223,7 @@ void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
     c.rope_h = h;
     c.rope_w = w;
     c.rope_rows = L;
+    c.rope_off = off;
 }
 
 // the time's embedding as the reference makes it: the sinusoid [cos, sin] of the timestep by freq / 2 frequencies
@@ -1436,8 +1443,9 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
     }
 }
 
-void MossDit::set_refs(const std::vector<RefLatent>& refs) {
+void MossDit::set_refs(const std::vector<RefLatent>& refs, bool text_start) {
     gpu::stream_sync(s_);
+    ref_text_start_ = text_start;
     for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_}) release(allocs_, p);
     ref_k16_ = ref_v16_ = nullptr;
     ref_hs_ = nullptr;

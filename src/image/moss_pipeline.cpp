@@ -142,7 +142,7 @@ bool moss_is_dit(const std::string& path) {
 }
 
 bool MossPipeline::open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err,
-                        int q8) {
+                        int q8, const std::string& vision) {
     s_ = core::Runtime::get().create_stream();
     dit_path_ = dit;
     vae_path_ = vae;
@@ -157,6 +157,16 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     if (!vae_size_->flux2()) {
         err = "image engine: MOSS-Image's VAE is the Flux2 VAE (" + vae + " is not)";
         return false;
+    }
+    vision_path_ = vision;
+    if (!vision.empty()) {   // an ai-toolkit edit adapter's pictures: Qwen3.5-9B's ViT
+        vision_size_ = std::make_unique<QiVision>();
+        if (!vision_size_->open(vision, s_, err, true)) return false;
+        try {
+            image_pad_ = (int32_t) GgufModel::open(text).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
+        } catch (const std::exception&) {
+            image_pad_ = -1;
+        }
     }
     {
         std::string no;
@@ -302,13 +312,18 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
         fixed += (R > 0 ? 0 : vae.encoder_bytes()) + LatentStart::bytes(dit.latent_channels() * h * w, h * w, true);
         base = std::max(base, vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4);
     }
-    const uint64_t te = states_given_ ? 0 : text_fixed() + 2 * te_layer_max_;
+    // an ai-toolkit edit's pictures: the vision encoder, open beside the text encoder while they are read
+    uint64_t vis = 0;
+    if (vision_size_)
+        for (const auto& [pw, ph] : pictures_)
+            vis = std::max(vis, vision_size_->weight_bytes() + vision_size_->scratch_bytes((pw / 16) * (ph / 16)));
+    const uint64_t te = (states_given_ ? 0 : text_fixed() + 2 * te_layer_max_) + vis;
     QiNeed nd;
     nd.least = fixed + dit.weight_bytes() + dit.scratch_bytes() +
                std::max({dit.activation_bytes(hw, n, max_text, 512, R) + dit.block_min(), te,
                          vae.least_scratch_bytes(h, w), base});
     nd.full = fixed + full.weight_bytes() + full.scratch_bytes() + full.block_bytes() +
-              (states_given_ ? 0 : text_fixed() + te_layers_) +
+              (states_given_ ? 0 : text_fixed() + te_layers_) + vis +
               std::max({full.activation_bytes(hw, n, max_text, 0, R), vae.scratch_bytes(h, w), base});
     nd.held = held();
     size_t free = 0, total = 0;
@@ -450,13 +465,14 @@ bool MossPipeline::open_text() {
     return true;
 }
 
-void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& out) {
+void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& out,
+                          const std::vector<MossText::Picture>& pictures) {
     if ((int64_t) ids.size() > kMaxTokens)
         throw std::invalid_argument("image engine: MOSS-Image's prompt is longer than 4096 tokens");
     open_text();
     const uint64_t before = free_vram() + te_->layers_vram();
     std::string err;
-    out = te_->encode(ids, err);
+    out = te_->encode(ids, err, pictures);
     if (out.empty()) throw std::runtime_error(err);
     // the prompt's buffers, made by the first open's first encode, are the encoder's fixed part too
     if (te_measure_ == 1) {
@@ -485,8 +501,23 @@ void MossPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStar
         vae_->drop_scratch();
         throw;
     }
-    gpu::free(rgb);
-    vae_->drop_scratch();
+    gpu::free(rgb);   // the VAE's scratch stays for the decode where the plan has room for it (generate)
+}
+
+std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>& pictures) {
+    if (vision_path_.empty() || image_pad_ < 0)
+        throw std::invalid_argument("image engine: an ai-toolkit edit's pictures need the vision encoder (--vision, "
+                                    "Qwen3.5-9B's mmproj) and a text encoder with <|image_pad|>");
+    std::string err;
+    QiVision v;
+    if (!v.open(vision_path_, s_, err)) throw std::runtime_error(err);
+    std::vector<QiVisionOut> out;
+    for (const QiRef& f : pictures) {
+        const std::vector<float> rgb = base_rgb(f, f.width, f.height);
+        out.push_back(v.encode(rgb.data(), f.width, f.height));
+    }
+    v.drop_scratch();
+    return out;
 }
 
 float* MossPipeline::encode_ref(const QiRef& f) {
@@ -508,8 +539,7 @@ float* MossPipeline::encode_ref(const QiRef& f) {
         vae_->drop_scratch();
         throw;
     }
-    gpu::free(rgb);
-    vae_->drop_scratch();
+    gpu::free(rgb);   // the VAE's scratch stays for the decode where the plan has room for it (generate)
     return z;
 }
 
@@ -527,6 +557,32 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             throw std::invalid_argument("image engine: a reference image's sides must be multiples of 16");
         ref_rows_ += (f.width / 16) * (f.height / 16);
     }
+    // an ai-toolkit edit's pictures: each <|image_pad|> of the prompt (and of the negative prompt) widened to the
+    // picture's tokens, one per 32 x 32 pixels
+    for (const QiRef& f : r.pictures)
+        if (f.width <= 0 || f.height <= 0 || f.width % 32 != 0 || f.height % 32 != 0 ||
+            f.rgba.size() != (size_t) (f.width * f.height * 4))
+            throw std::invalid_argument("image engine: a picture's sides must be multiples of 32");
+    auto widen = [&](const std::vector<int32_t>& in) {
+        if (r.pictures.empty()) return in;
+        std::vector<int32_t> out;
+        size_t k = 0;
+        for (const int32_t t : in) {
+            if (t == image_pad_ && k < r.pictures.size()) {
+                out.insert(out.end(), (size_t) ((r.pictures[k].width / 32) * (r.pictures[k].height / 32)), t);
+                ++k;
+            } else {
+                out.push_back(t);
+            }
+        }
+        if (k != 0 && k != r.pictures.size())
+            throw std::invalid_argument("image engine: the prompt's <|image_pad|> tokens are not one a picture");
+        return out;
+    };
+    const std::vector<int32_t> ids0 = widen(r.ids), ids1 = widen(r.neg_ids);
+    const std::string pics = r.pictures.empty() ? std::string() : refs_key(r.pictures);
+    if (!r.pictures.empty() && (r.te_rows > 0 || r.neg_te_rows > 0))
+        throw std::invalid_argument("image engine: the text encoder's pictures need its own states (no TE:)");
     const int64_t width = dit_size_->text_dim();
     if (r.te_rows > 0 && (int64_t) r.te.size() != r.te_rows * width)
         throw std::invalid_argument("image engine: the prompt's states are not " + std::to_string(width) + " wide");
@@ -570,8 +626,8 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     std::vector<LoraUse> dit_part, te_part;
     lora_split(r.loras, dit_part, te_part);
     const bool own = !te_part.empty();
-    const int64_t rows0 = r.te_rows > 0 && !own ? r.te_rows : (int64_t) r.ids.size();
-    const int64_t rows1 = guided ? (r.neg_te_rows > 0 && !own ? r.neg_te_rows : (int64_t) r.neg_ids.size()) : 0;
+    const int64_t rows0 = r.te_rows > 0 && !own ? r.te_rows : (int64_t) ids0.size();
+    const int64_t rows1 = guided ? (r.neg_te_rows > 0 && !own ? r.neg_te_rows : (int64_t) ids1.size()) : 0;
     ensure_open(want_q8(h * w, n, std::max(rows0, rows1)));
     MossDit& d = *dit_;
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
@@ -584,18 +640,32 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     if (stage) stage("text");
     bool cached = true;
     const std::vector<float>* st[2] = {&r.te, &r.neg_te};
+    // an ai-toolkit edit's pictures through the vision encoder, where a prompt with them is encoded
+    std::vector<QiVisionOut> vouts;
+    std::vector<MossText::Picture> pv;
+    auto pictures = [&](const std::vector<int32_t>& ids) {
+        if (r.pictures.empty() || std::find(ids.begin(), ids.end(), image_pad_) == ids.end())
+            return std::vector<MossText::Picture>{};
+        if (vouts.empty()) {
+            vouts = encode_pictures(r.pictures);
+            for (const QiVisionOut& v : vouts) pv.push_back({v.main.data(), v.grid_w, v.grid_h});
+        }
+        return pv;
+    };
     if (r.te_rows == 0 || own) {
-        if (r.ids != last_ids_) {
-            encode(r.ids, last_states_);
-            last_ids_ = r.ids;
+        if (ids0 != last_ids_ || pics != last_pics_) {
+            encode(ids0, last_states_, pictures(ids0));
+            last_ids_ = ids0;
+            last_pics_ = pics;
             cached = false;
         }
         st[0] = &last_states_;
     }
     if (guided && (r.neg_te_rows == 0 || own)) {
-        if (r.neg_ids != last_neg_ids_) {
-            encode(r.neg_ids, last_neg_states_);
-            last_neg_ids_ = r.neg_ids;
+        if (ids1 != last_neg_ids_ || pics != last_neg_pics_) {
+            encode(ids1, last_neg_states_, pictures(ids1));
+            last_neg_ids_ = ids1;
+            last_neg_pics_ = pics;
             cached = false;
         }
         st[1] = &last_neg_states_;
@@ -632,7 +702,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
                 z.push_back(encode_ref(f));
                 lat.push_back({z.back(), f.height / 16, f.width / 16});
             }
-            d.set_refs(lat);
+            d.set_refs(lat, !r.refs_aitk);
         } catch (...) {
             for (float* p0 : z) gpu::free(p0);
             throw;
@@ -641,6 +711,9 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     } else if (d.ref_rows() > 0) {
         d.set_refs({});
     }
+    // the encoders' scratch (the references', the base image's) kept for the decode only beside this image's work, as
+    // the last image's is: allocating it again at the decode cost a 1 MP edit's decode a fifth (B70, 2026-11-04)
+    if (vae_->scratch_held() > p.vae - p.activations) vae_->drop_scratch();
     const auto t1 = clock::now();
     // the seed's noise as the reference's ([channels][h][w], PyTorch's CPU randn), as the latent's tokens [h w][channels]
     const int64_t Cl = d.latent_channels(), N = Cl * h * w;

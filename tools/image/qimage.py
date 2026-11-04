@@ -48,9 +48,14 @@ transformer folder's three bf16 shards, which the engine keeps 16-bit or quantiz
 Mage-Flow's: "dit_q8"), its Flux2 VAE with a narrower decoder (fixed, bf16), and Qwen3.5-9B as its text encoder: the
 chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QUANTS, Q8_0 lowered for the RAM like
 the others').  When the chat model is that same file, setup links it instead of fetching it again and the server has
-the chat engine encode the prompts (serve/images.py's text_states).  Its edits take chinoll's Moss-Image-Edit adapter
-(PedroMarinhoDev's ComfyUI copy, GPL-3.0; "edit_lora", applied at 1 to an edit): up to four reference images, the
-instruction in the prompt.
+the chat engine encode the prompts (serve/images.py's text_states).  Its edits take an edit adapter, applied at 1:
+up to four reference images, the instruction in the prompt.  Setup fetches three ("edit_adapters"; the config's
+"edit_adapter" or XESTRATA_MOSS_EDIT chooses): chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy, GPL-3.0),
+the default - beside akhaliq's MOSS-Image-Edit-HQ armV5 (Apache 2.0) it kept the clothes a face swap was not asked to
+change, in 30 steps against 50 (the same face swap and expression through ComfyUI and the engine, 2026-11-04) - and
+armV5 and armV6 (armV5 trained on with other captions and loss, its card's experiment), ai-toolkit adapters whose
+text encoder sees the references too: Qwen3.5-9B's vision encoder (Unsloth's mmproj, the same for every size of the
+text encoder) comes with them.
 
 Anima (CircleStone Labs and Comfy Org, its own non-commercial license and NVIDIA's Open Model License; anima-base,
 anima-aesthetic, anima-turbo, and Gazingstars123's anima-2.9b): a DiT of one bf16 file (the engine keeps it 16-bit or
@@ -88,6 +93,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "OpenMOSS-Team/MOSS-Image-SFT": "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9",                     # 2026-10-27
     "OpenMOSS-Team/MOSS-Image-Base": "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",                    # 2026-10-27
     "PedroMarinhoDev/Moss-Image-Edit-ComfyUI": "908d6308cf38fed82263f09e9a334070183a18f8",          # 2026-11-04
+    "akhaliq/MOSS-Image-Edit-HQ": "ee1493ba577437e70b88bc4499b85cc7aa4594ca",                       # 2026-11-04
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "circlestone-labs/Anima": "f973fc41ec7545364ac9776c2440285f43ff2a30",                          # 2026-11-02
@@ -109,6 +115,7 @@ _HY_C = "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI"   # its quant
 _MS = "OpenMOSS-Team/MOSS-Image-SFT"
 _MB = "OpenMOSS-Team/MOSS-Image-Base"
 _ME = "PedroMarinhoDev/Moss-Image-Edit-ComfyUI"   # chinoll's Moss-Image-Edit adapter, its keys as ComfyUI's
+_MEHQ = "akhaliq/MOSS-Image-Edit-HQ"              # its armV5 and armV6, ai-toolkit adapters
 _Q35 = "unsloth/Qwen3.5-9B-GGUF"
 _Q35H = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 _Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
@@ -231,6 +238,13 @@ FILES = {
     # its edit adapter (trained on the SFT model, taken by the base model too)
     "moss-edit-lora": (_ME, "moss_image_edit_lora_bf16.safetensors", 297_419_000,
                        "f4bf2905dd40ae490ffda37d6be717f3361a4a723225cf0bf1f3b941eb03315d"),
+    "moss-edit-armv5": (_MEHQ, "weights/armV5/armV5.safetensors", 495_514_936,
+                        "1fbfae4eaaafc62c66a298e63e16fc5211566e1e3de1c58f83c35c6bc226c9f9"),
+    "moss-edit-armv6": (_MEHQ, "weights/armV6/armV6.safetensors", 495_514_936,
+                        "579d97ba2d9d12a9fad68cc2678eb3ca4ff5a2ae3a4c7689193a2e354c21f8b0"),
+    # the text encoder's vision encoder (an ai-toolkit edit adapter's pictures), one file for every size of it
+    "moss-mmproj": (_Q35, "mmproj-F16.gguf", 918_166_080,
+                    "f70dc3509053962b0d0d3ee8a7eacebf5d60aa560cad78254ae8698516ae029f"),
     "llm-moss-stock-Q4_K_M": (_Q35, "Qwen3.5-9B-Q4_K_M.gguf", 5_680_522_464,
                               "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"),
     "llm-moss-stock-Q6_K": (_Q35, "Qwen3.5-9B-Q6_K.gguf", 7_458_301_152,
@@ -370,6 +384,8 @@ MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-ba
 MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
 # files whose own name says too little
 LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors",
+               "moss-edit-armv5": "armV5-ai-toolkit.safetensors", "moss-edit-armv6": "armV6-ai-toolkit.safetensors",
+               "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
@@ -532,8 +548,9 @@ def license_note(dit: str) -> str:
                 "the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0")
     if is_moss(dit):
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
-                "too (HauhauCS's uncensored one, from it, as well).  Its edit adapter, chinoll's Moss-Image-Edit "
-                f"(PedroMarinhoDev's ComfyUI copy), is under GPL-3.0: https://huggingface.co/{_ME}")
+                "too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit "
+                f"(PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/{_ME}; akhaliq's "
+                f"MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/{_MEHQ}")
     if dit == "mf-trail":
         return (f"{name} (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: "
                 f"https://huggingface.co/{repo}; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under "
@@ -559,8 +576,8 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
     if is_moss(dit):
-        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora",
-                text_file(text_encoder, text_quant))
+        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora", "moss-edit-armv5",
+                "moss-edit-armv6", "moss-mmproj", text_file(text_encoder, text_quant))
     if is_anima(dit):
         return (f"{dit}-bf16", "anima-vae", text_file(text_encoder, text_quant), "anima-t5-tokenizer")
     if is_mage(dit):
@@ -782,7 +799,12 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "diffusion_model": str(local_path(models_dir, f"{dit}-1").parent), "steps": DITS[dit][1],
                 "schedule": "moss", "cfg_scale": MOSS_CFG, "shift": MOSS_SHIFT, "transparency": False,
                 "vae": str(local_path(models_dir, "moss-vae")),
-                "edit_lora": str(local_path(models_dir, "moss-edit-lora")),
+                "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_adapter": "chinoll",
+                "edit_adapters": {"chinoll": {"lora": str(local_path(models_dir, "moss-edit-lora")),
+                                              "format": "moss-image-edit"},
+                                  **{v: {"lora": str(local_path(models_dir, f"moss-edit-{v}")), "format": "ai-toolkit",
+                                         "vision": str(local_path(models_dir, "moss-mmproj"))}
+                                     for v in ("armv5", "armv6")}},
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):

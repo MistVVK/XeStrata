@@ -4,6 +4,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 # Anima
 
+When: an Anima model's prompt: its tag order, artists and characters, several people.
+
 - Start the prompt with `masterpiece, best quality, score_7, safe,` except with anima-aesthetic.
 - Score tags keep their underscores: `score_9`.
 - A space between a number and a noun: `2 dogs`. `1girl`, `2girls` and `1boy` stay as they are.

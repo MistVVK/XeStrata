@@ -306,8 +306,9 @@ CropBox parse_crop(const std::string& word) {
     std::vector<int64_t> v;
     std::stringstream ss(word.substr(word.rfind("CROP:", 0) == 0 ? 5 : 0));
     for (std::string tok; std::getline(ss, tok, ',');) v.push_back(std::stoll(tok));
-    if (v.size() != 7 || v[2] <= 0 || v[3] <= 0 || v[4] < 0 || v[5] <= 0 || v[6] <= 0)
-        throw std::invalid_argument("CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height>: " + word);
+    if ((v.size() != 7 && v.size() != 9) || v[2] <= 0 || v[3] <= 0 || v[4] < 0 || v[5] <= 0 || v[6] <= 0 ||
+        (v.size() == 9 && (v[7] <= 0 || v[8] <= 0)))
+        throw std::invalid_argument("CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height>[,<ref_w>,<ref_h>]: " + word);
     c.x = v[0];
     c.y = v[1];
     c.w = v[2];
@@ -315,14 +316,21 @@ CropBox parse_crop(const std::string& word) {
     c.blend = v[4];
     c.width = v[5];
     c.height = v[6];
+    if (v.size() == 9) {
+        c.ref_w = v[7];
+        c.ref_h = v[8];
+    }
     return c;
 }
 
-uint64_t CropStitch::bytes(int64_t W, int64_t H, int64_t w, int64_t h, int64_t gw, int64_t gh) {
+uint64_t CropStitch::bytes(int64_t W, int64_t H, int64_t w, int64_t h, int64_t gw, int64_t gh, int64_t rw,
+                           int64_t rh) {
     const uint64_t pic = (uint64_t) (W * H), box = (uint64_t) (w * h), gen = (uint64_t) (gw * gh);
     // prepare: the picture, its mask and a scratch; the rows' passes (the picture's 4 planes and the mask's) at the
-    // drawing's width and the box's rows; the drawing's planes, its mask and a scratch, the outputs
-    const uint64_t prep = pic * (4 + 4 + 4) + (uint64_t) (h * gw) * 5 * 4 + gen * (4 * 4 + 4 + 4 + 4 + 4);
+    // drawing's width and the box's rows; the drawing's planes, its mask and a scratch, the outputs; the reference's
+    // rows' pass, planes and output
+    const uint64_t prep = pic * (4 + 4 + 4) + (uint64_t) (h * gw) * 5 * 4 + gen * (4 * 4 + 4 + 4 + 4 + 4) +
+                          (uint64_t) (h * rw) * 4 * 4 + (uint64_t) (rw * rh) * (4 * 4 + 4);
     // stitch: the picture, the drawing, the rows' passes at the box's width and the drawing's rows, the box's planes
     // and its blend mask
     const uint64_t back = pic * 4 + gen * (4 + 4) + (uint64_t) (gh * w) * 5 * 4 + box * 5 * 4;
@@ -393,6 +401,25 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     gpu::copy(crop_.rgba.data(), out, (size_t) (4 * n));
     gpu::copy(regen_.rgba.data(), reg, (size_t) (4 * n));
     gpu::copy(blend_.data(), mt, (size_t) n * sizeof(float));
+    // the reference beside the base, when the box asks for one: the box at its size from the picture as well
+    ref_ = QiRef{};
+    if (box.ref_w > 0) {
+        const int64_t rw = box.ref_w, rh = box.ref_h, rn = rw * rh;
+        float* rp = b.get<float>((size_t) (4 * rn));
+        Resize rz(b, box.w, box.h, rw, rh, true);
+        float* mid = b.get<float>((size_t) (4 * box.h * rw));
+        rows_rgba8(pic, W, H, box.x, box.y, box.h, rz.tx, rz.lox, rz.wx, mid);
+        columns(mid, 4, box.h, rw, rz.ty, rz.loy, rz.wy, rp, 0.0f, 255.0f);
+        uint8_t* ro = b.get<uint8_t>((size_t) (4 * rn));
+        done(queue().parallel_for(sycl::range<1>((size_t) rn), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0];
+            for (int c = 0; c < 4; ++c) ro[i * 4 + c] = (uint8_t) sycl::round(rp[c * rn + i]);
+        }), "crop: reference");
+        ref_.width = rw;
+        ref_.height = rh;
+        ref_.rgba.resize((size_t) (4 * rn));
+        gpu::copy(ref_.rgba.data(), ro, (size_t) (4 * rn));
+    }
 }
 
 std::vector<uint8_t> CropStitch::stitch(const std::vector<uint8_t>& made) const {

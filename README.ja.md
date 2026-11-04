@@ -384,7 +384,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj、[拒否を外した版](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)は dealignai）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
-   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image と chinoll の編集の LoRA（Moss-Image-Edit）、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、akhaliq の MOSS-Image-Edit-HQ）、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:

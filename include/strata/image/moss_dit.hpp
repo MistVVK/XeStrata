@@ -72,12 +72,14 @@ public:
     /// and attending to each other alone, and each block's keys and values of them are kept (their v heads' scales
     /// with them); at every step the rows of each context attend to them as well, their keys before the context's
     /// own.  Called after the adapters are bound (the blocks they go through are the adapted ones); empty: none, the
-    /// kept keys and values freed.
+    /// kept keys and values freed.  `text_start` false: an ai-toolkit adapter's layout (ComfyUI's
+    /// "index_timestep_zero_isolated"), each context's image and text rows on f moved back by the context's rows (the
+    /// references keep f = 0; Moss-Image-Edit's, true, leave them where a picture without references has them).
     struct RefLatent {
         const float* tokens;
         int64_t h, w;
     };
-    void set_refs(const std::vector<RefLatent>& refs);
+    void set_refs(const std::vector<RefLatent>& refs, bool text_start = true);
     int64_t ref_rows() const { return ref_rows_; }
     /// The VRAM the kept keys and values of `rows` reference rows take.
     uint64_t ref_bytes(int64_t rows) const {
@@ -206,7 +208,7 @@ private:
         std::vector<int> skip;
         // the RoPE's tables of the context's rows, [h w + rows][64] (for the size they were made for)
         float *cos = nullptr, *sin = nullptr;
-        int64_t rope_h = -1, rope_w = -1, rope_rows = -1;
+        int64_t rope_h = -1, rope_w = -1, rope_rows = -1, rope_off = 0;
     };
     W dense(const std::vector<std::string>& names, bool biased, const float** bias, std::vector<void*>& owned,
             uint64_t& bytes);
@@ -314,7 +316,7 @@ private:
     uint16_t *ref_k16_ = nullptr, *ref_v16_ = nullptr;
     float* ref_hs_ = nullptr;
     int64_t ref_rows_ = 0;
-    bool capture_ = false;
+    bool ref_text_start_ = true, capture_ = false;
     int cur_block_ = 0;
 };
 

@@ -8365,7 +8365,7 @@ def make_handler(svc: Service):
                 image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
                                                     model=want.get("model") if isinstance(want, dict) else None,
-                                                    user=user)
+                                                    user=user, skills="inline" if image_force else "index")
                 if user:
                     images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
@@ -8711,7 +8711,7 @@ def make_handler(svc: Service):
                     mask = svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
-                                                         spec, model=fixed, mask=mask)
+                                                         spec, model=fixed, mask=mask, skills="inline")
                 if req.get("stream") is True:            # the tool's partial_images, sent as the image is made
                     self.image_tools.stream_partials(spec.get("partial_images"))
                 offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})

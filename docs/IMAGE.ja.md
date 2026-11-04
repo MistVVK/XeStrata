@@ -147,6 +147,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
+| `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6`、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
 | `crop_stitch` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
 | `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
 
@@ -270,7 +271,9 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - 切り出す範囲は、塗った部分の 1.2 倍です。参照画像が 2 枚以上のとき（「画像 2 の顔に差し替える」など）は、周りがよく分かるよう 1.6 倍です。
    - 塗った部分が大きく、切り出しても拡大にならないときは、画像全体を約 1024x1024 ピクセルで描き直し、元の大きさに戻して貼り戻します。
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
-   - MOSS-Image の編集で参照画像が 2 枚以上のときは、まず画像全体を描き、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです。時間はおよそ 1.6 倍です。
+   - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です（ComfyUI の Text Encode MOSS-Image Edit の ai-toolkit と同じ）。
+   - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです（ComfyUI の Inpaint Crop and Stitch でも同じでした）。
+     `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
    - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
@@ -457,7 +460,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
   量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
-  編集の LoRA は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit) で、setup は PedroMarinhoDev が ComfyUI の形に直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)（GPL-3.0）を取ります。
+  編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が ComfyUI の形に直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
   VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。

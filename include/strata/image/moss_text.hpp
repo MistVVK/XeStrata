@@ -36,8 +36,20 @@ public:
     bool is_open() const { return model_ != nullptr; }
     /// Frees the weights and the buffers (open again for the next text).
     void close();
-    /// [ids.size()][hidden()] floats (host); empty with `err` on a failure.
-    std::vector<float> encode(const std::vector<int32_t>& ids, std::string& err);
+    /// A picture among the prompt's tokens (an ai-toolkit edit adapter's: the text encoder sees the references): its
+    /// rows [nx ny][hidden()] (host, the vision encoder's, the merged grid's rows one after the other), the grid's
+    /// columns nx and rows ny.
+    struct Picture {
+        const float* rows;
+        int64_t nx, ny;
+    };
+    /// [ids.size()][hidden()] floats (host); empty with `err` on a failure.  `pictures` take the runs of <|image_pad|>
+    /// tokens (image_pad()) in order, nx ny each, their rows in place of the tokens' embeddings and their M-RoPE
+    /// positions the chat engine's (mtmd's: t = p, h = p + y, w = p + x; the text after at p + max(nx, ny)).
+    std::vector<float> encode(const std::vector<int32_t>& ids, std::string& err,
+                              const std::vector<Picture>& pictures = {});
+    /// The <|image_pad|> token's id (-1: the vocabulary has none).
+    int32_t image_pad() const { return image_pad_; }
     int64_t hidden() const;
     /// The adapters' text encoder entries (lora_split's `te`: Qwen3.5's names, sd-scripts' lora_te_layers_N_... or
     /// the model's own) added after the blocks' products from the next encode: a plain LoRA or a whole delta (the GDN
@@ -66,6 +78,8 @@ private:
     std::unique_ptr<LayerStream> layers_;
     std::unique_ptr<Source> source_;
     std::unique_ptr<core::PlainModel> model_;
+    int32_t image_pad_ = -1;
+    int64_t pos_set_ = 0;   // the cells whose M-RoPE positions an earlier prompt's pictures set (not the identity)
 };
 
 }  // namespace strata::image

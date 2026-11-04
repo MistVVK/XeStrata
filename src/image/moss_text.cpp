@@ -4,6 +4,7 @@
 
 #include "strata/image/moss_text.hpp"
 
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/plain_model.hpp"
@@ -174,6 +175,7 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
     o.gguf = gguf;
     o.encoder = true;
     o.stream_blocks = true;
+    o.vision = true;   // pictures among the prompt's tokens (an ai-toolkit edit adapter's references)
     // the prompt in one chunk of its length (the encoder's states do not depend on the chunking, its K/V cells are the
     // prompt's), the windows of one token it never runs
     o.max_cells = max_tokens;
@@ -204,6 +206,11 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
         err = std::string("MOSS-Image's text encoder: ") + e.what();
         return false;
     }
+    try {
+        image_pad_ = (int32_t) GgufModel::open(gguf).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
+    } catch (const std::exception&) {
+        image_pad_ = -1;   // no such token: no pictures
+    }
     layers_ = std::move(layers);
     source_ = std::move(src);
     model_ = std::move(m);
@@ -217,6 +224,7 @@ void MossText::close() {
     layers_.reset();
     source_.reset();
     model_.reset();
+    pos_set_ = 0;
 }
 
 void MossText::set_layer_budget(uint64_t bytes) {
@@ -224,15 +232,63 @@ void MossText::set_layer_budget(uint64_t bytes) {
         layers_->configure(std::min(std::max(bytes, layers_->min_budget()), layers_->total()), model_->stream());
 }
 
-std::vector<float> MossText::encode(const std::vector<int32_t>& ids, std::string& err) {
+std::vector<float> MossText::encode(const std::vector<int32_t>& ids, std::string& err,
+                                    const std::vector<Picture>& pictures) {
+    const int32_t pad = image_pad_;
     if (model_ == nullptr) {
         err = "MOSS-Image's text encoder is not open";
         return {};
     }
-    std::vector<float> out(ids.size() * (size_t) hidden());
+    const int64_t n = (int64_t) ids.size(), N = hidden();
+    // the cells' positions: the pictures' grids, the text's one after another (the identity where there are none,
+    // also over the cells an earlier prompt's pictures set)
+    std::vector<int32_t> pos3;
+    std::vector<const float*> rows;
+    if (!pictures.empty() || pos_set_ > 0) {
+        const int64_t cells = std::max(n, pos_set_);
+        pos3.resize((size_t) cells * 3);
+        rows.assign((size_t) n, nullptr);
+        int64_t p = 0, i = 0;
+        size_t k = 0;
+        while (i < n) {
+            if (ids[(size_t) i] != pad || k >= pictures.size()) {
+                pos3[(size_t) i * 3] = pos3[(size_t) i * 3 + 1] = pos3[(size_t) i * 3 + 2] = (int32_t) p++;
+                ++i;
+                continue;
+            }
+            const Picture& pic = pictures[k++];
+            for (int64_t j = 0; j < pic.nx * pic.ny; ++j) {
+                if (i + j >= n || ids[(size_t) (i + j)] != pad) {
+                    err = "MOSS-Image's text encoder: picture " + std::to_string(k) + " has fewer <|image_pad|> tokens "
+                          "than its " + std::to_string(pic.nx * pic.ny) + " rows";
+                    return {};
+                }
+                pos3[(size_t) (i + j) * 3] = (int32_t) p;
+                pos3[(size_t) (i + j) * 3 + 1] = (int32_t) (p + j / pic.nx);
+                pos3[(size_t) (i + j) * 3 + 2] = (int32_t) (p + j % pic.nx);
+                rows[(size_t) (i + j)] = pic.rows + j * N;
+            }
+            i += pic.nx * pic.ny;
+            p += std::max(pic.nx, pic.ny);
+        }
+        if (k != pictures.size()) {
+            err = "MOSS-Image's text encoder: more pictures than runs of <|image_pad|> tokens";
+            return {};
+        }
+        for (int64_t c = n; c < cells; ++c, ++p) pos3[(size_t) c * 3] = pos3[(size_t) c * 3 + 1] = pos3[(size_t) c * 3 + 2] = (int32_t) p;
+        if (pictures.empty())   // back to the identity
+            for (int64_t c = 0; c < cells; ++c) pos3[(size_t) c * 3] = pos3[(size_t) c * 3 + 1] = pos3[(size_t) c * 3 + 2] = (int32_t) c;
+        if (!model_->set_positions(pos3.data(), cells, err)) return {};
+        pos_set_ = pictures.empty() ? 0 : n;
+    }
+    std::vector<float> out(ids.size() * (size_t) N);
     try {
-        if (!model_->encode(ids.data(), (int64_t) ids.size(), out.data(), err)) return {};
+        if (!pictures.empty()) model_->set_embeddings(&rows);
+        const bool ok = model_->encode(ids.data(), n, out.data(), err);
+        model_->set_embeddings(nullptr);
+        if (!ok) return {};
     } catch (const std::exception& e) {   // a streamed block's copy failed
+        model_->set_embeddings(nullptr);
         err = std::string("MOSS-Image's text encoder: ") + e.what();
         return {};
     }
