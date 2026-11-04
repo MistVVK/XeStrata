@@ -7161,7 +7161,7 @@ def describe() -> dict:
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
                        "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit), 1),
                        "edits": dit in QI.MF_EDIT or QI.is_moss(dit) or not QI.engine_quantized(dit),
-                       "license": QI.license_note(dit),
+                       "license": QI.license_note(dit), "tools": list(QI.IMAGE_TOOLS),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
                        # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
                        # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),

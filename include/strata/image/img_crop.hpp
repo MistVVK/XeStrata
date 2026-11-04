@@ -33,6 +33,10 @@ struct CropBox {
     int64_t ref_w = 0, ref_h = 0;
 };
 
+/// `src` (RGBA8) at w x h by Pillow's Lanczos, its support widened by the scale when it shrinks (an upscale's base
+/// image: the IMG line's UPSCALE).
+QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h);
+
 /// The IMG and NEED lines' CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height>[,<ref_w>,<ref_h>] -> the box;
 /// std::invalid_argument when the word is not that.
 CropBox parse_crop(const std::string& word);
@@ -42,7 +46,13 @@ public:
     /// Cuts `box` out of `base` (RGBA8, box.width x box.height) for a drawing of gw x gh, by `mask` (OpenAI's alpha over
     /// base: 0 where the picture changes).  Throws std::invalid_argument when the sizes do not agree, and
     /// std::runtime_error when the GPU has no room for the steps.
-    void prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh);
+    /// `keep`: the cut kept on the GPU too, for stitch's color match (not copied up again: 2.8 ms of a 1 MP cut over
+    /// the RTX 4070's PCIe x4).
+    void prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep = false);
+    CropStitch() = default;
+    CropStitch(const CropStitch&) = delete;
+    CropStitch& operator=(const CropStitch&) = delete;
+    ~CropStitch();
     /// The drawing's base image (the box at gw x gh) and its mask (alpha 0 where the model redraws, 255 elsewhere).
     const QiRef& crop() const { return crop_; }
     const QiRef& regen() const { return regen_; }
@@ -59,7 +69,8 @@ public:
     /// few pixels or a flat channel give no statistics.
     std::vector<uint8_t> stitch(const std::vector<uint8_t>& made, int color = 0) const;
     /// The VRAM the steps take at most, for a picture of width x height, a box of w x h, a drawing of gw x gh and a
-    /// reference of rw x rh (none of it is held while the model draws).
+    /// reference of rw x rh (none of it is held while the model draws but prepare's kept cut, 4 bytes a pixel of
+    /// gw x gh).
     static uint64_t bytes(int64_t width, int64_t height, int64_t w, int64_t h, int64_t gw, int64_t gh, int64_t rw = 0,
                           int64_t rh = 0);
 
@@ -70,6 +81,7 @@ private:
     CropBox box_;
     int64_t gw_ = 0, gh_ = 0;
     QiRef crop_, regen_, ref_;
+    uint8_t* crop_dev_ = nullptr;   // the cut on the GPU (prepare's keep)
 };
 
 }  // namespace strata::image

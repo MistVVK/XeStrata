@@ -68,6 +68,8 @@
 //                            (an ai-toolkit MOSS-Image edit's; the base the drawing's init image); COLOR:<off|auto|
 //                            full> the drawing's colors matched to the picture's as it goes back (off, the default;
 //                            auto by the part kept around the paint; full by the whole cut: CropStitch::stitch);
+//                            UPSCALE: the base image (INIT:, else the first REF:) Lanczos-resized to the line's size
+//                            first (an upscale's second pass; its time in crop_s);
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
 //                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
 //                            %XX'd, the word's whitespace being the line's);
@@ -264,6 +266,15 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word.rfind("PIC:", 0) == 0) r.pictures.push_back(read_image(word.substr(4)));
         else if (word == "EDITFMT:aitk") r.refs_aitk = true;
         else if (word == "EDITFMT:moss") r.refs_aitk = false;
+        else if (word == "UPSCALE") r.upscale = true;
+        else if (word.rfind("TILES:", 0) == 0) {
+            const std::vector<int32_t> v = parse_ids(word.substr(6));
+            if (v.size() != 3 || v[0] < 256 || v[1] < 0 || v[2] < 0)
+                throw std::invalid_argument("TILES:<tile>,<pad>,<blur> (tile 256 or more): " + word);
+            r.tile = v[0];
+            r.tile_pad = v[1];
+            r.tile_blur = v[2];
+        }
         else if (word.rfind("COLOR:", 0) == 0) {
             const std::string m = word.substr(6);
             if (m != "off" && m != "auto" && m != "full") throw std::invalid_argument("COLOR:off|auto|full: " + word);
@@ -318,7 +329,9 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
             crop = si::parse_crop(word);
             continue;
         }
-        if (word.rfind("EDITFMT:", 0) == 0 || word.rfind("COLOR:", 0) == 0) continue;
+        if (word.rfind("EDITFMT:", 0) == 0 || word.rfind("COLOR:", 0) == 0 || word == "UPSCALE" ||
+            word.rfind("TILES:", 0) == 0)
+            continue;
         if (word.rfind("PIC:", 0) == 0) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
             int64_t w = 0, h = 0;
             if (!si::image_size(word.substr(4), w, h)) throw std::invalid_argument("not an image: " + word);
@@ -442,6 +455,73 @@ bool takes_loras(si::ImagePipeline& p) {
            dynamic_cast<si::MfPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
 }
 
+// An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image Lanczos-resized to the
+// line's size, then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
+// from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
+// r.tile_blur (Crop and Stitch's steps: img_crop.hpp), the next tile cut from the picture as it now is.  The tiles'
+// times summed into `t`, the last one's plan in `pl`, the resizes and the cuts' time in `cut_s`.
+std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0, si::QiTimes& t, si::QiPlan& pl,
+                                   double& cut_s, Lines& in) {
+    const si::QiRef* base0 = !r0.init.rgba.empty() ? &r0.init : !r0.refs.empty() ? &r0.refs[0] : nullptr;
+    if (base0 == nullptr) throw std::invalid_argument("TILES: a base image (INIT: or the first REF:)");
+    const int64_t W = r0.width, H = r0.height, T = r0.tile;
+    auto t0 = std::chrono::steady_clock::now();
+    si::QiRef pic = si::lanczos_resize(*base0, W, H);
+    cut_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const int64_t nx = (W + T - 1) / T, ny = (H + T - 1) / T;
+    int index = 0;
+    for (int64_t ty = 0; ty < ny; ++ty)
+        for (int64_t tx = 0; tx < nx; ++tx, ++index) {
+            const int64_t x0 = tx * T, y0 = ty * T, x1 = std::min(W, x0 + T), y1 = std::min(H, y0 + T);
+            // the box: the tile and its context, its sides multiples of 16 (the drawing is the box's size)
+            const int64_t bw = ((x1 - x0) + 2 * r0.tile_pad + 15) / 16 * 16, bh = ((y1 - y0) + 2 * r0.tile_pad + 15) / 16 * 16;
+            si::CropBox box;
+            box.x = x0 - (bw - (x1 - x0)) / 2;
+            box.y = y0 - (bh - (y1 - y0)) / 2;
+            box.w = bw;
+            box.h = bh;
+            box.blend = r0.tile_blur;
+            box.width = W;
+            box.height = H;
+            si::QiRef mask;   // the tile changes (alpha 0), the rest of the picture stays
+            mask.width = W;
+            mask.height = H;
+            mask.rgba.assign((size_t) (W * H * 4), 255);
+            for (int64_t y = y0; y < y1; ++y)
+                for (int64_t x = x0; x < x1; ++x) mask.rgba[(size_t) ((y * W + x) * 4 + 3)] = 0;
+            si::CropStitch cs;
+            t0 = std::chrono::steady_clock::now();
+            cs.prepare(pic, mask, box, bw, bh);
+            cut_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            si::QiRequest r = r0;
+            r.width = bw;
+            r.height = bh;
+            r.seed = r0.seed + (uint64_t) index;
+            r.upscale = false;
+            r.tile = 0;
+            r.refs.clear();
+            r.init = cs.crop();
+            r.mask = cs.regen();
+            r.mask_share = cs.share();
+            si::QiTimes tt;
+            const auto img = p.generate(r, &tt, &pl, [&in](int done, int steps) {
+                std::printf("STEP %d %d\n", done, steps);
+                std::fflush(stdout);
+                return !in.stop.load();
+            }, [](const char* stage) {
+                std::printf("STAGE %s\n", stage);
+                std::fflush(stdout);
+            });
+            t.text += tt.text;
+            t.sampling += tt.sampling;
+            t.decode += tt.decode;
+            t0 = std::chrono::steady_clock::now();
+            pic.rgba = cs.stitch(img);
+            cut_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+    return pic.rgba;
+}
+
 int serve(si::ImagePipeline& p) {
     Loras loras;   // the adapters' files, read once for the requests that name them
     {
@@ -493,12 +573,28 @@ int serve(si::ImagePipeline& p) {
                     f();
                     crop_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 };
+                if (r.tile > 0) {   // an upscale past the model's size: tile by tile (upscale_tiles)
+                    if (crop) throw std::invalid_argument("TILES: not with CROP:");
+                    si::QiTimes t;
+                    si::QiPlan pl;
+                    double cut_s = 0.0;
+                    const auto img = upscale_tiles(p, r, t, pl, cut_s, in);
+                    write_file(out, img);
+                    std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), cut_s);
+                    std::fflush(stdout);
+                    continue;
+                }
+                if (r.upscale) {   // the base image at the line's size by Lanczos before it is drawn again
+                    si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
+                    if (base == nullptr) throw std::invalid_argument("UPSCALE: a base image (INIT: or the first REF:)");
+                    timed([&] { *base = si::lanczos_resize(*base, r.width, r.height); });
+                }
                 if (crop) {
                     si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
                     if (base == nullptr || r.mask.rgba.empty())
                         throw std::invalid_argument("CROP: a mask and its base image (INIT: or the first REF:)");
                     cs = std::make_unique<si::CropStitch>();
-                    timed([&] { cs->prepare(*base, r.mask, *crop, r.width, r.height); });
+                    timed([&] { cs->prepare(*base, r.mask, *crop, r.width, r.height, r.crop_color > 0); });
                     if (crop->ref_w > 0 && base != &r.init) {   // the base the init image, the reference its own size
                         r.init = cs->crop();
                         *base = cs->ref();

@@ -387,6 +387,8 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
                "moss-edit-armv5": "armV5-ai-toolkit.safetensors", "moss-edit-armv6": "armV6-ai-toolkit.safetensors",
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
+# the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
+IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image")
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
 MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)

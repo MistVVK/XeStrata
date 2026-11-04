@@ -301,6 +301,33 @@ uint8_t* rgba8_device(Buffers& b, const std::vector<uint8_t>& v) { return b.put(
 
 }  // namespace
 
+QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) {
+    if (src.width <= 0 || src.height <= 0 || src.rgba.size() != (size_t) (src.width * src.height * 4) || w <= 0 ||
+        h <= 0)
+        throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
+    Buffers b;
+    const uint8_t* pic = rgba8_device(b, src.rgba);
+    const int64_t n = w * h;
+    float* planes = b.get<float>((size_t) (4 * n));
+    {
+        Resize rz(b, src.width, src.height, w, h, true);
+        float* mid = b.get<float>((size_t) (4 * src.height * w));
+        rows_rgba8(pic, src.width, src.height, 0, 0, src.height, rz.tx, rz.lox, rz.wx, mid);
+        columns(mid, 4, src.height, w, rz.ty, rz.loy, rz.wy, planes, 0.0f, 255.0f);
+    }
+    uint8_t* out = b.get<uint8_t>((size_t) (4 * n));
+    done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        for (int c = 0; c < 4; ++c) out[i * 4 + c] = (uint8_t) sycl::round(planes[c * n + i]);
+    }), "resize: outputs");
+    QiRef r;
+    r.width = w;
+    r.height = h;
+    r.rgba.resize((size_t) (4 * n));
+    gpu::copy(r.rgba.data(), out, r.rgba.size());
+    return r;
+}
+
 CropBox parse_crop(const std::string& word) {
     CropBox c;
     std::vector<int64_t> v;
@@ -337,7 +364,9 @@ uint64_t CropStitch::bytes(int64_t W, int64_t H, int64_t w, int64_t h, int64_t g
     return std::max(prep, back) + (1ull << 20);   // and the taps
 }
 
-void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh) {
+CropStitch::~CropStitch() { gpu::free(crop_dev_); }
+
+void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep) {
     const int64_t W = base.width, H = base.height;
     if (W != box.width || H != box.height || base.rgba.size() != (size_t) (W * H * 4))
         throw std::invalid_argument("image engine: CROP: the picture is not the size the box was made for");
@@ -399,6 +428,13 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     regen_.rgba.resize((size_t) (4 * n));
     blend_.resize((size_t) n);
     gpu::copy(crop_.rgba.data(), out, (size_t) (4 * n));
+    gpu::free(crop_dev_);
+    crop_dev_ = nullptr;
+    if (keep) {
+        if (!gpu::alloc_device(&crop_dev_, (size_t) (4 * n)))
+            throw std::runtime_error(std::string("image engine: GPU memory (crop and stitch): ") + gpu::last_error());
+        gpu::copy(crop_dev_, out, (size_t) (4 * n));
+    }
     gpu::copy(regen_.rgba.data(), reg, (size_t) (4 * n));
     gpu::copy(blend_.data(), mt, (size_t) n * sizeof(float));
     // the reference beside the base, when the box asks for one: the box at its size from the picture as well
@@ -515,7 +551,7 @@ std::vector<uint8_t> CropStitch::stitch(const std::vector<uint8_t>& made, int co
     uint8_t* pic = rgba8_device(b, base_);
     uint8_t* drawn = rgba8_device(b, made);
     const float* bm = b.put(blend_);
-    if (color > 0) color_match(b, drawn, rgba8_device(b, crop_.rgba), bm, n, color == 2);
+    if (color > 0) color_match(b, drawn, crop_dev_ != nullptr ? crop_dev_ : rgba8_device(b, crop_.rgba), bm, n, color == 2);
     // the drawing at the box's size (Lanczos) and the blend mask with it (bilinear)
     float* planes = b.get<float>((size_t) (4 * bw * bh));
     {

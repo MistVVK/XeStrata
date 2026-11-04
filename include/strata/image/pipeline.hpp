@@ -42,6 +42,12 @@ struct QiRequest {
     // Crop and Stitch's color match of the drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
     // around the paint (the default's: the drawing's drift only), 2 the whole cut (ComfyUI's ColorTransfer)
     int crop_color = 0;
+    // an upscale: the base image resized to the request's size (Lanczos) before it is drawn again (strata_image's
+    // UPSCALE; the pipelines take it at that size)
+    bool upscale = false;
+    // an upscale past the model's size, drawn again in tiles as Ultimate SD Upscale does (strata_image's TILES:): the
+    // tile's side, the context around it and the blend at its edges, in pixels; 0: one drawing
+    int64_t tile = 0, tile_pad = 0, tile_blur = 0;
     std::vector<QiRef> pictures;
     QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
                                 // alpha 0 where the image changes); empty: none

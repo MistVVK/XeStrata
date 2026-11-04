@@ -145,7 +145,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from serve import loras as lora_api
 
@@ -185,6 +185,16 @@ CROP_REFINE_STRENGTH = 0.5
 EXTEND_FEATHER = 40
 # Crop and Stitch's color match by default (color_match_mode): set by the images compared (C4)
 COLOR_MATCH = "off"
+# an upscale's second pass (parse_upscale): its strength, the low end of the 0.3 to 0.6 ComfyUI's two-pass workflows
+# use (less drift from the first image); the largest scale and side; past max_side, tiles as Ultimate SD Upscale draws
+# them, 1024 pixels with more context and blend than its defaults (32 and 8): with those a swimsuit's edge across a
+# tile's border came out broken (Qwen-Image-2.1-Turbo, 2x of 832x1248, 2026-11-05); 128 and 32 drew it whole
+UPSCALE_STRENGTH = 0.35
+UPSCALE_MAX_SCALE = 4.0
+UPSCALE_MAX_SIDE = 4096
+UPSCALE_TILE = 1024
+UPSCALE_PAD = 128
+UPSCALE_BLUR = 32
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -362,7 +372,9 @@ def model_defaults(cfg: dict) -> dict:
            "transparency": cfg.get("transparency") is not False,
            "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG,
            # an edit with a mask: Crop and Stitch by default (crop_wanted), MOSS-Image's second pass on request
-           "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg))}
+           "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg)),
+           # the image tools a chat may use with it (and the Images API's operations): the config's image_tools
+           "tools": [t["name"] for t in TOOLS if cfg.get("image_tools") is None or t["name"] in cfg["image_tools"]]}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
     if anima:
@@ -906,6 +918,48 @@ def img2img_strength(steps: int) -> float:
     return STRENGTH_IMG2IMG if steps < 2 else min(STRENGTH_IMG2IMG, 1 - 1 / steps)
 
 
+def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
+    """An upscale (the edits' `upscale`, the chat's upscale_image), as ComfyUI's two-pass workflows make one: `image`
+    Lanczos-resized by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU and drawn again
+    from it at `strength` (UPSCALE_STRENGTH), an img2img of the whole picture (job["init"], job["upscale"]); past the
+    model's max_side, in tiles as Ultimate SD Upscale draws them (job["tiles"]: UPSCALE_TILE pixels, UPSCALE_PAD of
+    context around each, UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most."""
+    v = req["upscale"]
+    if isinstance(v, str):   # a form's field
+        try:
+            v = json.loads(v)
+        except ValueError:
+            v = None
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        v = {"scale": v}
+    if not isinstance(v, dict) or not set(v) <= {"scale", "strength"}:
+        raise ImageRequestError('upscale: {"scale": 1.5 or 2, "strength": 0.35} (or the scale alone)')
+    try:
+        scale = float(v.get("scale", 2))
+    except (TypeError, ValueError):
+        raise ImageRequestError("upscale.scale: a number") from None
+    if not 1.0 < scale <= UPSCALE_MAX_SCALE:
+        raise ImageRequestError(f"upscale.scale: above 1, at most {UPSCALE_MAX_SCALE:g}")
+    w0, h0 = image_dims(image)
+    w, h = (max(SIZE_STEP, round(x * scale / SIZE_STEP) * SIZE_STEP) for x in (w0, h0))
+    if max(w, h) > UPSCALE_MAX_SIDE:
+        raise ImageRequestError(f"upscale: {w}x{h} passes {UPSCALE_MAX_SIDE} pixels a side")
+    side = int(cfg.get("max_side") or 2048)
+    tiled = max(w, h) > side
+    job = parse_request({**req, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
+    job["width"], job["height"] = w, h
+    job["init"] = image
+    job["upscale"] = True
+    if tiled:
+        job["tiles"] = {"tile": UPSCALE_TILE, "pad": UPSCALE_PAD, "blur": UPSCALE_BLUR}
+    strength = parse_strength({"strength": v.get("strength", UPSCALE_STRENGTH)})
+    run = strength_run(job["steps"], cast(float, strength))
+    if run < 1:
+        raise ImageRequestError(f"upscale.strength: {strength:g} runs none of the {job['steps']} steps")
+    job["strength"], job["steps_run"] = strength, run
+    return job
+
+
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
     """An edit (/v1/images/edits): parse_request's fields with `images` (PNG, JPEG, GIF or BMP).  A model that edits
     takes them as its reference images (job["refs"]); one that does not (can_edit) takes one image as img2img's base
@@ -944,6 +998,10 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         if w < 16 or h < 16:
             raise ImageRequestError(f"image: {w}x{h} is too small")
         dims.append((w, h))
+    if req.get("upscale") is not None:   # the first image drawn again larger (parse_upscale)
+        if mask is not None or req.get("extend") is not None or len(images) > 1:
+            raise ImageRequestError("upscale: one image, without a mask or extend")
+        return parse_upscale(req, images[0], cfg)
     if req.get("extend") is not None:   # an outpaint: the canvas grown, its new area the mask
         if mask is not None:
             raise ImageRequestError("extend: not with a mask (extend the image, then edit the result with one)")
@@ -1295,6 +1353,10 @@ def made_size(job: dict) -> tuple[int, int]:
     plan's drawing (the engine puts it back into the picture, job["width"] x job["height"])."""
     if job.get("crop") and not job["crop"].get("empty"):
         return job["crop"]["gen"][0], job["crop"]["gen"][1]
+    if job.get("tiles"):   # an upscale in tiles: a tile and its context (the engine's upscale_tiles)
+        side = -(-(job["tiles"]["tile"] + 2 * job["tiles"]["pad"]) // SIZE_STEP) * SIZE_STEP
+        return (min(side, -(-int(job["width"]) // SIZE_STEP) * SIZE_STEP),
+                min(side, -(-int(job["height"]) // SIZE_STEP) * SIZE_STEP))
 
     def up(v) -> int:
         return -(-int(v) // SIZE_STEP) * SIZE_STEP
@@ -2285,6 +2347,9 @@ class ImageGen:
                     else "")
                  + (f" COLOR:{job['color_match']}" if job.get("crop") and not job["crop"].get("empty")
                     and job.get("color_match") else "")
+                 + (" UPSCALE" if job.get("upscale") else "")
+                 + ("" if not job.get("tiles") else
+                    f" TILES:{job['tiles']['tile']},{job['tiles']['pad']},{job['tiles']['blur']}")
                  + (" EDITFMT:aitk" if job.get("edit_format", "").startswith("ai-toolkit") else "")
                  + "".join(f" PIC:{p}" for p in job.get("pic_paths") or ())
                  + (f" INIT:{job['init_path']}" if job.get("init_path") else "")
@@ -2422,8 +2487,11 @@ class ImageGen:
                 if job.get("choose_size"):
                     self._choose_size(job, timeout, cancel)
                 mw, mh = made_size(job)
-                # the engine's RGBA rows: the size made (cut to the size asked for), or Crop and Stitch's picture
-                rw, rh = (job["width"], job["height"]) if crop and not crop.get("empty") else (mw, mh)
+                # the engine's RGBA rows: the size made (cut to the size asked for), or Crop and Stitch's picture; an
+                # upscale in tiles is asked at its whole size (the engine draws it tile by tile: upscale_tiles)
+                whole = crop and not crop.get("empty") or job.get("tiles")
+                rw, rh = (job["width"], job["height"]) if whole else (mw, mh)
+                lw, lh = (job["width"], job["height"]) if job.get("tiles") else (mw, mh)
                 ids = ",".join(str(i) for i in self.ids(job))
                 sched = self.cfg.get("schedule")
                 sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
@@ -2468,7 +2536,7 @@ class ImageGen:
                     def stage(name):
                         self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
                     try:
-                        r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
+                        r = self.engine.ask(f"IMG {lw} {lh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
                                             f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}"
                                             f"{self._lora_words(job)}", "IMAGE",
                                             timeout, cancel, step, stage, **({"preview": peek} if shows else {}))
@@ -2789,6 +2857,15 @@ TOOLS: list[dict[str, Any]] = [
          "aspect": {"type": "string", "description": "the shape to grow to instead of pixels, e.g. 16:9"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
+    {"name": "upscale_image",
+     "description": "Make an image larger and finer, drawn again from it (the same picture): the conversation's last "
+                    "image unless `image` names another.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "what the image shows"},
+         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
+         "seed": {"type": "integer"}},
+         "required": ["prompt"]}},
 ]
 
 SKILLS = Path(__file__).resolve().parent / "image_skills"
@@ -3000,7 +3077,7 @@ class ImageTools:
     def template_tools(self, exclude=()) -> list[dict]:
         out = []
         for t in TOOLS:
-            gens = self._gens(t["name"] in ("edit_image", "extend_image"))
+            gens = self._gens(t["name"] in ("edit_image", "extend_image", "upscale_image"))
             if not gens or t["name"] in exclude or t["name"] not in self.allowed:
                 continue
             # the user's boxes alone make a new image by them, as ComfyUI's MOSS-Image Layout Prompt does (the picture
@@ -3266,21 +3343,24 @@ class ImageTools:
                 req["strength"] = args["strength"]
             if name == "edit_image" and args.get("refine") not in (None, ""):
                 req["refine"] = args["refine"]
+            if name == "upscale_image":
+                req["upscale"] = {"scale": args["scale"]} if args.get("scale") not in (None, "") else {}
             if name == "extend_image":
                 req["extend"] = ({"aspect": args["aspect"]} if args.get("aspect") not in (None, "") else
                                  {k: args[k] for k in ("left", "top", "right", "bottom")
                                   if args.get(k) not in (None, "")})
-            gens = self._gens(name in ("edit_image", "extend_image"))
+            gens = self._gens(name in ("edit_image", "extend_image", "upscale_image"))
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
                 raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
             if name == "generate_image":
                 job = parse_request(req, gen.cfg)
-            elif name == "extend_image":
+            elif name in ("extend_image", "upscale_image"):
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
-                    raise ImageRequestError("there is no image in the conversation to extend")
+                    raise ImageRequestError(f"there is no image in the conversation to "
+                                            f"{'extend' if name == 'extend_image' else 'upscale'}")
                 job = parse_edit_request(req, [self.normalize(data)], gen.cfg)
             elif name == "edit_image":
                 mask = self.mask

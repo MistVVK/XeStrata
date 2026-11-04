@@ -174,6 +174,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
           <label class="st-field" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span data-i18n="img.strength">Strength</span>
             <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></label>
+          <label class="st-field" id="img-up-f" hidden title="Draw the image again larger and finer (Lanczos, then strength 0.35; in tiles past the largest side)" data-i18n-title="img.upscaleTitle"><span data-i18n="img.upscale">Upscale</span>
+            <select class="st-input" id="img-up"><option value="" data-i18n="img.upNone">None</option><option value="1.5">1.5&times;</option><option value="2">2&times;</option></select></label>
+          <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-i18n="img.extend">Extend to</span>
+            <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
           <label class="st-field" id="img-steps-f"><span data-i18n="img.steps">Steps</span>
             <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
           <label class="st-field" id="img-cfg-f"><span id="img-cfg-l">Guidance (CFG)</span>
@@ -202,6 +206,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
             <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
             <label class="img-check" title="Crop and Stitch: the part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropStitchTitle"><input type="checkbox" id="img-crop" checked> <span data-i18n="img.cropStitch">Cut out the painted part and draw it larger</span></label>
+            <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
             <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
           </div>
           <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
