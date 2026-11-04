@@ -66,6 +66,24 @@ public:
     /// The blocks context i skips (none by default).
     void set_skip(int i, std::vector<int> blocks) { ctx_[i].skip = std::move(blocks); }
 
+    /// An edit's reference images, as Moss-Image-Edit's adapter takes them (ComfyUI's MOSS-Image edit, its method
+    /// "index_timestep_zero_text_start"): each a latent [h w][128] (device FP32, the VAE's encode), on the rotary axes
+    /// at r = its index + 1, f = 0, its rows and columns centered.  They go through every block once, at timestep 0
+    /// and attending to each other alone, and each block's keys and values of them are kept (their v heads' scales
+    /// with them); at every step the rows of each context attend to them as well, their keys before the context's
+    /// own.  Called after the adapters are bound (the blocks they go through are the adapted ones); empty: none, the
+    /// kept keys and values freed.
+    struct RefLatent {
+        const float* tokens;
+        int64_t h, w;
+    };
+    void set_refs(const std::vector<RefLatent>& refs);
+    int64_t ref_rows() const { return ref_rows_; }
+    /// The VRAM the kept keys and values of `rows` reference rows take.
+    uint64_t ref_bytes(int64_t rows) const {
+        return (uint64_t) blocks_.size() * ((uint64_t) rows * C_ * 2 * 2 + (uint64_t) heads_ * 4);
+    }
+
     /// The sampler's guidance (the reference pipeline's arguments).  cfg: with context 1, u + cfg (c - u);
     /// uncond_skip: the blocks context 1 skips; slg (with slg_scale above 0): a third pass of context 0 with those
     /// blocks skipped, slg_scale (c - k) added.  Both skips act in the steps whose share of the schedule is in
@@ -113,12 +131,12 @@ public:
     void drop_text();
     uint64_t scratch_bytes() const { return (uint64_t) scratch_ * 2; }   // the products' dequantization scratch
     /// The working buffers n contexts of hw image rows take (text rows up to max_text a context), with the MLP a band
-    /// of mlp_rows rows at a time (0: all).
-    uint64_t activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows = 0) const;
+    /// of mlp_rows rows at a time (0: all), and ref_rows reference rows before each context's in its attention.
+    uint64_t activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows = 0, int64_t ref_rows = 0) const;
     void set_mlp_rows(int64_t rows) { mlp_cap_ = rows; }
     /// What the working buffers take now
     uint64_t activations_held() const {
-        return cap_hw_ > 0 ? activation_bytes(cap_hw_, (int) cap_n_, cap_text_, mlp_rows_) : 0;
+        return cap_hw_ > 0 ? activation_bytes(cap_hw_, (int) cap_n_, cap_text_, mlp_rows_, cap_ref_) : 0;
     }
     void drop_activations();
 
@@ -260,7 +278,7 @@ private:
     LayerStream blocks_stream_;
     Ctx ctx_[2];
     // activations, grown on demand
-    int64_t cap_hw_ = 0, cap_n_ = 0, cap_text_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
+    int64_t cap_hw_ = 0, cap_n_ = 0, cap_text_ = 0, cap_ref_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
     int64_t dirty_[2] = {0, 0};   // the rows of each attention slot (jq16_ ...) that may not be zero
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *gu_ = nullptr,
           *temb_ = nullptr, *mod_ = nullptr, *head_ = nullptr;
@@ -291,6 +309,13 @@ private:
     float* pend_sw_ = nullptr;
     void flush_pending();
     float* b0_ = nullptr;
+    // an edit's references (set_refs): every block's keys and values of their rows and its v heads' scales; capture_
+    // while set_refs runs the blocks over them; cur_block_ the block run_block runs
+    uint16_t *ref_k16_ = nullptr, *ref_v16_ = nullptr;
+    float* ref_hs_ = nullptr;
+    int64_t ref_rows_ = 0;
+    bool capture_ = false;
+    int cur_block_ = 0;
 };
 
 }  // namespace strata::image

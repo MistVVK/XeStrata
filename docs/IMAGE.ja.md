@@ -27,7 +27,7 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30（CFG） | 調整の前の元のモデル |
 | `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30（CFG） | Mage-Flow を Danbooru と e621 の画像で微調整した版。booru のタグで描くイラスト向け。編集はできない（img2img とマスクは使える） |
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 52 GB）。編集は参照画像 3 枚まで（透明な背景はない） |
-| `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集はできない（img2img とマスクは使える） |
+| `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
 | `moss-image-uncensored`、`moss-image-base-uncensored` | 上の 2 つ | 50（CFG） | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
@@ -253,26 +253,28 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 ### 画像を直す（`POST /v1/images/edits`）
 
 参照画像を元に画像を作ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。
-編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow、MOSS-Image）は、1 枚の画像から始める img2img になります。
+編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow、編集の LoRA を入れていない MOSS-Image）は、1 枚の画像から始める img2img になります。
 
 - **参照画像**: OpenAI の形の multipart の `image` か `image[]`、または JSON の `"images": [{"image_url": ...}]`（data: の URL、http(s) の URL）。
-  Qwen-Image-2.1 は 10 枚まで、Mage-Flow と HunyuanImage 3.0 は 3 枚まで、編集のないモデルは 1 枚です。1 枚 32 MiB まで、16x16 ピクセル以上です。
+  Qwen-Image-2.1 は 10 枚まで、MOSS-Image は 4 枚まで、Mage-Flow と HunyuanImage 3.0 は 3 枚まで、編集のないモデルは 1 枚です。1 枚 32 MiB まで、16x16 ピクセル以上です。
 - **モデル**: `model` で選びます。付けないときは既定のモデルです。既定のモデルが編集できないとき（MageTrail）は、`strength` か `mask` があれば既定のモデルの img2img、どちらもなければ編集できる最初のモデルで作り、応答の `model` がそれを示します。
   PNG、JPEG、GIF、BMP はそのまま、ほかの形式（WebP など）は PNG に変えて読みます。
 - **大きさ**: `size` を `auto` にするか付けないと、1 枚目の参照画像の縦横比で約 1024x1024 ピクセルにします。HunyuanImage 3.0 では、参照画像とプロンプトからモデルが選んだ大きさにします。
 - **参照画像の読み方**: Qwen-Image-2.1 は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024x1024 ピクセルで読みます。参照画像が多いほど時間とメモリがかかります。
   Mage-Flow は、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます。
   HunyuanImage 3.0 は、参照画像を縦横比のいちばん近いバケットの大きさに切り出して VAE で読み（1024x1024 なら 64x64 = 4,096 トークン）、SigLIP2 でも読みます（最大 1,024 パッチ）。参照画像 1 枚でおよそ 5,000 トークンが増え、その分 1 ステップが長くなります。
+  MOSS-Image は、参照画像を 1 枚ずつ縦横比を保った約 1024x1024 ピクセルにして VAE で読み、最初に 1 度だけ DiT に通して、各ステップで描く画像がそれを見ます（ComfyUI の MOSS-Image の編集の Moss-Image-Edit の形。文の読み手は画像を見ません）。参照画像 1 枚で約 2 GB の VRAM を使います。
 - **マスク**: `mask` に、1 枚目の画像と同じ大きさのアルファ付きの PNG を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します。どのモデルでも使えます。
   `size` を付けないか、`auto` か 1 枚目の画像と同じ大きさのときは、塗った部分の周りを切り出し、モデルの得意な約 1024x1024 ピクセルに拡大して描き直し、縮めて元の画像に貼り戻します（ComfyUI の Inpaint Crop and Stitch の手順と既定値）。顔のような小さな部分も細かく描け、出力は 1 枚目の画像と同じ大きさです。
    - 貼り戻しの縁はぼかすので、塗った部分のすぐ外（数十ピクセル）も少し変わります。それより外の画素は 1 枚目の画像とまったく同じです。
    - 切り出す範囲は、塗った部分の 1.2 倍です。参照画像が 2 枚以上のとき（「画像 2 の顔に差し替える」など）は、周りがよく分かるよう 1.6 倍です。
    - 塗った部分が大きく、切り出しても拡大にならないときは、画像全体を約 1024x1024 ピクセルで描き直し、元の大きさに戻して貼り戻します。
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
+   - MOSS-Image の編集で参照画像が 2 枚以上のときは、まず画像全体を描き、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです。時間はおよそ 1.6 倍です。
    - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
-- **ステップ数**: Qwen-Image-2.1、HunyuanImage 3.0、MOSS-Image は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。
+- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（PedroMarinhoDev の版の説明の値。強さが 1 より小さいと、編集でなく描き直しになります）。
 - **LoRA**: 生成と同じ `lora`（とプロンプトのタグ）を受け、参照画像を使う画像にも同じアダプターを当てます（[LoRA](#loraアダプター)）。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
 
@@ -280,7 +282,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。
+- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
@@ -455,6 +457,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
   量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
+  編集の LoRA は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit) で、setup は PedroMarinhoDev が ComfyUI の形に直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)（GPL-3.0）を取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
   VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。

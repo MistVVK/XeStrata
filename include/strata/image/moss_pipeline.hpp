@@ -85,6 +85,9 @@ private:
     void encode(const std::vector<int32_t>& ids, std::vector<float>& out);
     uint64_t text_fixed() const;
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
+    /// An edit's reference image through the VAE's encoder at its own size -> its latent [h w][128] (device FP32, the
+    /// caller's to free).
+    float* encode_ref(const QiRef& f);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
@@ -92,6 +95,7 @@ private:
     mutable int w8_faster_ = -1;   // as MfPipeline's: the 8-bit DiT is the faster here (1 yes, 0 no, -1 not timed)
     mutable int64_t w8_rows_ = 0;
     bool base_encoder_ = false, states_given_ = false;
+    int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
     std::unique_ptr<MossText> te_;
     std::unique_ptr<MossDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;   // the closed DiT's blocks in 8 bits (release(true)), for its next open

@@ -222,6 +222,26 @@ void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, 
     });
 }
 
+// an edit's references beside a context (MossDit::set_refs): hs[h] = the larger of a context's and the references'
+// scale of head h, powers of two both
+void hs_max(float* hs, const float* other, int64_t heads, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) heads), [=](sycl::id<1> id) {
+        hs[id[0]] = sycl::fmax(hs[id[0]], other[id[0]]);
+    });
+}
+
+// the references' v16 [R][heads hd], kept at their heads' scales `from`, at the scales `to` (powers of two, `to` the
+// larger: the FP16 values divided exactly)
+void ref_values(const uint16_t* v16, const float* from, const float* to, int64_t R, int64_t heads, int64_t hd,
+                uint16_t* out, void* s) {
+    const int64_t C = heads * hd;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t h = (i % C) / hd;
+        out[i] = f16_from_f32(kernels::f32_from_f16(v16[i]) * (from[h] / to[h]));
+    });
+}
+
 // p's n bf16 values rewritten in place as FP16, saturated at FP16's largest
 void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
     q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -683,8 +703,8 @@ void MossDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int6
     lora_output_add(y + t0 * w.n, nt, w.n, r0, lora_glora_y_, n, s_);
 }
 
-uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows) const {
-    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text);
+uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows, int64_t ref_rows) const {
+    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text + ref_rows);
     const int64_t band = mlp_rows > 0 ? std::min(R, mlp_rows) : R;
     return (uint64_t) R * C_ * 4 * 5 +                          // x, q, k, v, a
            (uint64_t) band * 2 * F_ * 4 +                       // the MLP's up_gate sums
@@ -699,14 +719,14 @@ uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t 
 
 void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     const int64_t cap_rows = cap_n_ * (cap_hw_ + cap_text_);
-    if (hw <= cap_hw_ && n <= cap_n_ && max_text <= cap_text_ &&
+    if (hw <= cap_hw_ && n <= cap_n_ && max_text <= cap_text_ && ref_rows_ <= cap_ref_ &&
         mlp_rows_ == (mlp_cap_ > 0 ? std::min(cap_rows, mlp_cap_) : cap_rows))
         return;
     hw = std::max(hw, cap_hw_);
     n = std::max<int>(n, (int) cap_n_);
     max_text = std::max(max_text, cap_text_);
     drop_activations();
-    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text);
+    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text + ref_rows_);
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
     x_ = alloc<float>(allocs_, R * C_);
     q_ = alloc<float>(allocs_, R * C_);
@@ -737,6 +757,7 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     cap_hw_ = hw;
     cap_n_ = n;
     cap_text_ = max_text;
+    cap_ref_ = ref_rows_;
     dirty_[0] = dirty_[1] = 0;
 }
 
@@ -757,7 +778,7 @@ void MossDit::drop_activations() {
     lora_glora_y_ = nullptr;
     lora_glora_x8_ = nullptr;
     lora_glora_sx_ = nullptr;
-    cap_hw_ = cap_n_ = cap_text_ = 0;
+    cap_hw_ = cap_n_ = cap_text_ = cap_ref_ = 0;
 }
 
 std::vector<MossDit::LoraTarget> MossDit::lora_targets() const {
@@ -1258,21 +1279,35 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     const MfOut k = product(h16_, rs_, *w[1], base, k_, R, b(1), w[0]->type == kTypeW8, true);
     const MfOut v = product(h16_, rs_, *w[2], base, v_, R, b(2), w[1]->type == kTypeW8, true);
     // each segment: its v heads' scales, its q and k normed and rotated, the attention among its rows, the output
-    // back as FP16 rows scaled by row
+    // back as FP16 rows scaled by row.  An edit's references (set_refs) go first in each segment's keys and values,
+    // the segment's rows asking after them, both at the larger of their heads' scales; while set_refs runs the blocks
+    // over them, each block's are kept
+    const int64_t P = ref_rows_ > 0 && !capture_ && mod != nullptr ? ref_rows_ : 0;
     int64_t r0 = 0;
     float* so = i8 ? i8_slot() : nullptr;   // the attention's output's scales (q, k and v's sums read the other slot)
     for (size_t i = 0; i < seg.size(); ++i) {
-        const int64_t T = seg[i], o = (int64_t) i * jrows_ * C;
-        if (dirty_[i] > T)
+        const int64_t T = seg[i], o = (int64_t) i * jrows_ * C, TT = P + T;
+        if (dirty_[i] > TT)
             for (uint16_t* jb : {jq16_, jk16_, jv16_})
-                gpu::memset_async(jb + o + T * C, 0, (size_t) ((dirty_[i] - T) * C) * 2, s_);
-        dirty_[i] = T;
+                gpu::memset_async(jb + o + TT * C, 0, (size_t) ((dirty_[i] - TT) * C) * 2, s_);
+        dirty_[i] = TT;
         head_max(v.from(r0), T, MfOut{}, 0, heads_, hd_, vpart_, s_);
         head_scale(vpart_, T, heads_, hs_, s_);
-        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o,
-                  jk16_ + o, jv16_ + o, s_);
+        const int64_t rk = (int64_t) cur_block_ * ref_rows_ * C;
+        if (P > 0) hs_max(hs_, ref_hs_ + cur_block_ * heads_, heads_, s_);
+        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o + P * C,
+                  jk16_ + o + P * C, jv16_ + o + P * C, s_);
+        if (P > 0) {
+            gpu::copy_async(jk16_ + o, ref_k16_ + rk, (size_t) (P * C) * 2, s_);
+            ref_values(ref_v16_ + rk, ref_hs_ + cur_block_ * heads_, hs_, P, heads_, hd_, jv16_ + o, s_);
+        }
+        if (capture_) {
+            gpu::copy_async(ref_k16_ + rk, jk16_ + o, (size_t) (T * C) * 2, s_);
+            gpu::copy_async(ref_v16_ + rk, jv16_ + o, (size_t) (T * C) * 2, s_);
+            gpu::copy_async(ref_hs_ + cur_block_ * heads_, hs_, (size_t) heads_ * 4, s_);
+        }
         // every row sees every key: the int8 kernel may take them all where it is the faster (qi_attention's choice)
-        qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, T, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, 0, true);
+        qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, P, true);
         if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);
         else rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
         r0 += T;
@@ -1375,6 +1410,7 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
                 c1 = i + 1;
             }
         const uint8_t* base = blocks_stream_.begin(bi);
+        cur_block_ = bi;
         if (c0 >= 0) {
             auto f = [base](uint64_t o) { return reinterpret_cast<const float*>(base + o); };
             std::vector<int64_t> seg;
@@ -1398,6 +1434,68 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
         rows16(RmsMod{x_ + off[(size_t) i] * C, fnorm_, head_, head_ + C, C}, HW, C, h16_, rs_, s_);
         product(h16_, rs_, fout_, nullptr, out + i * HW * in_ch_, HW, nullptr);
     }
+}
+
+void MossDit::set_refs(const std::vector<RefLatent>& refs) {
+    gpu::stream_sync(s_);
+    for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_}) release(allocs_, p);
+    ref_k16_ = ref_v16_ = nullptr;
+    ref_hs_ = nullptr;
+    ref_rows_ = 0;
+    int64_t R = 0;
+    for (const RefLatent& f : refs) R += f.h * f.w;
+    if (R == 0) return;
+    const int64_t nb = (int64_t) blocks_.size(), C = C_;
+    ref_k16_ = alloc<uint16_t>(allocs_, nb * R * C);
+    ref_v16_ = alloc<uint16_t>(allocs_, nb * R * C);
+    ref_hs_ = alloc<float>(allocs_, nb * heads_);
+    ref_rows_ = R;   // the attention's rows count them from here (ensure)
+    ensure(R, 1, 0);
+    // their rows through the input projection, on the rotary axes (index + 1, 0, row, column), at timestep 0
+    std::vector<float> cv, sv;
+    rope_rows(R, hd_, rope_base_, [&refs](int64_t r, float* p) {
+        size_t i = 0;
+        while (r >= refs[i].h * refs[i].w) {
+            r -= refs[i].h * refs[i].w;
+            ++i;
+        }
+        const int64_t w = refs[i].w, y = r / w, x = r - y * w;
+        p[0] = (float) (i + 1);
+        p[1] = 0.f;
+        p[2] = (float) y - (float) (refs[i].h - 1) / 2.f;
+        p[3] = (float) x - (float) (w - 1) / 2.f;
+    }, cv, sv);
+    float* dc = alloc<float>(allocs_, (int64_t) cv.size());
+    float* ds = alloc<float>(allocs_, (int64_t) sv.size());
+    gpu::copy(dc, cv.data(), cv.size() * 4);
+    gpu::copy(ds, sv.data(), sv.size() * 4);
+    int64_t o = 0;
+    for (const RefLatent& f : refs) {
+        qi_to_f16(f.tokens, f.h * f.w * in_ch_, h16_ + o * in_ch_, s_);
+        o += f.h * f.w;
+    }
+    product(h16_, nullptr, vin_, nullptr, x_, R, b_vin_);
+    time_embedding(0.f);
+    capture_ = true;
+    try {
+        for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
+            const Block& b = blocks_[(size_t) bi];
+            const uint8_t* base = blocks_stream_.begin(bi);
+            auto f = [base](uint64_t off) { return reinterpret_cast<const float*>(base + off); };
+            const W* ws[6] = {&b.q, &b.k, &b.v, &b.o, &b.up_gate, &b.down};
+            cur_block_ = bi;
+            run_block(ws, nullptr, f(b.n1), f(b.n2), f(b.nq), f(b.nk), base, mod_, x_, {R}, {dc}, {ds});
+            blocks_stream_.end(bi);
+        }
+        flush_pending();
+    } catch (...) {
+        capture_ = false;
+        throw;
+    }
+    capture_ = false;
+    gpu::stream_sync(s_);
+    release(allocs_, dc);
+    release(allocs_, ds);
 }
 
 namespace {

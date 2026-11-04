@@ -27,7 +27,7 @@ Text and images take turns on one GPU and share its VRAM. What happens to the te
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30 (CFG) | The base model, before that tuning |
 | `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30 (CFG) | Mage-Flow tuned on Danbooru and e621 images. For illustrations drawn from booru tags. No edits (img2img and masks work) |
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 52 GB). Edits with up to 3 reference images (no transparent backgrounds) |
-| `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50 (CFG) | OpenMOSS's 5B model. For text in images and a layout set with boxes (`layout`); the prompt can be expanded (`enhance`). No edits (img2img and masks work) |
+| `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50 (CFG) | OpenMOSS's 5B model. For text in images and a layout set with boxes (`layout`); the prompt can be expanded (`enhance`). Edits through chinoll's edit adapter (Moss-Image-Edit), up to 4 reference images (img2img and masks work too) |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50 (CFG) | The base model, before its tuning |
 | `moss-image-uncensored`, `moss-image-base-uncensored` | The two above | 50 (CFG) | With HauhauCS's Qwen3.5-9B, its refusals removed, as the text encoder |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30 (CFG) | CircleStone Labs' 2B model. For anime-style illustrations drawn from Danbooru tags and sentences. No edits (img2img and masks work) |
@@ -253,26 +253,28 @@ The answer's `revised_prompt` is the prompt the model read, and `strata.enhance`
 ### Changing an image (`POST /v1/images/edits`)
 
 Makes an image from reference images: rewriting a reference image, or making a person or a thing in one the subject.
-A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) makes it from one image, img2img.
+A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image without its edit adapter) makes it from one image, img2img.
 
 - **The reference images:** OpenAI's multipart form with `image` or `image[]`, or JSON with `"images": [{"image_url": ...}]` (a data: URL or an http(s) URL).
-  Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow and HunyuanImage 3.0, 1 for a model without edits; each up to 32 MiB and at least 16x16 pixels.
+  Up to 10 for Qwen-Image-2.1, 4 for MOSS-Image, 3 for Mage-Flow and HunyuanImage 3.0, 1 for a model without edits; each up to 32 MiB and at least 16x16 pixels.
   PNG, JPEG, GIF and BMP are read as they are, other formats (WebP and others) are turned into PNG first.
 - **The model:** `model` chooses it. Without one it is the default model; where the default does not edit (MageTrail), the default's img2img when there is a `strength` or a `mask`, else the first model that edits, and the answer's `model` says which.
 - **The size:** `size` `auto`, or none, gives the first reference image's aspect ratio at about 1024x1024 pixels. HunyuanImage 3.0 makes the size the model chooses from the reference images and the prompt.
 - **How the references are read:** Qwen-Image-2.1 reads each at about 1024x1024 pixels with its aspect ratio kept, whatever the output's size; more references take more time and memory.
   Mage-Flow's picture reader reads them with the long side at 384 pixels or less, and its VAE at the output's size.
   HunyuanImage 3.0 cuts a reference to the bucket whose shape is nearest and reads it with its VAE (4,096 tokens at 1024x1024) and with SigLIP2 (at most 1,024 patches): about 5,000 tokens a reference, which lengthen each step.
+  MOSS-Image reads each reference with its VAE at about 1024x1024 pixels in its aspect ratio and puts it through the DiT once, first; at every step the image being made looks at it (the Moss-Image-Edit form of ComfyUI's MOSS-Image edit: the text encoder does not see the images). A reference takes about 2 GB of VRAM.
 - **A mask:** `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels. Every model takes one.
   With no `size`, `auto` or the first image's own size, the part around the paint is cut out, enlarged to the about 1024x1024 pixels the model draws well, drawn again, and shrunk and put back into the image (the steps and defaults of ComfyUI's Inpaint Crop and Stitch). A small part such as a face is drawn in detail, and the image comes back at the first image's size.
    - The edge put back is blurred, so the paint's close surroundings (some tens of pixels) change a little as well. Every pixel past them is exactly the first image's.
    - The part cut out is the paint's 1.2 times; with two reference images or more ("put image 2's face on her"), 1.6 times, to show more around it.
    - When the paint is so large that the cut would not be enlarged, the whole image is drawn again at about 1024x1024 pixels and put back at its own size.
    - A mask with nothing painted gives the first image as it is.
+   - For a MOSS-Image edit with two reference images or more, the whole image is drawn first, then the paint's part of that is cut out and drawn again with the reference images at strength 0.5: the edit adapter knows the references paired with a whole image, and with the cut part alone it copies another part of a reference. It takes about 1.6 times as long.
    - `crop_stitch` `false` (or the config's `images` `crop_stitch`) draws again at the output's size, as before; so does a `size` of another size.
 - **strength:** above 0 and at most 1: how much of the first image to change; the lower, the more of it is kept. As diffusers' img2img, it skips the first floor(steps × (1 − strength)) of the schedule and starts from the image's latent with that point's share of noise (fewer steps run, so it is faster too).
   The default is 1 for an edit (the edits as before; the default denoise of ComfyUI's KSampler), 0.87 for img2img (the denoise of ComfyUI's own img2img example, but no more than 1 − 1/steps, so that it skips one step at least: 0.75 at 4 steps), and 1 for img2img with a mask alone. A value that runs no step is refused. ComfyUI's `denoise` is not taken (`denoise` 0.5 at 20 steps is `strength` 0.5 at 40).
-- **The steps:** for Qwen-Image-2.1, HunyuanImage 3.0 and MOSS-Image the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating.
+- **The steps:** for Qwen-Image-2.1 and HunyuanImage 3.0 the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating. MOSS-Image's edits take 30 steps at CFG 5, with the edit adapter at strength 1 (the values of PedroMarinhoDev's copy's notes; below 1 the image is drawn again rather than edited).
 - **LoRA:** the same `lora` (and the prompts' tags) as generating, applied to the image made from reference images too ([LoRA](#lora-adapters)).
 - A reference image's alpha goes to the image model as it is. The other fields are those of generating.
 
@@ -280,7 +282,7 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`; `lora` (each adapter's `name` and `scale`) when adapters were applied.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`).
+- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
@@ -455,6 +457,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
   Read [Tencent's license](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE), its Acceptable Use Policy included, before you use the images.
   The quantized files are the ones PedroMarinhoDev publishes for ComfyUI.
 - MOSS-Image's weights (SFT and Base) are under Apache 2.0, published by OpenMOSS (MOSI. AI). Its VAE is the one in MOSS-Image's repository.
+  Its edit adapter is chinoll's [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit); setup takes PedroMarinhoDev's [copy](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI) in ComfyUI's form (GPL-3.0).
 - Anima's weights (Base, Aesthetic, Turbo) are under CircleStone Labs' non-commercial license and NVIDIA's Open Model License of Cosmos-Predict2, which it is built on. The model may not be used commercially (the images it makes may). Read [Anima's page](https://huggingface.co/circlestone-labs/Anima) before using it.
   Anima-2.9B (Gazingstars123's) and the derivatives are under their publishers' licenses.
   The VAE is Wan 2.1's, in Anima's repository; it and T5's `tokenizer.json` (google-t5/t5-base), which splits the prompt for the adapter, are under Apache 2.0.

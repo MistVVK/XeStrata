@@ -170,6 +170,12 @@ CROP_HIPASS = 0.1
 CROP_FILL_REACH = 2   # the most the engine's hole fill reaches past the mask's box (crop_reach)
 CROP_CONTEXT = 1.2
 CROP_CONTEXT_REFS = 1.6
+# MOSS-Image's edit with references besides the picture: its edit adapter matches them with the whole picture it was
+# trained beside, and a cut part alone takes their content (the face swap of 2026-11-04 drew image 2's body in place of
+# the face).  So the whole picture is edited first (its whole box: the part outside the mask kept), then the part cut
+# out of that and drawn again with the references at this strength (FaceDetailer's denoise): the same face swap kept
+# image 2's face and drew its eyes and mouth finer; 0.7 turned the hair grey
+CROP_REFINE_STRENGTH = 0.5
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -221,6 +227,14 @@ MOSS_NEG = ""
 MOSS_UNCOND_SKIP = [22]
 MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
 MOSS_SHIFT_MAX = 20.0
+# MOSS-Image's edits: chinoll's Moss-Image-Edit adapter (the config's "edit_lora", at strength 1: below 1 the scene is
+# drawn again rather than edited), as PedroMarinhoDev's ComfyUI copy's model card sets it: CFG 5, 30 steps, block 22
+# skipped by the negative pass, up to four references, each at about 1 MP in its own shape (smaller than the image
+# made, the scene zooms out); ComfyUI's TextEncodeMOSSImageEdit, its Moss-Image-Edit format (no image to the text
+# encoder, the references' latents to the DiT)
+MOSS_EDIT_STEPS = 30
+MOSS_EDIT_CFG = 5.0
+MOSS_MAX_REFS = 4
 ANIMA_STEPS = 30                   # the model card's 30 to 50 (Turbo: 8 to 12, its config's 10), CFG 4 to 5 (Turbo 1)
 ANIMA_CFG = 4.0
 ANIMA_SHIFT = 3.0                  # ComfyUI's sampling_settings for the model
@@ -310,7 +324,8 @@ def model_defaults(cfg: dict) -> dict:
         steps, least, fixed = int(cfg.get("steps") or MOSS_STEPS), 1, False
     else:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
-    edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
+    edit = (int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else
+            int(cfg.get("edit_steps") or MOSS_EDIT_STEPS) if moss and cfg.get("edit_lora") else steps)
     # "strength": an img2img's at most, lowered by the steps as img2img_strength (the web page's imgStrength)
     out = {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
@@ -333,6 +348,8 @@ def model_defaults(cfg: dict) -> dict:
                    sampler=cfg.get("sampler") or ANIMA_SAMPLERS[0])
     elif mage and not can_edit(cfg):   # Mage-Flow's Euler, er_sde on request (MageTrail's author uses either)
         out.update(samplers=list(MF_SAMPLERS), sampler=cfg.get("sampler") or MF_SAMPLERS[0])
+    if moss and cfg.get("edit_lora"):   # its edits' guidance (MOSS_EDIT_CFG)
+        out["edit_guidance"] = float(cfg.get("edit_cfg_scale") or MOSS_EDIT_CFG)
     if moss:
         out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
                    slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True,
@@ -881,13 +898,14 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     mask."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
+    moss = cfg.get("family") == "moss-image"
     edits = can_edit(cfg)
     strength = parse_strength(req)
     if not images:
         raise ImageRequestError("image: one reference image or more" if edits else "image: the image to start from")
     if edits:
         max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else HUNYUANIMAGE3_MAX_REFS if hunyuan
-                                               else MAX_REFS))
+                                               else MOSS_MAX_REFS if moss else MAX_REFS))
         if len(images) > max_refs:
             raise ImageRequestError(f"image: at most {max_refs} reference images")
     elif len(images) > 1:
@@ -919,10 +937,20 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         th = tw * h0 / w0
         tw, th = (min(side, max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP)) for v in (tw, th))
         req = {**req, "size": f"{tw}x{th}"}
-    # Mage-Flow's edit model has its own steps
-    job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")} if mage and edits else cfg)
+    # Mage-Flow's edit model has its own steps; MOSS-Image's edits their steps and guidance (MOSS_EDIT_STEPS)
+    if mage and edits:
+        job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")})
+    elif moss and edits:
+        dflt = model_defaults(cfg)
+        job = parse_request(req, {**cfg, "steps": dflt["edit_steps"], "cfg_scale": dflt["edit_guidance"]})
+    else:
+        job = parse_request(req, cfg)
     if edits:
         job["refs"] = list(images)
+        if moss:   # the references at about 1 MP (Crop and Stitch's first, the picture the engine cuts from, as it is)
+            keep = 1 if crop is not None and not crop.get("empty") else 0
+            job["refs"] = job["refs"][:keep] + [moss_ref(r) for r in job["refs"][keep:]]
+            job["edit_lora"] = cfg["edit_lora"]
     else:
         job["init"] = images[0]
         if strength is None:
@@ -932,6 +960,10 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     if crop is not None:   # the image at the first image's size, drawn at the plan's
         job["crop"] = crop
         job["width"], job["height"] = w0, h0
+        if moss and edits and len(images) > 1 and not crop.get("empty") and not crop["whole"]:   # CROP_REFINE_STRENGTH
+            job["crop"] = crop_whole(cfg, w0, h0, crop["blend"])
+            job["refine"] = {"crop": crop, "strength": CROP_REFINE_STRENGTH,
+                             "steps_run": strength_run(job["steps"], CROP_REFINE_STRENGTH)}
     if strength is not None and strength < 1:
         run = strength_run(job["steps"], strength)
         if run < 1:
@@ -1029,8 +1061,8 @@ def _crop_to_shape(x: int, y: int, w: int, h: int, W: int, H: int, gw: int, gh: 
 
 def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEXT,
               blend: int = CROP_BLEND) -> dict | None:
-    """Crop and Stitch's plan of an edit with a mask (img_crop.hpp, the engine's part, which fills the mask's holes): the
-    box of the mask's values from CROP_HIPASS on (mask_hipass_filter), grown by the engine's reach (crop_reach), by
+    """Crop and Stitch's plan of an edit with a mask (img_crop.hpp, the engine's part, which fills the mask's holes):
+    the box of the mask's values from CROP_HIPASS on (mask_hipass_filter), grown by the engine's reach (crop_reach), by
     `context` around (context_from_mask_extend_factor) and to the drawing's shape (crop_gen_size, _crop_to_shape).  A
     box the drawing would not enlarge is the whole picture's (drawn at the model's size and put back at the picture's,
     its pixels outside the mask kept).  -> {"box": [x, y, w, h], "gen": [gw, gh], "blend", "size": [W, H], "whole":
@@ -1054,11 +1086,17 @@ def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEX
         x0, y0, x1, y1 = max(0, x0 - gx), max(0, y0 - gy), min(W, x1 + gx), min(H, y1 + gy)
     gw, gh = crop_gen_size(cfg, x1 - x0, y1 - y0)
     x, y, w, h = _crop_to_shape(x0, y0, x1 - x0, y1 - y0, W, H, gw, gh)
-    whole = gw <= w   # the drawing would not enlarge the box: the whole picture instead
-    if whole:
-        gw, gh = crop_gen_size(cfg, W, H)
-        x, y, w, h = _crop_to_shape(0, 0, W, H, W, H, gw, gh)
-    return {"box": [x, y, w, h], "gen": [gw, gh], "blend": blend, "size": [W, H], "whole": whole}
+    if gw <= w:   # the drawing would not enlarge the box: the whole picture instead
+        return crop_whole(cfg, W, H, blend)
+    return {"box": [x, y, w, h], "gen": [gw, gh], "blend": blend, "size": [W, H], "whole": False}
+
+
+def crop_whole(cfg: dict, W: int, H: int, blend: int = CROP_BLEND) -> dict:
+    """plan_crop's plan of the whole picture of W x H: drawn at the model's size in its shape and put back at its own,
+    the part outside the mask kept."""
+    gw, gh = crop_gen_size(cfg, W, H)
+    return {"box": list(_crop_to_shape(0, 0, W, H, W, H, gw, gh)), "gen": [gw, gh], "blend": blend, "size": [W, H],
+            "whole": True}
 
 
 def crop_word(crop: dict) -> str:
@@ -1335,8 +1373,25 @@ def load_tokenizer(path: str, family: str = "qwen-image"):
 def can_edit(cfg: dict) -> bool:
     """Whether the image model of the config section `cfg` edits (takes reference images): Qwen-Image-2.1's and
     Mage-Flow's with their vision encoder (and Mage-Flow's edit model), HunyuanImage 3.0's with its vision model's
-    file; MageTrail does not."""
+    file, MOSS-Image's with its edit adapter (edit_lora); MageTrail does not."""
+    if cfg.get("family") == "moss-image":
+        return bool(cfg.get("edit_lora"))
     return bool(cfg.get("vision")) and not (cfg.get("family") == "mage-flow" and not cfg.get("edit_model"))
+
+
+def moss_ref(data: bytes) -> bytes:
+    """A MOSS-Image edit's reference image at about 1024 x 1024 pixels in its shape, sides multiples of 16 (Lanczos;
+    MOSS_EDIT_STEPS' note), as a PNG; one already that size as it is."""
+    import io
+    from PIL import Image
+    w0, h0 = image_dims(data)
+    tw = (1024 * 1024 * w0 / h0) ** 0.5
+    w, h = (max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP) for v in (tw, tw * h0 / w0))
+    if (w, h) == (w0, h0):
+        return data
+    out = io.BytesIO()
+    Image.open(io.BytesIO(data)).convert("RGBA").resize((w, h), Image.LANCZOS).save(out, format="PNG", compress_level=1)
+    return out.getvalue()
 
 
 def _kv(line: str) -> dict:
@@ -1922,9 +1977,10 @@ class ImageGen:
     def _lora_words(job: dict) -> str:
         """IMG's and NEED's adapters: LORA:<strength>:<path> for each, in the order the request gave them (the strength
         first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the engine splits the
-        line on whitespace - encode_path)."""
-        return "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
-                       for use in job.get("loras") or ())
+        line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at 1."""
+        edit = f" LORA:1.0:{lora_api.encode_path(job['edit_lora'])}" if job.get("edit_lora") else ""
+        return edit + "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
+                              for use in job.get("loras") or ())
 
     @staticmethod
     def _cfg_words(job: dict) -> str:
@@ -2000,8 +2056,58 @@ class ImageGen:
             self.stage(job)
             n = len(self.ids(job)) - self.drop_of(job)
             neg = f" NEG:{len(job['neg_ids']) - self.drop_of(job)}" if job.get("cfg") else ""
-            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}",
-                                   "NEED", 600)
+            got = self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}",
+                                  "NEED", 600)
+            if job.get("refine"):   # the second pass's too: the larger of each
+                job2 = self._refine_job(job)
+                self.stage(job2)
+                try:
+                    w2, h2 = made_size(job2)
+                    two = self.engine.ask(f"NEED {w2} {h2} {n}{self._refs_words(job2, need=True)}{neg}"
+                                          f"{self._lora_words(job2)}", "NEED", 600)
+                finally:
+                    self._unstage_refine(job2)
+                got = {k: max(v, two.get(k, v)) if k in ("least_mib", "full_mib") else v for k, v in got.items()}
+            return got
+
+    def _refine_job(self, job: dict, picture: bytes | None = None) -> dict:
+        """The second pass of a job with "refine" (CROP_REFINE_STRENGTH): its Crop and Stitch plan and strength, the
+        first pass's `picture` as the first reference (the first image's until then), its own files staged."""
+        job2 = {k: v for k, v in job.items() if k not in ("ref_dir", "ref_paths", "mask_path", "init_path", "refine")}
+        job2.update(crop=job["refine"]["crop"], strength=job["refine"]["strength"],
+                    steps_run=job["refine"]["steps_run"])
+        if picture is not None:
+            job2["refs"] = [picture] + list(job["refs"][1:])
+        return job2
+
+    @staticmethod
+    def _unstage_refine(job2: dict) -> None:
+        """A second pass's own files removed (the text states' files are the first pass's: unstage would take them)."""
+        for p in (job2.get("ref_paths") or []) + [job2[k] for k in ("mask_path", "init_path") if job2.get(k)]:
+            with contextlib.suppress(OSError):
+                os.unlink(p)
+        if job2.get("ref_dir"):
+            with contextlib.suppress(OSError):
+                os.rmdir(job2["ref_dir"])
+
+    def _refine(self, job: dict, i: int, picture: bytes, out: Path, ids: str, guide: str, timeout: float, cancel,
+                step, stage) -> dict:
+        """Image i's second pass (a job with "refine") from the first's `picture` into `out` -> its IMAGE line."""
+        job2 = self._refine_job(job, picture)
+        self.stage(job2)
+        gw, gh = job2["crop"]["gen"]
+        self._live(stage="refs", step=0, steps=job2["steps_run"], sampling_at=None)
+        try:
+            return self.engine.ask(f"IMG {gw} {gh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{guide}"
+                                   f"{self._refs_words(job2)}{self._cfg_words(job2)}{self._lora_words(job2)}",
+                                   "IMAGE", timeout, cancel, step, stage)
+        except ImageJobFailed as e:
+            self.totals["failed"] += 1
+            why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
+            self._say(f"image job failed: {why}")
+            raise (LoraRejected if isinstance(e, LoraRejected) else ImageJobFailed)(why) from e
+        finally:
+            self._unstage_refine(job2)
 
     def free_mib(self) -> int:
         """The device's free VRAM, as the engine sees it (its parts left as they are)."""
@@ -2111,6 +2217,12 @@ class ImageGen:
                     images.append(png_rgba(out.read_bytes(), job["width"], job["height"], rw, rh))
                     parts.append(r)
                     self._measured(job, r)
+                    if job.get("refine"):   # its part cut out of the first pass and drawn again (CROP_REFINE_STRENGTH)
+                        r = self._refine(job, i, images[-1], work / f"img_{i}.refine.rgba", ids, guide, timeout,
+                                         cancel, step, stage)
+                        images[-1] = png_rgba((work / f"img_{i}.refine.rgba").read_bytes(), job["width"],
+                                              job["height"], job["width"], job["height"])
+                        parts.append(r)
         finally:
             self.progress = None
             self.unstage(job)
@@ -2140,6 +2252,10 @@ class ImageGen:
         if crop:   # Crop and Stitch: the box drawn (on the picture, x y w h) or nothing to change
             figures["crop"] = ({"empty": True} if crop.get("empty") else
                                {"box": list(crop["box"]), "whole": bool(crop.get("whole"))})
+        if job.get("refine"):   # its second pass: the part cut out of the first and drawn again
+            two = job["refine"]["crop"]
+            figures["refine"] = {"box": list(two["box"]), "made_size": "{}x{}".format(*two["gen"]),
+                                 "strength": job["refine"]["strength"]}
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
             figures["requested_size"] = job["requested_size"]
         if job.get("loras"):                               # the IMAGE line's count and VRAM, and a tag's names left out

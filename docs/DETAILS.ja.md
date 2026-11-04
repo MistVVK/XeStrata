@@ -2047,7 +2047,7 @@ Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコー�
   Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
   ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)、拒否を外した版は dealignai の [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）、Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と HauhauCS の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
-  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の ComfyUI 向けの単一ファイル）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
+  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の ComfyUI 向けの単一ファイル）、OpenMOSS の MOSS-Image と chinoll の編集の LoRA（Moss-Image-Edit、ComfyUI の形は PedroMarinhoDev）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
@@ -2070,6 +2070,7 @@ Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコー�
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)
      （VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方。コードは書き起こし）。
+   - Kijai による ComfyUI の MOSS-Image の編集（[#17296](https://github.com/comfyanonymous/ComfyUI/pull/17296)、GPL-3.0）: MOSS-Image の編集の参照画像の扱い（`src/image/moss_dit.cpp` の `set_refs`: 時刻 0 で参照どうしだけが見合う K と V を 1 度作り、各ステップで描く画像と文の行がそれも見る。RoPE の位置）。コードは写さずに書いています。
    - lquesada による [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch)（GPL-3.0）: マスク付きの編集の切り出しと貼り戻し（`src/image/img_crop.cpp`、`serve/images.py` の `plan_crop`）の手順と既定値（InpaintCropImproved・InpaintStitchImproved のマスクの hipass・穴埋め・膨張・ぼかし、範囲の広げ方、縦横比の合わせ方、縁の複製、貼り戻し）。コードは写さずに書いています。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
   チャットの数式は [KaTeX](https://katex.org/) 0.19.0（MIT、`third_party/main/katex/LICENSE`）で描きます。

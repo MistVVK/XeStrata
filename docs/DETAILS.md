@@ -2102,7 +2102,7 @@ The model files are not part of it; their licenses apply to them (below).
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
   The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
-  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
+  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with chinoll's edit adapter (Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
@@ -2127,6 +2127,10 @@ The model files are not part of it; their licenses apply to them (below).
      [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
+   - ComfyUI's MOSS-Image edit, by Kijai ([#17296](https://github.com/comfyanonymous/ComfyUI/pull/17296), GPL-3.0): how a
+     MOSS-Image edit takes its reference images (`src/image/moss_dit.cpp`'s `set_refs`: their keys and values made once
+     at timestep 0, the references seeing each other alone, and seen at every step by the image's and the text's rows;
+     their RoPE positions). The code is written without copying theirs.
    - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (GPL-3.0):
      the steps and defaults of an edit's cut and putting back with a mask (`src/image/img_crop.cpp`, `serve/images.py`'s
      `plan_crop`: InpaintCropImproved's and InpaintStitchImproved's mask hipass, hole fill, growth and blur, how the part
