@@ -485,7 +485,11 @@ void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& o
 void MossPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls) {
     const int64_t h = r.height / 16, w = r.width / 16;
     const uint64_t more = need(0, r.width, r.height, {}, true).least - need(0, r.width, r.height).least;
-    if (held() + more > budget()) release(false);
+    // the encoder's room by the device's own count as well: the last request's parts may hold more than held() counts
+    // (an edit after an edit on the RTX 4070's 12 GB held 11525 MiB of an 11215 MiB budget, and the encode was refused)
+    const uint64_t enc = vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * r.width * r.height) * 4 +
+                         (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + (64ull << 20);
+    if (held() + more > budget() || free_vram() < enc) release(false);
     std::string err;
     if (!vae_->open_encoder(err)) throw std::runtime_error(err);
     const std::vector<float> px = base_rgb(base, r.width, r.height);
@@ -698,10 +702,28 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         std::vector<float*> z;
         try {
             std::vector<MossDit::RefLatent> lat;
+            // their encoding's room: the plan leaves it out, and the last request's activations and the text
+            // encoder's layers may hold it (a second edit on the RTX 4070's 12 GB was refused the VAE's scratch)
+            uint64_t enc = 0;
+            for (const QiRef& f : r.refs)
+                enc = std::max(enc, vae_->encode_scratch_bytes(f.height / 16, f.width / 16) +
+                                        (uint64_t) (3 * f.width * f.height) * 4 +
+                                        (uint64_t) (d.latent_channels() * (f.height / 16) * (f.width / 16)) * 4);
+            enc += (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + (64ull << 20);
+            if (free_vram() < enc) d.drop_activations();
+            if (free_vram() < enc && te_ && te_->layers_vram() > te_->layer_min()) {
+                te_->set_layer_budget(te_->layer_min());
+                te_set_ = te_->layer_min();
+            }
             for (const QiRef& f : r.refs) {
                 z.push_back(encode_ref(f));
                 lat.push_back({z.back(), f.height / 16, f.width / 16});
             }
+            // the encoders' scratch (the references', the base image's) kept for the decode only where every block
+            // is resident and it fits beside this image's work, and let go before the blocks run over the references:
+            // allocating it again at the decode cost a 1 MP edit's decode a fifth (B70, 2026-11-04), but a card that
+            // streams the blocks (the RTX 4070's 12 GB) needs the room for their layers
+            if (d.resident_blocks() < d.blocks() || vae_->scratch_held() > p.vae - p.activations) vae_->drop_scratch();
             d.set_refs(lat, !r.refs_aitk);
         } catch (...) {
             for (float* p0 : z) gpu::free(p0);
@@ -711,9 +733,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     } else if (d.ref_rows() > 0) {
         d.set_refs({});
     }
-    // the encoders' scratch (the references', the base image's) kept for the decode only beside this image's work, as
-    // the last image's is: allocating it again at the decode cost a 1 MP edit's decode a fifth (B70, 2026-11-04)
-    if (vae_->scratch_held() > p.vae - p.activations) vae_->drop_scratch();
     const auto t1 = clock::now();
     // the seed's noise as the reference's ([channels][h][w], PyTorch's CPU randn), as the latent's tokens [h w][channels]
     const int64_t Cl = d.latent_channels(), N = Cl * h * w;
@@ -772,6 +791,11 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             te_->set_layer_budget(te_->layer_min());
             te_set_ = te_->layer_min();
         }
+        // the room by the device's own count too, less a margin: the scratch's estimate runs a little short (an
+        // ai-toolkit edit on the RTX 4070: 3346 MiB estimated in 3394 of room, and a 64 MiB buffer refused) - where it
+        // does not fit, the VAE decodes in tiles
+        room = std::min(room, free_vram() + vae_->scratch_held());
+        room -= std::min(room, (uint64_t) 128 << 20);
         vae_->decode(x, h, w, rgba, room);
         p.vae_tiled = vae_->last_tiled();
         if (vae_->scratch_bytes(h, w) > p.vae) vae_->drop_scratch();

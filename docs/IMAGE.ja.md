@@ -148,6 +148,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
 | `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6`、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
+| `image_tools` | すべて | チャットのモデルが使ってよい画像の道具の一覧（`generate_image`・`edit_image`）。ここにない道具は、チャットにも Images API にも出しません |
 | `crop_stitch` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
 | `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
 
@@ -293,7 +294,9 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
-- 道具の説明には、渡す画像のモデルごとのプロンプトの書き方が入り、チャットのモデルはそれに沿ってプロンプトを書きます。Anima と MageTrail は Danbooru のタグ、ほかのモデルは英語の文で、そのうえにモデルごとの決まりがあります。書き方は `serve/image_skills/` にあります（共通の `common.md`、タグの `booru.md`、文の `natural.md`、モデルや系統ごとのファイル）。
+- `strata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
+- 画像を読めるチャットのモデル（`vision` の設定がある）には、作った画像の小さな写し（長い辺 512 ピクセル）を道具の結果として見せ、頼んだとおりかを確かめさせます。
+- 画像のモデルごとのプロンプトの書き方（スキル）は、`image_skill` の道具で読みます。いつも渡すのは、画像の道具の短い説明と、`image_skill` の説明（共通の書き方、どのモデルがタグか文か、スキルの一覧）だけで、チャットのモデルは画像を作ると決めたときに、要るスキルを選んで（いくつでもまとめて）読みます。画像を作らない会話には、スキルの中身は入りません。Anima と MageTrail は Danbooru のタグ、ほかのモデルは英語の文で、そのうえにモデルごとの決まりがあります。モデルが 2 つ以上なら、それぞれの得意なこと（`models`）も同じように読みます。書き方は `serve/image_skills/` にあります（共通の `common.md`、タグの `booru.md`、文の `natural.md`、モデルや系統ごとのファイル。各ファイルの `When:` の行が一覧の説明になります）。画像のボタンで送った要求と `/v1/responses` の `image_generation` では、今までどおり、渡すモデルのスキルを道具の説明に最初から入れます。
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。

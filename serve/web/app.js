@@ -3342,6 +3342,8 @@ function imgMaskSetup() {
   if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
   imgMaskURL = null;
   $("img-mask").hidden = !(f && d.mask);
+  $("img-crop").checked = d.crop_stitch !== false;
+  $("img-refine-f").hidden = !(d.refine && ($("img-ref").files || []).length > 1);
   if ($("img-mask").hidden) { imgLayoutDraw(); return; }
   imgMaskURL = URL.createObjectURL(f);
   const img = $("img-mask-img"), c = $("img-mask-paint");
@@ -3716,7 +3718,11 @@ $("img-form").onsubmit = async (ev) => {
     // server takes only JSON from a browser page, so that another site's form cannot use it)
     if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataURL(f)})));
     const mask = refs.length ? imgMask() : null;
-    if (mask) body.mask = {image_url: mask};
+    if (mask) {
+      body.mask = {image_url: mask};
+      body.crop_stitch = $("img-crop").checked;
+      if (!$("img-refine-f").hidden && $("img-refine").checked) body.refine = true;
+    }
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const j = partial && r.ok ? await imgStream(r, prompt) : await r.json();
@@ -3727,7 +3733,9 @@ $("img-form").onsubmit = async (ev) => {
       img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      const made = j.strata && j.strata.made_size ? ` ${tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})}`
+      const made = j.strata && j.strata.crop && !j.strata.crop.whole && j.strata.made_size ? ` ${tr("img.madeCrop", "(drawn at {size} around the painted part)", {size: j.strata.made_size})}`
+        : j.strata && j.strata.crop ? ""
+        : j.strata && j.strata.made_size ? ` ${tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})}`
         : j.strata && j.strata.requested_size ? ` ${tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size})}` : "";
       const by = $("img-model-f").hidden ? "" : `${j.model}, `;
       cap.textContent = `${by}${j.size}${made}, ${tr("img.capSeed", "seed {seed}", {seed: d.seed})}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
@@ -3737,7 +3745,7 @@ $("img-form").onsubmit = async (ev) => {
       $("img-results").prepend(fig);
     }
     $("img-hint").textContent = tr("img.done", "Done. Right-click an image to save it.");
-    if (j.strata && j.strata.made_size)
+    if (j.strata && j.strata.made_size && !j.strata.crop)
       toast("info", tr("img.madeAt", "Made at {size}", {size: j.strata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
     else if (j.strata && j.strata.requested_size)
       toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.strata.requested_size}), 8000);

@@ -355,7 +355,9 @@ def model_defaults(cfg: dict) -> dict:
            "prompt_start": (MAGETRAIL_QUALITY if mage and str(cfg.get("model_name", "")).startswith("magetrail")
                             else (cfg.get("prompt_start", ANIMA_QUALITY) or "") if anima else ""),
            "transparency": cfg.get("transparency") is not False,
-           "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG}
+           "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG,
+           # an edit with a mask: Crop and Stitch by default (crop_wanted), MOSS-Image's second pass on request
+           "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg))}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
     if anima:
@@ -1131,6 +1133,14 @@ def crop_word(crop: dict, ref: tuple[int, int] | None = None) -> str:
     x, y, w, h = crop["box"]
     word = f" CROP:{x},{y},{w},{h},{crop['blend']},{crop['size'][0]},{crop['size'][1]}"
     return word + (f",{ref[0]},{ref[1]}" if ref else "")
+
+
+def check_tool(cfg: dict, name: str) -> None:
+    """ImageRequestError where the config's "image_tools" (every image tool by default) leaves `name` out: the Images
+    API's operations are the chat's tools', and a tool turned off is off at every entry."""
+    conf = cfg.get("image_tools")
+    if conf is not None and name not in conf:
+        raise ImageRequestError(f"{name} is turned off on this server (its config's images \"image_tools\")")
 
 
 def parse_flag(v, name: str) -> bool | None:
@@ -2704,6 +2714,10 @@ SKILL_KINDS = ("catalog", "style", "model", "tool")
 SKILL_MODELS = "models"   # the catalog: what each image model offered is made for (the tools' "model" choice)
 SKILL_MODELS_WHEN = "choosing the image model: what each one is made for."
 SKILL_TOOL = "image_skill"
+# the copy of a made image an image tool's result shows a chat model that reads pictures: its longer side, and how many
+# such copies the image folder's seen/ keeps (a request's later rounds read them)
+SEEN_SIDE = 512
+SEEN_KEEP = 32
 SKILL_READ = " Before writing its prompt, read the skills it needs with image_skill."
 
 
@@ -2810,7 +2824,7 @@ class ImageTools:
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
                  model: str | None = None, mask: bytes | None = None, user: dict | None = None,
-                 skills: str = "index"):
+                 skills: str = "index", tools=None):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
         if model is not None:   # the request's own image model (strata_images {"model": ...}): that one alone
@@ -2834,6 +2848,19 @@ class ImageTools:
         # "inline", every skill of the models offered in the tools' descriptions (the image button's request, which is
         # an image's for certain, and the Responses route's image_generation tool)
         self.skills = skills
+        # the image tools this request may use: the config's "image_tools" (every one by default), narrowed by the
+        # request's strata_images.tools - a tool the config leaves out cannot be asked for
+        offered = [t["name"] for t in TOOLS]
+        conf = gen.cfg.get("image_tools")
+        allowed = set(offered if conf is None else conf)
+        if tools is not None:
+            if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+                raise ImageRequestError("strata_images.tools: a list of image tools' names")
+            unknown = [t for t in tools if t not in offered]
+            if unknown:
+                raise ImageRequestError(f"strata_images.tools: {', '.join(unknown)}: one of {', '.join(offered)}")
+            allowed &= set(tools)
+        self.allowed = allowed
         # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
         # background, over what the model's call says (size "auto": the call's)
         self.options = {k: v for k, v in (options or {}).items()
@@ -2865,7 +2892,7 @@ class ImageTools:
         out = []
         for t in TOOLS:
             gens = self._gens(t["name"] == "edit_image")
-            if not gens or t["name"] in exclude:
+            if not gens or t["name"] in exclude or t["name"] not in self.allowed:
                 continue
             # the user's boxes alone make a new image by them, as ComfyUI's MOSS-Image Layout Prompt does (the picture
             # they were drawn on is the canvas' background only); with a mask too, the painted part is redrawn by them
@@ -3012,6 +3039,26 @@ class ImageTools:
                 "ms": round((time.monotonic() - t0) * 1000), "server": None, "tool": SKILL_TOOL, "images": []}
 
     @staticmethod
+    def _seen(gen, png: bytes) -> Path | None:
+        """A copy of `png` at most SEEN_SIDE pixels a side (JPEG) in the image folder's seen/, the newest SEEN_KEEP kept
+        -> its path; None where it cannot be written."""
+        import io
+        from PIL import Image
+        try:
+            d = Path(gen.cfg.get("out_dir") or tempfile.gettempdir()) / "seen"
+            d.mkdir(parents=True, exist_ok=True)
+            im = Image.open(io.BytesIO(png)).convert("RGB")
+            im.thumbnail((SEEN_SIDE, SEEN_SIDE), Image.LANCZOS)
+            path = d / f"{secrets.token_hex(16)}.jpg"
+            im.save(path, format="JPEG", quality=85)
+            for old in sorted(d.glob("*.jpg"), key=lambda f: f.stat().st_mtime)[:-SEEN_KEEP]:
+                with contextlib.suppress(OSError):
+                    old.unlink()
+            return path
+        except OSError:
+            return None
+
+    @staticmethod
     def _about(g) -> str:
         """A model the catalog does not describe: a derivative of Anima the user put in its folder."""
         if g.family == "anima":
@@ -3075,6 +3122,11 @@ class ImageTools:
         if name == SKILL_TOOL:   # reading skills makes no image: not one of max_tool_calls' calls
             return self._read_skills(arguments)
         t0 = time.monotonic()
+        if name not in self.allowed:   # checked as it runs, not only by the tools offered
+            text = (f"error: not run: {name} is not one of this request's image tools "
+                    f"({', '.join(sorted(self.allowed))})")
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
+                    "tool": name, "images": []}
         if self.max_calls is not None and self.calls >= self.max_calls:
             text = f"error: not run: this response may make {self.max_calls} image tool call(s) (max_tool_calls)"
             return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
@@ -3147,10 +3199,16 @@ class ImageTools:
             text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
                     f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. To change it, call edit_image "
                     f"(its image: {urls[0]}).")
+            seen = self._seen(gen, images[0])
             ok = True
         except (ValueError, ImageJobFailed) as e:
-            text, ok = f"error: {e}", False
+            text, ok, seen = f"error: {e}", False, None
         return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
+                # a small copy of the image for a chat model that reads pictures (run_with_mcp passes it with one):
+                # it sees whether the image shows what was asked, and can fix it with the tools
+                **({"model_content": [
+                    {"type": "text", "text": text + " A small copy is attached: check that it shows what was asked."},
+                    {"type": "image", "source": str(seen)}]} if seen is not None else {}),
                 "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls,
                 **({"image": {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
                               "background": job["background"], "output_format": job["output_format"],

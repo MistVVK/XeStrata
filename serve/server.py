@@ -7811,6 +7811,7 @@ def make_handler(svc: Service):
                                            "message": images_api.not_set_up_message()}})
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
+            images_api.check_tool(gen.cfg, "generate_image")    # the config's image_tools, at every entry
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
             self._image_job(gen, job, req.get("stream") is True)
 
@@ -7858,6 +7859,7 @@ def make_handler(svc: Service):
             # the image model it names; else the default, or where that one has no edits (MageTrail), the first that
             # edits - unless the request is img2img's (a strength or a mask), which the default takes
             gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
+            images_api.check_tool(gen.cfg, "edit_image")
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job, req.get("stream") is True, edit=True)
@@ -8365,7 +8367,8 @@ def make_handler(svc: Service):
                 image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
                                                     model=want.get("model") if isinstance(want, dict) else None,
-                                                    user=user, skills="inline" if image_force else "index")
+                                                    user=user, skills="inline" if image_force else "index",
+                                                    tools=want.get("tools") if isinstance(want, dict) else None)
                 if user:
                     images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
