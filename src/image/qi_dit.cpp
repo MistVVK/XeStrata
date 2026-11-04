@@ -243,13 +243,26 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         // weight dequantized to FP16 in the products' scratch and rotated and quantized again a row at a time, in
         // place, each time a block is copied to the GPU (int8 values and a scale a row take less room than any
         // block format of 8 bits a value or more); else Q8_0's on NVIDIA's int8 tensor cores where the GPU has them
+        uint64_t w8t_bytes = 0;
         if (std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(s_)) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
                     w->w8 = w->k % kQiRotate == 0 &&
                             (uint64_t) w->n * w->row_bytes >= (uint64_t) w->n * (uint64_t) w->k + 4 * (uint64_t) w->n;
+                    // a block format of fewer bits (Q6_K, Q5_K, Q4_K...): kept as it is in VRAM and written as int8
+                    // rows into a scratch at each product.  The int8 products' rate against the FP16 products' (half
+                    // of it with FP32 sums on NVIDIA's GeForce cards) pays for the rewrite many times over (RTX 4070,
+                    // Qwen-Image-2.1-Turbo Q6_K, 1024 x 1024, 8 steps, 2026-11-05: 9.12 s of sampling in FP16, 4.5 so
+                    // with the int8 attention, 0.48 of it the rewrites)
+                    if (!w->w8 && w->k % kQiRotate == 0 && w->type != kTypeF16 && w->type != kTypeF32 &&
+                        kernels::dequant_bf16_supported(w->type)) {
+                        w->w8 = w->w8t = true;
+                        w8t_rows_ = std::max(w8t_rows_, w->n);
+                        w8t_bytes = std::max(w8t_bytes, (uint64_t) (w->n * w->k));
+                    }
                     w8_ = w8_ || w->w8;
                 }
+            if (w8t_bytes > 0) weight_bytes_ += w8t_bytes + (uint64_t) (kW8tScales * w8t_rows_) * 4;
         } else if (kernels::q8_mma_usable(core::Runtime::get().stream(s_))) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
@@ -260,6 +273,10 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         install_prepare();
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
+        if (w8t_bytes > 0) {
+            w8t_ = alloc<int8_t>(allocs_, (int64_t) w8t_bytes);
+            w8t_s_ = alloc<float>(allocs_, kW8tScales * w8t_rows_);
+        }
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
         temb_ = alloc<float>(allocs_, 2 * C_);
         mods_ = alloc<float>(allocs_, 8 * C_);
@@ -309,7 +326,7 @@ void QiDit::install_prepare() {
         const Block& b = blocks_[(size_t) i];
         for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
             auto* p = d + reinterpret_cast<uintptr_t>(w->d);
-            if (w->w8) {
+            if (w->w8 && !w->w8t) {
                 if (w->type == kTypeF16)   // already FP16: the values the dequantization would write
                     gpu::copy_async(gemm_.scratch(), p, (size_t) (w->n * w->k) * 2, s_);
                 else
@@ -319,7 +336,8 @@ void QiDit::install_prepare() {
             } else if (w->packed) {
                 kernels::q8_mma_repack(q, p, w->n, w->k);
             }
-            if (w->baked) w->lora->bake(w->w8 ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
+            if (w->baked)
+                w->lora->bake(w->w8 && !w->w8t ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
         }
     });
 }
@@ -347,7 +365,17 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             qi_rows_i8(x16, false, T, w.k, x8, sx, nullptr, s_);
         }
         const auto* w8 = static_cast<const uint8_t*>(w.d);
-        const auto* sw = reinterpret_cast<const float*>(w8 + w.n * w.k) + row0;
+        const float* sw = reinterpret_cast<const float*>(w8 + w.n * w.k) + row0;
+        if (w.w8t) {   // the weight's rows as int8 into the scratch, as install_prepare writes a w8 weight's
+            float* s = w8t_s_ + w8t_next_ * w8t_rows_;
+            w8t_next_ = (w8t_next_ + 1) % kW8tScales;
+            if (!qi_rows_i8_blocks(w.type, base, rows, w.k, w8t_, s, s_)) {
+                kernels::dequant_f16(w.type, base, 0, rows, w.k, gemm_.scratch(), s_);
+                qi_rows_i8(gemm_.scratch(), false, rows, w.k, w8t_, s, nullptr, s_);
+            }
+            w8 = reinterpret_cast<const uint8_t*>(w8t_) - row0 * w.k;
+            sw = s;
+        }
         prefill::Gemm::i8(x8, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), reinterpret_cast<int32_t*>(y), T,
                           rows, w.k, ldy, s_);
         if (defer) {
@@ -893,7 +921,7 @@ void QiDit::lora_glora_scratch() {
 void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
                          int64_t ldy, int64_t row0) {
     const auto* d = static_cast<const uint8_t*>(w.d);
-    if (w.w8) {
+    if (w.w8 && !w.w8t) {   // a w8t weight's blocks take the native path below
         // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
         qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
@@ -1110,7 +1138,8 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
         int64_t nk = 0, kr = 0;
         for (Block& b : blocks_)
             for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down})
-                if (w->lora != nullptr && w->lora->bakeable() && (w->w8 ? -8 : w->type == 1 ? 1 : w->type == 8 && !w->packed ? 8 : 0) != 0) {
+                if (w->lora != nullptr && w->lora->bakeable() &&
+                    (w->w8 && !w->w8t ? -8 : w->type == 1 ? 1 : w->type == 8 && !w->packed ? 8 : 0) != 0) {
                     w->baked = true;
                     nk = std::max(nk, w->n * w->k);
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());

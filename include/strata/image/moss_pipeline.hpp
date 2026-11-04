@@ -64,7 +64,9 @@ public:
               const std::string& vision = "");
 
     void set_budget(uint64_t bytes) override;
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
+    /// The budget set (or the automatic one) less what the device's own use past this engine's allocations has grown
+    /// since it was set (vram_other)
+    uint64_t budget() const override;
     void release(bool all = false) override;
     void fit(uint64_t reserve) override;
     uint64_t held() const override;
@@ -88,6 +90,7 @@ private:
     void use_loras(const QiRequest& r);
     bool want_q8(int64_t rows, int n, int64_t max_text);
     bool open_text();
+    void fit_text();
     void encode(const std::vector<int32_t>& ids, std::vector<float>& out,
                 const std::vector<MossText::Picture>& pictures = {});
     uint64_t text_fixed() const;
@@ -119,6 +122,7 @@ private:
     uint64_t te_layers_ = 0, te_layer_max_ = 0, te_other_ = 0, te_fixed_ = 0;
     int te_measure_ = 0;
     uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
+    int64_t other_base_ = 0;   // vram_other() as the budget was set
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_, last_neg_ids_;
     std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens

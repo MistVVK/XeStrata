@@ -15,8 +15,8 @@
 // coefficients and a prototype branch (two 3 x 3 convolutions around a 2 x 2 transposed one, then a 1 x 1).
 //
 // The picture is letterboxed to 640 on its longer side (bilinear, kept ratio, the short side padded to a multiple of
-// 32 with grey 114, the padding split in two) on the GPU; the convolutions go through qi_conv (oneDNN, cuDNN) where
-// the build and the GPU take them, else through prefill::Gemm (1 x 1 as products, k x k unfolded); the activations,
+// 32 with grey 114, the padding split in two) on the GPU; the k x k convolutions go through oneDNN (qi_conv) where
+// the build and the GPU take it, else, and the 1 x 1 ones, through prefill::Gemm (k x k unfolded); the activations,
 // pools, upsampling, concatenations, the head's decoding and the masks are the engine's kernels.  The candidates above
 // the threshold go through non-maximum suppression on the host (IoU 0.7, every class together, 300 at most), and the
 // boxes are mapped back to the picture and clipped to it.

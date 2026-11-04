@@ -73,6 +73,20 @@ bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v
                      int64_t r0, int64_t first, uint16_t* out16, void* stream);
 /// The keys of qi_attention_i8's chunks: P in int8 at 127 steps of a row's largest in each chunk (from key 0).
 int qi_attention_i8_chunk();
+/// The int8 kernel over a prefix of keys made once and read by many attentions (an edit's references, each block's):
+/// qi_attention_i8_prefix_bytes of device memory a prefix of P keys takes; qi_attention_i8_prefix makes it from their
+/// k16 and v16 ([P][heads * 128]); qi_attention_i8_prefixed is the attention of T rows (q16, k16, v16 [T][heads * 128])
+/// over the prefix's P keys and their own T, to out16 [T][heads * 128], the prefix's V taken at v_from[h] / v_to[h]
+/// (device [heads]) of its values.  false where the kernel is not built for the GPU or its buffers do not fit.
+uint64_t qi_attention_i8_prefix_bytes(int64_t P, int64_t heads);
+bool qi_attention_i8_prefix(const uint16_t* k16, const uint16_t* v16, int64_t P, int64_t heads, void* prefix,
+                            void* stream);
+bool qi_attention_i8_prefixed(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
+                              int64_t heads, const void* prefix, int64_t P, const float* v_from, const float* v_to,
+                              uint16_t* out16, void* stream);
+/// qi_attention takes the int8 kernel for `rows` rows of `keys` keys on the stream's GPU (as it times it, once a shape
+/// in steps of 1024; STRATA_IMAGE_ATTN_I8 forces it): false where the GPU has no int8 kernel or matrix engines.
+bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* stream);
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
@@ -108,6 +122,10 @@ constexpr int64_t kQiRotate = 256;
 /// The weights' rows and the activations' tokens alike.
 void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,
                 void* stream);
+
+/// qi_rows_i8 of a matrix of GGUF blocks (`type`: Q4_K, Q5_K or Q6_K; K a multiple of 256) straight from the blocks,
+/// the int8 rows qi_rows_i8 makes of kernels::dequant_f16's output; false for another type (nothing is written).
+bool qi_rows_i8_blocks(int type, const void* blocks, int64_t rows, int64_t K, int8_t* q, float* s, void* stream);
 
 /// qi_rows_i8 of qi_swiglu16's values, from the gate_up product's int32 sums gu [T][2 inter] (scaled by g): the down
 /// product's int8 input in one pass.

@@ -54,6 +54,12 @@
 
 namespace strata::image {
 
+/// W values side by side, aligned to their size: a work-item's load or store of them in one access (vec<T, W> of
+/// SYCL, whose header this one does not take)
+template<class T, int W> struct alignas(sizeof(T) * W) Packed {
+    T v[W];
+};
+
 /// A product's output [T][C] as its readers take it: FP32 sums (f) times the rows' scales (rs, null: 1), or a W8A8
 /// product's int32 sums (i) times the activations' scales (sx, a row) and the weights' (sw, a column); plus the bias
 /// (b, null: none).
@@ -66,6 +72,23 @@ struct MfOut {
         const float v = i != nullptr ? (float) i[t * C + c] * sx[t] * sw[c]
                                      : (rs != nullptr ? f[t * C + c] * rs[t] : f[t * C + c]);
         return b != nullptr ? v + b[c] : v;
+    }
+    /// at(t, c + p) for p below W, read W side by side (c and C multiples of W)
+    template<int W> void at_w(int64_t t, int64_t c, float* o) const {
+        if (i != nullptr) {
+            const Packed<int32_t, W> iv = *reinterpret_cast<const Packed<int32_t, W>*>(i + t * C + c);
+            const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(sw + c);
+            const float st = sx[t];
+            for (int p = 0; p < W; ++p) o[p] = (float) iv.v[p] * st * wv.v[p];
+        } else {
+            const Packed<float, W> fv = *reinterpret_cast<const Packed<float, W>*>(f + t * C + c);
+            const float r = rs != nullptr ? rs[t] : 1.f;
+            for (int p = 0; p < W; ++p) o[p] = rs != nullptr ? fv.v[p] * r : fv.v[p];
+        }
+        if (b != nullptr) {
+            const Packed<float, W> bv = *reinterpret_cast<const Packed<float, W>*>(b + c);
+            for (int p = 0; p < W; ++p) o[p] += bv.v[p];
+        }
     }
     /// the rows from r on
     MfOut from(int64_t r) const {

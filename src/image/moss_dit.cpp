@@ -132,6 +132,34 @@ struct RmsI8 {
         const float y = v * inv * w[c];
         return scale != nullptr ? y * (1.f + scale[c]) + shift[c] : y;
     }
+    // the same W values side by side (RowsI8Of's vector form)
+    template<int W> void raw_w(int64_t t, int64_t c, float* v) const {
+        const Packed<float, W> xv = *reinterpret_cast<const Packed<float, W>*>(x + t * C + c);
+        if (add.C > 0) {
+            float a[W];
+            add.at_w<W>(t, c, a);
+            const Packed<float, W> gv = *reinterpret_cast<const Packed<float, W>*>(gate + c);
+            for (int p = 0; p < W; ++p) v[p] = xv.v[p] + gv.v[p] * a[p];
+        } else {
+            for (int p = 0; p < W; ++p) v[p] = xv.v[p];
+        }
+    }
+    template<int W> void keep_w(int64_t t, int64_t c, const float* v) const {
+        if (add.C == 0) return;
+        Packed<float, W> o;
+        for (int p = 0; p < W; ++p) o.v[p] = v[p];
+        *reinterpret_cast<Packed<float, W>*>(x + t * C + c) = o;
+    }
+    template<int W> void out_w(int64_t, int64_t c, float* v, float inv) const {
+        const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(w + c);
+        if (scale != nullptr) {
+            const Packed<float, W> sc = *reinterpret_cast<const Packed<float, W>*>(scale + c),
+                                   sh = *reinterpret_cast<const Packed<float, W>*>(shift + c);
+            for (int p = 0; p < W; ++p) v[p] = v[p] * inv * wv.v[p] * (1.f + sc.v[p]) + sh.v[p];
+        } else {
+            for (int p = 0; p < W; ++p) v[p] = v[p] * inv * wv.v[p];
+        }
+    }
 };
 
 struct SituI8 {
@@ -141,6 +169,13 @@ struct SituI8 {
     void keep(int64_t, int64_t, float) const {}
     float inv(float) const { return 1.f; }
     float out(int64_t, int64_t, float v, float) const { return v; }
+    template<int W> void raw_w(int64_t t, int64_t c, float* v) const {
+        float h[W], gt[W];
+        s.g.at_w<W>(t, c, h);
+        s.g.at_w<W>(t, c + s.F, gt);
+        for (int p = 0; p < W; ++p)
+            v[p] = 4.f * sycl::tanh(gt[p] * 0.25f) / (1.f + sycl::exp(-gt[p])) * (25.f * sycl::tanh(h[p] * 0.04f));
+    }
 };
 
 struct HeadsI8 {
@@ -238,7 +273,7 @@ void ref_values(const uint16_t* v16, const float* from, const float* to, int64_t
     q_of(s).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t h = (i % C) / hd;
-        out[i] = f16_from_f32(kernels::f32_from_f16(v16[i]) * (from[h] / to[h]));
+        out[i] = f16_from_f32(f32_from_f16(v16[i]) * (from[h] / to[h]));
     });
 }
 
@@ -703,30 +738,57 @@ void MossDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int6
     lora_output_add(y + t0 * w.n, nt, w.n, r0, lora_glora_y_, n, s_);
 }
 
+// An edit's references, a 1 MP image's rows asking after them (the image's rows are not known yet): the int8 kernel's
+// prefix where qi_attention takes the int8 kernel at that shape
+bool MossDit::refs_in_i8(int64_t rows) const {
+    return rows > 0 && qi_attention_i8_preferred(4096, 4096 + rows, heads_, s_);
+}
+
+uint64_t MossDit::ref_bytes(int64_t rows) const {
+    const uint64_t each = refs_in_i8(rows) ? (qi_attention_i8_prefix_bytes(rows, heads_) + 255) / 256 * 256
+                                           : (uint64_t) rows * C_ * 2 * 2;
+    return (uint64_t) blocks_.size() * (each + (uint64_t) heads_ * 4);
+}
+
+// The rows the working buffers hold: the steps' (n contexts of hw + max_text rows), or an edit's references' pass over
+// the blocks (set_refs: one context of their rows), the more of the two
+MossDit::Rows MossDit::rows_for(int64_t hw, int n, int64_t max_text, int64_t ref_rows, bool ref_i8) const {
+    Rows r;
+    r.R = std::max<int64_t>(n * (hw + max_text), ref_rows);
+    r.ctx = std::max(hw + max_text, ref_rows);
+    r.TP = qi_attn_rows(hw + max_text + (ref_i8 ? 0 : ref_rows));   // a context's, its references' rows before it
+    r.J = std::max(n * r.TP, qi_attn_rows(ref_rows));
+    r.O = std::max(r.TP, qi_attn_rows(ref_rows));
+    return r;
+}
+
 uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows, int64_t ref_rows) const {
-    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text + ref_rows);
+    const Rows rw = rows_for(hw, n, max_text, ref_rows, refs_in_i8(ref_rows));
+    const int64_t R = rw.R;
     const int64_t band = mlp_rows > 0 ? std::min(R, mlp_rows) : R;
     return (uint64_t) R * C_ * 4 * 5 +                          // x, q, k, v, a
            (uint64_t) band * 2 * F_ * 4 +                       // the MLP's up_gate sums
            (uint64_t) std::max(R * C_, band * F_) * 2 +         // the products' FP16 input
-           (uint64_t) n * TP * C_ * 2 * 3 + (uint64_t) TP * C_ * 2 +   // q, k, v of each context, the output
+           (uint64_t) rw.J * C_ * 2 * 3 + (uint64_t) rw.O * C_ * 2 +   // q, k, v of each context, the output
            (uint64_t) R * C_ * 2 +                              // the attention's output, a row's scale
            (uint64_t) n * (hw + max_text) * hd_ * 4 +           // the rotary tables
-           (uint64_t) TP * C_ * 4 +                             // the plain attention's scratch
+           (uint64_t) rw.O * C_ * 4 +                           // the plain attention's scratch
            (w8_ ? (uint64_t) std::max(R, band) * std::max(C_, F_) + (uint64_t) std::max(R, band) * 8 + C_ * 4 : 0) +
            (lora_cols_ > 0 ? (uint64_t) std::max(R, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
 }
 
 void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
-    const int64_t cap_rows = cap_n_ * (cap_hw_ + cap_text_);
+    const int64_t cap_rows = rows_for(cap_hw_, (int) cap_n_, cap_text_, cap_ref_, cap_ref_i8_).R;
     if (hw <= cap_hw_ && n <= cap_n_ && max_text <= cap_text_ && ref_rows_ <= cap_ref_ &&
+        (ref_rows_ == 0 || ref_i8_on_ == cap_ref_i8_) &&
         mlp_rows_ == (mlp_cap_ > 0 ? std::min(cap_rows, mlp_cap_) : cap_rows))
         return;
     hw = std::max(hw, cap_hw_);
     n = std::max<int>(n, (int) cap_n_);
     max_text = std::max(max_text, cap_text_);
     drop_activations();
-    const int64_t R = n * (hw + max_text), TP = qi_attn_rows(hw + max_text + ref_rows_);
+    const Rows rw = rows_for(hw, n, max_text, ref_rows_, ref_i8_on_);
+    const int64_t R = rw.R, TP = rw.TP;
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
     x_ = alloc<float>(allocs_, R * C_);
     q_ = alloc<float>(allocs_, R * C_);
@@ -739,25 +801,26 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     rs2_ = alloc<float>(allocs_, std::max(R, mlp_rows_));
     rs_o_ = alloc<float>(allocs_, R);
     hs_ = alloc<float>(allocs_, heads_);
-    vpart_ = alloc<float>(allocs_, (hw + max_text) * heads_);
+    vpart_ = alloc<float>(allocs_, rw.ctx * heads_);
     if (w8_) {   // W8A8's int8 input: the most rows of the widest input, then two arrays of a scale a row
         xq8_rows_ = std::max(R, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
         xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4);
         pend_sw_ = alloc<float>(allocs_, C_);
     }
-    jrows_ = TP;
-    jq16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jk16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jv16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jo16_ = alloc<uint16_t>(allocs_, TP * C_);
+    jrows_ = TP;   // a context's stride (the references' pass: one context, from row 0)
+    jq16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
+    jk16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
+    jv16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
+    jo16_ = alloc<uint16_t>(allocs_, rw.O * C_);
     o16_ = alloc<uint16_t>(allocs_, R * C_);
-    if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, TP * C_);
+    if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, rw.O * C_);
     if (keep0_) b0_ = alloc<float>(allocs_, (hw + max_text) * C_);
     cap_hw_ = hw;
     cap_n_ = n;
     cap_text_ = max_text;
     cap_ref_ = ref_rows_;
+    cap_ref_i8_ = ref_i8_on_;
     dirty_[0] = dirty_[1] = 0;
 }
 
@@ -1265,8 +1328,10 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     // W8A8 blocks take their products' int8 inputs from the row-wise kernels themselves (rows_i8), each into the
     // scales' slot the deferred sums before it do not read (i8_slot).  A block an adapter changes takes its products'
     // inputs as the FP16 rows (rows16): the delta is the input's own, and rows_i8 makes only its int8 values (and every
-    // product there is one pass more, the adapter applied)
-    const bool i8 = std::all_of(w, w + 6, [](const W* p) { return p->type == kTypeW8 && p->lora == nullptr; });
+    // product there is one pass more, the adapter applied).  An adapter baked into the weights (set_loras) is as none
+    const bool i8 = std::all_of(w, w + 6, [](const W* p) {
+        return p->type == kTypeW8 && (p->lora == nullptr || p->baked);
+    });
     // the block before's MLP output, added to x by this block's first kernel where it ran over the same rows
     MfOut pre;
     const float* pre_gate = nullptr;
@@ -1290,10 +1355,12 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     // the segment's rows asking after them, both at the larger of their heads' scales; while set_refs runs the blocks
     // over them, each block's are kept
     const int64_t P = ref_rows_ > 0 && !capture_ && mod != nullptr ? ref_rows_ : 0;
+    const bool kept = P > 0 && ref_i8_ != nullptr;   // the references as the int8 kernel's prefix, not rows before
+    const int64_t PO = kept ? 0 : P;                   // the segment's own rows' first row
     int64_t r0 = 0;
     float* so = i8 ? i8_slot() : nullptr;   // the attention's output's scales (q, k and v's sums read the other slot)
     for (size_t i = 0; i < seg.size(); ++i) {
-        const int64_t T = seg[i], o = (int64_t) i * jrows_ * C, TT = P + T;
+        const int64_t T = seg[i], o = (int64_t) i * jrows_ * C, TT = PO + T;
         if (dirty_[i] > TT)
             for (uint16_t* jb : {jq16_, jk16_, jv16_})
                 gpu::memset_async(jb + o + TT * C, 0, (size_t) ((dirty_[i] - TT) * C) * 2, s_);
@@ -1302,19 +1369,32 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
         head_scale(vpart_, T, heads_, hs_, s_);
         const int64_t rk = (int64_t) cur_block_ * ref_rows_ * C;
         if (P > 0) hs_max(hs_, ref_hs_ + cur_block_ * heads_, heads_, s_);
-        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o + P * C,
-                  jk16_ + o + P * C, jv16_ + o + P * C, s_);
-        if (P > 0) {
+        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o + PO * C,
+                  jk16_ + o + PO * C, jv16_ + o + PO * C, s_);
+        if (P > 0 && !kept) {
             gpu::copy_async(jk16_ + o, ref_k16_ + rk, (size_t) (P * C) * 2, s_);
             ref_values(ref_v16_ + rk, ref_hs_ + cur_block_ * heads_, hs_, P, heads_, hd_, jv16_ + o, s_);
         }
         if (capture_) {
-            gpu::copy_async(ref_k16_ + rk, jk16_ + o, (size_t) (T * C) * 2, s_);
-            gpu::copy_async(ref_v16_ + rk, jv16_ + o, (size_t) (T * C) * 2, s_);
+            if (ref_i8_ != nullptr) {
+                if (!qi_attention_i8_prefix(jk16_ + o, jv16_ + o, T, heads_, ref_i8_ + cur_block_ * ref_i8_stride_, s_))
+                    throw std::runtime_error("image engine: the references' keys could not be kept in int8");
+            } else {
+                gpu::copy_async(ref_k16_ + rk, jk16_ + o, (size_t) (T * C) * 2, s_);
+                gpu::copy_async(ref_v16_ + rk, jv16_ + o, (size_t) (T * C) * 2, s_);
+            }
             gpu::copy_async(ref_hs_ + cur_block_ * heads_, hs_, (size_t) heads_ * 4, s_);
         }
         // every row sees every key: the int8 kernel may take them all where it is the faster (qi_attention's choice)
-        qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, P, true);
+        if (kept) {
+            const uint8_t* prefix = ref_i8_ + cur_block_ * ref_i8_stride_;
+            if (!qi_attention_i8_prefixed(jq16_ + o, jk16_ + o, jv16_ + o, T, heads_, prefix, P,
+                                          ref_hs_ + cur_block_ * heads_, hs_, jo16_, s_))
+                throw std::runtime_error("image engine: the attention's int8 buffers do not fit");
+        } else {
+            qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, P,
+                         true);
+        }
         if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);
         else rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
         r0 += T;
@@ -1446,19 +1526,27 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
 void MossDit::set_refs(const std::vector<RefLatent>& refs, bool text_start) {
     gpu::stream_sync(s_);
     ref_text_start_ = text_start;
-    for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_}) release(allocs_, p);
+    for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_, (void*) ref_i8_}) release(allocs_, p);
     ref_k16_ = ref_v16_ = nullptr;
     ref_hs_ = nullptr;
+    ref_i8_ = nullptr;
+    ref_i8_on_ = false;
     ref_rows_ = 0;
     int64_t R = 0;
     for (const RefLatent& f : refs) R += f.h * f.w;
     if (R == 0) return;
     const int64_t nb = (int64_t) blocks_.size(), C = C_;
-    ref_k16_ = alloc<uint16_t>(allocs_, nb * R * C);
-    ref_v16_ = alloc<uint16_t>(allocs_, nb * R * C);
+    ref_i8_on_ = refs_in_i8(R);
+    if (ref_i8_on_) {
+        ref_i8_stride_ = (qi_attention_i8_prefix_bytes(R, heads_) + 255) / 256 * 256;
+        ref_i8_ = alloc<uint8_t>(allocs_, nb * (int64_t) ref_i8_stride_);
+    } else {
+        ref_k16_ = alloc<uint16_t>(allocs_, nb * R * C);
+        ref_v16_ = alloc<uint16_t>(allocs_, nb * R * C);
+    }
     ref_hs_ = alloc<float>(allocs_, nb * heads_);
     ref_rows_ = R;   // the attention's rows count them from here (ensure)
-    ensure(R, 1, 0);
+    ensure(cap_hw_, std::max<int>(1, (int) cap_n_), cap_text_);
     // their rows through the input projection, on the rotary axes (index + 1, 0, row, column), at timestep 0
     std::vector<float> cv, sv;
     rope_rows(R, hd_, rope_base_, [&refs](int64_t r, float* p) {

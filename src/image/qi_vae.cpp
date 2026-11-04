@@ -10,6 +10,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "f16_gpu.hpp"
 
 #if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
@@ -28,8 +29,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 
 namespace {
 
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using f16_gpu::f32_from_f16;
 
 // Qwen/Qwen-Image-2.1's vae/config.json: latents_mean and latents_std (the DiT's latent is (z - mean) / std)
 const float kMean[64] = {0.5126f, 0.7721f, -0.0631f, 1.3506f, -0.7855f, -2.1025f, -0.3458f, 1.3722f, 1.8873f,

@@ -9,6 +9,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "f16_gpu.hpp"
 
 #if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
@@ -29,8 +30,8 @@ namespace gpu = strata::gpu;
 // name and signature in another image file (qi_vae.cpp's to_rgba) gave its kernel to both.
 namespace mf_vae_detail {
 
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using f16_gpu::f32_from_f16;
 
 constexpr int64_t kPatch = 16, kPix = kPatch * kPatch;   // a latent position's pixels
 constexpr int64_t kWin = 32, kWinTok = kWin * kWin;       // the CoD decoder's attention windows

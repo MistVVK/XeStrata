@@ -287,10 +287,24 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
     // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
     if (glm_) return true;   // GLM-5.3-Flash's first prompt loads its products' kernels itself
+    // A shape warmed once in the process on the GPU stays warm: a model opened again (MOSS-Image's text encoder, after
+    // each image) skips it, and a streamed layer whose shapes are all warm is not bound (the RTX 4070's 12 GB, the
+    // encoder with one layer resident: binding the other 31 to warm them took 3 s an image, 2026-11-05).
+    using Shape = std::tuple<int, int, int, int64_t>;
+    struct Warmed {
+        std::mutex mu;
+        std::set<Shape> of;
+    };
+    static PerDevice<std::shared_ptr<Warmed>> warmed_of;
+    Warmed& warmed = *warmed_of.get(Runtime::get().stream(cs_).get_device(), [] { return std::make_shared<Warmed>(); });
+    std::lock_guard<std::mutex> lock(warmed.mu);
     PromptBufs& P = pb_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
-    std::set<std::tuple<int, int, int, int64_t>> seen;
+    std::set<Shape>& seen = warmed.of;
+    auto cold = [&](const W& w, int64_t ldy = 0) {
+        return w.type != 0 && seen.count({w.type, w.n_out, w.n_in, ldy}) == 0;
+    };
     auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
         if (w.data != nullptr && w.type != 0 && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
             gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
@@ -307,9 +321,15 @@ bool PlainModel::prompt_warm_products(std::string& err) {
             warm(mtp_eh_, P.x);
         }
         for (const Block* bp : all) {
+            const Block& b = *bp;
+            const bool shared = has_shared_ || dense_;
+            if (!(b.recurrent ? cold(b.qkv) || cold(b.z) || cold(b.alpha, 2 * HV) || cold(b.beta, 2 * HV) ||
+                                    cold(b.ssm_out)
+                              : cold(b.q) || cold(b.k) || cold(b.v) || cold(b.o)) &&
+                !(shared && (cold(b.sh_gate) || cold(b.sh_up) || cold(b.sh_down))))
+                continue;
             const int64_t l = bp == &mtp_ ? -1 : bp - blocks_.data();   // the MTP layer: nothing to bind
             bind_block(l);
-            const Block& b = *bp;
             if (b.recurrent) {
                 warm(b.qkv, P.qkv);
                 warm(b.z, P.z);
@@ -322,7 +342,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
                 warm(b.v, P.vcur);
                 warm(b.o, P.mix);
             }
-            if (has_shared_ || dense_) {   // the shared expert, or the dense FFN in its fields
+            if (shared) {   // the shared expert, or the dense FFN in its fields
                 warm(b.sh_gate, P.sh_gate);
                 warm(b.sh_up, P.sh_up);
                 warm(b.sh_down, P.shared);

@@ -82,9 +82,7 @@ public:
     void set_refs(const std::vector<RefLatent>& refs, bool text_start = true);
     int64_t ref_rows() const { return ref_rows_; }
     /// The VRAM the kept keys and values of `rows` reference rows take.
-    uint64_t ref_bytes(int64_t rows) const {
-        return (uint64_t) blocks_.size() * ((uint64_t) rows * C_ * 2 * 2 + (uint64_t) heads_ * 4);
-    }
+    uint64_t ref_bytes(int64_t rows) const;
 
     /// The sampler's guidance (the reference pipeline's arguments).  cfg: with context 1, u + cfg (c - u);
     /// uncond_skip: the blocks context 1 skips; slg (with slg_scale above 0): a third pass of context 0 with those
@@ -138,7 +136,8 @@ public:
     void set_mlp_rows(int64_t rows) { mlp_cap_ = rows; }
     /// What the working buffers take now
     uint64_t activations_held() const {
-        return cap_hw_ > 0 ? activation_bytes(cap_hw_, (int) cap_n_, cap_text_, mlp_rows_, cap_ref_) : 0;
+        return cap_hw_ > 0 || cap_ref_ > 0 ? activation_bytes(cap_hw_, (int) cap_n_, cap_text_, mlp_rows_, cap_ref_)
+                                           : 0;
     }
     void drop_activations();
 
@@ -281,6 +280,11 @@ private:
     Ctx ctx_[2];
     // activations, grown on demand
     int64_t cap_hw_ = 0, cap_n_ = 0, cap_text_ = 0, cap_ref_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
+    bool cap_ref_i8_ = false;
+    struct Rows {
+        int64_t R, ctx, TP, J, O;   // all rows, a context's, a context's attention rows, q/k/v's and the output's
+    };
+    Rows rows_for(int64_t hw, int n, int64_t max_text, int64_t ref_rows, bool ref_i8) const;
     int64_t dirty_[2] = {0, 0};   // the rows of each attention slot (jq16_ ...) that may not be zero
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *gu_ = nullptr,
           *temb_ = nullptr, *mod_ = nullptr, *head_ = nullptr;
@@ -316,6 +320,13 @@ private:
     uint16_t *ref_k16_ = nullptr, *ref_v16_ = nullptr;
     float* ref_hs_ = nullptr;
     int64_t ref_rows_ = 0;
+    // or, where the attention takes the int8 kernel (refs_in_i8), each block's keys and values made into its prefix
+    // once (qi_attention_i8_prefix: ref_i8_stride_ bytes a block), and the rows' own q, k and v without the
+    // references' rows before them
+    uint8_t* ref_i8_ = nullptr;
+    uint64_t ref_i8_stride_ = 0;
+    bool ref_i8_on_ = false;
+    bool refs_in_i8(int64_t rows) const;
     bool ref_text_start_ = true, capture_ = false;
     int cur_block_ = 0;
 };

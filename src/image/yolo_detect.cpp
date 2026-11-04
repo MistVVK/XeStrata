@@ -9,7 +9,7 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#if STRATA_ONEDNN || STRATA_CUDNN
+#if STRATA_ONEDNN
 #include "qi_conv.hpp"
 #endif
 
@@ -530,9 +530,6 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
 #if STRATA_ONEDNN
         if (c.k > 1 && conv::onednn(q, x.p, x.h, x.w, c.in, c.w, c.outp, (int) c.k, (int) c.s, p, p, p, p, c.b, false, y))
             return true;
-#endif
-#if STRATA_CUDNN
-        if (c.k > 1 && c.s == 1 && conv::cudnn(q, x.p, x.h, x.w, c.in, c.w, c.outp, (int) c.k, c.b, false, y)) return true;
 #endif
         if (c.k == 1 && c.s == 1) {
             gemm_.f16(x.p, c.w, y, x.h * x.w, c.outp, c.in);

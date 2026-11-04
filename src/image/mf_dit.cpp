@@ -179,7 +179,7 @@ void q8_0_vec(const uint8_t* w, const float* x, const float* b, float* y, int64_
             if (o == 0) continue;
             const uint16_t v = row[k];
             const float* xb = x + blk * 32 + 2 * (o - 1);
-            const float d = kernels::f32_from_f16(row[blk * 17]);
+            const float d = f32_from_f16(row[blk * 17]);
             acc += d * ((float) (int8_t) (v & 0xFF) * xb[0] + (float) (int8_t) (v >> 8) * xb[1]);
         }
         acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());

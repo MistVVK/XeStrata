@@ -56,6 +56,8 @@ bool stream_idle(Stream s);
 bool device_sync();
 
 void* alloc_device(size_t bytes);
+/// The bytes this process holds through alloc_device on the current device.
+size_t device_held();
 /// Host USM.  A refusal while the pinned memory's hard reserve is held (pin_reserve_take) gives the reserve back and
 /// tries once more.
 void* alloc_host(size_t bytes);

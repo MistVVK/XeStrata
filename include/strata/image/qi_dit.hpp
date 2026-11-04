@@ -155,6 +155,8 @@ private:
         uint64_t row_bytes = 0;
         bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
+        bool w8t = false;       // w8 through w8t_: a block format of fewer bits than int8's rows, kept as it is and
+                                // written as int8 rows into the scratch at each product
         LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
         bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
     };
@@ -258,6 +260,13 @@ private:
     int64_t xs_rows_ = 0;    // deferred sums keep theirs while the next input is quantized
     int xs_next_ = 0;
     QiI8 i8_;                // the last deferred product's scales
+    // W::w8t: a weight's int8 rows (the largest weight's), and kW8tScales arrays of its row scales taken in turn (a
+    // deferred product's scales are read after up to two more products: q, k and v)
+    static constexpr int kW8tScales = 4;
+    int8_t* w8t_ = nullptr;
+    float* w8t_s_ = nullptr;
+    int64_t w8t_rows_ = 0;
+    int w8t_next_ = 0;
     int64_t rope_H_ = -1, rope_W_ = -1, rope_text_ = -1;
     float *text_ = nullptr;           // the prefix's rows [n_text][C] (the projected text, the references' tokens)
     std::vector<float> pre_pos_;      // the prefix rows' positions [n_text][3]

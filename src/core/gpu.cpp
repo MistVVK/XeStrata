@@ -194,6 +194,12 @@ void* alloc_device(size_t bytes) {
     } catch (const std::exception& e) { fail("alloc_device", e); return nullptr; }
 }
 
+size_t device_held() {
+    std::lock_guard<std::mutex> lock(g_live_mu);
+    const auto it = g_live_on.find(rt().ordinal());
+    return it != g_live_on.end() ? it->second : 0;
+}
+
 namespace {
 std::mutex g_pin_mu;
 void* g_pin_soft = nullptr;

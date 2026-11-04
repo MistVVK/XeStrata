@@ -44,6 +44,18 @@ uint64_t free_vram() {
     return free;
 }
 
+// The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
+// (their code, their workspaces), other programs', and what the allocations take past their sizes.  The HIP runtime
+// takes a block of 1 to 2 MiB as 2 MiB and a larger one in steps of 2 MiB (the RX 9060 XT, ROCm 7.1 and 10.1,
+// 2026-11-05: 200 blocks of 1 MiB + 4 KiB took 400 MiB), so it grows with the engine's blocks: an edit after a refined
+// edit on ROCm 10.1 held 15176 MiB in 1151 blocks of a 15358 MiB budget with 46 MiB free, 1082 MiB of the 16304 past
+// them against 434 when the budget was set.
+int64_t vram_other() {
+    size_t free = 0, total = 0;
+    if (!gpu::mem_info(&free, &total)) return 0;
+    return (int64_t) total - (int64_t) free - (int64_t) gpu::device_held();
+}
+
 // RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque
 std::vector<float> base_rgb(const QiRef& f, int64_t W, int64_t H) {
     const std::vector<uint8_t> px = resize_nearest(f, W, H);
@@ -196,7 +208,14 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
     auto_budget_ = vram_cap(free);
+    other_base_ = vram_other();
     return true;
+}
+
+uint64_t MossPipeline::budget() const {
+    const uint64_t b = budget_ > 0 ? budget_ : auto_budget_;
+    const int64_t grown = vram_other() - other_base_;
+    return grown > 0 ? b - std::min(b, (uint64_t) grown) : b;
 }
 
 void MossPipeline::use_loras(const QiRequest& r) {
@@ -335,6 +354,7 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
 
 void MossPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    other_base_ = vram_other();
     if (held() == 0 || !dit_) return;
     (void) plan(0, 1, 0);   // shrink at once what no longer fits
 }
@@ -383,13 +403,12 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
                                  " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
     int64_t mlp = 0;
-    // an edit's references: their pass over the blocks takes the activations' rows too (set_refs)
-    const int64_t arows = hw > 0 ? std::max(hw, ref_rows_) : 0;
-    p.activations = hw > 0 ? d.activation_bytes(arows, n, max_text, 0, ref_rows_) : 0;
+    // an edit's references: their pass over the blocks takes the activations' rows too (set_refs; activation_bytes)
+    p.activations = hw > 0 ? d.activation_bytes(hw, n, max_text, 0, ref_rows_) : 0;
     for (int64_t rows : {4096, 2048, 1024, 512}) {
         if (hw == 0 || p.activations * 3 <= avail) break;
         mlp = rows;
-        p.activations = d.activation_bytes(arows, n, max_text, rows, ref_rows_);
+        p.activations = d.activation_bytes(hw, n, max_text, rows, ref_rows_);
     }
     if (avail < p.activations + dit_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
@@ -465,11 +484,37 @@ bool MossPipeline::open_text() {
     return true;
 }
 
+// The encoder's layers' budget, which a plan set beside that request's work, against what is held and free now: the
+// last request's leftovers (its decode's VAE scratch, its edit's references) count in held() but were not in that plan
+// (an edit after a refined edit on ROCm 10.1: a budget of 3266 MiB for 442 MiB of layers with 2498 MiB free, and a
+// layer refused).  The VAE's scratch gives way first, then the DiT's activations and blocks.
+void MossPipeline::fit_text() {
+    if (!te_) return;
+    auto room = [&]() -> uint64_t {
+        const uint64_t others = held() - te_->layers_vram(), on_device = free_vram() + te_->layers_vram(),
+                       slack = (uint64_t) 64 << 20;
+        return std::min<uint64_t>(budget() > others ? budget() - others : 0, on_device > slack ? on_device - slack : 0);
+    };
+    if (room() < te_set_ && vae_) vae_->drop_scratch();
+    if (room() < te_->layer_min() && dit_) {
+        dit_->drop_activations();
+        dit_->drop_blocks();
+        dit_set_ = 0;
+        mlp_set_ = -1;
+    }
+    const uint64_t r = clampu(room(), te_->layer_min(), te_->layer_bytes());
+    if (r < te_set_) {
+        te_->set_layer_budget(r);
+        te_set_ = r;
+    }
+}
+
 void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& out,
                           const std::vector<MossText::Picture>& pictures) {
     if ((int64_t) ids.size() > kMaxTokens)
         throw std::invalid_argument("image engine: MOSS-Image's prompt is longer than 4096 tokens");
     open_text();
+    fit_text();
     const uint64_t before = free_vram() + te_->layers_vram();
     std::string err;
     out = te_->encode(ids, err, pictures);
@@ -513,6 +558,28 @@ std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>&
         throw std::invalid_argument("image engine: an ai-toolkit edit's pictures need the vision encoder (--vision, "
                                     "Qwen3.5-9B's mmproj) and a text encoder with <|image_pad|>");
     std::string err;
+    // its weights and the largest picture's scratch beside what is held: the last request's leftovers give way, the
+    // VAE's scratch first, then the DiT's activations and blocks (an ai-toolkit edit after one on the RTX 4070's 12 GB:
+    // 7 MiB free, and the encoder's first buffer refused)
+    {
+        QiVision size;
+        if (!size.open(vision_path_, s_, err, true)) throw std::runtime_error(err);
+        int64_t most = 0;
+        for (const QiRef& f : pictures) most = std::max<int64_t>(most, (f.height / 16) * (f.width / 16));
+        const uint64_t need = size.weight_bytes() + size.scratch_bytes(most) + (64ull << 20);
+        auto room = [&]() -> uint64_t {
+            const uint64_t h = held();
+            return std::min(budget() > h ? budget() - h : 0, free_vram());
+        };
+        if (room() < need && vae_) vae_->drop_scratch();
+        if (room() < need && dit_) {
+            dit_->drop_activations();
+            dit_->drop_blocks();
+            dit_set_ = 0;
+            mlp_set_ = -1;
+        }
+        if (room() < need) release(false);
+    }
     QiVision v;
     if (!v.open(vision_path_, s_, err)) throw std::runtime_error(err);
     std::vector<QiVisionOut> out;
@@ -634,6 +701,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     const int64_t rows1 = guided ? (r.neg_te_rows > 0 && !own ? r.neg_te_rows : (int64_t) ids1.size()) : 0;
     ensure_open(want_q8(h * w, n, std::max(rows0, rows1)));
     MossDit& d = *dit_;
+    if (d.ref_rows() > 0) d.set_refs({});   // the last edit's references: this request makes its own (or has none)
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
     LatentStart ls;
     if (base != nullptr) {
@@ -794,6 +862,13 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         // the room by the device's own count too, less a margin: the scratch's estimate runs a little short (an
         // ai-toolkit edit on the RTX 4070: 3346 MiB estimated in 3394 of room, and a 64 MiB buffer refused) - where it
         // does not fit, the VAE decodes in tiles
+        // the budget beside what is held now, where the plan's share is short of it (the encoder's layers it counted but
+        // did not take back since a decode before gave them up: the chinoll edit's second request, 832 x 1248, tiled
+        // in 1536 MiB of 3346 with 5221 free on the RX 9060 XT)
+        if (vae_->scratch_bytes(h, w) > room) {
+            const uint64_t others = held() - vae_->scratch_held();
+            if (budget() > others) room = std::max(room, budget() - others);
+        }
         room = std::min(room, free_vram() + vae_->scratch_held());
         room -= std::min(room, (uint64_t) 128 << 20);
         vae_->decode(x, h, w, rgba, room);

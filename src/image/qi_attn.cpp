@@ -21,6 +21,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "f16_gpu.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "../kernels/xe/amd_wmma.hpp"
 #include "../kernels/xe/device_target.hpp"
@@ -49,7 +50,8 @@ namespace {
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
-using strata::kernels::f16_from_f32;
+using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using f16_gpu::f32_from_f16;
 
 constexpr int D = 128;      // head_dim
 constexpr int CH = 64;      // keys a chunk
@@ -371,8 +373,8 @@ sycl::event launch(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, con
 // against the row's running maximum (no lazy reference here: P is int8), a scale a (row, chunk) from the chunk's
 // largest.  The sums are int32, turned to FP32 with the scales into the output's accumulators.  A work-group takes 128
 // query rows of a head (8 waves of 16) and shares each chunk's 64 keys' K and V^T in local memory.
-// RDNA3 and RDNA4's WMMA (16 x 16 x 16 iu8 on 32 lanes, the layouts of amd_wmma.hpp and iq_mmq.cpp); elsewhere not
-// built, and qi_attention keeps the 16-bit path.
+// RDNA3 and RDNA4's WMMA (16 x 16 x 16 iu8 on 32 lanes, the layouts of amd_wmma.hpp and iq_mmq.cpp: Kernel) and
+// NVIDIA's mma.sync from sm_80 on (NvKernel); elsewhere not built, and qi_attention keeps the 16-bit path.
 namespace i8 {
 
 constexpr int CH = 32;            // keys a chunk
@@ -387,18 +389,19 @@ constexpr int SLICES = 32;        // the key stats' partial sums: slices of the 
 // scales
 struct Bufs {
     int8_t *q = nullptr, *k = nullptr, *vt = nullptr;
-    float *sq = nullptr, *sk = nullptr, *sv = nullptr, *mean = nullptr, *part = nullptr;
+    float *sq = nullptr, *sk = nullptr, *sv = nullptr, *mean = nullptr, *part = nullptr, *sw = nullptr;
     int64_t cap_t = 0, cap_c = 0;
     bool grow(int64_t T, int64_t C, int64_t heads) {
         const int64_t Tp = (T + CH - 1) / CH * CH;
         if (Tp <= cap_t && C <= cap_c) return true;
-        for (void* p : {(void*) q, (void*) k, (void*) vt, (void*) sq, (void*) sk, (void*) sv, (void*) mean, (void*) part})
+        for (void* p : {(void*) q, (void*) k, (void*) vt, (void*) sq, (void*) sk, (void*) sv, (void*) mean, (void*) part,
+                        (void*) sw})
             if (p != nullptr) strata::gpu::free(p);
         *this = Bufs{};
         if (!strata::gpu::alloc_device(&q, (size_t) (Tp * C)) || !strata::gpu::alloc_device(&k, (size_t) (Tp * C)) ||
             !strata::gpu::alloc_device(&vt, (size_t) (Tp * C)) || !strata::gpu::alloc_device(&sq, (size_t) (Tp * heads) * 4) ||
             !strata::gpu::alloc_device(&sk, (size_t) (Tp * heads) * 4) || !strata::gpu::alloc_device(&sv, (size_t) C * 4) ||
-            !strata::gpu::alloc_device(&mean, (size_t) C * 4) ||
+            !strata::gpu::alloc_device(&mean, (size_t) C * 4) || !strata::gpu::alloc_device(&sw, (size_t) C * 4) ||
             !strata::gpu::alloc_device(&part, (size_t) 2 * SLICES * C * 4))
             return false;
         cap_t = Tp;
@@ -406,6 +409,73 @@ struct Bufs {
         return true;
     }
 };
+
+Bufs& bufs_of(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<Bufs>> of;
+    return *of.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
+}
+
+// NVIDIA's mma.sync from sm_80 on, in PTX (NvKernel): m16n8k32 s8 . s8 into s32, ldmatrix for the B operands out of
+// local memory and cp.async for the chunks into it
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
+#define STRATA_NV_I8 1
+inline void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+inline uint32_t smem_u32(const void* p) {
+    uint32_t a;
+    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
+    return a;
+}
+inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+}
+inline void cp16(uint32_t dst, const void* src) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
+}
+inline void cp_commit() { asm volatile("cp.async.commit_group;"); }
+inline uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+template<int N>
+inline void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+// 2^x flushing a denormal result to 0: sycl::native::exp2 is ex2.approx.f32 without .ftz, which sm_89 runs as a check,
+// two multiplies and the instruction (20% of the kernel's instructions, RTX 4070, 2026-11-05); a probability below
+// 2^-126 is 0 in int8 either way
+inline float ex2(float x) {
+    float r;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
+    return r;
+}
+#else
+#define STRATA_NV_I8 0
+#endif
+
+// Which of the int8 kernels the device takes: 1 Kernel (RDNA3, RDNA4), 2 NvKernel (NVIDIA from sm_80 on, where the
+// binary the runtime picked for it carries the kernel: an older target's code JIT-compiled for it does not), else 0
+int kind_of(sycl::queue& q) {
+    static core::PerDevice<int> of;
+    return of.get(q.get_device(), [&q] {
+        const sycl::device d = q.get_device();
+        if (strata::kernels::xe::amd_wmma(d)) return 1;
+        if (d.get_backend() != sycl::backend::ext_oneapi_cuda) return 0;
+        const auto a = static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>());
+        if (a < static_cast<uint64_t>(syclex::architecture::nvidia_gpu_sm_80) || a >= 0x0200000000000000ull) return 0;
+        int* f = sycl::malloc_device<int>(1, q);
+        if (f == nullptr) return 0;
+        int v = 0;
+        q.single_task([=] { *f = STRATA_NV_I8; }).wait();
+        q.memcpy(&v, f, sizeof v).wait();
+        sycl::free(f, q);
+        return v == 1 ? 2 : 0;
+    });
+}
 
 // the keys' sums and the values' largest magnitudes over slices of the keys: part [2][SLICES][C]
 void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t C, float* part,
@@ -415,8 +485,8 @@ void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t
         const int64_t t0 = T * sl / SLICES, t1 = T * (sl + 1) / SLICES;
         float sum = 0.f, mx = 0.f;
         for (int64_t t = t0; t < t1; ++t) {
-            sum += strata::kernels::f32_from_f16(k16[t * C + c]);
-            mx = sycl::fmax(mx, sycl::fabs(strata::kernels::f32_from_f16(v16[t * C + c])));
+            sum += f32_from_f16(k16[t * C + c]);
+            mx = sycl::fmax(mx, sycl::fabs(f32_from_f16(v16[t * C + c])));
         }
         part[sl * C + c] = sum;
         part[(SLICES + sl) * C + c] = mx;
@@ -436,10 +506,14 @@ void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t
 // Q's and K's rows (a (row, head)'s 128 values, less `mean` for K) as int8 with their scales (Q's times `qmul`), and V
 // as int8 by its (head, dim) scales, transposed into vt [heads][Tp / CH][D][CH] (a chunk's V^T in one piece, which the
 // attention reads at once: a dim's CH bytes Tp apart were 2% slower on the RX 9060 XT): one kernel, a work-group a head
-// and RB keys, V^T built in local memory so its rows go out RB bytes at a time; rows and keys past T zero
+// and RB keys, V^T built in local memory so its rows go out RB bytes at a time; rows and keys past T up to Tp zero.
+// q16 null: the keys and values alone (make_prefix).  NvKernel's V^T (kind_of 2) holds each 16 keys in the order its
+// P operand takes them: at 4 i + j the key 2 i + (j & 1) + 8 (j >> 1).
 void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* mean,
              const float* sv, int64_t T, int64_t Tp, int64_t heads, float qmul, int8_t* q8, int8_t* k8, int8_t* vt,
              float* sq, float* sk) {
+    const bool with_q = q16 != nullptr, nv = kind_of(q) == 2;
+    const int64_t nc = Tp / CH;
     constexpr int RB = 128, WG = 256, TLD = RB + 4;   // V^T's rows in the tile: 4 lanes' dims a bank apart
     const int64_t C = heads * D;
     q.submit([&](sycl::handler& h) {
@@ -464,16 +538,18 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
                 const int64_t t = t0 + tt, base = t * C + (int64_t) hd * D + (int64_t) lane * 4;
                 const bool in = t < T;
                 const sycl::vec<uint16_t, 4> z(0);
-                const sycl::vec<uint16_t, 4> xq = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(q16 + base) : z,
+                const bool inq = in && with_q;
+                const sycl::vec<uint16_t, 4> xq = inq ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(q16 + base)
+                                                      : z,
                                              xk = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(k16 + base) : z,
                                              xv = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(v16 + base) : z;
                 float vq[4], vk[4];
                 float mq = 0.f, mk = 0.f;
 #pragma unroll
                 for (int u = 0; u < 4; ++u) {
-                    vq[u] = strata::kernels::f32_from_f16(xq[u]);
-                    vk[u] = in ? strata::kernels::f32_from_f16(xk[u]) - mn[u] : 0.f;
-                    tile[(lane * 4 + u) * TLD + tt] = (int8_t) sycl::rint(strata::kernels::f32_from_f16(xv[u]) * isv[u]);
+                    vq[u] = f32_from_f16(xq[u]);
+                    vk[u] = in ? f32_from_f16(xk[u]) - mn[u] : 0.f;
+                    tile[(lane * 4 + u) * TLD + tt] = (int8_t) sycl::rint(f32_from_f16(xv[u]) * isv[u]);
                     mq = sycl::fmax(mq, sycl::fabs(vq[u]));
                     mk = sycl::fmax(mk, sycl::fabs(vk[u]));
                 }
@@ -487,10 +563,10 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
                     wq |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vq[u] * iq) << (8 * u);
                     wk |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vk[u] * ik) << (8 * u);
                 }
-                *reinterpret_cast<uint32_t*>(q8 + base) = wq;
+                if (with_q) *reinterpret_cast<uint32_t*>(q8 + base) = wq;
                 *reinterpret_cast<uint32_t*>(k8 + base) = wk;
                 if (lane == 0) {
-                    sq[t * heads + hd] = cq * qmul;
+                    if (with_q) sq[t * heads + hd] = cq * qmul;
                     sk[t * heads + hd] = ck;
                 }
             }
@@ -498,10 +574,17 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
             const int nk = (int) sycl::min<int64_t>(RB, Tp - t0);
             for (int i = lid; i < D * RB / 4; i += WG) {   // V^T along the keys, 4 a work-item
                 const int d = i / (RB / 4), tt = i % (RB / 4) * 4;
-                if (tt < nk)
-                    *reinterpret_cast<uint32_t*>(vt + (((int64_t) hd * (Tp / CH) + (t0 + tt) / CH) * D + d) * CH +
-                                                 (t0 + tt) % CH) =
-                        *reinterpret_cast<const uint32_t*>(&tile[d * TLD + tt]);
+                if (tt >= nk) continue;
+                uint32_t w;
+                if (nv) {
+                    const int8_t* r = &tile[d * TLD + (tt & ~15) + (tt & 15) / 2];
+                    w = (uint32_t) (uint8_t) r[0] | (uint32_t) (uint8_t) r[1] << 8 | (uint32_t) (uint8_t) r[8] << 16 |
+                        (uint32_t) (uint8_t) r[9] << 24;
+                } else {
+                    w = *reinterpret_cast<const uint32_t*>(&tile[d * TLD + tt]);
+                }
+                const int64_t at = (((int64_t) hd * nc + (t0 + tt) / CH) * D + d) * CH + (t0 + tt) % CH;
+                *reinterpret_cast<uint32_t*>(vt + at) = w;
             }
         });
     });
@@ -512,13 +595,24 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
 // P^T in the registers they are in, and the output's corrections a query's are the lane's scalars.  K and V^T of the
 // chunk in local memory (two buffers: the next chunk's loads go out while this one is worked).  exp2, the scores in
 // log2 units (Q's scales carry log2 e).
+// A second segment of keys may follow the first's T (Seg: a prefix made once, make_prefix), its own K, V^T and key
+// scales, its V at other scales: the output so far is turned to them as its chunks begin (o times sw, a dim's), and sv
+// is the second's.
+struct Seg {
+    const int8_t *k = nullptr, *vt = nullptr;
+    const float *sk = nullptr, *sw = nullptr;
+    int64_t T = 0, Tp = 0;
+};
+
 struct Kernel {
     const int8_t *q8, *k8, *vt;
     const float *sq, *sk, *sv;
     uint16_t* out16;
     int64_t T, Tp, heads, r0, first, row_end;
+    Seg b;
     sycl::local_accessor<int8_t, 1> kl, vl;       // two chunks' K [CH][KLD] and V^T [D][VLD]
-    sycl::local_accessor<float, 1> skl, svl;      // two chunks' key scales [CH], the head's V scales [D]
+    sycl::local_accessor<float, 1> skl, svl;      // two chunks' key scales [CH], the head's V scales [D] (and the
+                                                  // second segment's turn [D] after them)
 
     // the work-group as an attribute, not a property: intel/llvm bounds an AMD kernel's registers by it from the
     // attribute only (see iq_mmq.cpp), and the 32 queries a wave need more than the 192 VGPRs of a 1024-lane group
@@ -558,7 +652,10 @@ struct Kernel {
         const bool live = my0 < row_end;
         int8_t* K0 = kl.get_multi_ptr<sycl::access::decorated::no>().get();
         int8_t* V0 = vl.get_multi_ptr<sycl::access::decorated::no>().get();
-        for (int i = lid; i < D; i += NW * 32) svl[i] = sv[h * D + i];
+        for (int i = lid; i < D; i += NW * 32) {
+            svl[i] = sv[h * D + i];
+            if (b.T > 0) svl[D + i] = b.sw[h * D + i];
+        }
         // the queries as B operands of S^T (column lo: a query, K values kk * 16 + hi KOFF ..), their scales
         frag qb[QT][D / 16];
         float sql[QT], m[QT], l[QT];
@@ -582,17 +679,23 @@ struct Kernel {
         static_assert(CH <= NW * 32, "a work-item a key's scale");
         u4 rk[PIECES], rv[PIECES];
         float rs = 0.f;
-        auto fetch = [&](int64_t j0) {
+        // chunk ci: the first segment's ci, else the second's ci - na
+        const int64_t na = Tp / CH, nch = na + b.Tp / CH;
+        auto fetch = [&](int64_t ci) {
+            const bool sb = ci >= na;
+            const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T, nc = sb ? b.Tp / CH : na;
+            const int8_t *kp = sb ? b.k : k8, *vp = sb ? b.vt : vt;
+            const float* sp = sb ? b.sk : sk;
 #pragma unroll
             for (int p = 0; p < PIECES; ++p) {
                 const int i = lid + p * NW * 32;
                 if (i >= KV16) break;
                 const int kr = i / (D / 16), c = i % (D / 16) * 16;
-                rk[p] = *reinterpret_cast<const u4*>(k8 + (j0 + kr) * C + h * D + c);
+                rk[p] = *reinterpret_cast<const u4*>(kp + (j0 + kr) * C + h * D + c);
                 const int d = i / (CH / 16), cv = i % (CH / 16) * 16;
-                rv[p] = *reinterpret_cast<const u4*>(vt + ((h * (Tp / CH) + j0 / CH) * D + d) * CH + cv);
+                rv[p] = *reinterpret_cast<const u4*>(vp + ((h * nc + j0 / CH) * D + d) * CH + cv);
             }
-            if (lid < CH) rs = j0 + lid < T ? sk[(j0 + lid) * heads + h] : 0.f;
+            if (lid < CH) rs = j0 + lid < lim ? sp[(j0 + lid) * heads + h] : 0.f;
         };
         auto stash = [&](int bf) {
             int8_t* Kb = K0 + bf * CH * KLD;
@@ -609,14 +712,24 @@ struct Kernel {
         fetch(0);
         stash(0);
         sycl::group_barrier(it.get_group());
-        if (CH < T) fetch(CH);
+        if (nch > 1) fetch(1);
         int bf = 0;
-        for (int64_t j0 = 0; j0 < T; j0 += CH, bf ^= 1) {
+        for (int64_t ci = 0; ci < nch; ++ci, bf ^= 1) {
           if (live) {   // a wave past the rows shares the loads, nothing else
+            const bool sb = ci >= na;
+            const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T;
+            if (sb && ci == na) {   // the second segment's V scales from here on
+#pragma unroll
+                for (int qt = 0; qt < QT; ++qt)
+#pragma unroll
+                    for (int nt = 0; nt < D / 16; ++nt)
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) o[qt][nt][e] *= svl[D + nt * 16 + row_of(e)];
+            }
             const int8_t* Kb = K0 + bf * CH * KLD;
             const int8_t* Vb = V0 + bf * D * VLD;
             const float* sk_ = &skl[bf * CH];
-            const bool whole = j0 + CH <= T;   // no key of the chunk past T
+            const bool whole = j0 + CH <= lim;   // no key of the chunk past the segment's
             // S^T: a tile's rows the keys nt * 16 + row_of(e), its column a query; K's operand read once for the tiles.
             // The scores times the keys' scales only: the query's (positive) goes into exp2's argument, and the
             // largest is taken before it, a multiply less a score
@@ -638,7 +751,7 @@ struct Kernel {
 #pragma unroll
                 for (int e = 0; e < 8; ++e) {
                     const int kr = nt * 16 + row_of(e);
-                    const bool in = whole || j0 + kr < T;
+                    const bool in = whole || j0 + kr < lim;
                     const float ks = sk_[kr];
 #pragma unroll
                     for (int qt = 0; qt < QT; ++qt) {
@@ -652,7 +765,10 @@ struct Kernel {
 #pragma unroll
             for (int qt = 0; qt < QT; ++qt) {
                 cmx[qt] = sycl::fmax(cmx[qt], sycl::permute_group_by_xor(sg, cmx[qt], 16)) * sql[qt];   // its other keys
-                if (cmx[qt] > m[qt]) {   // the output and the sum follow the new reference
+                // the output and the sum follow a new reference only where the chunk's largest passes it by 2^8 (or
+                // there is none yet): below that, the chunk's scale ps (up to 2^8 / 127) carries it in FP32, and a
+                // wave's chunks seldom take this branch, which scales the whole output
+                if (cmx[qt] > m[qt] + 8.f) {
                     const float corr = m[qt] == -INFINITY ? 0.f : sycl::native::exp2(m[qt] - cmx[qt]);
 #pragma unroll
                     for (int nt = 0; nt < D / 16; ++nt) o[qt][nt] *= corr;
@@ -667,6 +783,7 @@ struct Kernel {
                 // 0.022 so); such a chunk's ps is 0 and it adds nothing
                 ps[qt] = m[qt] == -INFINITY ? 0.f : sycl::native::exp2(cmx[qt] - m[qt]) / 127.f;
                 float sum = 0.f;
+                const float off = 6.98868468677217f - cmx[qt];   // log2 127: the values times 127 in exp2's argument
 #pragma unroll
                 for (int nt = 0; nt < CH / 16; ++nt) {
                     // 0 .. 127, rounded and packed a byte at a time by v_cvt_pk_u8_f32 (a score past T: exp2 of -inf,
@@ -674,7 +791,7 @@ struct Kernel {
                     uint32_t w0 = 0, w1 = 0;
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-                        const float pv = sycl::native::exp2(sycl::fma(s[qt][nt][e], sql[qt], -cmx[qt])) * 127.f;
+                        const float pv = sycl::native::exp2(sycl::fma(s[qt][nt][e], sql[qt], off));
                         sum += pv;
                         if (e < 4) w0 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) e, w0);
                         else w1 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) (e - 4), w1);
@@ -716,9 +833,9 @@ struct Kernel {
           }
             // the next chunk into the other buffer (read last in the previous step, which the barrier closed), then
             // the one after it into the registers
-            if (j0 + CH < T) stash(bf ^ 1);
+            if (ci + 1 < nch) stash(bf ^ 1);
             sycl::group_barrier(it.get_group());
-            if (j0 + 2 * CH < T) fetch(j0 + 2 * CH);
+            if (ci + 2 < nch) fetch(ci + 2);
         }
         if (!live) return;
 #pragma unroll
@@ -739,27 +856,420 @@ struct Kernel {
     }
 };
 
+// NVIDIA's tensor cores from sm_80 on: the same scheme on mma.sync m16n8k32 (s8 . s8 into s32).  S = Q . K^T with the
+// queries as A's rows: a warp NQ tiles of 16 queries, Q's operands in registers for the whole row of keys, a lane
+// holding rows g and g + 8 (g its lane / 4) and two keys of each 8, a row's maximum and sum over its quad (four lanes,
+// two exchanges).  A step takes NK keys (SC of the layout's chunks; P's int8 scale is the step's), copied into local
+// memory with cp.async a step ahead, the operands read from there with ldmatrix.  An accumulator's two keys of each
+// tile of 8 are not the four consecutive K values a lane holds of P . V's A operand, so P takes them as they are and
+// V^T is stored with its keys in that order (prep_i8).  The output's FP32 sums take each step's int32 P . V by the
+// step's scale, so the longer step makes that update rarer.  Integers and floats cross by the bits of 1.5 * 2^23 (an
+// integer below 2^22 in magnitude is its mantissa's low bits there), on the full-rate units: the conversion
+// instructions run at a quarter of their rate on these GPUs, and a step converts each score, probability and sum.  The
+// mma's sums start from those bits, so a score is one FMA from them (with the key's scale and its -1.5 * 2^23
+// multiple), and P's bytes are packed with prmt.  A step that ends before the segment's last key takes no masks.
+// A warp 16 queries and a work-group 8 warps: 3.7 ms on the RTX 4070 for 4400 rows of 32 heads (3.9 before the FMA
+// and the packing) against 4.4 with 32 queries and 4 warps (both at 255 registers; bounded to 128 for two work-groups
+// an SM, they spilled: 4.9 ms)
+constexpr int NQ = 1;             // query tiles of 16 a warp
+constexpr int NNW = 8;            // warps a work-group
+constexpr int SC = 2;             // the layout's chunks a step
+constexpr int NK = SC * CH;       // keys a step
+constexpr int NVLD = NK + 16;     // a dim's row of V^T in local memory (bytes; 8 rows of an ldmatrix in distinct banks)
+
+struct NvKernel {
+    const int8_t *q8, *k8, *vt;
+    const float *sq, *sk, *sv;
+    uint16_t* out16;
+    int64_t T, Tp, heads, r0, first, row_end;
+    Seg b;
+    sycl::local_accessor<int8_t, 1> kl, vl;       // two steps' K [NK][KLD] and V^T [D][NVLD]
+    sycl::local_accessor<float, 1> skl, svl;      // two steps' key scales and their -kMagicF multiples [NK][2], the
+                                                  // head's V scales [D] (and the second
+                                                  // segment's turn [D] after them)
+
+    [[sycl::reqd_work_group_size(1, NNW * 32), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
+    void operator()(sycl::nd_item<2> it) const {
+#if STRATA_NV_I8
+        constexpr int kMagic = 0x4b400000;      // 1.5 * 2^23's bits
+        constexpr float kMagicF = 12582912.f;   // 1.5 * 2^23
+        sycl::sub_group sg = it.get_sub_group();
+        const int wave = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int g = lane >> 2, t4 = lane & 3, lid = (int) it.get_local_id(1);
+        const int64_t h = (int64_t) it.get_group(0), C = heads * D;
+        const int64_t my0 = r0 + (int64_t) it.get_group(1) * NNW * 16 * NQ + (int64_t) wave * 16 * NQ;
+        const bool live = my0 < row_end;
+        int8_t* K0 = kl.get_multi_ptr<sycl::access::decorated::no>().get();
+        int8_t* V0 = vl.get_multi_ptr<sycl::access::decorated::no>().get();
+        for (int i = lid; i < D; i += NNW * 32) {
+            svl[i] = sv[h * D + i];
+            if (b.T > 0) svl[D + i] = b.sw[h * D + i];
+        }
+        // the members as values (the lambdas below take them so, not through the kernel object)
+        const int8_t *const ka = k8, *const kb2 = b.k, *const va = vt, *const vb2 = b.vt;
+        const float *const ska = sk, *const skb = b.sk;
+        const int64_t Ta = T, Tb = b.T;
+        // the steps: the first segment's, then the second's, each from a chunk of CH keys
+        const int64_t na = Tp / CH, nb = b.Tp / CH, sa = (na + SC - 1) / SC, nsteps = sa + (nb + SC - 1) / SC;
+        auto step_of = [=](int64_t si, bool& sb, int64_t& c0, int& nc) {
+            sb = si >= sa;
+            c0 = (sb ? si - sa : si) * SC;
+            nc = (int) sycl::min<int64_t>(SC, (sb ? nb : na) - c0);
+        };
+        // a step's K rows and V^T's chunks into buffer bf (16 bytes a copy), its key scales into a register: piece p
+        // of a work-item is K's row kr0 + p KR at column kc0, and V^T's chunk p at dim vd0, keys vc0 (offsets from a
+        // base each, not arrays: those were held in registers the kernel had none left for)
+        constexpr int NT = NNW * 32, KP = NK * D / 16 / NT, VP = D * NK / 16 / NT, KR = NT / (D / 16);
+        static_assert(KP * NT == NK * D / 16 && NT % (D / 16) == 0 && NT == D * CH / 16 && VP == NK / CH,
+                      "whole pieces a work-item");
+        const int kr0 = lid / (D / 16), vd0 = lid / (CH / 16);
+        const uint32_t ks_at = (uint32_t) (kr0 * KLD + lid % (D / 16) * 16),
+                       vs_at = (uint32_t) (vd0 * NVLD + lid % (CH / 16) * 16);
+        const int64_t kg_at = (int64_t) kr0 * C + (int64_t) (lid % (D / 16)) * 16,
+                      vg_at = (int64_t) vd0 * CH + (int64_t) (lid % (CH / 16)) * 16;
+        const uint32_t ks0 = smem_u32(K0), vs0 = smem_u32(V0);
+        float rs = 0.f;
+        auto issue = [&](int64_t si, int bf) {
+            bool sb;
+            int64_t c0;
+            int nc;
+            step_of(si, sb, c0, nc);
+            const int8_t* kp = (sb ? kb2 : ka) + c0 * CH * C + h * D + kg_at;
+            const int8_t* vp = (sb ? vb2 : va) + (h * (sb ? nb : na) + c0) * D * CH + vg_at;
+            const uint32_t kb = ks0 + (uint32_t) bf * NK * KLD + ks_at, vb = vs0 + (uint32_t) bf * D * NVLD + vs_at;
+#pragma unroll
+            for (int p = 0; p < KP; ++p)
+                if (kr0 + p * KR < nc * CH) cp16(kb + (uint32_t) (p * KR * KLD), kp + (int64_t) p * KR * C);
+#pragma unroll
+            for (int p = 0; p < VP; ++p)
+                if (p < nc) cp16(vb + (uint32_t) (p * CH), vp + (int64_t) p * D * CH);
+            cp_commit();
+            const int64_t key = c0 * CH + lid;
+            if (lid < NK) rs = lid < nc * CH && key < (sb ? Tb : Ta) ? (sb ? skb : ska)[key * heads + h] : 0.f;
+        };
+        // the queries as A operands (rows g and g + 8 of a tile, K values t4 * 4 .. and 16 + t4 * 4 .. of each 32),
+        // the two rows' scales, references and sums (a lane's part of its quad's)
+        uint32_t qa[NQ][D / 32][4];
+        float sql[NQ][2], m[NQ][2], l[NQ][2];
+        // the output's sums take P . V's bits as floats (kMagicF + the int32 sum) times the step's scale, and moff the
+        // kMagicF times the scales for its row, taken off at the end: one FMA an element and step, not an FADD too.
+        // An element's rounding is then of its sum with the kMagicF multiples, about 2^-24 kMagicF (0.75) times a
+        // step's scale, against the 0.5 of each of the step's probabilities in int8 times its value
+        float moff[NQ][2];
+        float o[NQ][D / 8][4];   // tile nt: rows g (0, 1) and g + 8 (2, 3), dims nt * 8 + 2 t4 + (e & 1)
+        issue(0, 0);
+#pragma unroll
+        for (int qt = 0; qt < NQ; ++qt) {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int64_t qr = sycl::min<int64_t>(my0 + (16 * qt + g + 8 * r), Tp - 1);
+#pragma unroll
+                for (int ks = 0; ks < D / 32; ++ks) {
+                    const int8_t* p = q8 + qr * C + h * D + (ks * 32 + t4 * 4);
+                    qa[qt][ks][r] = *reinterpret_cast<const uint32_t*>(p);
+                    qa[qt][ks][2 + r] = *reinterpret_cast<const uint32_t*>(p + 16);
+                }
+                sql[qt][r] = sq[qr * heads + h];
+                m[qt][r] = -INFINITY;
+                moff[qt][r] = 0.f;
+                l[qt][r] = 0.f;
+            }
+#pragma unroll
+            for (int nt = 0; nt < D / 8; ++nt)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) o[qt][nt][e] = 0.f;
+        }
+        if (lid < NK) {
+            skl[(size_t) 2 * lid] = rs;
+            skl[(size_t) 2 * lid + 1] = -kMagicF * rs;
+        }
+        // ldmatrix's row addresses: lane l the row l % 8 of matrix l / 8 (of K: tile j + (l >> 4), dims
+        // + 16 (l >> 3 & 1); of V^T: dims tile nt + (l >> 4), keys + 16 (l >> 3 & 1))
+        const int lr = lane & 7, lm = lane >> 3;
+        const uint32_t koff = (uint32_t) ((8 * (lm >> 1) + lr) * KLD + 16 * (lm & 1)),
+                       voff = (uint32_t) ((8 * (lm >> 1) + lr) * NVLD + 16 * (lm & 1));
+        for (int64_t si = 0; si < nsteps; ++si) {
+            // one barrier a step: past it this step's copies (the only ones out) have landed and every warp has
+            // left the last step, so the next step's copies may go into the buffer that step read (two barriers a
+            // step, the copy issued before the wait: 3.32 ms on the RTX 4070, 4400 rows of 32 heads)
+            const int bf = (int) (si & 1);
+            cp_wait<0>();
+            sycl::group_barrier(it.get_group());
+            if (si + 1 < nsteps) issue(si + 1, bf ^ 1);
+            bool sb;
+            int64_t c0;
+            int nc;
+            step_of(si, sb, c0, nc);
+            if (live) {
+                const int64_t j0 = c0 * CH, lim = sb ? Tb : Ta;
+                if (sb && c0 == 0) {   // the second segment's V scales from here on (moff taken off first: a dim's)
+#pragma unroll
+                    for (int qt = 0; qt < NQ; ++qt) {
+#pragma unroll
+                        for (int nt = 0; nt < D / 8; ++nt)
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                o[qt][nt][e] = (o[qt][nt][e] - moff[qt][e >> 1]) * svl[D + nt * 8 + 2 * t4 + (e & 1)];
+                        moff[qt][0] = moff[qt][1] = 0.f;
+                    }
+                }
+                const uint32_t kb = smem_u32(K0) + (uint32_t) bf * NK * KLD + koff,
+                               vb = smem_u32(V0) + (uint32_t) bf * D * NVLD + voff;
+                const float* sk_ = &skl[(size_t) bf * 2 * NK];
+                const int kmax = (int) sycl::min<int64_t>(NK, lim - j0);   // the step's keys before the segment's end
+                // S: tile j's keys j * 8 + 2 t4 + (e & 1), rows g (e < 2) and g + 8; K's operands read once for the
+                // tiles
+                int acc[NQ][NK / 8][4];
+#pragma unroll
+                for (int qt = 0; qt < NQ; ++qt)
+#pragma unroll
+                    for (int j = 0; j < NK / 8; ++j)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) acc[qt][j][e] = kMagic;
+#pragma unroll
+                for (int ks = 0; ks < D / 32; ++ks)
+#pragma unroll
+                    for (int j = 0; j < NK / 8; j += 2) {
+                        uint32_t kf[4];   // tile j's b0, b1, tile j + 1's
+                        ldsm4(kf, kb + j * 8 * KLD + ks * 32);
+#pragma unroll
+                        for (int qt = 0; qt < NQ; ++qt) {
+                            mma_s8(acc[qt][j], qa[qt][ks], kf[0], kf[1]);
+                            mma_s8(acc[qt][j + 1], qa[qt][ks], kf[2], kf[3]);
+                        }
+                    }
+                uint32_t pa[NQ][NK / 32][4];
+                float ps[NQ][2];
+                // the scores, P and its sums; a step that ends past the segment's last key (edge) masks the keys
+                // after it
+                auto scores = [&](auto edge, int qt) __attribute__((always_inline)) {
+                    float cmx[2] = {-INFINITY, -INFINITY};
+                    float s[NK / 8][4];
+#pragma unroll
+                    for (int j = 0; j < NK / 8; ++j) {
+                        // the two keys' scales and their -kMagicF multiples
+                        const sycl::float4 ks = *reinterpret_cast<const sycl::float4*>(sk_ + (ptrdiff_t) 2 * (j * 8 + 2 * t4));
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int k = 2 * (e & 1);
+                            s[j][e] = sycl::fma(sycl::bit_cast<float>(acc[qt][j][e]), ks[k], ks[k + 1]);
+                            if constexpr (decltype(edge)::value)
+                                if (j * 8 + 2 * t4 + (e & 1) >= kmax) s[j][e] = -INFINITY;
+                            cmx[e >> 1] = sycl::fmax(cmx[e >> 1], s[j][e]);
+                        }
+                    }
+                    float off[2], sum[2] = {0.f, 0.f};
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) {
+                        cmx[r] = sycl::fmax(cmx[r], sycl::permute_group_by_xor(sg, cmx[r], 1));
+                        cmx[r] = sycl::fmax(cmx[r], sycl::permute_group_by_xor(sg, cmx[r], 2)) * sql[qt][r];
+                        if (cmx[r] > m[qt][r] + 8.f) {   // as Kernel's: a new reference past 2^8 only
+                            const float corr = m[qt][r] == -INFINITY ? 0.f : ex2(m[qt][r] - cmx[r]);
+#pragma unroll
+                            for (int nt = 0; nt < D / 8; ++nt) {
+                                const int e0 = 2 * r;
+                                o[qt][nt][e0] *= corr;
+                                o[qt][nt][e0 + 1] *= corr;
+                            }
+                            l[qt][r] *= corr;
+                            moff[qt][r] *= corr;
+                            m[qt][r] = cmx[r];
+                        }
+                        ps[qt][r] = m[qt][r] == -INFINITY ? 0.f : ex2(cmx[r] - m[qt][r]) * (1.f / 127.f);
+                        off[r] = 6.98868468677217f - cmx[r];
+                    }
+                    uint32_t w[NK / 8][2];   // tile j's row r's two values, 0 .. 127, in bytes 0 and 1
+#pragma unroll
+                    for (int j = 0; j < NK / 8; ++j)
+#pragma unroll
+                        for (int r = 0; r < 2; ++r) {
+                            const int e0 = 2 * r;
+                            const float p0 = ex2(sycl::fma(s[j][e0], sql[qt][r], off[r])),
+                                        p1 = ex2(sycl::fma(s[j][e0 + 1], sql[qt][r], off[r]));
+                            sum[r] += p0 + p1;
+                            // rounded to the nearest (even) integer by the add, its low byte the value
+                            w[j][r] = prmt(sycl::bit_cast<uint32_t>(p0 + kMagicF),
+                                           sycl::bit_cast<uint32_t>(p1 + kMagicF), 0x0040u);
+                        }
+                    // A of P . V a 32 keys: row g's keys 4 t4 .. in V^T's order from tiles 4 kc and 4 kc + 1, then
+                    // 16 + 4 t4 .. from 4 kc + 2 and 4 kc + 3; row g + 8's the same
+#pragma unroll
+                    for (int kc = 0; kc < NK / 32; ++kc)
+#pragma unroll
+                        for (int r = 0; r < 2; ++r) {
+                            const int j0 = 4 * kc;
+                            pa[qt][kc][r] = prmt(w[j0][r], w[j0 + 1][r], 0x5410u);
+                            pa[qt][kc][2 + r] = prmt(w[j0 + 2][r], w[j0 + 3][r], 0x5410u);
+                        }
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) l[qt][r] += sum[r] * ps[qt][r];
+                };
+#pragma unroll
+                for (int qt = 0; qt < NQ; ++qt) {
+                    if (kmax == NK) scores(std::false_type{}, qt);
+                    else scores(std::true_type{}, qt);
+                }
+#pragma unroll
+                for (int qt = 0; qt < NQ; ++qt)
+#pragma unroll
+                    for (int r = 0; r < 2; ++r) moff[qt][r] = sycl::fma(kMagicF, ps[qt][r], moff[qt][r]);
+                // O += P . V, dims nt * 8 .. and the next 8; V^T's operands read once
+#pragma unroll
+                for (int nt = 0; nt < D / 8; nt += 2) {
+                    int c[NQ][2][4];
+#pragma unroll
+                    for (int qt = 0; qt < NQ; ++qt)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) c[qt][0][e] = c[qt][1][e] = kMagic;
+#pragma unroll
+                    for (int kc = 0; kc < NK / 32; ++kc) {
+                        uint32_t vf[4];   // dims tile nt's b0, b1, tile nt + 1's
+                        ldsm4(vf, vb + nt * 8 * NVLD + kc * 32);
+#pragma unroll
+                        for (int qt = 0; qt < NQ; ++qt) {
+                            mma_s8(c[qt][0], pa[qt][kc], vf[0], vf[1]);
+                            mma_s8(c[qt][1], pa[qt][kc], vf[2], vf[3]);
+                        }
+                    }
+#pragma unroll
+                    for (int qt = 0; qt < NQ; ++qt)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const float pr = ps[qt][e >> 1];
+                            o[qt][nt][e] = sycl::fma(sycl::bit_cast<float>(c[qt][0][e]), pr, o[qt][nt][e]);
+                            o[qt][nt + 1][e] = sycl::fma(sycl::bit_cast<float>(c[qt][1][e]), pr, o[qt][nt + 1][e]);
+                        }
+                }
+            }
+            if (si + 1 < nsteps && lid < NK) {   // the next step's key scales (its buffer was read last step)
+                skl[(size_t) (bf ^ 1) * 2 * NK + (size_t) 2 * lid] = rs;
+                skl[(size_t) (bf ^ 1) * 2 * NK + (size_t) 2 * lid + 1] = -kMagicF * rs;
+            }
+        }
+        if (!live) return;
+#pragma unroll
+        for (int qt = 0; qt < NQ; ++qt)
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                float lr2 = l[qt][r];
+                lr2 += sycl::permute_group_by_xor(sg, lr2, 1);
+                lr2 += sycl::permute_group_by_xor(sg, lr2, 2);
+                const int64_t t = my0 + (16 * qt + g + 8 * r);
+                if (t >= row_end || t < first) continue;
+                const float inv = lr2 > 0.f ? 1.f / lr2 : 0.f;
+#pragma unroll
+                for (int nt = 0; nt < D / 8; ++nt) {
+                    const int d = nt * 8 + 2 * t4;
+                    const int e0 = 2 * r;
+                    const float mo = moff[qt][r];
+                    const uint32_t v = (uint32_t) f16_from_f32((o[qt][nt][e0] - mo) * inv * svl[(size_t) d]) |
+                                       (uint32_t) f16_from_f32((o[qt][nt][e0 + 1] - mo) * inv * svl[d + 1]) << 16;
+                    *reinterpret_cast<uint32_t*>(out16 + (t - first) * C + h * D + d) = v;
+                }
+            }
+#else
+        (void) it;
+#endif
+    }
+};
+
+void launch(sycl::queue& q, const Bufs& b, const float* sv, int64_t T, int64_t Tp, int64_t heads, int64_t r0,
+            int64_t first, int64_t row_end, uint16_t* out16, const Seg& seg = {});
+
 // The rows r0 .. row_end - 1 (which see every key) into out16 (its row 0 query row `first`) through the int8 kernel;
 // false where it is not built for the device or its buffers do not fit (the caller takes the 16-bit path).
 bool run(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
          int64_t r0, int64_t first, int64_t row_end, uint16_t* out16) {
-    if (!strata::kernels::xe::amd_wmma(q.get_device())) return false;
-    static core::PerDevice<std::shared_ptr<Bufs>> of;
-    Bufs& b = *of.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
+    if (kind_of(q) == 0) return false;
+    Bufs& b = bufs_of(q);
     const int64_t C = heads * D, Tp = (T + CH - 1) / CH * CH;
     if (!b.grow(T, C, heads)) return false;
     key_stats(q, k16, v16, T, C, b.part, b.mean, b.sv);
     prep_i8(q, q16, k16, v16, b.mean, b.sv, T, Tp, heads, 1.4426950408889634f / std::sqrt((float) D),   // log2 e / sqrt D
             b.q, b.k, b.vt, b.sq, b.sk);
+    launch(q, b, b.sv, T, Tp, heads, r0, first, row_end, out16);
+    return true;
+}
+
+// the kernel on the buffers prepared: T keys (then seg's), query rows r0 .. row_end - 1, the output at V's scales sv
+void launch(sycl::queue& q, const Bufs& b, const float* sv, int64_t T, int64_t Tp, int64_t heads, int64_t r0,
+            int64_t first, int64_t row_end, uint16_t* out16, const Seg& seg) {
+    if (kind_of(q) == 2) {
+        const int64_t rows = (int64_t) NNW * 16 * NQ;
+        const size_t groups = (size_t) ((row_end - r0 + rows - 1) / rows);
+        q.submit([&](sycl::handler& h) {
+            NvKernel k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
+                       sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * NK * KLD)), h),
+                       sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * D * NVLD)), h),
+                       sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (4 * NK)), h),
+                       sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * D)), h)};
+            h.parallel_for(sycl::nd_range<2>({(size_t) heads, groups * NNW * 32}, {1, (size_t) NNW * 32}), k);
+        });
+        return;
+    }
     const size_t groups = (size_t) ((row_end - r0 + (int64_t) NW * 16 * QT - 1) / ((int64_t) NW * 16 * QT));
     q.submit([&](sycl::handler& h) {
-        Kernel k{b.q, b.k, b.vt, b.sq, b.sk, b.sv, out16, T, Tp, heads, r0, first, row_end,
+        Kernel k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
                  sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * CH * KLD)), h),
                  sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * D * VLD)), h),
                  sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * CH)), h),
-                 sycl::local_accessor<float, 1>(sycl::range<1>((size_t) D), h)};
+                 sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * D)), h)};
         h.parallel_for(sycl::nd_range<2>({(size_t) heads, groups * NW * 32}, {1, (size_t) NW * 32}), k);
     });
+}
+
+// A prefix of keys made once (make_prefix) and read by many attentions (run_prefixed): K [Pp][C] less its mean, V^T
+// [heads][Pp / CH][D][CH], the keys' scales [Pp][heads], V's [C] and K's mean [C], one piece
+struct Prefix {
+    int8_t *k, *vt;
+    float *sk, *sv, *mean;
+    int64_t Pp;
+    Prefix(void* p, int64_t P, int64_t heads) : Pp((P + CH - 1) / CH * CH) {
+        const int64_t C = heads * D;
+        k = static_cast<int8_t*>(p);
+        vt = k + Pp * C;
+        sk = reinterpret_cast<float*>(vt + Pp * C);
+        sv = sk + Pp * heads;
+        mean = sv + C;
+    }
+    static uint64_t bytes(int64_t P, int64_t heads) {
+        const int64_t Pp = (P + CH - 1) / CH * CH, C = heads * D;
+        return (uint64_t) Pp * C * 2 + (uint64_t) Pp * heads * 4 + (uint64_t) C * 8;
+    }
+};
+
+bool make_prefix(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t P, int64_t heads, void* to) {
+    if (kind_of(q) == 0) return false;
+    Bufs& b = bufs_of(q);   // its key stats' partial sums
+    const int64_t C = heads * D;
+    if (!b.grow(1, C, heads)) return false;
+    const Prefix f(to, P, heads);
+    key_stats(q, k16, v16, P, C, b.part, f.mean, f.sv);
+    prep_i8(q, nullptr, k16, v16, f.mean, f.sv, P, f.Pp, heads, 0.f, nullptr, f.k, f.vt, nullptr, f.sk);
+    return true;
+}
+
+// The T rows' attention over their own T keys and then the prefix's P, read where they are (the kernel's second
+// segment): the rows' K less the prefix's mean (which leaves a row's softmax as it is), their V at their own scales;
+// the prefix's V at its scales times pnum / pden (a head's), which the output takes as the prefix's chunks begin
+bool run_prefixed(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
+                  int64_t heads, const void* prefix, int64_t P, const float* pnum, const float* pden, uint16_t* out16) {
+    if (kind_of(q) == 0) return false;
+    Bufs& b = bufs_of(q);
+    const int64_t C = heads * D, Tp = (T + CH - 1) / CH * CH;
+    if (!b.grow(T, C, heads)) return false;
+    const Prefix f(const_cast<void*>(prefix), P, heads);
+    key_stats(q, k16, v16, T, C, b.part, b.mean, b.sv);   // the rows' V scales (their K's mean is not taken)
+    const float *sv = b.sv, *psv = f.sv;
+    float *fin = b.mean, *sw = b.sw;
+    q.parallel_for(sycl::range<1>((size_t) C), [=](sycl::id<1> id) {
+        const int64_t c = (int64_t) id[0], h = c / D;
+        fin[c] = psv[c] * (pnum[h] / pden[h]);   // key_stats' scales are never 0
+        sw[c] = sv[c] / fin[c];
+    });
+    prep_i8(q, q16, k16, v16, f.mean, b.sv, T, Tp, heads, 1.4426950408889634f / std::sqrt((float) D),
+            b.q, b.k, b.vt, b.sq, b.sk);
+    launch(q, b, fin, T, Tp, heads, 0, 0, T, out16, Seg{f.k, f.vt, f.sk, sw, P, f.Pp});
     return true;
 }
 
@@ -776,7 +1286,24 @@ const char* qi_attention_path() {
 
 namespace {
 thread_local bool g_no_i8 = false;   // the 16-bit path's run while the int8 one is timed against it
+
+// qi_attention's choices of the int8 kernel, a GPU's: (image rows, keys) / 1024 -> int8
+struct Choices {
+    std::mutex mu;
+    std::map<std::pair<int64_t, int64_t>, bool> of;
+};
+Choices& choices_of(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<Choices>> of;
+    return *of.get(q.get_device(), [] { return std::make_shared<Choices>(); });
 }
+int forced_i8() {   // STRATA_IMAGE_ATTN_I8: 1 always, 0 never, else -1 (timed)
+    static const int forced = [] {
+        const char* v = std::getenv("STRATA_IMAGE_ATTN_I8");
+        return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
+    }();
+    return forced;
+}
+}  // namespace
 
 bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                      int64_t r0, int64_t first, uint16_t* out16, void* stream) {
@@ -788,6 +1315,65 @@ bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v
 }
 
 int qi_attention_i8_chunk() { return i8::CH; }
+
+uint64_t qi_attention_i8_prefix_bytes(int64_t P, int64_t heads) { return i8::Prefix::bytes(P, heads); }
+
+bool qi_attention_i8_prefix(const uint16_t* k16, const uint16_t* v16, int64_t P, int64_t heads, void* prefix,
+                            void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (P <= 0 || !i8::make_prefix(q, k16, v16, P, heads, prefix)) return false;
+    if (!stream) q.wait();
+    return true;
+}
+
+bool qi_attention_i8_prefixed(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T,
+                              int64_t heads, const void* prefix, int64_t P, const float* v_from, const float* v_to,
+                              uint16_t* out16, void* stream) {
+    if (T <= 0) return true;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (P <= 0 || !i8::run_prefixed(q, q16, k16, v16, T, heads, prefix, P, v_from, v_to, out16)) return false;
+    if (!stream) q.wait();
+    return true;
+}
+
+bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (i8::kind_of(q) == 0 || pick(q.get_device()) < 0) return false;
+    if (forced_i8() >= 0) return forced_i8() == 1;
+    rows = std::max<int64_t>(rows, 2048);   // qi_attention times from 2048 rows on
+    keys = std::max(keys, rows);
+    Choices& ch = choices_of(q);
+    const auto key = std::make_pair((rows + 1023) / 1024, (keys + 1023) / 1024);
+    {
+        std::lock_guard<std::mutex> lock(ch.mu);
+        if (const auto it = ch.of.find(key); it != ch.of.end()) return it->second;
+    }
+    // not timed yet: qi_attention times it, on rows of zeros (the kernels' speed does not ask what the values are)
+    const int64_t C = heads * D, TP = qi_attn_rows(keys);
+    uint16_t *qkv = nullptr, *out = nullptr;
+    if (!strata::gpu::alloc_device(&qkv, (size_t) (3 * TP * C) * 2) ||
+        !strata::gpu::alloc_device(&out, (size_t) (rows * C) * 2)) {
+        if (qkv != nullptr) strata::gpu::free(qkv);
+        return false;
+    }
+    bool use = false;
+    try {
+        strata::gpu::memset_async(qkv, 0, (size_t) (3 * TP * C) * 2, stream);
+        qi_attention(qkv, qkv + TP * C, qkv + 2 * TP * C, keys, heads, D, 0, out, nullptr, stream, nullptr,
+                     keys - rows, true);
+        q.wait();
+        std::lock_guard<std::mutex> lock(ch.mu);
+        const auto it = ch.of.find(key);
+        use = it != ch.of.end() && it->second;
+    } catch (...) {
+        strata::gpu::free(qkv);
+        strata::gpu::free(out);
+        throw;
+    }
+    strata::gpu::free(qkv);
+    strata::gpu::free(out);
+    return use;
+}
 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
@@ -805,16 +1391,8 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     bool i8_done = false;
     if (int8 && T - r0 >= 256) {
         sycl::queue& qq = core::Runtime::get().stream(stream);
-        static const int forced = [] {
-            const char* v = std::getenv("STRATA_IMAGE_ATTN_I8");
-            return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
-        }();
-        struct Choices {
-            std::mutex mu;
-            std::map<std::pair<int64_t, int64_t>, bool> of;   // (image rows, keys) / 1024 -> int8
-        };
-        static core::PerDevice<std::shared_ptr<Choices>> choices_of;
-        Choices& ch = *choices_of.get(qq.get_device(), [] { return std::make_shared<Choices>(); });
+        const int forced = forced_i8();
+        Choices& ch = choices_of(qq);
         const auto key = std::make_pair((T - r0 + 1023) / 1024, (T + 1023) / 1024);
         auto run_i8 = [&] { return i8::run(qq, q16, k16, v16, T, heads, r0, first, T, out16); };
         int use = forced;
@@ -822,7 +1400,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
             std::lock_guard<std::mutex> lock(ch.mu);
             const auto it = ch.of.find(key);
             if (it != ch.of.end()) use = it->second;
-            else if (T - r0 >= 2048 && strata::kernels::xe::amd_wmma(qq.get_device())) {
+            else if (T - r0 >= 2048 && i8::kind_of(qq) != 0) {
                 auto timed = [&](const std::function<bool()>& f) {
                     if (!f()) return -1.0;
                     qq.wait();

@@ -13,6 +13,7 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "f16_gpu.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -32,7 +33,8 @@
 namespace strata::image::dit_rows {
 
 namespace syclex = sycl::ext::oneapi::experimental;
-using strata::kernels::f16_from_f32;
+using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using f16_gpu::f32_from_f16;
 
 inline sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
@@ -201,6 +203,14 @@ struct Stats {
 template<class Op, int W> struct RowsI8Of {
     static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = 4;
     static_assert(W == 1 || W == 4 || W == V);
+    // an op's W values side by side in one access (raw_w, keep_w where it keeps them; out_w): RmsI8 on the RTX 4070
+    // through scalar reads W values apart kept the L1 busy at 44% of the memory's bandwidth (2026-11-05)
+    static constexpr bool kVec = W > 1 && requires(const Op& o, float* p) {
+        o.template raw_w<W>(int64_t{}, int64_t{}, p);
+    } && (!Op::kKeep || requires(const Op& o, const float* p) { o.template keep_w<W>(int64_t{}, int64_t{}, p); });
+    static constexpr bool kVecOut = W > 1 && requires(const Op& o, float* p) {
+        o.template out_w<W>(int64_t{}, int64_t{}, p, 1.f);
+    };
     Op op;
     int64_t K, gpr, nsg;
     int8_t* q;
@@ -211,38 +221,68 @@ template<class Op, int W> struct RowsI8Of {
         const auto si = static_cast<int64_t>(sg.get_group_linear_id());
         const int lane = static_cast<int>(sg.get_local_linear_id());
         auto off = [](int j) { return (int64_t) (j / W) * SG * W + j % W; };   // value j past the lane's first
+        // every loop unrolled, the groups a sub-group skips by a condition: rolled (the breaks they had), v went to
+        // local memory on NVPTX (qi_kernels.cpp's RowsI8: the L2's writes 35 times its output, RTX 4070, 2026-11-05)
         float v[kMaxG][V];
         float ss = 0.f;
+#pragma unroll
         for (int c = 0; c < kMaxG; ++c) {
             const int64_t g = si + c * nsg;
-            if (g >= gpr) break;   // the whole sub-group
+            if (g >= gpr) continue;   // the whole sub-group
             const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
-            for (int j = 0; j < V; ++j) {
-                v[c][j] = op.raw(r, k0 + off(j));
-                if constexpr (Op::kKeep) op.keep(r, k0 + off(j), v[c][j]);
-                if constexpr (Op::kRms) ss += v[c][j] * v[c][j];
+            if constexpr (kVec) {   // W values a load: one access each, not W the lanes' accesses W values apart
+#pragma unroll
+                for (int h = 0; h < V / W; ++h) {
+                    const int j = h * W;
+                    op.template raw_w<W>(r, k0 + (int64_t) h * SG * W, &v[c][j]);
+                    if constexpr (Op::kKeep) op.template keep_w<W>(r, k0 + (int64_t) h * SG * W, &v[c][j]);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < V; ++j) {
+                    v[c][j] = op.raw(r, k0 + off(j));
+                    if constexpr (Op::kKeep) op.keep(r, k0 + off(j), v[c][j]);
+                }
             }
+            if constexpr (Op::kRms)
+#pragma unroll
+                for (int j = 0; j < V; ++j) ss += v[c][j] * v[c][j];
         }
         float inv = 1.f;
         if constexpr (Op::kRms) inv = op.inv(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()));
         float amax = 0.f;
+#pragma unroll
         for (int c = 0; c < kMaxG; ++c) {
             const int64_t g = si + c * nsg;
-            if (g >= gpr) break;
+            if (g >= gpr) continue;
             const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
-            for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
+            if constexpr (kVecOut) {
+#pragma unroll
+                for (int h = 0; h < V / W; ++h) {
+                    const int j = h * W;
+                    op.template out_w<W>(r, k0 + (int64_t) h * SG * W, &v[c][j], inv);
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
+            }
+#pragma unroll
             for (int m = 1; m < V; m <<= 1)
+#pragma unroll
                 for (int j = 0; j < V; ++j)
                     if ((j & m) == 0) {
                         const float a = v[c][j], b = v[c][j + m];
                         v[c][j] = a + b;
                         v[c][j + m] = a - b;
                     }
+#pragma unroll
             for (int l = 1; l < SG; l <<= 1)
+#pragma unroll
                 for (int j = 0; j < V; ++j) {
                     const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
                     v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
                 }
+#pragma unroll
             for (int j = 0; j < V; ++j) {
                 v[c][j] *= 1.f / 16.f;
                 amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
@@ -250,14 +290,28 @@ template<class Op, int W> struct RowsI8Of {
         }
         amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
         const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+#pragma unroll
         for (int c = 0; c < kMaxG; ++c) {
             const int64_t g = si + c * nsg;
-            if (g >= gpr) break;
+            if (g >= gpr) continue;
             int8_t* qg = q + r * K + g * kQiRotate + (int64_t) lane * W;
+#pragma unroll
             for (int h = 0; h < V / W; ++h) {
-                sycl::vec<int8_t, W> o;
-                for (int p = 0; p < W; ++p) o[p] = (int8_t) (int) sycl::round(v[c][h * W + p] * id);
-                *reinterpret_cast<sycl::vec<int8_t, W>*>(qg + (int64_t) h * SG * W) = o;
+                auto q8 = [&](int p) { return (uint32_t) (uint8_t) (int8_t) (int) sycl::round(v[c][h * W + p] * id); };
+                if constexpr (W == 1) {
+                    qg[(int64_t) h * SG] = (int8_t) q8(0);
+                } else {   // packed into 32-bit words and stored as one: a sycl::vec<int8_t, W> store is split into
+                           // its bytes on NVPTX
+                    uint32_t o[W / 4] = {};
+#pragma unroll
+                    for (int p = 0; p < W; ++p) o[p / 4] |= q8(p) << (8 * (p % 4));
+                    if constexpr (W == 4) {
+                        *reinterpret_cast<uint32_t*>(qg + (int64_t) h * SG * W) = o[0];
+                    } else {
+                        using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
+                        *reinterpret_cast<u32x2*>(qg + (int64_t) h * SG * W) = u32x2{o[0], o[1]};
+                    }
+                }
             }
         }
         if (si == 0 && lane == 0) s[r] = d;
@@ -300,7 +354,7 @@ struct TimedHalfI8 {
     static constexpr bool kRms = false, kKeep = false;
     const uint16_t* h;
     int64_t C;
-    float raw(int64_t t, int64_t c) const { return kernels::f32_from_f16(h[t * C + c]); }
+    float raw(int64_t t, int64_t c) const { return f32_from_f16(h[t * C + c]); }
     void keep(int64_t, int64_t, float) const {}
     float inv(float) const { return 1.f; }
     float out(int64_t, int64_t, float v, float) const { return v; }
@@ -399,7 +453,7 @@ struct Heads {
     const float* hs;
     int64_t C, hd;
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
-    float value(int64_t t, int64_t c, const Stats&) const { return kernels::f32_from_f16(o16[t * C + c]) * hs[c / hd]; }
+    float value(int64_t t, int64_t c, const Stats&) const { return f32_from_f16(o16[t * C + c]) * hs[c / hd]; }
 };
 
 // The per-head kernels below: a sub-group of 32 a row's head (its values read side by side, kSG apart), kRows heads a
