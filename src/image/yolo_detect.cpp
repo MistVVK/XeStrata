@@ -498,11 +498,12 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
     net.pool.next = 0;
     sycl::queue& q = queue();
 
-    // the letterbox (MMYOLO's LetterResize with the least padding to a multiple of 32, grey 114)
+    // the letterbox: the least padding to a multiple of 32, its smaller half before, grey 114 (the input Ultralytics'
+    // predict makes, matched by its outputs run as a black box)
     const double r = std::min((double) imgsz / (double) H, (double) imgsz / (double) W);
     const int64_t nw = (int64_t) std::lround((double) W * r), nh = (int64_t) std::lround((double) H * r);
     const int64_t pw = (imgsz - nw) % 32, ph = (imgsz - nh) % 32, iw = nw + pw, ih = nh + ph;
-    const int64_t left = (int64_t) std::lround((double) pw / 2.0 - 0.1), top = (int64_t) std::lround((double) ph / 2.0 - 0.1);
+    const int64_t left = pw / 2, top = ph / 2;
     uint8_t* src = net.pool.get<uint8_t>((size_t) (W * H * 4));
     q.memcpy(src, img.rgba.data(), (size_t) (W * H * 4));
     Map x0{net.pool.get<uint16_t>((size_t) (iw * ih * kInC)), ih, iw, kInC};

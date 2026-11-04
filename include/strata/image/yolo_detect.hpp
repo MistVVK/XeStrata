@@ -6,8 +6,8 @@
 // The weights are a checkpoint converted by tools/image/yolo_pt.py (Bingsu/adetailer's face_yolov8m, hand_yolov8s,
 // person_yolov8m-seg): each convolution's weight and batch norm under its module path, and the layer list in the
 // header's metadata (`graph`).  The network is built from that list and the tensors' shapes, after the published
-// descriptions of YOLOv8 (Ultralytics' documentation of its modules, MMYOLO's YOLOv8 head and LetterResize, GPL-3.0,
-// read, not copied): convolutions with their batch norm folded in and SiLU; C2f blocks (a 1 x 1 convolution split in
+// descriptions of YOLOv8 (MMYOLO's YOLOv8 head and LetterResize, GPL-3.0, read, not copied; Ultralytics' code was
+// not read, its letterbox and outputs were matched by running it as a black box): convolutions with their batch norm folded in and SiLU; C2f blocks (a 1 x 1 convolution split in
 // two halves, bottlenecks of two 3 x 3 convolutions on the last half, every output concatenated into a 1 x 1
 // convolution); SPPF (three 5 x 5 max pools in a row); nearest 2x upsampling and concatenation in the neck; and the
 // anchor-free head: per level, the box's four distances as distribution focal loss bins (a softmax over 16 bins, its

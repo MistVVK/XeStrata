@@ -1368,6 +1368,27 @@ def box_mask(W: int, H: int, box: tuple[int, int, int, int]) -> bytes:
     return buf.getvalue()
 
 
+def grow_mask(mask: Any, lo: int, hi: int) -> Any:
+    """A boolean mask grown by a rectangle of lo + 1 + hi pixels a side: each pixel set where one within lo pixels
+    after it or hi before it (a row, then a column) is set."""
+    out = mask.astype(bool)
+    for axis in (0, 1):
+        n = out.shape[axis]
+        grown = out.copy()
+        for k in range(-hi, lo + 1):
+            if k == 0 or abs(k) >= n:
+                continue
+            src = [slice(None)] * 2
+            dst = [slice(None)] * 2
+            if k > 0:
+                src[axis], dst[axis] = slice(k, None), slice(None, n - k)
+            else:
+                src[axis], dst[axis] = slice(None, n + k), slice(-k, None)
+            grown[tuple(dst)] |= out[tuple(src)]
+        out = grown
+    return out
+
+
 def fix_regions(found: list[dict], W: int, H: int, cfg: dict) -> tuple[list[dict], list[dict]]:
     """The detections (each {"part", "box": [x0, y0, x1, y1], "score", "mask": a bool array or None}) as the regions
     the Detailer draws, largest first (the same area by the parts' order, then the box's place), each its crop and
@@ -1375,7 +1396,7 @@ def fix_regions(found: list[dict], W: int, H: int, cfg: dict) -> tuple[list[dict
     the ones left out with the reason: drop_size, or already larger than guide_size on both sides)."""
     import io
     import numpy as np
-    from PIL import Image, ImageFilter
+    from PIL import Image
     order = list(FIX_PARTS)
     keep, left = [], []
     for d in found:
@@ -1392,18 +1413,20 @@ def fix_regions(found: list[dict], W: int, H: int, cfg: dict) -> tuple[list[dict
     regions = []
     for d in keep:
         x0, y0, x1, y1 = d["box"]
-        r = FIX_DILATION
-        if d.get("mask") is not None:   # cv2.dilate by a square, as Impact Pack's dilate_masks: a max filter
-            m = Image.fromarray(np.where(d["mask"], 255, 0).astype(np.uint8))
-            edit = np.asarray(m.filter(ImageFilter.MaxFilter(2 * r + 1))) > 0
+        # grown as Impact Pack's dilation of FIX_DILATION grows it: a square of that side centred as OpenCV centres
+        # an even one, lo pixels up and left and hi down and right
+        hi = FIX_DILATION // 2
+        lo = FIX_DILATION - 1 - hi
+        if d.get("mask") is not None:
+            edit = grow_mask(d["mask"], lo, hi)
             rgba = np.zeros((H, W, 4), dtype=np.uint8)
             rgba[..., 3] = np.where(edit, 0, 255).astype(np.uint8)
             buf = io.BytesIO()
             Image.fromarray(rgba, "RGBA").save(buf, "PNG")
             mask = buf.getvalue()
         else:
-            mask = box_mask(W, H, (max(0, int(x0) - r), max(0, int(y0) - r), min(W, math.ceil(x1) + r),
-                                   min(H, math.ceil(y1) + r)))
+            mask = box_mask(W, H, (max(0, int(x0) - lo), max(0, int(y0) - lo), min(W, math.ceil(x1) + hi),
+                                   min(H, math.ceil(y1) + hi)))
         regions.append({"part": d["part"], "box": [round(v, 1) for v in d["box"]], "score": round(d["score"], 4),
                         "crop": fix_crop(d["box"], W, H, cfg), "mask": mask})
     return regions, left
@@ -3180,14 +3203,13 @@ TOOLS: list[dict[str, Any]] = [
          "seed": {"type": "integer", "description": "the same seed and prompt make the same image"}},
          "required": ["prompt"]}},
     {"name": "edit_image",
-     "description": "Change an image, or make a new one from it (its subject, its style): the conversation's last "
-                    "image (one the user attached or one made here) unless `image` names another (a "
-                    "/v1/images/files/... link from an earlier result). The new image is shown to the user. An image "
-                    "model without edits draws the prompt over the image instead (img2img): the prompt then says "
-                    "what the whole picture shows.",
+     "description": "Change an image, or make a new one from it (its subject, its style); the new image is shown "
+                    "to the user. A model without edits draws the prompt over the image (img2img): the prompt then "
+                    "says what the whole picture shows.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what to change, or what to make from the image"},
-         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
          "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
          "strength": {"type": "number",
                       "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
@@ -3198,33 +3220,34 @@ TOOLS: list[dict[str, Any]] = [
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "extend_image",
-     "description": "Grow an image past its edges (outpaint): the conversation's last image unless `image` names "
-                    "another; the new area drawn on, the image kept as it is. Pixels a side, or a shape.",
+     "description": "Grow an image past its edges (outpaint), the image kept as it is: pixels a side, or a shape.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what the whole image shows, its new area too"},
-         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
          "left": {"type": "integer"}, "top": {"type": "integer"}, "right": {"type": "integer"},
          "bottom": {"type": "integer"},
          "aspect": {"type": "string", "description": "the shape to grow to instead of pixels, e.g. 16:9"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "upscale_image",
-     "description": "Make an image larger and finer, drawn again from it (the same picture): the conversation's last "
-                    "image unless `image` names another.",
+     "description": "Make an image larger and finer, drawn again from it (the same picture).",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what the image shows"},
-         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
          "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "fix_image",
-     "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer): the "
-                    "conversation's last image unless `image` names another; the rest of the image kept.",
+     "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer); the rest of "
+                    "the image kept.",
      "parameters": {"type": "object", "properties": {
          "parts": {"type": "array", "items": {"type": "string", "enum": list(FIX_PARTS)},
                    "description": 'what to find and redraw, e.g. ["face"], ["face", "hands"], ["person"]'},
          "prompt": {"type": "string", "description": "what the parts should look like (default: well drawn)"},
-         "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
          "strength": {"type": "number", "description": "how much each part may change, above 0 to 1 (default 0.5)"},
          "seed": {"type": "integer"}},
          "required": ["parts"]}},
@@ -3483,6 +3506,10 @@ class ImageTools:
                                       f"; {', '.join(g.model for g in guided)} only")}}
                 t["parameters"] = params
             moss = [g.model for g in gens if g.family == "moss-image"]
+            if t["name"] == "edit_image" and not any(can_edit(g.cfg) for g in gens if g.family == "moss-image"):
+                params = dict(t["parameters"])   # refine is MOSS-Image's edits' alone
+                params["properties"] = {k: v for k, v in params["properties"].items() if k != "refine"}
+                t["parameters"] = params
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "layout": {
@@ -3560,7 +3587,8 @@ class ImageTools:
         """image_skill: its description common.md, which models take which prompt style, and the index (each skill's
         name and its "When:" line); it reads the skills named, several at once."""
         index = self._skill_index(tools)
-        lines = [f"- {name}: {SKILL_MODELS_WHEN if k == 'catalog' else skill_when(name)}"
+        lines = [f"- {name}: "
+                 + (SKILL_MODELS_WHEN if k == "catalog" else skill_when(f"tools/{name}" if k == "tool" else name))
                  for kind in SKILL_KINDS for name, (k, _) in index.items() if k == kind]
         # which models take which style, by their families (a model with a style of its own, MageTrail, by its name)
         kinds: dict[str, list[str]] = {}

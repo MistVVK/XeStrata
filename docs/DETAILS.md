@@ -2137,8 +2137,9 @@ The model files are not part of it; their licenses apply to them (below).
      is widened and shaped, the edges' copies and the putting back). The code is written without copying theirs.
    - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)'s FaceDetailer, by ltdrdata (GPL-3.0): the
      Detailer's steps and defaults (`serve/images.py`'s `fix_regions`, `fix_crop` and `fix_images`: the score of 0.5,
-     the box grown by 10 pixels, the crop of three times it, `drop_size` 10, the parts `guide_size` skips, denoise 0.5,
-     the noise mask's blur of 20 pixels, largest first, one at a time). The code is written without copying theirs.
+     the dilation by a square of 10 pixels, the crop of three times the box, `drop_size` 10, the parts `guide_size`
+     skips, denoise 0.5, the noise mask's blur of 20 pixels, one at a time; largest first is XeStrata's choice, where
+     FaceDetailer goes in the detections' order). The code is written without copying theirs.
    - The YOLOv8 detector (`src/image/yolo_detect.cpp`): its layers and shapes are built from the tensors' names and
      shapes in the weights' file and the model configuration (its layer list) the file carries; the letterbox, the
      distribution box head and the segmentation masks follow [MMYOLO](https://github.com/open-mmlab/mmyolo)'s (GPL-3.0)
