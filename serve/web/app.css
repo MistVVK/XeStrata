@@ -5,6 +5,8 @@
    shadows come only from the kit's tokens. */
 [hidden] { display: none !important; }
 html, body { height: 100%; }
+/* components.css writes the code blocks' size in pixels: with the text size setting too */
+.st-code pre { font-size: calc(13px * var(--st-text-scale)); }
 body { display: flex; flex-direction: column; overflow: hidden; }
 main { flex: 1; min-height: 0; display: flex; }
 .view { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
@@ -16,6 +18,28 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-header .st-tabs { margin-left: var(--st-s-4); }
 #unload-btn { min-width: 7.75rem; }   /* About: Load and Unloading… keep one width */
 .st-header--clip #pill-text { display: none; }
+.st-header--noname .st-header__brand { display: none; }
+/* the header's pill as a button: what runs, a mark and a number for each (pill-lanes), and their list under it */
+button.st-pill { font-family: inherit; cursor: pointer; flex: none; white-space: nowrap; }
+button.st-pill:hover { border-color: var(--st-ink-muted); }
+.st-pill.has-lanes #pill-text { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.pill-lanes { display: inline-flex; align-items: center; gap: 10px; }
+.pill-lanes:empty { display: none; }
+.pill-lane { display: inline-flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+.pill-lane .st-icon { width: 14px; height: 14px; }
+.pill-pop { position: absolute; top: calc(100% + 6px); right: var(--st-s-3); z-index: 40; width: min(340px, calc(100vw - 16px));
+            padding: 10px; border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface);
+            box-shadow: var(--st-sh-pop); display: flex; flex-direction: column; gap: 8px; font-size: var(--st-fs-sm); }
+.pill-pop[hidden] { display: none; }
+.pill-pop__row { display: flex; align-items: flex-start; gap: 8px; }
+.pill-pop__row .st-icon { flex: none; width: 16px; height: 16px; margin-top: 2px; color: var(--st-ink-muted); }
+.pill-pop__row b { font-weight: var(--st-fw-bold); }
+.pill-pop__chats { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 0; padding: 0; list-style: none; }
+.pill-pop__chats button { border: 0; padding: 2px 0; background: transparent; color: var(--st-accent-text); font: inherit; cursor: pointer;
+                          text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 280px; }
+.pill-pop__chats button:hover { text-decoration: underline; }
+.pill-pop__foot { border-top: 1px solid var(--st-line); padding-top: 8px; }
+@media (max-width: 480px) { .pill-lanes { gap: 6px; } }
 
 /* ---------------------------------------------------------------- chat */
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; }
@@ -81,12 +105,12 @@ main { flex: 1; min-height: 0; display: flex; }
 .attach-preview__foot:not(:empty) { padding: 8px 14px; border-top: 1px solid var(--st-line); }
 /* a picture marked for the next message (imageMarks): its chip says so, and in the chat its frame and a label over it */
 .marks-badge { flex: none; padding: 1px 6px; border-radius: var(--st-r-pill); background: var(--st-accent); color: var(--st-accent-ink);
-               font-size: 11px; line-height: 16px; }
+               font-size: calc(11px * var(--st-text-scale)); line-height: 1.45; }
 .msg-image-wrap, a[data-gen-image] { position: relative; display: inline-block; }
 .msg-image-wrap.is-marked img, a[data-gen-image].is-marked img { outline: 3px solid var(--st-accent); outline-offset: 2px; }
 .msg-image-wrap.is-marked::after, a[data-gen-image].is-marked::after {
   content: attr(data-marks); position: absolute; left: 6px; top: 6px; padding: 1px 6px; border-radius: var(--st-r-pill);
-  background: var(--st-accent); color: var(--st-accent-ink); font-size: 11px; line-height: 16px; pointer-events: none; }
+  background: var(--st-accent); color: var(--st-accent-ink); font-size: calc(11px * var(--st-text-scale)); line-height: 1.45; pointer-events: none; }
 .attach-preview__body pre { margin: 0; padding: 12px 14px; max-height: calc(90vh - 52px); overflow: auto; white-space: pre-wrap;
                             overflow-wrap: anywhere; font: var(--st-fs-xs)/1.5 var(--st-font-mono); }
 .tool-images { justify-content: flex-start; margin: var(--st-s-2) 0; }
@@ -111,7 +135,7 @@ main { flex: 1; min-height: 0; display: flex; }
 .tool-call[data-state="running"] .st-badge::before, .tool-call[data-state="writing"] .st-badge::before { animation: blink 1s steps(2) infinite; }
 .tool-call__label { font-size: var(--st-fs-xs); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin: var(--st-s-2) 0 var(--st-s-1); }
 .tool-call__pre { margin: 0; padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
-                  font: 400 12.5px/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);
+                  font: 400 calc(12.5px * var(--st-text-scale))/1.5 var(--st-font-mono); color: var(--st-ink-soft); background: var(--st-surface);
                   border: 1px solid var(--st-line-soft); border-radius: var(--st-r-sm); }
 
 .composer-wrap { flex: none; padding: 0 var(--st-s-6) var(--st-s-6); }
@@ -119,15 +143,22 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer textarea { max-height: 40vh; }
 .st-btn--send { width: 42px; padding: 0; }
 .composer-hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin-right: var(--st-s-2); font-variant-numeric: tabular-nums; }
-/* the image switch: says its state; on, a tinted pill (not the send button's fill) and the box outlined */
-.image-toggle { height: 36px; gap: 6px; padding: 0 12px; border-radius: var(--st-r-pill); background: var(--st-surface);
-  color: var(--st-ink); border: 1.5px solid var(--st-line); font-size: var(--st-fs-sm); white-space: nowrap; flex: none; }
-.image-toggle:hover { border-color: var(--st-ink-muted); }
-.image-toggle[aria-pressed="true"] { background: var(--st-accent-tint); color: var(--st-accent-text); border: 2px solid var(--st-accent);
-  font-weight: 700; }
-.image-toggle[aria-pressed="true"]:hover { border-color: var(--st-accent-hover); }
-/* Stop, the image switch and Send: one group that does not break, at the row's end; the row wraps before it runs over */
+/* Stop and Send: one group that does not break, at the row's end */
 .composer-send { display: inline-flex; align-items: center; gap: 6px; flex: none; margin-left: auto; }
+/* the + at the row's start and its menu (attach, Chat settings, the image switch) above it; the + tinted while the
+   image switch is on */
+.composer-more-box { position: relative; display: inline-flex; flex: none; }
+.composer-more.is-on { background: var(--st-accent-tint); color: var(--st-accent-text); box-shadow: inset 0 0 0 2px var(--st-accent); }
+.composer-menu { position: absolute; left: 0; bottom: calc(100% + 8px); z-index: 30; min-width: 220px; padding: 6px;
+                 display: flex; flex-direction: column; gap: 2px; background: var(--st-surface); border: 1px solid var(--st-line);
+                 border-radius: var(--st-r-md); box-shadow: var(--st-sh-pop); }
+.composer-menu[hidden] { display: none; }
+.composer-menu__item { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 38px; padding: 0 10px; border: 0;
+                       border-radius: var(--st-r-sm, 8px); background: transparent; color: var(--st-ink); font: inherit;
+                       font-size: var(--st-fs-sm); text-align: left; cursor: pointer; white-space: nowrap; }
+.composer-menu__item:hover, .composer-menu__item:focus-visible { background: var(--st-surface-2); }
+.composer-menu__item[hidden] { display: none; }
+.composer-menu__item[aria-checked="true"] { color: var(--st-accent-text); font-weight: var(--st-fw-bold); }
 /* one row at any width: every tool keeps its size, and the images choice alone gives way, scrolled sideways in its
    box (chat-images-box) when the row is short of room */
 .st-composer__bar { flex-wrap: nowrap; min-width: 0; }
@@ -136,10 +167,24 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-composer__bar > .chat-images-box { flex: 0 1 auto; min-width: 56px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
                                        border-radius: var(--st-r-md); }
 .chat-images-box[hidden] { display: none; }
+/* the open chat's context, a ring next to Chat settings: its share of the segment (or of the context) used */
+/* (its share in the middle, always: a phone has no hover for the title; a tap says the tokens) */
+.ctx-ring { position: relative; width: calc(34px * var(--st-text-scale)); height: calc(34px * var(--st-text-scale)); flex: none;
+            display: inline-flex; padding: 0; border: 0; background: transparent; cursor: pointer; }
+.ctx-ring[hidden] { display: none; }
+.ctx-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.ctx-ring circle { fill: none; stroke-width: 3.5; }
+.ctx-ring__pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 font: 700 calc(9px * var(--st-text-scale))/1 var(--st-font); color: var(--st-ink-soft); font-variant-numeric: tabular-nums;
+                 letter-spacing: -0.02em; }
+.ctx-ring__track { stroke: var(--st-line); }
+.ctx-ring__fill { stroke: var(--st-accent); stroke-linecap: round; transition: stroke-dasharray 400ms var(--st-ease); }
+.ctx-ring[data-level="warn"] .ctx-ring__fill { stroke: var(--st-warn); }
+.ctx-ring[data-level="full"] .ctx-ring__fill { stroke: var(--st-danger); }
+@media (max-width: 360px) { .ctx-ring { width: calc(30px * var(--st-text-scale)); height: calc(30px * var(--st-text-scale)); } }
 .chat-images-box .chat-images { max-width: none; width: auto; }
 @media (max-width: 1100px) {
-  .composer-hint, .chat-settings-label { display: none; }
-  .chat-settings-short { display: inline; }
+  .composer-hint { display: none; }
 }
 .st-composer.image-always { border-color: var(--st-accent); box-shadow: 0 0 0 1px var(--st-accent), var(--st-sh-bar); }
 .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
@@ -218,7 +263,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .cfg-form { display: grid; grid-template-columns: minmax(min(180px, 100%), max-content) minmax(0, 1fr); gap: var(--st-s-3) var(--st-s-4);
             align-items: center; }
 .cfg-form label { overflow-wrap: anywhere; font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); }
-.cfg-form label code { font: 400 12px var(--st-font-mono); color: var(--st-ink-muted); display: block; }
+.cfg-form label code { font: 400 var(--st-fs-xs) var(--st-font-mono); color: var(--st-ink-muted); display: block; }
 .cfg-form .st-input { height: 38px; width: 100%; max-width: 360px; min-width: 0; }
 .cfg-actions { display: flex; align-items: center; gap: var(--st-s-3); }
 .tab-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--st-accent); }
@@ -238,7 +283,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .facts dt { color: var(--st-ink-muted); }
 .facts dd { margin: 0; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; display: flex; align-items: center; gap: 6px;
             overflow-wrap: anywhere; }
-.facts dd code { font: 400 13px var(--st-font-mono); }
+.facts dd code { font: 400 var(--st-fs-sm) var(--st-font-mono); }
 .facts .st-btn--icon { width: 28px; height: 28px; }
 .facts .st-btn--icon .st-icon { width: 16px; height: 16px; }
 .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
@@ -284,6 +329,16 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
   .st-header__brand { display: none; }
   .st-header .st-tabs { min-width: 4.75rem; }
 }
+/* phones: every tab in the strip, not scrolled - the open one by its icon and name, the others by their icons (their
+   names are their aria-label and title) */
+@media (max-width: 640px) {
+  .st-header .st-tabs { flex: 0 1 auto; min-width: 0; }
+  .st-header .st-tab .st-icon { display: inline-block; }
+  .st-header .st-tab[aria-selected="false"] > span:not(.tab-dot) { display: none; }   /* not the Monitor's GPU tabs */
+  .st-header .st-tab[aria-selected="false"] { padding: 0 9px; }
+  .st-header .st-tab { gap: 6px; }
+  .tab-dot { margin-left: -4px; }
+}
 @media (max-width: 640px) {
   .chat { padding: var(--st-s-5) var(--st-s-4); }
   .composer-wrap { padding: 0 var(--st-s-3) var(--st-s-3); }
@@ -305,9 +360,9 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
   .monitor .metric-card { padding: var(--st-s-3); }
   .metric-card .st-metric { gap: 6px; }
   .metric-card .st-metric__label { font-size: var(--st-fs-xs); }
-  .metric-card .st-metric__value, .speed-values .st-metric__value { font-size: 22px; }
+  .metric-card .st-metric__value, .speed-values .st-metric__value { font-size: calc(22px * var(--st-text-scale)); }
   .metric-card .st-metric__value small { font-size: var(--st-fs-xs); }
-  .metric-card .st-metric__sub { font-size: 11px; overflow-wrap: anywhere; }
+  .metric-card .st-metric__sub { font-size: calc(11px * var(--st-text-scale)); overflow-wrap: anywhere; }
   .metric-card .st-metric__spark { height: 20px; }
   .speed-values > div { gap: 4px; }
   .badges .st-badge:not(.on) { display: none; }      /* only the state the model is in */
@@ -336,8 +391,8 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .img-form{display:flex;flex-direction:column;gap:12px}
 .img-prompt{height:auto;padding:10px 14px;resize:vertical}
 .img-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
-.chat-images{width:auto;max-width:220px;height:36px;padding:0 10px;font-size:13px}
-.msg-sources{margin-top:var(--st-s-2);font-size:13px}
+.chat-images{width:auto;max-width:220px;height:36px;padding:0 10px;font-size:var(--st-fs-sm)}
+.msg-sources{margin-top:var(--st-s-2);font-size:var(--st-fs-sm)}
 .msg-sources ol{margin:4px 0 0;padding-left:1.4em}
 .msg-sources a{overflow-wrap:anywhere}
 .img-row input[type=number]{width:120px}
@@ -466,12 +521,14 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .pending__text { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; color: var(--st-ink-soft); }
 .pending__actions { display: flex; gap: var(--st-s-2); }
 
-/* Chat settings: the button says what it is, and the drawer groups the chat switches */
-.chat-settings-button { height: 36px; padding: 0 10px; gap: 6px; white-space: nowrap; font-size: var(--st-fs-sm); }
-.chat-settings-short { display: none; }
+/* Chat settings: the drawer groups the chat switches */
 .drawer-group { display: flex; flex-direction: column; gap: var(--st-s-4); padding-top: var(--st-s-4); border-top: 1px solid var(--st-line); }
 .drawer-group__title { margin: 0; font-size: var(--st-fs-base); font-weight: var(--st-fw-bold); color: var(--st-ink); }
 .seg--3 { grid-template-columns: repeat(3, 1fr); }
+.seg--2 { grid-template-columns: repeat(2, 1fr); }
+/* the messages waiting in the open chat's queue, one row each (renderPending) */
+.pending-list { display: flex; flex-direction: column; gap: 4px; max-width: min(100%, 1100px); margin: 0 auto var(--st-s-2); }
+.pending-list .pending { margin: 0; }
 .seg--3 button { padding: 0 4px; }
 #lang { width: 100%; }
 #drawer-close .st-icon { transform: rotate(-90deg); }
@@ -483,17 +540,12 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 #req-wrap .st-table td.req-image--error,
 #req-wrap .st-table td.req-image--error .muted { color: var(--st-danger-text); }
 @media (max-width: 640px) {
-  .chat-settings-label, .composer-hint { display: none; }
-  .chat-settings-short { display: inline; }
-  /* the message box's tools in as few rows as they fit: the image switch by its icon, the images choice narrower */
-  .image-toggle { width: 40px; padding: 0; justify-content: center; }
-  .image-toggle__label { display: none; }
+  .composer-hint { display: none; }
+  /* the message box's tools in one row: the images choice narrower */
   .st-composer__bar { gap: 4px; }
   .st-composer__bar .chat-images { padding: 0 6px; }
 }
 @media (max-width: 480px) {
-  .chat-settings-short { display: none; }               /* the settings button by its icon too */
-  .chat-settings-button, .image-toggle { width: 36px; padding: 0; justify-content: center; }
   .st-composer__bar .st-btn--icon { width: 34px; }
   .st-composer { padding: 8px 6px; }
   .st-composer__bar .chat-images { padding: 0 4px; }
@@ -504,7 +556,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 }
 @media (max-width: 360px) {
   .st-composer__bar { gap: 2px; }
-  .st-composer__bar .st-btn--icon, .chat-settings-button, .image-toggle, #stop-btn { width: 32px; }
+  .st-composer__bar .st-btn--icon, #stop-btn { width: 32px; }
   .st-composer__bar > .chat-images-box { min-width: 30px; }
   .st-btn--send { width: 38px; }
 }
@@ -518,6 +570,8 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 }
 
 .st-toast .st-btn { white-space: nowrap; }
+.st-toast .st-toast__close { flex: none; width: 28px; height: 28px; margin: -4px -6px -4px auto; color: var(--st-ink-muted); }
+.st-toast .st-btn--secondary + .st-toast__close { margin-left: 0; }   /* after an action button (Undo): beside it */
 
 /* Raster MCP results remain visible outside the collapsed tool details. */
 .tool-image { margin: 16px 0; max-width: 100%; }

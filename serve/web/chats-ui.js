@@ -14,9 +14,10 @@
 // health, headers.
 // app.js calls initChats() once, from start().
 /* global tr, $, esc, icon, toast, store, settings, messages:writable, attachments:writable, busy:writable, replies, pending, setBusy,
+          queueOf, syncPending, settlePending,
           renderChat, renderAttachments, autosize, generateReply, releasePending, StrataHistory, StrataChatStore, StrataSegments, health,
           headers */
-/* exported initChats, setChatList, syncActions, renderParent, saveChatOf, resumeReplies */
+/* exported initChats, setChatList, syncActions, renderParent, saveChatOf, resumeReplies, chatName */
 "use strict";
 
 const H = StrataHistory;
@@ -67,6 +68,12 @@ function saveChatOf(home) {
   chatStore.put(H.cleanChat(home.chat));
   sendDebugChat(H.cleanChat(home.chat));
   renderSidebar();
+}
+// a chat's name as the list shows it (the header pill's list of the answers being written); the single chat is "this chat"
+function chatName(id) {
+  if (id === "single") return tr("pill.thisChat", "This chat");
+  const c = chats.find((x) => x.id === id);
+  return c ? H.chatTitle(c, untitled()) : untitled();
 }
 // The answers a page closed while it read them (their strata_reply id kept in the message): read again from the server,
 // which keeps each one until the page has read it, up to 12 hours.  Once a load, after /health.
@@ -167,22 +174,23 @@ function showChat(c) {
   clearUndo();
   chat = c; chatId = c.id; messages = c.messages;
   busy = replies.get(c.id) || null;
+  syncPending();                          // its own waiting messages (queueOf), kept while another chat was open
   store.set("chatId", chatId);
   chatStore.put(H.cleanChat(chat));       // renderChat renders the list, so the write here does not render it again
   renderChat();
   setBusy(!!busy);
+  const q = queueOf();
+  if (!busy && q.go) { q.go = false; settlePending(false, true); }   // its answer ended while it was not open
 }
 // another chat, while an answer may be written in this one: that answer goes on, in its own chat
 function openChat(id) {
   const c = chats.find((x) => x.id === id);
   if (!c || c === chat) return;
-  releasePending();
   closePanel();
   showChat(c);
 }
 function startChat() {
   if (!messages.length && !chat.parent) { $("input").focus(); return; }          // already a fresh chat
-  releasePending();
   closePanel();
   const prev = chatId, c = H.newChat();
   chats.push(c);

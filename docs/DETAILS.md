@@ -1450,10 +1450,11 @@ Every switch below is **off by default**; with all of them off the page behaves 
   **Branch from here** (needs the saved chats list) starts a new chat from the messages up to that point and leaves this chat as it is; the branch keeps a name such as "Branch of ..." and links back to the original.
   An **Undo** bar above the box brings back what was hidden, until your next question, another chat or a reload.
   A picture or file that was only kept by name is not sent again: the page asks you to attach it again.
-- **When you send while it is answering.** *Wait* (the default): Send is off until the answer is done.
-  *Send after*: your message waits and goes when the answer is done.
+- **When you send while it is answering.** Send works while an answer is written: your message goes into the chat's queue.
+  *Send after* (the default): when the answer is done, the queue goes one message after another.
   *Interrupt*: the answer stops where it is, what was written stays and is marked interrupted, and your message goes at once; a tool that is running finishes first.
-  Only one message waits, and **Take back** returns it to the box. Stop keeps a waiting message for you to send yourself.
+  Each waiting message has **Take back** (back to the box: cancelled) and **Send now** (the answer stops and it goes first). Stop keeps the waiting messages for you to send yourself.
+  The queue is each chat's own: it stays with its chat while another is open, and goes on when that chat is opened again after its answer ended.
 - **Go on past the context** (on by default). One chat goes on past the context with no summary, as [Mainplane](#mainplane)'s sessions do.
   Within a segment the earlier messages go back as they were sent, so the prompt only grows and each turn reads only what it added.
   Whether an answer's thinking goes back with it is decided once, when the answer ends: it does while more than half the segment is left, and where dropping it would read again more (the answer and its tools' results) than the thinking holds.
@@ -1481,6 +1482,8 @@ The Chat view, its settings, the header and the Images view are translated; Moni
 A language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key.
 `python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`).
 `/?lang=de` shows a language for one visit.
+
+**Text size.** About > Settings' "Text size" makes the page's text Small, Standard, Large or Larger (0.9, 1, 1.15 and 1.3 times the standard). The choice is kept in this browser. The browser's own zoom makes everything larger, the layout too.
 
 ### API request monitor
 

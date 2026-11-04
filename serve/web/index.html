@@ -19,6 +19,9 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     const t = localStorage.getItem("xestrata.theme") ||
       (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     document.documentElement.dataset.theme = t;
+    // and the text size (About > Settings)
+    const z = localStorage.getItem("xestrata.textScale");
+    if (z) document.documentElement.style.setProperty("--st-text-scale", z);
   } catch (e) {}
 </script>
 </head>
@@ -32,18 +35,21 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <select id="model-select" aria-label="Model on the GPU" data-i18n-label="switch.label"></select>
   </label>
   <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
-    <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
+    <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat" aria-label="Chat" title="Chat" data-i18n-label="tab.chat" data-i18n-title="tab.chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
+    <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" aria-label="Images" title="Images" data-i18n-label="tab.images" data-i18n-title="tab.images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
+    <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor" aria-label="Monitor" title="Monitor" data-i18n-label="tab.monitor" data-i18n-title="tab.monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
-    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
+    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about" aria-label="About" title="About" data-i18n-label="tab.about" data-i18n-title="tab.about">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span><span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
   <span class="st-header__spacer"></span>
-  <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
+  <!-- what runs: a mark and a number for each (the text model's turn, the requests waiting, an image job); a tap lists
+       them (renderPill) -->
+  <button type="button" class="st-pill" id="pill" data-state="idle" aria-haspopup="true" aria-expanded="false" aria-controls="pill-pop">
+    <span class="st-pill__dot"></span><span id="pill-text" role="status" aria-live="polite" data-i18n="pill.connecting">Connecting&hellip;</span><span class="pill-lanes" id="pill-lanes" aria-hidden="true"></span></button>
+  <div class="pill-pop" id="pill-pop" role="dialog" aria-label="What is running" data-i18n-label="pill.open" hidden></div>
 </header>
 
 <main>
@@ -78,16 +84,30 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <div class="attachments" id="attachments" hidden></div>
           <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
           <div class="st-composer__bar">
-            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attachLabel">
-              <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
             <input type="file" id="file" multiple hidden>
+            <!-- the + at the row's start, its menu above it: attach, Chat settings, the image switch -->
+            <span class="composer-more-box">
+            <button type="button" class="st-btn st-btn--icon composer-more" id="more-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="more-menu"
+                    title="More" aria-label="More" data-i18n-title="composer.more" data-i18n-label="composer.more">
+              <svg class="st-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5V19M5 12H19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+            <span class="composer-menu" id="more-menu" role="menu" hidden>
+              <button type="button" role="menuitem" class="composer-menu__item" id="attach-btn" title="Attach a text file (or drop it here)">
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-attach"/></svg><span data-i18n="composer.attachLabel">Attach a file</span></button>
+              <button type="button" role="menuitem" class="composer-menu__item" id="sampling-btn">
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg><span data-i18n="drawer.title">Chat settings</span></button>
+              <button type="button" role="menuitemcheckbox" aria-checked="false" class="composer-menu__item" id="image-btn"
+                      title="Always make an image: while on, every answer makes or edits an image" data-i18n-title="composer.image" hidden>
+                <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span class="image-toggle__label">Always image: off</span></button>
+            </span>
+            </span>
             <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">
               <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
             <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat" data-i18n-title="composer.save" data-i18n-label="composer.saveLabel">
               <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-            <button type="button" class="st-btn st-btn--secondary chat-settings-button" id="sampling-btn" title="Chat settings" aria-label="Chat settings" data-i18n-title="drawer.title" data-i18n-label="drawer.title">
-              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>
-              <span class="chat-settings-label" data-i18n="drawer.title">Chat settings</span><span class="chat-settings-short" aria-hidden="true" data-i18n="drawer.short">Settings</span></button>
+            <!-- how much of its context the open chat uses (paintCtxRing) -->
+            <button type="button" class="ctx-ring" id="ctx-ring" hidden><svg viewBox="0 0 36 36" aria-hidden="true">
+              <circle class="ctx-ring__track" cx="18" cy="18" r="15"/><circle class="ctx-ring__fill" id="ctx-ring-fill" cx="18" cy="18" r="15"/></svg><span
+              class="ctx-ring__pct" id="ctx-ring-pct" aria-hidden="true"></span></button>
             <!-- the images choice in a box of its own that scrolls sideways: it alone gives way, so the row stays one line -->
             <span class="chat-images-box" id="chat-images-box" hidden>
             <select class="st-input chat-images" id="chat-images" title="Images in the chat: the model makes one when the conversation asks for it" aria-label="Images in the chat"
@@ -95,12 +115,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             </span>
             <span class="spacer"></span>
             <span class="composer-hint" id="composer-hint"></span>
-            <!-- Stop, the image switch and Send stay together, the switch always beside Send -->
+            <!-- Stop and Send stay together at the row's end -->
             <span class="composer-send">
             <button type="button" class="st-btn st-btn--secondary" id="stop-btn" aria-label="Stop" data-i18n-label="composer.stop" hidden>
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg><span data-i18n="composer.stop">Stop</span></button>
-            <button type="button" class="st-btn image-toggle" id="image-btn" aria-pressed="false" title="Always make an image: while on, every answer makes or edits an image" data-i18n-title="composer.image" hidden>
-              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span class="image-toggle__label">Always image: off</span></button>
             <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send" data-i18n-label="composer.send">
               <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
             </span>
@@ -359,6 +377,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <select class="st-input" id="lang"></select>
           <span class="muted small" data-i18n="settings.languageNote">Messages from the server and the engine (errors, the stages of an image job) stay in English.</span>
         </div>
+        <div class="st-field">
+          <label class="st-label" for="text-size"><span data-i18n="settings.textSize">Text size</span></label>
+          <select class="st-input" id="text-size"></select>
+          <span class="muted small" data-i18n="settings.textSizeNote">Kept in this browser. The browser's own zoom makes everything larger, the layout too.</span>
+        </div>
         <div class="toggle-row"><span data-i18n="about.dark">Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme" data-i18n-label="about.dark"></button></div>
         <p class="muted small"><span data-i18n="about.kept">Chats, settings and the key are kept in this browser only.</span>
@@ -464,8 +487,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       </div>
       <div class="st-field">
         <label class="st-label" for="s-busy"><span data-i18n="drawer.busy">When you send while it is answering</span></label>
-        <div class="seg seg--3" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
-          <button type="button" role="radio" data-v="wait" data-i18n="drawer.busyWait">Wait</button><button type="button" role="radio" data-v="queue" data-i18n="drawer.busyQueue">Send after</button>
+        <div class="seg seg--2" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
+          <button type="button" role="radio" data-v="queue" data-i18n="drawer.busyQueue">Send after</button>
           <button type="button" role="radio" data-v="interject" data-i18n="drawer.busyInterject">Interrupt</button>
         </div>
         <span class="muted small" id="o-busy"></span>

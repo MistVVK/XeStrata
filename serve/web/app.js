@@ -5,7 +5,7 @@
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 /* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
           clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen, chatId,
-          chat, saveChatOf, resumeReplies, StrataSegments */
+          chat, saveChatOf, resumeReplies, chatName, openChat, StrataSegments */
 // serve/web/i18n.js, math.js, preview.js, segments.js and chats-ui.js, loaded before this file
 "use strict";
 
@@ -42,8 +42,17 @@ function toast(kind, title, text = "", ms = 3500, action = null) {
     b.onclick = () => { action.run(); el.remove(); };
     el.appendChild(b);
   }
+  // closed by hand too (×), before its time is up
+  const x = document.createElement("button");
+  x.type = "button";
+  x.className = "st-btn st-btn--icon st-toast__close";
+  x.setAttribute("aria-label", tr("close", "Close"));
+  x.title = tr("close", "Close");
+  x.innerHTML = `<svg class="st-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+  const timer = setTimeout(() => el.remove(), ms);
+  x.onclick = () => { clearTimeout(timer); el.remove(); };
+  el.appendChild(x);
   $("toasts").appendChild(el);
-  setTimeout(() => el.remove(), ms);
 }
 
 async function copyText(text, btn) {
@@ -83,6 +92,7 @@ let noteShown = false;
 function showTab(name) {
   tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
+  fitHeader();                                       // on a phone the open tab shows its name: the row's room changes
   for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") {
     $("img-prompt").focus();
@@ -136,6 +146,7 @@ async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
     renderEmptyChat();
+    paintCtxRing();                      // the model's context is known now
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
@@ -303,20 +314,88 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
-function setPill(state, text, force = false) {
+function setPill(state, text, force = false, lanes = []) {
   if (switching && !force) return;   // while the models swap, the menu owns the pill
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
+  $("pill").title = text;
+  // the marks: one for each thing that runs (pillLanes); the sentence stays for a screen reader and the title
+  const marks = lanes.map(([name, value]) => `<span class="pill-lane">${icon(name, "st-icon")}${esc(value)}</span>`).join("");
+  $("pill").classList.toggle("has-lanes", lanes.length > 0);
+  if ($("pill-lanes").innerHTML !== marks) $("pill-lanes").innerHTML = marks;
   // a poll re-sets the sentence every second; refit only when its text changed
-  if (text !== lastPillText) { lastPillText = text; fitHeader(); }
+  if (text + marks !== lastPillText) { lastPillText = text + marks; fitHeader(); }
 }
 let lastPillText = null;
+// What runs at once, for the pill: the text model's turn (its tok/s, or how much of the prompt is read), the requests
+// waiting for it, an image job (its step). Each is [icon, value, its sentence]; none: the pill says Idle or Unloaded.
+function pillLanes(live, localLoad) {
+  const lanes = [];
+  if (modelOp === "load" || localLoad) lanes.push(["chat", "…", tr("model.loading", "Loading…")]);
+  else if (modelOp === "unload") lanes.push(["chat", "…", tr("model.unloading", "Unloading…")]);
+  else if (live.state === "reading") {
+    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
+    lanes.push(["chat", pct != null ? `${pct}%` : "…", pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt")]);
+  } else if (live.state === "generating") {
+    lanes.push(["chat", `${fmt(live.tok_s, 1)} tok/s`, tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)})]);
+  }
+  if (live.queued > 0) lanes.push(["clock", String(live.queued), tr("pill.queued", "{n} queued", {n: live.queued})]);
+  if (live.image) {
+    const img = live.image;
+    lanes.push(["image", img.stage === "sampling" ? `${img.step}/${img.steps}` : "…", tr("img.pill", "Image · {step}", {step: imageStep(img)})]);
+  } else if (imageBusy) {
+    lanes.push(["image", "…", tr("pill.image", "Generating image…")]);
+  }
+  return lanes;
+}
+// the pill's list (a tap on it): each thing that runs on a row, the answers this page writes (a click opens the chat),
+// and the Monitor for the rest
+let pillLive = null;
+function renderPillPop() {
+  const pop = $("pill-pop");
+  if (pop.hidden || !pillLive) return;
+  const {lanes, idle} = pillLive;
+  const row = (name, html) => `<div class="pill-pop__row">${icon(name, "st-icon")}<span>${html}</span></div>`;
+  let html = lanes.length ? lanes.map(([name, , sentence]) => row(name, esc(sentence) + (name === "image" ? ` <span class="muted">· ${esc(imageWhere())}</span>` : ""))).join("")
+                          : row("chat", esc(idle));
+  if (replies.size) {
+    const items = [...replies.keys()].map((id) => `<li><button type="button" data-pill-chat="${esc(id)}">${esc(chatName(id))}</button></li>`).join("");
+    html += row("edit", `<b>${esc(tr("pill.thisPage", "Answers this page is writing"))}</b><ul class="pill-pop__chats">${items}</ul>`);
+  }
+  html += `<div class="pill-pop__foot"><button type="button" class="st-btn st-btn--secondary" data-pill-monitor>${esc(tr("pill.monitor", "Details in Monitor"))}</button></div>`;
+  if (pop.innerHTML !== html) pop.innerHTML = html;
+}
+// where image jobs run (imageGpu), in words
+function imageWhere() {
+  const g = imageGpu();
+  return g === "separate" ? tr("pill.imageSeparate", "on a GPU of its own, beside the chat")
+       : g === "helper" ? tr("pill.imageHelper", "on the text model's second GPU, beside the chat")
+       : tr("pill.imageShared", "on the text model's GPU, in its turn");
+}
+function openPill(open) {
+  $("pill-pop").hidden = !open;
+  $("pill").setAttribute("aria-expanded", String(open));
+  if (open) renderPillPop();
+}
+$("pill").onclick = (e) => { e.stopPropagation(); openPill($("pill-pop").hidden); };
+$("pill-pop").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const c = e.target.closest("[data-pill-chat]");
+  if (c) { openPill(false); showTab("chat"); if (c.dataset.pillChat !== "single") openChat(c.dataset.pillChat); return; }
+  if (e.target.closest("[data-pill-monitor]")) { openPill(false); showTab("monitor"); }
+});
+document.addEventListener("click", () => { if (!$("pill-pop").hidden) openPill(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("pill-pop").hidden) { openPill(false); $("pill").focus(); } });
 // The pill's sentence is the first thing the header row can spare when it runs out of room.
+// the header row as far as it fits: the pill's text goes first, then the name (XeStrata), before the tabs scroll
 function fitHeader() {
   const header = document.querySelector(".st-header");
   if (!header) return;
-  header.classList.remove("st-header--clip");
-  if (header.scrollWidth > header.clientWidth) header.classList.add("st-header--clip");
+  const tabs = header.querySelector(".st-tabs");
+  const over = () => header.scrollWidth > header.clientWidth || (tabs && tabs.scrollWidth > tabs.clientWidth + 1);
+  header.classList.remove("st-header--clip", "st-header--noname");
+  if (over()) header.classList.add("st-header--clip");
+  if (over()) header.classList.add("st-header--noname");
 }
 window.addEventListener("resize", fitHeader);
 
@@ -454,32 +533,16 @@ function render(m) {
   // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
   // model (it has its own engine), so only a chat turn here counts as a load.
   const localLoad = live.state === "unloaded" && replies.size > 0;
-  // an image job on another card beside a chat turn: the pill says both (the turn's, then the image's)
-  const chatOn = live.state === "reading" || live.state === "generating";
-  const beside = imageBeside() && chatOn;
-  const withImage = (text) => (beside && live.image ? `${text} | ${tr("img.pill", "Image · {step}", {step: imageStep(live.image)})}` : text);
-  if (modelOp === "load") {
-    setPill("idle", tr("model.loading", "Loading…"));
-  } else if (modelOp === "unload") {
-    setPill("idle", tr("model.unloading", "Unloading…"));
-  } else if (live.image && !beside) {
-    setPill("generating", tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
-  } else if (localLoad) {
-    setPill("idle", tr("model.loading", "Loading…"));
-  } else if (imageLive(live) && !beside) {
-    setPill("reading", tr("pill.image", "Generating image…"));
-  } else if (live.state === "reading") {
-    const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", withImage(pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt")));
-  } else if (live.state === "generating") {
-    setPill("generating", withImage(tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)})));
-  } else if (live.state === "unloaded") {
-    setPill("idle", tr("pill.unloaded", "Unloaded"));
-  } else {
-    setPill("idle", tr("pill.idle", "Idle"));
-  }
+  // everything that runs at once, side by side: the text model's turn, the requests waiting, an image job (pillLanes);
+  // the dot's colour is the busiest of them
+  const lanes = pillLanes(live, localLoad);
+  const idle = live.state === "unloaded" ? tr("pill.unloaded", "Unloaded") : tr("pill.idle", "Idle");
+  const state = lanes.some((l) => l[0] === "image") || live.state === "generating" ? "generating"
+              : live.state === "reading" ? "reading" : live.queued > 0 ? "queued" : "idle";
+  setPill(state, lanes.length ? lanes.map((l) => l[2]).join(" · ") : idle, false, lanes.map((l) => [l[0], l[1]]));
+  pillLive = {lanes, idle};
+  renderPillPop();
   modelButton(live);
-  if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
   const fail = m.engine_failure;
   if (fail && fail.at !== failureSeen) {
@@ -879,6 +942,46 @@ function imageModelRows(models) {
       m.text_quant ? tr("about.textEncoder", "text encoder {quant}", {quant: m.text_quant}) : null,
       m.steps ? tr("about.steps", "{n} steps", {n: m.steps}) : null, m.edits ? tr("about.edits", "edits images") : null].filter(Boolean).join(", ")}`]);
 }
+// How the GPUs share the work (/metrics hardware.gpus: each card's roles, layer split stage and replica, from
+// serve/server.py's gpu_roles; engine.image_gpu: where the image jobs run): a sentence, then a row for each card
+function gpuPlanRows(eng, hw, st) {
+  const title = tr("about.gpuPlan", "GPUs");
+  const images = Array.isArray(eng.image_models) && eng.image_models.length > 0, where = eng.image_gpu || "";
+  let cards = Array.isArray(hw.gpus) ? hw.gpus : [];
+  if (!cards.length) {                       // one card (or an older server): the text model's, the images on it too
+    if (!st.gpu_name) return [];
+    cards = [{index: 0, name: st.gpu_name, mem_total: hw.gpu_mem_total, roles: ["text", ...(images ? ["image"] : [])]}];
+  }
+  const has = (r) => cards.filter((c) => (c.roles || []).includes(r));
+  const text = has("text"), stages = new Set(text.map((c) => c.stage).filter((x) => x != null)).size;
+  const replicas = new Set(text.map((c) => c.replica).filter((x) => x != null)).size;
+  const parts = [];
+  if (replicas > 1) parts.push(tr("about.gpuPlanReplicas", "the text model runs as {n} copies, the requests shared between them", {n: replicas}));
+  else if (has("prefill").length && has("decode").length) parts.push(tr("about.gpuPlanSplitServe", "prefill and decode on different GPUs"));
+  else if (stages > 1) parts.push(tr("about.gpuPlanStages", "the text model's layers shared by {n} GPUs", {n: stages}));
+  if (images && where === "separate" && !parts.length && text.length === 1) {
+    parts.push(tr("about.gpuPlanApart", "text and images on GPUs of their own, side by side"));
+  } else if (images) {
+    parts.push(where === "separate" ? tr("about.gpuPlanSeparate", "the images on a GPU of their own, beside the text")
+             : where === "helper" ? tr("about.gpuPlanHelper", "the images on the text model's helper GPU, lent to them for each image")
+             : cards.length === 1 ? tr("about.gpuPlanOneBoth", "text and images on one GPU, in turn")
+             : tr("about.gpuPlanShared", "the images on the text model's GPU, in turn"));
+  } else if (cards.length === 1) {
+    parts.push(tr("about.gpuPlanOneText", "the text model on one GPU"));
+  }
+  if (!parts.length) parts.push(tr("about.gpuPlanText", "the text model on {n} GPUs", {n: text.length}));
+  const sentence = parts.join(tr("about.gpuPlanAnd", "; "));
+  const roleName = (c, r) => {
+    const name = ROLES[r] ? ROLES[r]() : r;
+    if (r !== "text") return r === "helper" && where === "helper" ? tr("about.gpuPlanLent", "{role} (lent to the images)", {role: name}) : name;
+    const more = [c.replica != null && replicas > 1 ? tr("gpu.replica", "Replica {n}", {n: c.replica + 1}) : null,
+                  c.stage != null && stages > 1 ? tr("gpu.stage", "Stage {n}", {n: c.stage + 1}) : null].filter(Boolean);
+    return more.length ? tr("about.gpuPlanRole", "{role} ({more})", {role: name, more: more.join(tr("about.gpuPlanComma", ", "))}) : name;
+  };
+  return [[title, sentence], ...cards.map((c) => ["", `GPU ${c.index ?? 0} · ${String(c.name || "").replace(/ at [0-9a-f:.]+$/i, "")}` +
+    `${c.mem_total ? `, ${gb(c.mem_total, 0)} GB` : ""}: ${(c.roles || []).filter((r) => r !== "text" || !(c.roles || []).some((x) => x === "prefill" || x === "decode"))
+      .map((r) => roleName(c, r)).join(tr("about.gpuPlanComma", ", "))}`])];
+}
 function renderAbout(eng, hw, st) {
   const kv = {int8: tr("about.kv8", "8-bit"), q4_0: tr("about.kv4", "4-bit (Hadamard-rotated)"), fp16: tr("about.kv16", "16-bit")}[eng.kv] || eng.kv;
   const drafts = Math.max(0, (eng.mtp_max || eng.spec) - 1);
@@ -892,6 +995,7 @@ function renderAbout(eng, hw, st) {
     [tr("mon.expertsVram", "Experts in VRAM"), eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     [tr("about.spec", "Speculation"), !eng.spec ? null : eng.lookup ? tr("about.specLookup", "MTP drafts up to {n} tokens, prompt lookup on", {n: drafts})
                                                                      : tr("about.specMtp", "MTP drafts up to {n} tokens", {n: drafts})],
+    ...gpuPlanRows(eng, hw, st),
     [tr("about.vision", "Reading images"), visionText(eng)],
     ...imageModelRows(eng.image_models),
     [tr("about.projection", "Experimental speed projection"), projectionText(eng.cvec)],
@@ -1215,7 +1319,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true, math: true, chatList: true, chatEdit: true, whileBusy: "wait", segments: true, segmentLimit: "",
+                  mcp: true, math: true, chatList: true, chatEdit: true, whileBusy: "queue", segments: true, segmentLimit: "",
                   script: "", scriptContext: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 // the script guard (serve/script_guard.py): "" follows the page's language until the user picks one - its own mode for
@@ -1230,6 +1334,7 @@ function samplingUntouched(s) {
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+if (settings.whileBusy === "wait") settings.whileBusy = "queue";   // "wait" (Send off while it answered) is no more
 // before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
 if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
 // the math, the saved-chats list and the edit controls were off by default before defaults_v 2, and saved so: on once
@@ -1241,7 +1346,17 @@ let busy = null;                      // the open chat's answer being written: {
 // every chat's answer being written, by chat (generateReply's home.id): another chat can be opened or started meanwhile
 const replies = new Map();
 let imageAlways = store.get("chat_image_always", false) === true;   // the image switch (paintImageSwitch)
-let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
+// the messages sent while an answer is written, by chat (generateReply's home.id): [{text, images, files, mode}], the first
+// sent first; `pending` is the open chat's, null when it has none (the history's buttons wait for it)
+const queues = new Map();
+let pending = null;
+const chatKey = () => (chat ? chat.id : "single");
+function queueOf(id = chatKey()) {
+  let q = queues.get(id);
+  if (!q) { q = []; queues.set(id, q); }
+  return q;
+}
+function syncPending() { pending = queueOf().length ? queueOf() : null; }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -1453,12 +1568,31 @@ function updateAssistant(el, m, streaming) {
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
+// The open chat's context in the message box: the tokens its last answer left in use (prompt and answer: settleTurn's
+// `used`) against its segment's limit (segments on), else the model's context; hidden until an answer has said it
+function paintCtxRing() {
+  const ring = $("ctx-ring");
+  let used = 0;
+  for (let i = messages.length - 1; i >= 0 && !used; i--) used = (messages[i].role === "assistant" && messages[i].used) || 0;
+  const seg = segmentNow(), limit = (seg && seg.limit) || health.max_context || 0;
+  ring.hidden = !used || !limit;
+  if (ring.hidden) return;
+  const frac = Math.min(1, used / limit), c = 2 * Math.PI * 15;
+  $("ctx-ring-fill").setAttribute("stroke-dasharray", `${(frac * c).toFixed(2)} ${c.toFixed(2)}`);
+  ring.dataset.level = frac >= 0.9 ? "full" : frac >= 0.7 ? "warn" : "";
+  $("ctx-ring-pct").textContent = `${Math.round(frac * 100)}%`;
+  const text = `${tr("chat.context", "context {n} of {limit}", {n: fmt(used), limit: fmt(limit)})} (${Math.round(frac * 100)}%)`;
+  ring.title = text;
+  ring.setAttribute("aria-label", text);
+}
+$("ctx-ring").onclick = () => toast("info", tr("mon.ctx", "Context fill"), $("ctx-ring").title, 4000);   // a phone: no hover
 function renderChat() {
   const chat = $("chat");
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
   paintMarks();
+  paintCtxRing();
   renderSidebar();
   renderParent();
   renderUndoBar();
@@ -1706,19 +1840,16 @@ async function askPersist() {
 }
 
 function busyHint() {
-  const mode = settings.whileBusy;
-  return mode === "queue" ? tr("composer.hintQueue", "Ctrl+Enter sends when the answer is done")
-       : mode === "interject" ? tr("composer.hintInterject", "Ctrl+Enter stops the answer here and sends now") : "";
+  return settings.whileBusy === "interject" ? tr("composer.hintInterject", "Ctrl+Enter stops the answer here and sends now")
+                                            : tr("composer.hintQueue", "Ctrl+Enter sends when the answer is done");
 }
-// While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
-const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
 // what the chat is waiting for while the model loads (after an image job, every image that took the GPU from it)
 const loadingHint = () => modelLoading === "after_image"
   ? tr("composer.loadingAfterImage", "The model is loading again after the image (a minute or two); the answer goes on then")
   : tr("composer.loading", "The model is loading (a minute or two); the answer goes on then");
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  $("send-btn").disabled = !!panel;                    // while it answers, Send queues the message (park)
   paintImageSwitch();
   $("input").disabled = !!panel;
   $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
@@ -1731,15 +1862,16 @@ function setBusy(on) {
   renderPending();
 }
 
-// A message sent while an answer is being written (#4004). "queue": it waits and goes when the answer is done. "interject": the
-// answer stops where it is (what is written stays, marked interrupted) and the message goes at once; if a tool is running, the
-// tool finishes first. Only one message waits. Off by default: with "wait" the page does nothing, as before.
+// A message sent while an answer is being written (#4004) waits in its chat's queue (queueOf). "queue" (the default): it
+// goes when the answer is done, the queue one after another. "interject": the answer stops where it is (what is written
+// stays, marked interrupted) and the message goes at once; if a tool is running, the tool finishes first. Each waiting
+// message can be taken back to the box (cancelled) or sent now (it interrupts).
 function park(p, own) {
-  if (!parksWhileBusy()) return;
-  if (pending) { toast("warn", tr("pending.one", "A message is already waiting"), tr("pending.oneText", "Take it back or wait until it is sent.")); return; }
-  pending = {...p, mode: settings.whileBusy};
+  const q = queueOf(), mode = settings.whileBusy === "interject" && !q.some((x) => x.mode === "interject") ? "interject" : "queue";
+  if (mode === "interject") q.unshift({...p, mode}); else q.push({...p, mode});
   if (own) { attachments = []; renderAttachments(); $("input").value = ""; autosize(); }
-  if (pending.mode === "interject") requestCut();
+  syncPending();
+  if (mode === "interject") requestCut();
   setBusy(!!busy);
 }
 function requestCut() {
@@ -1750,53 +1882,69 @@ function requestCut() {
 }
 function renderPending() {
   let el = $("pending");
-  if (!pending) { if (el) el.remove(); return; }
+  const q = queueOf();
+  if (!q.length) { if (el) el.remove(); return; }
   if (!el) {
-    el = node("div", "pending");
+    el = node("div", "pending-list");
     el.id = "pending";
     el.setAttribute("role", "status");
-    el.innerHTML = "<span class=\"pending__text\"></span><span class=\"pending__actions\"><button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-now></button>" +
-      "<button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-back></button></span>";
-    el.querySelector("[data-pending-now]").onclick = pendingNow;
-    el.querySelector("[data-pending-back]").onclick = releasePending;
+    el.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-pending-now], [data-pending-back]");
+      if (!b) return;
+      const i = +b.closest("[data-i]").dataset.i;
+      if (b.dataset.pendingNow != null) pendingNow(i); else releasePending(i);
+    });
     $("composer").before(el);
   }
-  const quote = (pending.text || (pending.files[0] || pending.images[0] || {}).name || "").replace(/\s+/g, " ").slice(0, 70);
-  const text = !busy ? tr("pending.ready", "Not sent yet: “{text}”", {text: quote})
-    : pending.mode === "queue" ? tr("pending.queued", "Sends when this answer is done: “{text}”", {text: quote})
-    : busy.cutAfterTool ? tr("pending.afterTool", "Waiting for the tool to finish, then sending: “{text}”", {text: quote})
-    : tr("pending.cutting", "Stopping the answer, then sending: “{text}”", {text: quote});
-  el.querySelector(".pending__text").textContent = text;
-  const now = el.querySelector("[data-pending-now]");
-  now.textContent = busy ? tr("pending.sendNow", "Send now") : tr("pending.send", "Send");
-  now.hidden = !!busy && pending.mode === "interject";            // already on its way
-  el.querySelector("[data-pending-back]").textContent = tr("pending.takeBack", "Take back");
+  el.innerHTML = q.map((p, i) => {
+    const quote = (p.text || (p.files[0] || p.images[0] || {}).name || "").replace(/\s+/g, " ").slice(0, 70);
+    const text = !busy ? tr("pending.ready", "Not sent yet: “{text}”", {text: quote})
+      : p.mode === "interject" ? (busy.cutAfterTool ? tr("pending.afterTool", "Waiting for the tool to finish, then sending: “{text}”", {text: quote})
+                                                    : tr("pending.cutting", "Stopping the answer, then sending: “{text}”", {text: quote}))
+      : i === 0 ? tr("pending.queued", "Sends when this answer is done: “{text}”", {text: quote})
+      : tr("pending.queuedLater", "Then sends ({n}): “{text}”", {n: i + 1, text: quote});
+    const now = !!busy && p.mode === "interject" ? "" : `<button type="button" class="st-btn st-btn--secondary" data-pending-now>${
+      esc(busy ? tr("pending.sendNow", "Send now") : tr("pending.send", "Send"))}</button>`;
+    return `<div class="pending" data-i="${i}"><span class="pending__text">${esc(text)}</span><span class="pending__actions">${now}` +
+           `<button type="button" class="st-btn st-btn--secondary" data-pending-back>${esc(tr("pending.takeBack", "Take back"))}</button></span></div>`;
+  }).join("");
 }
-function pendingNow() {
-  if (!pending) return;
-  if (busy) { pending.mode = "interject"; requestCut(); setBusy(true); return; }
-  const p = pending;
-  pending = null;
+// a waiting message sent now: while it answers, it goes first and interrupts; else it is sent
+function pendingNow(i = 0) {
+  const q = queueOf(), [p] = q.splice(i, 1);
+  if (!p) return;
+  if (busy) {
+    const was = q.findIndex((x) => x.mode === "interject");
+    if (was >= 0) q[was].mode = "queue";                 // one interrupts: the one asked for last
+    q.unshift({...p, mode: "interject"});
+    syncPending();
+    requestCut();
+    setBusy(true);
+    return;
+  }
+  syncPending();
   setBusy(false);
   send(p);
 }
-// the waiting message goes back into the message box (a chat switch or a new chat must not lose it)
-function releasePending() {
-  if (!pending) return;
-  const p = pending;
-  pending = null;
-  if (!$("input").value.trim()) $("input").value = p.text;
-  else $("input").value = `${p.text}\n\n${$("input").value}`;
-  attachments = [...p.images, ...p.files, ...attachments];
+// a waiting message back into the message box (cancelled); without `i`, every one of this chat (its chat is cleared)
+function releasePending(i) {
+  const q = queueOf(), out = i == null ? q.splice(0) : q.splice(i, 1);
+  if (!out.length) return;
+  syncPending();
+  for (const p of out.reverse()) {
+    $("input").value = $("input").value.trim() ? `${p.text}\n\n${$("input").value}` : p.text;
+    attachments = [...p.images, ...p.files, ...attachments];
+  }
   renderAttachments(); autosize();
   setBusy(!!busy);
 }
-// after an answer: an interrupted one sends an interjection, a finished one sends a queued message
+// after an answer: an interrupted one sends an interjection, a finished one the next queued message (Stop keeps them)
 function settlePending(cut, finished) {
-  if (!pending) return;
-  if ((pending.mode === "interject" && cut) || (pending.mode === "queue" && finished)) {
-    const p = pending;
-    pending = null;
+  const q = queueOf();
+  if (!q.length) return;
+  if ((q[0].mode === "interject" && cut) || (q[0].mode === "queue" && finished)) {
+    const p = q.shift();
+    syncPending();
     setBusy(false);
     send(p);
   }
@@ -2069,7 +2217,11 @@ async function generateReply(opts = {}) {
   replyRead(me.rid);                                 // kept in the chat now: the server lets it go
   renderSidebar();
   keepToolCopies(m).then((got) => { if (got && msgs.includes(m)) saveChatOf(home); });
-  if (!shown()) return;
+  if (shown()) paintCtxRing();
+  if (!shown()) {                                    // its queue goes on when the chat is opened again (showChat)
+    if (!m.stopped && !m.error && queueOf(home.id).length) queueOf(home.id).go = true;
+    return;
+  }
   scrollDown();
   settlePending(cut, !m.stopped && !m.error);
 }
@@ -2077,16 +2229,26 @@ async function generateReply(opts = {}) {
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 // the image switch: not a send button - while on, every answer sent makes or edits an image; kept here
 function paintImageSwitch() {
-  $("image-btn").setAttribute("aria-pressed", String(imageAlways));
+  $("image-btn").setAttribute("aria-checked", String(imageAlways));   // (in the + menu)
   const label = imageAlways ? tr("composer.imageLabelOn", "Always image: on") : tr("composer.imageLabelOff", "Always image: off");
   $("image-btn").querySelector(".image-toggle__label").textContent = label;
-  $("image-btn").setAttribute("aria-label", label);         // the label is hidden on a narrow screen: the icon alone
+  $("more-btn").classList.toggle("is-on", imageAlways);                // the + says it while its menu is shut
   $("composer").classList.toggle("image-always", imageAlways);
   if (!busy && !$("input").disabled) $("composer-hint").textContent = imageAlways ? tr("composer.imageOnHint", "Ctrl+Enter: send (makes an image)")
                                                                     : tr("composer.sendHint", "Ctrl+Enter: send");
 }
 $("image-btn").onclick = () => { imageAlways = !imageAlways; store.set("chat_image_always", imageAlways); paintImageSwitch(); };
 paintImageSwitch();
+// the + menu: attach, Chat settings, the image switch; it shuts when one is chosen, at a click outside or Escape
+function openMore(open) {
+  $("more-menu").hidden = !open;
+  $("more-btn").setAttribute("aria-expanded", String(open));
+  if (open) ($("more-menu").querySelector(".composer-menu__item:not([hidden])") || $("more-btn")).focus();
+}
+$("more-btn").onclick = (e) => { e.stopPropagation(); openMore($("more-menu").hidden); };
+$("more-menu").addEventListener("click", (e) => { e.stopPropagation(); if (e.target.closest(".composer-menu__item")) openMore(false); });
+document.addEventListener("click", () => { if (!$("more-menu").hidden) openMore(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("more-menu").hidden) { openMore(false); $("more-btn").focus(); } });
 $("stop-btn").onclick = () => { if (busy) stopReply(); };
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); send(); }   // Enter alone: a new line
@@ -2502,7 +2664,7 @@ function loadDrawer(s = settings) {
   $("s-seg").setAttribute("aria-checked", String(s.segments !== false));
   $("s-seglimit").value = s.segmentLimit || "";
   $("s-memory").value = StrataSegments.memoryAt(messages);
-  for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy || "wait")));
+  for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy === "interject" ? "interject" : "queue")));
   outputs();
 }
 // "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
@@ -2582,8 +2744,7 @@ function outputs() {
                 max: tr("drawer.thinkMax", "the most thorough"), on: tr("drawer.thinkOn", "thinks first")};
   $("o-thinking").textContent = sel ? what[sel] + (sel === thinkingInfo().default ? ` ${tr("drawer.thinkDefault", "(default)")}` : "") : "";
   const busyMode = segValue("s-busy");
-  $("o-busy").textContent = {wait: tr("drawer.busyWaitNote", "Send is off until the answer is done, as before."),
-    queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
+  $("o-busy").textContent = {queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
     interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
@@ -2613,7 +2774,7 @@ $("s-apply").onclick = async () => {
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
-              whileBusy: segValue("s-busy") || "wait", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),
+              whileBusy: segValue("s-busy") || "queue", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),
               // the language's own choice stays "": it follows a later change of the page's language
               script: segValue("s-script") === scriptChoice({}) ? "" : segValue("s-script"), scriptContext: checked("s-scriptctx")};
   store.set("sampling", settings);
@@ -2626,7 +2787,6 @@ $("s-apply").onclick = async () => {
   StrataMath.reset();                                  // math on or off: every answer is drawn again
   if (settings.chatList !== !!prev.chatList) await setChatList(settings.chatList, true);
   if (settings.chatEdit !== !!prev.chatEdit) { clearUndo(); syncActions(); }
-  if (settings.whileBusy === "wait" && pending) releasePending();    // "wait" parks nothing: a waiting message goes back to the box
   setBusy(!!busy);
   for (const el of $("chat").querySelectorAll(".st-msg--assistant")) {
     const m = messages[+el.dataset.i];
@@ -2666,8 +2826,26 @@ function languageChoices() {
   $("lang").value = urlLang && urlLang === StrataI18n.lang ? StrataI18n.lang
                   : StrataI18n.LANGUAGES.some((l) => l[0] === saved) ? saved : "auto";
 }
+// the page's text size (About > Settings): the size tokens' scale (tokens.css --st-text-scale), kept in this browser
+// and set before the first paint (index.html)
+function textSizeChoices() {
+  let saved = "1";
+  try { saved = localStorage.getItem("xestrata.textScale") || "1"; } catch (e) { /* the default */ }
+  const sizes = [["0.9", tr("settings.textSmall", "Small")], ["1", tr("settings.textNormal", "Standard")],
+                 ["1.15", tr("settings.textLarge", "Large")], ["1.3", tr("settings.textLarger", "Larger")]];
+  $("text-size").replaceChildren(...sizes.map(([v, name]) => new Option(name, v)));
+  $("text-size").value = sizes.some((t) => t[0] === saved) ? saved : "1";
+}
+$("text-size").onchange = () => {
+  const v = $("text-size").value;
+  document.documentElement.style.setProperty("--st-text-scale", v);
+  try { if (v === "1") localStorage.removeItem("xestrata.textScale"); else localStorage.setItem("xestrata.textScale", v); } catch (e) { /* this visit only */ }
+  fitHeader();
+  fitChatImages();
+};
 function showLanguage() {
   languageChoices();
+  textSizeChoices();
   renderEmptyChat();
   setSidebar(sidebarOpen, false);
   thinkingButtons();   // the level buttons are built in the code, in the language of the moment
@@ -2690,6 +2868,7 @@ $("lang").onchange = async () => {
 async function start() {
   await StrataI18n.setLanguage(browserLanguage());
   languageChoices();
+  textSizeChoices();
   renderEmptyChat();
   initChats();
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw

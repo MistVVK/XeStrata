@@ -13,8 +13,12 @@
   /* type */
   --st-font:"Outfit",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --st-font-mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,"Liberation Mono",monospace; /* (derived) */
-  --st-fs-xs:12px;  --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:16px;
-  --st-fs-lg:18px;  --st-fs-xl:24px; --st-fs-stat:32px; --st-fs-display:40px;
+  /* the text sizes, times the page's text size setting (About > Settings: --st-text-scale, 1 by default) */
+  --st-text-scale:1;
+  --st-fs-xs:calc(12px * var(--st-text-scale));  --st-fs-sm:calc(13px * var(--st-text-scale));
+  --st-fs-md:calc(14px * var(--st-text-scale));  --st-fs-base:calc(16px * var(--st-text-scale));
+  --st-fs-lg:calc(18px * var(--st-text-scale));  --st-fs-xl:calc(24px * var(--st-text-scale));
+  --st-fs-stat:calc(32px * var(--st-text-scale)); --st-fs-display:calc(40px * var(--st-text-scale));
   --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:700; --st-fw-black:900;
   --st-lh-tight:1.1; --st-lh-body:1.55;
 
