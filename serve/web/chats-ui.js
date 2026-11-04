@@ -316,9 +316,9 @@ function msgActions(m, i) {
   if (i < StrataSegments.segmentStart(messages)) return null;   // an earlier segment is read back as it was (segments.js)
   const row = node("div", "history-actions");
   const lock = historyLocked();
-  const add = (label, title, run) => {
+  const add = (label, title, run, off = lock) => {
     const b = node("button", "st-btn st-btn--secondary", label);
-    b.type = "button"; b.title = title; b.disabled = lock; b.onclick = run;
+    b.type = "button"; b.title = title; b.disabled = off; b.onclick = run;
     row.appendChild(b);
   };
   const last = i === messages.length - 1;
@@ -326,7 +326,9 @@ function msgActions(m, i) {
     add(tr("hist.regenerate", "Regenerate"), tr("hist.regenerateTitle", "Ask for a new answer to this question. Tools may run again."), () => regenerateAt(i));
   }
   if (m.role === "assistant") add(tr("hist.editAnswer", "Edit answer"), tr("hist.editAnswerTitle", "Correct the answer's text. No request is sent."), () => editAnswerAt(i));
-  add(tr("hist.rewind", "Rewind to here"), tr("hist.rewindTitle", "Go back to this point in the chat"), () => openRewind(i));
+  // while an answer is written (or messages wait), Rewind opens for its branch: a new chat, this one untouched
+  add(tr("hist.rewind", "Rewind to here"), tr("hist.rewindTitle", "Go back to this point in the chat"), () => openRewind(i),
+      !!panel || (lock && !listOn));
   return row;
 }
 // true when a history change may start now (and says why not when it may not)
@@ -414,24 +416,28 @@ function saveAnswerEdit(i, text) {
 
 // "Rewind to here" asks what to do (#3823): go back HERE (this chat, with an Undo) or BRANCH (a new chat, this one stays)
 function openRewind(i) {
-  if (!historyReady() || !messages[i]) return false;
+  // while this chat writes an answer or holds waiting messages, only its branch (listOn): rewinding it here would
+  // change the messages the answer is written after
+  const branchOnly = listOn && settings.chatEdit && !panel && (!!busy || !!pending);
+  if ((!branchOnly && !historyReady()) || !messages[i]) return false;
   const m = messages[i], el = $("chat").querySelector(`[data-i="${i}"]`);
   const user = m.role === "user";
   const box = node("div", "history-panel");
   box.setAttribute("role", "group");
   box.setAttribute("aria-label", tr("rewind.title", "Rewind to here"));
-  const choice = (label, text, run, primary) => {
+  const choice = (label, text, run, primary, off = false) => {
     const row = node("div", "history-choice");
     const b = node("button", `st-btn ${primary ? "st-btn--primary" : "st-btn--secondary"}`, label);
-    b.type = "button"; b.onclick = run;
+    b.type = "button"; b.onclick = run; b.disabled = off;
     row.appendChild(b);
     row.appendChild(node("span", "muted small", text));
     box.appendChild(row);
   };
   choice(user ? tr("rewind.hereUser", "Edit and send again here") : tr("rewind.hereAnswer", "Continue from here"),
-         user ? tr("rewind.hereUserText", "Hides this message and the ones after it, and puts your message in the box below. Undo brings them back.")
+         branchOnly ? tr("rewind.hereBusy", "Not while an answer is written or a message waits in this chat; a branch can start now.")
+         : user ? tr("rewind.hereUserText", "Hides this message and the ones after it, and puts your message in the box below. Undo brings them back.")
               : tr("rewind.hereAnswerText", "Hides the messages after this answer. Undo brings them back."),
-         () => rewindHere(i), true);
+         () => rewindHere(i), !branchOnly, branchOnly);
   if (listOn) {
     choice(tr("rewind.branch", "Branch from here"),
            user ? tr("rewind.branchUserText", "Starts a new chat with the messages before this one, and puts your message in its box. This chat stays as it is.")
@@ -447,7 +453,7 @@ function openRewind(i) {
   el.appendChild(box);
   panel = {kind: "rewind", index: i, el};
   setBusy(!!busy);
-  box.querySelector("button").focus();
+  box.querySelector("button:not(:disabled)").focus();
   box.scrollIntoView({block: "nearest"});
   return true;
 }
@@ -469,8 +475,9 @@ function rewindHere(i) {
   $("input").focus();
   return true;
 }
+// (also while this chat writes an answer: the branch copies the messages up to i, the answer goes on here)
 function branchHere(i) {
-  if (!listOn || busy || pending || !panel || panel.kind !== "rewind") return false;
+  if (!listOn || !panel || panel.kind !== "rewind") return false;
   const plan = H.rewind(messages, i);
   if (!plan) return false;
   closePanel();

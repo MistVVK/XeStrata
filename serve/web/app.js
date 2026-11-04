@@ -2095,8 +2095,10 @@ async function generateReply(opts = {}) {
       } else {
         body.messages = apiMessages(round > 0, msgs, m);
         // a round after the page's own tools goes on with the same answer: the image button's forced call and the
-        // marks were the first round's (sent again, every round made one more image)
-        if (round > 0 && body.strata_images && typeof body.strata_images === "object") {
+        // marks hold until an image tool has run in it (sent again after that, every round made one more image;
+        // dropped before it, a mask the model had not used yet was lost when it wrote its memory first)
+        const imageRan = (m.tools || []).some((t) => ["edit_image", "generate_image"].includes(t.tool || t.name) && t.state !== "writing");
+        if (round > 0 && imageRan && body.strata_images && typeof body.strata_images === "object") {
           const {force, edit, layout, ...rest} = body.strata_images;
           body.strata_images = Object.keys(rest).length ? rest : true;
         }
@@ -2361,16 +2363,29 @@ function previewAttachment(a) {
     d.id = "attach-preview";
     d.className = "attach-preview";
     d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span><span class="attach-preview__modes" role="group"></span>` +
+      `<a class="st-btn st-btn--icon" data-preview-download>${icon("download")}</a>` +
       `<button type="button" class="st-btn st-btn--icon" data-preview-close><svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>` +
       `<div class="attach-preview__tools"></div><div class="attach-preview__body"></div><div class="attach-preview__foot"></div>`;
     d.querySelector("[data-preview-close]").onclick = () => d.close();
     d.addEventListener("click", (e) => { if (e.target === d) d.close(); });   // the backdrop: outside the box
-    d.addEventListener("close", () => { for (const k of ["body", "tools", "foot", "modes"]) d.querySelector(`.attach-preview__${k}`).innerHTML = ""; });
+    d.addEventListener("close", () => {
+      for (const k of ["body", "tools", "foot", "modes"]) d.querySelector(`.attach-preview__${k}`).innerHTML = "";
+      if (d._fit) { d._fit.disconnect(); d._fit = null; }
+      const dl = d.querySelector("[data-preview-download]");
+      if (dl.href.startsWith("blob:")) URL.revokeObjectURL(dl.href);
+    });
     document.body.appendChild(d);
   }
   const name = a.name || tr("chat.image", "image");
   d.querySelector(".attach-preview__name").textContent = name;
   d.querySelector("[data-preview-close]").setAttribute("aria-label", tr("close", "Close"));
+  // the picture or the file, saved as it is (its name)
+  const dl = d.querySelector("[data-preview-download]");
+  dl.href = a.kind === "image" ? a.url : URL.createObjectURL(new Blob([a.text || ""], {type: "text/plain"}));
+  dl.download = name;
+  dl.title = tr("preview.download", "Download");
+  dl.setAttribute("aria-label", tr("preview.download", "Download"));
+  d.classList.toggle("is-image", a.kind === "image");
   const body = d.querySelector(".attach-preview__body");
   if (a.kind !== "image") {
     const pre = document.createElement("pre");
@@ -2392,7 +2407,17 @@ function previewAttachment(a) {
   body.appendChild(wrap);
   const tools = d.querySelector(".attach-preview__tools"), foot = d.querySelector(".attach-preview__foot"), modes = d.querySelector(".attach-preview__modes");
   const btn = (text, cls = "st-btn") => { const b = document.createElement("button"); b.type = "button"; b.className = cls; b.textContent = text; return b; };
+  // the picture as large as the box's room lets it, never larger than itself: the head, tools and foot keep their rows,
+  // and a change of their height (the tools of another mode, the window) fits it again
+  const fit = () => {
+    if (!img.naturalWidth) return;
+    const k = Math.min(1, (body.clientWidth - 16) / img.naturalWidth, (body.clientHeight - 16) / img.naturalHeight);
+    img.style.width = `${Math.max(1, Math.floor(img.naturalWidth * k))}px`;
+    img.style.height = `${Math.max(1, Math.floor(img.naturalHeight * k))}px`;
+  };
+  if (window.ResizeObserver) { d._fit = new ResizeObserver(fit); d._fit.observe(body); }
   img.onload = () => {
+    fit();
     paint.width = img.naturalWidth; paint.height = img.naturalHeight;
     if (was && was.mask) { const m = new Image(); m.onload = () => paintFromMask(m); m.src = was.mask; }
     drawBoxes();
@@ -2466,13 +2491,15 @@ function previewAttachment(a) {
       return e;
     }));
   };
+  // the selected box's fields, always in their row (off with no box, the words off but for a text box): a box drawn
+  // does not make the row grow and the picture move
   const fields = () => {
     const b = st.boxes[st.sel];
-    boxFields.hidden = !b;
-    if (!b) return;
-    label.value = b.label; caption.value = b.caption; words.value = b.text; words.hidden = b.label !== "text";
+    for (const x of [label, caption, del]) x.disabled = !b;
+    words.disabled = !b || b.label !== "text";
+    label.value = b ? b.label : "object"; caption.value = b ? b.caption : ""; words.value = b ? b.text : "";
   };
-  label.onchange = () => { const b = st.boxes[st.sel]; if (b) { b.label = label.value; words.hidden = b.label !== "text"; drawBoxes(); } };
+  label.onchange = () => { const b = st.boxes[st.sel]; if (b) { b.label = label.value; words.disabled = b.label !== "text"; drawBoxes(); } };
   caption.oninput = () => { const b = st.boxes[st.sel]; if (b) { b.caption = caption.value; drawBoxes(); } };
   words.oninput = () => { const b = st.boxes[st.sel]; if (b) { b.text = words.value; drawBoxes(); } };
   del.onclick = () => { if (st.sel >= 0) { st.boxes.splice(st.sel, 1); st.sel = -1; drawBoxes(); fields(); } };
@@ -2545,7 +2572,8 @@ function previewAttachment(a) {
       const boxes = st.boxes.filter((b) => b.x1 > b.x0 && b.y1 > b.y0);
       if (boxes.some((b) => b.label === "text" && !b.text.trim())) { toast("warn", tr("img.boxNeedsWords", "A text box needs its words.")); return; }
       const mask = painted() ? maskURL() : null;
-      imageMarks = mask || boxes.length ? {name, url: a.url, ref, w: img.naturalWidth, h: img.naturalHeight, mask, boxes} : null;
+      imageMarks = mask || boxes.length ? {name, url: a.url, ref, w: img.naturalWidth, h: img.naturalHeight, mask, boxes,
+                                           overlay: marksOverlay(paint, boxes, mask != null)} : null;
       renderAttachments();
       paintMarks();
       d.close();
@@ -2565,14 +2593,38 @@ function marksBadge() {
   b.title = tr("preview.use", "Use in the next message");
   return b;
 }
-// the pictures in the chat the marks are on (a picture sent, an image a tool made): their frame marked, the label over it
+// the marks as a picture to lay over the image's thumbnail: the paint (half see-through, as the preview shows it) and the
+// boxes' outlines, at the image's size
+function marksOverlay(paint, boxes, painted) {
+  const c = document.createElement("canvas");
+  c.width = paint.width; c.height = paint.height;
+  if (!c.width) return null;
+  const g = c.getContext("2d");
+  if (painted) { g.globalAlpha = 0.55; g.drawImage(paint, 0, 0); g.globalAlpha = 1; }
+  g.lineWidth = Math.max(3, Math.round(c.width / 150));
+  for (const b of boxes) {
+    g.strokeStyle = b.label === "text" ? "#e11d48" : b.label === "character" ? "#16a34a" : "#2563eb";   // the boxes' colours
+    g.strokeRect(b.x0 * c.width, b.y0 * c.height, (b.x1 - b.x0) * c.width, (b.y1 - b.y0) * c.height);
+  }
+  return c.toDataURL("image/png");
+}
+// the marks over a thumbnail: their picture laid on it (marksOverlay), or none
+function setMarksOverlay(el, overlay) {
+  let o = el.querySelector(":scope > .marks-overlay");
+  if (!overlay) { if (o) o.remove(); return; }
+  if (!o) { o = document.createElement("img"); o.className = "marks-overlay"; o.alt = ""; el.appendChild(o); }
+  if (o.src !== overlay) o.src = overlay;
+}
+// the pictures in the chat the marks are on (a picture sent, an image a tool made): their frame marked, the label and the
+// marks themselves over it
 function paintMarks() {
   const label = imageMarks ? marksBadge().textContent : "";
   for (const el of document.querySelectorAll("#chat .msg-image-wrap, #chat [data-gen-image]")) {
-    const ref = el.dataset.genImage || (el.querySelector("img") || {}).src;
+    const ref = el.dataset.genImage || (el.querySelector("img:not(.marks-overlay)") || {}).src;
     const on = !!imageMarks && ref === imageMarks.ref;
     el.classList.toggle("is-marked", on);
     if (on) el.dataset.marks = label; else delete el.dataset.marks;
+    setMarksOverlay(el, on ? imageMarks.overlay : null);
   }
 }
 // the marks into a request's strata_images (then they are spent): edit's image and mask, layout's boxes at the image's
@@ -2580,14 +2632,17 @@ function paintMarks() {
 function marksBody(want) {
   if (!imageMarks) return want;
   const m = imageMarks, out = {...(want && typeof want === "object" ? want : {})};
-  if (m.mask) out.edit = {image: m.ref, mask: {image_url: m.mask}};
+  // the picture itself where the page has it (an image a tool made, copied into the chat: keepToolCopies), not its
+  // /v1/images/files/ link - the server keeps those only so long (a restart, or 64 newer ones, lets them go)
+  const image = typeof m.url === "string" && m.url.startsWith("data:") ? m.url : m.ref;
+  if (m.mask) out.edit = {image, mask: {image_url: m.mask}};
   if (m.boxes.length) {
     const k = Math.sqrt(1024 * 1024 / (m.w * m.h));
     const w = Math.max(256, Math.round(m.w * k / 16) * 16), h = Math.max(256, Math.round(m.h * k / 16) * 16);
     // the boxes are MOSS-Image's: its model, chosen or not (another model chosen gives way to it)
     const moss = (health.image_models || []).filter((x) => (x.defaults || {}).layout).map((x) => x.id);
     if (moss.length && !moss.includes(out.model)) out.model = moss[0];
-    out.layout = {size: `${w}x${h}`, image: m.ref, items: m.boxes.map((b) => ({label: b.label, caption: b.caption.trim() || (b.label === "text" ? b.text.trim() : imgBoxName(b.label)),
+    out.layout = {size: `${w}x${h}`, image, items: m.boxes.map((b) => ({label: b.label, caption: b.caption.trim() || (b.label === "text" ? b.text.trim() : imgBoxName(b.label)),
                                                                  ...(b.label === "text" ? {text: b.text.trim()} : {}), box: [b.x0, b.y0, b.x1, b.y1]}))};
   }
   imageMarks = null;
@@ -2601,7 +2656,15 @@ function renderAttachments() {
   box.innerHTML = "";
   attachments.forEach((a, i) => {
     const c = attachChip(a, a.kind === "file" ? "attach" : "image");
-    if (imageMarks && a.url === imageMarks.ref) c.querySelector(".chip__name").after(marksBadge());
+    if (imageMarks && a.url === imageMarks.ref) {     // the marked picture: a thumbnail with its marks, and their label
+      const t = document.createElement("span"), im = document.createElement("img");
+      t.className = "chip__thumb";
+      im.src = a.url; im.alt = "";
+      t.appendChild(im);
+      setMarksOverlay(t, imageMarks.overlay);
+      c.querySelector(".st-icon").replaceWith(t);
+      c.querySelector(".chip__name").after(marksBadge());
+    }
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", tr("file.remove", "Remove"));
     x.innerHTML = icon("trash");

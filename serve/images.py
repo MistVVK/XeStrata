@@ -2414,6 +2414,12 @@ class ImageTools:
                 + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
                    for name, models in styles.items() if (text := skill(name))]
                 + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
+            if t["name"] == "edit_image" and self.attached():
+                t["description"] += ("\n\nThe pictures the user attached to their last message go with the edit as "
+                                     "reference images after the image it edits: the image edited is image 1, the "
+                                     "attached ones image 2, 3 and so on (in the order attached). Say in the prompt "
+                                     "which to take from and what (\"the face from image 2\"). A model without edits "
+                                     "(img2img) takes the image edited alone.")
             if t["name"] == "edit_image" and self.user.get("mask") is not None:
                 t["description"] += ("\n\nThe user has painted over an image the part to change (a mask): "
                                      "edit_image changes that part of that image only; its image and mask are set.")
@@ -2471,6 +2477,18 @@ class ImageTools:
     def _file(self, name: str) -> bytes | None:
         p = (self.models or self.gen).file(name)
         return p.read_bytes() if p is not None else None
+
+    def attached(self) -> list[bytes]:
+        """The pictures in the user's last message: an edit takes them as its reference images after the one it edits
+        (as ComfyUI's Qwen-Image edit takes its image2 and image3 beside image1), so "the face from the picture I
+        attached" reaches the image model - before, only the image edited did, and the prompt alone named the face."""
+        for msg in reversed(self.messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            return [self.load(item["source"]) for item in (content if isinstance(content, list) else [])
+                    if isinstance(item, dict) and item.get("type") == "image" and item.get("source")]
+        return []
 
     def has_image(self) -> bool:
         """Is there an image an edit could take (one this request made, a picture in the conversation, or a link to a
@@ -2553,7 +2571,13 @@ class ImageTools:
                     data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
-                job = parse_edit_request(req, [self.normalize(data)], gen.cfg, mask)
+                images = [self.normalize(data)]
+                if can_edit(gen.cfg):                    # the user's attached pictures as references (attached)
+                    limit = int(gen.cfg.get("max_refs") or (MF_MAX_REFS if gen.family == "mage-flow" else
+                                                            HUNYUANIMAGE3_MAX_REFS if gen.family == "hunyuan-image-3"
+                                                            else MAX_REFS))   # as parse_edit_request counts them
+                    images += [self.normalize(p) for p in self.attached() if p != data][:max(0, limit - 1)]
+                job = parse_edit_request(req, images, gen.cfg, mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
             preview = None
