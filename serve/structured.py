@@ -348,6 +348,20 @@ def tool_grammar(tools, strict: set, patterns: dict, thinking: bool, form: str):
     return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)
 
 
+def call_names_grammar(names, thinking: bool, form: str):
+    """A forced call among several tools (the web page's image button, strata_images.force): the server writes the
+    call's opening, and this keeps its name to one of `names` - else the model chose one of its own after
+    "<function=" (a memory tool it knew), which is no declared tool and went back as text, and no image was made.
+    In Qwen's call form; None in another (GLM's, Harmony's) or without names."""
+    if form != "qwen" or not names:
+        return None
+    tags = [{"type": "tag", "begin": f"<tool_call>\n<function={name}>\n", "content": {"type": "any_text"},
+             "end": "\n</function>\n</tool_call>"} for name in names]
+    calls = {"type": "triggered_tags", "triggers": ["<tool_call>\n<function="], "tags": tags, "excludes": [],
+             "at_least_one": False, "stop_after_first": False}
+    return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)
+
+
 def constrained_tools(tools, namespace: str = "") -> tuple[set, dict]:
     """A request's tools as sent (Chat's, Responses', Anthropic's shapes; a Responses namespace's tools under
     "namespace.name", the name the template has) -> (the names of those with "strict": true, {name: pattern} of the

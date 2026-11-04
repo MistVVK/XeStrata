@@ -1271,7 +1271,10 @@ function msgEl(m, i) {
         img.className = "msg-image"; img.tabIndex = 0;
         img.onclick = () => previewAttachment({kind: "image", ...im});
         img.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); img.onclick(); } };
-        wrap.appendChild(img);
+        const frame = document.createElement("span");   // where the marks show (paintMarks)
+        frame.className = "msg-image-wrap";
+        frame.appendChild(img);
+        wrap.appendChild(frame);
       }
       el.appendChild(wrap);
     }
@@ -1329,7 +1332,7 @@ function imageToolHtml(t, k) {
   const open = layout && t.state === "done" ? `<button type="button" class="st-btn" data-tool-layout="${k}">${esc(tr("img.layoutToImages", "Open the layout in Images"))}</button>` : "";
   const src = (u) => (t.copies && t.copies[u]) || u.replace(/^\//, "");   // the chat's own copy (keepToolCopies) first
   return urls.length || open ? `<div class="msg-images tool-images">${urls.map((u) =>
-    `<a href="${esc(src(u))}" target="_blank" rel="noopener"><img src="${esc(src(u))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
+    `<a href="${esc(src(u))}" target="_blank" rel="noopener" data-gen-image="${esc(u)}"><img src="${esc(src(u))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
 }
 // The images an answer's tools made, copied into the chat once it is written: the server keeps only its newest files
 // (images' keep_files, the MCP media folder), and a saved chat should still show them. Data URLs, as the pictures sent.
@@ -1444,6 +1447,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = answerHtml(m);
     if (settings.math) StrataMath.hydrate(bubble);
     hydrateToolImages(bubble);
+    if (!streaming) paintMarks();
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
@@ -1454,6 +1458,7 @@ function renderChat() {
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
+  paintMarks();
   renderSidebar();
   renderParent();
   renderUndoBar();
@@ -1512,6 +1517,13 @@ $("chat").addEventListener("click", (e) => {
     const run = fr.dataset.scripts !== "1";
     if (run && !confirm(tr("preview.confirm", "Run this code with scripts?\n\nIt runs in your browser, cut off from this chat and from the network, but it can still freeze the tab, and it is code the model wrote.\n\nOnly this block, and only until you close the preview."))) return;
     fillPreview(fr, run);
+    return;
+  }
+  // an image a tool made: its preview (where it can be marked for the next message); a modified click still opens a tab
+  const gi = e.target.closest("[data-gen-image]");
+  if (gi && e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey) {
+    e.preventDefault();
+    previewAttachment({kind: "image", url: gi.getAttribute("href"), ref: gi.dataset.genImage, name: gi.dataset.genImage.split("/").pop()});
     return;
   }
   const mc = e.target.closest("[data-msg-copy]");
@@ -1901,6 +1913,9 @@ async function generateReply(opts = {}) {
   if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
   if (health.image_generation && opts.image)                // the image button: by the model chosen, else the words'
     body.strata_images = {...(ci && ci !== "auto" && ci !== "off" ? {model: ci} : {}), force: true};
+  // what the user marked on a picture in its preview (previewAttachment): this message's image tools take it, even with
+  // images off
+  if (health.image_generation && imageMarks && !opts.resume) body.strata_images = marksBody(body.strata_images);
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
@@ -1931,6 +1946,12 @@ async function generateReply(opts = {}) {
         if (r.status === 404) throw replyError(tr("chat.replyLost", "The server no longer has this answer (it was restarted, or the answer waited more than 12 hours)."));
       } else {
         body.messages = apiMessages(round > 0, msgs, m);
+        // a round after the page's own tools goes on with the same answer: the image button's forced call and the
+        // marks were the first round's (sent again, every round made one more image)
+        if (round > 0 && body.strata_images && typeof body.strata_images === "object") {
+          const {force, edit, layout, ...rest} = body.strata_images;
+          body.strata_images = Object.keys(rest).length ? rest : true;
+        }
         // kept past its connection (a tab put to sleep, a network that dropped, the page closed): the rest is read again
         // below, or, when the page is opened again, from the id kept in the message (resumeReplies)
         const prev = me.rid;
@@ -2057,8 +2078,9 @@ $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 // the image switch: not a send button - while on, every answer sent makes or edits an image; kept here
 function paintImageSwitch() {
   $("image-btn").setAttribute("aria-pressed", String(imageAlways));
-  $("image-btn").querySelector(".image-toggle__label").textContent = imageAlways ? tr("composer.imageLabelOn", "Always image: on")
-                                                                                 : tr("composer.imageLabelOff", "Always image: off");
+  const label = imageAlways ? tr("composer.imageLabelOn", "Always image: on") : tr("composer.imageLabelOff", "Always image: off");
+  $("image-btn").querySelector(".image-toggle__label").textContent = label;
+  $("image-btn").setAttribute("aria-label", label);         // the label is hidden on a narrow screen: the icon alone
   $("composer").classList.toggle("image-always", imageAlways);
   if (!busy && !$("input").disabled) $("composer-hint").textContent = imageAlways ? tr("composer.imageOnHint", "Ctrl+Enter: send (makes an image)")
                                                                     : tr("composer.sendHint", "Ctrl+Enter: send");
@@ -2102,6 +2124,7 @@ $("export-btn").onclick = () => {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
+$("drawer-export").onclick = () => $("export-btn").onclick();
 
 // pictures and text files: the attach button, dropping them on the chat, or pasting a picture (issue #30)
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
@@ -2162,34 +2185,253 @@ function attachChip(a, kind) {
   c.appendChild(n);
   return c;
 }
-// a picture at its size (to the window's), or a file's text, over the page; Escape, the button or a click outside closes it
+// a picture at its size (to the window's), or a file's text, over the page; Escape, the button or a click outside closes it.
+// A picture can be marked for the next message's image tools (imageMarks): a mask painted over the part edit_image
+// changes, MOSS-Image's boxes that generate_image lays the new image out by.  `a.ref`: what the server knows it by (a
+// /v1/images/files/ link of an image made here), else its data: URL.
+let imageMarks = null;   // {name, url, ref, w, h, mask: a data: URL or null, boxes: [{x0, y0, x1, y1, label, caption, text}]}
+const canMask = () => !!health.image_generation;
+const canBox = () => (health.image_models || []).some((m) => (m.defaults || {}).layout);
 function previewAttachment(a) {
   let d = $("attach-preview");
   if (!d) {
     d = document.createElement("dialog");
     d.id = "attach-preview";
     d.className = "attach-preview";
-    d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span>` +
-      `<button type="button" class="st-btn st-btn--icon" data-preview-close><svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div><div class="attach-preview__body"></div>`;
+    d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span><span class="attach-preview__modes" role="group"></span>` +
+      `<button type="button" class="st-btn st-btn--icon" data-preview-close><svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button></div>` +
+      `<div class="attach-preview__tools"></div><div class="attach-preview__body"></div><div class="attach-preview__foot"></div>`;
     d.querySelector("[data-preview-close]").onclick = () => d.close();
     d.addEventListener("click", (e) => { if (e.target === d) d.close(); });   // the backdrop: outside the box
-    d.addEventListener("close", () => { d.querySelector(".attach-preview__body").innerHTML = ""; });
+    d.addEventListener("close", () => { for (const k of ["body", "tools", "foot", "modes"]) d.querySelector(`.attach-preview__${k}`).innerHTML = ""; });
     document.body.appendChild(d);
   }
   const name = a.name || tr("chat.image", "image");
   d.querySelector(".attach-preview__name").textContent = name;
   d.querySelector("[data-preview-close]").setAttribute("aria-label", tr("close", "Close"));
   const body = d.querySelector(".attach-preview__body");
-  if (a.kind === "image") {
-    const img = document.createElement("img");
-    img.src = a.url; img.alt = name;
-    body.appendChild(img);
-  } else {
+  if (a.kind !== "image") {
     const pre = document.createElement("pre");
     pre.textContent = a.text;
     body.appendChild(pre);
+    d.showModal();
+    return;
   }
+  // the picture, with the paint and the boxes over it at its own size (the screen's pixels are counted back into its own)
+  const ref = a.ref || a.url;
+  const was = imageMarks && imageMarks.ref === ref ? imageMarks : null;
+  const st = {mode: "view", boxes: was ? was.boxes.map((x) => ({...x})) : [], sel: -1};
+  const wrap = document.createElement("div"), img = document.createElement("img"), paint = document.createElement("canvas"), stage = document.createElement("div");
+  wrap.className = "attach-preview__stage";
+  img.src = a.url; img.alt = name;
+  paint.className = "attach-preview__paint";
+  stage.className = "attach-preview__boxes";
+  wrap.append(img, paint, stage);
+  body.appendChild(wrap);
+  const tools = d.querySelector(".attach-preview__tools"), foot = d.querySelector(".attach-preview__foot"), modes = d.querySelector(".attach-preview__modes");
+  const btn = (text, cls = "st-btn") => { const b = document.createElement("button"); b.type = "button"; b.className = cls; b.textContent = text; return b; };
+  img.onload = () => {
+    paint.width = img.naturalWidth; paint.height = img.naturalHeight;
+    if (was && was.mask) { const m = new Image(); m.onload = () => paintFromMask(m); m.src = was.mask; }
+    drawBoxes();
+  };
+  // the mask as sent (opaque, transparent where painted) back into paint
+  const paintFromMask = (m) => {
+    const g = paint.getContext("2d");
+    g.fillStyle = "#e11d48"; g.fillRect(0, 0, paint.width, paint.height);
+    g.globalCompositeOperation = "destination-in";
+    const inv = document.createElement("canvas");
+    inv.width = paint.width; inv.height = paint.height;
+    const ig = inv.getContext("2d");
+    ig.fillRect(0, 0, inv.width, inv.height);
+    ig.globalCompositeOperation = "destination-out";
+    ig.drawImage(m, 0, 0, inv.width, inv.height);
+    g.drawImage(inv, 0, 0);
+    g.globalCompositeOperation = "source-over";
+  };
+  const painted = () => {
+    if (!paint.width) return false;
+    const px = paint.getContext("2d").getImageData(0, 0, paint.width, paint.height).data;
+    for (let i = 3; i < px.length; i += 4) if (px[i] > 0) return true;
+    return false;
+  };
+  const maskURL = () => {             // as imgMask: opaque, transparent where it was painted
+    const m = document.createElement("canvas");
+    m.width = paint.width; m.height = paint.height;
+    const g = m.getContext("2d");
+    g.fillRect(0, 0, m.width, m.height);
+    g.globalCompositeOperation = "destination-out";
+    g.drawImage(paint, 0, 0);
+    return m.toDataURL("image/png");
+  };
+  // the mask's tools: the brush (in screen pixels), erase, clear
+  const brush = document.createElement("input"), erase = document.createElement("input");
+  brush.type = "range"; brush.min = "4"; brush.max = "120"; brush.value = "32"; brush.setAttribute("aria-label", tr("img.brushSize", "Brush size"));
+  erase.type = "checkbox";
+  (() => {
+    let last = null;
+    const at = (ev) => { const r = paint.getBoundingClientRect(); return [(ev.clientX - r.left) * paint.width / r.width, (ev.clientY - r.top) * paint.height / r.height, paint.width / r.width]; };
+    const stroke = (p, q) => {
+      const g = paint.getContext("2d");
+      g.globalCompositeOperation = erase.checked ? "destination-out" : "source-over";
+      g.strokeStyle = "#e11d48"; g.lineCap = g.lineJoin = "round";
+      g.lineWidth = Number(brush.value) * q[2];
+      g.beginPath(); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); g.stroke();
+    };
+    paint.onpointerdown = (ev) => { if (st.mode !== "mask") return; paint.setPointerCapture(ev.pointerId); last = at(ev); stroke(last, last); };
+    paint.onpointermove = (ev) => { if (!last) return; const q = at(ev); stroke(last, q); last = q; };
+    paint.onpointerup = paint.onpointercancel = () => { last = null; };
+  })();
+  // the boxes: drawn, moved and sized as the Images tab's (in shares of the picture's sides)
+  const label = document.createElement("select"), caption = document.createElement("input"), words = document.createElement("input");
+  for (const v of ["object", "text", "character"]) label.add(new Option(imgBoxName(v), v));
+  caption.className = words.className = label.className = "st-input";
+  caption.placeholder = tr("img.boxCaption", "What it looks like"); words.placeholder = tr("img.boxWords", "The exact words");
+  const boxFields = document.createElement("div");
+  boxFields.className = "attach-preview__box";
+  const del = btn(tr("img.boxDelete", "Delete the box"));
+  boxFields.append(label, caption, words, del);
+  const drawBoxes = () => {
+    stage.replaceChildren(...st.boxes.map((b, i) => {
+      const e = document.createElement("div"), hd = document.createElement("span");
+      e.className = "img-box"; e.dataset.i = String(i); e.dataset.label = b.label;
+      e.setAttribute("aria-selected", String(i === st.sel));
+      Object.assign(e.style, {left: `${b.x0 * 100}%`, top: `${b.y0 * 100}%`, width: `${(b.x1 - b.x0) * 100}%`, height: `${(b.y1 - b.y0) * 100}%`,
+                              zIndex: String(1 + Math.round((1 - (b.x1 - b.x0) * (b.y1 - b.y0)) * 1000))});
+      e.textContent = b.label === "text" && b.text ? `"${b.text}"` : b.caption || imgBoxName(b.label);
+      hd.className = "img-box__handle";
+      e.append(hd);
+      return e;
+    }));
+  };
+  const fields = () => {
+    const b = st.boxes[st.sel];
+    boxFields.hidden = !b;
+    if (!b) return;
+    label.value = b.label; caption.value = b.caption; words.value = b.text; words.hidden = b.label !== "text";
+  };
+  label.onchange = () => { const b = st.boxes[st.sel]; if (b) { b.label = label.value; words.hidden = b.label !== "text"; drawBoxes(); } };
+  caption.oninput = () => { const b = st.boxes[st.sel]; if (b) { b.caption = caption.value; drawBoxes(); } };
+  words.oninput = () => { const b = st.boxes[st.sel]; if (b) { b.text = words.value; drawBoxes(); } };
+  del.onclick = () => { if (st.sel >= 0) { st.boxes.splice(st.sel, 1); st.sel = -1; drawBoxes(); fields(); } };
+  (() => {
+    const least = 0.02;
+    let drag = null;
+    const at = (ev) => { const r = stage.getBoundingClientRect(); return [clamp01((ev.clientX - r.left) / r.width), clamp01((ev.clientY - r.top) / r.height)]; };
+    stage.onpointerdown = (ev) => {
+      if (st.mode !== "boxes") return;
+      const q = at(ev), el = ev.target.closest(".img-box");
+      stage.setPointerCapture(ev.pointerId);
+      if (el) drag = {i: +el.dataset.i, mode: ev.target.classList.contains("img-box__handle") ? "size" : "move", p: q, b: {...st.boxes[+el.dataset.i]}};
+      else { st.boxes.push({x0: q[0], y0: q[1], x1: q[0], y1: q[1], label: "object", caption: "", text: ""}); drag = {i: st.boxes.length - 1, mode: "new", p: q}; }
+      st.sel = drag.i; drawBoxes(); fields();
+    };
+    stage.onpointermove = (ev) => {
+      if (!drag) return;
+      const q = at(ev), b = st.boxes[drag.i];
+      if (drag.mode === "new") {
+        [b.x0, b.x1] = [Math.min(drag.p[0], q[0]), Math.max(drag.p[0], q[0])];
+        [b.y0, b.y1] = [Math.min(drag.p[1], q[1]), Math.max(drag.p[1], q[1])];
+      } else if (drag.mode === "move") {
+        const o = drag.b, dx = Math.min(1 - o.x1, Math.max(-o.x0, q[0] - drag.p[0])), dy = Math.min(1 - o.y1, Math.max(-o.y0, q[1] - drag.p[1]));
+        Object.assign(b, {x0: o.x0 + dx, x1: o.x1 + dx, y0: o.y0 + dy, y1: o.y1 + dy});
+      } else { b.x1 = Math.max(b.x0 + least, q[0]); b.y1 = Math.max(b.y0 + least, q[1]); }
+      drawBoxes();
+    };
+    stage.onpointerup = stage.onpointercancel = () => {
+      if (!drag) return;
+      const b = st.boxes[drag.i], made = drag.mode === "new";
+      if (made && (b.x1 - b.x0 < least || b.y1 - b.y0 < least)) { st.boxes.splice(drag.i, 1); st.sel = -1; }
+      drag = null; drawBoxes(); fields();
+      if (made && st.sel >= 0) caption.focus();
+    };
+  })();
+  // the modes: view, the mask, the boxes (where the image models take them)
+  const setMode = (m) => {
+    st.mode = m;
+    wrap.dataset.mode = m;
+    for (const b of modes.children) b.setAttribute("aria-pressed", String(b.dataset.mode === m));
+    tools.replaceChildren();
+    if (m === "mask") {
+      const lb = document.createElement("label"), le = document.createElement("label"), clear = btn(tr("img.clear", "Clear"));
+      lb.className = le.className = "attach-preview__tool";
+      lb.append(tr("img.brush", "Brush"), brush);
+      le.append(erase, tr("img.erase", "Erase"));
+      clear.onclick = () => paint.getContext("2d").clearRect(0, 0, paint.width, paint.height);
+      tools.append(lb, le, clear);
+    } else if (m === "boxes") {
+      const hint = document.createElement("span");
+      hint.className = "muted small";
+      hint.textContent = tr("img.layoutHint", "Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.");
+      tools.append(hint, boxFields);
+      fields();
+    }
+  };
+  if (canMask()) {
+    for (const [m, text] of [["view", tr("preview.view", "View")], ["mask", tr("preview.mask", "Mask")], ["boxes", tr("preview.boxes", "Boxes")]]) {
+      const b = btn(text, "st-btn attach-preview__mode");
+      b.dataset.mode = m;
+      b.onclick = () => {
+        if (m === "boxes" && !canBox()) { toast("error", tr("preview.noMoss", "Boxes need MOSS-Image, and no MOSS-Image model is installed here.")); return; }
+        setMode(m);
+      };
+      modes.appendChild(b);
+    }
+    const use = btn(tr("preview.use", "Use in the next message"), "st-btn st-btn--primary"), drop = btn(tr("preview.drop", "Remove the marks"));
+    drop.hidden = !was;
+    use.onclick = () => {
+      const boxes = st.boxes.filter((b) => b.x1 > b.x0 && b.y1 > b.y0);
+      if (boxes.some((b) => b.label === "text" && !b.text.trim())) { toast("warn", tr("img.boxNeedsWords", "A text box needs its words.")); return; }
+      const mask = painted() ? maskURL() : null;
+      imageMarks = mask || boxes.length ? {name, url: a.url, ref, w: img.naturalWidth, h: img.naturalHeight, mask, boxes} : null;
+      renderAttachments();
+      paintMarks();
+      d.close();
+      $("input").focus();
+    };
+    drop.onclick = () => { imageMarks = null; renderAttachments(); paintMarks(); d.close(); };
+    foot.append(drop, use);
+  }
+  setMode(was && was.boxes.length && !was.mask ? "boxes" : was ? "mask" : "view");
   d.showModal();
+}
+// what the marks on a picture are, beside it: its chip in the message box, or over it in the chat (paintMarks)
+function marksBadge() {
+  const b = document.createElement("span");
+  b.className = "marks-badge";
+  b.textContent = [imageMarks.mask ? tr("preview.mask", "Mask") : "", imageMarks.boxes.length ? tr("preview.boxes", "Boxes") : ""].filter(Boolean).join(" · ");
+  b.title = tr("preview.use", "Use in the next message");
+  return b;
+}
+// the pictures in the chat the marks are on (a picture sent, an image a tool made): their frame marked, the label over it
+function paintMarks() {
+  const label = imageMarks ? marksBadge().textContent : "";
+  for (const el of document.querySelectorAll("#chat .msg-image-wrap, #chat [data-gen-image]")) {
+    const ref = el.dataset.genImage || (el.querySelector("img") || {}).src;
+    const on = !!imageMarks && ref === imageMarks.ref;
+    el.classList.toggle("is-marked", on);
+    if (on) el.dataset.marks = label; else delete el.dataset.marks;
+  }
+}
+// the marks into a request's strata_images (then they are spent): edit's image and mask, layout's boxes at the image's
+// shape at about 1024 x 1024 pixels (as the Images tab's auto size)
+function marksBody(want) {
+  if (!imageMarks) return want;
+  const m = imageMarks, out = {...(want && typeof want === "object" ? want : {})};
+  if (m.mask) out.edit = {image: m.ref, mask: {image_url: m.mask}};
+  if (m.boxes.length) {
+    const k = Math.sqrt(1024 * 1024 / (m.w * m.h));
+    const w = Math.max(256, Math.round(m.w * k / 16) * 16), h = Math.max(256, Math.round(m.h * k / 16) * 16);
+    // the boxes are MOSS-Image's: its model, chosen or not (another model chosen gives way to it)
+    const moss = (health.image_models || []).filter((x) => (x.defaults || {}).layout).map((x) => x.id);
+    if (moss.length && !moss.includes(out.model)) out.model = moss[0];
+    out.layout = {size: `${w}x${h}`, image: m.ref, items: m.boxes.map((b) => ({label: b.label, caption: b.caption.trim() || (b.label === "text" ? b.text.trim() : imgBoxName(b.label)),
+                                                                 ...(b.label === "text" ? {text: b.text.trim()} : {}), box: [b.x0, b.y0, b.x1, b.y1]}))};
+  }
+  imageMarks = null;
+  renderAttachments();
+  paintMarks();
+  return out;
 }
 function renderAttachments() {
   const box = $("attachments");
@@ -2197,6 +2439,7 @@ function renderAttachments() {
   box.innerHTML = "";
   attachments.forEach((a, i) => {
     const c = attachChip(a, a.kind === "file" ? "attach" : "image");
+    if (imageMarks && a.url === imageMarks.ref) c.querySelector(".chip__name").after(marksBadge());
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", tr("file.remove", "Remove"));
     x.innerHTML = icon("trash");
@@ -2493,15 +2736,26 @@ function chatImages() {
   if (ms.length > 1) opts.push(...ms.map(m => new Option(tr("chatImages.model", "Images: {model}", {model: m.id}), m.id)));
   sel.replaceChildren(...opts);
   sel.value = [...sel.options].some(o => o.value === was) ? was : "auto";
-  sel.hidden = $("image-btn").hidden = !health.image_generation;
+  $("chat-images-box").hidden = $("image-btn").hidden = !health.image_generation;
+  fitChatImages();
 }
-$("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
+// the choice as wide as the option chosen (not the longest one, as a select is by itself): its box scrolls the rest
+function fitChatImages() {
+  const sel = $("chat-images"), o = sel.options[sel.selectedIndex];
+  if (!o) return;
+  const cs = getComputedStyle(sel), g = (fitChatImages.c || (fitChatImages.c = document.createElement("canvas"))).getContext("2d");
+  g.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+  const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight) + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
+  sel.style.width = `${Math.ceil(g.measureText(o.text).width + pad + 24)}px`;   // 24: the arrow
+}
+$("chat-images").onchange = () => { store.set("chat_images", $("chat-images").value); fitChatImages(); };
+window.addEventListener("resize", fitChatImages);   // its padding follows the width (app.css)
 // the chat's web search (the server's search_url): on or off, kept here; on sends web_search_options
 function chatSearch() {
   const sel = $("chat-search"), was = sel.value || store.get("chat_search", "on");
   sel.replaceChildren(new Option(tr("chatSearch.on", "Search: on"), "on"), new Option(tr("chatSearch.off", "Search: off"), "off"));
   sel.value = was === "off" ? "off" : "on";
-  sel.hidden = !health.web_search;
+  $("search-row").hidden = !health.web_search;        // in Chat settings (the message box keeps its row short)
   renderEmptyChat();
 }
 $("chat-search").onchange = () => { store.set("chat_search", $("chat-search").value); renderEmptyChat(); };

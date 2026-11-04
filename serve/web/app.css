@@ -53,9 +53,40 @@ main { flex: 1; min-height: 0; display: flex; }
 .attach-preview { max-width: min(92vw, 1100px); max-height: 90vh; padding: 0; border: 1px solid var(--st-line);
                   border-radius: var(--st-r-md); background: var(--st-surface); color: var(--st-ink); }
 .attach-preview::backdrop { background: rgb(0 0 0 / 60%); }
+/* the head, the tools and the foot always shown; the picture or the text scrolls between them */
+.attach-preview[open] { display: flex; flex-direction: column; }
+.attach-preview__head, .attach-preview__tools, .attach-preview__foot { flex: none; }
+.attach-preview__body { flex: 1 1 auto; min-height: 0; overflow: auto; }
 .attach-preview__head { display: flex; align-items: center; gap: var(--st-s-2); padding: 6px 6px 6px 14px; border-bottom: 1px solid var(--st-line); }
 .attach-preview__name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--st-fs-sm); }
 .attach-preview__body img { display: block; max-width: min(92vw, 1100px); max-height: calc(90vh - 52px); margin: 0 auto; }
+/* the picture with its paint and boxes over it, the same size; the tools and the button that keeps them for the next
+   message around it.  Painting and drawing go to the layer of the mode chosen */
+.attach-preview__modes { display: flex; gap: 4px; flex: none; }
+.attach-preview__mode[aria-pressed=true] { background: var(--st-accent-tint); border-color: var(--st-accent); }
+.attach-preview__tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--st-s-2); padding: 0 14px; }
+.attach-preview__tools:not(:empty) { padding: 8px 14px; border-bottom: 1px solid var(--st-line); }
+.attach-preview__tool { display: inline-flex; align-items: center; gap: 6px; font-size: var(--st-fs-sm); }
+.attach-preview__box { display: flex; flex-wrap: wrap; gap: var(--st-s-2); width: 100%; }
+.attach-preview__box .st-input { flex: 1 1 160px; min-width: 0; }
+.attach-preview__box select.st-input { flex: 0 0 auto; }
+.attach-preview__stage { position: relative; width: fit-content; margin: 0 auto; touch-action: none; }
+.attach-preview__stage img { max-height: calc(90vh - 240px); }
+.attach-preview__paint { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .5; pointer-events: none; }
+.attach-preview__boxes { position: absolute; inset: 0; pointer-events: none; }
+.attach-preview__stage[data-mode=mask] .attach-preview__paint { pointer-events: auto; cursor: crosshair; }
+.attach-preview__stage[data-mode=boxes] .attach-preview__boxes { pointer-events: auto; cursor: crosshair; }
+.attach-preview__stage:not([data-mode=boxes]) .img-box { pointer-events: none; }
+.attach-preview__foot { display: flex; justify-content: flex-end; gap: var(--st-s-2); padding: 0 14px; }
+.attach-preview__foot:not(:empty) { padding: 8px 14px; border-top: 1px solid var(--st-line); }
+/* a picture marked for the next message (imageMarks): its chip says so, and in the chat its frame and a label over it */
+.marks-badge { flex: none; padding: 1px 6px; border-radius: var(--st-r-pill); background: var(--st-accent); color: var(--st-accent-ink);
+               font-size: 11px; line-height: 16px; }
+.msg-image-wrap, a[data-gen-image] { position: relative; display: inline-block; }
+.msg-image-wrap.is-marked img, a[data-gen-image].is-marked img { outline: 3px solid var(--st-accent); outline-offset: 2px; }
+.msg-image-wrap.is-marked::after, a[data-gen-image].is-marked::after {
+  content: attr(data-marks); position: absolute; left: 6px; top: 6px; padding: 1px 6px; border-radius: var(--st-r-pill);
+  background: var(--st-accent); color: var(--st-accent-ink); font-size: 11px; line-height: 16px; pointer-events: none; }
 .attach-preview__body pre { margin: 0; padding: 12px 14px; max-height: calc(90vh - 52px); overflow: auto; white-space: pre-wrap;
                             overflow-wrap: anywhere; font: var(--st-fs-xs)/1.5 var(--st-font-mono); }
 .tool-images { justify-content: flex-start; margin: var(--st-s-2) 0; }
@@ -95,6 +126,21 @@ main { flex: 1; min-height: 0; display: flex; }
 .image-toggle[aria-pressed="true"] { background: var(--st-accent-tint); color: var(--st-accent-text); border: 2px solid var(--st-accent);
   font-weight: 700; }
 .image-toggle[aria-pressed="true"]:hover { border-color: var(--st-accent-hover); }
+/* Stop, the image switch and Send: one group that does not break, at the row's end; the row wraps before it runs over */
+.composer-send { display: inline-flex; align-items: center; gap: 6px; flex: none; margin-left: auto; }
+/* one row at any width: every tool keeps its size, and the images choice alone gives way, scrolled sideways in its
+   box (chat-images-box) when the row is short of room */
+.st-composer__bar { flex-wrap: nowrap; min-width: 0; }
+.st-composer__bar > * { flex: none; }
+.st-composer__bar > .spacer { flex: 1 1 0; min-width: 0; }
+.st-composer__bar > .chat-images-box { flex: 0 1 auto; min-width: 56px; overflow-x: auto; overflow-y: hidden; scrollbar-width: thin;
+                                       border-radius: var(--st-r-md); }
+.chat-images-box[hidden] { display: none; }
+.chat-images-box .chat-images { max-width: none; width: auto; }
+@media (max-width: 1100px) {
+  .composer-hint, .chat-settings-label { display: none; }
+  .chat-settings-short { display: inline; }
+}
 .st-composer.image-always { border-color: var(--st-accent); box-shadow: 0 0 0 1px var(--st-accent), var(--st-sh-bar); }
 .attachments { display: flex; flex-wrap: wrap; gap: var(--st-s-2); padding: 2px 4px 0; }
 .st-composer.dragging { outline: 2px dashed var(--st-accent); outline-offset: 3px; }
@@ -249,7 +295,6 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
   .st-btn--icon, .st-composer__bar .st-btn--icon { width: 40px; height: 40px; }
   .st-btn--send { width: 44px; }
   .st-msg__meta .st-btn--icon, .facts .st-btn--icon { width: 40px; height: 40px; }
-  .st-composer__bar { flex-wrap: wrap; }
   .tool-call__pre, .st-code pre, .table-wrap { max-width: 100%; }
 }
 /* phones: the Monitor's cards two to a row and smaller, so its state, GPUs and requests fit in a few screens */
@@ -440,8 +485,31 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 @media (max-width: 640px) {
   .chat-settings-label, .composer-hint { display: none; }
   .chat-settings-short { display: inline; }
-  .st-btn--send { margin-left: auto; }
+  /* the message box's tools in as few rows as they fit: the image switch by its icon, the images choice narrower */
+  .image-toggle { width: 40px; padding: 0; justify-content: center; }
+  .image-toggle__label { display: none; }
+  .st-composer__bar { gap: 4px; }
+  .st-composer__bar .chat-images { padding: 0 6px; }
 }
+@media (max-width: 480px) {
+  .chat-settings-short { display: none; }               /* the settings button by its icon too */
+  .chat-settings-button, .image-toggle { width: 36px; padding: 0; justify-content: center; }
+  .st-composer__bar .st-btn--icon { width: 34px; }
+  .st-composer { padding: 8px 6px; }
+  .st-composer__bar .chat-images { padding: 0 4px; }
+  #stop-btn span { display: none; }                      /* Stop by its icon */
+  #stop-btn { width: 36px; padding: 0; justify-content: center; }
+  .st-btn--send { width: 40px; }
+  #export-btn { display: none; }                         /* Chat settings has it (drawer-export) */
+}
+@media (max-width: 360px) {
+  .st-composer__bar { gap: 2px; }
+  .st-composer__bar .st-btn--icon, .chat-settings-button, .image-toggle, #stop-btn { width: 32px; }
+  .st-composer__bar > .chat-images-box { min-width: 30px; }
+  .st-btn--send { width: 38px; }
+}
+.drawer-export { display: none; }
+@media (max-width: 480px) { .drawer-export { display: inline-flex; } }
 @media (max-width: 760px) {
   /* the list is an overlay here: the chat keeps the whole width when it is closed to its rail */
   .view--chat { position: relative; }

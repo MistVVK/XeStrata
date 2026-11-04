@@ -2244,6 +2244,97 @@ def skill(name: str) -> str:
     return re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.S).strip()
 
 
+def fit_mask(mask: bytes, image: bytes) -> bytes:
+    """A mask the web page painted at the size it showed the image, at the image's own size (nearest pixels)."""
+    import io
+    from PIL import Image
+    try:
+        m, im = Image.open(io.BytesIO(mask)), Image.open(io.BytesIO(image))
+    except Exception as e:
+        raise ImageRequestError(f"mask: the PNG could not be read ({e})") from None
+    if m.size == im.size:
+        return mask
+    out = io.BytesIO()
+    m.convert("RGBA").resize(im.size, Image.NEAREST).save(out, format="PNG")
+    return out.getvalue()
+
+
+def user_marks(want: dict, load, file) -> dict:
+    """strata_images' edit and layout, what the user marked on an image in the web page's preview, into ImageTools'
+    `user`: {"edit": {"image": a data: URL or a /v1/images/files/ link, "mask": {"image_url": a data: URL}}} - the
+    picture and the paint over the part to change; {"layout": {"items": [{"label", "caption", "text", "box": [x0, y0,
+    x1, y1] in shares of the sides}], "size": "WxH", "image": the picture they were drawn on}} - MOSS-Image's boxes, in
+    pixels of that size.  `load` reads a
+    data: URL, `file` a kept image by its file name."""
+    out: dict = {}
+    edit = want.get("edit")
+    if edit is not None:
+        mask = edit.get("mask") if isinstance(edit, dict) else None
+        url = mask.get("image_url") if isinstance(mask, dict) else None
+        which = edit.get("image") if isinstance(edit, dict) else None
+        if not (isinstance(url, str) and url.startswith("data:")) or not isinstance(which, str):
+            raise ImageRequestError('strata_images.edit: {"image": a data: URL or a /v1/images/files/ link, '
+                                    '"mask": {"image_url": a data: URL}}')
+        kept = FILE_REF.search(which)
+        image = file(kept.group(1)) if kept else load(which) if which.startswith("data:") else None
+        if image is None:
+            raise ImageRequestError("strata_images.edit: the image is not here (a kept image the server let go?)")
+        out["image"], out["mask"] = image, load(url)
+    layout = want.get("layout")
+    if layout is not None:
+        size = layout.get("size") if isinstance(layout, dict) else None
+        items = layout.get("items") if isinstance(layout, dict) else None
+        if not isinstance(size, str) or not re.fullmatch(r"\d+x\d+", size) or not isinstance(items, list) or not items:
+            raise ImageRequestError('strata_images.layout: {"items": [{"label", "caption", "text", "box"}], '
+                                    '"size": "WxH"}')
+        w, h = (int(v) for v in size.split("x"))
+        drawn = []
+        for it in items:
+            box = it.get("box") if isinstance(it, dict) else None
+            if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) and
+                                                                    not isinstance(v, bool) for v in box)):
+                raise ImageRequestError("strata_images.layout: each item's box is [x0, y0, x1, y1] in shares")
+            drawn.append({**{k: it[k] for k in ("label", "caption", "text") if isinstance(it.get(k), str)},
+                          "bbox": [round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)]})
+        out["layout"], out["size"] = {"items": drawn}, (w, h)
+        which = layout.get("image")                    # the picture they were drawn on (a mask's edit redraws it)
+        if isinstance(which, str) and "image" not in out:
+            kept = FILE_REF.search(which)
+            image = file(kept.group(1)) if kept else load(which) if which.startswith("data:") else None
+            if image is not None:
+                out["image"] = image
+    return out
+
+
+def note_marks(messages: list, user: dict) -> None:
+    """The marks the user made (user_marks) said in their last message too, after what they wrote: the words alone ("do
+    this edit") do not say what to do, and the model asked back instead of calling the tool the marks are for."""
+    parts = []
+    if user.get("mask") is not None:
+        parts.append("a mask painted over the part of the image to change")
+    if user.get("layout") is not None:
+        parts.append(f"boxes for where things go ({user_layout_words(user['layout'])})")
+    if not parts:
+        return
+    note = (f"[In the page, the user marked the image: {'; '.join(parts)}. They are what to make: call "
+            f"{'edit_image' if user.get('mask') is not None else 'generate_image'} now; it applies them.]")
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [*content, {"type": "text", "text": note}]
+        else:
+            msg["content"] = f"{content or ''}\n\n{note}".lstrip()
+        return
+
+
+def user_layout_words(layout: dict) -> str:
+    """The boxes the user drew, as the tool's description names them."""
+    return "; ".join(f"{it.get('label', 'object')} \"{it.get('text') or it.get('caption') or ''}\""
+                     for it in layout.get("items", []))
+
+
 class ImageTools:
     """generate_image and edit_image for a chat (or Responses) request that asks for them: the model writes a call,
     the server makes the image in the GPU's turn as /v1/images does, keeps it (/v1/images/files/), and the call's
@@ -2255,7 +2346,7 @@ class ImageTools:
     (template_tools, routes, call, settings)."""
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
-                 model: str | None = None, mask: bytes | None = None):
+                 model: str | None = None, mask: bytes | None = None, user: dict | None = None):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
         if model is not None:   # the request's own image model (strata_images {"model": ...}): that one alone
@@ -2264,6 +2355,15 @@ class ImageTools:
                 raise ValueError(f"strata_images: model must be one of "
                                  f"{', '.join(images.gens if isinstance(images, ImageModels) else [gen.model])}")
             self.models = None
+        self.user = user or {}
+        if self.user.get("layout") is not None:   # the user's boxes are MOSS-Image's: a model of its, chosen or not
+            every = list(images.gens.values()) if isinstance(images, ImageModels) else [gen]
+            moss = [g for g in every if g.family == "moss-image"]
+            if not moss:
+                raise ImageRequestError("strata_images.layout: the boxes are MOSS-Image's, and no MOSS-Image model is "
+                                        "installed here")
+            if self.models is None and gen.family != "moss-image":
+                gen = moss[0]
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
         # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
         # background, over what the model's call says (size "auto": the call's)
@@ -2274,6 +2374,8 @@ class ImageTools:
         self.max_calls: int | None = None  # a Responses request's max_tool_calls: the calls that run, at most
         self.calls = 0
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
+        # what the user marked on an image in the web page's preview (strata_images' edit and layout, user_marks):
+        # {"image": bytes, "mask": bytes} that edit_image takes, {"layout": ..., "size": (w, h)} generate_image does
         # a streamed Responses request's partial_images (the tool's, 1..3): each call's partial images, put here as
         # (index, the image in the tool's output_format) for run_with_mcp to send while the call runs
         self.partials: queue.Queue | None = None
@@ -2296,6 +2398,10 @@ class ImageTools:
             gens = self._gens(t["name"] == "edit_image")
             if not gens or t["name"] in exclude:
                 continue
+            # the user's boxes alone make a new image by them, as ComfyUI's MOSS-Image Layout Prompt does (the picture
+            # they were drawn on is the canvas' background only); with a mask too, the painted part is redrawn by them
+            if t["name"] == "edit_image" and self.user.get("layout") is not None and self.user.get("mask") is None:
+                continue
             t = dict(t)
             styles: dict[str, list[str]] = {}
             rules: dict[str, list[str]] = {}
@@ -2308,6 +2414,15 @@ class ImageTools:
                 + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
                    for name, models in styles.items() if (text := skill(name))]
                 + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
+            if t["name"] == "edit_image" and self.user.get("mask") is not None:
+                t["description"] += ("\n\nThe user has painted over an image the part to change (a mask): "
+                                     "edit_image changes that part of that image only; its image and mask are set.")
+            if self.user.get("layout") is not None:
+                t["description"] += ("\n\nThe user has drawn over an image where things go (boxes: "
+                                     f"{user_layout_words(self.user['layout'])}): "
+                                     + ("edit_image redraws the painted part by them" if t["name"] == "edit_image" else
+                                        "generate_image makes a new image by them")
+                                     + "; the boxes and the size are set (a layout you write is replaced).")
             moss = [g.model for g in gens if g.family == "moss-image"]
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])
@@ -2360,7 +2475,7 @@ class ImageTools:
     def has_image(self) -> bool:
         """Is there an image an edit could take (one this request made, a picture in the conversation, or a link to a
         kept one)?  Nothing is read."""
-        if self.made:
+        if self.made or self.user.get("image") is not None:
             return True
         for msg in self.messages:
             content = msg.get("content")
@@ -2402,7 +2517,15 @@ class ImageTools:
         urls: list[str] = []
         try:
             req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
-            if args.get("layout") not in (None, "", {}) and name == "generate_image":   # MOSS-Image's boxes
+            if self.user.get("layout") is not None:   # the user's boxes, at their size
+                w, h = self.user["size"]
+                req["size"] = f"{w}x{h}"
+                args = {**args, "layout": self.user["layout"]}
+            if args.get("layout") not in (None, "", {}):   # boxes, the user's or the model's: a MOSS-Image model
+                moss = [g.model for g in self._gens() if g.family == "moss-image"]
+                if moss and args.get("model") not in moss:
+                    args = {**args, "model": moss[0]}
+            if args.get("layout") not in (None, "", {}):   # MOSS-Image's boxes
                 layout = args["layout"]
                 if isinstance(layout, str):
                     try:
@@ -2421,10 +2544,16 @@ class ImageTools:
             if name == "generate_image":
                 job = parse_request(req, gen.cfg)
             elif name == "edit_image":
-                data = self._image(str(args.get("image") or ""))
+                mask = self.mask
+                if self.user.get("image") is not None:   # the image the user painted over or drew boxes on
+                    data = self.user["image"]
+                    if self.user.get("mask") is not None:
+                        mask = fit_mask(self.user["mask"], self.normalize(data))
+                else:
+                    data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
-                job = parse_edit_request(req, [self.normalize(data)], gen.cfg, self.mask)
+                job = parse_edit_request(req, [self.normalize(data)], gen.cfg, mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
             preview = None

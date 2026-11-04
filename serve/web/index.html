@@ -88,18 +88,22 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <button type="button" class="st-btn st-btn--secondary chat-settings-button" id="sampling-btn" title="Chat settings" aria-label="Chat settings" data-i18n-title="drawer.title" data-i18n-label="drawer.title">
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>
               <span class="chat-settings-label" data-i18n="drawer.title">Chat settings</span><span class="chat-settings-short" aria-hidden="true" data-i18n="drawer.short">Settings</span></button>
+            <!-- the images choice in a box of its own that scrolls sideways: it alone gives way, so the row stays one line -->
+            <span class="chat-images-box" id="chat-images-box" hidden>
             <select class="st-input chat-images" id="chat-images" title="Images in the chat: the model makes one when the conversation asks for it" aria-label="Images in the chat"
-                    data-i18n-title="chatImages.title" data-i18n-label="chatImages.label" hidden></select>
-            <select class="st-input chat-images" id="chat-search" title="Web search in the chat: the model searches when the question needs it" aria-label="Web search in the chat"
-                    data-i18n-title="chatSearch.title" data-i18n-label="chatSearch.label" hidden></select>
+                    data-i18n-title="chatImages.title" data-i18n-label="chatImages.label"></select>
+            </span>
             <span class="spacer"></span>
             <span class="composer-hint" id="composer-hint"></span>
-            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
+            <!-- Stop, the image switch and Send stay together, the switch always beside Send -->
+            <span class="composer-send">
+            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" aria-label="Stop" data-i18n-label="composer.stop" hidden>
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg><span data-i18n="composer.stop">Stop</span></button>
             <button type="button" class="st-btn image-toggle" id="image-btn" aria-pressed="false" title="Always make an image: while on, every answer makes or edits an image" data-i18n-title="composer.image" hidden>
               <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span class="image-toggle__label">Always image: off</span></button>
             <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send" data-i18n-label="composer.send">
               <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
+            </span>
           </div>
         </form>
       </div>
@@ -423,6 +427,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <div class="toggle-row" id="script-ctx-row"><span><span data-i18n="drawer.scriptContext">Allow the characters in the conversation</span><br><span class="muted small"
       data-i18n="drawer.scriptContextNote">Text in another language pasted into the question can be quoted or translated in the answer</span></span>
       <button class="st-toggle" id="s-scriptctx" role="switch" aria-checked="true" aria-label="Allow the characters in the conversation" data-i18n-label="drawer.scriptContext"></button></div>
+    <div class="st-field" id="search-row" hidden>
+      <label class="st-label" for="chat-search"><span data-i18n="chatSearch.label">Web search in the chat</span></label>
+      <select class="st-input" id="chat-search" title="Web search in the chat: the model searches when the question needs it"
+              data-i18n-title="chatSearch.title"></select>
+      <span class="muted small" data-i18n="chatSearch.title">Web search in the chat: the model searches when the question needs it</span>
+    </div>
     <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>
@@ -460,6 +470,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         </div>
         <span class="muted small" id="o-busy"></span>
       </div>
+      <!-- the message box's Save, here on a narrow screen (where the box keeps its tools to one row) -->
+      <button type="button" class="st-btn st-btn--secondary drawer-export" id="drawer-export" data-i18n="composer.save">Save this chat as Markdown</button>
     </div>
 
     <div class="drawer-actions">

@@ -66,7 +66,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
-from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
+from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
                             custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
                             literal_tags, thinking_signature, mark_think_literals,
@@ -82,7 +82,8 @@ from serve import loop_guard  # noqa: E402
 from serve import debuglog  # noqa: E402
 from serve import script_guard  # noqa: E402
 from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
-                              extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
+                              call_names_grammar, extract_json, prepare_format, strict_schemas, tool_grammar,
+                              validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -5220,6 +5221,11 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             written = force                             # (a grammar's prefix: the reply starts with it)
             opening, force = parser.feed(force), None
+        # a forced call waiting for the thinking to end: the model's own call opening (one token, Qwen's <tool_call>)
+        # is not taken there, and the forced opening goes in its place - else the model's call, of a tool the force
+        # does not name (one it made up), dropped the force and was refused as undeclared, and nothing was called
+        enc = self.tok.encode(CALL_START, parse_special=True) if force else []
+        call_tok = enc[0] if len(enc) == 1 else None
         tail = ""                                       # the last characters written (the newlines before a call)
         one_done = False                                # one_call: the reply's one call has been written
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
@@ -5323,8 +5329,19 @@ class Service:
                                 **sampling["strata_grammar"], "prefix": written + self.tok.decode(raw_ids)}}
                         # the loop guard's short repetition penalty after a loop: an engine call of its own, which
                         # ends where it ends (the request's own sampling after it); else the request's sampling
-                        smp_call, n_call = guard.sampling(sampling, n, max_new - n) if guard is not None \
-                            else (sampling, max_new - n)
+                        # the room this pass has: the reply's own, and the context's (a pass after the server wrote
+                        # into the reply - a forced call's opening, a wrap-up - reads it encoded whole, which can be a
+                        # token or two longer than the pieces counted, and the engine refuses prompt + max_new + 8 over
+                        # its context)
+                        left = max_new - n
+                        ctx = getattr(self.engine, "max_context", 0) or 0
+                        if ctx:
+                            left = min(left, ctx - CTX_SLACK - len(prompt))
+                        if left < 1:
+                            finish = "length"
+                            break
+                        smp_call, n_call = guard.sampling(sampling, n, left) if guard is not None \
+                            else (sampling, left)
                         if guard is not None and guard.events:
                             # after a loop the rest of the reply routes the experts exactly: the engine's
                             # STRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
@@ -5364,6 +5381,9 @@ class Service:
                                         break
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    break
+                                if force and t == call_tok and parser.state == "content":
+                                    opens = True        # the model opens a call before the forced one: that one here
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -5945,6 +5965,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         rounds += 1
         force = None
+        if isinstance(sampling, dict) and sampling.get("strata_grammar_first_round"):   # the forced call's name only
+            sampling = {k: v for k, v in sampling.items() if k not in ("strata_grammar", "strata_grammar_first_round")}
         results = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
@@ -8331,19 +8353,31 @@ def make_handler(svc: Service):
             # are the request's only tools
             want = req.get("strata_images")
             image_force = isinstance(want, dict) and want.get("force") is True
+            image_force_names: list = []
             if image_force and (svc.images is None or force or tool_choice_of(req.get("tool_choice"))[0] == "none"):
                 raise ValueError("strata_images.force: " + ("this server makes no images" if svc.images is None else
                                                             "it is a tool_choice of its own; send none beside it"))
             if (want is True or isinstance(want, dict)) and svc.images is not None:
+                # what the user marked in the web page's preview: the mask over an image an edit takes, the boxes of
+                # MOSS-Image's layout (images_api.user_marks)
+                user = images_api.user_marks(want, Vision.load, lambda n: (
+                    (f := svc.images.file(n)) and f.read_bytes())) if isinstance(want, dict) else None
                 image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
-                                                    model=want.get("model") if isinstance(want, dict) else None)
+                                                    model=want.get("model") if isinstance(want, dict) else None,
+                                                    user=user)
+                if user:
+                    images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if image_force:
                     if not more:
                         raise ValueError("strata_images.force: the image tools are not available for this request")
-                    tools, extra, hubs = None, list(more), []
+                    # the request's own tools stay declared (the page's memory tools: a call of them after the image
+                    # is the page's to run, not text in the answer); the forced call is of an image tool, its name
+                    # kept to them by a grammar where the engine takes one (call_names_grammar, the first round)
+                    extra, hubs = list(more), []
                     force = forced_call("required", more, getattr(svc.template, "call_form", "qwen"))
+                    image_force_names = [t["name"] for t in more]
                 if more:
                     extra += [] if image_force else more
                     hubs.append(image_tools)
@@ -8384,12 +8418,19 @@ def make_handler(svc: Service):
             form = getattr(svc.template, "call_form", "qwen")
             # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
             strict, patterns = constrained_tools(req.get("tools"))
-            svc.attach_grammar(req, answer_grammar(req.get("response_format"), thinking) if validator is not None
-                               else tool_grammar(tools, strict, patterns, thinking, form))
+            grammar = answer_grammar(req.get("response_format"), thinking) if validator is not None \
+                else tool_grammar(tools, strict, patterns, thinking, form)
+            if grammar is None and image_force_names and len(image_force_names) > 1:
+                grammar = call_names_grammar(image_force_names, thinking, form)
+                req["strata_grammar_first_round"] = grammar is not None
+            svc.attach_grammar(req, grammar)
             svc.check_strict(req, tools, strict)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+            # with `force` (the image button's call): with thinking, the call opens where the thinking ends - without it
+            # here the forced call of a thinking reply never opened, and the model wrote whatever it liked
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
-                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
+                               thinking, max_new, max_req, req, cancel, {t["name"] for t in extra},
+                               force=force) if use_mcp else None
             if n > 1:
                 first = (ids, thinking, max_new)
 
@@ -8726,12 +8767,15 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e), "top_logprobs") from None
             # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
             choice = responses_api.forced_choice(req)
+            image_forced = isinstance(choice, dict) and choice.get("type") == "image_generation"
             try:
-                if isinstance(choice, dict) and choice.get("type") == "image_generation":
+                if image_forced:
                     if not image_names:
                         raise ValueError("tool_choice image_generation: the request has no image_generation tool "
                                          "this server can run")
-                    tools, choice = [t for t in tools or [] if t["name"] in image_names], "required"
+                    # as OpenAI's: the hosted tool's call is forced, the request's other tools stay declared (the
+                    # forced call below, among the image tools alone)
+                    choice = "auto"
                 if isinstance(choice, dict) and str(choice.get("type")).startswith("web_search"):
                     if not search_names:
                         raise ValueError(f"tool_choice {choice.get('type')}: the request has no web search tool this "
@@ -8741,6 +8785,9 @@ def make_handler(svc: Service):
                                                               **({k: search_names for k in hosted}
                                                                  if search_names else {})})
                 force = forced_call(choice, tools, getattr(svc.template, "call_form", "qwen"))
+                if image_forced:
+                    force = forced_call("required", [t for t in tools or [] if t["name"] in image_names],
+                                        getattr(svc.template, "call_form", "qwen"))
             except ValueError as e:
                 raise ResponsesError(str(e), "tool_choice") from None
             try:
@@ -8800,10 +8847,12 @@ def make_handler(svc: Service):
                 responses_api.prompt_made(req, shown)
             req = dict(req)
             strict, patterns = constrained_tools(responses_api.given_tools(req))   # namespaces' and additional_tools'
-            svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
-                               if validator is not None and not tools
-                               else tool_grammar(tools, strict, patterns, thinking,
-                                                 getattr(svc.template, "call_form", "qwen")))
+            grammar = answer_grammar(responses_api.text_format(req), thinking) if validator is not None and not tools \
+                else tool_grammar(tools, strict, patterns, thinking, getattr(svc.template, "call_form", "qwen"))
+            if grammar is None and image_forced and len(image_names) > 1:   # the forced call's name: an image tool's
+                grammar = call_names_grammar(image_names, thinking, getattr(svc.template, "call_form", "qwen"))
+                req["strata_grammar_first_round"] = grammar is not None
+            svc.attach_grammar(req, grammar)
             svc.check_strict(req, tools, strict)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
