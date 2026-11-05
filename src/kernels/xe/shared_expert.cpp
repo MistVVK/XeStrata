@@ -271,31 +271,4 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     if (!stream) core::Runtime::get().finish(q);
 }
 
-namespace {
-// double, in the reference's order (float without FP64); the shared output is added plain
-template <typename D>
-sycl::event moe_combine_t(sycl::queue& q, const float* parts, const float* weights, const float* shared, float* y, int n,
-                          int kk) {
-    return q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const int j = (int) id[0];
-        D acc = 0;
-        for (int i = 0; i < kk; ++i) acc += (D) weights[i] * (D) parts[(size_t) i * n + j];
-        if (shared) acc += (D) shared[j];
-        y[j] = (float) acc;
-    });
-}
-}  // namespace
-
-void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream) {
-    if (n_embd <= 0 || k <= 0) return;
-    // k > 64 is refused rather than truncated
-    if (k > 64) throw core::DeviceError("moe_combine: k = " + std::to_string(k) + " exceeds 64");
-    const int n = (int) n_embd, kk = (int) k;
-    auto& q = queue_for(stream);
-    const auto e = xe::has_fp64(q) ? moe_combine_t<double>(q, parts, weights, shared, y, n, kk)
-                                   : moe_combine_t<float>(q, parts, weights, shared, y, n, kk);
-    if (!stream) core::Runtime::get().wait(e, "moe_combine");
-}
-
 }  // namespace strata::kernels

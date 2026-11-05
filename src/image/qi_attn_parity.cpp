@@ -244,7 +244,6 @@ int check() {
     ref_rms = std::sqrt(ref_rms / (double) (T * C));
     uint16_t *q = up(dev, qh), *kd = up(dev, kh), *v = up(dev, vh);
     uint16_t* out = dev.alloc<uint16_t>((size_t) (T * C));
-    float* scratch = dev.alloc<float>((size_t) (T * C));
     // the RMS error over rows r0 .. T - 1 of `got` (head h's column taken from head h + shift there)
     auto rms_err = [&](const std::vector<double>& got, int64_t r0, int64_t shift) {
         double e = 0.0;
@@ -264,7 +263,7 @@ int check() {
         return d;
     };
     int fails = 0;
-    si::qi_attention(q, kd, v, T, H, D, n_text, out, scratch, nullptr);
+    si::qi_attention(q, kd, v, T, H, D, n_text, out, nullptr);
     const double e16 = rms_err(fetch(), 0, 0) / ref_rms;
     std::printf("  16-bit path (%s)          RMS error %.3e of the output's (at most 1e-02) %s\n", si::qi_attention_path(),
                 e16, e16 <= 1e-2 ? "ok" : "FAIL");
@@ -299,7 +298,6 @@ int bench(int64_t T, int64_t n_text) {
     inputs(T, qh, kh, vh);
     uint16_t *q = up(dev, qh), *kd = up(dev, kh), *v = up(dev, vh);
     uint16_t* out = dev.alloc<uint16_t>((size_t) (T * C));
-    float* scratch = dev.alloc<float>((size_t) (T * C));
     // the median of 21 runs after one (a run's time on this GPU varies by a fifth from one to the next)
     auto ms = [&](auto&& f) {
         f();
@@ -319,7 +317,7 @@ int bench(int64_t T, int64_t n_text) {
         si::qi_sdpa(q, kd, v, n_text, T, T, H, D, out, nullptr);
         par::copy_out(&one, out, 1);
     })
-                             : ms([&] { si::qi_attention(q, kd, v, T, H, D, n_text, out, scratch, nullptr); });
+                             : ms([&] { si::qi_attention(q, kd, v, T, H, D, n_text, out, nullptr); });
     std::printf("%lld rows (%lld before the image rows): 16-bit %s %.3f ms", (long long) T, (long long) n_text,
                 maker ? "(the maker's kernel, the image rows)" : "(qi_attention, every row)", f16);
     if (si::qi_attention_i8(q, kd, v, T, H, n_text, 0, out, nullptr))

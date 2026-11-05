@@ -246,7 +246,6 @@ private:
     float *sc_ = nullptr;                     // a head's scores [Tq][Tk]
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *o16_ = nullptr, *qh16_ = nullptr, *p16_ = nullptr;
-    float* attn_scratch_ = nullptr;
     int64_t jrows_ = 0;
     int64_t dirty_[2] = {0, 0};
     bool lora_bake_ = true, baked_any_ = false;

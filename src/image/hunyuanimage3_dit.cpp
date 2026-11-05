@@ -74,7 +74,6 @@ uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d) {
     f32(T * d.experts);                       // logits
     f32(2 * T * d.hidden);                    // xn32, xn232 (the norms, FP32 up to the rotation)
     f32(T * (d.head_dim / 2));                // ang
-    f32(rows * d.heads * d.head_dim);         // attn_scratch: the plain attention's FP32 output
     f32(2 * T * d.topk);                      // d_w, d_tw
     b += (uint64_t) std::max<int64_t>(2 * T * d.topk, 1) * sizeof(int32_t);   // d_rows, d_idx
     b += (uint64_t) (2 * d.experts + 1) * sizeof(int32_t);                 // d_bounds, d_cursor
@@ -114,7 +113,6 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
         sc.xn32 = take_as<float>(owned, T * d.hidden, "xn32");
         sc.xn232 = take_as<float>(owned, T * d.hidden, "xn232");
         sc.ang = take_as<float>(owned, T * (d.head_dim / 2), "ang");
-        sc.attn_scratch = take_as<float>(owned, hdots, "attn_scratch");
         sc.d_rows = take_as<int32_t>(owned, T * d.topk, "d_rows");
         sc.d_w = take_as<float>(owned, T * d.topk, "d_w");
         sc.d_tw = take_as<float>(owned, T * d.topk, "d_tw");
@@ -133,7 +131,7 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
 void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc) {
     const void* ps[] = {sc.xr16, sc.ar16, sc.xr216, sc.a16, sc.gx16, sc.q16, sc.k16, sc.v16, sc.act16, sc.gact16,
                         sc.egu16, sc.edn16, sc.qkv32, sc.o32, sc.gu32, sc.eg32, sc.ed32, sc.logits, sc.ang,
-                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds, sc.d_cursor};
+                        sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds, sc.d_cursor};
     for (const void* p : ps)
         if (p != nullptr) gpu::free(p);
     sc = HunyuanImage3Scratch{};
@@ -177,7 +175,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
                            sc.v16, stream);
         // the rows T .. qi_attn_rows(T) of q, k and v are the attention's padding: hunyuanimage3_scratch_alloc zeroed them,
         // and a sequence changes T only by going through a new scratch
-        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, sc.attn_scratch, stream,
+        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, stream,
                      key_lim);
         hunyuanimage3_rotate16(sc.a16, T, d.hidden, d.rotate, sc.ar16, stream);
         gemm.f16(sc.ar16, w.o, sc.o32, T, w.o_n, w.o_k);

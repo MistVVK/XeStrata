@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/kernels/xe/attn_parts.hpp - the parts the attention kernels share (flash_attn.cpp, qsa_prompt_attn.cpp,
-// src/image/qi_attn.cpp): the FP16 matrix engines' tiles in one form (joint_matrix's, RDNA's WMMA instructions), the
-// form a device takes, and the K/V cache's formats read as FP16.
+// src/kernels/xe/attn_parts.hpp - the parts the attention kernels share (flash_attn.cpp, src/image/qi_attn.cpp): the
+// FP16 matrix engines' tiles in one form (joint_matrix's, RDNA's WMMA instructions), the form a device takes, and the
+// K/V cache's formats read as FP16.
 #pragma once
 
 #include "amd_wmma.hpp"
@@ -132,14 +132,39 @@ inline int pool_format(const QsaAttnPools& p) {
 }
 
 using h8 = sycl::vec<uint16_t, 8>;
+using u32x2 = uint32_t __attribute__((ext_vector_type(2)));   // one 8- or 16-byte access (sycl::vec is split on NVPTX)
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+
+// 8 int8 codes (two words) as 8 FP16 halves (four words of two), two at a time: code + 128 in the low mantissa bits
+// of 1024 (0x6400) is exactly 1152 + code, and 1152 comes off in one two-half subtraction.  [[maybe_unused]]: only
+// the device code calls it.
+[[maybe_unused]] inline u32x4 i8x8_to_h8(u32x2 w) {
+    u32x4 r = {0, 0, 0, 0};
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t x = w[k / 2] >> (16 * (k % 2));
+        const uint32_t b = (((x & 0xFFu) | ((x & 0xFF00u) << 8)) ^ 0x00800080u) | 0x64006400u;
+        const sycl::vec<sycl::half, 2> h =
+            sycl::bit_cast<sycl::vec<sycl::half, 2>>(b) - sycl::vec<sycl::half, 2>(sycl::half(1152.0f));
+        r[k] = sycl::bit_cast<uint32_t>(h);
+    }
+    return r;
+}
 
 // 8 values of an INT8 pool row (codes with an FP16 scale per 64 values) from element dd on, as FP16 bits: the codes
-// are exact in FP16 and so is their product with the scale before its one rounding
+// are exact in FP16 and so is their product with the scale before its one rounding.  Intel's GPUs convert them in one
+// instruction; elsewhere i8x8_to_h8's mantissa trick (the convert was 10% slower on Xe, flash_attn.cpp's selection form)
 template<int HD>
 inline h8 i8_row8(const int8_t* codes, const uint16_t* scales, int64_t row, int dd) {
-    const auto c = *reinterpret_cast<const sycl::vec<int8_t, 8>*>(codes + row * HD + dd);
     const sycl::half sc = sycl::bit_cast<sycl::half>(scales[row * (HD / 64) + dd / 64]);
-    const sycl::vec<sycl::half, 8> v = c.template convert<sycl::half>() * sycl::vec<sycl::half, 8>(sc);
+#if STRATA_DEVICE_NOT_INTEL
+    const u32x4 w = i8x8_to_h8(*reinterpret_cast<const u32x2*>(codes + row * HD + dd));
+    const sycl::vec<sycl::half, 8> c =
+        sycl::bit_cast<sycl::vec<sycl::half, 8>>(sycl::vec<uint32_t, 4>(w[0], w[1], w[2], w[3]));
+#else
+    const sycl::vec<sycl::half, 8> c =
+        (*reinterpret_cast<const sycl::vec<int8_t, 8>*>(codes + row * HD + dd)).template convert<sycl::half>();
+#endif
+    const sycl::vec<sycl::half, 8> v = c * sycl::vec<sycl::half, 8>(sc);
     return v.template as<h8>();
 }
 

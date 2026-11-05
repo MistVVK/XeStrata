@@ -718,7 +718,6 @@ void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
         gpu::copy(cos_id_, one.data(), one.size() * 4);
         gpu::copy(sin_id_, zero.data(), zero.size() * 4);
     }
-    if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, TP * C_);
     b0_img_ = alloc<float>(allocs_, hw * C_);
     xin_ = alloc<float>(allocs_, hw * in_ch_);
     b0_txt_ = alloc<float>(allocs_, max_text * C_);
@@ -737,13 +736,13 @@ void MfDit::drop_activations() {
     tq_ = tk_ = tv_ = rs_ = rs2_ = rs_io_ = rs_to_ = hs_ = vpart_ = nullptr;
     for (void* p : {(void*) img_, (void*) txt_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_,
                     (void*) h16_, (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) io16_,
-                    (void*) to16_, (void*) cos_, (void*) sin_, (void*) cos_id_, (void*) sin_id_, (void*) attn_scratch_,
+                    (void*) to16_, (void*) cos_, (void*) sin_, (void*) cos_id_, (void*) sin_id_,
                     (void*) b0_img_, (void*) b0_txt_, (void*) xin_, (void*) xq8_, (void*) lora_glora_y_,
                     (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
     xq8_ = nullptr;
     img_ = txt_ = q_ = k_ = v_ = a_ = gu_ = cos_ = sin_ = cos_id_ = sin_id_ = nullptr;
-    attn_scratch_ = b0_img_ = b0_txt_ = xin_ = nullptr;
+    b0_img_ = b0_txt_ = xin_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = io16_ = to16_ = nullptr;
     lora_f32_ = nullptr;
     lora16_ = nullptr;
@@ -1242,7 +1241,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
                         heads_, hd_, jq16_ + o + Lt * C, jk16_ + o + Lt * C, jv16_ + o + Lt * C, s_);
             // every row sees every key (the text rows too: Mage-Flow's joint attention has no mask), so all of
             // them go to the GPU maker's attention where there is one
-            qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, Lt + HW, heads_, hd_, 0, jo16_, attn_scratch_, s_);
+            qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, Lt + HW, heads_, hd_, 0, jo16_, s_);
             rows16(Heads{jo16_, hs_ + i * heads_, C, hd_}, Lt, C, to16_ + t0, rs_to_ + toff[(size_t) i], s_);
             rows16(Heads{jo16_ + Lt * C, hs_ + i * heads_, C, hd_}, HW, C, io16_ + i * HW * C, rs_io_ + i * HW, s_);
         }

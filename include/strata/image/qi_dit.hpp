@@ -250,7 +250,7 @@ private:
     int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
-    float *cos_ = nullptr, *sin_ = nullptr, *attn_scratch_ = nullptr;
+    float *cos_ = nullptr, *sin_ = nullptr;
     // the int8 products' activations (W::packed): xq_ for xq_bytes_
     bool packed_ = false;   // some block's products take them
     bool w8_ = false;       // some block's products are W8A8 ones (W::w8): xq_ holds their activations

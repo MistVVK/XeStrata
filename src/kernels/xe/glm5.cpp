@@ -12,6 +12,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_glm5
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -557,9 +558,9 @@ void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap,
     if (cap <= 0 || stride < cap + (tail_kpool > 1 ? tail_kpool - 1 : 0) || tail_kpool < 0 || tail_kpool == 1)
         throw core::DeviceError("glm5_latent_gather: cap " + std::to_string(cap) + ", stride " + std::to_string(stride));
     const int KP = tail_kpool;
-    const auto event = queue_for(stream).parallel_for(
-        sycl::range<2>((size_t) (n_tokens * stride), (size_t) W), [=](sycl::id<2> id) {
-            const int64_t t = (int64_t) id[0] / stride, j = (int64_t) id[0] % stride;
+    const auto event = for_rows_cols(queue_for(stream),
+        n_tokens * stride, W, [=](int64_t row, int64_t q) {
+            const int64_t t = row / stride, j = row % stride;
             const int64_t chosen = sycl::min<int64_t>(steps[t * kStepCount + kStepWidth], cap);
             const int32_t pos = steps[t * kStepCount + kStepPos];
             const int64_t tail0 = KP > 0 && pos >= 0 ? (int64_t) ((pos + 1) / KP) * KP : 0;
@@ -568,7 +569,7 @@ void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap,
             const int64_t c = j < chosen ? (int64_t) ids[t * cap + j] : tail0 + (j - chosen);
             const auto* src = reinterpret_cast<const sycl::uint4*>(latent + c * L);
             auto* dst = reinterpret_cast<sycl::uint4*>(out + (t * stride + j) * L);
-            dst[id[1]] = src[id[1]];
+            dst[q] = src[q];
         });
     sync_if_needed(stream, event, "glm5_latent_gather");
 }

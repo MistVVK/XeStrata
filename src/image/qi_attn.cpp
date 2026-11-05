@@ -4,7 +4,7 @@
 //
 // The 16-bit attention is the kernel the plain models' prompt shares (strata/kernels/flash_attn.hpp, on the
 // matrix engines); Q, K and V hold their rows rounded up to a multiple of 128 (qi_attn_rows), the rows past T zero.
-// A GPU without matrix engines, or STRATA_NO_XMX=1, takes qi_attention_plain.  The int8 attention below
+// A GPU without matrix engines, or STRATA_NO_XMX=1, takes its FMA form.  The int8 attention below
 // (SageAttention's scheme) is the image rows' own.
 #include "strata/image/qi_kernels.hpp"
 
@@ -1045,7 +1045,7 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
     bool use = false;
     try {
         strata::gpu::memset_async(qkv, 0, (size_t) (3 * TP * C) * 2, stream);
-        qi_attention(qkv, qkv + TP * C, qkv + 2 * TP * C, keys, heads, D, 0, out, nullptr, stream, nullptr,
+        qi_attention(qkv, qkv + TP * C, qkv + 2 * TP * C, keys, heads, D, 0, out, stream, nullptr,
                      keys - rows, true);
         q.wait();
         std::lock_guard<std::mutex> lock(ch.mu);
@@ -1062,7 +1062,7 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
 }
 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
+                  int64_t head_dim, int64_t n_text, uint16_t* out16, void* stream,
                   const int32_t* key_lim, int64_t first, bool int8,
                   const std::vector<std::pair<int64_t, int64_t>>* spans) {
     if (T <= first) return;
@@ -1103,7 +1103,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                 if (f16ms < 0.0) {
                     g_no_i8 = true;
                     f16ms = timed([&] {
-                        qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, scratch, stream, key_lim, first);
+                        qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
                         return true;
                     });
                     g_no_i8 = false;
@@ -1139,8 +1139,8 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     // block, the B70 4 (11.88 -> 11.44 ms), the RTX 4070 2 (11.55 -> 10.53 ms).  Until then, the most.
     static core::PerDevice<std::shared_ptr<std::atomic<int>>> tuned_of;
     std::atomic<int>& tuned = *tuned_of.get(q.get_device(), [] { return std::make_shared<std::atomic<int>>(0); });
-    // rows f .. e - 1 by the shared kernel (flash_attn.hpp), the dense layout
-    auto run = [&](int nsg, int64_t f, int64_t e) {
+    // rows f .. e - 1 by the shared kernel (flash_attn.hpp), the dense layout; `fma`: its FMA form (no matrix engines)
+    auto run = [&](int nsg, int64_t f, int64_t e, bool fma = false) {
         kernels::FlashAttnArgs a;
         a.q = q16;
         a.q_ld = heads * D;
@@ -1157,6 +1157,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         a.out = out16 + (f - first) * heads * head_dim;
         a.out_ld = heads * D;
         a.scale = 1.0f / std::sqrt((float) D);
+        a.fma = fma;
         return kernels::flash_attn(a, stream, nsg);
     };
     // The references' rows (spans) as image rows past a context of b keys, through the image rows' kernels (the int8
@@ -1168,7 +1169,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         if (p >= 0 && spans != nullptr)
             for (const auto& [a, b] : *spans) {
                 if (a < f || b > std::min(row_end, n_text)) continue;   // a span asked only in part: the kernel below
-                qi_attention(q16, k16, v16, b, heads, head_dim, a, out16 + (a - first) * heads * head_dim, scratch,
+                qi_attention(q16, k16, v16, b, heads, head_dim, a, out16 + (a - first) * heads * head_dim,
                              stream, nullptr, a, int8);
                 if (a > f) segs.emplace_back(f, a);
                 f = b;
@@ -1202,12 +1203,8 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     bool done = most > 0;
     for (const auto& [f, end] : segs)
         if (done) done = run(nsg, f, end);
-    if (!done) {
-        qi_attention_plain(q16, k16, v16, T, heads, head_dim, n_text, scratch, stream, key_lim);
-        kernels::f32_to_f16_bulk(scratch + first * heads * head_dim, out16, (row_end - first) * heads * head_dim,
-                                 stream);
-        return;
-    }
+    if (!done && !run(0, first, row_end, true))
+        throw std::invalid_argument("qi_attention: no form of the attention takes the shape");
     if (!stream) q.wait();
 }
 

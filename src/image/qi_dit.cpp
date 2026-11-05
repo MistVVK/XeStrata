@@ -440,8 +440,7 @@ void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64
 void QiDit::ensure(int64_t T, int64_t HW) {
     if (T > cap_T_) {
         for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_,
-                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_,
-                        (void*) attn_scratch_})
+                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_})
             if (p != nullptr) {
                 allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
                 gpu::free(p);
@@ -462,7 +461,6 @@ void QiDit::ensure(int64_t T, int64_t HW) {
         cos_ = alloc<float>(allocs_, T * kHead / 2);
         sin_ = alloc<float>(allocs_, T * kHead / 2);
         // the plain attention's FP32 output: only where the matrix engines' path is not taken
-        if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, T * C_);
         cap_T_ = T;
         dirty_T_ = 0;
         rope_H_ = rope_W_ = rope_text_ = -1;
@@ -726,7 +724,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             }
         }
         // the queries from r0 on: a cached prefix's rows are not asked again (an edit's references: most of them)
-        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, attn_scratch_, s_, key_lim_, r0, true,
+        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, s_, key_lim_, r0, true,
                      key_lim_ != nullptr ? &ref_spans_ : nullptr);
         const bool od = product(o16_ + r0 * C, wo, h_, Tr, 0, 0, -1, false, wo.lora == nullptr);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_, od ? &i8_ : nullptr);
@@ -817,8 +815,8 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
             gpu::copy_async(k16b, o.pk[(size_t) bi], bytes_b, s_);
             gpu::copy_async(v16b, o.pv[(size_t) bi], bytes_b, s_);
         }
-        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, attn_scratch_, s_, key_lim_, na, true);
-        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, attn_scratch_, s_, o.key_lim, nb, true);
+        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, s_, key_lim_, na, true);
+        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, s_, o.key_lim, nb, true);
         const bool od = product(o16_, wo, h_, R, 0, 0, -1, false, wo.lora == nullptr);
         qi_gate_add(x_, h_, mod(1), 0, R, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < R; m0 += mlp_rows_) {   // the MLP a band of rows at a time
@@ -836,11 +834,9 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
 
 uint64_t QiDit::activation_bytes(int64_t T, int64_t mlp_rows) const {
     const int64_t TP = qi_attn_rows(T), mr = std::min(T, mlp_rows > 0 ? mlp_rows : T);
-    const bool plain = std::strcmp(qi_attention_path(), "plain (FP32)") == 0;
     return (uint64_t) T * (uint64_t) C_ * 4 * 4 + (uint64_t) T * (uint64_t) std::max(C_, in_ch_) * 4 +
            (uint64_t) mr * 2 * (uint64_t) inter_ * 4 + (uint64_t) T * (uint64_t) std::max(C_, inter_) * 2 +
            (uint64_t) TP * (uint64_t) C_ * 2 * 3 + (uint64_t) T * (uint64_t) C_ * 2 + (uint64_t) T * kHead * 4 +
-           (plain ? (uint64_t) T * (uint64_t) C_ * 4 : 0) +
            (packed_ ? std::max(kernels::iq_mmq_act_bytes(T, C_), kernels::iq_mmq_act_bytes(mr, inter_)) : 0) +
            (w8_ ? (uint64_t) std::max(T * C_, mr * inter_) + (uint64_t) T * 8 : 0) +
            (lora_cols_ > 0 ? (uint64_t) std::max(T, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
@@ -1319,14 +1315,14 @@ void QiDit::drop_loras() {
 
 void QiDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_, (void*) q16_,
-                    (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, (void*) attn_scratch_, xq_,
+                    (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, xq_,
                     (void*) xs_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_,
                     (void*) lora_glora_sx_, lora_glora_xq_})
         if (p != nullptr) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
             gpu::free(p);
         }
-    x_ = q_ = k_ = v_ = h_ = gu_ = cos_ = sin_ = attn_scratch_ = nullptr;
+    x_ = q_ = k_ = v_ = h_ = gu_ = cos_ = sin_ = nullptr;
     xq_ = nullptr;
     xq_bytes_ = 0;
     xs_ = nullptr;

@@ -179,8 +179,9 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
     const bool scaled = scaling.type != RopeScalingType::None;
     const RopeKernelArgs ka = scaling.kernel_args(n_rot);
     const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
-    q.parallel_for(sycl::range<2>((size_t) rows, (size_t) width / 2), [=](sycl::id<2> id) {
-        const int row = (int) id[0], pair = (int) id[1];
+    // one dimension: a prompt's rows (tokens x heads) pass the 65,535 a GPU's first dimension takes
+    q.parallel_for(sycl::range<1>((size_t) rows * (size_t) (width / 2)), [=](sycl::id<1> id) {
+        const int row = (int) (id[0] / (size_t) (width / 2)), pair = (int) (id[0] % (size_t) (width / 2));
         const size_t start = size_t(row) * width;
         if (pair >= n_rot / 2) {
             if (x != out) {

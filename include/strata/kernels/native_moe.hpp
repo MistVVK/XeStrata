@@ -22,7 +22,8 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
 /// `shared_gate` (n_tok raw gates): the shared rows are scaled by their gate's sigmoid here, as shared_expert_multi's
 /// last step would have (upstream b08cf3e1: the same bits, one launch fewer).
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
-                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate = nullptr);
+                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate = nullptr,
+                              const int32_t* slot = nullptr);
 /// native_moe_combine_multi with moe_hit_add folded in (upstream a9917a55's STRATA_FUSE_HITS): the entries listed in
 /// dst[0, *count) (entry = token * k + expert, at most n_tok * k of them) read parts + hits, as the add moe_hit_add makes
 /// in place would leave them; the same bits, one launch fewer.  STRATA_FUSE_HITS=0: the two launches.

@@ -342,7 +342,7 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
             qi_repeat_kv16(v16_, T, heads_, kv_heads_, head_dim_, vx, s_);
             done = qi_sdpa(q16_, kx, vx, 0, T, T, heads_, head_dim_, h16_, s_, true);
         }
-        if (!done) {   // the attention the plain models' prompt shares (flash_attn.hpp), on the matrix engines
+        if (!done) {   // the attention the plain models' prompt shares (flash_attn.hpp)
             kernels::FlashAttnArgs fa;
             fa.q = q16_;
             fa.q_ld = heads_ * head_dim_;
@@ -357,11 +357,12 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
             fa.out_ld = heads_ * head_dim_;
             fa.scale = 1.0f / std::sqrt((float) head_dim_);
             done = kernels::flash_attn(fa, s_);
+            if (!done) {   // its FMA form (no matrix engines)
+                fa.fma = true;
+                done = kernels::flash_attn(fa, s_);
+            }
         }
-        if (!done) {
-            qi_attention_causal(q16_, k16_, v16_, T, heads_, kv_heads_, head_dim_, a_, s_);
-            kernels::f32_to_f16_bulk(a_, h16_, T * heads_ * head_dim_, s_);
-        }
+        if (!done) throw std::runtime_error("the text encoder's attention: no form takes its heads");
         gemm_.native(h16_, l.o.type, w(l.o), h_, T, l.o.n, l.o.k);
         lora_add(l.o, h16_, T, h_, l.o.n);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);

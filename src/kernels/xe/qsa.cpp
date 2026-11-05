@@ -8,6 +8,7 @@
 // separately rounded, which CUDA spelled with __dadd_rn/__dmul_rn.  A warp is a sub-group of 32.  The CUDA entry
 // points exited on a bad argument; these throw core::DeviceError.
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -27,7 +28,6 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int THREADS = 128;
 constexpr int WARP = 32;
 constexpr int TOPK_THREADS = 256;
 
@@ -106,6 +106,25 @@ const int32_t* step_upload_width(int64_t width, const QsaShapes& s) {
     return step_scratch();
 }
 
+// the FP16 appends through the cache's one append (kv_q8.hpp: kv_append_cells), its arithmetic f16(x)
+void kv_append_steps_host(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                          int step_stride, const float* kcur, const float* vcur, int cur_stride, int n_tok,
+                          const QsaShapes& s, void* stream, const KvHostPools* host) {
+    if (n_tok == 0) return;
+    KvAppend a;
+    a.step = step;
+    a.step_stride = step_stride;
+    a.k = kcur;
+    a.v = vcur;
+    a.cur_stride = cur_stride;
+    a.n_tok = n_tok;
+    a.k_pool = k_pool;
+    a.v_pool = v_pool;
+    a.page_table = page_table;
+    a.host = host;
+    kv_append_cells(a, s, stream);
+}
+
 }  // namespace
 
 // ================= THE CAPTURABLE ENTRY POINTS =================
@@ -114,55 +133,15 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream, const KvHostPools* host) {
     validate(s, "kv_append");
     if (step == nullptr) fail("kv_append: step is null");
-    const long long n = s.n_head_kv * s.head_dim;
-    const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
-    const KvHostPools hp = host ? *host : KvHostPools{};
-    const int32_t* table = page_table;
-    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(grid_for(n, THREADS), THREADS), [=](sycl::nd_item<1> it) {
-        const long long pos = (long long) step[kStepPos];
-        const int i = (int) it.get_global_id(0);
-        if (i >= kv_heads * head_dim) return;
-        const int h = i / head_dim, d = i - h * head_dim;
-        // `[page][kv_head][page_size][head_dim]`; KV streaming: the host copy always, the VRAM page if resident.
-        const long long page = (long long) table[pos / page_size];
-        if (page >= 0) {
-            const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-            k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
-            v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
-        }
-        if (hp.k_pool != nullptr) {
-            const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-            hp.k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
-            hp.v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
-        }
-    });
-    finish(stream, e, "kv_append");
+    kv_append_steps_host(k_pool, v_pool, page_table, step, 0, kcur, vcur, 0, 1, s, stream, host);
 }
 
 void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step, int step_stride,
                      const float* kcur, const float* vcur, int cur_stride, int n_tok, const QsaShapes& s, void* stream) {
     validate(s, "kv_append_steps");
     if (step == nullptr || n_tok < 0) fail("kv_append_steps: step is null or n_tok negative");
-    if (n_tok == 0) return;
-    const long long per = s.n_head_kv * s.head_dim, n = per * n_tok;
-    const int head_dim = (int) s.head_dim, kv_heads = (int) s.n_head_kv, page_size = (int) s.page_size;
-    const int32_t* table = page_table;
-    // kv_append_step's arithmetic for each of n_tok tokens: token t's position in step[t * step_stride + kStepPos],
-    // its K and V at kcur / vcur + t * cur_stride
-    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(grid_for(n, THREADS), THREADS), [=](sycl::nd_item<1> it) {
-        const long long g = (long long) it.get_global_id(0);
-        if (g >= n) return;
-        const int t = (int) (g / per), i = (int) (g - (long long) t * per);
-        const long long pos = (long long) step[(long long) t * step_stride + kStepPos];
-        const int h = i / head_dim, d = i - h * head_dim;
-        const long long page = (long long) table[pos / page_size];
-        if (page >= 0) {
-            const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-            k_pool[row * head_dim + d] = f16_from_f32(kcur[(long long) t * cur_stride + i]);
-            v_pool[row * head_dim + d] = f16_from_f32(vcur[(long long) t * cur_stride + i]);
-        }
-    });
-    finish(stream, e, "kv_append_steps");
+    kv_append_steps_host(k_pool, v_pool, page_table, step, step_stride, kcur, vcur, cur_stride, n_tok, s, stream,
+                         nullptr);
 }
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,

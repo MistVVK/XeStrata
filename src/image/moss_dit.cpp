@@ -815,7 +815,6 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     jv16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
     jo16_ = alloc<uint16_t>(allocs_, rw.O * C_);
     o16_ = alloc<uint16_t>(allocs_, R * C_);
-    if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, rw.O * C_);
     if (keep0_) b0_ = alloc<float>(allocs_, (hw + max_text) * C_);
     cap_hw_ = hw;
     cap_n_ = n;
@@ -829,11 +828,11 @@ void MossDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
                     (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) pend_sw_,
-                    (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) attn_scratch_,
+                    (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_,
                     (void*) b0_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_,
                     (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = attn_scratch_ = b0_ = pend_sw_ = nullptr;
+    x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = b0_ = pend_sw_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
     xq8_ = nullptr;
     lora_f32_ = nullptr;
@@ -1393,7 +1392,7 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
                                           ref_hs_ + cur_block_ * heads_, hs_, jo16_, s_))
                 throw std::runtime_error("image engine: the attention's int8 buffers do not fit");
         } else {
-            qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, P,
+            qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, s_, nullptr, P,
                          true);
         }
         if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);

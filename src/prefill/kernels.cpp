@@ -9,8 +9,12 @@
 #include "gdn_tc.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/rope_scaling.hpp"
+#include "strata/kernels/rows_cols.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
@@ -39,10 +43,6 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
-inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
-    return v;
-}
 inline uint16_t bf(float f) {
     uint32_t u = sycl::bit_cast<uint32_t>(f);
     u += 0x7fffu + ((u >> 16) & 1u);
@@ -52,7 +52,7 @@ inline uint16_t bf(float f) {
 // itself in BF16.  W.hi + W.lo carries ~16 mantissa bits of the activation - decode's FP32 x to within ~1e-5.
 inline uint16_t bf_lo(float f, uint16_t hi) { return bf(f - sycl::bit_cast<float>((uint32_t) hi << 16)); }
 inline float sigm(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
-inline uint16_t hf(float f) { return kernels::f16_from_f32(f); }
+inline uint16_t hf(float f) { return kernels::f16_gpu::f16_from_f32(f); }   // the GPU's conversion (f16_gpu.hpp)
 // A SwiGLU product for an FP16 GEMM: saturated, so a token with a massive activation cannot turn into inf and then
 // NaN in the down projection (decode's q8_1 has room to ~8e6; FP16 ends at 65504).  A NaN stays NaN; finite values
 // below 65504 round exactly as before (upstream 7bc505d, f8fe938).
@@ -80,45 +80,6 @@ constexpr int CB = 32, NCB = S / CB;
 // STRATA_GDN_TC: the prep and the scan's two launches a super-block cost more than they save on shorter chunks
 // (upstream's threshold, measured on a CMP 170HX)
 constexpr int64_t kGdnTcMin = 128;
-
-template <int REG>
-void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout, int64_t T) {
-    q.parallel_for(sycl::nd_range<1>((size_t) ((T + 7) / 8) * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int64_t t = (int64_t) it.get_group(0) * 8 + (int64_t) sg.get_group_linear_id();
-        if (t >= T) return;   // uniform over the sub-group
-        const int lane = (int) sg.get_local_linear_id();
-        const float* lg = logits + t * (REG * 32);
-        float v[REG];
-        for (int i = 0; i < REG; ++i) v[i] = lg[lane + i * 32];
-        float mx = -INFINITY;
-        for (int i = 0; i < REG; ++i) mx = sycl::fmax(mx, v[i]);
-        mx = warp_max(sg, mx);
-        float sum = 0.0f;
-        for (int i = 0; i < REG; ++i) { v[i] = sycl::exp(v[i] - mx); sum += v[i]; }
-        const float rcp = 1.0f / warp_sum(sg, sum);
-        for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (sycl::isnan(v[i])) v[i] = -FLT_MAX; }
-        // the picked rows as a bit mask, not -INFINITY stored back into v: IGC 2.38.2 drops this kernel's stores
-        // otherwise (#45, as top10_token in src/kernels/xe/router.cpp)
-        int picked = 0;
-        float selected = 0.0f, selected_sum = 0.0f;
-        for (int rank = 0; rank < 10; ++rank) {
-            float best = -INFINITY;
-            int ex = lane;
-            for (int i = 0; i < REG; ++i) if (((picked >> i) & 1) == 0 && v[i] > best) { best = v[i]; ex = lane + i * 32; }
-            for (int m = 16; m; m >>= 1) {
-                const float ob = sycl::permute_group_by_xor(sg, best, m);
-                const int oi = sycl::permute_group_by_xor(sg, ex, m);
-                if (ob > best || (ob == best && oi < ex)) { best = ob; ex = oi; }
-            }
-            if ((ex & 31) == lane) { picked |= 1 << (ex / 32); selected_sum += best; }
-            if (lane == 0) ids[t * 10 + rank] = ex;
-            if (rank == lane) selected = best;
-        }
-        selected_sum = sycl::fmax(warp_sum(sg, selected_sum), 6.103515625e-5f);
-        if (lane < 10) wout[t * 10 + lane] = selected / selected_sum;
-    });
-}
 
 // Strata blob: gate/up codes [1280][640 B], down codes [2560][160 B], gate/up scales [1280][40] f16, down scales
 // [2560][10] f16
@@ -154,94 +115,26 @@ void blob_dequant_launch(sycl::queue& q, const uint8_t* blob, uint16_t* gu16, ui
 // resident (table >= 0), and the host copy and the prompt path's staging pool (both identity layout) when given.
 void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const int32_t* page_table, int64_t page_size,
                uint16_t* k_pool, uint16_t* v_pool, int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale,
-               void* stream, const strata::kernels::KvHostPools* host_p, const strata::kernels::KvHostPools* stage_p) {
+               void* stream, const strata::kernels::KvHostPools* host, const strata::kernels::KvHostPools* stage) {
     if (T <= 0) return;
-    const strata::kernels::KvHostPools host = host_p ? *host_p : strata::kernels::KvHostPools{};
-    const strata::kernels::KvHostPools stage = stage_p ? *stage_p : strata::kernels::KvHostPools{};
-    const int32_t* table = page_table;
-    // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
-    // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
-    // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
-    static const bool wide_env = [] {
-        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool wide = wide_env;   // (a kernel captures a copy, not the static)
-    Q(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> wm(sycl::range<1>(2), h);
-        sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(64), h);   // the group's 64 values, for the wide stores
-        h.parallel_for(sycl::nd_range<3>({(size_t) T, 2, 8 * 64}, {1, 1, 64}), [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int64_t t = (int64_t) it.get_group(0);
-            const int kvh = (int) it.get_group(1), z = (int) it.get_group(2), g = z >> 1;
-            const bool is_v = (z & 1) != 0;
-            const int tid = (int) it.get_local_id(2);
-            const int d = g * 64 + tid;
-            const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
-            const int64_t pos = pos0 + t;
-            const int64_t page = table[pos / page_size];
-            const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
-            const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
-            if (k_pool != nullptr) {   // uniform
-                const uint16_t hv = hf(x);
-                if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = hv;
-                if (wide && (host.k_pool != nullptr || stage.k_pool != nullptr)) {   // uniform
-                    lane[tid] = hv;
-                    sycl::group_barrier(it.get_group());
-                    if (tid < 32) {
-                        const size_t l2 = 2 * (size_t) tid;
-                        const uint32_t w = lane[l2] | (lane[l2 + 1] << 16);
-                        if (host.k_pool != nullptr)
-                            reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                        if (stage.k_pool != nullptr)
-                            reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                    }
-                    return;
-                }
-                if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = hv;
-                if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = hv;
-                return;
-            }
-            float a = sycl::fabs(x);
-            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, sycl::permute_group_by_xor(sg, a, o));
-            if ((tid & 31) == 0) wm[tid >> 5] = a;
-            sycl::group_barrier(it.get_group());
-            const float amax = sycl::fmax(wm[0], wm[1]);
-            const uint16_t sb = hf(amax / 127.0f);
-            const float sf = kernels::f32_from_f16(sb);
-            int qv = 0;
-            if (sf > 0.0f) { qv = (int) sycl::rint(x / sf); qv = qv < -127 ? -127 : (qv > 127 ? 127 : qv); }
-            if (page >= 0) {
-                (is_v ? v_q : k_q)[row * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
-            }
-            if (wide && (host.k_q != nullptr || stage.k_q != nullptr)) {   // uniform
-                lane[tid] = (uint32_t) (uint8_t) (int8_t) qv;
-                sycl::group_barrier(it.get_group());
-                if (tid < 16) {
-                    const size_t l4 = 4 * (size_t) tid;
-                    const uint32_t w = lane[l4] | (lane[l4 + 1] << 8) | (lane[l4 + 2] << 16) | (lane[l4 + 3] << 24);
-                    if (host.k_q != nullptr)
-                        reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                    if (stage.k_q != nullptr)
-                        reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + row_id * 256 + (int64_t) g * 64)[tid] = w;
-                }
-                if (tid == 0) {
-                    if (host.k_q != nullptr) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
-                    if (stage.k_q != nullptr) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
-                }
-                return;
-            }
-            if (host.k_q != nullptr) {
-                (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
-            }
-            if (stage.k_q != nullptr) {
-                (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) qv;
-                if (tid == 0) (is_v ? stage.v_scale : stage.k_scale)[row_id * 4 + g] = sb;
-            }
-        });
-    });
+    // the K/V cache's one append (kv_q8.hpp), the decode's arithmetic: 2 KV heads of 256
+    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+    s.page_size = page_size;
+    strata::kernels::KvAppend a;
+    a.pos0 = pos0;
+    a.k = K;
+    a.v = V;
+    a.n_tok = T;
+    a.k_pool = k_pool;
+    a.v_pool = v_pool;
+    a.k_q = k_q;
+    a.v_q = v_q;
+    a.k_scale = k_scale;
+    a.v_scale = v_scale;
+    a.page_table = page_table;
+    a.host = host;
+    a.stage = stage;
+    strata::kernels::kv_append_cells(a, s, stream);
 }
 
 void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream) {
@@ -1063,9 +956,9 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
 
 // ---------------------------------------------------------------- MoE
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
-    if (n_expert == 512) route_launch<16>(Q(stream), logits, ids, weights, T);
-    else if (n_expert == 256) route_launch<8>(Q(stream), logits, ids, weights, T);
-    else strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
+    if (T <= 0) return;
+    // the decode's router, each row as one token there
+    strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {
     blob_dequant_launch<false>(Q(stream), blob, gu16, down16);
@@ -1083,11 +976,26 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width, int64_t ld) {
     if (n <= 0) return;
-    if (ld <= 0) ld = width;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], r = i / width, at = r * ld + (i - r * width);
+    if (ld <= 0 || ld == width) {   // one run of n x width values (a row index per value cost the shared expert 40%)
+        Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
+            const float a = g[i];
+            h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
+        });
+        return;
+    }
+    // the rows in the first of two dimensions (no division a value), which takes 65,535: more, one dimension
+    if (n > 65535) {
+        Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0], r = i / width, at = r * ld + (i - r * width);
+            const float a = g[at];
+            h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
+        });
+        return;
+    }
+    Q(stream).parallel_for(sycl::range<2>((size_t) n, (size_t) width), [=](sycl::id<2> id) {
+        const int64_t r = (int64_t) id[0], c = (int64_t) id[1], at = r * ld + c;
         const float a = g[at];
-        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
+        h16[r * width + c] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
     });
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
@@ -1116,12 +1024,8 @@ void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t 
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
-        float s = 0.0f;
-        for (int k = 0; k < 10; ++k) s = sycl::fma(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
-        bo[i] = s + shared[i] * sigm(sg[t]);
-    });
+    if (T <= 0) return;
+    kernels::native_moe_combine_multi(Dm, w, shared, bo, N, 10, (int) T, stream, sg, slot);
 }
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
     if (T <= 0) return;
@@ -1134,8 +1038,7 @@ void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T
 void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
                      const float* u_w, int64_t n_u, float* acc, void* stream) {
     if (n_u <= 0) return;
-    Q(stream).parallel_for(sycl::range<2>((size_t) n_u, (size_t) N), [=](sycl::id<2> id) {
-        const int64_t u = (int64_t) id[0], d = (int64_t) id[1];
+    strata::kernels::for_rows_cols(Q(stream), n_u, N, [=](int64_t u, int64_t d) {
         float s = 0.0f;
         for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
         acc[(int64_t) u_tok[u] * N + d] += s;
@@ -1149,9 +1052,10 @@ void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t p
     const bool scaled = scaling.type != strata::kernels::RopeScalingType::None;
     const strata::kernels::RopeKernelArgs ka = scaling.kernel_args(64);
     const strata::kernels::RopeTab tab = strata::kernels::rope_table_for(scaling);
-    Q(stream).parallel_for(sycl::range<2>((size_t) (T * heads), 32), [=](sycl::id<2> id) {
-        const int64_t row = (int64_t) id[0];   // t * heads + h
-        const int pair = (int) id[1];          // 0..31
+    // one dimension: T x heads rows pass the 65,535 a GPU's first dimension takes
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * heads) * 32), [=](sycl::id<1> id) {
+        const int64_t row = (int64_t) id[0] / 32;   // t * heads + h
+        const int pair = (int) (id[0] % 32);       // 0..31
         const int64_t t = row / heads, hh = row % heads;
         float* p = x + t * ld + hh * dim;
         const int rp = strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair);

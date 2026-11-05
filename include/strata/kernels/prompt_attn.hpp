@@ -7,9 +7,9 @@
 // at 16K tokens llm-jp-4.1's attention took 62 s of a 73 s prompt.  Here a work-group takes BQ queries of one KV head
 // (BQ x the heads that share it: GQA's rows), walks the cells up to its last query 16 at a time through local memory,
 // and keeps an online softmax per row, so a cell's K and V are read once per work-group.  Q.K^T and P.V run on the
-// FP16 matrix engines (Q and the probabilities rounded to FP16): RDNA3's and RDNA4's WMMA instructions, Intel's XMX and
-// NVIDIA's tensor cores through flash_attn.hpp's kernel (the pools overload); a GPU without them takes a kernel in FP32
-// FMAs (K and V enter from FP16).  STRATA_PROMPT_ATTN_MMA=0 takes the FMA kernel everywhere.
+// FP16 matrix engines (Q and the probabilities rounded to FP16): Intel's XMX, NVIDIA's tensor cores and RDNA3's and
+// RDNA4's WMMA instructions through flash_attn.hpp's kernel; a GPU without them takes a kernel in FP32 FMAs (K and V
+// enter from FP16).  STRATA_PROMPT_ATTN_MMA=0 takes the FMA kernel everywhere.
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
@@ -28,11 +28,10 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
 
 /// The same over `pools` (qsa_decode_attn.hpp): FP16 ones, INT8 codes with an FP16 scale per 64 values (--kv int8),
 /// or Q4_0 (--kv q4_0) or INT8 K with Q4_0 V (--kv k8v4), rotated as kv_q4.hpp has them (the caller rotates the queries
-/// and the output).  On the matrix engines where the device has them: Intel's XMX and NVIDIA's tensor cores from sm_70
-/// through the attention the image engine shares (flash_attn.hpp: head_dim 128 or 256, the Q4_0 forms 256; any
-/// number of query heads a KV head; FP16 pools in pages of a multiple of 64 cells read where they are), RDNA3's and
-/// RDNA4's WMMA for INT8 pools (the shapes of the kernel above); Q and the probabilities in FP16.  Else the kernels
-/// above (FP16 pools only).  False, nothing launched, when none takes the pools or the shape.
+/// and the output).  On the matrix engines where the device has them (Intel's XMX, NVIDIA's tensor cores from sm_70,
+/// RDNA3's and RDNA4's WMMA) through the attention the image engine shares (flash_attn.hpp: head_dim 128 or 256, the
+/// Q4_0 forms 256; any number of query heads a KV head); Q and the probabilities in FP16.  Else the FMA kernel above
+/// (FP16 pools only).  False, nothing launched, when none takes the pools or the shape.
 bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s, float* attn,
                  void* stream);
 

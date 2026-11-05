@@ -77,7 +77,7 @@ inline auto at(const A& a, size_t off) {
     const int e = 14 - ((sycl::bit_cast<int>(m) >> 23) - 127);
     return e < -40 ? -40 : (e > 40 ? 40 : e);
 }
-// x as FP16 hi + lo.  hi goes back to FP32 through integer operations (as qsa_prompt_attn.cpp's split): written as
+// x as FP16 hi + lo.  hi goes back to FP32 through integer operations (as flash_attn.cpp's selection form's split): written as
 // x - (float) half(x), the compiler may take the round trip for exact and make lo zero
 inline void split(float x, sycl::half& hi, sycl::half& lo) {
     hi = sycl::half(x);

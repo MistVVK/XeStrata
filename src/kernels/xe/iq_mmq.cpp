@@ -618,7 +618,7 @@ struct Kernel {
     // Intel's XMX: the sub-groups split the WM x WN tile into 8 x ISG tiles, a column of them each (TPS tiles down its
     // row group's rows).  The weights' words go to local memory in Intel's VNNI order, [K / 4][output] (a word is 4 K
     // values of one output, as Dec gives them); a block of 32 is one product.  An 8 x N accumulator gives each lane one
-    // column, its element i in row i (Xe's DPAS layout, as qsa_prompt_attn takes it; intel_layout_ok checks it at the
+    // column, its element i in row i (Xe's DPAS layout, as flash_attn's selection form takes it; intel_layout_ok checks it at the
     // start), so the scales are applied by element order: asking each element its coordinates cost more than the
     // products there.
     void intel_body(sycl::nd_item<1> it) const {

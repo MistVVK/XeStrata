@@ -7,9 +7,12 @@
 // 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE): parts[0] * w[0], then each further expert's product
 // added in order, then the shared output.
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/shared_expert.hpp"
 #include "strata/core/runtime.hpp"
+#include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_moe
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -17,6 +20,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace strata::kernels {
 namespace {
@@ -32,26 +36,37 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     return ap < bp + bn && bp < ap + an;
 }
 
-void launch(void* stream, const float* parts, const float* weights, const float* shared, float* output,
-            int64_t n_embd, int k, int n_tok, const float* shared_gate = nullptr) {
-    if (!stream) throw core::DeviceError("native MoE combine requires an explicit stream");
-    auto& queue = core::Runtime::get().stream(stream);
-    queue.parallel_for(sycl::range<2>(size_t(n_tok), size_t(n_embd)), [=](sycl::id<2> id) {
-        const int64_t tk = int64_t(id[0]), col = int64_t(id[1]);
-        const float* p = parts + tk * k * n_embd;
-        const float* w = weights + tk * k;
-        float sum = p[col] * w[0];
-        for (int expert = 1; expert < k; ++expert) sum += p[int64_t(expert) * n_embd + col] * w[expert];
-        if (shared) {
-            float sv = shared[tk * n_embd + col];
-            if (shared_gate) {   // shared_expert's sigmoid_scale_rows, its product rounded before the add
-                const float gt = 1.0f / (1.0f + sycl::exp(-shared_gate[tk]));
-                sv = sv * gt;
-            }
-            sum += sv;
-        }
-        output[tk * n_embd + col] = sum;
+// The one combination of the routed experts' outputs, for the decode, the MTP head and the prompt alike: one output
+// element, part(e) expert e's value for it, shared its shared output (or null), gate its raw gate.  D: the sum's
+// type, double for ref/moe.py's reading (moe_combine), float for ggml's (native); a float product is exact in double,
+// so either way the order is parts[0] w[0], then each further expert's product, then the shared output.
+template <typename D, typename Part>
+inline float combine(Part part, const float* w, int k, const float* shared, const float* gate) {
+    D sum = D(part(0)) * D(w[0]);
+    for (int expert = 1; expert < k; ++expert) sum += D(part(expert)) * D(w[expert]);
+    if (shared) {
+        float sv = *shared;
+        if (gate) sv = sv * (1.0f / (1.0f + sycl::exp(-*gate)));   // sigmoid_scale_rows, rounded before the add
+        sum += D(sv);
+    }
+    return float(sum);
+}
+
+// slot: the parts' rows by (token, expert), slot[tk k + e] (Qwen3.8-Flash-Next's prompt: its experts' outputs in
+// expert order), else token tk's k rows in turn
+template <typename D>
+sycl::event launch(sycl::queue& queue, const float* parts, const float* weights, const float* shared, float* output,
+                   int64_t n_embd, int k, int n_tok, const float* shared_gate = nullptr,
+                   const int32_t* slot = nullptr) {
+    return for_rows_cols(queue, n_tok, n_embd, [=](int64_t tk, int64_t col) {
+        output[tk * n_embd + col] = combine<D>([&](int e) {
+            return parts[(slot ? int64_t(slot[tk * k + e]) : tk * k + e) * n_embd + col];
+        }, weights + tk * k, k, shared ? shared + tk * n_embd + col : nullptr, shared_gate ? shared_gate + tk : nullptr);
     });
+}
+sycl::queue& explicit_stream(void* stream) {
+    if (!stream) throw core::DeviceError("native MoE combine requires an explicit stream");
+    return core::Runtime::get().stream(stream);
 }
 
 }  // namespace
@@ -86,24 +101,12 @@ void native_moe_combine_multi_hits(const float* parts, const float* hits, const 
             if (col >= n_embd) return;
             const float* p = parts + tk * k * n_embd;
             const float* hp = hits + tk * k * n_embd;
-            const float* w = weights + tk * k;
             const uint8_t* ht = &hit[(size_t) (tk * k)];
-            const float p0 = ht[0] ? p[col] + hp[col] : p[col];   // moe_hit_add's sum, then its product
-            float sum = p0 * w[0];
-            for (int expert = 1; expert < k; ++expert) {
-                const int64_t o = int64_t(expert) * n_embd + col;
-                const float pe = ht[expert] ? p[o] + hp[o] : p[o];
-                sum += pe * w[expert];
-            }
-            if (shared) {
-                float sv = shared[tk * n_embd + col];
-                if (shared_gate) {
-                    const float gt = 1.0f / (1.0f + sycl::exp(-shared_gate[tk]));
-                    sv = sv * gt;
-                }
-                sum += sv;
-            }
-            output[tk * n_embd + col] = sum;
+            output[tk * n_embd + col] = combine<float>([&](int e) {
+                const int64_t o = int64_t(e) * n_embd + col;
+                return ht[e] ? p[o] + hp[o] : p[o];   // moe_hit_add's sum, then its product
+            }, weights + tk * k, int(k), shared ? shared + tk * n_embd + col : nullptr,
+               shared_gate ? shared_gate + tk : nullptr);
         });
     });
 }
@@ -123,14 +126,27 @@ void native_moe_combine(const float* parts, const float* weights, const float* s
             || overlap(output, row_bytes, weights, weight_bytes)
             || (shared && overlap(output, row_bytes, shared, row_bytes)))
         throw std::invalid_argument("native MoE combine requires aligned spans and disjoint output");
-    launch(stream, parts, weights, shared, output, n_embd, int(k), 1);
+    launch<float>(explicit_stream(stream), parts, weights, shared, output, n_embd, int(k), 1);
 }
 
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
-                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate) {
+                              int64_t n_embd, int64_t k, int n_tok, void* stream, const float* shared_gate,
+                              const int32_t* slot) {
     if (!stream || n_embd <= 0 || k < 1 || k > 15 || n_tok < 1 || (shared_gate && !shared))
         throw std::invalid_argument("native MoE combine (multi) requires a stream, width, 1..15 experts, tokens");
-    launch(stream, parts, weights, shared, output, n_embd, int(k), n_tok, shared_gate);
+    launch<float>(explicit_stream(stream), parts, weights, shared, output, n_embd, int(k), n_tok, shared_gate, slot);
+}
+
+void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
+                 int64_t k, void* stream) {
+    if (n_embd <= 0 || k <= 0) return;
+    // k > 64 is refused rather than truncated
+    if (k > 64) throw core::DeviceError("moe_combine: k = " + std::to_string(k) + " exceeds 64");
+    auto& q = core::Runtime::get().stream(stream);
+    // double where the device has FP64 (device_caps.hpp), float elsewhere
+    const auto e = xe::has_fp64(q) ? launch<double>(q, parts, weights, shared, y, n_embd, int(k), 1)
+                                   : launch<float>(q, parts, weights, shared, y, n_embd, int(k), 1);
+    if (!stream) core::Runtime::get().wait(e, "moe_combine");
 }
 
 }  // namespace strata::kernels

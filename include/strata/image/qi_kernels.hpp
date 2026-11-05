@@ -33,24 +33,20 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
                        uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const QiI8* i8 = nullptr);
 
-/// out[t, h, :] = softmax(q . k^T / sqrt(head_dim)) . v over the rows token t sees: a prefix token (t < n_text) the
-/// tokens up to itself, or with key_lim the first key_lim[t] (never falling from row to row: an edit's reference
-/// image sees all of itself), an image token every token.  FP32 accumulation; the plain form, every GPU.
-void qi_attention_plain(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, int64_t n_text, float* out, void* stream, const int32_t* key_lim = nullptr);
-
 /// The rows q16, k16 and v16 must hold for qi_attention: T rounded up to a multiple of 128, the rows past T zero.
 constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 
-/// The same attention on the GPU's matrix engines where it has them (src/image/qi_attn.cpp), FP16 out16
-/// [T - first][heads * head_dim]: the query rows from `first` on (the rows before it, a cached prefix's, are not
-/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).  `int8`: the rows that see every key
+/// out16[t, h, :] = softmax(q . k^T / sqrt(head_dim)) . v over the rows token t sees: a prefix token (t < n_text) the
+/// tokens up to itself, or with key_lim the first key_lim[t] (never falling from row to row: an edit's reference
+/// image sees all of itself), an image token every token.  On the GPU's matrix engines where it has them
+/// (src/image/qi_attn.cpp, flash_attn.hpp), FP16 out16 [T - first][heads * head_dim]: the query rows from `first` on
+/// (the rows before it, a cached prefix's, are not asked); else the same kernel's FMA form.  `int8`: the rows that see every key
 /// may take the int8 kernel where it is the faster (qi_attention_i8: a model whose images it keeps, Qwen-Image's; not
 /// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).  `spans`: prefix rows [a, b) that see
 /// keys 0 .. b - 1 and no others (an edit's references, as key_lim says on the GPU): they take the image rows' kernels,
 /// as rows past a context of b keys.
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                  int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
+                  int64_t head_dim, int64_t n_text, uint16_t* out16, void* stream,
                   const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false,
                   const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr);
 
@@ -96,10 +92,6 @@ void qi_text_qk_rope16(const float* q, const float* k, const float* v, const flo
                        int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
                        uint16_t* v16, void* stream, const int32_t* pos3 = nullptr, int sec_h = 0, int sec_w = 0);
 
-/// Causal attention with grouped K/V heads (query head h reads K/V head h / (q_heads / kv_heads)): out [T][q_heads *
-/// head_dim] FP32, the plain form (the text encoder's few tokens).
-void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
-                         int64_t kv_heads, int64_t head_dim, float* out, void* stream);
 /// Grouped K/V heads [T][kv_heads * head_dim] (FP16) repeated to one a query head, out [T][q_heads * head_dim] (query
 /// head h's the K/V head h / (q_heads / kv_heads)): a grouped attention as qi_sdpa's plain one.
 void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,

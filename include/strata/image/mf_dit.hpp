@@ -296,7 +296,7 @@ private:
     float *rs_ = nullptr, *rs2_ = nullptr, *rs_io_ = nullptr, *rs_to_ = nullptr, *hs_ = nullptr, *vpart_ = nullptr;
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *io16_ = nullptr, *to16_ = nullptr, *t16_ = nullptr;
-    float *cos_ = nullptr, *sin_ = nullptr, *cos_id_ = nullptr, *sin_id_ = nullptr, *attn_scratch_ = nullptr;
+    float *cos_ = nullptr, *sin_ = nullptr, *cos_id_ = nullptr, *sin_id_ = nullptr;
     // W8A8's input (w8_): xq8_rows_ rows of up to xq8_cols_ int8 values, then two arrays of their scales, taken in
     // turn (xs_next_), so that the deferred sums of one input keep theirs while the next input is quantized
     int8_t* xq8_ = nullptr;

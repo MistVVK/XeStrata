@@ -14,6 +14,7 @@
 #if STRATA_ONEMATH
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/rows_cols.hpp"
 #include <oneapi/math/blas.hpp>
 #include <filesystem>
 #include <future>
@@ -210,9 +211,7 @@ bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         std::fprintf(stderr, "strata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
         return false;
     }
-    q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
-        Y[(int64_t) i[0] * ldy + (int64_t) i[1]] = (float) yh[(int64_t) i[0] * N + (int64_t) i[1]];
-    });
+    strata::kernels::for_rows_cols(q, T, N, [=](int64_t t, int64_t n) { Y[t * ldy + n] = (float) yh[t * N + n]; });
     return true;
 }
 

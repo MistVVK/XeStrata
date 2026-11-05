@@ -1950,17 +1950,15 @@ int attn_cmd(int64_t T, int64_t heads, int64_t dim) {
             }
     void* s = strata::core::Runtime::get().create_stream();
     uint16_t *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr;
-    float* dscratch = nullptr;
     if (!gpu::alloc_device(&dq, hq.size() * 2) || !gpu::alloc_device(&dk, hk.size() * 2) ||
-        !gpu::alloc_device(&dv, hv.size() * 2) || !gpu::alloc_device(&dout, (size_t) T * heads * dim * 2) ||
-        !gpu::alloc_device(&dscratch, (size_t) rows * heads * dim * 4)) {
+        !gpu::alloc_device(&dv, hv.size() * 2) || !gpu::alloc_device(&dout, (size_t) T * heads * dim * 2)) {
         std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dq, hq.data(), hq.size() * 2);
     gpu::copy(dk, hk.data(), hk.size() * 2);
     gpu::copy(dv, hv.data(), hv.size() * 2);
-    si::qi_attention(dq, dk, dv, T, heads, dim, 0, dout, dscratch, s);   // n_text 0: every row sees all T keys
+    si::qi_attention(dq, dk, dv, T, heads, dim, 0, dout, s);   // n_text 0: every row sees all T keys
     gpu::device_sync();
     std::vector<uint16_t> hout((size_t) T * heads * dim);
     gpu::copy(hout.data(), dout, hout.size() * 2);
@@ -1997,7 +1995,7 @@ int attn_cmd(int64_t T, int64_t heads, int64_t dim) {
     std::printf("attn T=%ld rows=%ld heads=%ld dim=%ld: rel %.6e (the zero keys past T %s)\n", (long) T, (long) rows,
                 (long) heads, (long) dim, dden > 0 ? std::sqrt(dnum / dden) : 0.0,
                 rows > T ? "are padded in" : "are not there");
-    gpu::free(dq), gpu::free(dk), gpu::free(dv), gpu::free(dout), gpu::free(dscratch);
+    gpu::free(dq), gpu::free(dk), gpu::free(dv), gpu::free(dout);
     return 0;
 }
 

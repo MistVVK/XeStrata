@@ -122,7 +122,7 @@ The weights are read in their GGUF blocks and the activations rounded to int8, a
 That reads and writes less than dequantizing to FP16 and multiplying, and the relative error against FP64 is about 0.4% (the activations' rounding).
 It covers the i-quants but IQ1_M, and Q2_0; a layer of another type keeps the FP16 path.
 
-On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), prefill's attention runs a kernel written on joint_matrix's portable API (`src/kernels/xe/qsa_prompt_attn.cpp`).
+On a GPU without XMX that reports the FP16 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores, from sm_70 on), prefill's attention runs a kernel written on joint_matrix's portable API (the selection form of `src/kernels/xe/flash_attn.cpp`).
 It takes FP16, INT8 and K8V4 KV; Q4_0 keeps the FP32 kernel (the range of upstream's Volta kernel 06a90a2).
 INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they are, with the scales applied in FP32.
 With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.

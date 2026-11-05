@@ -937,7 +937,6 @@ void AnimaDit::ensure(int64_t hw, int n) {
     cos_ = alloc<float>(allocs_, hw * (hd_ / 2));
     sin_ = alloc<float>(allocs_, hw * (hd_ / 2));
     rope_h_ = rope_w_ = -1;
-    if (std::strcmp(qi_attention_path(), "plain (FP32)") == 0) attn_scratch_ = alloc<float>(allocs_, TP * C_);
     cap_hw_ = hw;
     cap_n_ = n;
     dirty_[0] = dirty_[1] = 0;
@@ -948,10 +947,10 @@ void AnimaDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) o32_, (void*) g_, (void*) h16_,
                     (void*) rs_, (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) qh16_,
-                    (void*) sc_, (void*) p16_, (void*) cos_, (void*) sin_, (void*) attn_scratch_, (void*) lora_f32_,
+                    (void*) sc_, (void*) p16_, (void*) cos_, (void*) sin_, (void*) lora_f32_,
                     (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = attn_scratch_ = nullptr;
+    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = qh16_ = p16_ = nullptr;
     xq8_ = nullptr;
     lora_f32_ = nullptr;
@@ -1310,7 +1309,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
             head_scale(vpart_, HW, heads_, hs_, s_);
             qk_rope16(q.from(r0), k.from(r0), v.from(r0), f(b.sqn), f(b.skn), cos_, sin_, hs_, HW, heads_, hd_, jq16_,
                       jk16_, jv16_, s_);
-            qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, 0, false);
+            qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, false);
             rows16(Heads{jo16_, hs_, C, hd_}, HW, C, o16_ + r0 * C, rs_o_ + r0, s_);
         }
         gate_add(x_, product(o16_, rs_o_, b.so, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);

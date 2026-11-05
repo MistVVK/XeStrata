@@ -35,7 +35,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -2727,10 +2727,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (qsa_prompt_attn.hpp). The pools it has no kernel for on this device,
+                    // accuracy but not bitwise (flash_attn.hpp). The pools it has no kernel for on this device,
                     // or STRATA_PROMPT_ATTN_OLD=1: the decode kernel, 32 queries at a time
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                    if (old_attn || !strata::kernels::flash_attn_select(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
@@ -4970,7 +4970,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
                         static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                        if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                        if (old_attn || !strata::kernels::flash_attn_select(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                                 m.attn, T, cs))
                             for (int64_t q0 = 0; q0 < T; q0 += m.attn_batch) {
                                 const int64_t nb = std::min(m.attn_batch, T - q0);

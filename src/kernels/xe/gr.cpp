@@ -187,8 +187,9 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* 
     check_pointer(input, msg);
     check_pointer(gamma, msg);
     check_pointer(output, msg);
-    // a gamma row each row: the engines' one RMSNorm with as many groups as rows (native_qsa.hpp), the same sums
-    rms_norm_rows(input, gamma, n_rows, output, nullptr, n_cols, n_rows, epsilon, stream);
+    // a gamma row each row: the engines' one RMSNorm with as many groups as rows (native_qsa.hpp), pinned: the sums
+    // of native_qsa_rms_norm_weighted, as before
+    rms_norm_rows(input, gamma, n_rows, output, nullptr, n_cols, n_rows, epsilon, stream, true);
 }
 
 void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {

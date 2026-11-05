@@ -402,7 +402,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/native_qsa_score.cpp src/kernels/xe/native_qsa_indexer.cpp
                                     src/kernels/xe/native_flash_attn.cpp src/kernels/xe/qsa_select.cpp
                                     src/kernels/xe/dequant_bf16.cpp src/kernels/xe/ple.cpp
-                                    src/kernels/xe/s2_expert_grouped.cpp src/kernels/xe/qsa_prompt_attn.cpp
+                                    src/kernels/xe/s2_expert_grouped.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/flash_attn.cpp

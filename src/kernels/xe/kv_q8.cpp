@@ -7,10 +7,12 @@
 // quantized against the STORED (fp16-rounded) scale, and __float2int_rn's round-half-to-even is sycl::rint's.
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/f16_gpu.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q8
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -32,30 +34,63 @@ void validate(const QsaShapes& s, const char* what) {
 
 }  // namespace
 
-void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
-                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host) {
-    validate(s, "kv_append_q8");
-    if (n_tok < 1) return;
+void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
+    validate(s, "kv_append_cells");
+    if (a.n_tok < 1) return;
+    const bool f16 = a.k_pool != nullptr;
+    if (!f16 && a.k_q == nullptr) throw core::DeviceError("kv_append_cells: no pools");
     const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
     const int groups = head_dim / KV_Q8_GROUP;
-    const int planes = (k_q == v_q && kcur == vcur) ? 1 : 2;
-    const KvHostPools hp = host ? *host : KvHostPools{};
-    const int32_t* table = page_table;
+    const int planes = !f16 && a.k_q == a.v_q && a.k == a.v ? 1 : 2;
+    const int64_t cur_stride = a.cur_stride > 0 ? a.cur_stride : (int64_t) kv_heads * head_dim;
+    const KvHostPools host = a.host ? *a.host : KvHostPools{}, stage = a.stage ? *a.stage : KvHostPools{};
+    // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
+    // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
+    // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
+    static const bool wide_env = [] {
+        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool wide = wide_env && (f16 ? host.k_pool != nullptr || stage.k_pool != nullptr
+                                       : host.k_q != nullptr || stage.k_q != nullptr);
+    const KvAppend p = a;
     const auto e = queue_for(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> warp_max(sycl::range<1>(2), hd);
-        hd.parallel_for(sycl::nd_range<3>({(size_t) n_tok * planes, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP},
+        sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(KV_Q8_GROUP), hd);   // the group's values, wide stores
+        hd.parallel_for(sycl::nd_range<3>({(size_t) p.n_tok * planes, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP},
                                           {1, 1, KV_Q8_GROUP}),
                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int j = (int) it.get_group(0) / planes;
-            const long long pos = (long long) step[(long long) j * step_stride + kStepPos];
+            const int64_t j = (int64_t) it.get_group(0) / planes;
+            const long long pos = p.step ? (long long) p.step[j * p.step_stride + kStepPos] : (long long) (p.pos0 + j);
             const int h = (int) it.get_group(2), g = (int) it.get_group(1), t = (int) it.get_local_id(2);
             const bool is_v = (int) it.get_group(0) % planes == 1;
             const sycl::sub_group sg = it.get_sub_group();
-            const float x = (is_v ? vcur : kcur)[(long long) j * cur_stride + (long long) h * head_dim + (long long) g * KV_Q8_GROUP + t];
-            float a = sycl::fabs(x);
-            for (int o = 16; o > 0; o >>= 1) a = sycl::fmax(a, sycl::permute_group_by_xor(sg, a, o));
-            if ((t & 31) == 0) warp_max[t >> 5] = a;
+            const int d = g * KV_Q8_GROUP + t;
+            const float x = (is_v ? p.v : p.k)[j * cur_stride + (int64_t) h * head_dim + d];
+            const long long page = (long long) p.page_table[pos / page_size];
+            const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+            const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+            if (f16) {   // uniform
+                const uint16_t hv = f16_gpu::f16_from_f32(x);
+                if (page >= 0) (is_v ? p.v_pool : p.k_pool)[row * head_dim + d] = hv;
+                if (wide) {   // uniform
+                    lane[t] = hv;
+                    sycl::group_barrier(it.get_group());
+                    if (t < KV_Q8_GROUP / 2) {
+                        const uint32_t w = lane[2 * t] | (lane[2 * t + 1] << 16);
+                        const long long at = row_id * head_dim + g * KV_Q8_GROUP;
+                        if (host.k_pool != nullptr) reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + at)[t] = w;
+                        if (stage.k_pool != nullptr) reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + at)[t] = w;
+                    }
+                    return;
+                }
+                if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * head_dim + d] = hv;
+                if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * head_dim + d] = hv;
+                return;
+            }
+            float am = sycl::fabs(x);
+            for (int o = 16; o > 0; o >>= 1) am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, o));
+            if ((t & 31) == 0) warp_max[t >> 5] = am;
             sycl::group_barrier(it.get_group());
             const float amax = sycl::fmax(warp_max[0], warp_max[1]);
             const uint16_t sbits = f16_from_f32(amax / 127.0f);
@@ -65,20 +100,52 @@ void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v
                 q = (int) sycl::rint(x / sf);
                 q = q < -127 ? -127 : (q > 127 ? 127 : q);
             }
-            const long long page = (long long) table[pos / page_size];
             if (page >= 0) {
-                const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-                (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
-                if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
+                (is_v ? p.v_q : p.k_q)[row * head_dim + d] = (int8_t) q;
+                if (t == 0) (is_v ? p.v_scale : p.k_scale)[row * groups + g] = sbits;
             }
-            if (hp.k_q != nullptr) {
-                const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-                (is_v ? hp.v_q : hp.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
-                if (t == 0) (is_v ? hp.v_scale : hp.k_scale)[row * groups + g] = sbits;
+            if (wide) {   // uniform
+                lane[t] = (uint32_t) (uint8_t) (int8_t) q;
+                sycl::group_barrier(it.get_group());
+                if (t < KV_Q8_GROUP / 4) {
+                    const uint32_t w = lane[4 * t] | (lane[4 * t + 1] << 8) | (lane[4 * t + 2] << 16) | (lane[4 * t + 3] << 24);
+                    const long long at = row_id * head_dim + g * KV_Q8_GROUP;
+                    if (host.k_q != nullptr) reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + at)[t] = w;
+                    if (stage.k_q != nullptr) reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + at)[t] = w;
+                }
+                if (t == 0) {
+                    if (host.k_q != nullptr) (is_v ? host.v_scale : host.k_scale)[row_id * groups + g] = sbits;
+                    if (stage.k_q != nullptr) (is_v ? stage.v_scale : stage.k_scale)[row_id * groups + g] = sbits;
+                }
+                return;
+            }
+            for (const KvHostPools* hp : {&host, &stage}) {
+                if (hp->k_q == nullptr) continue;
+                (is_v ? hp->v_q : hp->k_q)[row_id * head_dim + d] = (int8_t) q;
+                if (t == 0) (is_v ? hp->v_scale : hp->k_scale)[row_id * groups + g] = sbits;
             }
         });
     });
-    if (!stream) core::Runtime::get().wait(e, "kv_append_q8");
+    if (!stream) core::Runtime::get().wait(e, "kv_append_cells");
+}
+
+void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
+                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host) {
+    KvAppend a;
+    a.step = step;
+    a.step_stride = step_stride;
+    a.k = kcur;
+    a.v = vcur;
+    a.cur_stride = cur_stride;
+    a.n_tok = n_tok;
+    a.k_q = k_q;
+    a.v_q = v_q;
+    a.k_scale = k_scale;
+    a.v_scale = v_scale;
+    a.page_table = page_table;
+    a.host = host;
+    kv_append_cells(a, s, stream);
 }
 
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,

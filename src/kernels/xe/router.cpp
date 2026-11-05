@@ -29,7 +29,6 @@ class RouterPublishKernel;   // asked for its work-group (work_group_upto_1024_o
 
 namespace {
 
-constexpr int RT_MAX_THREADS = 512;
 constexpr int WARP = 32;
 
 // The argmax order of both routers: the larger probability wins, a tie keeps the lower expert index.  It is a total
@@ -56,131 +55,20 @@ sycl::queue& queue_for(void* stream, bool required) {
 
 }  // namespace
 
-namespace {
-// D: double where the device has FP64 (the reference's exponentials and sums), float elsewhere (device_caps.hpp)
-template <typename D>
-sycl::event router_top10_launch(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k, int* ids,
-                                float* weights, int threads, int nw) {
-    return q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<unsigned char, 1> s_taken(sycl::range<1>((size_t) n_expert), h);
-        sycl::local_accessor<D, 1> s_ex(sycl::range<1>((size_t) n_expert), h);
-        sycl::local_accessor<float, 1> s_p(sycl::range<1>((size_t) n_expert), h);
-        sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / WARP), h);
-        sycl::local_accessor<int, 1> s_rid(sycl::range<1>(RT_MAX_THREADS / WARP), h);
-        sycl::local_accessor<D, 1> s_sum(sycl::range<1>(1), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * threads, threads),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const auto g = it.get_group();
-            const sycl::sub_group sg = it.get_sub_group();
-            const int t = (int) it.get_group(0);
-            const int tid = (int) it.get_local_id(0), nt = threads;
-            const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
-            const float* l = logits + (size_t) t * n_expert;
-
-            // ---- softmax over ALL experts, for stability: the max (an exact, order-independent tree)
-            float mx = -INFINITY;
-            for (int x = tid; x < n_expert; x += nt) mx = sycl::fmax(mx, l[x]);
-            mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
-            if (lane == 0) s_red[warp] = mx;
-            sycl::group_barrier(g);
-            if (warp == 0) {
-                float v = lane < nw ? s_red[lane] : -INFINITY;
-                v = sycl::reduce_over_group(sg, v, sycl::maximum<float>());
-                if (lane == 0) s_red[0] = v;
-            }
-            sycl::group_barrier(g);
-            mx = s_red[0];
-
-            // ---- the exponentials, once each, in parallel
-            for (int x = tid; x < n_expert; x += nt) s_ex[x] = sycl::exp((D) l[x] - (D) mx);
-            sycl::group_barrier(g);
-
-            // ---- the sum, ascending, on one work-item
-            if (tid == 0) {
-                D sum = 0;
-                for (int x = 0; x < n_expert; ++x) sum += s_ex[x];
-                s_sum[0] = sum;
-            }
-            sycl::group_barrier(g);
-            const float inv = (float) ((D) 1 / s_sum[0]);
-
-            // ---- p[] once, the same expression the reference-faithful version evaluated
-            for (int x = tid; x < n_expert; x += nt) { s_p[x] = (float) (s_ex[x] * inv); s_taken[x] = 0; }
-            sycl::group_barrier(g);
-
-            // ---- k passes of a stable argmax: ascending scan with strict `>` keeps the lowest index on a tie
-            for (int i = 0; i < k; ++i) {
-                float bv = -INFINITY;
-                int bi = n_expert;               // a sentinel that loses to every real index
-                for (int x = tid; x < n_expert; x += nt) {
-                    if (s_taken[x]) continue;
-                    const float pe = s_p[x];
-                    if (pe > bv) { bv = pe; bi = x; }
-                }
-                for (int off = 16; off > 0; off >>= 1)
-                    better(bv, bi, sycl::permute_group_by_xor(sg, bv, off), sycl::permute_group_by_xor(sg, bi, off));
-                if (lane == 0) { s_red[warp] = bv; s_rid[warp] = bi; }
-                sycl::group_barrier(g);
-                if (warp == 0) {
-                    float v = lane < nw ? s_red[lane] : -INFINITY;
-                    int ix = lane < nw ? s_rid[lane] : n_expert;
-                    for (int off = 16; off > 0; off >>= 1)
-                        better(v, ix, sycl::permute_group_by_xor(sg, v, off), sycl::permute_group_by_xor(sg, ix, off));
-                    if (lane == 0 && ix < n_expert) {
-                        ids[(size_t) t * k + i] = ix;
-                        weights[(size_t) t * k + i] = v;
-                        s_taken[ix] = 1;
-                    }
-                }
-                sycl::group_barrier(g);
-            }
-
-            // ---- renormalise, with ggml's lower clamp.  Order preserved.
-            if (tid == 0) {
-                D s = 0;
-                for (int i = 0; i < k; ++i) s += (D) weights[(size_t) t * k + i];
-                const D sc = sycl::fmax(s, (D) 6.103515625e-05);       // 2**-14
-                for (int i = 0; i < k; ++i)
-                    weights[(size_t) t * k + i] = (float) ((D) weights[(size_t) t * k + i] / sc);
-            }
-        });
-    });
-}
-}  // namespace
-
-// One work-group per token.  See the CUDA file for why each step is shaped as it is: the max is an exact tree, the
-// exponentials are computed once in parallel in double, the double sum stays serial and ascending, and the top k
-// are k passes of a stable argmax.
-void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
-                  void* stream) {
-    if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
-    if (k > 64) throw core::DeviceError("router_top10: k " + std::to_string(k) + " exceeds the kernel's 64");
-    if (n_expert > RT_MAX_THREADS * 64)
-        throw core::DeviceError("router_top10: n_expert " + std::to_string(n_expert) + " is past the kernel's " +
-                                std::to_string(RT_MAX_THREADS * 64));
-    int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
-    threads = (threads + WARP - 1) & ~(WARP - 1);                  // whole sub-groups, for the reductions
-    const int nw = threads / WARP;
-    auto& q = queue_for(stream, false);
-    const auto e = xe::has_fp64(q)
-                       ? router_top10_launch<double>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw)
-                       : router_top10_launch<float>(q, logits, n_tokens, n_expert, k, ids, weights, threads, nw);
-    if (!stream) core::Runtime::get().wait(e, "router_top10");
-}
-
 void native_router_set_enabled(bool value) { native_enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return native_enabled.load(std::memory_order_relaxed); }
 
 namespace {
-// One token's top-10 by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL = n_expert
-// / 32 values a lane: `ids2` and `weights2`, when given, get the same values (the doorbell's mapped copies, written here
-// instead of copied after)
+// One token's top k (k <= 32) by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL
+// values a lane, the experts past n_expert (<= NPL x 32) never picked: `ids2` and `weights2`, when given, get the same
+// values (the doorbell's mapped copies, written here instead of copied after)
 template <int NPL>
 inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t* ids, float* weights, int32_t* ids2,
-                        float* weights2) {
+                        float* weights2, int n_expert = NPL * 32, int k = 10) {
         const int lane = (int) sg.get_local_linear_id();
+        const bool full = n_expert == NPL * 32;
         float values[NPL];
-        for (int i = 0; i < NPL; ++i) values[i] = logits[lane + i * 32];
+        for (int i = 0; i < NPL; ++i) values[i] = full || lane + i * 32 < n_expert ? logits[lane + i * 32] : -INFINITY;
         float maximum = -INFINITY;
         for (int i = 0; i < NPL; ++i) maximum = sycl::max(maximum, values[i]);
         for (int mask = 16; mask; mask >>= 1) maximum = sycl::fmax(maximum, sycl::permute_group_by_xor(sg, maximum, mask));
@@ -194,22 +82,23 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         for (int i = 0; i < NPL; ++i) {
             values[i] *= reciprocal;
             if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
+            if (!full && lane + i * 32 >= n_expert) values[i] = -INFINITY;
         }
         // The rows already picked are a bit mask, not -INFINITY stored back into `values`: IGC 2.38.2 drops every store
         // of this kernel when it stores at a run-time index into the private array the butterfly just read (#45, Arc
         // Pro B70: the routing table kept its old contents).  The picks, their order and the ties are the same.
-        int picked = 0;
+        uint32_t picked = 0;
         float selected = 0.0f, selected_sum = 0.0f;
-        for (int rank = 0; rank < 10; ++rank) {
+        for (int rank = 0; rank < k; ++rank) {
             float best = -INFINITY;
             int expert = lane;
             for (int i = 0; i < NPL; ++i) {
-                if (((picked >> i) & 1) == 0 && values[i] > best) { best = values[i]; expert = lane + i * 32; }
+                if (((picked >> i) & 1u) == 0 && values[i] > best) { best = values[i]; expert = lane + i * 32; }
             }
             for (int mask = 16; mask; mask >>= 1)
                 better(best, expert, sycl::permute_group_by_xor(sg, best, mask), sycl::permute_group_by_xor(sg, expert, mask));
             if ((expert & 31) == lane) {
-                picked |= 1 << (expert / 32);
+                picked |= 1u << (expert / 32);
                 ids[rank] = expert;
                 if (ids2 != nullptr) ids2[rank] = expert;
                 // Deliberately accumulate by WINNING EXPERT lane, not output rank.
@@ -221,24 +110,42 @@ inline void top10_token(const sycl::sub_group& sg, const float* logits, int32_t*
         for (int mask = 16; mask; mask >>= 1) selected_sum += sycl::permute_group_by_xor(sg, selected_sum, mask);
         selected_sum = sycl::max(selected_sum, 6.103515625e-5f);
         const float inverse_selected_sum = 1.0f / selected_sum;
-        if (lane < 10) {
+        if (lane < k) {
             weights[lane] = selected * inverse_selected_sum;
             if (weights2 != nullptr) weights2[lane] = selected * inverse_selected_sum;
         }
 }
 
+// a token a sub-group, 8 tokens a work-group from 8 tokens on (the prompt's rows; each token's arithmetic as alone): a
+// work-group of one sub-group a token ran 2,048 tokens of 512 experts 3% slower on the RTX 4070 (0.0132 ms against
+// the prompt's former kernel's 0.0128)
 template <int NPL>
-void launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_all, float* weights_all, int n_tok) {
-    q.parallel_for(sycl::nd_range<1>((size_t) n_tok * WARP, WARP), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const size_t tok = it.get_group(0);
-        top10_token<NPL>(it.get_sub_group(), logits_all + tok * NPL * 32, ids_all + tok * 10, weights_all + tok * 10,
-                         nullptr, nullptr);
+sycl::event launch_native_router(sycl::queue& q, const float* logits_all, int32_t* ids_all, float* weights_all, int n_tok,
+                                 int n_expert, int k) {
+    const int per = n_tok >= 8 ? 8 : 1;
+    return q.parallel_for(sycl::nd_range<1>((size_t) ((n_tok + per - 1) / per) * per * WARP, (size_t) per * WARP),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const size_t tok = it.get_group(0) * per + sg.get_group_linear_id();
+        if (tok >= (size_t) n_tok) return;   // uniform over the sub-group
+        top10_token<NPL>(sg, logits_all + tok * n_expert, ids_all + tok * k, weights_all + tok * k, nullptr, nullptr,
+                         n_expert, k);
     });
 }
 
+// NPL: the fewest values a lane that hold n_expert (<= 1,024)
+sycl::event router_top_k_launch(sycl::queue& q, const float* logits, int32_t* ids, float* weights, int n_tok,
+                                int n_expert, int k) {
+    if (n_expert <= 32) return launch_native_router<1>(q, logits, ids, weights, n_tok, n_expert, k);
+    if (n_expert <= 64) return launch_native_router<2>(q, logits, ids, weights, n_tok, n_expert, k);
+    if (n_expert <= 128) return launch_native_router<4>(q, logits, ids, weights, n_tok, n_expert, k);
+    if (n_expert <= 256) return launch_native_router<8>(q, logits, ids, weights, n_tok, n_expert, k);
+    if (n_expert <= 512) return launch_native_router<16>(q, logits, ids, weights, n_tok, n_expert, k);
+    return launch_native_router<32>(q, logits, ids, weights, n_tok, n_expert, k);
+}
+
 void launch_native_router_n(sycl::queue& q, const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert) {
-    if (n_expert == 512) launch_native_router<16>(q, logits, ids, weights, n_tok);
-    else launch_native_router<8>(q, logits, ids, weights, n_tok);
+    router_top_k_launch(q, logits, ids, weights, n_tok, n_expert, 10);
 }
 
 void require_shape(int n_expert, const char* what) {
@@ -254,6 +161,19 @@ inline void bump_host(uint32_t* p) {
     *v = n;
 }
 }  // namespace
+
+// The one router, the native one at any width (router_top_k_launch below).  Its reading is ggml's (FP32, the sum a
+// butterfly), not ref/moe.py's double one this replaced: the ids and weights may differ by rounding.
+void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights,
+                  void* stream) {
+    if (n_tokens <= 0 || n_expert <= 0 || k <= 0) return;
+    if (k > 32 || k >= n_expert || n_expert > 1024)
+        throw core::DeviceError("router_top10: top " + std::to_string(k) + " of " + std::to_string(n_expert) +
+                                " experts is past the kernel's top 32 of 1,024");
+    auto& q = queue_for(stream, false);
+    const auto e = router_top_k_launch(q, logits, ids, weights, n_tokens, n_expert, k);
+    if (!stream) core::Runtime::get().wait(e, "router_top10");
+}
 
 void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
                                  int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,

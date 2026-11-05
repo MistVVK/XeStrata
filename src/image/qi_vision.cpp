@@ -288,7 +288,7 @@ QiVisionOut QiVision::encode(const float* rgb, int64_t width, int64_t height) {
         qi_layer_norm16(x_, l.ln1.w, l.ln1.b, T, C_, eps_, h16_, s_);
         product(h16_, l.qkv, y_, T);
         qi_vit_qkv_rope16(y_, yx_, T, heads_, hd_, 10000.f, q_scale, q16_, k16_, v16_, s_);
-        qi_attention(q16_, k16_, v16_, T, heads_, 128, 0, a16_, big_, s_);
+        qi_attention(q16_, k16_, v16_, T, heads_, 128, 0, a16_, s_);
         qi_unpad_heads16(a16_, T, heads_, hd_, o16_, s_);
         product(o16_, l.o, y_, T);
         qi_axpy(x_, y_, 1.f, T * C_, s_);

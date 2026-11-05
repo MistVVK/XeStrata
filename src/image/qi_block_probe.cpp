@@ -16,6 +16,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/flash_attn.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -31,7 +32,6 @@
 namespace {
 
 namespace gpu = strata::gpu;
-using strata::image::qi_attention_plain;
 
 std::vector<char> read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -154,9 +154,24 @@ int main(int argc, char** argv) {
             gemm.native(h16, wd.type, wd.d, q, T, wd.n, wd.k);
             strata::image::qi_gate_add(x, q, mod(3), n_text, T, C, s);
         };
-        auto attention = [&]() { qi_attention_plain(q16, k16, v16, T, H, 128, n_text, a, s); };
+        auto attention = [&]() {   // the FMA form of the shared attention (flash_attn.hpp), FP32 out
+            strata::kernels::FlashAttnArgs fa;
+            fa.q = q16;
+            fa.k = k16;
+            fa.v = v16;
+            fa.q_ld = fa.kv_ld = fa.out_ld = H * 128;
+            fa.n_head = fa.n_kv = H;
+            fa.head_dim = 128;
+            fa.rows = fa.keys = fa.row_end = T;
+            fa.n_causal = n_text;
+            fa.out = a;
+            fa.out_f32 = true;
+            fa.scale = 1.0f / std::sqrt(128.0f);
+            fa.fma = true;
+            strata::kernels::flash_attn(fa, s);
+        };
         uint16_t* o16 = device<uint16_t>(T * C);
-        auto attention_mx = [&]() { strata::image::qi_attention(q16, k16, v16, T, H, 128, n_text, o16, a, s); };
+        auto attention_mx = [&]() { strata::image::qi_attention(q16, k16, v16, T, H, 128, n_text, o16, s); };
         auto sync = [&]() {
             if (!gpu::stream_sync(s)) throw std::runtime_error(std::string("sync: ") + gpu::last_error());
         };

@@ -27,10 +27,12 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
                                   int n_cols, int n_rows, float epsilon, void* stream);
 
 // The engines' one RMSNorm (the image engine's, the plain models' and Qwen3.8-Flash-Next's, prompt and decode): rows of
-// n_cols, row r scaled by gamma's row r % groups (gamma null: by 1), its arithmetic native_qsa_rms_norm_weighted's,
-// into `output` (FP32; it may be `input`) or `out16` (FP16), one of them.  A null stream waits.
+// n_cols, row r scaled by gamma's row r % groups (gamma null: by 1), into `output` (FP32; it may be `input`) or `out16`
+// (FP16), one of them.  `pinned`: native_qsa_rms_norm_weighted's arithmetic to the bit; else the form the device runs
+// fastest (its own work-group reduction where it has 16-wide sub-groups), the same for any number of rows.  A null
+// stream waits.
 void rms_norm_rows(const float* input, const float* gamma, int groups, float* output, uint16_t* out16, int n_cols,
-                   int n_rows, float epsilon, void* stream);
+                   int n_rows, float epsilon, void* stream, bool pinned = false);
 
 // The same, writing the output also as q8_1 blocks (n_cols a multiple of 32) into x_q8_1, bit for bit
 // native_quantize_q8_1 of the output: one launch for the norm and the quantization of the next products.

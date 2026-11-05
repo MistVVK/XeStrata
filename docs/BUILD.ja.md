@@ -124,7 +124,7 @@ prefill の経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16�
 FP16 に展開してから掛ける経路より読み書きが少なく、FP64 との相対誤差は約 0.4% です（活性を int8 に丸めた分）。
 対象は IQ1_M を除く i-quant と Q2_0 で、それ以外の型の層は FP16 の経路のままです。
 
-prefill の注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/qsa_prompt_attn.cpp`）。
+prefill の注意は、XMX のない GPU でも FP16 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core、sm_70 から）、`joint_matrix` の標準の API で書いた版で計算します（`src/kernels/xe/flash_attn.cpp` の選択の形）。
 KV は FP16・INT8・K8V4 で、Q4_0 は FP32 のカーネルのままです（upstream の Volta のカーネル 06a90a2 と同じ範囲）。
 INT8 と Q4_0 の符号は FP16 で正確に表せるのでそのまま行列エンジンに渡し、尺度は FP32 で掛けます。
 RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP64 との誤差は FP32 のカーネルの 3 倍以内で、2,048 クエリ・32K セルの塊が INT8 で 1.6 倍、FP16 と K8V4 で 1.5 倍速くなりました。

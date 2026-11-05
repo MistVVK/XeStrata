@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/qsa_prompt_attn_parity.cpp - perf-review D-1: the prompt attention on the matrix engines (XMX on Xe,
-// tensor cores in Strata's CUDA build; qsa_prompt_attn.hpp) against the FP32 kernel it replaces
+// tensor cores in Strata's CUDA build; flash_attn.hpp) against the FP32 kernel it replaces
 // (`qsa_decode_attn_batch`) and an FP64 host reference (GPU, synthetic, no model).
 //
 // Int8, FP16 and Q4_0 pools with random codes, scales and queries; selections shaped like the prompt path's (the 2,051
@@ -15,7 +15,7 @@
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
-#include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
@@ -144,13 +144,13 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), par::stream());
     };
     auto new_run = [&]() {
-        if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+        if (!k::flash_attn_select(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
             std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools (or the device has no matrix engines)\n");
             std::exit(2);
         }
     };
     // Q4_0 KV runs on Intel's kernel only (the portable one leaves it to the FP32 kernel; upstream 06a90a2)
-    if (fmt == 2 && !k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
+    if (fmt == 2 && !k::flash_attn_select(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, par::stream())) {
         std::printf("SKIP q4_0 ctx %lld: the prompt attention leaves Q4_0 KV to the FP32 kernel on this device\n",
                     (long long) ctx);
         return 0;

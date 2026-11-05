@@ -24,6 +24,32 @@ namespace strata::kernels {
 
 inline constexpr int KV_Q8_GROUP = 64;
 
+/// The K/V cache's one append (Qwen3.8-Flash-Next's prompt and decode, the plain models'): n_tok cells, cell t at
+/// step[t * step_stride + kStepPos] (graph-capturable) or, without `step`, at pos0 + t; its K and V at k / v +
+/// t * cur_stride floats [n_kv][head_dim].  FP16 pools (k_pool, v_pool) or INT8 ones (k_q.. with an FP16 scale per
+/// 64 values: scale = fp16(max|x| / 127), code = clamp(rint(x / scale), -127, 127)); with k_q == v_q and k == v
+/// (K8V4's folded halves) one plane.  A page of -1 (KV streaming: not resident) is not written in VRAM; `host` (the
+/// streaming's host copy) and `stage` (its staging pool) get every cell, at the cell's own row.
+struct KvAppend {
+    const int32_t* step = nullptr;
+    int step_stride = 0;
+    int64_t pos0 = 0;
+    const float* k = nullptr;
+    const float* v = nullptr;
+    int64_t cur_stride = 0;
+    int64_t n_tok = 0;
+    uint16_t* k_pool = nullptr;
+    uint16_t* v_pool = nullptr;
+    int8_t* k_q = nullptr;
+    int8_t* v_q = nullptr;
+    uint16_t* k_scale = nullptr;
+    uint16_t* v_scale = nullptr;
+    const int32_t* page_table = nullptr;
+    const KvHostPools* host = nullptr;
+    const KvHostPools* stage = nullptr;
+};
+void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream);
+
 /// Bytes per cell (one token, one layer): K and V codes plus their scales.
 inline uint64_t kv_q8_bytes_per_cell(const QsaShapes& s) {
     return (uint64_t) s.n_head_kv * s.head_dim * 2 + (uint64_t) s.n_head_kv * (s.head_dim / KV_Q8_GROUP) * 2 * 2;

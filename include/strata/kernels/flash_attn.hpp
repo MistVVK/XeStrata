@@ -1,8 +1,10 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/flash_attn.hpp - the attention on the GPU's FP16 matrix engines that the image engine's DiT
-// (qi_attention) and the plain models' prompt (prompt_attn) share: one kernel, the keys and values read where they
-// are (a dense [key][row] layout, or the K/V cache's pages), the output in FP16 or FP32.
+// (qi_attention), the plain models' prompt (prompt_attn) and Qwen3.8-Flash-Next's prompt (flash_attn_select) share:
+// one entry, the keys and values read where they are (a dense [key][row] layout, or the K/V cache's pages) or gathered
+// from the pools, the output in FP16 or FP32.
 //
 // A sub-group takes TM query rows of one head and walks that head's keys 64 at a time on its own: S = Q . K^T with
 // Q's tiles in registers and K's read from global memory (the caches share them between the sub-groups of a
@@ -12,6 +14,7 @@
 // RDNA4's WMMA instructions (amd_wmma.hpp); a GPU without them, or STRATA_NO_XMX=1, has none (flash_attn_path -1).
 #pragma once
 
+#include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 
 #include <cstdint>
@@ -32,6 +35,12 @@ struct FlashAttnArgs {
     /// rows (query, head) of one KV head it takes, any page_size.  pools_format -1: k and v (FP16) as above.
     QsaAttnPools pools;
     int pools_format = -1;
+    /// A selection (Qwen3.8-Flash-Next's QSA, flash_attn_select): query t reads the cells sel_ids[t * sel_cap + j],
+    /// j < sel_steps[t * kStepCount + kStepWidth], none masked but those whose page is -1; the pools in any format
+    /// (pools_format unused), FP32 queries and output, rows 0 .. rows - 1.
+    const int32_t* sel_ids = nullptr;
+    const int32_t* sel_steps = nullptr;
+    int64_t sel_cap = 0;
     int64_t n_head = 0, n_kv = 0, head_dim = 0;   ///< query heads, KV heads (query head h reads h / (n_head / n_kv))
     int64_t rows = 0;      ///< query rows; the keys are read in whole chunks of 64 up to `keys`, which must be there
     int64_t keys = 0;      ///< the keys the rows from n_causal on see (all of them)
@@ -44,6 +53,7 @@ struct FlashAttnArgs {
     int64_t out_ld = 0;
     bool out_f32 = false;
     float scale = 0.0f;                 ///< the scores' scale (1 / sqrt(head_dim))
+    bool fma = false;                   ///< the FMA form (FP32 FMAs) on a GPU with matrix engines too (timing it)
 };
 
 /// The matrix engines' form the device takes (0 Xe2's 8 x 16 x 16 on 16 lanes, 1 Alchemist's 8 x 8 x 16 on 8, 2
@@ -55,8 +65,38 @@ int flash_attn_path(const void* sycl_device);
 int flash_attn_nsg_most(const void* sycl_device, int64_t head_dim);
 
 /// Launches the attention of `a` on `stream` (the runtime's queue) with `nsg` sub-groups a work-group (0: the most),
-/// not waiting for it.  False, nothing launched, where the device has no matrix engines' form or the shape is not
-/// one the kernel takes (head_dim 128 or 256; a paged layout's page_size a multiple of 64).
+/// not waiting for it.  False, nothing launched, where no form takes the shape (head_dim 128 or 256; a paged layout's
+/// page_size a multiple of 64 on Intel's and NVIDIA's matrix engines; without matrix engines FP16 K and V and 1, 2,
+/// 4, 8 and 10 or 12 query heads a KV head).
 bool flash_attn(const FlashAttnArgs& a, void* stream, int nsg = 0);
+
+// The selection form (formerly qsa_prompt_attn.hpp, perf-review D-1: the prompt path's QSA attention on the matrix
+// engines):
+//
+// `qsa_decode_attn_batch` serves a prompt one query at a time with the decode kernel: FP32 dot products with a warp
+// reduction per head and cell, 64-cell chunks whose partial sums go through global scratch to a second (merge)
+// kernel. At 32K that is 21% of the prompt (5.6 s of 26 s on a 5070, Q2_0, int8 KV), and it is limited by
+// instruction issue, not memory (~150 GB/s of logical reads, 3.4 TFLOP/s).
+//
+// This kernel keeps the same per-query selection (no masking, no union) and reads the same pools, but:
+//   * one block per (query, KV head) walks all its selected cells in chunks (32 on CUDA, 16 on Xe) with an online
+//     softmax: no split-K scratch and no merge kernel;
+//   * q.k and p.v are FP16 matrix products with FP32 accumulation (m16n8k16 on CUDA, joint_matrix 8x16x16 on Xe)
+//     over the 12 query heads of the KV head (+4 pad rows);
+//   * the stored values enter exactly: int8 codes are exact in FP16 and their per-64 scales are applied in FP32
+//     (to the q.k partial of each 64-dim group, and folded into p for p.v); FP16 KV is used as is; Q4_0's codes
+//     minus 8 are exact in FP16 too, and its signed per-32 scales are applied the same way (upstream 778e1f6);
+//   * q and p are split into FP16 hi + lo parts (two MMAs each), so they keep ~22 bits: the result differs from
+//     the FP32 kernel by summation order and the exp2 rounding, not by an FP16 cast.
+// Not bitwise equal to `qsa_decode_attn_batch`; `qsa_prompt_attn_parity` bounds the difference and the prompt
+// quality gate (needles, teacher-forced top-1) checks it end to end. K8V4 (INT8 K, Q4_0 V) is handled by the portable
+// kernel only (NVIDIA's tensor cores; on Intel's XMX it ran slower than the FP32 kernel), Q4_0 KV by Intel's kernel
+// only, and nothing on a device without the matrix engines.
+//
+/// flash_attn over a selection, with `qsa_decode_attn_batch`'s arguments minus the scratch.  Returns false (nothing
+/// launched) when the device has no kernel for the pools (above) or the geometry is not 24 heads / 2 KV heads / 256:
+/// the caller then uses the decode kernel.
+bool flash_attn_select(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+                       const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels

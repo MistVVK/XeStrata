@@ -22,6 +22,7 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_mma_gemm
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -565,8 +566,7 @@ sycl::event launch_split(sycl::queue& q, const E* x, const E* w, float* Y, int64
     float* part = k_scratch(q, (size_t) (ns * T * N));
     if (part == nullptr) { *slices = 1; return launch<S, E, false, GROUPED>(q, x, w, 0, Y, ldy, nullptr, 1, T, N, K, K); }
     launch<S, E, false, GROUPED>(q, x, w, 0, part, N, nullptr, (int) ns, T, N, K, kslice);
-    return q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
-        const int64_t t = (int64_t) i[0], n = (int64_t) i[1];
+    return for_rows_cols(q, T, N, [=](int64_t t, int64_t n) {
         float v = part[t * N + n];
         for (int64_t k = 1; k < ns; ++k) v += part[(k * T + t) * N + n];
         Y[t * ldy + n] = v;

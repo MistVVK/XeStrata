@@ -59,7 +59,7 @@ struct HunyuanImage3Scratch {
     /// through the rotation into every value of the group (see hunyuanimage3_rotate16_from32).
     float *xn32 = nullptr, *xn232 = nullptr;
     float *qkv32 = nullptr, *o32 = nullptr, *gu32 = nullptr, *eg32 = nullptr, *ed32 = nullptr,
-          *logits = nullptr, *ang = nullptr, *attn_scratch = nullptr, *d_w = nullptr, *d_tw = nullptr;
+          *logits = nullptr, *ang = nullptr, *d_w = nullptr, *d_tw = nullptr;
     /// the routing: each token's experts and weights (d_idx, d_tw), then grouped by expert (d_rows, d_w, d_bounds)
     int32_t *d_rows = nullptr, *d_idx = nullptr, *d_bounds = nullptr, *d_cursor = nullptr;
 };
