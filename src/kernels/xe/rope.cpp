@@ -19,7 +19,6 @@
 
 #include <array>
 #include <atomic>
-#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -43,7 +42,6 @@ int device_slot() {
     if (d < 0 || d >= kMaxDevices) throw std::runtime_error("rope tables: engine device " + std::to_string(d));
     return d;
 }
-std::atomic<bool> native_enabled{false};
 
 bool overlaps(const void* a, size_t an, const void* b, size_t bn) {
     auto x = reinterpret_cast<uintptr_t>(a), y = reinterpret_cast<uintptr_t>(b);
@@ -154,21 +152,6 @@ void rope_rows(const float* x, float* out, int64_t T, int64_t heads, int head_di
                        scaling.type != RopeScalingType::None, scaling.kernel_args(n_rot), positions, pos0};
     rope_launch(queue_for(stream), x, out, T, heads, head_dim, ld_in, ld_out, n_rot, ang);
 }
-
-// the session's table at every position (the image path's per-pair position)
-void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
-                     const float* sin_tab, const int* pos, void* stream) {
-    if (rows <= 0 || n_rot <= 0) return;
-    if (n_rot % 2 != 0 || n_rot > head_dim)
-        throw core::DeviceError("rope_neox_apply: n_rot " + std::to_string(n_rot) + " must be even and <= head_dim " +
-                                std::to_string(head_dim));
-    const qk::Rope ang{mrope_table(), cos_tab, sin_tab, INT_MAX, n_rot / 2, 0.f, false, {}, pos, 0};
-    const auto e = rope_launch(queue_for(stream), x, out, rows, 1, head_dim, head_dim, head_dim, n_rot, ang);
-    if (!stream) core::Runtime::get().wait(e, "rope_neox_apply");
-}
-
-void native_rope_set_enabled(bool value) { native_enabled.store(value, std::memory_order_relaxed); }
-bool native_rope_enabled() { return native_enabled.load(std::memory_order_relaxed); }
 
 void native_rope_apply(const float* x, float* out, int rows, int head_dim,
                        int n_rot, const RopeScaling& scaling, const int* positions, void* stream) {

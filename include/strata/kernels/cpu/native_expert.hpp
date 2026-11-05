@@ -66,8 +66,9 @@ bool native_experts_available() noexcept;
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err,
                 int up_type = -1);
 
-/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (a model's
-/// embedding row read on the host).  False when ggml has none for the type or `n` is not whole blocks.
+/// One row of `n` values of a GGUF tensor of ggml type `type` to floats, by ggml's own dequantizer (F32 copied): the
+/// one host lookup of an embedding row, for every table that stays in host memory (the plain models' and the image
+/// engine's text readers').  False when ggml has none for the type or `n` is not whole blocks.
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);

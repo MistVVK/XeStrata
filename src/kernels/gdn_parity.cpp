@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms.
+// src/kernels/gdn_parity.cpp - P2.S2's test for the GDN recurrence, the conv and the two norms: the native kernels
+// (native_gdn.hpp, native_gdn_preprocess.hpp) against `ref/gdn.py`'s reading in double.
 //
 // `ref/gdn.py` carries eleven PROPERTY checks, several of which exist because a rival reading of the SOURCE
 // produces well-formed output.  The four that the kernels here can be wrong about are re-pinned below, each
@@ -22,8 +23,11 @@
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
 #include "strata/kernels/gdn.hpp"
+#include "strata/kernels/native_gdn.hpp"
+#include "strata/kernels/native_gdn_preprocess.hpp"
 
 #include "parity_device.hpp"
+#include "strata/core/gpu.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -98,6 +102,8 @@ int main(int argc, char** argv) {
     }
 
     const int S = 128, h_k = 16, h_v = 48;      // the artifact's real geometry
+    strata::gpu::Stream cs = strata::gpu::stream_create();   // the native kernels take an explicit stream
+    if (cs == nullptr) { std::fprintf(stderr, "gdn_parity: no stream\n"); return 1; }
     std::mt19937 rng(2024);
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
@@ -171,7 +177,10 @@ int main(int argc, char** argv) {
         strata::parity::copy_bytes_in(d_b, beta.data(), beta.size() * 4);
 
         strata::kernels::GdnShapes sh{S, h_k, h_v};
-        strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+        strata::kernels::native_gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, cs);
+        strata::gpu::stream_sync(cs);
+        // q is not pre-scaled: the kernel applies the recurrence's 1/sqrt(S) to the finished readout
+        for (auto& x : want_o) x = (float) ((double) x / std::sqrt((double) S));
 
         std::vector<float> got_o((size_t) h_v * S), got_st(st_dev.size());
         strata::parity::copy_bytes_out(got_o.data(), d_o, got_o.size() * 4);
@@ -203,7 +212,8 @@ int main(int argc, char** argv) {
             strata::parity::copy_bytes_in(d_st, zero.data(), zero.size() * 4);
             strata::parity::copy_bytes_in(d_g, zg.data(), zg.size() * 4);
             strata::parity::copy_bytes_in(d_b, zb.data(), zb.size() * 4);
-            strata::kernels::gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, nullptr);
+            strata::kernels::native_gdn_step(d_st, d_q, d_k, d_v, d_g, d_b, d_o, sh, cs);
+            strata::gpu::stream_sync(cs);
             std::vector<float> zz(zero.size());
             strata::parity::copy_bytes_out(zz.data(), d_st, zz.size() * 4);
             double nz = 0;
@@ -237,7 +247,7 @@ int main(int argc, char** argv) {
             return d;
         };
 
-        std::vector<float> cs = to_dev_layout(cs_ref);
+        std::vector<float> cst = to_dev_layout(cs_ref);
         std::vector<float> want;
         std::vector<float> cs_want_ref = cs_ref;
         ref_conv(cs_want_ref, x, kern, C, dc, want);
@@ -254,7 +264,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < kern.size(); ++i) kW_wrong[i] = kern[i];
         {
             // apply the WRONG layout by hand: tap i of channel c is kW[c*dc+i] read as kW[i*C+c]
-            std::vector<float> cs2 = cs;
+            const std::vector<float>& cs2 = cst;
             std::vector<float> out_bad((size_t) C, 0.0f);
             for (int c = 0; c < C; ++c) {
                 double a = 0;
@@ -268,22 +278,33 @@ int main(int argc, char** argv) {
             if (!(rel > 0.05)) ++bad;
         }
 
-        float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr;
-        d_cs = static_cast<decltype(d_cs)>(strata::parity::alloc_bytes(cs.size() * 4));
+        float *d_cs = nullptr, *d_x = nullptr, *d_w = nullptr, *d_o = nullptr, *d_silu = nullptr;
+        d_cs = static_cast<decltype(d_cs)>(strata::parity::alloc_bytes(cst.size() * 4));
         d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
         d_w = static_cast<decltype(d_w)>(strata::parity::alloc_bytes(kW.size() * 4));
         d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes((size_t) C * 4));
-        strata::parity::copy_bytes_in(d_cs, cs.data(), cs.size() * 4);
+        d_silu = static_cast<decltype(d_silu)>(strata::parity::alloc_bytes((size_t) C * 4));
+        strata::parity::copy_bytes_in(d_cs, cst.data(), cst.size() * 4);
         strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
         strata::parity::copy_bytes_in(d_w, kW.data(), kW.size() * 4);
-        strata::kernels::gdn_conv_step(d_cs, d_x, d_w, d_o, C, dc, nullptr);
-        std::vector<float> got((size_t) C), got_cs(cs.size());
+        strata::kernels::native_gdn_conv_silu(d_cs, d_x, d_w, d_o, d_silu, C, dc, cs);
+        strata::gpu::stream_sync(cs);
+        std::vector<float> got((size_t) C), got_silu((size_t) C), got_cs(cst.size());
         strata::parity::copy_bytes_out(got.data(), d_o, got.size() * 4);
+        strata::parity::copy_bytes_out(got_silu.data(), d_silu, got_silu.size() * 4);
         strata::parity::copy_bytes_out(got_cs.data(), d_cs, got_cs.size() * 4);
-        const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs);
+        std::vector<float> want_silu((size_t) C);
+        for (int c = 0; c < C; ++c) {
+            const double v = (double) want[(size_t) c];
+            want_silu[(size_t) c] = (float) (v / (1.0 + std::exp(-v)));
+        }
+        const double rel_out = rel_l1(want, got), rel_cs = rel_l1(cs_want, got_cs), rel_silu = rel_l1(want_silu, got_silu);
         std::printf("  %-42s rel %.3e\n", "conv out vs reference", rel_out);
+        std::printf("  %-42s rel %.3e\n", "conv SiLU vs the double reference", rel_silu);
         std::printf("  %-42s rel %.3e\n", "conv state slide (mapped) vs reference", rel_cs);
         if (!(rel_out <= 1e-6)) { std::printf("    *** conv out ***\n"); ++bad; }
+        // f32 fast-math SiLU: a few ulp of the device's exp
+        if (!(rel_silu <= 1e-6)) { std::printf("    *** conv silu ***\n"); ++bad; }
         if (!(rel_cs <= 1e-6)) { std::printf("    *** conv state ***\n"); ++bad; }
         }
 
@@ -319,7 +340,8 @@ int main(int argc, char** argv) {
         float* d_x = nullptr;
         d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(x.size() * 4));
         strata::parity::copy_bytes_in(d_x, x.data(), x.size() * 4);
-        strata::kernels::gdn_l2_norm(d_x, rows, cols, eps, nullptr);
+        strata::kernels::native_gdn_l2_norm(d_x, rows, cols, eps, cs);
+        strata::gpu::stream_sync(cs);
         std::vector<float> got(x.size());
         strata::parity::copy_bytes_out(got.data(), d_x, got.size() * 4);
         const double rel = rel_l1(x_ref, got);
@@ -351,7 +373,8 @@ int main(int argc, char** argv) {
         strata::parity::copy_bytes_in(d_o, o.data(), o.size() * 4);
         strata::parity::copy_bytes_in(d_z, z.data(), z.size() * 4);
         strata::parity::copy_bytes_in(d_sn, sn.data(), sn.size() * 4);
-        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        strata::kernels::native_gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, cs);
+        strata::gpu::stream_sync(cs);
         std::vector<float> got(y_ref.size());
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel = rel_l1(y_ref, got);
@@ -377,7 +400,8 @@ int main(int argc, char** argv) {
 
         // ...and it is qwen35moe's: gdn_set_silu_gate switches the kernel to it, and back
         strata::kernels::gdn_set_silu_gate(true);
-        strata::kernels::gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, nullptr);
+        strata::kernels::native_gdn_out_norm(d_o, d_z, d_sn, d_y, hv2, S2, eps, cs);
+        strata::gpu::stream_sync(cs);
         strata::kernels::gdn_set_silu_gate(false);
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel_gate = rel_l1(y_silu, got);
@@ -385,6 +409,7 @@ int main(int argc, char** argv) {
         if (!(rel_gate <= 1e-6)) ++bad;
         }
 
+    strata::gpu::stream_destroy(cs);
     std::printf("\ngdn: %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("gdn_parity OK\n");

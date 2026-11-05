@@ -10,12 +10,11 @@
 // here is everything BETWEEN the projections:
 //
 //     kv_append            the new token's K and V into the paged cache
-//     indexer_key_append   the raw indexer tail, and the pooling that fires on block completion
-//     qsa_index            per-CELL indexer scores: Relu per head, sum over heads, + bias, mapped by cell_block
-//     topk_512             the selection: the `width` largest cells, ties by ascending index, returned ascending
 //     kv_gather            selected cells through the PAGE TABLE into a contiguous scratch
 //     qsa_attend           softmax GQA over the scratch
-//     qsa_gate_apply       `attn * sigmoid(gate)` and the round to the fp16 activation `attn_output` consumes
+//
+// The indexer's key append and pooling (native_qsa_indexer.hpp), its block scores and selection (qsa_select.hpp) and
+// the output gate (native_qsa.hpp) are the native kernels; the indexer's buffers are declared here.
 //
 // DECODE ONLY, and that is a deliberate scope statement rather than an omission.  `ref/qsa.py::indexer_scores`
 // has no mask parameter and says why: "The causal part of the mask is already satisfied: every cached cell
@@ -188,7 +187,7 @@ void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, in
 
 /// The selected cells through the page table into a contiguous scratch.
 ///
-///   ids            (n_ids,) i32, logical cells, ASCENDING and unique as `topk_512` returns them
+///   ids            (n_ids,) i32, logical cells, unique
 ///   k_scratch etc  (n_ids, n_head_kv, head_dim) fp16, written in full
 ///
 /// A cell that is not gathered does not exist for `qsa_attend`, which is how the top-k mask is realised: the
@@ -206,8 +205,8 @@ void kv_gather(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* pa
 ///                                           position here so the rotation can read it ON THE DEVICE
 ///
 /// **Every pointer in this struct is a DEVICE pointer**, and so are every other pointer this header's entry
-/// points take: `rope_neox_apply` indexes its cos/sin table and its position array on the device, so a host
-/// scalar passed as `pos` is an illegal access rather than a convenience.  `block_pos` exists for exactly that
+/// points take: the RoPE indexes its cos/sin table and its position array on the device, so a host scalar passed
+/// as `pos` is an illegal access rather than a convenience.  `block_pos` exists for exactly that
 /// reason - the rotation position is derived from the host's `pos`, so it has to be handed to the device
 /// through memory, which is also the only form a CUDA graph can replay.
 ///
@@ -222,70 +221,8 @@ struct QsaIndexerBuffers {
     int32_t* block_pos = nullptr;
 };
 
-/// Append one raw indexer key (IDX_DIM wide, fp32, NEVER normed and NEVER rotated - `ref/qsa.py` L201-210) and
-/// run the pooling if this cell COMPLETES a block.
-///
-/// `pooled[b] = rope_neox(rms_norm(mean(raw[b*r .. b*r+r-1]), w_k_norm), pos of cell b*r)` for b = pos/r on a
-/// completion, and the spare slot `pooled[n_bid] = rope_neox(rms_norm(raw[0], w_k_norm), 0)`.  The rotation
-/// position is the block's FIRST cell, which `ref/qsa.py` PROPERTY 4 pins and the test re-pins: rotating at the
-/// block's LAST cell keeps every shape and every magnitude.
-///
-/// **`pos_dev` IS A DEVICE POINTER AND THIS FUNCTION IS CAPTURABLE.**  It used to take `int64_t pos` as a host
-/// scalar, and a CUDA graph bakes kernel ARGUMENTS in at capture time - so a captured call would have replayed
-/// the FIRST token's position forever: `slot = pos % idx_block` would never advance, no block would ever
-/// complete, the indexer would keep pooling cells 0-3, and the selection would stay pinned to the first block.
-/// Not a crash and not a small error - a plausible attention output over the wrong cells.  Worse than a stale
-/// POINTER, which this project's pitfalls list already warns about, because a stale pointer tends to fault while
-/// a stale VALUE looks like a working graph.
-///
-/// It could not be fixed by swapping the scalar for a pointer alone: `pos` was ALSO read on the host, to decide
-/// whether to run the completion rotation at all and which pooled row to rotate.  So the rotation moved INTO
-/// the pooling kernel, which is why this now takes `cos_tab`/`sin_tab` and `n_rot`, and why `block_pos` is kept
-/// only as a readable record of the rotation position rather than as the input to a second launch.
-///
-/// `pos_base` IS THE SEQUENCE'S FIRST CELL'S POSITION, so cell j sits at position `pos_base + j`.  The kernel
-/// cannot derive it: `QsaCache.pos` is what the reference rotates by, and equating a cell's position with its
-/// index is only right for a sequence that starts at 0.  The test runs the fixture at `pos_base = 100`, where
-/// the two readings are 514% apart.  `pos_base` is CONSTANT for a sequence, so unlike `pos_dev` it is safe to
-/// bake into a graph.
-void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
-                        float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
-                        const float* sin_tab, void* stream);
-
-/// Per-CELL indexer scores, `n_kv = pos + 1` of them, fp32.
-///
-///   pooled  (n_bid + 1, idx_dim)   block keys, the spare slot last, as `indexer_key_append` maintains them
-///   q_idx   (idx_n_head, idx_dim)  ALREADY normed and rotated by the caller
-///   bias    (n_bid + 1,) or null   optional additional per-block bias
-///
-///   score[j] = bias[cb] + sum_h Relu(dot(pooled[cb], q_idx[h])),   cb = min(j / r, n_bid)
-///   score[j] += 1e9f for incomplete-tail cells (j >= (n_kv / r) * r).
-/// The tail bias matches llama.cpp's causal decode input and applies even when bias is null.
-/// Completed blocks receive no tail bias; the step API derives this from each replay's n_kv.
-///
-/// The Relu is PER HEAD and the sum is over heads AFTERWARDS: `relu(sum_h dot_h)` is the rival reading, and it
-/// is a different number whenever any head's dot is negative.  Flipping one query head's sign can never lower
-/// the score, which is the property the test asserts.  There is NO softmax and NO 1/sqrt(d) here.
-void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
-               int64_t n_kv, float* cell_scores, void* stream);
-
-/// The largest `qsa_selection_width(n_kv)` cells of `cell_scores`, ascending, into `ids`.
-///
-/// Ties are broken by ASCENDING INDEX.  ggml does not specify that, and `ref/qsa.py` is explicit about it so a
-/// mismatch is at least diagnosable; the host test compares against `np.lexsort((arange, -scores))`, which is
-/// the same rule, implemented independently of the kernel's threshold search.
-///
-/// `cap` is the caller's buffer size in ids and must be >= the width; the kernel writes EXACTLY `width` and
-/// refuses rather than truncating.  The `-1` padding that `docs/capture-format.md` L66-73 describes is the
-/// capture writer's job, not this kernel's: the padded width is a property of the run, not of one token.
-///
-/// `n_kv` must be <= 32768 (`kTopkMaxCells`): the selection runs in ONE block, which is what makes the
-/// ascending tie rule deterministic without a second pass over global memory.  Phase 3 replaces this with a
-/// radix select and Phase 7 raises the cap; until then a longer context is refused loudly.
+/// The largest context the selection's capacity is sized for: `qsa_selection_width(kTopkMaxCells, s)` ids.
 inline constexpr int64_t kTopkMaxCells = 32768;
-
-void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_t cap, int32_t* ids,
-              void* stream);
 
 /// Softmax GQA over ONLY the gathered cells.  `q` is (n_head, head_dim) f32, already normed and rotated.
 ///
@@ -303,29 +240,6 @@ void topk_512(const float* cell_scores, int64_t n_kv, const QsaShapes& s, int64_
 void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scratch, int64_t n_ids,
                 const QsaShapes& s, float* attn, float* weights, void* stream);
 
-/// `attn *= sigmoid(gate)` in f32, then ONE round to fp16 for the `attn_output` GEMV.
-///
-///   q_full  (n_head, 2*head_dim) f32  the raw `attn_q` projection, BEFORE any norm
-///   gate    = q_full[h][head_dim + d]  - the SECOND half of each head's 2*head_dim block
-///   out     (n_head, head_dim) fp16
-///
-/// The split is NOT element-interleaved (`ref/qsa.py` PROPERTY 10 pins that: `q = per_head[:, :head_dim]`,
-/// `gate = per_head[:, head_dim:]`), and the rounding happens AFTER the multiply so there is one rounding
-/// rather than two.  SIGMOID, not SiLU: this artifact's QSA gate is a sigmoid.
-void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, uint16_t* out, void* stream);
-
-/// THE SAME MULTIPLY WITHOUT THE fp16 ROUND, for the caller whose weight wants Q8_K.
-///
-/// `attn_output` is a K-quant (Q4_K/Q5_K/Q6_K in every QSA layer of this artifact) and its `vec_dot_type` is
-/// **Q8_K, not fp16** - `docs/activation-contract.md` is explicit, and the measured cost of getting it wrong is
-/// 0.66-1.41% per GEMV against a 1e-3 tolerance, which is above what Gate C1 allows.  The fp16 form exists
-/// because that is what the engine did first; this one exists because that was a gap, and the caller quantizes
-/// to Q8_K between the two calls.
-///
-/// The arithmetic is IDENTICAL to `qsa_gate_apply`'s up to the last step, and the multiply is in double in both
-/// - so switching between them changes exactly one rounding, which is the point.
-void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream);
-
 // ================= THE CAPTURABLE ENTRY POINTS =================
 //
 // These take the per-token counts from `step` AND size every launch from a CONSTANT capacity, which is the two
@@ -341,14 +255,6 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
 // The kernels already guard for the surplus: `qsa_index_kernel` returns for `b > n_bid`, `kv_gather_kernel`
 // returns past its device `n_ids`, and `qsa_attend_kernel` handles an empty selection itself.  So passing a
 // capacity LARGER than this token needs is correct, not merely safe.
-
-/// `max_blocks` must be at least `(max_cells / idx_block) + 2`.
-void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
-                    const int32_t* step, int64_t max_blocks, float* cell_scores, void* stream);
-
-/// `cap` must be `qsa_selection_width(kTopkMaxCells, s)` - the largest width the kernel can ever write.
-void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, const int32_t* step,
-                   int32_t* ids, void* stream);
 
 /// `max_ids` must be the CAPACITY of `k_scratch`/`v_scratch` in ids.
 void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,

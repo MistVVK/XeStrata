@@ -12,9 +12,8 @@
 //
 // ROPE SCALING RIDES IN THE TABLE, NOT IN THE KERNEL.  The kernels below read cos/sin values and
 // cannot tell a scaled table from an unscaled one - with scaling on, the scaled angles (and YaRN's
-// mscale magnitude correction, folded into the same values) simply ARE the table.  That is why
-// neither `rope_neox_apply` nor the indexer's pooling kernel takes any scaling argument: the config
-// enters once, here, at build time (`rope_scaling.hpp`).
+// mscale magnitude correction, folded into the same values) simply ARE the table: the config enters
+// once, here, at build time (`rope_scaling.hpp`).
 #pragma once
 
 #include "strata/kernels/rope_scaling.hpp"
@@ -33,10 +32,9 @@ namespace strata::kernels {
 
 /// ONE NEOX PAIR: `(a, b) -> (a*c - b*s, a*s + b*c)`.
 ///
-/// This exists so the pairing and the sign convention live in ONE place.  `rope_neox_apply` walks a whole row
-/// with it, and `indexer_key_append`'s pooling kernel uses it to rotate the single pooled row it has just
-/// written - two call sites that MUST agree, because the indexer's key is compared against query scores
-/// downstream and a mismatched rotation produces a well-formed key pointing the wrong way.
+/// This exists so the pairing and the sign convention live in ONE place: the kernel (qk_norm_rope.hpp) and the
+/// host references in the tests rotate with the same convention, because a mismatched rotation produces a
+/// well-formed key pointing the wrong way.
 ///
 /// It is `__host__ __device__` (the `f16_bits.hpp` pattern) rather than device-only so a host-side reference in
 /// a test can call THE SAME function instead of transcribing it.  A transcription is exactly how the pairing
@@ -55,20 +53,11 @@ void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, floa
 /// five-argument builder above (called as it is); for linear and YaRN the scaled angles, YaRN's magnitude included.
 void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float* cos_tab, float* sin_tab);
 
-// `x` and `out` are (rows, head_dim) and `pos` is (rows,) - one position per row, so a batch of heads at
-// different sequence positions is one call.  `cos_tab`/`sin_tab` are (max_pos, n_rot/2).  `out` may equal `x`.
-//
-// **`pos` IS A DEVICE ARRAY, NOT A HOST SCALAR**, and that is a graph-capture requirement rather than a style
-// choice: a CUDA graph bakes kernel arguments in at capture time, so a host scalar position would replay the
-// first token's value forever.  See the same note on `indexer_key_append` in `qsa.hpp`.
-void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
-                     const float* sin_tab, const int* pos, void* stream);
-
 /// The LLMs' one RoPE (qk_norm_rope.hpp's kernel, the heads rotated only): T rows of `heads` heads of head_dim, a row
 /// ld_in floats apart in `x` and ld_out in `out` (in place where out is x), the first n_rot of each head rotated in
 /// pairs (i, i + n_rot / 2) at positions[t] (null: pos0 + t), Qwen3.8-Flash-Next's IMRoPE sections and the session's
-/// table where n_rot is 64, else the angle computed under `scaling`.  rope_neox_apply, native_rope_apply and the
-/// prompt's rope are this.
+/// table where n_rot is 64, else the angle computed under `scaling`.  native_rope_apply and the prompt's rope are
+/// this.
 void rope_rows(const float* x, float* out, int64_t T, int64_t heads, int head_dim, int64_t ld_in, int64_t ld_out,
                int n_rot, const RopeScaling& scaling, const int* positions, int64_t pos0, void* stream);
 

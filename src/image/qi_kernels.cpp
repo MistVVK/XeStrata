@@ -7,6 +7,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 
 #include <sycl/sycl.hpp>
@@ -438,11 +439,7 @@ void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent,
     finish(stream, e, "qi_tokens_latent");
 }
 
-void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += a * v[i]; });
-    finish(stream, e, "qi_axpy");
-}
+void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) { kernels::add_inplace(x, v, n, stream, a); }
 
 void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
                     void* stream) {

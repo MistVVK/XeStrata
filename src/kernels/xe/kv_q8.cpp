@@ -8,6 +8,8 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/kv_stream.hpp"
+#include "kv_q4_parts.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q8
 #include "strata/kernels/device_arch_tag.hpp"
@@ -37,11 +39,13 @@ void validate(const QsaShapes& s, const char* what) {
 void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
     validate(s, "kv_append_cells");
     if (a.n_tok < 1) return;
-    const bool f16 = a.k_pool != nullptr;
-    if (!f16 && a.k_q == nullptr) throw core::DeviceError("kv_append_cells: no pools");
+    const bool f16 = a.k_pool != nullptr, q4 = a.k_q4 != nullptr;
+    if (!f16 && !q4 && a.k_q == nullptr) throw core::DeviceError("kv_append_cells: no pools");
+    if (q4 && s.head_dim != 256)
+        throw core::DeviceError("kv_append_cells: Q4_0 wants head_dim 256 (the Hadamard transform's size)");
     const int kv_heads = (int) s.n_head_kv, head_dim = (int) s.head_dim, page_size = (int) s.page_size;
     const int groups = head_dim / KV_Q8_GROUP;
-    const int planes = !f16 && a.k_q == a.v_q && a.k == a.v ? 1 : 2;
+    const int planes = (q4 ? a.k_q4 == a.v_q4 : !f16 && a.k_q == a.v_q) && a.k == a.v ? 1 : 2;
     const int64_t cur_stride = a.cur_stride > 0 ? a.cur_stride : (int64_t) kv_heads * head_dim;
     const KvHostPools host = a.host ? *a.host : KvHostPools{}, stage = a.stage ? *a.stage : KvHostPools{};
     // upstream 5a0df898 (its sycl/ port): the host copy and the staging pool are written 4 bytes a lane, 64 contiguous
@@ -51,25 +55,35 @@ void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
         const char* v = std::getenv("STRATA_KV_WIDE_HOST");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool wide = wide_env && (f16 ? host.k_pool != nullptr || stage.k_pool != nullptr
+    const bool wide = !q4 && wide_env && (f16 ? host.k_pool != nullptr || stage.k_pool != nullptr
                                        : host.k_q != nullptr || stage.k_q != nullptr);
     const KvAppend p = a;
     const auto e = queue_for(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> warp_max(sycl::range<1>(2), hd);
         sycl::local_accessor<uint32_t, 1> lane(sycl::range<1>(KV_Q8_GROUP), hd);   // the group's values, wide stores
-        hd.parallel_for(sycl::nd_range<3>({(size_t) p.n_tok * planes, (size_t) groups, (size_t) kv_heads * KV_Q8_GROUP},
-                                          {1, 1, KV_Q8_GROUP}),
-                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const int64_t j = (int64_t) it.get_group(0) / planes;
+        // one dimension: a prompt's cells x planes pass the 65,535 a GPU's first dimension takes
+        hd.parallel_for(sycl::nd_range<1>((size_t) p.n_tok * planes * groups * kv_heads * KV_Q8_GROUP, KV_Q8_GROUP),
+                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            const int64_t wg = (int64_t) it.get_group(0), jp = wg / ((int64_t) groups * kv_heads);
+            const int64_t j = jp / planes;
             const long long pos = p.step ? (long long) p.step[j * p.step_stride + kStepPos] : (long long) (p.pos0 + j);
-            const int h = (int) it.get_group(2), g = (int) it.get_group(1), t = (int) it.get_local_id(2);
-            const bool is_v = (int) it.get_group(0) % planes == 1;
+            const int h = (int) (wg % kv_heads), g = (int) ((wg / kv_heads) % groups), t = (int) it.get_local_id(0);
+            const bool is_v = jp % planes == 1;
             const sycl::sub_group sg = it.get_sub_group();
             const int d = g * KV_Q8_GROUP + t;
             const float x = (is_v ? p.v : p.k)[j * cur_stride + (int64_t) h * head_dim + d];
             const long long page = (long long) p.page_table[pos / page_size];
             const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
             const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+            if (q4) {   // uniform: each sub-group one block of 32
+                uint8_t byte;
+                const uint16_t dq = kvq4::q4_group(sg, x, byte);
+                const int b = g * 2 + (t >> 5), lane32 = t & 31;
+                if (page >= 0) kvq4::q4_store(is_v ? p.v_q4 : p.k_q4, row, b, lane32, dq, byte);
+                if (host.k_q4 != nullptr) kvq4::q4_store(is_v ? host.v_q4 : host.k_q4, row_id, b, lane32, dq, byte);
+                if (stage.k_q4 != nullptr) kvq4::q4_store(is_v ? stage.v_q4 : stage.k_q4, row_id, b, lane32, dq, byte);
+                return;
+            }
             if (f16) {   // uniform
                 const uint16_t hv = f16_gpu::f16_from_f32(x);
                 if (page >= 0) (is_v ? p.v_pool : p.k_pool)[row * head_dim + d] = hv;

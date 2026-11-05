@@ -22,11 +22,8 @@ namespace {
 // (--prefill-experts): the other models' engine has windows of its own, one graph a window size, one fetch over PCIe
 const char* const kQwen38Only[] = {
     "--pack", "--ple-gguf", "--no-ple", "--ple-io", "--ple-row-cache", "--ple-inflight", "--ple-delay-us",
-    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-bf16",
-    "--native-bf16-extra", "--native-ple-key", "--native-ple-postops", "--native-moe-combine", "--native-gdn",
-    "--native-flash-attn-short", "--native-qsa", "--native-qsa-indexer", "--native-rope", "--native-router",
-    "--gr-fp32-activations", "--gr-native-mmvf", "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn",
-    "--no-fast-select", "--mtp-hnorm", "--vision", "--shared-late", "--keep-canonical",
+    "--ple-sync-submit", "--embd-gguf", "--native-dense-gguf", "--native-head-gguf", "--native-flash-attn-short",
+    "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn", "--mtp-hnorm", "--vision", "--shared-late", "--keep-canonical",
     "--cpu-oracle-q8-0", "--dump-final-r", "--dump-halves", "--dump-mixed", "--dump-residual", "--dump-layers",
     "--prefill", "--prefill-until", "--no-prefill-borrow", "--prefill-experts",
     "--expert-cache-per-layer", "--kv-resident",

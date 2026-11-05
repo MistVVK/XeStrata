@@ -528,7 +528,7 @@ This does not validate a whole-token graph or a CPU/GPU doorbell protocol.
 
 ### Elementwise operations
 
-The Xe library exports `embedding_gather`, `gdn_gate`, `scale_inplace`, `f32_to_f16_bulk`, `silu_inplace` and `rms_norm_weighted`.
+The Xe library exports the embedding gather `embed_rows` (`iq_kernels.hpp`), `scale_inplace` and `f32_to_f16_bulk`.
 The other declarations in `elementwise.hpp` are not ported and not provided by the library.
 These kernels and the parity oracle are compiled without fast math and without multiply/add contraction.
 

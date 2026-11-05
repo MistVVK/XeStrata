@@ -141,12 +141,7 @@ void store(const float* y, int64_t HW, int64_t O, int64_t ldy, const float* bias
 }
 
 // y [HW][O] += b [O]
-void add_bias(float* y, int64_t HW, int64_t O, const float* b) {
-    queue().parallel_for(sycl::range<1>((size_t) (HW * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % O];
-    });
-}
+void add_bias(float* y, int64_t HW, int64_t O, const float* b) { qi_bias_add(y, b, HW, O, nullptr); }
 
 // the 5 x 5 max pool of stride 1 (padded by -inf) of x [H][W][C] to dst [HW][ld] from channel off and to dst2
 // [HW][C]

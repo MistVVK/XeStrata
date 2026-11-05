@@ -22,8 +22,7 @@
 //   6. The attention reads ONLY the selected cells.  The source writes -inf into the mask and zeros at the
 //      top-k indices, so an unselected cell has weight exactly zero even when it would score highest -
 //      PROPERTY 8's fixture, reproduced here with its own numbers.
-//   7. `attn *= sigmoid(gate)` with the gate taken from the SECOND half of each head's 2*head_dim block, and
-//      the rounding to fp16 happening AFTER the multiply (one rounding, not two).
+//   7. `attn *= sigmoid(gate)` with the gate taken from the SECOND half of each head's 2*head_dim block.
 //   8. The KV cache is PAGED and the page table is not assumed to be the identity: the pool is written and
 //      read back at page_size 1, 4 and 512 with a REVERSED table, and the kernel's own reading of the layout
 //      is compared against two rivals (linear, i.e. the table ignored; and cell-major inside the page).
@@ -34,23 +33,27 @@
 // denominator is the magnitude of the TERMS.
 //
 // WHAT SETS EACH TOLERANCE, because a tolerance nobody can explain is one nobody can tighten:
-//   * the fp16 converter, the pool contents, the gathered scratch and the spare indexer key: EXACT.  The only
-//     arithmetic is a conversion, and section 0 checks that conversion against numpy's float16 over 395
-//     vectors covering ties in both directions, subnormals and overflow - an oracle sharing no code with it -
-//     plus all 65,536 fp16 patterns in the reverse direction.
-//   * the pooled block keys: 1e-6.  The pooling and the norm are double on both sides and are bit-exact
-//     BEFORE the rotation; the residual is `rope_neox_apply` (f32, reused rather than re-implemented) against
-//     the reference's float64 rotation, the class round 189 measured at ~1e-7.
-//   * the indexer scores: 1e-6 against Sum|dot_h| + |bias|, set by the fp32 storage of the pooled keys -
-//     2^-24 per element over a 128-term dot.
-//   * the selected ids: EXACT.  `docs/capture-format.md` L127 gives `indexer_ids` no tolerance.
+//   * the fp16 converter, the pool contents and the gathered scratch: EXACT.  The only arithmetic is a
+//     conversion, and section 0 checks that conversion against numpy's float16 over 395 vectors covering ties
+//     in both directions, subnormals and overflow - an oracle sharing no code with it - plus all 65,536 fp16
+//     patterns in the reverse direction.
+//   * the indexer's keys (native_qsa_indexer_append, which keeps the raw keys in fp16 and pools and normalizes
+//     in f32; the reference reads the same fp16 keys in double): the spare key to an f32 sum of 128 squares and
+//     a few ulp of the rsqrt, the pooled block keys to 1e-4 of their rope terms - the f32 angle at position ~100.
+//   * the indexer's block scores (qsa_block_scores, f32): 1e-5 against Sum|dot_h|, 128-term f32 dots over four
+//     heads.
+//   * the selected ids (qsa_block_topk): EXACT.  `docs/capture-format.md` L127 gives `indexer_ids` no tolerance.
+//   * the output gate (native_qsa_gate_apply, f32): 1e-6 relative to the double reference.
 //   * the attention against a reference reading the SAME fp16 cache: 1e-5, set by f32 accumulation over
 //     256-term dots plus `expf`'s 2 ulp.  This is the KERNEL's number.
 //   * the attention against a reference reading the f32 keys: REPORTED and then checked against the phase's
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/native_qsa_indexer.hpp"
+#include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
@@ -539,7 +542,7 @@ int main(int argc, char** argv) try {
                 std::to_string(gm) + " wrong bits");
     }
 
-    // ================= 2. indexer_key_append =================
+    // ================= 2. the indexer's key append (native_qsa_indexer_append) =================
     const int64_t NT = 10;                           // 2 complete blocks + a 2-cell tail
     // The cells sit at POSITIONS 100..109, not at 0..9: `QsaCache.pos` is what the reference rotates by,
     // and a kernel that assumes position == cell index is wrong for any sequence that does not start at 0
@@ -555,28 +558,32 @@ int main(int argc, char** argv) try {
         // and "norm then pool" would agree to within the noise and the fixture could not see its own trap.
         for (int64_t d = 0; d < IDXD; ++d) rr[(size_t) d] = gauss(rng) * std::pow(4.0, (double) (t % 4));
         for (int64_t d = 0; d < IDXD; ++d) raw_flat.push_back((float) rr[(size_t) d]);
-        // The reference gets the f32 PROMOTION of what the device gets, not the f64 original.  Feeding it
-        // the f64 values left a 6e-8 relative difference, which is invisible in a score but crosses an f32
-        // rounding boundary in one value in four - and the spare key is asserted BIT-EXACT.
-        for (int64_t d = 0; d < IDXD; ++d) rr[(size_t) d] = (double) raw_flat[(size_t) t * IDXD + d];
+        // The reference gets the value the kernel keeps: the raw key rounded to fp16 (the native indexer's
+        // raw-key cache), not the f64 original.
+        for (int64_t d = 0; d < IDXD; ++d)
+            rr[(size_t) d] = (double) f32_from_f16(f16_from_f32(raw_flat[(size_t) t * IDXD + d]));
         rc.append(kk, vv, rr, (double) (100 + t));
     }
     std::vector<float> w_kn((size_t) IDXD);
     for (auto& x : w_kn) x = 1.0f + 0.1f * rnd(1.0);
-    std::vector<float> cos_tab((size_t) (2000 * S.n_rot / 2)), sin_tab(cos_tab.size());
-    strata::kernels::build_rope_table((int) S.n_rot, THETA, 2000, cos_tab.data(), sin_tab.data());
-    Dev<float> dw_kn, dcos, dsin;
+    Dev<float> dw_kn;
     dw_kn.put(w_kn);
-    dcos.put(cos_tab);
-    dsin.put(sin_tab);
+    strata::gpu::Stream cs_idx = nullptr;   // the native indexer takes an explicit stream
+    check(((cs_idx = strata::gpu::stream_create()) != nullptr), "cs");
+    const strata::kernels::RopeScaling no_scaling;
 
     const int64_t n_bid = NT / R;
+    const int64_t idx_cells = (n_bid + 1) * R;   // the capacity: max_cells / r + 1 pooled rows, every cell inside
     const size_t pooled_n = (size_t) (n_bid + 1) * IDXD;
-    Dev<float> dpooled(pooled_n), ddead((size_t) IDXD), dtail((size_t) (R - 1) * IDXD);
+    Dev<float> dpooled((size_t) (idx_cells / R + 1) * IDXD), ddead((size_t) IDXD), dtail((size_t) (R - 1) * IDXD);
     Dev<int32_t> dblockpos(1);      // the rotation position, which only the DEVICE may read
     // The POSITION is a device value now, because a host scalar would be baked into a captured graph.  One
     // `cudaMemcpy` per cell here; the layer keeps this buffer and updates it per token.
     Dev<int32_t> dpos(1);
+    check(strata::gpu::memset(dpooled.p, 0, (size_t) (idx_cells / R + 1) * IDXD * 4), "zero");
+    check(strata::gpu::memset(ddead.p, 0, (size_t) IDXD * 4), "zero");
+    check(strata::gpu::memset(dtail.p, 0, (size_t) (R - 1) * IDXD * 4), "zero");
+    check(strata::gpu::memset(dblockpos.p, 0, 4), "zero");
     {
         strata::kernels::QsaIndexerBuffers bufs{dtail.p, ddead.p, dpooled.p, dblockpos.p};
         Dev<float> draw((size_t) IDXD);
@@ -584,32 +591,26 @@ int main(int argc, char** argv) try {
             strata::parity::copy_bytes_in(draw.p, &raw_flat[(size_t) t * IDXD], (size_t) IDXD * 4);
             const int32_t tpos = (int32_t) t;
             strata::parity::copy_bytes_in(dpos.p, &tpos, 4);
-            strata::kernels::indexer_key_append(draw.p, dpos.p, POS_BASE, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
-                                                nullptr);
+            strata::kernels::native_qsa_indexer_append(draw.p, dpos.p, POS_BASE, dw_kn.p, EPS, bufs, S, idx_cells,
+                                                       no_scaling, cs_idx);
+            check(strata::gpu::stream_sync(cs_idx), "sync");
         }
         const std::vector<float> got = dpooled.get(pooled_n), got_dead = ddead.get((size_t) IDXD);
         std::vector<double> terms;
         const std::vector<double> want = ref_pooled(rc, w_kn, EPS, (int) S.n_rot, THETA, Alt{}, &terms);
         const std::vector<double> want_raw = ref_pooled_raw(rc);
 
-        // A GPU without FP64 normalizes in f32 (device_caps.hpp's has_fp64; the Arc A series): its sum of IDXD
-        // squares rounds, so its keys are held to the bound of an f32 sum of that many terms instead of the
-        // FP64 path's bit-exactness and 1e-6 (the A380: 64 of 128 spare words off by an ulp, 1.04e-6 pooled).
-        const bool fp64 = strata::core::Runtime::get().compute().get_device().has(sycl::aspect::fp64);
-        const double f32_bound = (double) (IDXD + R + 4) * std::ldexp(1.0, -24);
-        // (a) the spare slot: BIT-EXACT, because rope at position 0 is the identity in both (cos = 1, sin = 0
-        //     exactly), so the residual the pooled rows carry from the f32 rope cannot appear here.
-        int dead_bad = 0;
+        // The kernel pools and normalizes in f32 (its sum of IDXD squares and its rsqrt round), so its keys are
+        // held to the bound of an f32 sum of that many terms and a few ulp of the rsqrt.
+        const double f32_bound = (double) (IDXD + R + 4) * std::ldexp(1.0, -24) + 4 * std::ldexp(1.0, -23);
+        // (a) the spare slot: rope at position 0 is the identity (cos = 1, sin = 0 exactly), so the residual the
+        //     pooled rows carry from the f32 rope cannot appear here.
         double dead_worst = 0;
         for (int64_t d = 0; d < IDXD; ++d) {
             const double wv = want[(size_t) n_bid * IDXD + d];
-            if (got_dead[(size_t) d] != (float) wv) ++dead_bad;
             dead_worst = std::max(dead_worst, std::fabs((double) got_dead[(size_t) d] - wv) / std::fabs(wv));
         }
-        if (fp64)
-            require("the spare slot's key (rms_norm of cell 0) is BIT-EXACT", dead_bad == 0,
-                    std::to_string(dead_bad) + " of " + std::to_string(IDXD) + " wrong");
-        else {
+        {
             char detail[96];
             std::snprintf(detail, sizeof detail, "worst relative %.3e (bound %.3e)", dead_worst, f32_bound);
             require("the spare slot's key (rms_norm of cell 0), f32", dead_worst <= f32_bound, detail);
@@ -619,8 +620,8 @@ int main(int argc, char** argv) try {
 
         // (b) the pooled blocks against the reference
         // THE DENOMINATOR IS THE ROPE'S TERMS, not the result: `a*cos - b*sin` cancels, and the kernel's
-        // rotation runs in f32 over an f32 table (6e-8 per term) while the reference's runs in f64.  Dividing
-        // by the result reports the cancellation, which is what made this read 1.067e-06 against a 1e-6 bar.
+        // rotation runs in f32 (its angle p * theta_scale^i in float: ~p ulp of the angle at position p ~ 100)
+        // while the reference's runs in f64.  Dividing by the result reports the cancellation.
         double worst = 0;
         for (int64_t b = 0; b < n_bid; ++b)
             for (int64_t d = 0; d < IDXD; ++d) {
@@ -629,7 +630,9 @@ int main(int argc, char** argv) try {
                 worst = std::max(worst, rel_terms(wv, (double) got[(size_t) b * IDXD + d], tm));
             }
         report("pooled block keys vs the reference", worst, "rel/|rope terms|");
-        const double bar = fp64 ? 1e-6 : f32_bound;
+        // the f32 angle at position ~100: one ulp of a 100-rad angle is 7.6e-6 rad, and the device's fast trig adds
+        // its own (measured 2.3e-5 on the B70); the rival readings below sit 5% apart and more
+        const double bar = 1e-4;
         if (!(worst <= bar)) { std::printf("    *** over %.2e ***\n", bar); ++g_bad; }
 
         // (c) THE INCOMPLETE TAIL IS NOT POOLED: the two tail cells take the SPARE slot's score, which is cell
@@ -713,51 +716,51 @@ int main(int argc, char** argv) try {
         }
     }
 
-    // ================= 3. qsa_index =================
+    // ================= 3. the indexer's block scores (qsa_block_scores) =================
     std::vector<float> q_idx((size_t) (IDXN * IDXD));
     for (auto& x : q_idx) x = rnd(1.0);
     // A bias of ~0.4 against scores of ~20 separates "applies the bias" from "drops it" by 3.4%, which
-    // is not a fixture that can see its own trap. This is a guard for the kernel's optional additional
-    // bias, separate from the mandatory incomplete-tail bias; it is sized to
-    // be comparable with the scores so that dropping it is material.
+    // is not a fixture that can see its own trap.  The reference's optional per-block bias (the kernel has
+    // none) is sized to be comparable with the scores so that dropping it is material.
     std::vector<float> bias((size_t) (n_bid + 1));
     for (auto& x : bias) x = rnd(8.0f);
     {
-        const std::vector<float> got_pooled = dpooled.get(pooled_n);
+        const std::vector<float> got_pooled = dpooled.get(pooled_n), got_dead = ddead.get((size_t) IDXD);
         const std::vector<double> p64 = as_d(got_pooled);
         const std::vector<double> q_idx64 = as_d(q_idx);
-        const int64_t n_kv = NT;
-        Dev<float> dp, dqi, dbias, dsc;
+        const int64_t n_kv = NT, max_blocks = n_kv / R + 2;
+        std::vector<int32_t> hstep(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(hstep.data(), n_kv - 1, S);
+        Dev<float> dp, dd, dqi, dsc((size_t) max_blocks);
+        Dev<int32_t> dstep;
         dp.put(got_pooled);
+        dd.put(got_dead);
         dqi.put(q_idx);
-        dbias.put(bias);
-        dsc.alloc((size_t) n_kv);
-        strata::kernels::qsa_index(dp.p, n_bid, dqi.p, dbias.p, S, n_kv, dsc.p, nullptr);
-        const std::vector<float> got = dsc.get((size_t) n_kv);
-        const std::vector<double> want =
-            ref_indexer_scores(p64, n_bid, q_idx64, IDXN, IDXD, bias, n_kv, Alt{});
+        dstep.put(hstep);
+        strata::kernels::qsa_block_scores(dp.p, dd.p, dqi.p, dstep.p, 1, max_blocks, S, dsc.p, cs_idx);
+        check(strata::gpu::stream_sync(cs_idx), "sync");
+        const std::vector<float> got = dsc.get((size_t) (n_bid + 1));
+        const std::vector<double> want0 = ref_indexer_scores(p64, n_bid, q_idx64, IDXN, IDXD, {}, n_kv, Alt{});
+        const std::vector<double> want = ref_indexer_scores(p64, n_bid, q_idx64, IDXN, IDXD, bias, n_kv, Alt{});
 
-        // The score is a SUM of four relu'd dots plus the bias, so the denominator is the magnitude of the
-        // TERMS - |dot| bounds a relu'd dot from above and is what is used here.
+        // The score is a SUM of four relu'd dots, so the denominator is the magnitude of the TERMS - |dot| bounds
+        // a relu'd dot from above and is what is used here.  Block b is the score of its cells b*r..b*r+r-1; block
+        // n_bid (the tail) scores the spare key with the tail's +1e9.
         double worst = 0;
-        for (int64_t j = 0; j < n_kv; ++j) {
-            const int64_t cb = std::min(j / R, n_bid);
-            double terms = std::fabs((double) bias[(size_t) cb]);
-            if (cb == n_bid && n_kv % R != 0) terms += 1e9;
+        for (int64_t b = 0; b <= n_bid; ++b) {
+            double terms = b == n_bid && n_kv % R != 0 ? 1e9 : 0.0;
             for (int64_t h = 0; h < IDXN; ++h) {
                 double dot = 0;
-                for (int64_t d = 0; d < IDXD; ++d) dot += p64[(size_t) cb * IDXD + d] * q_idx64[(size_t) h * IDXD + d];
+                for (int64_t d = 0; d < IDXD; ++d) dot += p64[(size_t) b * IDXD + d] * q_idx64[(size_t) h * IDXD + d];
                 terms += std::fabs(dot);
             }
-            worst = std::max(worst, rel_terms(want[(size_t) j], (double) got[(size_t) j], terms));
+            worst = std::max(worst, rel_terms(want0[(size_t) (b * R)], (double) got[(size_t) b], terms));
         }
-        report("indexer cell scores vs the reference", worst, "rel/Sum|terms|");
-        if (!(worst <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++g_bad; }
-
-        require("cells of one block share its score (0..3)",
-                got[0] == got[1] && got[1] == got[2] && got[2] == got[3] && got[0] != got[4]);
-        require("cells 8,9 (the tail) take the SPARE slot's score, not block 1's",
-                got[8] == got[9] && got[9] != got[7], "got[8] == got[9] != got[7]");
+        report("indexer block scores vs the reference", worst, "rel/Sum|terms|");
+        // f32 dots of IDXD terms summed over IDXN heads
+        if (!(worst <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++g_bad; }
+        require("the tail block (cells 8,9) takes the SPARE key's score plus the tail bias",
+                got[(size_t) n_bid] >= 1e9f, "score " + std::to_string(got[(size_t) n_bid]));
 
         auto sep_scores = [&](const std::string& name, const Alt& a) {
             const std::vector<double> alt = ref_indexer_scores(p64, n_bid, q_idx64, IDXN, IDXD, bias, n_kv, a);
@@ -783,11 +786,12 @@ int main(int argc, char** argv) try {
     // Replay one captured graph across block/page boundaries to catch stale bias.
     {
         const int64_t max_n = 20480;
-        const int64_t max_blocks = max_n / R + 1;
-        const int64_t cap = strata::kernels::qsa_selection_width(max_n, S);
-        Dev<float> pooled, query, scores((size_t) max_n);
+        const int64_t max_blocks = max_n / R + 2;
+        const int64_t cap = strata::kernels::qsa_selection_width(MAXC, S);
+        Dev<float> pooled, dead, query, scores((size_t) max_blocks);
         Dev<int32_t> ids((size_t) cap), step(strata::kernels::kStepCount);
         pooled.put(std::vector<float>((size_t) max_blocks * IDXD, 0.0f));
+        dead.put(std::vector<float>((size_t) IDXD, 0.0f));
         query.put(std::vector<float>((size_t) IDXN * IDXD, 0.0f));
 
         namespace sx = sycl::ext::oneapi::experimental;
@@ -795,8 +799,8 @@ int main(int argc, char** argv) try {
         void* stream = &cq;
         sx::command_graph graph(cq.get_context(), cq.get_device());
         graph.begin_recording(cq);
-        strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
-        strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
+        strata::kernels::qsa_block_scores(pooled.p, dead.p, query.p, step.p, 1, max_blocks, S, scores.p, stream);
+        strata::kernels::qsa_block_topk(scores.p, step.p, 1, max_blocks, cap, S, ids.p, stream);
         graph.end_recording(cq);
         auto exec = graph.finalize();
 
@@ -811,99 +815,25 @@ int main(int argc, char** argv) try {
             for (int64_t j = 0; j < width - tail; ++j) want.push_back((int32_t) j);
             for (int64_t j = n - tail; j < n; ++j) want.push_back((int32_t) j);
 
-            strata::kernels::qsa_index(pooled.p, n / R, query.p, nullptr, S, n, scores.p, nullptr);
-            strata::kernels::topk_512(scores.p, n, S, cap, ids.p, nullptr);
-            require("tail static n=" + std::to_string(n), ids.get((size_t) width) == want);
-
             std::vector<int32_t> values(strata::kernels::kStepCount);
             strata::kernels::qsa_step_fill(values.data(), n - 1, S);
             step.put(values);
+            strata::kernels::qsa_block_scores(pooled.p, dead.p, query.p, step.p, 1, max_blocks, S, scores.p, stream);
+            strata::kernels::qsa_block_topk(scores.p, step.p, 1, max_blocks, cap, S, ids.p, stream);
+            strata::parity::sync();
+            require("tail static n=" + std::to_string(n), ids.get((size_t) width) == want);
+
             cq.ext_oneapi_graph(exec);
             strata::parity::sync();
             require("tail captured n=" + std::to_string(n), ids.get((size_t) width) == want);
-            const auto actual_scores = scores.get((size_t) n);
+            const auto actual_scores = scores.get((size_t) (n / R + 1));
             bool exact_scores = true;
-            for (int64_t j = 0; j < n; ++j) {
-                const float expected = j >= n - tail ? 1e9f : 0.0f;
-                exact_scores = exact_scores && actual_scores[(size_t) j] == expected;
+            for (int64_t b = 0; b <= n / R; ++b) {
+                if (b == n / R && tail == 0) continue;   // an empty tail block: not a cell of the selection
+                const float expected = b == n / R ? 1e9f : 0.0f;
+                exact_scores = exact_scores && actual_scores[(size_t) b] == expected;
             }
-            require("  only incomplete cells receive the bias", exact_scores);
-        }
-    }
-
-    // ================= 4. topk_512, against an independent sort =================
-    {
-        const int64_t CAP = strata::kernels::qsa_selection_width(MAXC, S);
-        Dev<float> dsc;
-        Dev<int32_t> dids;
-        dsc.alloc((size_t) MAXC);
-        dids.alloc((size_t) CAP);
-        std::vector<float> sc((size_t) MAXC);
-
-        auto one = [&](const std::string& name, int64_t n_kv) {
-            dsc.put(std::vector<float>(sc.begin(), sc.begin() + n_kv));
-            strata::kernels::topk_512(dsc.p, n_kv, S, CAP, dids.p, nullptr);
-            const int64_t width = strata::kernels::qsa_selection_width(n_kv, S);
-            const std::vector<int32_t> g = dids.get((size_t) width);
-            const std::vector<int32_t> want = ref_select(as_d(std::vector<float>(sc.begin(), sc.begin() + n_kv)),
-                                                         n_kv, TOPK, false);
-            const bool ok = g == want;
-            require(name, ok, std::to_string(width) + " ids, width = min(n_kv, top_k + r - 1)");
-            if (!ok) {
-                for (size_t i = 0; i < std::min(g.size(), want.size()); ++i)
-                    if (g[i] != want[i]) {
-                        std::printf("    first difference at %zu: got %d, want %d\n", i, g[i], want[i]);
-                        break;
-                    }
-            }
-            bool asc = true;
-            for (size_t i = 1; i < g.size(); ++i) if (g[i] <= g[i - 1]) asc = false;
-            require("  ...ascending and unique", asc);
-            return g;
-        };
-
-        for (auto& x : sc) x = rnd(1.0);
-        one("topk_512 n_kv = 1", 1);
-        one("topk_512 n_kv = 7 (random)", 7);
-        one("topk_512 n_kv = 2048 (the plan's threshold)", 2048);
-        one("topk_512 n_kv = 2051 (the reference's own bound)", 2051);
-        one("topk_512 n_kv = 2052 (two past the plan's number)", 2052);
-        one("topk_512 n_kv = 5000 (random)", 5000);
-        one("topk_512 n_kv = 32768 (= kTopkMaxCells)", MAXC);
-
-        // ALL-EQUAL scores: every cell ties, so the answer must be 0..width-1 and any other tie rule shows up
-        // on the first element.  ggml does not specify the rule; the reference and the kernel both say
-        // ascending index, and this is the case that distinguishes them.
-        std::fill(sc.begin(), sc.begin() + 2052, 0.25f);
-        one("topk_512 with 2052 EQUAL scores (every cell ties)", 2052);
-
-        // a tie BLOCK straddling the cut: 100 cells share the cut score and only some of them fit
-        for (int64_t j = 0; j < 5000; ++j) sc[(size_t) j] = (float) (-(double) j);
-        for (int64_t j = 2051 - 50; j < 2051 + 50; ++j) sc[(size_t) j] = -1000.0f;
-        one("topk_512 with a 100-cell tie straddling the cut", 5000);
-
-        // THE IDENTITY BELOW THE BOUND.  `select_cells` returns `arange` whenever width == n_kv, which is what
-        // "selection skipped when context <= 2,048" means - and it holds to 2,051, not 2,048.
-        for (int64_t n : {(int64_t) 2048, (int64_t) 2051}) {
-            for (int64_t j = 0; j < n; ++j) sc[(size_t) j] = rnd(1.0);
-            const std::vector<int32_t> g = one(std::string("topk_512 n_kv = ") + std::to_string(n) +
-                                                   " selects every cell (identity)",
-                                               n);
-            bool ident = (int64_t) g.size() == n;
-            for (int64_t j = 0; j < n && ident; ++j) if (g[(size_t) j] != j) ident = false;
-            require("  ...and it really is 0,1,2,...", ident);
-        }
-        {   // one past the bound the identity must FAIL, or the two checks above prove nothing
-            for (int64_t j = 0; j < 2052; ++j) sc[(size_t) j] = rnd(1.0);
-            const std::vector<int32_t> g = one("topk_512 n_kv = 2052 is NOT the identity", 2052);
-            std::vector<char> kept(2052, 0);
-            for (int32_t id : g) kept[(size_t) id] = 1;
-            int64_t missing = 0;
-            for (int64_t j = 0; j < 2052; ++j) if (!kept[(size_t) j]) ++missing;
-            int64_t argmin = 0;
-            for (int64_t j = 1; j < 2052; ++j) if (sc[(size_t) j] < sc[(size_t) argmin]) argmin = j;
-            require("  ...exactly one cell is dropped, and it is the smallest score",
-                    missing == 1 && !kept[(size_t) argmin], std::to_string(missing) + " dropped");
+            require("  only the incomplete block receives the bias", exact_scores);
         }
     }
 
@@ -1041,26 +971,34 @@ int main(int argc, char** argv) try {
             strata::kernels::kv_append(dpk.p, dpv.p, dtab.p, t, dpk_all.p + (size_t) t * NKV * HD,
                                        dpv_all.p + (size_t) t * NKV * HD, Sp, nullptr);
 
-        const size_t ppooled_n = (size_t) (p_nbid + 1) * IDXD;
+        const size_t ppooled_n = (size_t) (p_nbid + 1) * IDXD;   // T / r + 1 rows: the capacity of T cells
         Dev<float> dpp((size_t) ppooled_n), dpdead((size_t) IDXD), dptail((size_t) (R - 1) * IDXD);
         Dev<int32_t> dblockpos2(1);
-        Dev<int32_t> dpos2(1);
-        Dev<float> draw((size_t) IDXD);
+        check(strata::gpu::memset(dpp.p, 0, ppooled_n * 4), "zero");
+        check(strata::gpu::memset(dpdead.p, 0, (size_t) IDXD * 4), "zero");
+        check(strata::gpu::memset(dptail.p, 0, (size_t) (R - 1) * IDXD * 4), "zero");
+        check(strata::gpu::memset(dblockpos2.p, 0, 4), "zero");
+        Dev<float> drawall;
+        drawall.put(praw);
+        std::vector<int32_t> cells((size_t) T);
+        for (int64_t t = 0; t < T; ++t) cells[(size_t) t] = (int32_t) t;
+        Dev<int32_t> dcells;
+        dcells.put(cells);
         strata::kernels::QsaIndexerBuffers bufs{dptail.p, dpdead.p, dpp.p, dblockpos2.p};
-        for (int64_t t = 0; t < T; ++t) {
-            strata::parity::copy_bytes_in(draw.p, &praw[(size_t) t * IDXD], (size_t) IDXD * 4);
-            const int32_t tpos = (int32_t) t;
-            strata::parity::copy_bytes_in(dpos2.p, &tpos, 4);
-            strata::kernels::indexer_key_append(draw.p, dpos2.p, 0, dw_kn.p, EPS, bufs, S, dcos.p, dsin.p,
-                                                nullptr);
-        }
-        Dev<float> dqidx, dsc;
+        for (int64_t t = 0; t < T; ++t)
+            strata::kernels::native_qsa_indexer_append(drawall.p + t * IDXD, dcells.p + t, 0, dw_kn.p, EPS, bufs, S, T,
+                                                       no_scaling, cs_idx);
+        // the selection as the decode runs it: block scores and the block top-k (qsa_select.hpp)
+        const int64_t max_blocks = T / R + 2, cap = strata::kernels::qsa_selection_width(MAXC, S);
+        std::vector<int32_t> hstep(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(hstep.data(), T - 1, S);
+        Dev<float> dqidx, dsc((size_t) max_blocks);
+        Dev<int32_t> dstep, dsel((size_t) cap);
         dqidx.put(q_idx);
-        dsc.alloc((size_t) T);
-        strata::kernels::qsa_index(dpp.p, p_nbid, dqidx.p, nullptr, S, T, dsc.p, nullptr);
-
-        Dev<int32_t> dsel((size_t) T);
-        strata::kernels::topk_512(dsc.p, T, S, T, dsel.p, nullptr);
+        dstep.put(hstep);
+        strata::kernels::qsa_block_scores(dpp.p, dpdead.p, dqidx.p, dstep.p, 1, max_blocks, S, dsc.p, cs_idx);
+        strata::kernels::qsa_block_topk(dsc.p, dstep.p, 1, max_blocks, cap, S, dsel.p, cs_idx);
+        check(strata::gpu::stream_sync(cs_idx), "sync");
         const std::vector<int32_t> sel_sparse = dsel.get((size_t) width);
         const std::vector<float> pool32 = dpp.get(ppooled_n);
         const std::vector<double> pool64 = as_d(pool32);
@@ -1154,25 +1092,20 @@ int main(int argc, char** argv) try {
         // the gate
         std::vector<float> q_full((size_t) (NH * 2 * HD));
         for (auto& x : q_full) x = rnd(2.0);
-        Dev<float> dqf, dattnf;
+        Dev<float> dqf, dattnf, dgate((size_t) NH * HD);
         dqf.put(q_full);
         dattnf.put(as_f(attn));
-        Dev<uint16_t> dgate((size_t) NH * HD);
-        strata::kernels::qsa_gate_apply(dattnf.p, dqf.p, S, dgate.p, nullptr);
-        const std::vector<uint16_t> gate16 = dgate.get((size_t) NH * HD);
+        strata::kernels::native_qsa_gate_apply(dattnf.p, dqf.p, dgate.p, (int) NH, (int) HD, cs_idx);
+        check(strata::gpu::stream_sync(cs_idx), "sync");
+        const std::vector<float> gate32 = dgate.get((size_t) NH * HD);
         const std::vector<double> qf64 = as_d(q_full);
         const std::vector<double> gwant = ref_gate(attn, qf64, NH, HD, Alt{});
-        double gnum = 0, gden = 0;
-        int gbits = 0;
-        for (size_t i = 0; i < gwant.size(); ++i) {
-            gnum += std::fabs((double) f32_from_f16(gate16[i]) - gwant[i]);
-            gden += std::fabs(gwant[i]);
-            if (gate16[i] != f16_from_f32((float) gwant[i])) ++gbits;
-        }
-        report("qsa_gate_apply vs the double reference", gnum / gden, "rel (f16 out quant ~2.4e-4)");
-        if (!(gnum / gden <= 1e-3)) { std::printf("    *** over 1e-3 ***\n"); ++g_bad; }
-        std::printf("  %-48s      %d of %lld (CUDA's double exp vs libm's, in the last bits)\n",
-                    "fp16 gate bits differing from the reference", gbits, (long long) gwant.size());
+        double gworst = 0;
+        for (size_t i = 0; i < gwant.size(); ++i)
+            gworst = std::max(gworst, std::fabs((double) gate32[i] - gwant[i]) / std::max(std::fabs(gwant[i]), 1e-30));
+        // f32 sigmoid and multiply: a few ulp of the device's exp and the two roundings
+        report("native_qsa_gate_apply vs the double reference", gworst, "max rel");
+        if (!(gworst <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++g_bad; }
 
         auto sep_gate = [&](const std::string& name, const Alt& a) {
             const std::vector<double> alt = ref_gate(attn, qf64, NH, HD, a);
@@ -1252,14 +1185,17 @@ int main(int argc, char** argv) try {
         strata::kernels::kv_append(dpk.p, dpv.p, dtab.p, 0, dkz.p, dvz.p, S, nullptr);
 
         const size_t ppooled_n = (size_t) (nbid + 1) * IDXD;
-        Dev<float> dpp((size_t) ppooled_n), dsc((size_t) T);
-        std::vector<float> pz(ppooled_n), sz((size_t) T);
+        const int64_t max_blocks = nbid + 2;
+        Dev<float> dpp((size_t) ppooled_n), dsc((size_t) max_blocks);
+        std::vector<float> pz(ppooled_n);
         for (auto& x : pz) x = rnd(0.1f);
-        for (auto& x : sz) x = std::fabs(rnd(1.0f));
         dpp.put(pz);
-        dsc.put(sz);
         Dev<float> dqidx;
         dqidx.put(q_idx);
+        std::vector<int32_t> hstep(strata::kernels::kStepCount);
+        strata::kernels::qsa_step_fill(hstep.data(), T - 1, S);
+        Dev<int32_t> dstep;
+        dstep.put(hstep);
         Dev<int32_t> dsel((size_t) w);
         Dev<uint16_t> dks((size_t) w * NKV * HD), dvs((size_t) w * NKV * HD);
         Dev<float> dq((size_t) NH * HD), dattn((size_t) NH * HD), dwt((size_t) NH * w);
@@ -1278,28 +1214,31 @@ int main(int argc, char** argv) try {
             std::printf("  %-48s %8.1f us\n", name.c_str(), ms * 1000.0 / (double) reps);
         };
         const int reps = 20;
-        timeit("qsa_index  (8193 pooled rows x 4 heads)", reps,
-               [&] { strata::kernels::qsa_index(dpp.p, nbid, dqidx.p, nullptr, S, T, dsc.p, nullptr); });
-        timeit("topk_512   (32768 cells)", reps,
-               [&] { strata::kernels::topk_512(dsc.p, T, S, w, dsel.p, nullptr); });
-        strata::kernels::topk_512(dsc.p, T, S, w, dsel.p, nullptr);
+        timeit("qsa_block_scores (8193 pooled rows x 4 heads)", reps, [&] {
+            strata::kernels::qsa_block_scores(dpp.p, dpp.p + (size_t) nbid * IDXD, dqidx.p, dstep.p, 1, max_blocks, S,
+                                              dsc.p, nullptr);
+        });
+        timeit("qsa_block_topk   (32768 cells)", reps,
+               [&] { strata::kernels::qsa_block_topk(dsc.p, dstep.p, 1, max_blocks, w, S, dsel.p, nullptr); });
+        strata::kernels::qsa_block_topk(dsc.p, dstep.p, 1, max_blocks, w, S, dsel.p, nullptr);
         timeit("kv_gather  (2051 ids through the page table)", reps,
                [&] { strata::kernels::kv_gather(dpk.p, dpv.p, dtab.p, dsel.p, w, S, dks.p, dvs.p, nullptr); });
         timeit("qsa_attend (2051 selected, 24 heads)", reps,
                [&] { strata::kernels::qsa_attend(dq.p, dks.p, dvs.p, w, S, dattn.p, dwt.p, nullptr); });
         timeit("kv_append  (one cell, 2 heads x 256)", 200,
                [&] { strata::kernels::kv_append(dpk.p, dpv.p, dtab.p, 0, dkz.p, dvz.p, S, nullptr); });
-        timeit("ONE QSA LAYER (index+topk+gather+attend)", reps, [&] {
-            strata::kernels::qsa_index(dpp.p, nbid, dqidx.p, nullptr, S, T, dsc.p, nullptr);
-            strata::kernels::topk_512(dsc.p, T, S, w, dsel.p, nullptr);
+        timeit("ONE QSA LAYER (scores+topk+gather+attend)", reps, [&] {
+            strata::kernels::qsa_block_scores(dpp.p, dpp.p + (size_t) nbid * IDXD, dqidx.p, dstep.p, 1, max_blocks, S,
+                                              dsc.p, nullptr);
+            strata::kernels::qsa_block_topk(dsc.p, dstep.p, 1, max_blocks, w, S, dsel.p, nullptr);
             strata::kernels::kv_gather(dpk.p, dpv.p, dtab.p, dsel.p, w, S, dks.p, dvs.p, nullptr);
             strata::kernels::qsa_attend(dq.p, dks.p, dvs.p, w, S, dattn.p, dwt.p, nullptr);
         });
     }
 
-    // ================= 6. indexer_key_append IS CAPTURABLE =================
+    // ================= 6. the indexer's append IS CAPTURABLE =================
     //
-    // THE PROPERTY THE DEVICE-POSITION REFACTOR WAS FOR, TESTED DIRECTLY rather than argued.  `indexer_key_append`
+    // THE PROPERTY THE DEVICE-POSITION REFACTOR WAS FOR, TESTED DIRECTLY rather than argued.  The append once
     // took `int64_t pos` as a host scalar, which a CUDA graph bakes in at capture time - so a captured call
     // would replay the first token's position forever: `slot = pos % r` never advances, no block completes, and
     // the indexer keeps pooling cells 0-3 for the whole sequence.
@@ -1312,7 +1251,7 @@ int main(int argc, char** argv) try {
     // graph that reread the position by accident, but "row 0 unchanged AND row 1 correct AND row 1 != row 0"
     // cannot pass for a baked-in position.
     {
-        std::printf("\n-- indexer_key_append under graph capture\n");
+        std::printf("\n-- native_qsa_indexer_append under graph capture\n");
         const int R2 = 4;
         const int64_t NCELL = 8;                       // two complete blocks of r=4
         const size_t IDXD2 = (size_t) IDXD;
@@ -1323,6 +1262,10 @@ int main(int argc, char** argv) try {
         Dev<float> pooled2((size_t) (nb2 + 2) * IDXD2), dead2(IDXD2), tail2((size_t) (R2 - 1) * IDXD2);
         Dev<int32_t> bpos2(1), pos2(1);
         Dev<float> raw2d(IDXD2);
+        check(strata::gpu::memset(pooled2.p, 0, (size_t) (nb2 + 2) * IDXD2 * 4), "zero");
+        check(strata::gpu::memset(dead2.p, 0, IDXD2 * 4), "zero");
+        check(strata::gpu::memset(tail2.p, 0, (size_t) (R2 - 1) * IDXD2 * 4), "zero");
+        check(strata::gpu::memset(bpos2.p, 0, 4), "zero");
         strata::kernels::QsaIndexerBuffers bufs2{tail2.p, dead2.p, pooled2.p, bpos2.p};
 
         // capture ONE call, on its own stream
@@ -1330,8 +1273,8 @@ int main(int argc, char** argv) try {
         auto& cq = strata::core::Runtime::get().compute();
         sx::command_graph g2(cq.get_context(), cq.get_device());
         g2.begin_recording(cq);
-        strata::kernels::indexer_key_append(raw2d.p, pos2.p, POS_BASE, dw_kn.p, EPS, bufs2, S, dcos.p, dsin.p,
-                                            (void*) &cq);
+        strata::kernels::native_qsa_indexer_append(raw2d.p, pos2.p, POS_BASE, dw_kn.p, EPS, bufs2, S, NCELL,
+                                                   no_scaling, (void*) &cq);
         g2.end_recording(cq);
         const size_t nodes2 = g2.get_nodes().size();
         auto ex2 = g2.finalize();
@@ -1494,17 +1437,14 @@ int main(int argc, char** argv) try {
         strata::gpu::stream_destroy(cs);
     }
 
-    // ================= the spare (position 0) under rope scaling: the table indexer vs the native one =========
+    // ================= the spare (position 0) under rope scaling =================
     // The spare key (`dead`, and `pooled[0]` until the first block completes) rotates at angle 0.  Its sine is
-    // 0 in every scaling, so the rotation is `v * cos_tab[0][pair]`: exactly `v` unscaled (row 0 is (1, 0), the
-    // bit-exact value section 2 asserts), `v * mscale` under YaRN - the magnitude every other pooled row and
-    // the native kernel's spare carry.  The table kernel used to skip the rotation at position 0, which left
-    // the spare the one unscaled key of a scaled cache.  Asserted per variant: the table spare is BIT-EXACTLY
-    // the unscaled spare times row 0 on the rotated dims and the unscaled spare past them; `pooled[0]` equals
-    // `dead`; the native spare carries the same factor (to f32 rounding: its mscale is formed in float); and
-    // under YaRN the factor is observable (row 0 is not 1).
+    // 0 in every scaling, so the rotation is `v * cos(0)`: exactly `v` unscaled, `v * mscale` under YaRN - the
+    // magnitude every other pooled row carries.  Asserted per variant: the spare is the unscaled spare times row 0
+    // of the scaled table on the rotated dims and the unscaled spare past them (to f32 rounding: the kernel forms its
+    // mscale in float), `pooled[0]` is the spare, and under YaRN the factor is observable (row 0 is not 1).
     {
-        std::printf("\n-- the spare key (position 0) under rope scaling: table indexer vs native indexer\n");
+        std::printf("\n-- the spare key (position 0) under rope scaling\n");
         using RST = strata::kernels::RopeScalingType;
         struct Variant { const char* name; RST type; double factor; double ext; };
         const Variant variants[] = {{"none", RST::None, 1.0, 0.0},
@@ -1518,12 +1458,9 @@ int main(int argc, char** argv) try {
         Dev<int32_t> dpos0(1);
         const int32_t zero = 0;
         check(strata::gpu::copy(dpos0.p, &zero, 4), "pos0");
-        strata::gpu::Stream cs = nullptr;
-        check(((cs = strata::gpu::stream_create()) != nullptr), "cs");
         const size_t prows = (size_t) (MC / R + 1) * IDXD, trows = (size_t) (R - 1) * IDXD;
-        // one cell at position 0 through either kernel; returns (dead, pooled[0])
-        auto spare = [&](bool native, const strata::kernels::RopeScaling& sc, std::vector<float>& dead,
-                         std::vector<float>& pooled0) {
+        // one cell at position 0; returns (dead, pooled[0])
+        auto spare = [&](const strata::kernels::RopeScaling& sc, std::vector<float>& dead, std::vector<float>& pooled0) {
             Dev<float> pooled(prows), dd((size_t) IDXD), tail(trows);
             Dev<int32_t> bpos(1);
             check(strata::gpu::memset(pooled.p, 0, prows * 4), "zero");
@@ -1531,21 +1468,12 @@ int main(int argc, char** argv) try {
             check(strata::gpu::memset(tail.p, 0, trows * 4), "zero");
             check(strata::gpu::memset(bpos.p, 0, 4), "zero");
             strata::kernels::QsaIndexerBuffers bufs{tail.p, dd.p, pooled.p, bpos.p};
-            if (native) {
-                strata::kernels::native_qsa_indexer_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, MC, sc, cs);
-            } else {
-                std::vector<float> tc((size_t) (MC * HALF)), ts(tc.size());
-                strata::kernels::build_rope_table((int) NROT, sc, (int) MC, tc.data(), ts.data());
-                Dev<float> dc, dsn;
-                dc.put(tc);
-                dsn.put(ts);
-                strata::kernels::indexer_key_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, dc.p, dsn.p, cs);
-            }
-            check(strata::gpu::stream_sync(cs), "sync");
+            strata::kernels::native_qsa_indexer_append(draw0.p, dpos0.p, 0, dw_kn.p, EPS, bufs, S, MC, sc, cs_idx);
+            check(strata::gpu::stream_sync(cs_idx), "sync");
             dead = dd.get((size_t) IDXD);
             pooled0 = pooled.get((size_t) IDXD);
         };
-        std::vector<float> t_none, t_none_p, n_none, n_none_p;
+        std::vector<float> n_none;
         for (const Variant& var : variants) {
             strata::kernels::RopeScaling sc;
             sc.type = var.type;
@@ -1553,40 +1481,35 @@ int main(int argc, char** argv) try {
             sc.ext_factor = var.ext;
             std::vector<float> row0c((size_t) (MC * HALF)), row0s(row0c.size());
             strata::kernels::build_rope_table((int) NROT, sc, (int) MC, row0c.data(), row0s.data());
-            std::vector<float> td, tp, nd, np;
-            spare(false, sc, td, tp);
-            spare(true, sc, nd, np);
-            if (var.type == RST::None) { t_none = td; t_none_p = tp; n_none = nd; n_none_p = np; }
-            long long tbad = 0, pbad = 0, sin_bad = 0;
+            std::vector<float> nd, np;
+            spare(sc, nd, np);
+            if (var.type == RST::None) n_none = nd;
+            long long pbad = 0, sin_bad = 0;
             double nworst = 0;
             for (int64_t i = 0; i < HALF; ++i) sin_bad += row0s[(size_t) i] != 0.0f;
             for (int64_t d = 0; d < IDXD; ++d) {
                 const float c0 = d < NROT ? row0c[(size_t) (d % HALF)] : 1.0f;
-                const float want = d < NROT ? t_none[(size_t) d] * c0 : t_none[(size_t) d];
-                tbad += std::memcmp(static_cast<const void*>(&td[(size_t) d]), static_cast<const void*>(&want), 4) != 0;
-                pbad += std::memcmp(static_cast<const void*>(&tp[(size_t) d]), static_cast<const void*>(&td[(size_t) d]), 4) != 0;
+                pbad += std::memcmp(static_cast<const void*>(&np[(size_t) d]), static_cast<const void*>(&nd[(size_t) d]), 4) != 0;
                 const double nwant = (double) n_none[(size_t) d] * (double) c0;
                 const double den = std::max(std::fabs(nwant), 1e-6);
                 nworst = std::max(nworst, std::fabs((double) nd[(size_t) d] - nwant) / den);
             }
             require(std::string("  ") + var.name + ": row 0 of the table is (c, 0)", sin_bad == 0,
                     std::to_string(sin_bad) + " nonzero sines");
-            require(std::string("  ") + var.name + ": the table spare is the unscaled spare times row 0, BIT-EXACT",
-                    tbad == 0, std::to_string(tbad) + " of " + std::to_string(IDXD) + " wrong");
-            require(std::string("  ") + var.name + ": the table's pooled[0] is its spare", pbad == 0,
+            require(std::string("  ") + var.name + ": pooled[0] is the spare", pbad == 0,
                     std::to_string(pbad) + " wrong");
-            require(std::string("  ") + var.name + ": the native spare carries the same row-0 factor", nworst <= 4e-7,
+            require(std::string("  ") + var.name + ": the spare carries the row-0 factor", nworst <= 4e-7,
                     "worst relative " + std::to_string(nworst));
             if (var.type == RST::YaRN) {
                 int moved = 0;
-                for (int64_t d = 0; d < NROT; ++d) moved += std::memcmp(static_cast<const void*>(&td[(size_t) d]), static_cast<const void*>(&t_none[(size_t) d]), 4) != 0;
-                require("  yarn 2: the magnitude correction is observable on the table spare",
+                for (int64_t d = 0; d < NROT; ++d) moved += std::memcmp(static_cast<const void*>(&nd[(size_t) d]), static_cast<const void*>(&n_none[(size_t) d]), 4) != 0;
+                require("  yarn 2: the magnitude correction is observable on the spare",
                         row0c[0] != 1.0f && moved > NROT / 2,
                         "row0 cos " + std::to_string(row0c[0]) + ", " + std::to_string(moved) + " dims moved");
             }
         }
-        strata::gpu::stream_destroy(cs);
     }
+    strata::gpu::stream_destroy(cs_idx);
 
     std::printf("\nqsa: %d failures\n", g_bad);
     if (g_bad) return 1;

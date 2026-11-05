@@ -27,7 +27,6 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
-#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm5.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
@@ -194,19 +193,7 @@ bool PlainModel::load_glm5(std::string& err) {
     }
 
     const GgufModel& m = *model_;
-    {   // the embedding stays in the mapping: a token's row is dequantized on the host
-        size_t at = 0;
-        const TensorInfo* t = m.find("token_embd.weight", &at);
-        if (t == nullptr || t->shape.size() != 2 || t->shape[0] != (uint64_t) s.n_embd || !m.in_bounds(*t, at)) {
-            err = "plain model: token_embd.weight is missing or of another width";
-            return false;
-        }
-        emb_type_ = (int) t->type;
-        n_vocab_ = (int64_t) t->shape[1];
-        emb_row_ = k::cpu::native_row_bytes(emb_type_, s.n_embd);
-        if (emb_row_ == 0) { err = "plain model: token_embd.weight's type has no host dequantizer"; return false; }
-        emb_ = m.shard(at).tensor_data(*t);
-    }
+    if (!load_embedding(err)) return false;
     if (last()) {   // the head: the last stage's
         if (!upload(m, "output.weight", head_, err) ||
             !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))

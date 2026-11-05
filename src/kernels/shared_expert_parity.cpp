@@ -19,6 +19,7 @@
 //      checked the same way - it is computed and required to differ.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
@@ -417,7 +418,7 @@ int main(int argc, char** argv) {
         strata::parity::copy_bytes_in(d_p, parts.data(), parts.size() * 4);
         strata::parity::copy_bytes_in(d_w, w.data(), w.size() * 4);
         strata::parity::copy_bytes_in(d_s, shared.data(), shared.size() * 4);
-        strata::kernels::moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, nullptr);
+        strata::kernels::native_moe_combine(d_p, d_w, d_s, d_y, n_embd2, k2, strata::parity::stream());
         std::vector<float> got((size_t) n_embd2);
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
 
@@ -432,12 +433,12 @@ int main(int argc, char** argv) {
         }
 
         const double rel_k = rel_l1(want, got);
-        std::printf("  %-42s rel %.3e\n", "moe_combine vs reference", rel_k);
+        std::printf("  %-42s rel %.3e\n", "native_moe_combine vs reference", rel_k);
         // The kernel sums in FP32 (ggml's order), the reference in double: 10 terms, so FP32 rounding only.
         if (!(rel_k <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
 
         // a null `shared` must mean "no shared expert", not "add nothing but leave it undefined"
-        strata::kernels::moe_combine(d_p, d_w, nullptr, d_y, n_embd2, k2, nullptr);
+        strata::kernels::native_moe_combine(d_p, d_w, nullptr, d_y, n_embd2, k2, strata::parity::stream());
         strata::parity::copy_bytes_out(got.data(), d_y, got.size() * 4);
         const double rel_no_shared = rel_l1(want, got);
         const bool differs = rel_no_shared > 0.05;

@@ -9,6 +9,8 @@
 #include <vector>
 #include <mutex>
 
+#include "strata/kernels/iq_kernels.hpp"
+
 namespace strata::core {
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
@@ -40,9 +42,10 @@ private:
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
-/// is read over PCIe per token, so the table costs no VRAM.  `embed_row`, the verify window and the MTP drafter
-/// use it instead of the canonical table when it is set (`set_native_embed`).  Host USM belongs to one GPU's context,
-/// so a layer split's stage on another GPU (the drafter on the last one) reads a copy made in its own, once.
+/// is read over PCIe per token, so the table costs no VRAM.  `embed_table` (the decode, the prompt, the verify
+/// window and the MTP drafter) takes it instead of the canonical table when it is set (`set_native_embed`).  Host
+/// USM belongs to one GPU's context, so a layer split's stage on another GPU (the drafter on the last one) reads a
+/// copy made in its own, once.
 /// `STRATA_EMBED_VRAM=1` places the same bytes in VRAM instead (slow host links); the gathers read `dev_` either way.
 class NativeEmbed {
 public:
@@ -51,10 +54,8 @@ public:
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
     bool load(const std::string& gguf, int64_t n_embd, int64_t n_vocab, std::string& err);
-    /// Rows for device token ids.
-    void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
-    /// One row for a host token id.
-    void gather_one(int64_t token, float* out, void* stream) const;
+    /// The table as the GPU that runs `stream` reads it (kernels::embed_rows).
+    strata::kernels::EmbedTable table(void* stream) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
     /// The table was placed in VRAM (STRATA_EMBED_VRAM=1) rather than mapped.

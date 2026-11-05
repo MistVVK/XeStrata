@@ -116,10 +116,6 @@ void hunyuanimage3_group_apply16(const float* x, const float* mean, const float*
                                  const float* b, const float* scale, const float* shift, int64_t P, int64_t C,
                                  bool silu, uint16_t* y16, void* stream, uint16_t* lo16 = nullptr);
 
-/// out16[t][:] = FP16(table[ids[t]][:]) of a BF16 embedding table [vocab][C]: the sequence's text rows.
-void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids, int64_t rows, int64_t C, uint16_t* out16,
-                       void* stream);
-
 /// dst16[:] = src16[:], n values: a meta token's row overwritten by its embedder's output.
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream);
 

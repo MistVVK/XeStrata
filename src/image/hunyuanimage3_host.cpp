@@ -11,7 +11,7 @@
 // y = x = the token's index, a causal mask).
 #include "strata/image/hunyuanimage3_host.hpp"
 
-#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <chrono>
 #include <functional>
@@ -762,7 +762,8 @@ bool time_embed(Ctx& c, const std::string& which, float t, std::vector<float>& o
 bool hunyuanimage3_wte_host(const HunyuanImage3File& f, const int32_t* ids, int64_t t, float* out, std::string& err) {
     // the rows the sequence reads, gathered out of the file's BF16: a prompt is tens to thousands of ids and the
     // table is 133120 x 4096, so converting the whole thing to pick rows out of it costs more than everything the
-    // rows feed (measured: the walk's host entry spent most of its seconds there).  bf16 widens exactly.
+    // rows feed (measured: the walk's host entry spent most of its seconds there).  bf16 widens exactly, by the one
+    // host lookup the text models share (native_row_to_float).
     const SafeTensor* wte = f.tensors().find("model.wte.weight");
     if (wte == nullptr) {
         err = "wte: no tensor model.wte.weight";
@@ -782,9 +783,11 @@ bool hunyuanimage3_wte_host(const HunyuanImage3File& f, const int32_t* ids, int6
             err = "wte: id " + std::to_string(id) + " outside the vocabulary of " + std::to_string(vocab);
             return false;
         }
-        const uint16_t* row = reinterpret_cast<const uint16_t*>(bytes) + (uint64_t) id * kHidden;
-        float* dst = out + i * kHidden;
-        for (int64_t j = 0; j < kHidden; ++j) dst[j] = strata::kernels::f32_from_bf16(row[j]);
+        if (!strata::kernels::cpu::native_row_to_float(30, bytes + (uint64_t) id * kHidden * 2, out + i * kHidden,
+                                                       kHidden)) {
+            err = "wte: the BF16 row could not be read";
+            return false;
+        }
     }
     return true;
 }

@@ -127,7 +127,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
                 if (tok < 0 || tok >= n_vocab_ ||
-                    (first() && !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N))) {
+                    (first() && !embed(tok, p0 + t, P.emb + t * N))) {
                     err = "plain prompt: a token is out of the vocabulary";
                     return false;
                 }
@@ -298,7 +298,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                 }
                 for (int64_t t = 0; t < T; ++t) {
                     const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
-                    if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                    if (!embed(tok, p0 + 1 + t, P.emb + t * N)) {
                         err = "plain prompt: a token is out of the vocabulary";
                         return false;
                     }

@@ -39,7 +39,6 @@ int main() {
     const long long n_embd = 2560, hc = 4, hc_lr = 320, hc_dim = hc * n_embd;
     std::mt19937 rng(783);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
     std::normal_distribution<float> gauss(0.f, 1.f);
-    k::gr_set_native_mmvf(true);
     const k::GrShapes sh{n_embd, hc, hc_lr};
     void* st = P::stream();
     int cases = 0, bad = 0;

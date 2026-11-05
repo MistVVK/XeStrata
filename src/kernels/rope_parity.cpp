@@ -8,9 +8,10 @@
 //   1. THE TABLE against the float64 reference - `theta ** (-2i/n_rot)`, `pos * inv`, `cos`/`sin`, all in
 //      double exactly as `ref/qsa.py::rope_freqs` does.  Compared as float32 after the cast, so a mismatch
 //      here is a real arithmetic difference and not a formatting one.
-//   2. THE ROTATION against a host rotation written from `ref/qsa.py::rope_neox`, using the SAME table the
-//      kernel is given.  Both sides then perform identical float32 operations, so this is BIT-EXACT - and a
-//      bit-exact rotation plus a table that matches the reference means the composition matches too.
+//   2. THE ROTATION (native_rope_apply, the engine's one RoPE) against a host rotation written from
+//      `ref/qsa.py::rope_neox` over that float64 table.  The kernel forms its angles in float32 on the device,
+//      so this holds to the float32 angle at the table's positions - and a rotation that matches plus a table
+//      that matches the reference means the composition matches too.
 //
 // A single end-to-end comparison would have had to carry one loose tolerance for both, and the interesting
 // failure - the NEOX pairing being wrong - is a PERMUTATION that a loose tolerance over all 256 dims would
@@ -24,9 +25,8 @@
 // EXTRAPOLATION while the last matches INTERPOLATION.  An observability assertion closes it: if the scaled
 // and unscaled tables were indistinguishable, every green number above would be vacuous.
 //
-// Check 5 holds the TWO PATHS together: the table path's float64 host trig and the native path's float32
-// fast-math device trig must answer to the same `RopeScaling`, yarn and none alike, so one cache never
-// mixes two rotations.
+// Check 5 holds the kernel to the float64 tables at long range: its float32 fast-math device trig must answer
+// to the same `RopeScaling` as the tables, yarn and none alike.
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -108,18 +108,22 @@ int main(int argc, char** argv) try {
     strata::parity::Device dev;
     float* d_x = dev.upload(x);
     float* d_out = dev.alloc<float>(ref.size());
-    float* d_cos = dev.upload(hcos);
-    float* d_sin = dev.upload(hsin);
     int* d_pos = dev.upload(pos);
-    strata::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
+    // the kernel takes an explicit stream (a null one is refused by validation, not defaulted)
+    strata::gpu::Stream cs = nullptr;
+    check(((cs = strata::gpu::stream_create()) != nullptr), "stream");
+    strata::kernels::RopeScaling unscaled;
+    unscaled.freq_base = theta;
+    strata::kernels::native_rope_apply(d_x, d_out, rows, head_dim, n_rot, unscaled, d_pos, cs);
+    check(strata::gpu::stream_sync(cs), "sync");
     std::vector<float> got(ref.size());
     strata::parity::copy_out(got.data(), d_out, got.size());
 
-    // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  *c - b*s is one of the expressions the compiler is free to
-    // contract into an FMA, and the host and device compilers choose differently - so a handful of values
-    // differ in the last bit.  Round 167 established this the hard way: a bit-equality expectation that a
-    // kernel cannot meet is a test that reports a correct kernel as broken.  The residual is reported, and if
-    // it were structural (a wrong pairing, a wrong table entry) it would be O(1), not O(1 ULP).
+    // A RELATIVE TOLERANCE, NOT BIT EQUALITY.  The kernel's angle is p * theta_scale^i in float32 and its cos/sin
+    // the device's, against the float64 table: at the positions here (< 32) that is a few float32 ulp of the
+    // angle.  The residual is reported, and if it were structural (a wrong pairing, a wrong angle) it would be
+    // O(1), not O(1e-6).
+    const double rot_tol = 1e-5;
     long long rot_bad = 0;
     double worst = 0.0;
     long long first_bad = -1;
@@ -138,10 +142,10 @@ int main(int argc, char** argv) try {
         const double a = ref[i], b = got[i];
         const double rel = std::fabs(a - b) / row_scale[i / (size_t) head_dim];
         if (!(rel <= worst)) worst = rel;
-        if (!(rel <= 1e-6)) { if (first_bad < 0) first_bad = (long long) i; ++rot_bad; }
+        if (!(rel <= rot_tol)) { if (first_bad < 0) first_bad = (long long) i; ++rot_bad; }
     }
-    std::printf("  rope rotation vs host reference   %s (%lld of %zu over 1e-6, worst rel %.3e)\n",
-                rot_bad ? "*** WRONG ***" : "agrees", rot_bad, ref.size(), worst);
+    std::printf("  rope rotation vs host reference   %s (%lld of %zu over %.0e, worst rel %.3e)\n",
+                rot_bad ? "*** WRONG ***" : "agrees", rot_bad, ref.size(), rot_tol, worst);
     if (first_bad >= 0) std::printf("    first over-tolerance at element %lld\n", first_bad);
     bad += (int) rot_bad;
 
@@ -158,7 +162,8 @@ int main(int argc, char** argv) try {
         // the check would report the correct kernel as wrong.  The first version made exactly that mistake.
         int p7 = 7;
         strata::parity::copy_in(d_pos, &p7, 1);
-        strata::kernels::rope_neox_apply(d_x, d_out, 1, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
+        strata::kernels::native_rope_apply(d_x, d_out, 1, head_dim, n_rot, unscaled, d_pos, cs);
+        check(strata::gpu::stream_sync(cs), "sync");
         strata::parity::copy_out(o.data(), d_out, o.size());
         int moved[4] = {0, 0, 0, 0};       // dims 0, 1, half, half+1
         const float* chk[4] = {&e[0], &e[1], &e[half], &e[half + 1]};
@@ -307,8 +312,8 @@ int main(int argc, char** argv) try {
             if (!sees) ++bad;
         }
 
-        // 4g. THE ROTATION under a scaled table.  The kernel is table-agnostic and must not know or care:
-        // the host reference is the same rope_neox_pair walk as check 2, over the YaRN table.
+        // 4g. THE ROTATION under YaRN: the kernel's own angles against the same rope_neox_pair walk as check 2,
+        // over the YaRN table.
         std::vector<float> ref2(x.size());
         for (int r = 0; r < rows; ++r) {
             const float* xr = &x[(size_t) r * head_dim];
@@ -320,10 +325,9 @@ int main(int argc, char** argv) try {
             }
         }
         check(strata::gpu::copy(d_x, x.data(), x.size() * sizeof(float)), "copy x");
-        check(strata::gpu::copy(d_cos, yc.data(), yc.size() * sizeof(float)), "copy ycos");
-        check(strata::gpu::copy(d_sin, ys.data(), ys.size() * sizeof(float)), "copy ysin");
         check(strata::gpu::copy(d_pos, pos.data(), pos.size() * sizeof(int)), "copy pos");
-        strata::kernels::rope_neox_apply(d_x, d_out, rows, head_dim, n_rot, d_cos, d_sin, d_pos, nullptr);
+        strata::kernels::native_rope_apply(d_x, d_out, rows, head_dim, n_rot, yarn, d_pos, cs);
+        check(strata::gpu::stream_sync(cs), "sync");
         std::vector<float> got2(ref2.size());
         check(strata::gpu::copy(got2.data(), d_out, got2.size() * sizeof(float)), "back");
         long long rot2_bad = 0;
@@ -332,20 +336,18 @@ int main(int argc, char** argv) try {
             const double a = ref2[i], b = got2[i];
             const double rel = std::fabs(a - b) / row_scale[i / (size_t) head_dim];
             worst2 = std::max(worst2, rel);
-            if (!(rel <= 1e-6)) ++rot2_bad;
+            if (!(rel <= rot_tol)) ++rot2_bad;
         }
-        std::printf("  rope rotation over the yarn table      %s (%lld of %zu over 1e-6, worst rel %.3e)\n",
-                    rot2_bad ? "*** WRONG ***" : "agrees", rot2_bad, ref2.size(), worst2);
+        std::printf("  rope rotation over the yarn table      %s (%lld of %zu over %.0e, worst rel %.3e)\n",
+                    rot2_bad ? "*** WRONG ***" : "agrees", rot2_bad, ref2.size(), rot_tol, worst2);
         bad += (int) rot2_bad;
     }
 
-    // ---- 5. THE TWO PATHS MUST AGREE.  The table path (the default) computes cos/sin on the host in float64;
-    // the native path (`--native-rope`) computes the same angles on device in float32 under `--use_fast_math`.
-    // They answer to ONE config - `RopeScaling` - and a disagreement between them would put differently-rotated
-    // K into the cache depending on which path ran.  The tolerance is NOT the 1e-6 of checks 2/4g: the device
-    // side takes fast-math trig at angles up to ~2048 rad, where the fp32 range reduction alone is worth ~1e-4,
-    // so the bar is the row-magnitude-relative 3e-3 and the test keeps the positions where that holds.  (The
-    // engine's default is the table path precisely because float64 host trig has no such floor.)
+    // ---- 5. THE KERNEL AGAINST THE TABLES AT LONG RANGE.  The tables compute cos/sin on the host in float64; the
+    // kernel computes the same angles on device in float32 under `--use_fast_math`.  Both answer to ONE config -
+    // `RopeScaling`.  The tolerance is NOT that of checks 2/4g: the device side takes fast-math trig at angles up
+    // to ~2048 rad, where the fp32 range reduction alone is worth ~1e-4, so the bar is the row-magnitude-relative
+    // 3e-3 and the test keeps the positions where that holds.
     {
         const int npos = 2048;
         strata::kernels::RopeScaling yarn;
@@ -362,26 +364,29 @@ int main(int argc, char** argv) try {
         std::vector<int> pos2((size_t) nrows);
         for (int r = 0; r < nrows; ++r) pos2[(size_t) r] = (r * 127) % npos;
 
-        float *d_x2 = nullptr, *d_t2 = nullptr, *d_n2 = nullptr, *d_c2 = nullptr, *d_s2 = nullptr;
+        // the rotation over a float64 table on the host (rope_neox_pair), the reference of this check
+        auto host_rotate = [&](const std::vector<float>& c, const std::vector<float>& sn) {
+            std::vector<float> out(x2);
+            for (int r = 0; r < nrows; ++r) {
+                const float* xr = &x2[(size_t) r * head_dim];
+                float* orow = &out[(size_t) r * head_dim];
+                for (int i = 0; i < half; ++i)
+                    strata::kernels::rope_neox_pair(xr[i], xr[half + i], c[(size_t) pos2[(size_t) r] * half + i],
+                                                    sn[(size_t) pos2[(size_t) r] * half + i], orow[i], orow[half + i]);
+            }
+            return out;
+        };
+        float *d_x2 = nullptr, *d_n2 = nullptr;
         int* d_p2 = nullptr;
         check(strata::gpu::alloc_device(&d_x2, x2.size() * sizeof(float)), "malloc x2");
-        check(strata::gpu::alloc_device(&d_t2, x2.size() * sizeof(float)), "malloc t2");
         check(strata::gpu::alloc_device(&d_n2, x2.size() * sizeof(float)), "malloc n2");
-        check(strata::gpu::alloc_device(&d_c2, sc.size() * sizeof(float)), "malloc c2");
-        check(strata::gpu::alloc_device(&d_s2, ss.size() * sizeof(float)), "malloc s2");
         check(strata::gpu::alloc_device(&d_p2, pos2.size() * sizeof(int)), "malloc p2");
         check(strata::gpu::copy(d_x2, x2.data(), x2.size() * sizeof(float)), "copy x2");
-        check(strata::gpu::copy(d_c2, sc.data(), sc.size() * sizeof(float)), "copy c2");
-        check(strata::gpu::copy(d_s2, ss.data(), ss.size() * sizeof(float)), "copy s2");
         check(strata::gpu::copy(d_p2, pos2.data(), pos2.size() * sizeof(int)), "copy p2");
-        // The native path demands an explicit stream - a null one is refused by validation, not defaulted.
-        strata::gpu::Stream cs5 = nullptr;
-        check(((cs5 = strata::gpu::stream_create()) != nullptr), "stream5");
-        strata::kernels::rope_neox_apply(d_x2, d_t2, nrows, head_dim, n_rot, d_c2, d_s2, d_p2, nullptr);
+        strata::gpu::Stream cs5 = cs;
         strata::kernels::native_rope_apply(d_x2, d_n2, nrows, head_dim, n_rot, yarn, d_p2, cs5);
         check(strata::gpu::stream_sync(cs5), "sync5");
-        std::vector<float> got_t(x2.size()), got_n(x2.size());
-        check(strata::gpu::copy(got_t.data(), d_t2, got_t.size() * sizeof(float)), "back t2");
+        std::vector<float> got_t = host_rotate(sc, ss), got_n(x2.size());
         check(strata::gpu::copy(got_n.data(), d_n2, got_n.size() * sizeof(float)), "back n2");
         long long agree_bad = 0;
         double worst = 0.0;
@@ -396,22 +401,19 @@ int main(int argc, char** argv) try {
                 if (!(rel <= 3e-3)) ++agree_bad;
             }
         }
-        std::printf("  native path vs table path, yarn factor 2   %s (%lld of %d over 3e-3, worst rel %.3e)\n",
+        std::printf("  the kernel vs the yarn table, factor 2      %s (%lld of %d over 3e-3, worst rel %.3e)\n",
                     agree_bad ? "*** WRONG ***" : "agrees", agree_bad, nrows * head_dim, worst);
         bad += (int) agree_bad;
 
-        // and the None config: the native path against the UNSCALED table - the identity this feature must
-        // not disturb.
+        // and the None config: the kernel against the UNSCALED table - the identity this feature must not
+        // disturb.
         strata::kernels::RopeScaling none5;               // all defaults: type None, freq_scale 1, mscale 1
         strata::kernels::native_rope_apply(d_x2, d_n2, nrows, head_dim, n_rot, none5, d_p2, cs5);
         check(strata::gpu::stream_sync(cs5), "sync5b");
         check(strata::gpu::copy(got_n.data(), d_n2, got_n.size() * sizeof(float)), "back n2b");
         std::vector<float> nc5((size_t) npos * half), ns5((size_t) npos * half);
         strata::kernels::build_rope_table(n_rot, none5, npos, nc5.data(), ns5.data());
-        check(strata::gpu::copy(d_c2, nc5.data(), nc5.size() * sizeof(float)), "copy c2b");
-        check(strata::gpu::copy(d_s2, ns5.data(), ns5.size() * sizeof(float)), "copy s2b");
-        strata::kernels::rope_neox_apply(d_x2, d_t2, nrows, head_dim, n_rot, d_c2, d_s2, d_p2, nullptr);
-        check(strata::gpu::copy(got_t.data(), d_t2, got_t.size() * sizeof(float)), "back t2b");
+        got_t = host_rotate(nc5, ns5);
         long long none_bad5 = 0;
         double worst5 = 0.0;
         for (int r = 0; r < nrows; ++r) {
@@ -425,7 +427,7 @@ int main(int argc, char** argv) try {
                 if (!(rel <= 3e-3)) ++none_bad5;
             }
         }
-        std::printf("  native path vs table path, none            %s (%lld of %d over 3e-3, worst rel %.3e)\n",
+        std::printf("  the kernel vs the unscaled table            %s (%lld of %d over 3e-3, worst rel %.3e)\n",
                     none_bad5 ? "*** WRONG ***" : "agrees", none_bad5, nrows * head_dim, worst5);
         bad += (int) none_bad5;
 

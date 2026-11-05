@@ -79,26 +79,4 @@ bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
                          const void* x_q8_1 = nullptr);
 /// (`x_q8_1`: `x`'s q8_1 image as native_quantize_q8_1 writes it, made by the caller; gate and up read it.)
 
-/// The MoE block's final combination, `ref/moe.py::moe` L156:
-///
-///     y = sum over the k routed experts of  w[k] * parts[k]  +  shared
-///
-/// `parts` is (k, n_embd) contiguous - one row per SELECTED expert, in the router's own order - and `shared`
-/// may be null for a layer with no shared expert.
-///
-/// TWO THINGS A READER GETS WRONG HERE, and they are why this is not inlined at the call site:
-///
-///   * The ROUTED outputs are router-WEIGHTED; the SHARED output is ADDED PLAIN.  `ref/moe.py` L116 says so
-///     outright - "router-weighted, not renormalised against it" - and weighting the shared term too is a
-///     one-line change that produces a plausible number.
-///   * The weights come from `router_top10` ALREADY renormalised (they sum to 1 over the selected experts).
-///     Normalising again here would be a second, different normalisation, and it is invisible whenever the
-///     router's weights happen to sum near 1 anyway.
-///
-/// One thread per output element, k accumulations each; k is 10 at the real geometry.  This is where the CPU
-/// expert pool's outputs are summed: `ExpertPool` carries a `weight` per job and deliberately does NOT apply
-/// it, because the sum has to happen once over all k and not once per worker.
-void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream);
-
 }  // namespace strata::kernels

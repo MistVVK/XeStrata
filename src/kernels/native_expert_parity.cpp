@@ -51,7 +51,7 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
     return n / (d + 1e-30);
 }
 
-// The BF16 token embedding (--embd-gguf): iq_embed_rows and iq_dequant_f32 on a random BF16 table against the exact
+// The BF16 token embedding (--embd-gguf): embed_rows and iq_dequant_f32 on a random BF16 table against the exact
 // widening (bits << 16), every bit; rows gathered out of order, with repeats
 static int check_bf16_embd(void* s) {
     constexpr int kBf16 = 30;
@@ -77,7 +77,13 @@ static int check_bf16_embd(void* s) {
     auto widen = [](uint16_t b) { return (uint32_t) b << 16; };   // the exact float bits
     auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
     std::vector<float> got((size_t) (out_rows * H));
-    strata::kernels::iq_embed_rows(kBf16, dt, (size_t) H * 2, dtok, NT, H, dout, s);
+    strata::kernels::EmbedTable et;
+    et.type = kBf16;
+    et.rows = dt;
+    et.row_bytes = (size_t) H * 2;
+    et.n_rows = V;
+    et.n_embd = H;
+    strata::kernels::embed_rows(et, dtok, 0, NT, dout, s);
     strata::parity::copy_out(got.data(), dout, (size_t) (NT * H));
     size_t rows_differ = 0;
     for (int64_t r = 0; r < NT; ++r)

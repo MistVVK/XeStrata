@@ -618,29 +618,21 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + (int64_t) row0 * 4;
     const int32_t* pos = pos_ + (int64_t) row0 * NH;
-    const bool fused_nr = native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
+    const bool fused_nr = native_norm_rope_usable((int) HD, (int) s.n_rot);
     auto norm_rope = [&](float* data, const float* gamma, int rows, int cols, const int32_t* p) {
         if (fused_nr && cols == (int) HD) {
             native_qsa_rms_norm_rope(data, cols, gamma, data, rows, cols, (int) s.n_rot, EPS, rope_scaling(), p, cs);
             return;
         }
         native_qsa_rms_norm_weighted(data, gamma, data, cols, rows, EPS, cs);
-        if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
-        else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st_.cos_tab, st_.sin_tab, p, cs);
+        native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), p, cs);
     };
     try {
       if (!rest_only) {
         // ---- the two input branches
-        const WeightRef* we = wt_->find("token_embd.weight");
-        if (!we) { err = "mtp: token_embd.weight is missing"; return false; }
-        if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
-            ne->gather_dev(tok_, T, emb_, cs);
-        } else {
-            const auto* codes = (const uint8_t*) we->data;
-            const auto* scales = (const float*) (codes + we->codes_bytes);
-            const auto* offsets = we->has_offset ? (const float*) (codes + we->codes_bytes + we->scales_bytes) : nullptr;
-            embedding_gather_dev(codes, scales, offsets, tok_, T, we->ne0, we->code_bits, we->code_bias, we->group_elems,
-                                 (uint64_t) (we->ne0 / (8 / we->code_bits)), (uint64_t) (we->ne0 / we->group_elems), emb_, cs);
+        if (!embed_rows(*wt_, g, tok_, 0, T, emb_, cs, err)) {
+            err = "mtp: " + err;
+            return false;
         }
         native_qsa_rms_norm_weighted(emb_, f32("pre_fc_norm_embedding.weight"), en_, (int) N, T, EPS, cs);
         native_quantize_q8_1(en_, xq_, (int) N, T, cs);
@@ -682,8 +674,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
         for (int t = 0; t < T; ++t) {
             float* kc = kcur_ + t * NKV * HD;
-            if (native_rope_enabled()) native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos + t * NH, cs);
-            else rope_neox_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, st_.cos_tab, st_.sin_tab, pos + t * NH, cs);
+            native_rope_apply(kc, kc, (int) NKV, (int) HD, (int) s.n_rot, rope_scaling(), pos + t * NH, cs);
         }
         if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp)
             fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
@@ -749,8 +740,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         // ---- MoE: router, the 512 resident experts, the shared expert, the combine, the write.  A window of more than
         // one token routes in two launches (one router GEMV, one top-10 over all rows; each row bitwise the single
         // call) and combines in one (upstream 868f2ef0)
-        const bool multi = T > 1 && native_router_enabled() && native_moe_combine_enabled() && g.n_expert == 512 &&
-                           K == 10;
+        const bool multi = T > 1 && g.n_expert == 512 && K == 10;
         // The shared expert reads mixed_ (and xq_, its scratch) and writes shared_ only: a branch beside the
         // router and the routed experts, joined before the combine (upstream 4a5713fb).  STRATA_MTP_SHARED_BRANCH=0:
         // one queue.
@@ -782,7 +772,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         } else
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled() && g.n_expert == 512 && K == 10)
+            if (g.n_expert == 512 && K == 10)
                 native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
@@ -795,12 +785,8 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
             err = std::string("mtp: the shared expert's branch: ") + strata::gpu::last_error();
             return false;
         }
-        for (int t = 0; t < T && !multi; ++t) {
-            if (native_moe_combine_enabled())
-                native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
-            else
-                moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
-        }
+        for (int t = 0; t < T && !multi; ++t)
+            native_moe_combine(parts_ + (size_t) t * K * N, w_ + t * K, shared_ + t * N, y_ + t * N, N, K, cs);
         if (multi) native_moe_combine_multi(parts_, w_, shared_, y_, N, K, T, cs);
         gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);   // the T residual writes in one launch
         // ---- the final mixer and the main model's head: the rows in one fused read (upstream edc592b1; the layers'

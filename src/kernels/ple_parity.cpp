@@ -804,23 +804,16 @@ int main(int argc, char** argv) {
                 reference_value[row] = float(sum);
             }
             ck(cudaMemcpy(d_emb, witness.data(), nd * sizeof(float), cudaMemcpyHostToDevice), "native PLE witness");
-            k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
-            ck(cudaDeviceSynchronize(), "legacy PLE witness sync");
-            std::vector<float> legacy_value(nd);
-            ck(cudaMemcpy(legacy_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "legacy PLE witness value");
             cudaStream_t stream;
             ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native PLE stream");
-            k::ple_set_native_bf16(true);
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
             ck(cudaStreamSynchronize(stream), "native PLE sync");
             ck(cudaMemcpy(native_value.data(), d_cv, nd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE value");
             ck(cudaMemcpy(native_result.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE result");
             long long nf = 0;
             const double rel = rel_l1(reference_value.data(), native_value.data(), nd, nullptr, &nf);
-            const double separation = rel_l1(native_value.data(), legacy_value.data(), nd);
-            const bool correct = le(rel, 2e-6) && nf == 0 && gt(separation, 1e-5);
-            std::printf("  native PLE value: %s (ref rel %.3e, BF16 separation %.3e)\n",
-                        correct ? "pass" : "FAIL", rel, separation);
+            const bool correct = le(rel, 2e-6) && nf == 0;
+            std::printf("  native PLE value: %s (ref rel %.3e)\n", correct ? "pass" : "FAIL", rel);
             if (!correct) ++bad;
             cudaGraph_t graph;
             cudaGraphExec_t executable;
@@ -828,7 +821,6 @@ int main(int argc, char** argv) {
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, stream);
             ck(cudaStreamEndCapture(stream, &graph), "native PLE capture end");
             ck(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "native PLE instantiate");
-            k::ple_set_native_bf16(false);
             ck(cudaGraphLaunch(executable, stream), "native PLE replay");
             ck(cudaStreamSynchronize(stream), "native PLE replay sync");
             ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE replay result");

@@ -17,7 +17,7 @@ namespace strata::kernels {
 
 /// ggml type ids handled here.
 bool iq_supported(int ggml_type) noexcept;
-/// The token-embedding types iq_embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
+/// The GGUF token-embedding types embed_rows and iq_dequant_f32 read: the i-quants above and BF16 (30).
 bool embed_type_supported(int ggml_type) noexcept;
 /// Bytes of one row of `n` values of `ggml_type` (n a multiple of the type's block).
 size_t iq_row_bytes(int ggml_type, int64_t n) noexcept;
@@ -31,10 +31,25 @@ void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_i
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
-/// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
-/// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
-void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok,
-                   int64_t n_embd, float* out, void* stream);
+/// A token-embedding table as the GPU reads it, through a device pointer (VRAM, or mapped pinned host memory): a
+/// GGUF table (`type` one of embed_type_supported; row r at `rows` + r * `row_bytes`, `n_embd` a multiple of 256),
+/// or (`type` kPacked) the packed planes of the canonical S2/S4/S8 tensor: `rows` the codes (`row_bytes` a row, low
+/// bits first), `scales` and the optional `offsets` FP32 per group of `group_elems`, a value
+/// `(code + code_bias) * scale + offset` with the product and the sum rounded separately (s_gemv_q8k_split's
+/// decode).  `n_rows`: the vocabulary, for the caller's checks of host ids.
+struct EmbedTable {
+    static constexpr int kPacked = -1;
+    int type = kPacked;
+    const void* rows = nullptr;
+    size_t row_bytes = 0;
+    int64_t n_rows = 0, n_embd = 0;
+    const float* scales = nullptr;
+    const float* offsets = nullptr;
+    int code_bits = 0, code_bias = 0, group_elems = 0;
+};
+/// The FP32 rows of `n_tok` tokens, out[t * n_embd + i]: the ids in device memory (`ids`, which a graph can
+/// capture), or with `ids` null the one row `token`.  The ids are not checked on the device.
+void embed_rows(const EmbedTable& table, const int32_t* ids, int64_t token, int64_t n_tok, float* out, void* stream);
 /// One expert's gate and up matrices (n_ff rows of n_embd each) into the interleaved fp16 layout the prompt path
 /// uses: row 2r = gate row r, row 2r+1 = up row r.
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,

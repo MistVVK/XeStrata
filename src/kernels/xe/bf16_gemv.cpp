@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/xe/bf16_gemv.cpp - the Xe ports of Strata's src/kernels/cuda/bf16_gemv.cu (BF16 x BF16 GEMV) and the FP32 x
-// BF16 matrix-vector kernels of Strata's src/kernels/cuda/native_bf16.cu (ggml-cuda's mmvf at llama.cpp 3cf03257; MIT
-// License, Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE).
+// src/kernels/xe/bf16_gemv.cpp - the Xe ports of the FP32 x BF16 matrix-vector kernels of Strata's
+// src/kernels/cuda/native_bf16.cu (ggml-cuda's mmvf at llama.cpp 3cf03257; MIT License, Copyright (c) 2023-2026 The
+// ggml authors, see third_party/main/ggml/LICENSE).
 //
 // Warp sums are xor butterflies.  Lane 0 of a butterfly adds the same partial sums in the same order as CUDA's
-// shuffle-down tree, so the row results of the warp-per-row kernel are those of the CUDA kernel.
+// shuffle-down tree.
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/core/runtime.hpp"
@@ -32,48 +32,16 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int THREADS = 256;
 constexpr int WARP = 32;
 
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
     return queue;
 }
-void finish(void* stream, const sycl::event& e, const char* what) {
-    if (!stream) core::Runtime::get().wait(e, what);
-}
 
 inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
     return v;
-}
-
-sycl::event launch_naive(sycl::queue& q, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
-    return q.parallel_for(sycl::range<1>((size_t) n_out), [=](sycl::id<1> id) {
-        const int64_t o = (int64_t) id[0];
-        const uint16_t* row = w + o * n_in;
-        float acc = 0.0f;
-        for (int64_t i = 0; i < n_in; ++i) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-        y[o] = acc;
-    });
-}
-
-// One sub-group per row, coalesced: consecutive lanes read consecutive weights.
-sycl::event launch_warp(sycl::queue& q, const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out) {
-    const int warps = THREADS / WARP;
-    const size_t groups = (size_t) ((n_out + warps - 1) / warps);
-    return q.parallel_for(sycl::nd_range<1>(groups * THREADS, THREADS),
-                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int64_t o = (int64_t) it.get_group(0) * warps + (int64_t) sg.get_group_linear_id();
-        if (o >= n_out) return;
-        const int lane = (int) sg.get_local_linear_id();
-        const uint16_t* row = w + o * n_in;
-        float acc = 0.0f;
-        for (int64_t i = lane; i < n_in; i += WARP) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-        acc = warp_sum(sg, acc);
-        if (lane == 0) y[o] = acc;
-    });
 }
 
 // ggml-cuda mmvf: work-group size chosen for the fewest pair iterations, two ordered FMAs per pair, a warp sum, and
@@ -296,50 +264,6 @@ void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t*
 }
 
 }  // namespace
-
-void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    auto& q = queue_for(stream);
-    // Warp-per-row when there are enough rows to fill the machine; see the CUDA file for the measurements.
-    if (n_out >= 64) {
-        finish(stream, launch_warp(q, x, w, y, n_in, n_out), "bf16_gemv(warp)");
-        return;
-    }
-    finish(stream, launch_naive(q, x, w, y, n_in, n_out), "bf16_gemv");
-}
-
-void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
-                     int threads_per_row, void* stream) {
-    if (n_in <= 0 || n_out <= 0) return;
-    auto& q = queue_for(stream);
-    if (threads_per_row == 32) {
-        finish(stream, launch_warp(q, x, w, y, n_in, n_out), "bf16_gemv_split(warp)");
-        return;
-    }
-    if (threads_per_row <= 0 || (threads_per_row & (threads_per_row - 1)) != 0)
-        throw core::DeviceError("bf16_gemv_split: threads_per_row " + std::to_string(threads_per_row) +
-                                " must be a power of two (32 selects the warp-per-row path)");
-    const int tpr = threads_per_row;
-    const auto e = q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> scratch(sycl::range<1>((size_t) tpr), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_out * tpr, tpr), [=](sycl::nd_item<1> it) {
-            const int64_t o = (int64_t) it.get_group(0);
-            const int t = (int) it.get_local_id(0);
-            const uint16_t* row = w + o * n_in;
-            float acc = 0.0f;
-            for (int64_t i = t; i < n_in; i += tpr) acc += f32_from_bf16(x[i]) * f32_from_bf16(row[i]);
-            // a tree in local memory, as CUDA's shared-memory tree
-            scratch[t] = acc;
-            sycl::group_barrier(it.get_group());
-            for (int off = tpr >> 1; off > 0; off >>= 1) {
-                if (t < off) scratch[t] += scratch[t + off];
-                sycl::group_barrier(it.get_group());
-            }
-            if (t == 0) y[o] = scratch[0];
-        });
-    });
-    finish(stream, e, "bf16_gemv_split");
-}
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {

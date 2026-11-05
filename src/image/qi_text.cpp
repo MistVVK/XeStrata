@@ -9,7 +9,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/flash_attn.hpp"
-#include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -73,7 +73,10 @@ bool QiText::open(const std::string& path, void* stream, std::string& err, bool 
         const TensorInfo* e = find_checked(*g_, "token_embd.weight");
         if (e == nullptr || e->shape.size() < 2) throw std::runtime_error("image engine (text): no token_embd.weight");
         embd_type_ = (int) e->type;
-        embd_row_bytes_ = tensor_payload_bytes(*e) / e->shape[1];
+        embd_rows_ = (int64_t) e->shape[1];
+        embd_row_bytes_ = kernels::cpu::native_row_bytes(embd_type_, C_);
+        if (embd_row_bytes_ == 0 || (int64_t) e->shape[0] != C_)
+            throw std::runtime_error("image engine (text): token_embd.weight's type has no host dequantizer");
         embd_ = g_->tensor_data(*e);
         int64_t scratch = 0;
         for (int64_t i = 0; i < layers; ++i) {   // the layers: spans of the mapped file, through layers_stream_
@@ -129,7 +132,7 @@ bool QiText::open(const std::string& path, void* stream, std::string& err, bool 
 void QiText::ensure(int64_t T) {
     if (T <= cap_T_) return;
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) h_, (void*) gu_, (void*) h16_,
-                    (void*) q16_, (void*) k16_, (void*) v16_, (void*) rows_})
+                    (void*) q16_, (void*) k16_, (void*) v16_})
         release(allocs_, p);
     const int64_t kv = kv_heads_ * head_dim_, qd = heads_ * head_dim_;
     x_ = alloc<float>(allocs_, T * C_);
@@ -147,25 +150,23 @@ void QiText::ensure(int64_t T) {
     k16_ = alloc<uint16_t>(allocs_, TP * kv);
     v16_ = alloc<uint16_t>(allocs_, TP * kv);
     for (uint16_t* p : {q16_, k16_, v16_}) gpu::memset(p, 0, (size_t) (TP * (p == q16_ ? qd : kv)) * 2);
-    rows_ = alloc<uint8_t>(allocs_, (int64_t) (T * (int64_t) embd_row_bytes_));
     cap_T_ = T;
 }
 
 uint64_t QiText::activation_bytes(int64_t T) const {
     const int64_t kv = kv_heads_ * head_dim_, qd = heads_ * head_dim_;
     return (uint64_t) T * ((uint64_t) (2 * C_ + 2 * qd + 2 * kv + 2 * inter_) * 4 +
-                           (uint64_t) std::max({C_, inter_, qd}) * 2 + embd_row_bytes_) +
+                           (uint64_t) std::max({C_, inter_, qd}) * 2) +
            (uint64_t) qi_attn_rows(T) * (uint64_t) (qd + 2 * kv) * 2;
 }
 
 void QiText::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) h_, (void*) gu_, (void*) h16_,
-                    (void*) q16_, (void*) k16_, (void*) v16_, (void*) rows_})
+                    (void*) q16_, (void*) k16_, (void*) v16_})
         release(allocs_, p);
     x_ = q_ = k_ = v_ = a_ = h_ = gu_ = nullptr;
     h16_ = q16_ = k16_ = v16_ = nullptr;
-    rows_ = nullptr;
     cap_T_ = 0;
 }
 
@@ -308,13 +309,17 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
         dpos = alloc<int32_t>(allocs_, 3 * T);
         gpu::copy(dpos, pos3.data(), pos3.size() * 4);
     }
-    // the prompt's embedding rows, gathered from the mapped file, expanded on the GPU
-    std::vector<uint8_t> host((size_t) (T * (int64_t) embd_row_bytes_));
-    for (int64_t t = 0; t < T; ++t)
-        std::memcpy(&host[(size_t) t * embd_row_bytes_], embd_ + (uint64_t) ids[(size_t) t] * embd_row_bytes_,
-                    embd_row_bytes_);
-    gpu::copy(rows_, host.data(), host.size());
-    kernels::dequant_f32(embd_type_, rows_, 0, T, C_, x_, s_);
+    // the prompt's embedding rows, dequantized on the host out of the mapped file (the text models' one lookup,
+    // native_row_to_float: the table stays out of VRAM), then up to the GPU
+    std::vector<float> host((size_t) (T * C_));
+    for (int64_t t = 0; t < T; ++t) {
+        const int32_t id = ids[(size_t) t];
+        if (id < 0 || id >= embd_rows_ ||
+            !kernels::cpu::native_row_to_float(embd_type_, embd_ + (uint64_t) id * embd_row_bytes_,
+                                               host.data() + t * C_, C_))
+            throw std::invalid_argument("image engine (text): a token outside the vocabulary");
+    }
+    gpu::copy(x_, host.data(), host.size() * 4);
     for (const Image& im : images)   // the image pads' rows: the vision encoder's embeddings
         gpu::copy_async(x_ + im.index * C_, im.main, (size_t) (im.rows * C_) * 4, s_);
     const bool sdpa_causal = qi_sdpa_causal(s_);

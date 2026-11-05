@@ -6,9 +6,6 @@
 #include "strata/kernels/rope_scaling.hpp"
 
 namespace strata::kernels {
-void native_rope_set_enabled(bool enabled);
-bool native_rope_enabled();
-
 // Pinned CUDA text-only IMRoPE: F32 rows, 64 rotated channels (or the whole row: NeoX over every channel, llm-jp-4.1's,
 // without the IMRoPE and float64 angle tables, which are 64-wide), equal text positions in all four
 // IMRoPE sections. Each device position must be nonnegative. The position buffer remains live

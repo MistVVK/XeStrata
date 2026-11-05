@@ -920,26 +920,6 @@ void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const u
     });
 }
 
-void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
-                          int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
-                          uint64_t row_groups, float* out, void* stream) {
-    const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
-        const int t = (int) id[0];
-        const int64_t i = (int64_t) id[1];
-        const uint64_t token = (uint64_t) tokens[t];
-        const uint8_t* c = codes + token * row_codes;
-        const float* sc = scales + token * row_groups;
-        const float* of = offsets ? offsets + token * row_groups : nullptr;
-        const int per_byte = 8 / code_bits;
-        const unsigned mask = (1u << code_bits) - 1u;
-        const int code = (c[i / per_byte] >> ((i % per_byte) * code_bits)) & mask;
-        const int64_t group = i / group_elems;
-        const float product = (float) (code + code_bias) * sc[group];
-        out[(size_t) t * n + i] = product + (of ? of[group] : 0.0f);
-    });
-    done(stream, e, "embedding_gather_dev");
-}
-
 void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {
     const auto e = Q(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) (n_embd * hc)), [=](sycl::id<2> id) {
         const int t = (int) id[0];

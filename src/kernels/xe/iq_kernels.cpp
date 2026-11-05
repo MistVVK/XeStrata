@@ -2081,7 +2081,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 2: return (size_t) (n / 32) * sizeof(block_q4_0);
         case 3: return (size_t) (n / 32) * sizeof(block_q4_1);
         case 14: return (size_t) (n / 256) * sizeof(block_q6_K);
-        case 30: return (size_t) n * 2;   // BF16: the token embedding (iq_embed_rows, iq_dequant_f32), BF16 experts
+        case 30: return (size_t) n * 2;   // BF16: the token embedding (embed_rows, iq_dequant_f32), BF16 experts
         case 144: return (size_t) (n / 128) * sizeof(block_tq2_t);
         case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
         case 146: return (size_t) (n / 128) * sizeof(block_tqk7);
@@ -2251,18 +2251,42 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
     sync_if_needed(stream, launch_dequant_flat<float>(queue_for(stream), t, src, n, dst), "iq_dequant_f32");
 }
 
-void iq_embed_rows(int t, const void* table, size_t row_bytes, const int32_t* tokens, int64_t n_tok, int64_t n_embd,
-                   float* out, void* stream) {
+void embed_rows(const EmbedTable& tb, const int32_t* ids, int64_t token, int64_t n_tok, float* out, void* stream) {
     if (n_tok <= 0) return;
-    require(n_embd % 256 == 0 && embed_type_supported(t), "iq_embed_rows");
-    const auto* tab = (const uint8_t*) table;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<2>({(size_t) n_tok, (size_t) (n_embd / 256) * 32}, {1, 32}), [=](sycl::nd_item<2> it) {
-            const int64_t tok = (int64_t) it.get_group(0), b = (int64_t) it.get_group(1);
-            const uint8_t* row = tab + (size_t) tokens[tok] * row_bytes;
-            dq_dispatch(t, row, b, ToGlobal<float>{out + (size_t) tok * n_embd + b * QK_K}, (int) it.get_local_id(1));
+    const int64_t n = tb.n_embd;
+    const auto* tab = (const uint8_t*) tb.rows;
+    const size_t rb = tb.row_bytes;
+    sycl::event e;
+    if (tb.type == EmbedTable::kPacked) {
+        const int bits = tb.code_bits, bias = tb.code_bias, ge = tb.group_elems;
+        require((bits == 2 || bits == 4 || bits == 8) && ge > 0 && n % ge == 0 && n % (8 / bits) == 0, "embed_rows");
+        const float *scales = tb.scales, *offsets = tb.offsets;
+        const uint64_t row_groups = (uint64_t) (n / ge);
+        e = queue_for(stream).parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
+            const int64_t t = (int64_t) id[0], i = (int64_t) id[1];
+            const uint64_t row = (uint64_t) (ids ? (int64_t) ids[t] : token);
+            const uint8_t* c = tab + row * rb;
+            const float* sc = scales + row * row_groups;
+            const float* of = offsets ? offsets + row * row_groups : nullptr;
+            const int per_byte = 8 / bits;
+            const unsigned mask = (1u << bits) - 1u;
+            const int code = (int) ((c[i / per_byte] >> ((i % per_byte) * bits)) & mask);
+            const int64_t group = i / ge;
+            // the product and the sum round separately: this library is built without contraction
+            const float product = (float) (code + bias) * sc[group];
+            out[(size_t) t * n + i] = product + (of ? of[group] : 0.0f);
         });
-    sync_if_needed(stream, e, "iq_embed_rows");
+    } else {
+        require(n % 256 == 0 && embed_type_supported(tb.type), "embed_rows");
+        const int ty = tb.type;
+        e = queue_for(stream).parallel_for(
+            sycl::nd_range<2>({(size_t) n_tok, (size_t) (n / 256) * 32}, {1, 32}), [=](sycl::nd_item<2> it) {
+                const int64_t t = (int64_t) it.get_group(0), b = (int64_t) it.get_group(1);
+                const uint8_t* row = tab + (size_t) (ids ? (int64_t) ids[t] : token) * rb;
+                dq_dispatch(ty, row, b, ToGlobal<float>{out + (size_t) t * n + b * QK_K}, (int) it.get_local_id(1));
+            });
+    }
+    sync_if_needed(stream, e, "embed_rows");
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {

@@ -1,21 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV.
+// src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV (bf16_gemv_fp32_mmvf: BF16 weights, FP32
+// activations, the pinned CUDA single-token MMVF).
 //
-// THREE THINGS ARE CHECKED, and the third is the one the engine's correctness rests on:
+// TWO THINGS ARE CHECKED, and the second is the one the engine's correctness rests on:
 //
-//   1. both kernels against a host reference that reads the SAME bf16 bits - so what is under test is the
-//      reduction, not the conversion, and the tolerance is set by summation order and nothing else;
-//   2. the naive and the split kernel agree with each other, because the naive one is the reference the
-//      split one exists to be checked against and a disagreement there means one of them is wrong;
-//   3. **THE ACTIVATION CONTRACT IS OBSERVABLE.**  A BF16 weight sees a BF16 activation; feeding it fp16 or
-//      f32 instead is a 2^-9 = 1.95e-03 relative change, which is above any 1e-3 tolerance.  An fp16
-//      activation is the rival reading, computed and required to differ, because it is what the engine did
-//      before `docs/activation-contract.md` settled the question and it produces perfectly plausible output.
+//   1. the kernel against a host reference in double over the SAME bf16 weight bits and FP32 activations - so the
+//      tolerance is set by f32 products and summation order and nothing else;
+//   2. **THE ACTIVATION CONTRACT IS OBSERVABLE.**  The kernel reads the activation in FP32; a BF16-rounded
+//      activation is a 2^-9 = 1.95e-03 relative change, the rival reading (the engine's former contract), computed
+//      and required to differ, because it produces perfectly plausible output.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
-#include "strata/kernels/f16_bits.hpp"
 
 #include "parity_device.hpp"
 
@@ -40,14 +37,14 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
     return d / (m > 1e-30 ? m : 1e-30);
 }
 
-/// The host reference, in DOUBLE, over the same bf16 bits.
-void reference(const std::vector<uint16_t>& x, const std::vector<uint16_t>& w, long long n_in, long long n_out,
+/// The host reference, in DOUBLE, over the same bf16 weight bits and the given activations.
+void reference(const std::vector<float>& x, const std::vector<uint16_t>& w, long long n_in, long long n_out,
                std::vector<float>& y) {
     y.assign((size_t) n_out, 0.0f);
     for (long long o = 0; o < n_out; ++o) {
         double acc = 0;
         for (long long i = 0; i < n_in; ++i)
-            acc += (double) f32_from_bf16(x[(size_t) i]) * (double) f32_from_bf16(w[(size_t) (o * n_in + i)]);
+            acc += (double) x[(size_t) i] * (double) f32_from_bf16(w[(size_t) (o * n_in + i)]);
         y[(size_t) o] = (float) acc;
     }
 }
@@ -80,55 +77,39 @@ int main(int argc, char** argv) {
         // a realistic weight scale: these are projections, not embeddings
         for (auto& v : fw) v = g(rng) * 0.05f;
 
-        // THE ACTIVATION IS ROUNDED TO BF16 FIRST, which is the contract, and the WEIGHT is already bf16 in
-        // the pack - the loaded bytes ARE the high 16 bits of an f32.
-        std::vector<uint16_t> x((size_t) s.n_in), w((size_t) (s.n_in * s.n_out));
-        for (size_t i = 0; i < fx.size(); ++i) x[i] = bf16_from_f32(fx[i]);
+        // THE WEIGHT is already bf16 in the pack - the loaded bytes ARE the high 16 bits of an f32; the activation
+        // stays f32.
+        std::vector<uint16_t> w((size_t) (s.n_in * s.n_out));
         for (size_t i = 0; i < fw.size(); ++i) w[i] = bf16_from_f32(fw[i]);
 
         std::vector<float> want;
-        reference(x, w, s.n_in, s.n_out, want);
+        reference(fx, w, s.n_in, s.n_out, want);
 
         strata::parity::Device dev;
-        uint16_t* d_x = dev.upload(x);
+        float* d_x = dev.upload(fx);
         uint16_t* d_w = dev.upload(w);
         float* d_y = dev.alloc<float>((size_t) s.n_out);
 
-        std::vector<float> naive((size_t) s.n_out), warp((size_t) s.n_out), split((size_t) s.n_out);
-        strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-        strata::parity::copy_out(naive.data(), d_y, naive.size());
-        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 32, nullptr);
-        strata::parity::copy_out(warp.data(), d_y, warp.size());
-        strata::kernels::bf16_gemv_split(d_x, d_w, d_y, s.n_in, s.n_out, 256, nullptr);
-        strata::parity::copy_out(split.data(), d_y, split.size());
+        std::vector<float> got((size_t) s.n_out);
+        strata::kernels::bf16_gemv_fp32_mmvf(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
+        strata::parity::copy_out(got.data(), d_y, got.size());
 
-        const double rn = rel_l1(want, naive), rw = rel_l1(want, warp), rs = rel_l1(want, split);
-        std::printf("  %-34s naive %.2e  warp %.2e  split256 %.2e\n", s.what, rn, rw, rs);
-        // The products are EXACT - both sides are bf16-valued, so f32 represents each product exactly - and
-        // the only difference is the order the 2560 terms are added.  A tight bound is therefore meaningful.
-        if (!(rn <= 1e-5 && rw <= 1e-5 && rs <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++bad; }
+        const double r = rel_l1(want, got);
+        std::printf("  %-34s mmvf %.2e\n", s.what, r);
+        // f32 products of an f32 activation and a bf16 weight, summed in f32 over n_in terms: a tight bound
+        if (!(r <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++bad; }
 
-        // ---- 3. THE ACTIVATION CONTRACT.  The rival: an fp16 activation instead of bf16, which is what the
-        // engine did before the contract was settled.  It must be observable, or check 1 above would pass
-        // against either and the contract would be untested.
+        // ---- 2. THE ACTIVATION CONTRACT.  The rival: the activation rounded to bf16 first.  It must be observable,
+        // or check 1 above would pass against either and the contract would be untested.
         {
-            std::vector<float> fp16_as_f32((size_t) s.n_in);
-            std::vector<uint16_t> x16((size_t) s.n_in);
-            for (size_t i = 0; i < fx.size(); ++i) {
-                x16[i] = strata::kernels::f16_from_f32(fx[i]);
-                fp16_as_f32[i] = strata::kernels::f32_from_f16(x16[i]);
-            }
-            // Round the fp16 value to bf16 - i.e. give the kernel a bf16 activation whose VALUES came through
-            // fp16.  That is the whole difference between the two contracts at this call site.
-            for (size_t i = 0; i < fp16_as_f32.size(); ++i) x[i] = bf16_from_f32(fp16_as_f32[i]);
-            strata::parity::copy_in(d_x, x.data(), x.size());
-            std::vector<float> rival((size_t) s.n_out);
-            strata::kernels::bf16_gemv(d_x, d_w, d_y, s.n_in, s.n_out, nullptr);
-            strata::parity::copy_out(rival.data(), d_y, rival.size());
-            const double r = rel_l1(want, rival);
-            const bool visible = r > 1e-4;
-            std::printf("      %-30s %s (%.4f%% apart)\n", "bf16 vs fp16 activation",
-                        visible ? "yes" : "*** NO ***", r * 100);
+            std::vector<float> xb((size_t) s.n_in);
+            for (size_t i = 0; i < fx.size(); ++i) xb[i] = f32_from_bf16(bf16_from_f32(fx[i]));
+            std::vector<float> rival;
+            reference(xb, w, s.n_in, s.n_out, rival);
+            const double rv = rel_l1(rival, got);
+            const bool visible = rv > 1e-4;
+            std::printf("      %-30s %s (%.4f%% apart)\n", "fp32 vs bf16 activation",
+                        visible ? "yes" : "*** NO ***", rv * 100);
             if (!visible) ++bad;
         }
     }

@@ -28,7 +28,7 @@
 //   - the TABLE path (the default decode path, the indexer's pooled key) never changes its kernels:
 //     scaling is baked into the cos/sin contents by `build_rope_table`, which the parity test checks
 //     bit-exactly against a float64 reference;
-//   - the ANALYTIC paths (`--native-rope`, the native indexer, prefill) get the resolved constants
+//   - the ANALYTIC paths (`native_rope_apply`, the native indexer, prefill) get the resolved constants
 //     as kernel arguments.
 //
 // **PROCESS CONSTANTS, SET ONCE BEFORE CAPTURE.**  A captured graph bakes kernel ARGUMENTS at capture

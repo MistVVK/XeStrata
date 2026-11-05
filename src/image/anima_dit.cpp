@@ -13,6 +13,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 
@@ -907,8 +908,10 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
     {
         const SafeTensor& e = file_->get("llm_adapter.embed.weight");
         const uint8_t* base = file_->raw(e);
-        const int kind = e.dtype == "BF16" ? 0 : e.dtype == "F16" ? 1 : e.dtype == "F32" ? 2 : -1;
-        if (kind < 0) throw std::runtime_error("image engine (Anima DiT): the adapter's embedding is " + e.dtype);
+        // the one host lookup of the text models (native_row_to_float), by the safetensors dtype's ggml type
+        const int type = e.dtype == "BF16" ? 30 : e.dtype == "F16" ? 1 : e.dtype == "F32" ? 0 : -1;
+        const size_t row_bytes = type < 0 ? 0 : kernels::cpu::native_row_bytes(type, C);
+        if (row_bytes == 0) throw std::runtime_error("image engine (Anima DiT): the adapter's embedding is " + e.dtype);
         std::vector<float> rowsf((size_t) (LT * C)), w((size_t) LT), st((size_t) (LQ * src_dim_));
         int64_t t = 0, r = 0;
         for (const AdapterIn& a : in) {
@@ -917,17 +920,8 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
                 if (id < 0 || id >= vocab_)
                     throw std::invalid_argument("image engine (Anima): a T5 id outside the vocabulary");
                 w[(size_t) t] = (*a.t5w)[i];
-                float* dst = rowsf.data() + t * C;
-                if (kind == 2) {
-                    std::memcpy(dst, base + id * C * 4, (size_t) C * 4);
-                    continue;
-                }
-                const uint8_t* row = base + id * C * 2;
-                for (int64_t ch = 0; ch < C; ++ch) {
-                    uint16_t bits;
-                    std::memcpy(&bits, row + ch * 2, 2);
-                    dst[ch] = kind == 0 ? bf16_value(bits) : kernels::f32_from_f16(bits);
-                }
+                if (!kernels::cpu::native_row_to_float(type, base + (size_t) id * row_bytes, rowsf.data() + t * C, C))
+                    throw std::runtime_error("image engine (Anima DiT): the adapter's embedding row could not be read");
             }
             std::memcpy(st.data() + r * src_dim_, a.states, (size_t) (a.rows * src_dim_) * 4);
             r += a.rows;

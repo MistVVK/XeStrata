@@ -17,7 +17,6 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa_indexer
 #include "strata/kernels/device_arch_tag.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +26,6 @@
 namespace strata::kernels {
 namespace {
 
-std::atomic<bool> enabled{false};
 constexpr int D = 128, R = 4, ROT = 64, THREADS = 256, WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {
@@ -125,9 +123,6 @@ inline void append_cells(const sycl::nd_item<1>& it, float* values, float* parti
 }
 
 }  // namespace
-
-void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_qsa_indexer_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device, int pos_stride, int n_steps,
                                      int32_t pos_base, const float* gamma, float epsilon, const QsaIndexerBuffers& b,

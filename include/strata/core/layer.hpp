@@ -39,6 +39,7 @@
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/gr.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
@@ -53,10 +54,6 @@
 
 namespace strata::core {
 
-/// Select pinned CUDA BF16/F32 projections for SSM gates, routing and the sparse indexer.
-/// Configure before session capture; captured graphs retain the selected implementation.
-/// Does not change GR, PLE or the shared expert's scalar gate.
-void layer_set_native_bf16(bool enabled);
 // Diagnostic vector-attention adapter; configure before capture, context <=256.
 void layer_set_native_flash_attn_short(bool enabled);
 
@@ -68,7 +65,6 @@ struct GdnBuffers {
     // `attn_qkv` alone is IQ4_XS on 13 layers, Q3_K on 18, Q4_K on 4 and S2 on 1.
     uint8_t* x_q8k = nullptr;      ///< n_embd, block_q8_K
     uint8_t* x_q8_0 = nullptr;     ///< n_embd, block_q8_0
-    uint16_t* x_bf16 = nullptr;    ///< n_embd, bf16 bits
 
     // the qkv path
     float* qkv = nullptr;          ///< conv_channels
@@ -111,7 +107,6 @@ struct Doorbell;   // defined with the rest of the handoff, below; only a pointe
 
 /// Buffers for the MoE block, on EVERY layer.
 struct MoEBuffers {
-    uint16_t* x_bf16 = nullptr;   ///< n_embd, for the ROUTER's weight, which is BF16
     uint16_t* x_f16 = nullptr;    ///< n_embd, for the SHARED EXPERT's weights (see the note in `moe_layer`)
     float* logits = nullptr;      ///< n_expert
     int* ids = nullptr;           ///< k
@@ -359,7 +354,6 @@ void stage_mark_end(int64_t layer, int slot, void* stream);
 struct QsaBuffers {
     uint8_t* x_q8_0 = nullptr;     ///< n_embd, block_q8_0 - `attn_q` is Q2_0, whose vec_dot_type is Q8_0
     uint8_t* x_q8k = nullptr;      ///< n_embd, block_q8_K - the three K-quant projections
-    uint16_t* x_bf16 = nullptr;    ///< n_embd - the two BF16 indexer projections
     float* q_full = nullptr;       ///< n_head * 2 * head_dim: the raw `attn_q` output, q | gate per head
     float* qcur = nullptr;         ///< n_head * head_dim: the FIRST half of each head, contiguously
     float* kcur = nullptr;         ///< n_head_kv * head_dim
@@ -371,7 +365,6 @@ struct QsaBuffers {
     uint16_t* k_scratch = nullptr; ///< cap * n_head_kv * head_dim
     uint16_t* v_scratch = nullptr;
     float* attn = nullptr;         ///< n_head * head_dim
-    uint16_t* attn16 = nullptr;    ///< n_head * head_dim, for a fp16-activation consumer
     /// `attn * sigmoid(gate)` in f32 and then in Q8_K - what `attn_output` ACTUALLY wants.  Its weights are
     /// Q4_K/Q5_K/Q6_K, whose `vec_dot_type` is Q8_K, and the fp16 path is worth 0.66-1.41% against the
     /// reference.  `docs/activation-contract.md`.
@@ -491,11 +484,8 @@ void layer_set_fast_attn(bool enabled);
 void layer_set_publish_kernel(bool enabled);
 /// Plan v0.3 P3: GDN step + output norm as one coalesced kernel under the native contract (default ON).
 void layer_set_fused_gdn(bool enabled);
-/// Plan v0.3 P7: QSA block scores in FP32 and a radix top-k over blocks (default ON; `false` = the FP64 row scores
-/// and the bit-serial cell top-k).  Set before capture.
-void layer_set_fast_select(bool enabled);
 /// Plan v0.3 P6: whether the current decode configuration is the one the speculative verify window reproduces
-/// bit for bit (native projections, fused GR and GDN, split-K attention, block selection, native indexer).
+/// bit for bit (fused GR and GDN, split-K attention).
 bool layer_verify_compatible(std::string& why);
 uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b);
 
@@ -511,8 +501,16 @@ uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b)
 /// the value is `(code + code_bias) * scales[i / group_elems] + offsets[i / group_elems]`; and the column's
 /// planes start at `token * n_in / PER_BYTE` and `token * n_in / group_elems`.  A second decoder that drifts
 /// from the kernel's would make the prompt embed differently from the tokens generated after it.
-bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev, void* stream,
-               std::string& err);
+///
+/// `embed_table` is the table every Qwen3.8 path gathers from (kernels::embed_rows, the one gather): the GGUF-form
+/// table when one is set (`native_embed`), else the packed planes of `token_embd.weight`, checked against the loaded
+/// shape; false with `err` when neither can be read.
+bool embed_table(const WeightTable& tables, const ModelGeometry& g, void* stream, strata::kernels::EmbedTable& table,
+                 std::string& err);
+/// The rows of `n_tok` tokens into `out_dev` through `embed_table`: `ids` in device memory, or with `ids` null the
+/// one `token` from the host, checked against the vocabulary.
+bool embed_rows(const WeightTable& tables, const ModelGeometry& g, const int32_t* ids, int64_t token, int64_t n_tok,
+                float* out_dev, void* stream, std::string& err);
 
 /// `ref/model.py` L520: `fin = GR.gr_read(R, output_hc_*..., inject=None, rms_eps); logits = output @ fin`.
 ///

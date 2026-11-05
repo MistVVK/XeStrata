@@ -27,8 +27,9 @@ inline constexpr int KV_Q8_GROUP = 64;
 /// The K/V cache's one append (Qwen3.8-Flash-Next's prompt and decode, the plain models'): n_tok cells, cell t at
 /// step[t * step_stride + kStepPos] (graph-capturable) or, without `step`, at pos0 + t; its K and V at k / v +
 /// t * cur_stride floats [n_kv][head_dim].  FP16 pools (k_pool, v_pool) or INT8 ones (k_q.. with an FP16 scale per
-/// 64 values: scale = fp16(max|x| / 127), code = clamp(rint(x / scale), -127, 127)); with k_q == v_q and k == v
-/// (K8V4's folded halves) one plane.  A page of -1 (KV streaming: not resident) is not written in VRAM; `host` (the
+/// 64 values: scale = fp16(max|x| / 127), code = clamp(rint(x / scale), -127, 127)) or Q4_0 ones (k_q4, v_q4: a
+/// block_q4_0 per 32 values, kv_q4.hpp; head_dim 256); with k_q == v_q (k_q4 == v_q4) and k == v (K8V4's folded
+/// halves) one plane.  A page of -1 (KV streaming: not resident) is not written in VRAM; `host` (the
 /// streaming's host copy) and `stage` (its staging pool) get every cell, at the cell's own row.
 struct KvAppend {
     const int32_t* step = nullptr;
@@ -44,6 +45,8 @@ struct KvAppend {
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
+    uint8_t* k_q4 = nullptr;
+    uint8_t* v_q4 = nullptr;
     const int32_t* page_table = nullptr;
     const KvHostPools* host = nullptr;
     const KvHostPools* stage = nullptr;

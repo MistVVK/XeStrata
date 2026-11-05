@@ -13,7 +13,6 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_gdn
 #include "strata/kernels/device_arch_tag.hpp"
 
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -22,7 +21,6 @@
 namespace strata::kernels {
 namespace {
 
-std::atomic<bool> enabled{false};
 constexpr int S = 128;
 constexpr int WARP = 32;
 constexpr int COLS = 4;   // columns (sub-groups) per work-group
@@ -42,9 +40,6 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 
 }  // namespace
-
-void native_gdn_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_gdn_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_gdn_step(float* state, const float* q, const float* k, const float* v,
                      const float* gate, const float* beta, float* output,

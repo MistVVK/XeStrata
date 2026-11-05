@@ -88,10 +88,6 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);
 
-/// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
-void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
-                          int n_tok, int64_t n, int code_bits, int code_bias, int group_elems, uint64_t row_codes,
-                          uint64_t row_groups, float* out, void* stream);
 /// R[t][c][:] = x[t][:] for the hc streams.
 void broadcast_streams(const float* x, float* R, int64_t n_embd, int hc, int n_tok, void* stream);
 /// dst[:n] = src[(*index) * stride + :n]  (index read from device memory; a negative index copies nothing).

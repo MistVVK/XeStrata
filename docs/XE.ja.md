@@ -514,7 +514,7 @@ parity のテストは、埋め込みとスケールの小さな記録と再生�
 
 ### 要素ごとの計算
 
-Xe のライブラリは、`embedding_gather`、`gdn_gate`、`scale_inplace`、`f32_to_f16_bulk`、`silu_inplace`、`rms_norm_weighted` を提供します。
+Xe のライブラリは、埋め込みの行の取り出し `embed_rows`（`iq_kernels.hpp`）、`scale_inplace`、`f32_to_f16_bulk` を提供します。
 `elementwise.hpp` のほかの宣言は移植しておらず、ライブラリにはありません。
 これらのカーネルと parity の参照は、高速な数学関数と積和の融合（contraction）を切ってコンパイルします。
 

@@ -16,6 +16,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -559,8 +560,7 @@ inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) { 
 // x[t] += gate * h[t] (per channel; gate null: 1)
 inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     if (T <= 0) return;
-    q_of(s).parallel_for(sycl::range<2>((size_t) T, (size_t) C), [=](sycl::id<2> id) {
-        const auto t = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+    kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
         x[t * C + c] += (gate != nullptr ? gate[c] : 1.f) * h.at(t, c);
     });
 }

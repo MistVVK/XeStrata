@@ -16,10 +16,9 @@
 //      obvious slip, and both are monotone saturating functions so the magnitudes stay comparable.
 //   4. `mean` over the stream axis, not `sum`.  A factor of hc = 4, which is exactly the kind of error that
 //      looks like a scale problem rather than a structural one.
-//   5. ACTIVATION PRECISION. The historical BF16-rounded CPU contract and the pinned CUDA single-token
-//      FP32-activation contract must be distinguishable. Both are tested against explicit references;
-//      neither is selected merely because the weight is BF16. The scalar fixture isolates xn and lo
-//      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
+//   5. ACTIVATION PRECISION. The kernel's contract is the pinned CUDA single-token FP32-activation one, and the
+//      BF16-rounded rival must be distinguishable from it. The scalar fixture isolates xn and lo rounding from
+//      reduction order, and graph replay must reproduce the direct call.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
 #include "strata/kernels/gr.hpp"
@@ -66,7 +65,7 @@ struct Opts {
     bool scale_inside_silu = true; ///< false: silu(proj)/hc instead of silu(proj/hc) (WRONG)
     bool sigmoid_on_gate = true;   ///< false: silu on the gate and sigmoid on lo (WRONG)
     bool mean_over_streams = true; ///< false: sum over streams instead of mean (WRONG)
-    bool round_activation = true;  ///< false: pinned CUDA single-token BF16 MMVF contract
+    bool round_activation = false; ///< true: BF16-rounded activations instead of the MMVF's FP32 ones (WRONG)
 };
 
 /// `ref/gr.py::gr_read`, transcribed with switches for the rival readings.
@@ -158,18 +157,10 @@ double rel_terms(double want, double got, double term_a, double term_b) {
     return std::fabs(want - got) / (den > 1e-30 ? den : 1e-30);
 }
 
-const char* activation_mode_name(int mode) {
-    return mode == 2 ? "native pinned GR" : (mode == 1 ? "FP32" : "BF16");
-}
-void select_activation_mode(int mode) {
-    strata::kernels::gr_set_native_mmvf(mode == 2);
-    // In mode 2 the precision-only switch is deliberately false: native MMVF must imply FP32 by itself.
-    strata::kernels::gr_set_fp32_activations(mode == 1);
-}
-
 // A diagonal GR fixture makes activation precision observable without summation-order ambiguity.
 // Two-wide matrices satisfy native MMVF's pair ABI, while each nonzero dot has only one nonzero product.
-// At R=1 and eps=0, xn=gamma exactly; any rounding in xn or lo comes from the selected activation contract.
+// At R=1 and eps=0, xn=gamma exactly; any rounding in xn or lo would come from the activation contract, which is
+// FP32 (the pinned CUDA single-token MMVF): a BF16-rounded activation is the rival reading.
 int scalar_activation_contract() {
     using namespace strata::kernels;
     const GrShapes sh{2, 1, 2};
@@ -196,75 +187,62 @@ int scalar_activation_contract() {
     auto& cq = strata::core::Runtime::get().compute();
     void* stream = &cq;
     int bad = 0;
+    // the scalar formulas, with the activations rounded to BF16 (the rival) or not (the contract)
+    auto expected = [](float gamma, bool round, float& mixed, float& inject) {
+        const float activation = round ? to_bf16(gamma) : gamma;
+        const float projection = activation * 0.5f;
+        const float lo = projection / (1.0f + std::exp(-projection));
+        const float gate = (round ? to_bf16(lo) : lo) * 1.5f;
+        mixed = gamma / (1.0f + std::exp(-gate));
+        inject = activation * 2.0f;
+    };
     for (float gamma : {1.0f, 1.00390625f}) {
         const float gammas[] = {gamma, gamma};
         strata::parity::copy_bytes_in(d_norm, gammas, sizeof(gammas));
-        float mixed_by_mode[3][2] = {}, inject_by_mode[3] = {};
-        for (int mode = 0; mode < 3; ++mode) {
-            select_activation_mode(mode);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
-                    sh, ws, d_mixed, d_inject, stream);
-            strata::parity::sync();
-            sx::command_graph graph(cq.get_context(), cq.get_device());
-            graph.begin_recording(cq);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
-                    sh, ws, d_mixed, d_inject, stream);
-            graph.end_recording(cq);
-            auto executable = graph.finalize();
-            // Changing both host options after capture cannot change the graph's selected kernels.
-            select_activation_mode((mode + 1) % 3);
-            // Warmup results must not make a missing/no-op captured launch pass.
-            // Poison the outputs and intermediate workspace before replay.
-            cq.memset(d_mixed, 0xa5, 2 * sizeof(float));
-            cq.memset(d_inject, 0xa5, sizeof(float));
-            cq.memset(d_scratch, 0xa5, ws.bytes);
-            cq.ext_oneapi_graph(executable);
-            strata::parity::sync();
-            strata::parity::copy_bytes_out(mixed_by_mode[mode], d_mixed, 2 * sizeof(float));
-            strata::parity::copy_bytes_out(&inject_by_mode[mode], d_inject, sizeof(float));
-            const float activation = mode ? gamma : to_bf16(gamma);
-            const float projection = activation * 0.5f;
-            const float lo = projection / (1.0f + std::exp(-projection));
-            const float gate = (mode ? lo : to_bf16(lo)) * 1.5f;
-            const float expected_mixed = gamma / (1.0f + std::exp(-gate));
-            const float expected_inject = activation * 2.0f;
-            // Each mode has its own activation contract and bounded scalar-formula
-            // check. Native fast exp/div need not match ordinary FP32 postops bit
-            // for bit: native_gr_postops_parity establishes that arithmetic with
-            // actual pinned CUDA graphs. The nonzero projection/injection here
-            // has only one exactly representable product and remains exact.
-            const bool ok = std::fabs(mixed_by_mode[mode][0] - expected_mixed) <= 2e-7f &&
-                            mixed_by_mode[mode][0] == mixed_by_mode[mode][1] &&
-                            inject_by_mode[mode] == expected_inject;
-            std::printf("  scalar gamma %.8f %s activation/capture %s (mixed %.9f, ref %.9f)\n",
-                        gamma, activation_mode_name(mode), ok ? "pass" : "FAIL",
-                        mixed_by_mode[mode][0], expected_mixed);
-            if (!ok) ++bad;
-
-            const float sentinel = -73.25f;
-            strata::parity::copy_bytes_in(d_inject, &sentinel, sizeof(float));
-            select_activation_mode(mode);
-            gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f,
-                    sh, ws, d_mixed, d_inject, stream);
-            strata::parity::sync();
-            float final_mixed[2] = {}, untouched = 0.0f;
-            strata::parity::copy_bytes_out(final_mixed, d_mixed, sizeof(final_mixed));
-            strata::parity::copy_bytes_out(&untouched, d_inject, sizeof(float));
-            const bool final_ok = std::memcmp(final_mixed, mixed_by_mode[mode], sizeof(final_mixed)) == 0 && untouched == sentinel;
-            std::printf("  scalar final mixer %s %s\n", activation_mode_name(mode), final_ok ? "pass" : "FAIL");
-            if (!final_ok) ++bad;
-        }
-        if (std::fabs(mixed_by_mode[1][0] - mixed_by_mode[0][0]) <= 1e-5f ||
-            (gamma != 1.0f && inject_by_mode[0] == inject_by_mode[1])) {
+        float got_mixed[2] = {}, got_inject = 0.0f;
+        gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, stream);
+        strata::parity::sync();
+        sx::command_graph graph(cq.get_context(), cq.get_device());
+        graph.begin_recording(cq);
+        gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, stream);
+        graph.end_recording(cq);
+        auto executable = graph.finalize();
+        // Warmup results must not make a missing/no-op captured launch pass.
+        // Poison the outputs and intermediate workspace before replay.
+        cq.memset(d_mixed, 0xa5, 2 * sizeof(float));
+        cq.memset(d_inject, 0xa5, sizeof(float));
+        cq.memset(d_scratch, 0xa5, ws.bytes);
+        cq.ext_oneapi_graph(executable);
+        strata::parity::sync();
+        strata::parity::copy_bytes_out(got_mixed, d_mixed, 2 * sizeof(float));
+        strata::parity::copy_bytes_out(&got_inject, d_inject, sizeof(float));
+        float expected_mixed = 0.0f, expected_inject = 0.0f, rival_mixed = 0.0f, rival_inject = 0.0f;
+        expected(gamma, false, expected_mixed, expected_inject);
+        expected(gamma, true, rival_mixed, rival_inject);
+        // A bounded scalar-formula check: the native fast exp/div need not match ordinary FP32 postops bit for
+        // bit.  The nonzero projection/injection here has only one exactly representable product and remains exact.
+        const bool ok = std::fabs(got_mixed[0] - expected_mixed) <= 2e-7f && got_mixed[0] == got_mixed[1] &&
+                        got_inject == expected_inject;
+        std::printf("  scalar gamma %.8f activation/capture %s (mixed %.9f, ref %.9f)\n", gamma, ok ? "pass" : "FAIL",
+                    got_mixed[0], expected_mixed);
+        if (!ok) ++bad;
+        if (gamma != 1.0f && (std::fabs(rival_mixed - expected_mixed) <= 1e-5f || rival_inject == expected_inject)) {
             std::printf("  scalar precision fixture is not observable\n");
             ++bad;
         }
-        if (inject_by_mode[1] != inject_by_mode[2]) {
-            std::printf("  native MMVF changed the exact scalar FP32 injection projection\n");
-            ++bad;
-        }
+
+        const float sentinel = -73.25f;
+        strata::parity::copy_bytes_in(d_inject, &sentinel, sizeof(float));
+        gr_read(d_R, d_norm, d_weights, d_weights + 4, nullptr, 0.0f, sh, ws, d_mixed, d_inject, stream);
+        strata::parity::sync();
+        float final_mixed[2] = {}, untouched = 0.0f;
+        strata::parity::copy_bytes_out(final_mixed, d_mixed, sizeof(final_mixed));
+        strata::parity::copy_bytes_out(&untouched, d_inject, sizeof(float));
+        const bool final_ok = std::fabs(final_mixed[0] - expected_mixed) <= 2e-7f && final_mixed[0] == final_mixed[1] &&
+                              untouched == sentinel;
+        std::printf("  scalar final mixer %s\n", final_ok ? "pass" : "FAIL");
+        if (!final_ok) ++bad;
     }
-    select_activation_mode(0);
     return bad;
 }
 
@@ -490,11 +468,11 @@ int main(int argc, char** argv) try {
 
     struct Trap { const char* name; Opts o; double floor; };
     const Trap traps[] = {
-        {"per-stream RMSNorm vs whole-stack", {false, true, true, true, true}, 0.05},
-        {"/hc inside the silu vs outside", {true, false, true, true, true}, 0.05},
-        {"SiLU on lo / sigmoid on gate, swapped", {true, true, false, true, true}, 0.05},
-        {"mean over streams vs sum", {true, true, true, false, true}, 0.50},
-        {"BF16 vs FP32 activation contracts", {true, true, true, true, false}, 1e-4},
+        {"per-stream RMSNorm vs whole-stack", {false, true, true, true, false}, 0.05},
+        {"/hc inside the silu vs outside", {true, false, true, true, false}, 0.05},
+        {"SiLU on lo / sigmoid on gate, swapped", {true, true, false, true, false}, 0.05},
+        {"mean over streams vs sum", {true, true, true, false, false}, 0.50},
+        {"FP32 vs BF16 activation contracts", {true, true, true, true, true}, 1e-4},
     };
     for (const Trap& t : traps) {
         std::vector<float> m, i;
@@ -514,9 +492,9 @@ int main(int argc, char** argv) try {
     const double rel_mixed = rel_diff(want_mixed, got_mixed, &mag);
     std::printf("\n  %-40s worst %.3e (mean |ref| %.4f)\n", "mixed vs reference", rel_mixed, mag);
 
-    // The tolerance is set by SUMMATION ORDER, not by the structure: both sides round the activation to bf16
-    // and both weights are bf16-valued, so every product is exact in f32 and only the order differs.  A
-    // structural error is several orders of magnitude larger - the trap floors above say so.
+    // The tolerance is set by SUMMATION ORDER and f32 products, not by the structure: the weights are bf16-valued
+    // and the activations f32 on both sides.  A structural error is several orders of magnitude larger - the trap
+    // floors above say so.
     if (!(rel_mixed <= 1e-4)) {
         std::printf("    *** over 1e-4, which summation order does not explain - look for a structural bug ***\n");
         ++bad;
@@ -533,32 +511,6 @@ int main(int argc, char** argv) try {
         for (long long c = 0; c < hc; ++c) std::printf(" %12.6f", (double) got_inject[(size_t) c]);
         std::printf("\n");
         ++bad;
-    }
-
-    // Same geometry and weights with the CUDA single-token activation contract.  The scalar fixture
-    // below is the independent precision check; this case exercises multi-stream reductions and indexing.
-    {
-        Opts fp32;
-        fp32.round_activation = false;
-        std::vector<float> wm, wi, gm((size_t) n_embd), gi((size_t) hc);
-        reference(R, w_norm, w_down, w_up, w_inject, eps, n_embd, hc, hc_lr, fp32, wm, wi);
-        strata::kernels::gr_set_fp32_activations(true);
-        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        strata::parity::copy_bytes_out(gm.data(), d_mixed, gm.size() * sizeof(float));
-        strata::parity::copy_bytes_out(gi.data(), d_inject, gi.size() * sizeof(float));
-        strata::kernels::gr_set_fp32_activations(false);
-        const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
-        const bool ok = rm <= 1e-4 && ri <= 1e-4;
-        std::printf("  FP32 activations vs reference: %s (mixed %.3e, inject %.3e)\n",
-                    ok ? "pass" : "FAIL", rm, ri);
-        if (!ok) ++bad;
-        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        strata::parity::copy_bytes_out(gm.data(), d_mixed, gm.size() * sizeof(float));
-        strata::parity::copy_bytes_out(gi.data(), d_inject, gi.size() * sizeof(float));
-        const bool restored = std::memcmp(gm.data(), got_mixed.data(), gm.size() * sizeof(float)) == 0 &&
-                              std::memcmp(gi.data(), got_inject.data(), gi.size() * sizeof(float)) == 0;
-        std::printf("  restoring default activation contract: %s\n", restored ? "byte-identical" : "FAIL");
-        if (!restored) ++bad;
     }
 
     // ---- THE WEIGHT ORIENTATION MUST BE OBSERVABLE.  The kernel now takes both matrices exactly as the
@@ -675,7 +627,7 @@ int main(int argc, char** argv) try {
                 streams_ok ? "yes" : "*** NO ***", worst_stream);
     if (!streams_ok) ++bad;
 
-    // ---- THE REAL DIMENSIONS. Exercise all activation/projection variants at n_embd=2560, hc=4, hc_lr=320.
+    // ---- THE REAL DIMENSIONS: n_embd=2560, hc=4, hc_lr=320.
     // Workspace sizing and every full weight row must agree with the model geometry.
     {
         const long long rn = 2560, rhc = 4, rlr = 320, rdim = rhc * rn;
@@ -721,25 +673,20 @@ int main(int argc, char** argv) try {
         rws_raw = static_cast<decltype(rws_raw)>(strata::parity::alloc_bytes(strata::kernels::gr_workspace_bytes(rsh)));
         strata::kernels::GrWorkspace rws;
         strata::kernels::gr_workspace_init(rsh, rws_raw, rws);
-        for (int mode = 0; mode < 3; ++mode) {
-            select_activation_mode(mode);
+        {
             strata::kernels::gr_read(dR, dN, dD, dU, dJ, eps, rsh, rws, dM, dI, nullptr);
             std::vector<float> gm((size_t) rn), gi((size_t) rhc);
             strata::parity::copy_bytes_out(gm.data(), dM, gm.size() * 4);
             strata::parity::copy_bytes_out(gi.data(), dI, gi.size() * 4);
 
-            Opts precision;
-            precision.round_activation = mode == 0;
             std::vector<float> wm, wi;
-            reference(rR, rnorm, rdown, rup, rinj, eps, rn, rhc, rlr, precision, wm, wi);
+            reference(rR, rnorm, rdown, rup, rinj, eps, rn, rhc, rlr, Opts{}, wm, wi);
             const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
             const bool ok = rm <= 1e-4 && ri <= 1e-4;
-            std::printf("\n  real dims 2560/4/320 %s %s (mixed %.3e, inject %.3e)\n",
-                        activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
+            std::printf("\n  real dims 2560/4/320 %s (mixed %.3e, inject %.3e)\n", ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }
         bad += fused_multi_lds_parity(dN, dD, dU, dJ, eps);
-        select_activation_mode(0);
         }
 
     bad += scalar_activation_contract();

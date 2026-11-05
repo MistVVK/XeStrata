@@ -17,7 +17,6 @@
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +31,6 @@ template <int BlockSize, int Threads> class NormKernelV;
 
 namespace {
 
-std::atomic<bool> enabled{false};
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float value) {
@@ -197,9 +195,6 @@ void rms_norm_rows(const float* input, const float* gamma, int groups, float* ou
     launch_norm(q, input, gamma, output, n_cols, n_rows, epsilon, groups, nullptr, out16, pinned);
     if (!stream) core::Runtime::get().finish(q);
 }
-
-void native_qsa_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_qsa_enabled() { return enabled.load(std::memory_order_relaxed); }
 
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream) {

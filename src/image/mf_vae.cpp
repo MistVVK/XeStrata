@@ -13,6 +13,7 @@
 #include "strata/kernels/elementwise.hpp"
 
 #if STRATA_ONEDNN || STRATA_CUDNN
+#include "dit_rows.hpp"
 #include "qi_conv.hpp"
 #endif
 
@@ -288,12 +289,12 @@ void scale16(const float* x, const float* ca, int64_t HW, int64_t C, uint16_t* y
     });
 }
 
-// x += gate * u (per channel)
+// x += gate * u (per channel): dit_rows' gate_add
 void gate_add(float* x, const float* u, const float* gate, int64_t HW, int64_t C, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        x[i] += gate[i % C] * u[i];
-    });
+    MfOut h;
+    h.f = u;
+    h.C = C;
+    dit_rows::gate_add(x, h, gate, HW, C, s);
 }
 
 // The per-pixel MLP of patches p0 .. p0 + np: pixel j of patch p takes the 32 values yx[p][c * 256 + j] (with the

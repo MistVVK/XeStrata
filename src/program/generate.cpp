@@ -6,8 +6,8 @@
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
 // component; this is the thing that composes them into a token:
 //
-//     embed_row(token)  ->  48 captured layer graphs (the CPU expert pool behind the doorbell)  ->
-//     lm_head(R)        ->  sample        ->  embed_row(next)  ->  ...
+//     embed_rows(token)  ->  48 captured layer graphs (the CPU expert pool behind the doorbell)  ->
+//     lm_head(R)        ->  sample        ->  embed_rows(next)  ->  ...
 //
 // WHAT IT IS NOT.  There is no tokenizer here.  `pack/full/tokenizer/` and `tools/strata_tokenizer.py` exist,
 // and a C++ BPE is Phase 1's deliverable rather than this program's, so the prompt arrives as IDS via
@@ -52,12 +52,6 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
-#include "strata/kernels/native_moe.hpp"
-#include "strata/kernels/native_gdn.hpp"
-#include "strata/kernels/native_router.hpp"
-#include "strata/kernels/native_qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
-#include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -233,25 +227,13 @@ struct Options {
     bool no_ple = false;              // explicit diagnostic ablation; never a normal inference default
     bool stream_token = false;        // R2.6 experiment: ordered work on the session stream
     bool check_logits = false;        // optional full-vocabulary finite scan
-    bool gr_fp32_activations = false;  // pinned CUDA single-token BF16 activation contract
-    bool gr_native_mmvf = false;       // pinned projection reduction tree as well as FP32 inputs
-    bool native_bf16 = false;          // SSM gates, router and indexer projections only
-    bool native_bf16_extra = false;    // PLE value
-    bool native_ple_key = false;       // unchanged Q2_0 key and CUDA Q8_1 activations
-    bool native_moe_combine = false;   // pinned fused CUDA weighted reduction
-    bool native_gdn = false;          // pinned CUDA recurrence and preprocessing
+    bool native_ple_key = false;       // the PLE key from --native-dense-gguf's GGUF (set from PLE and that option)
     bool native_flash_attn_short = false; // diagnostic pinned attention, context <=256
-    bool native_qsa_indexer = false;  // pinned F16 key cache and F32 pooling
-    bool native_qsa = false;          // pinned F32 QSA norms and gate
-    bool native_rope = false;         // pinned text-only CUDA rotary arithmetic
-    bool native_ple_postops = false;  // pinned PLE postprojection arithmetic
-    bool native_router = false;       // pinned fused top-10 router (512 or 256 experts)
     bool cpu_oracle_q8_0 = false;      // pinned x86 activation scales/codes at both expert stages
     std::string native_head_gguf;      // native output.weight experiment; same model shard as the pack
     std::vector<std::string> native_dense_gguf; // repeat for native GDN/QSA projection shards
-    /// Plan v0.3 P1: the whole native arithmetic set as ONE switch (model shard 1). It enables exactly the
-    /// combination recorded in bench/results/2026-09-23-attention-ple plus the native indexer, and never the
-    /// <=256-token attention adapter. It becomes the default once P0 shows it is not slower.
+    /// Plan v0.3 P1: the model's GGUF (shard 1): its head, dense projections, PLE key and embedding, and the
+    /// stream-token path.  The arithmetic is the native one with or without it.
     std::string native_preset;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
     std::string ple_io = "direct";
@@ -358,7 +340,6 @@ struct Options {
     bool no_fast_attn = false;         ///< plan v0.3 P3 A/B: gather + one-block-per-head QSA attention
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
-    bool no_fast_select = false;       ///< plan v0.3 P7 A/B: FP64 row scores + bit-serial cell top-k
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
@@ -595,24 +576,10 @@ void usage() {
                  "                       memory in pages of 2 MiB or more and the setup allows it\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
-                 "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
-                 "  --gr-native-mmvf      experimental pinned GR norm/projections; implies FP32 activations\n"
-                 "  --native-bf16         experimental CUDA-oracle SSM/router/indexer BF16 projections\n"
-                 "  --native-bf16-extra   experimental CUDA-oracle PLE BF16 projections\n"
-                 "  --native-ple-key      experimental native PLE key; requires --native-dense-gguf\n"
-                 "  --native-moe-combine  experimental pinned CUDA routed/shared combination\n"
-                 "  --native-gdn          experimental pinned CUDA GDN norms/gates/recurrence\n"
                  "  --native-flash-attn-short  diagnostic pinned vector attention; --max-context <=256\n"
-                 "  --native-qsa-indexer  experimental pinned indexer key cache and pooling\n"
-                 "  --native-qsa          experimental pinned QSA normalization and output gate\n"
-                 "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
-                 "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
-                 "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
                  "  --cpu-oracle-q8-0     experimental pinned CPU expert quantization and dot reduction\n"
-                 "  --native SHARD1      every full-context native path at once (plan v0.3 P1): stream-token,\n"
-                 "                       GR MMVF, BF16, head, dense + PLE key, MoE combine, GDN, router, QSA,\n"
-                 "                       indexer, RoPE, PLE postops, and the CPU q8_0 contract unless the\n"
-                 "                       expert cache is on. Individual --native-* flags stay for A/B.\n"
+                 "  --native SHARD1      the model's GGUF (plan v0.3 P1): its head, dense projections, PLE key and\n"
+                 "                       embedding, and the stream-token path\n"
                  "  --native-head-gguf PATH  native Q5_K head from model shard 1; requires --stream-token\n"
                  "  --native-dense-gguf PATH native GDN/QSA/shared projections; repeat for each source model shard\n"
                  "  --expert-cache-cpu-order  experimental GPU expert reduction matching CPU order\n"
@@ -2596,19 +2563,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-kv-grow") o.kv_grow = 0;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
-        else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
-        else if (a == "--gr-native-mmvf") o.gr_native_mmvf = true;
-        else if (a == "--native-bf16") o.native_bf16 = true;
-        else if (a == "--native-bf16-extra") o.native_bf16_extra = true;
-        else if (a == "--native-ple-key") o.native_ple_key = true;
-        else if (a == "--native-moe-combine") o.native_moe_combine = true;
-        else if (a == "--native-gdn") o.native_gdn = true;
         else if (a == "--native-flash-attn-short") o.native_flash_attn_short = true;
-        else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
-        else if (a == "--native-qsa") o.native_qsa = true;
-        else if (a == "--native-rope") o.native_rope = true;
-        else if (a == "--native-ple-postops") o.native_ple_postops = true;
-        else if (a == "--native-router") o.native_router = true;
         else if (a == "--cpu-oracle-q8-0") o.cpu_oracle_q8_0 = true;
         else if (a == "--native") o.native_preset = next("--native");
         else if (a == "--native-head-gguf") o.native_head_gguf = next("--native-head-gguf");
@@ -2826,7 +2781,6 @@ int main(int argc, char** argv) {
         else if (a == "--no-fast-attn") o.no_fast_attn = true;
         else if (a == "--no-publish-kernel") o.no_publish_kernel = true;
         else if (a == "--no-fused-gdn") o.no_fused_gdn = true;
-        else if (a == "--no-fast-select") o.no_fast_select = true;
         else {
             // An unknown flag is an ERROR and not a warning: a typo'd `--max-neww` that silently generated 16
             // tokens would look like a working run.
@@ -3140,10 +3094,6 @@ int main(int argc, char** argv) {
             return 2;
         }
         o.stream_token = true;
-        o.gr_native_mmvf = true;
-        o.native_bf16 = o.native_bf16_extra = true;
-        o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
-        o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
         if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
@@ -3170,10 +3120,6 @@ int main(int argc, char** argv) {
     }
     if (o.no_ple && !o.ple_gguf.empty()) {
         std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
-        return 2;
-    }
-    if (o.native_ple_postops && o.no_ple) {
-        std::fprintf(stderr, "strata generate: --native-ple-postops requires PLE enabled\n");
         return 2;
     }
     if (!o.no_ple && o.ple_gguf.empty()) {
@@ -3258,10 +3204,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --native-flash-attn-short requires the normal decode loop for status validation\n");
         return 2;
     }
-    if (o.native_ple_key && (o.native_dense_gguf.empty() || o.no_ple)) {
-        std::fprintf(stderr, "strata generate: --native-ple-key requires PLE and --native-dense-gguf\n");
-        return 2;
-    }
+    // the PLE key in its GGUF form, read where the GGUF's dense projections are (the canonical pack's key otherwise)
+    o.native_ple_key = !o.no_ple && !o.native_dense_gguf.empty();
     if (o.cpu_oracle_q8_0 && (o.expert_cache != 0 || !o.expert_profile.empty())) {
         std::fprintf(stderr, "strata generate: --cpu-oracle-q8-0 cannot be combined with --expert-cache or --expert-profile until the GPU expert contract matches\n");
         return 2;
@@ -4347,25 +4291,14 @@ int main(int argc, char** argv) {
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
     }
 
-    strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
-    strata::kernels::gr_set_native_mmvf(o.gr_native_mmvf);
-    // Plan v0.3 P3: the fused hyper-connection read rides the native (FP32-activation) contract; the per-stage
-    // and dump measurements need the unfused layout of R, so they keep the old kernels.
+    // Plan v0.3 P3: the fused hyper-connection read; the per-stage and dump measurements need the unfused layout of R,
+    // so they keep the separate kernels.
     strata::core::layer_set_fast_attn(!o.no_fast_attn);
     strata::core::layer_set_publish_kernel(!o.no_publish_kernel);
     strata::core::layer_set_fused_gdn(!o.no_fused_gdn);
-    strata::core::layer_set_fast_select(!o.no_fast_select);
-    strata::core::layer_set_fused_gr(o.gr_native_mmvf && !o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
+    strata::core::layer_set_fused_gr(!o.no_fused_gr && !o.gpu_stages && o.dump_layers.empty() &&
                                      o.dump_halves.empty() && !o.stage_timing);
-    strata::core::layer_set_native_bf16(o.native_bf16);
     strata::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
-    strata::kernels::ple_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
-    strata::kernels::native_gdn_set_enabled(o.native_gdn);
-    strata::kernels::native_router_set_enabled(o.native_router);
-    strata::kernels::native_qsa_set_enabled(o.native_qsa);
-    strata::kernels::native_qsa_indexer_set_enabled(o.native_qsa_indexer);
-    strata::kernels::native_rope_set_enabled(o.native_rope);
     // The vision path: every rope kernel reads a cell's (t, h, w) from this table (strata/kernels/mrope.hpp).  It is
     // the identity until an image request, and it is set here, before any CUDA graph captures a rope kernel.
     int32_t* d_mrope = nullptr;
@@ -4382,7 +4315,6 @@ int main(int argc, char** argv) {
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
-    strata::kernels::ple_set_native_postops(o.native_ple_postops);
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
     // the model file's rope keys (llama.cpp's names; the artifact ships none today)
@@ -6314,7 +6246,7 @@ int main(int argc, char** argv) {
     }
     // **`sample_tokens` TAKES DEVICE POINTERS.**  It is a kernel launch; `logits` and `out` are both read and
     // written on the device.  Passing `logits.data()` - the host vector - faults inside the kernel and the
-    // error surfaces at the NEXT synchronising call, which here was the next token's `embed_row`, reporting an
+    // error surfaces at the NEXT synchronising call, which here was the next token's `embed_rows`, reporting an
     // illegal access on a weight plane.  Nothing in the parameter names said device.
     int* d_next = nullptr;
     if (!strata::gpu::alloc_device(&d_next, sizeof(int))) {
@@ -6328,7 +6260,7 @@ int main(int argc, char** argv) {
     // broadcast is done directly.  Getting this wrong is invisible for exactly one token.
     void* token_stream = o.stream_token ? main_cs : nullptr;
     auto put_input = [&](int64_t tok, int64_t pos) -> bool {
-        if (!strata::core::embed_row(wt, g, tok, d_emb, token_stream, err)) {
+        if (!strata::core::embed_rows(wt, g, nullptr, tok, 1, d_emb, token_stream, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return false;
         }
@@ -6979,7 +6911,7 @@ int main(int argc, char** argv) {
     // ================================ WHERE THE HOST TERM GOES, PER TOKEN ================================
     //
     // **`--gpu-only-full` MEASURES THE 48 LAYER GRAPHS AND THE LM HEAD AND NOTHING ELSE.**  It never enters
-    // this loop, so it does not run `ple_stage_token`, `embed_row`, the whole-vocabulary logits readback, the
+    // this loop, so it does not run `ple_stage_token`, `embed_rows`, the whole-vocabulary logits readback, the
     // NaN scan or the sampler - and `--no-pool --stats` against that floor was being read as "the per-layer
     // round trip costs 12.4 ms" when an unknown part of it is per TOKEN, not per layer.  That is the same error
     // the review catalogued as A4/A5, one level down: a difference between two measurements attributed to a
@@ -8043,17 +7975,11 @@ int main(int argc, char** argv) {
                           rope_cfg.beta_slow};
                 c.cvec = cvec_digest;
                 c.switches = {
-                    {"no_ple", o.no_ple}, {"native_bf16", o.native_bf16}, {"native_bf16_extra", o.native_bf16_extra},
-                    {"native_ple_key", o.native_ple_key}, {"native_moe_combine", o.native_moe_combine},
-                    {"native_gdn", o.native_gdn}, {"native_flash_attn_short", o.native_flash_attn_short},
-                    {"native_qsa_indexer", o.native_qsa_indexer}, {"native_qsa", o.native_qsa},
-                    {"native_rope", o.native_rope}, {"native_ple_postops", o.native_ple_postops},
-                    {"native_router", o.native_router}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
-                    {"gr_fp32_activations", o.gr_fp32_activations}, {"gr_native_mmvf", o.gr_native_mmvf},
+                    {"no_ple", o.no_ple}, {"native_ple_key", o.native_ple_key},
+                    {"native_flash_attn_short", o.native_flash_attn_short}, {"cpu_oracle_q8_0", o.cpu_oracle_q8_0},
                     {"native_preset", !o.native_preset.empty()}, {"shared_late", o.shared_late},
                     {"keep_canonical", o.keep_canonical}, {"no_fused_gr", o.no_fused_gr},
-                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
-                    {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
+                    {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn}, {"vision", o.vision}};
                 config_fp = strata::core::session_config_fingerprint(c);
             }
             id.model = *model_fp;
@@ -13514,7 +13440,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         // **THE TOKEN TIMER STARTS HERE, BEFORE ANY OF THE TOKEN'S WORK (A7).**  It used to start after
-        // `put_input`/`embed_row`, which excluded the embedding and the PLE window advance from the reported
+        // `put_input`/`embed_rows`, which excluded the embedding and the PLE window advance from the reported
         // rate, and it stopped before the NaN scan, the logits dump and the sampler.  The published tok/s
         // figure is a WALL-CLOCK rate: everything one token costs, PLE advance to sampled id.  A rate that
         // excludes real per-token work is not a rate anyone can plan against.
@@ -13613,7 +13539,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         // **A CHECKPOINT AFTER THE HEAD, BECAUSE AN ASYNC FAULT IS STICKY AND LIES ABOUT WHERE IT HAPPENED.**
-        // Measured, and it cost an hour: without this, `embed_row`'s D2H on the NEXT token reported "an illegal
+        // Measured, and it cost an hour: without this, `embed_rows`'s D2H on the NEXT token reported "an illegal
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.

@@ -5,11 +5,6 @@
 #include <cstdint>
 
 namespace strata::kernels {
-// Configure before constructing/capturing sessions. Existing captures keep their
-// selected kernels; changing this flag does not rewrite an existing graph.
-void native_moe_combine_set_enabled(bool enabled);
-bool native_moe_combine_enabled();
-
 // Pinned CUDA weighted-reduction contract for one token, k in [1, 15].
 // The backend fuses k=2..15; k=1 is its ordinary multiply/contiguous/add path.
 // parts: k contiguous F32 rows of n_embd; weights: k F32 values. The first

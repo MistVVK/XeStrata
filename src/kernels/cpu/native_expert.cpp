@@ -18,6 +18,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <new>
@@ -66,6 +67,10 @@ size_t native_row_bytes(int type, int64_t n) {
 
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
     if (native_row_bytes(type, n) == 0) return false;
+    if (type == GGML_TYPE_F32) {   // ggml has no to_float for F32: its rows are the floats
+        std::memcpy(dst, src, (size_t) n * 4);
+        return true;
+    }
     const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
     if (t == nullptr || t->to_float == nullptr) return false;
     t->to_float(src, dst, n);

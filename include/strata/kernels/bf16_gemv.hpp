@@ -12,35 +12,17 @@
 //     ple_value.weight                                  layer 1, [n_embd, n_embd]
 //     ffn_gate_inp.weight                               handled inside `router_top10`
 //
-// The original entry points take BF16 activation bits for the historical CPU-derived contract. The explicit
-// FP32 entry point below follows the pinned CUDA single-token MMVF contract. See docs/activation-contract.md
-// for why activation precision depends on backend and batch geometry rather than weight type alone.
+// The entry points follow the pinned CUDA single-token MMVF contract: BF16 weights, FP32 activations.  See
+// docs/activation-contract.md for why activation precision depends on backend and batch geometry rather than weight
+// type alone.
 #pragma once
 
 #include <cstdint>
 
 namespace strata::kernels {
 
-/// `y[o] = sum_i f32(x[i]) * f32(w[o*n_in + i])`, with both sides bf16-valued so every product is exact in
-/// f32 and only the summation order differs.
-///
-/// THE WEIGHT LAYOUT IS THE MANIFEST'S: shape [n_in, n_out] with ne0 = n_in CONTIGUOUS, so row `o` is a
-/// contiguous run of `n_in` bf16 values.  That is the same convention `s_gemv` uses, and it is what
-/// `strata::core::WeightRef::ne0/ne1` already report.
-void bf16_gemv(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream);
-
-/// The row-split variant, for the same reason `s_gemv_split` exists: with one thread per output row the
-/// parallelism IS the output width, and `ssm_alpha` has 48 of them over 48 SMs.  One warp per row, lanes
-/// striding the reduction axis - which is also what makes the access pattern coalesced in this layout.
-///
-/// NOT bit-identical to `bf16_gemv`: the partial sums are added in a different order.  Both are kept and both
-/// are tested, because the naive one is the reference the split one is checked against.
-void bf16_gemv_split(const uint16_t* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out,
-                     int threads_per_row, void* stream);
-
 /// Single-token, contiguous 2D BF16-weight/F32-activation MMVF from the pinned llama.cpp CUDA path.
-/// Preserves pair accumulation, adaptive block size and warp-XOR reduction order. This is a separate
-/// opt-in entry point; the legacy BF16-activation kernels above retain their behavior.
+/// Preserves pair accumulation, adaptive block size and warp-XOR reduction order.
 /// `w[o*n_in+i]` is BF16 bits; x/y are F32. n_in must be positive and even, n_out positive, both <= INT_MAX.
 /// x must be 8-byte aligned, w 4-byte aligned, and y 4-byte aligned. Throws on invalid geometry/pointers.
 /// The device buffers must not overlap; allocation bounds remain the caller's responsibility.

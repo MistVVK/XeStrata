@@ -103,13 +103,13 @@ private:
     bool final_norm_ = false, flat_positions_ = false;
     std::vector<float> out_norm_;   // output_norm.weight (host), read when set_final_norm(true)
     uint64_t embd_row_bytes_ = 0;
-    const uint8_t* embd_ = nullptr;   // the token embeddings in the mapped file (rows gathered per prompt)
+    int64_t embd_rows_ = 0;
+    const uint8_t* embd_ = nullptr;   // the token embeddings in the mapped file (rows dequantized per prompt)
     std::vector<Layer> layers_;
     LayerStream layers_stream_;
     int64_t cap_T_ = 0;
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr;
-    uint8_t* rows_ = nullptr;
 };
 
 }  // namespace strata::image

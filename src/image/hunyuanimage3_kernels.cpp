@@ -10,8 +10,8 @@
 #include "strata/image/qi_kernels.hpp"
 
 #include "strata/core/runtime.hpp"
-#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/kernels/rows_cols.hpp"
 
@@ -26,7 +26,6 @@ namespace strata::image {
 namespace hunyuanimage3_detail {
 
 using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_bf16;
 using strata::kernels::f32_from_f16;
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
@@ -81,7 +80,6 @@ float hadamard256_lane(float* t, int lid, const sycl::nd_item<1>& it) {
 
 using hunyuanimage3_detail::e4m3;
 using hunyuanimage3_detail::f16_from_f32;
-using hunyuanimage3_detail::f32_from_bf16;
 using hunyuanimage3_detail::f32_from_f16;
 using hunyuanimage3_detail::finish;
 using hunyuanimage3_detail::hadamard256_lane;
@@ -249,22 +247,7 @@ void hunyuanimage3_scatter_scale_add(float* x, const float* y, const float* w, c
     finish(stream, e, "hunyuanimage3_scatter_scale_add");
 }
 
-void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        x[i[0]] += v[i[0]];
-    });
-    finish(stream, e, "hunyuanimage3_add");
-}
-
-void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids, int64_t rows, int64_t C, uint16_t* out16,
-                       void* stream) {
-    if (rows <= 0) return;
-    const auto e = kernels::for_rows_cols(queue_for(stream), rows, C, [=](int64_t r, int64_t c) {
-        out16[r * C + c] = f16_from_f32(f32_from_bf16(table_bf16[(int64_t) ids[r] * C + c]));
-    });
-    finish(stream, e, "hunyuanimage3_embed_bf16_16");
-}
+void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream) { kernels::add_inplace(x, v, n, stream); }
 
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream) {
     if (n <= 0) return;

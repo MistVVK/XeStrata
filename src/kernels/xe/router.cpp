@@ -14,7 +14,6 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_router
 #include "strata/kernels/device_arch_tag.hpp"
 
-#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
@@ -37,8 +36,6 @@ inline void better(float& bv, int& bi, float ov, int oi) {
     if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
 }
 
-std::atomic<bool> native_enabled{false};
-
 bool valid(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % 4 == 0 && bytes <= UINTPTR_MAX - address;
@@ -53,12 +50,6 @@ sycl::queue& queue_for(void* stream, bool required) {
     return core::Runtime::get().stream(stream);
 }
 
-}  // namespace
-
-void native_router_set_enabled(bool value) { native_enabled.store(value, std::memory_order_relaxed); }
-bool native_router_enabled() { return native_enabled.load(std::memory_order_relaxed); }
-
-namespace {
 // One token's top k (k <= 32) by one sub-group (the pinned kernel's 32 x 8 block has only its first warp active), NPL
 // values a lane, the experts past n_expert (<= NPL x 32) never picked: `ids2` and `weights2`, when given, get the same
 // values (the doorbell's mapped copies, written here instead of copied after)

@@ -5,21 +5,11 @@
 //
 // These are not interesting kernels and that is why they are in one file with one parity test: they are the
 // glue in the per-layer graph, and glue that is written inline at each call site is glue with several
-// slightly different float conventions.  Three of them exist because a projection returns a DIFFERENT
-// quantity from the one the next kernel wants:
+// slightly different float conventions.
 //
-//   * `gdn_gate` turns (alpha, dt, ssm_a) into the recurrence's `gate`.  `ref/gdn.py` L265:
-//     `gate = softplus(w_alpha . x + dt) * ssm_a`, with `softplus(x) = log1p(exp(x))` and the large-x branch
-//     `ggml_compute_softplus_f32` uses.  `ssm_a` is NEGATIVE, which is what puts `exp(gate)` in (0,1).
-//   * `scale_inplace` applies the delta net's `1/sqrt(S)` to q.  It is a separate op because
-//     `ref/gdn.py` says the two llama.cpp paths apply it in DIFFERENT places, so the caller has to own the
-//     choice rather than have it buried in a kernel.
 //   * `f32_to_f16_bulk` is what lets the f32 arithmetic of the mixer feed the fp16-activation GEMVs.
 //     `docs/activation-contract.md` is explicit that this is NOT the contract for a quantized weight - it is
 //     the bridge between two stages that both already exist, and the contract decision is a separate one.
-//
-// `silu_inplace` is here because `shared_expert` has its own copy inline and `gdn` needs one for the conv
-// output; a third copy would be two too many.
 #pragma once
 
 #include <cstdint>
@@ -30,25 +20,10 @@ namespace strata::kernels {
 // A null stream uses that queue and waits for completion. Unported entry points
 // are not linked into strata_kernels yet.
 
-/// Decode one canonical embedding row already selected by the caller. Codes are
-/// packed low bits first (2, 4 or 8 bits); scales/offsets are FP32 per group.
-/// The optional offset defaults to +0. Multiplication and addition round separately,
-/// matching the former CPU decoder. Launches asynchronously on the supplied stream.
-/// The caller validates positive, divisible dimensions and row/plane bounds.
-void embedding_gather(const uint8_t* codes, const float* scales, const float* offsets,
-                      int64_t n, int code_bits, int code_bias, int group_elems,
-                      float* out, void* stream);
-
-/// `y[t][h] = softplus(alpha[t][h] + dt[h]) * ssm_a[h]`, one thread per (t, h).  In place is not possible:
-/// `alpha` is read and `gate` is written, and they are different buffers by construction.
-///
-/// `h_v` is the number of v heads (48) and `n_tokens` the leading dimension; the real call is (1, 48).
-void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* gate, int64_t n_tokens,
-              int64_t h_v, void* stream);
-
 /// `x[i] *= s`, in place.
 void scale_inplace(float* x, int64_t n, float s, void* stream);
-/// `dst[i] += src[i]`.  **ADDED FOR R4's HIT/MISS SPLIT, WHERE THE TWO HALVES COME FROM DIFFERENT
+/// `dst[i] += a * src[i]` (a 1: the plain sum, its bits; the one residual add of the LLMs and the image engine).
+/// **ADDED FOR R4's HIT/MISS SPLIT, WHERE THE TWO HALVES COME FROM DIFFERENT
 /// ENGINES.**  The CPU writes the misses into `parts` and the GPU writes the resident experts into a
 /// buffer of their own, so that the GPU's work can run CONCURRENTLY with the CPU's instead of after it -
 /// and the two are summed here, on the stream, immediately before `moe_combine` reads the result.
@@ -56,37 +31,10 @@ void scale_inplace(float* x, int64_t n, float s, void* stream);
 /// The alternative - having the hit kernel write straight into `parts` - costs the whole overlap, because
 /// the copy of the misses into `parts` cannot happen until the pool has produced them, and the kernel is
 /// then ordered behind that copy.  Measured: the drain fell 18.2 -> 10.2 ms and the token did not move.
-void add_inplace(float* dst, const float* src, int64_t n, void* stream);
+void add_inplace(float* dst, const float* src, int64_t n, void* stream, float a = 1.0f);
 
 /// `y[i] = f16(x[i])`, round-to-nearest-even, using the shared conversion in `f16_bits.hpp`.
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);
-
-/// `y[i] = bf16(x[i])`, for the weights whose contract is a bf16 activation - the BF16 `hc_*`, `ssm_alpha`,
-/// `ssm_beta`, `indexer.*` and `ple_value` tensors.
-///
-/// A SEPARATE ENTRY POINT FROM `f32_to_f16_bulk` and not a flag on it, because the two conversions are not
-/// variants of one idea: fp16 has 5 exponent bits and 10 mantissa bits, bf16 has 8 and 7.  A caller that
-/// picked the wrong one would get a plausible tensor at the wrong precision - 2^-11 against 2^-9, a factor of
-/// four - and nothing downstream could tell which was intended.
-void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);
-
-/// `x[i] = x[i] / (1 + exp(-x[i]))`, in place.
-void silu_inplace(float* x, int64_t n, void* stream);
-
-/// `build_norm`: `y[r][c] = x[r][c] / sqrt(MEAN_c(x[r]^2) + eps) * w[c]`, over the LAST axis.
-///
-/// QSA's norm, used on `attn_q` (24x256), `attn_k` (2x256) and `indexer.q_proj` (4x128). `w` may be null.
-///
-/// **IT IS NOT `gdn_l2_norm` AND THE DIFFERENCE IS A FACTOR OF sqrt(cols) = 16 HERE.** `gdn_l2_norm` divides by
-/// `sqrt(SUM(x^2) + eps)` and applies no weight; this divides by `sqrt(MEAN(x^2) + eps)` and multiplies by `w`.
-/// Two kernels whose names both say "norm" and whose bodies differ in one `/ cols` is exactly the pair that
-/// gets swapped, and swapping them produces a well-scaled, plausible tensor - so they are separate entry
-/// points and the parity test asserts the two readings are OBSERVABLE apart rather than trusting the names.
-///
-/// There is NO `(1 + w)` folding: `ref/qsa.py::rms_norm` is `y * w`, and `build_norm` in the source is
-/// `ggml_rms_norm` followed by a plain multiply. Some norms in this artifact DO fold (the GDN path records
-/// which); this one does not, and the same `sqrt(cols)`-sized argument applies to getting it wrong.
-void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols, float eps, void* stream);
 
 /// *seq = v in MAPPED PINNED memory - THE DOORBELL.  A KERNEL and not cudaEventRecord, because round 199
 /// found that an event record inside a capture is SILENTLY DROPPED while a kernel is captured normally, and

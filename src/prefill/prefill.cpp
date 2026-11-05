@@ -1612,10 +1612,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     const float* w_kn = mtp.tensor_f32("self_attn.k_norm.weight");
     if (!w_ne || !w_fe || !w_nh || !w_fh || !w_hn || !w_dn || !w_up || !w_k || !w_v || !w_kn)
         return decline("a drafter tensor is missing (Q8_0 projections or norms)");
-    const core::NativeEmbed* nemb = core::native_embed();
-    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-    if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-                  (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+    strata::kernels::EmbedTable emb_table;
+    if (std::string why; !core::embed_table(*m.wt, g, m.cs, emb_table, why))
         return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
@@ -1668,18 +1666,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             return false;
         }
         // the input branches: the next token's embedding, and this cell's final residual rows
-        if (nemb) {
-            nemb->gather_dev(tok, nb, emb, m.cs);
-        } else {
-            const auto* codes = (const uint8_t*) wemb->data;
-            const auto* scales = (const float*) (codes + wemb->codes_bytes);
-            const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                   : nullptr;
-            strata::kernels::embedding_gather_dev(codes, scales, offsets, tok, (int) nb, wemb->ne0, wemb->code_bits,
-                                                  wemb->code_bias, wemb->group_elems,
-                                                  (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                  (uint64_t) (wemb->ne0 / wemb->group_elems), emb, m.cs);
-        }
+        strata::kernels::embed_rows(emb_table, tok, 0, nb, emb, m.cs);
         kernels::rms_norm_rows(emb, w_ne, 1, emb, nullptr, (int) (Nn), (int) (nb), EPS, m.cs);
         kernels::f32_to_f16_bulk(emb, en16, nb * Nn, m.cs);
         m.gemm.native(en16, mtp.tensor_q8_type("fc_embedding.weight"), w_fe, e2, nb, Nn, Nn);
@@ -2043,7 +2030,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const char* v = std::getenv("STRATA_PLE_BATCH");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+    const bool ple_batch = ple_on && ple_batch_env &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
@@ -2123,16 +2110,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
         // C-4: the whole chunk's rows in one gather (the same per-element arithmetic as the per-token path, so the
         // same bits); a chunk with picture rows, or a token outside the table, takes the per-token path
-        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
-        const core::NativeEmbed* nemb = core::native_embed();
-        const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-        if (batched && nemb == nullptr &&
-            (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-            batched = false;
+        strata::kernels::EmbedTable emb_table;
+        std::string why;
+        bool batched = hand_in_ == nullptr && m.tok_dev != nullptr && core::embed_table(*m.wt, g, m.cs, emb_table, why);
         for (int64_t t = 0; batched && t < T; ++t) {
             const int64_t tok = tokens[c0 + t];
-            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+            if ((embd_rows && embd_rows[p0 + t]) || tok < 0 || tok >= emb_table.n_rows) batched = false;
             else m.tok_host[(size_t) t] = (int32_t) tok;
         }
         if (batched) {
@@ -2140,18 +2123,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 err = "prefill: the token id upload failed";
                 return false;
             }
-            if (nemb) {
-                nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
-            } else {
-                const auto* codes = (const uint8_t*) wemb->data;
-                const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                       : nullptr;
-                strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                      wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                      (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                      (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, m.cs);
-            }
+            strata::kernels::embed_rows(emb_table, m.tok_dev, 0, T, m.emb, m.cs);
         }
         // the picture rows go up from one pinned buffer (upstream #1996: from the caller's pageable memory a later
         // prompt on gfx1100 read stale rows); without one, from the caller's memory with the stream waited for
@@ -2179,7 +2151,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: the image embedding upload failed";
                     return false;
                 }
-            } else if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, m.cs, err)) {
+            } else if (!core::embed_rows(*m.wt, g, nullptr, tokens[c0 + t], 1, m.emb + t * N, m.cs, err)) {
                 return false;
             }
         }
@@ -4234,7 +4206,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         const char* v = std::getenv("STRATA_PLE_BATCH");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool ple_batch = ple_on && ple_batch_env && strata::kernels::ple_native_postops_enabled() &&
+    const bool ple_batch = ple_on && ple_batch_env &&
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / (((uint64_t) 3 * strata::kernels::NG_HC_DIM + (uint64_t) N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
@@ -4676,16 +4648,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     // ---- embeddings, broadcast to the four streams (the default path's C-4 batched gather, else per
                     // token)
                     pt.mark(kPfStart, cs);
-                    bool batched = m.tok_dev != nullptr;
-                    const core::NativeEmbed* nemb = core::native_embed();
-                    const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-                    if (batched && nemb == nullptr &&
-                        (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-                         (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
-                        batched = false;
+                    strata::kernels::EmbedTable emb_table;
+                    std::string why;
+                    bool batched = m.tok_dev != nullptr && core::embed_table(*m.wt, g, cs, emb_table, why);
                     for (int64_t t = 0; batched && t < T; ++t) {
                         const int64_t tok = tokens[c0 + t];
-                        if (tok < 0 || (wemb && tok >= wemb->ne1)) batched = false;
+                        if (tok < 0 || tok >= emb_table.n_rows) batched = false;
                         else m.tok_host[(size_t) t] = (int32_t) tok;
                     }
                     if (batched) {
@@ -4693,21 +4661,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             err = "prefill: the token id upload failed";
                             return false;
                         }
-                        if (nemb) {
-                            nemb->gather_dev(m.tok_dev, T, m.emb, cs);
-                        } else {
-                            const auto* codes = (const uint8_t*) wemb->data;
-                            const auto* scales = (const float*) (codes + wemb->codes_bytes);
-                            const auto* offsets = wemb->has_offset ? (const float*) (codes + wemb->codes_bytes + wemb->scales_bytes)
-                                                                   : nullptr;
-                            strata::kernels::embedding_gather_dev(codes, scales, offsets, m.tok_dev, (int) T, wemb->ne0,
-                                                                  wemb->code_bits, wemb->code_bias, wemb->group_elems,
-                                                                  (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
-                                                                  (uint64_t) (wemb->ne0 / wemb->group_elems), m.emb, cs);
-                        }
+                        strata::kernels::embed_rows(emb_table, m.tok_dev, 0, T, m.emb, cs);
                     }
                     for (int64_t t = 0; !batched && t < T; ++t)
-                        if (!core::embed_row(*m.wt, g, tokens[c0 + t], m.emb + t * N, cs, err)) return false;
+                        if (!core::embed_rows(*m.wt, g, nullptr, tokens[c0 + t], 1, m.emb + t * N, cs, err))
+                            return false;
                     gr_broadcast(m.emb, m.R, T, cs);
                     if (ple_on && !ple_next.valid())
                         ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c0, b = ple_buf] {

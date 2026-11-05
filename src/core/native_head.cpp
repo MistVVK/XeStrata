@@ -234,13 +234,14 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
     }
 }
 
-void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
-    strata::kernels::iq_embed_rows(type_, table_for(stream), row_, tokens, n_tok, n_embd_, out, stream);
-}
-
-void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) table_for(stream) + (size_t) token * row_, n_embd_, out,
-                                    stream);
+strata::kernels::EmbedTable NativeEmbed::table(void* stream) const {
+    strata::kernels::EmbedTable t;
+    t.type = type_;
+    t.rows = table_for(stream);
+    t.row_bytes = row_;
+    t.n_rows = n_vocab_;
+    t.n_embd = n_embd_;
+    return t;
 }
 
 }  // namespace strata::core

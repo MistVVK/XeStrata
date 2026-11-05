@@ -13,7 +13,6 @@
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/kernels/rows_cols.hpp"
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -23,8 +22,6 @@
 
 namespace strata::kernels {
 namespace {
-
-std::atomic<bool> enabled{false};
 
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
@@ -108,9 +105,6 @@ void native_moe_combine_multi_hits(const float* parts, const float* hits, const 
     });
 }
 
-void native_moe_combine_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
-bool native_moe_combine_enabled() { return enabled.load(std::memory_order_relaxed); }
-
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream) {
     if (!stream || n_embd <= 0 || n_embd > std::numeric_limits<int>::max() || k < 1 || k > 15)
@@ -134,14 +128,5 @@ void native_moe_combine_multi(const float* parts, const float* weights, const fl
     launch(explicit_stream(stream), parts, weights, shared, output, n_embd, int(k), n_tok, shared_gate, slot);
 }
 
-void moe_combine(const float* parts, const float* weights, const float* shared, float* y, int64_t n_embd,
-                 int64_t k, void* stream) {
-    if (n_embd <= 0 || k <= 0) return;
-    // k > 64 is refused rather than truncated
-    if (k > 64) throw core::DeviceError("moe_combine: k = " + std::to_string(k) + " exceeds 64");
-    auto& q = core::Runtime::get().stream(stream);
-    const auto e = launch(q, parts, weights, shared, y, n_embd, int(k), 1);
-    if (!stream) core::Runtime::get().wait(e, "moe_combine");
-}
 
 }  // namespace strata::kernels

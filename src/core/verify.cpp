@@ -856,22 +856,11 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             copy_from_mapped(bo_ + (size_t) t * N, hin + HC * N, N, cs);
             copy_from_mapped(inj2_ + (size_t) t * HC, hin + HC * N + N, HC, cs);
         }
-    } else if (const NativeEmbed* ne = native_embed()) {       // plan v0.3 P6: the GGUF-form table
-        ne->gather_dev(tok_, T, emb_, cs);
-        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else {
-        const WeightRef* w = wt.find("token_embd.weight");
-        if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
-            err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
+        if (!embed_rows(wt, g, tok_, 0, T, emb_, cs, err)) {
+            err = "verify: " + err;
             return false;
         }
-        const auto* codes = (const uint8_t*) w->data;
-        const auto* scales = (const float*) (codes + w->codes_bytes);
-        const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
-        const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
-        const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
-        embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
-                             row_codes, row_groups, emb_, cs);
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
 
@@ -919,7 +908,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             }();
             PleWeights pw = ss.ple.w;
             const bool nkey = pw.key_native_data != nullptr && pw.key_bf16 == nullptr;
-            const bool batched = ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey) && ple_native_bf16();
+            const bool batched = ple_batch && n > 1 && (pw.key_bf16 != nullptr || nkey);
             if (batched) {
                 try {
                     if (pw.key_bf16 != nullptr) {
@@ -944,7 +933,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 const char* e = std::getenv("STRATA_DF_PLE");
                 return e == nullptr || std::strtol(e, nullptr, 10) != 0;
             }();
-            const bool ple_pass = df_ple && batched && dec_batch && !batch_rec_ && ple_native_postops_enabled();
+            const bool ple_pass = df_ple && batched && dec_batch && !batch_rec_;
             if (ple_pass) {
                 try {
                     native_ple_postops_batch_snap(ple_key_ + (size_t) tb * NG_HC_DIM, Rt(tb), ple_val_ + tb * N,
@@ -1097,15 +1086,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     return false;
                 auto norm_rope_on = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos,
                                         strata::gpu::Stream on) {
-                    if (native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable(cols, (int) s.n_rot)) {
+                    if (native_norm_rope_usable(cols, (int) s.n_rot)) {
                         native_qsa_rms_norm_rope(data, cols, (const float*) norm->data, data, rows, cols, (int) s.n_rot, EPS,
                                                  rope_scaling(), pos, on);
                         return;
                     }
-                    if (native_qsa_enabled()) native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, on);
-                    else rms_norm_weighted(data, (const float*) norm->data, rows, cols, EPS, on);
-                    if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, on);
-                    else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, on);
+                    native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, on);
+                    native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, on);
                 };
                 auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
                     norm_rope_on(data, norm, rows, cols, pos, cs);
@@ -1119,14 +1106,14 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     const char* e = std::getenv("STRATA_DF_QB_Q4");
                     return e == nullptr || std::strtol(e, nullptr, 10) != 0;
                 }();
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                const bool qb = dec_batch && n > 1 && (!st.kv_q4 || qb_q4);
                 if (!mixed_q8) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // the query side on branches (upstream 2e4ddf6e): q with its split, norm, RoPE and rotation on side 0, the
                 // indexer query on side 1, beside the K/V side; side 1 joins before the block scores, side 0 before
                 // attention (xq_ and mixed_ are not rewritten before then)
                 const bool qbr = br && qb;
                 // q out of the q|gate rows, normed and rotated: one launch where the fused kernel applies, else the
-                // split copy and norm_rope (the batched rows only: native QSA and native RoPE are on)
+                // split copy and norm_rope (the batched rows only)
                 auto q_split_norm_rope = [&](strata::gpu::Stream on) -> bool {
                     if (native_norm_rope_usable((int) HD, (int) s.n_rot)) {
                         native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
@@ -1313,13 +1300,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
-                for (int t = tb; t < te; ++t) {
-                    if (native_qsa_enabled())
-                        native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
-                                              (int) NH, (int) HD, cs);
-                    else
-                        qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
-                }
+                for (int t = tb; t < te; ++t)
+                    native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
+                                          (int) NH, (int) HD, cs);
                 stamp(l, 14, grp);
                 native_quantize_q8_1(attn32_ + tb * NH * HD, xq_, (int) (NH * HD), n, cs);
                 native_mmvq(wo->native_type, wo->native_data, xq_, bo_ + tb * N, (int) (NH * HD), (int) N, n, cs);
@@ -1347,7 +1330,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         // window; the plan's kernel runs after the doorbell, which the host does not read).  STRATA_ROUTER_PUBLISH=0: apart
         static const bool router_publish = [] { const char* v = std::getenv("STRATA_ROUTER_PUBLISH"); return v == nullptr || *v != '0'; }();
         bool published = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && native_router_takes((int) NE, (int) K)) {
+        if (dec_batch && n > 1 && w_router != nullptr && native_router_takes((int) NE, (int) K)) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
                 const WeightRef* w_sg = v.get("ffn_gate_inp_shexp.weight");
@@ -1440,7 +1423,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 gate_later_[grp] = shared_expert_multi(n, xm, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs,
-                                                       lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
+                                                       lfuse_gate && dec_batch && n > 1,
                                                        g_ready, qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36)
                                                                        : nullptr);
             } catch (const std::exception& e) {
@@ -1561,7 +1544,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     copy_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
         }
-        const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
+        const bool multi_combine = dec_batch && n > 1;
         const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
         if (!fold_hits) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (multi_combine) {   // one launch for the window's rows
