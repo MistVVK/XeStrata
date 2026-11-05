@@ -12,7 +12,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_mmq.hpp"
-#include "strata/kernels/q8_mma.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -265,7 +265,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
                     w8_ = w8_ || w->w8;
                 }
             if (w8t_bytes > 0) weight_bytes_ += w8t_bytes + (uint64_t) (kW8tScales * w8t_rows_) * 4;
-        } else if (kernels::q8_mma_usable(core::Runtime::get().stream(s_))) {
+        } else if (kernels::iq_mmq_q8_rows_usable(core::Runtime::get().stream(s_))) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
                     w->packed = w->type == 8 && w->n % 128 == 0 && w->k % 256 == 0;
@@ -316,7 +316,7 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
     return static_cast<int8_t*>(xq_);
 }
 
-// A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8) or for q8_mma_gemm (packed), and
+// A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8) or Q8_0 rows (packed), and
 // the adapters baked in (set_loras); none of it where nothing is to be done (the stream then copies them as they are)
 void QiDit::install_prepare() {
     if (!w8_ && !packed_ && !baked_any_) {
@@ -324,7 +324,6 @@ void QiDit::install_prepare() {
         return;
     }
     blocks_stream_.set_prepare([this](int i, uint8_t* d) {
-        sycl::queue& q = core::Runtime::get().stream(s_);
         const Block& b = blocks_[(size_t) i];
         for (const W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
             auto* p = d + reinterpret_cast<uintptr_t>(w->d);
@@ -336,7 +335,7 @@ void QiDit::install_prepare() {
                 qi_rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
                            reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
             } else if (w->packed) {
-                kernels::q8_mma_repack(q, p, w->n, w->k);
+                kernels::native_q8_0_to_rows(p, (int) w->k, (int) w->n, s_);
             }
             if (w->baked)
                 w->lora->bake(w->w8 && !w->w8t ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
@@ -397,7 +396,7 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             xq_bytes_ = need;
         }
         qi_quantize_q8(x16, T, w.k, xq_, s_);
-        kernels::q8_mma_gemm(core::Runtime::get().stream(s_), xq_, base, y, T, rows, w.k, ldy);
+        kernels::iq_mmq_q8_rows(core::Runtime::get().stream(s_), xq_, base, y, T, rows, w.k, ldy);
     } else if (w.type == kTypeF16) {
         gemm_.f16(x16, reinterpret_cast<const uint16_t*>(base), y, T, rows, w.k, ldy);
     } else {
@@ -928,8 +927,8 @@ void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, i
         qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.packed) {
         qi_quantize_q8(v, nt, w.k, lora_glora_xq_, s_);
-        kernels::q8_mma_gemm(core::Runtime::get().stream(s_), lora_glora_xq_, d + (uint64_t) r0 * w.row_bytes,
-                             lora_glora_y_, nt, n, w.k, n);
+        kernels::iq_mmq_q8_rows(core::Runtime::get().stream(s_), lora_glora_xq_, d + (uint64_t) r0 * w.row_bytes,
+                                lora_glora_y_, nt, n, w.k, n);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d + (uint64_t) r0 * w.row_bytes), lora_glora_y_, nt, n, w.k, n);
     } else {

@@ -34,7 +34,7 @@
 // the multi-column kernel with NCOLS = 1 and the ncols = 1 layout (4 warps, 1 row, or 4 rows for small K) is the
 // single-column path, so both share one set of dot-product traits.  A warp is a sub-group of 32.
 #include "strata/kernels/native_mmvq.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
@@ -67,7 +67,6 @@ constexpr int QI = 32;
 constexpr int VDR = 2;
 constexpr int WARPS = 4;
 constexpr int WARP = 32;
-constexpr int QUANT_THREADS = 256;
 constexpr int MAX_NCOLS = 8;
 
 using half = sycl::half;
@@ -510,10 +509,6 @@ inline float warp_sum(const sycl::sub_group& sg, float x) {
     for (int offset = WARP / 2; offset > 0; offset >>= 1) x += sycl::permute_group_by_xor(sg, x, offset);
     return x;
 }
-inline float warp_max(const sycl::sub_group& sg, float x) {
-    for (int offset = WARP / 2; offset > 0; offset >>= 1) x = sycl::fmax(x, sycl::permute_group_by_xor(sg, x, offset));
-    return x;
-}
 
 // NW warps per work-group and ROWS rows per work-group.  The EXACT layout (NW = 4, ROWS = 1, or 4 for small K) is
 // the ncols = 1 layout and keeps every column bitwise equal to a single-column call.  The UPSTREAM layout is
@@ -927,6 +922,22 @@ const char* format_name(const std::type_index& t) {
 
 } // namespace
 
+// native_swiglu_q8_1's values, in a namespace of their own (SYCL names a kernel by its type)
+namespace native_q8 {
+struct Swiglu {
+    static constexpr bool kRows = false;
+    const float *gate, *up;
+    float operator()(int64_t, int64_t c, int j) const {
+        // contraction off: the SwiGLU product must not fuse into the sub-group sum's first add (the stored and
+        // reloaded value of the two launches is rounded on its own)
+#pragma clang fp contract(off)
+        const int64_t i = c * Q8K + j;
+        const float g = gate[i];
+        return g / (1.0f + sycl::exp(-g)) * up[i];   // native_swiglu's expression
+    }
+};
+}  // namespace native_q8
+
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
 
@@ -954,21 +965,8 @@ void native_quantize_q8_1_rows(const float* x, void* x_q8_1, int n_in, int64_t r
     auto& q = validate_stream(stream);
     // Columns are contiguous and n_in is a multiple of 32, so ncols columns quantize as one vector of
     // ncols * n_in elements: every 32-element block stays inside one column.
-    const int n_total = (int) ((int64_t) n_in * rows);
-    auto* y = static_cast<Q81Block*>(x_q8_1);
-    const std::size_t global = (std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS * QUANT_THREADS;
-    q.parallel_for(sycl::nd_range<1>(global, QUANT_THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const int i = (int) it.get_global_linear_id();
-        if (i >= n_total) return; // n_total is a multiple of 32: only whole sub-groups return.
-        const sycl::sub_group sg = it.get_sub_group();
-        const float xi = x[i];
-        const float amax = warp_max(sg, sycl::fabs(xi));
-        const float sum = warp_sum(sg, xi);
-        const float d = xe::q8_1_finite(amax / 127.0f);   // #606: finite blocks bit for bit
-        const int8_t qv = xe::q8_1_quant(xi, d, amax);
-        y[i / Q8K].qs[i % Q8K] = qv;
-        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
-    });
+    q8act::quantize<1, q8act::Ggml>(q, (int64_t) n_in * rows / Q8K, 0, q8act::Flat{x},
+                                    q8act::Q8_1{static_cast<uint8_t*>(x_q8_1)});
 }
 
 void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_in, int ncols, void* stream) {
@@ -977,25 +975,8 @@ void native_swiglu_q8_1(const float* gate, const float* up, void* x_q8_1, int n_
     validate_pointer(up);
     validate_pointer(x_q8_1);
     auto& q = validate_stream(stream);
-    const int n_total = n_in * ncols;
-    auto* y = static_cast<Q81Block*>(x_q8_1);
-    const std::size_t global = (std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS * QUANT_THREADS;
-    q.parallel_for(sycl::nd_range<1>(global, QUANT_THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        // contraction off: the SwiGLU product must not fuse into the sub-group sum's first add (the stored and
-        // reloaded value of the two launches is rounded on its own)
-#pragma clang fp contract(off)
-        const int i = (int) it.get_global_linear_id();
-        if (i >= n_total) return; // n_total is a multiple of 32: only whole sub-groups return.
-        const sycl::sub_group sg = it.get_sub_group();
-        const float g = gate[i];
-        const float xi = g / (1.0f + sycl::exp(-g)) * up[i];   // native_swiglu's expression
-        const float amax = warp_max(sg, sycl::fabs(xi));
-        const float sum = warp_sum(sg, xi);
-        const float d = xe::q8_1_finite(amax / 127.0f);
-        const int8_t qv = xe::q8_1_quant(xi, d, amax);
-        y[i / Q8K].qs[i % Q8K] = qv;
-        if (i % Q8K == 0) y[i / Q8K].ds = half2(half(d), half(xe::q8_1_finite(sum)));
-    });
+    q8act::quantize<1, q8act::Ggml>(q, (int64_t) n_in * ncols / Q8K, 0, native_q8::Swiglu{gate, up},
+                                    q8act::Q8_1{static_cast<uint8_t*>(x_q8_1)});
 }
 
 void native_swiglu_f32(const float* gate, const float* up, float* out, int n_in, int ncols, void* stream) {

@@ -20,7 +20,7 @@
 // go from the mapped file to the GPU as they are and are rewritten there to FP16 in place (the same two bytes, the few
 // values past FP16's range saturated), which the products take as they are: no dequantization, the matrix units fed
 // straight (MfPipeline takes this when the blocks fit in VRAM).  The products take FP16 activations (rows scaled into
-// FP16's range, mf_dit.cpp): not q8_mma's int8 activations, which the image
+// FP16's range, mf_dit.cpp): not int8 activations a scale each 32 (iq_mmq_q8_rows'), which the image
 // stream's outlier channels (1e5 among values of 1) cost too much (RTX 4070, Turbo's 4 steps from the same noise: the
 // final latent's cosine to the reference 0.955 with them, 0.992 with FP16 on the B70, 0.996 in bf16).  The blocks go to
 // the GPU through a LayerStream: those that fit stay, the rest are streamed.

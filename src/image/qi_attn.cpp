@@ -18,6 +18,8 @@
 #include "strata/kernels/elementwise.hpp"
 #include "../kernels/xe/attn_parts.hpp"
 #include "../kernels/xe/amd_wmma.hpp"
+#include "../kernels/xe/cuda_intrinsics.hpp"
+#include "../kernels/xe/nv_mma.hpp"
 #include "../kernels/xe/device_target.hpp"
 
 #include <sycl/sycl.hpp>
@@ -100,36 +102,14 @@ Bufs& bufs_of(sycl::queue& q) {
     return *of.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
 }
 
-// NVIDIA's mma.sync from sm_80 on, in PTX (NvKernel): m16n8k32 s8 . s8 into s32, ldmatrix for the B operands out of
-// local memory and cp.async for the chunks into it
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
-#define STRATA_NV_I8 1
-inline void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-        "{%0, %1, %2, %3};"
-        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-inline uint32_t smem_u32(const void* p) {
-    uint32_t a;
-    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
-    return a;
-}
-inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
-}
-inline void cp16(uint32_t dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src));
-}
-inline void cp_commit() { asm volatile("cp.async.commit_group;"); }
-inline uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
-    uint32_t r;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
-    return r;
-}
-template<int N>
-inline void cp_wait() { asm volatile("cp.async.wait_group %0;" ::"n"(N)); }
+// NVIDIA's mma.sync from sm_80 on (NvKernel): m16n8k32 s8 . s8 into s32, ldmatrix for the B operands out of local
+// memory and cp.async for the chunks into it (nv_mma.hpp)
+#define STRATA_NV_I8 STRATA_NV_MMA
+#if STRATA_NV_I8
+namespace nv = kernels::xe::nv;
+using nv::mma_s8;
+using nv::ldsm4;
+using kernels::xe::byte_perm;
 // 2^x flushing a denormal result to 0: sycl::native::exp2 is ex2.approx.f32 without .ftz, which sm_89 runs as a check,
 // two multiplies and the instruction (20% of the kernel's instructions, RTX 4070, 2026-11-05); a probability below
 // 2^-126 is 0 in int8 either way
@@ -138,8 +118,6 @@ inline float ex2(float x) {
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(x));
     return r;
 }
-#else
-#define STRATA_NV_I8 0
 #endif
 
 // Which of the int8 kernels the device takes: 1 Kernel (RDNA3, RDNA4), 2 NvKernel (NVIDIA from sm_80 on, where the
@@ -304,33 +282,17 @@ struct Kernel {
     [[sycl::reqd_work_group_size(1, NW * 32), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
     __attribute__((always_inline)) void operator()(sycl::nd_item<2> it) const {
 #if STRATA_AMD_WMMA
-        using i8v = int __attribute__((ext_vector_type(8)));
-        using fv8 = float __attribute__((ext_vector_type(8)));
+        namespace wm = kernels::xe::wmma;   // amd_wmma.hpp's int8 operands and layouts
+        using i8v = wm::iv8;
+        using fv8 = wm::fv8;
         using u4 = sycl::vec<uint32_t, 4>;
-#if defined(__GFX12__)
-        using frag = int __attribute__((ext_vector_type(2)));
-        constexpr int KOFF = 8;
-#else
-        using frag = int __attribute__((ext_vector_type(4)));
-        constexpr int KOFF = 0;
-#endif
-        auto wmma = [](const frag& a, const frag& b, const i8v& c) {
-#if defined(__GFX12__)
-            return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
-#else
-            return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
-#endif
-        };
+        using frag = wm::s8f;
+        constexpr int KOFF = wm::KOFF;
+        auto wmma = [](const frag& a, const frag& b, const i8v& c) { return wm::mad_s8(a, b, c); };
         sycl::sub_group sg = it.get_sub_group();
         const int wave = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
         const int lo = lane & 15, hi = lane >> 4, lid = (int) it.get_local_id(1);
-        auto row_of = [&](int e) {   // the accumulator's row of element e (the lane's column is lo)
-#if defined(__GFX12__)
-            return 8 * hi + e;
-#else
-            return 2 * e + hi;
-#endif
-        };
+        auto row_of = [&](int e) { return wm::row_of(hi, e); };   // the accumulator's row of element e (column lo)
         const int64_t h = (int64_t) it.get_group(0), C = heads * D;
         // the wave's QT tiles of 16 queries: my0 + 16 qt + lo
         const int64_t my0 = r0 + (int64_t) it.get_group(1) * NW * 16 * QT + (int64_t) wave * 16 * QT;
@@ -612,7 +574,7 @@ struct NvKernel {
                        vs_at = (uint32_t) (vd0 * NVLD + lid % (CH / 16) * 16);
         const int64_t kg_at = (int64_t) kr0 * C + (int64_t) (lid % (D / 16)) * 16,
                       vg_at = (int64_t) vd0 * CH + (int64_t) (lid % (CH / 16)) * 16;
-        const uint32_t ks0 = smem_u32(K0), vs0 = smem_u32(V0);
+        const uint32_t ks0 = nv::smem_addr(K0), vs0 = nv::smem_addr(V0);
         float rs = 0.f;
         auto issue = [&](int64_t si, int bf) {
             bool sb;
@@ -624,11 +586,11 @@ struct NvKernel {
             const uint32_t kb = ks0 + (uint32_t) bf * NK * KLD + ks_at, vb = vs0 + (uint32_t) bf * D * NVLD + vs_at;
 #pragma unroll
             for (int p = 0; p < KP; ++p)
-                if (kr0 + p * KR < nc * CH) cp16(kb + (uint32_t) (p * KR * KLD), kp + (int64_t) p * KR * C);
+                if (kr0 + p * KR < nc * CH) nv::cp_async_cg(kb + (uint32_t) (p * KR * KLD), kp + (int64_t) p * KR * C);
 #pragma unroll
             for (int p = 0; p < VP; ++p)
-                if (p < nc) cp16(vb + (uint32_t) (p * CH), vp + (int64_t) p * D * CH);
-            cp_commit();
+                if (p < nc) nv::cp_async_cg(vb + (uint32_t) (p * CH), vp + (int64_t) p * D * CH);
+            nv::cp_async_commit();
             const int64_t key = c0 * CH + lid;
             if (lid < NK) rs = lid < nc * CH && key < (sb ? Tb : Ta) ? (sb ? skb : ska)[key * heads + h] : 0.f;
         };
@@ -678,7 +640,7 @@ struct NvKernel {
             // left the last step, so the next step's copies may go into the buffer that step read (two barriers a
             // step, the copy issued before the wait: 3.32 ms on the RTX 4070, 4400 rows of 32 heads)
             const int bf = (int) (si & 1);
-            cp_wait<0>();
+            nv::cp_async_wait<0>();
             sycl::group_barrier(it.get_group());
             if (si + 1 < nsteps) issue(si + 1, bf ^ 1);
             bool sb;
@@ -698,8 +660,8 @@ struct NvKernel {
                         moff[qt][0] = moff[qt][1] = 0.f;
                     }
                 }
-                const uint32_t kb = smem_u32(K0) + (uint32_t) bf * NK * KLD + koff,
-                               vb = smem_u32(V0) + (uint32_t) bf * D * NVLD + voff;
+                const uint32_t kb = nv::smem_addr(K0) + (uint32_t) bf * NK * KLD + koff,
+                               vb = nv::smem_addr(V0) + (uint32_t) bf * D * NVLD + voff;
                 const float* sk_ = &skl[(size_t) bf * 2 * NK];
                 const int kmax = (int) sycl::min<int64_t>(NK, lim - j0);   // the step's keys before the segment's end
                 // S: tile j's keys j * 8 + 2 t4 + (e & 1), rows g (e < 2) and g + 8; K's operands read once for the
@@ -773,7 +735,7 @@ struct NvKernel {
                                         p1 = ex2(sycl::fma(s[j][e0 + 1], sql[qt][r], off[r]));
                             sum[r] += p0 + p1;
                             // rounded to the nearest (even) integer by the add, its low byte the value
-                            w[j][r] = prmt(sycl::bit_cast<uint32_t>(p0 + kMagicF),
+                            w[j][r] = byte_perm(sycl::bit_cast<uint32_t>(p0 + kMagicF),
                                            sycl::bit_cast<uint32_t>(p1 + kMagicF), 0x0040u);
                         }
                     // A of P . V a 32 keys: row g's keys 4 t4 .. in V^T's order from tiles 4 kc and 4 kc + 1, then
@@ -783,8 +745,8 @@ struct NvKernel {
 #pragma unroll
                         for (int r = 0; r < 2; ++r) {
                             const int j0 = 4 * kc;
-                            pa[qt][kc][r] = prmt(w[j0][r], w[j0 + 1][r], 0x5410u);
-                            pa[qt][kc][2 + r] = prmt(w[j0 + 2][r], w[j0 + 3][r], 0x5410u);
+                            pa[qt][kc][r] = byte_perm(w[j0][r], w[j0 + 1][r], 0x5410u);
+                            pa[qt][kc][2 + r] = byte_perm(w[j0 + 2][r], w[j0 + 3][r], 0x5410u);
                         }
 #pragma unroll
                     for (int r = 0; r < 2; ++r) l[qt][r] += sum[r] * ps[qt][r];

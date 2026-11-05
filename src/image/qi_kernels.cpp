@@ -3,12 +3,14 @@
 // src/image/qi_kernels.cpp - see include/strata/image/qi_kernels.hpp.
 
 #include "strata/image/qi_kernels.hpp"
+#include "dit_rows.hpp"
 
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
+#include "strata/kernels/q8_act.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -53,29 +55,43 @@ struct QkvIn {
     }
 };
 
+}  // namespace
+
+// The W8A8 inputs' sources (dit_rows.hpp's RowsI8Of ops), in a namespace of their own: SYCL names a kernel by its
+// type, and an anonymous namespace mangles the same in every file.
+namespace qi_rows {
+
+using strata::kernels::f32_from_bf16;
+using kernels::f16_gpu::f16_from_f32;
+using kernels::f16_gpu::f32_from_f16;
+
 // qi_rows_i8's values: V of row r from column k, FP16 or BF16
 struct I8From16 {
+    static constexpr bool kRms = false, kKeep = false;
     const uint16_t* src;
     bool bf16;
     int64_t K;
-    template<int V> void load(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
+    const float* rs;   // the rows' factors on their scales (null: 1)
+    template<int V> void load_sg(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
         const auto raw = *reinterpret_cast<const sycl::vec<uint16_t, V>*>(src + r * K + k);
         for (int j = 0; j < V; ++j) v[j] = bf16 ? f32_from_bf16(raw[j]) : f32_from_f16(raw[j]);
     }
+    float row_scale(int64_t r) const { return rs != nullptr ? rs[r] : 1.f; }
 };
 
 // qi_rows_i8_blocks's: a row of GGUF blocks, each value as kernels::dequant_f16 writes it (rounded to FP16), so the
-// int8 rows are those of qi_rows_i8 of its output.  RowsI8 gives a sub-group one block (256 values, 8 a lane): its
+// int8 rows are those of qi_rows_i8 of its output.  RowsI8Of gives a sub-group one block (256 values, 8 a lane): its
 // lanes read the block's bytes 8 a lane in 16-bit loads side by side (a block is 2-byte aligned) and take the bytes
 // each value needs from the lane that read them, not a byte at a time from all over the block.
 template<int TYPE> struct I8FromBlocks {
+    static constexpr bool kRms = false, kKeep = false;
     static constexpr int BYTES = TYPE == 12 ? 144 : TYPE == 13 ? 176 : 210;
     const uint8_t* b;
     int64_t row_bytes;
     // inlined: else its stores through v put the values on the stack (RTX 4070, 2026-11-05: 8 stores and 4 loads a
     // lane's 8 values)
     template<int V>
-    __attribute__((always_inline)) void load(const sycl::sub_group& sg, int64_t r, int64_t k, float* v) const {
+    __attribute__((always_inline)) void load_sg(const sycl::sub_group& sg, int64_t r, int64_t k, float* v) const {
         static_assert(V == 8, "a lane's 8 values: 32 lanes a block");
         const uint8_t* blk = b + r * row_bytes + (k / 256) * BYTES;
         const int lane = (int) sg.get_local_linear_id();
@@ -137,10 +153,11 @@ template<int TYPE> struct I8FromBlocks {
 
 // qi_swiglu_i8's: SwiGLU of a W8A8 product's int32 sums [gate | up]
 struct I8FromSwiglu {
+    static constexpr bool kRms = false, kKeep = false;
     const int32_t* gu;
     const float *sx, *sw;
     int64_t inter;
-    template<int V> void load(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
+    template<int V> void load_sg(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
         const int32_t* row = gu + r * 2 * inter;
         for (int j = 0; j < V; ++j) {
             const float g = (float) row[k + j] * sx[r] * sw[k + j];
@@ -150,97 +167,23 @@ struct I8FromSwiglu {
     }
 };
 
-// qi_rows_i8 a work-group a row: a sub-group of 32 a group of 256 values (8 a lane, held in registers), up to MAXG
-// groups each (a template argument: the registers of 4 held the RTX 4070's occupancy to a third where 1 was
-// enough, 2026-11-05); the rotation's butterflies of strides 1 to 4 within a lane, 8 to 128 across lanes
-template<class Src, int MAXG> struct RowsI8 {
-    static constexpr int SG = 32, V = kQiRotate / SG;
-    static_assert(V == 8, "a lane's values: two 32-bit words");
-    using u32x2 = uint32_t __attribute__((ext_vector_type(2)));
-    Src src;
-    int64_t K, gpr, nsg;
-    int8_t* q;
-    float* s;
-    const float* rs;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto si = static_cast<int64_t>(sg.get_group_linear_id());
-        const int lane = static_cast<int>(sg.get_local_linear_id());
-        // every loop unrolled, the groups a sub-group skips by a condition: a loop left rolled (the break it had
-        // here) puts v in local memory, whose traffic through the L2 was 35 times the kernel's output (RTX 4070,
-        // Qwen-Image-2.1-Turbo Q6_K's weights, 2026-11-05: 96 M sectors written for 87 MB)
-        float v[MAXG][V];
-        float amax = 0.f;
-#pragma unroll
-        for (int c = 0; c < MAXG; ++c) {
-            const int64_t g = si + c * nsg;
-            if (g < gpr) {   // the whole sub-group
-                src.template load<V>(sg, r, g * kQiRotate + (int64_t) lane * V, v[c]);
-#pragma unroll
-                for (int m = 1; m < V; m <<= 1)
-#pragma unroll
-                    for (int j = 0; j < V; ++j)
-                        if ((j & m) == 0) {
-                            const float a = v[c][j], b = v[c][j + m];
-                            v[c][j] = a + b;
-                            v[c][j + m] = a - b;
-                        }
-#pragma unroll
-                for (int l = 1; l < SG; l <<= 1)
-#pragma unroll
-                    for (int j = 0; j < V; ++j) {
-                        const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
-                        v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
-                    }
-#pragma unroll
-                for (int j = 0; j < V; ++j) {
-                    v[c][j] *= 1.f / 16.f;
-                    amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
-                }
-            }
-        }
-        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
-        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-#pragma unroll
-        for (int c = 0; c < MAXG; ++c) {
-            const int64_t g = si + c * nsg;
-            if (g < gpr) {
-                // packed into 32-bit words and stored as one: a sycl::vec<int8_t, 8> store is split into its bytes on
-                // NVPTX
-                u32x2 o = {0u, 0u};
-#pragma unroll
-                for (int j = 0; j < V; ++j)
-                    o[j / 4] |= (uint32_t) (uint8_t) (int8_t) (int) sycl::round(v[c][j] * id) << (8 * (j % 4));
-                *reinterpret_cast<u32x2*>(q + r * K + g * kQiRotate + (int64_t) lane * V) = o;
-            }
-        }
-        if (si == 0 && lane == 0) s[r] = rs != nullptr ? d * rs[r] : d;
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
-};
-
+// qi_rows_i8 through dit_rows.hpp's RowsI8Of, 8 values side by side a lane (a GGUF block's 256 values a sub-group)
+// and as few groups a sub-group as the work-group allows: the registers of 4 held the RTX 4070's occupancy to a third
+// where 1 was enough (2026-11-05)
 template<class Src>
-void rows_i8(const Src& src, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs, void* stream) {
+void rows_i8(const Src& src, int64_t rows, int64_t K, int8_t* q, float* s, void* stream) {
     if (rows <= 0) return;
     sycl::queue& qu = queue_for(stream);
-    constexpr int64_t SG = RowsI8<Src, 1>::SG, MAXG = 4;
     const int64_t gpr = K / kQiRotate;
-    const auto max_sg =
-        static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / SG;
+    const auto max_sg = static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / 32;
     const int64_t per = (gpr + max_sg - 1) / max_sg;
-    if (K % kQiRotate != 0 || per > MAXG)
-        throw std::runtime_error("image engine: a W8A8 product takes rows of a multiple of 256 values, up to " +
-                                 std::to_string(max_sg * MAXG * kQiRotate));
-    const int64_t nsg = (gpr + per - 1) / per;
-    const sycl::nd_range<1> nd(sycl::range<1>((size_t) (rows * nsg * SG)), sycl::range<1>((size_t) (nsg * SG)));
-    const auto e = per == 1 ? qu.parallel_for(nd, RowsI8<Src, 1>{src, K, gpr, nsg, q, s, rs})
-                 : per == 2 ? qu.parallel_for(nd, RowsI8<Src, 2>{src, K, gpr, nsg, q, s, rs})
-                            : qu.parallel_for(nd, RowsI8<Src, 4>{src, K, gpr, nsg, q, s, rs});
+    const auto e = per <= 1 ? dit_rows::rows_i8_as<Src, 8, 1>(src, rows, K, q, s, qu)
+                 : per == 2 ? dit_rows::rows_i8_as<Src, 8, 2>(src, rows, K, q, s, qu)
+                            : dit_rows::rows_i8_as<Src, 8, 4>(src, rows, K, q, s, qu);
     finish(stream, e, "qi_rows_i8");
 }
 
-}  // namespace
+}  // namespace qi_rows
 
 void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream) {
     if (T <= 0) return;
@@ -337,45 +280,29 @@ void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, v
     if (rows <= 0) return;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
-    const int64_t nb = cols / 32;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
-        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const uint16_t* xr = x16 + r * cols + b * 32;
-        float v[32], amax = 0.f;
-        for (int j = 0; j < 32; ++j) { v[j] = f32_from_f16(xr[j]); amax = sycl::fmax(amax, sycl::fabs(v[j])); }
-        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-        uint32_t p[8];
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k)
-                u |= (uint32_t) (uint8_t) (int8_t) (int) sycl::round(v[4 * j + k] * id) << (8 * k);
-            p[j] = u;
-        }
-        auto* o = reinterpret_cast<sycl::vec<uint32_t, 4>*>(x8 + r * cols + b * 32);
-        o[0] = sycl::vec<uint32_t, 4>{p[0], p[1], p[2], p[3]};
-        o[1] = sycl::vec<uint32_t, 4>{p[4], p[5], p[6], p[7]};
-        xs[r * nb + b] = d;
-    });
-    finish(stream, e, "qi_quantize_q8");
+    const kernels::q8act::Rows<false> out{x8, xs, nullptr, cols, cols / 32};
+    finish(stream, kernels::q8act::quantize<8, kernels::q8act::Mul>(queue_for(stream), rows * (cols / 32), cols / 32,
+                                                                       kernels::q8act::HalfRows{x16, cols}, out),
+           "qi_quantize_q8");
 }
 
 void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,
                 void* stream) {
-    rows_i8(I8From16{src, bf16, K}, rows, K, q, s, rs, stream);
+    qi_rows::rows_i8(qi_rows::I8From16{src, bf16, K, rs}, rows, K, q, s, stream);
 }
 
 bool qi_rows_i8_blocks(int type, const void* blocks, int64_t rows, int64_t K, int8_t* q, float* s, void* stream) {
     const auto* b = static_cast<const uint8_t*>(blocks);
     switch (type) {
-    case 12: rows_i8(I8FromBlocks<12>{b, K / 256 * 144}, rows, K, q, s, nullptr, stream); return true;
-    case 13: rows_i8(I8FromBlocks<13>{b, K / 256 * 176}, rows, K, q, s, nullptr, stream); return true;
-    case 14: rows_i8(I8FromBlocks<14>{b, K / 256 * 210}, rows, K, q, s, nullptr, stream); return true;
+    case 12: qi_rows::rows_i8(qi_rows::I8FromBlocks<12>{b, K / 256 * 144}, rows, K, q, s, stream); return true;
+    case 13: qi_rows::rows_i8(qi_rows::I8FromBlocks<13>{b, K / 256 * 176}, rows, K, q, s, stream); return true;
+    case 14: qi_rows::rows_i8(qi_rows::I8FromBlocks<14>{b, K / 256 * 210}, rows, K, q, s, stream); return true;
     default: return false;
     }
 }
 
 void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
-    rows_i8(I8FromSwiglu{gu, g.sx, g.sw, inter}, T, inter, q, s, nullptr, stream);
+    qi_rows::rows_i8(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter}, T, inter, q, s, stream);
 }
 
 void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,

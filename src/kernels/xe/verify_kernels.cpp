@@ -13,7 +13,7 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
 #include "strata/kernels/device_arch_tag.hpp"
@@ -55,18 +55,9 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
-// The q8_1 block of a sub-group's 32 values, lane l's value xi (native_quantize_q8_1's quantizer, the same bytes):
-// contraction off, so the product that made xi cannot fuse into the sum's first add.
+// The q8_1 block of a sub-group's 32 values, lane l's value xi (native_quantize_q8_1's quantizer, the same bytes)
 inline void q8_1_store(const sycl::sub_group& sg, const float xi, uint8_t* block, const int lane) {
-#pragma clang fp contract(off)
-    float amax = sycl::fabs(xi), sum = xi;
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        sum += sycl::permute_group_by_xor(sg, sum, o);
-    }
-    const float d = xe::q8_1_finite(amax / 127.0f);
-    block[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
-    if (lane == 0) *reinterpret_cast<sycl::half2*>(block) = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+    q8act::q8_1_block(sg, xi, block, lane);
 }
 inline uint32_t read_host(const uint32_t* p) {
     const uint32_t v = *reinterpret_cast<const volatile uint32_t*>(p);

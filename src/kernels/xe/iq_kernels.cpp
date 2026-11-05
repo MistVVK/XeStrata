@@ -40,7 +40,7 @@
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
 #include "strata/kernels/device_arch_tag.hpp"
@@ -941,10 +941,6 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
     for (int o = 16; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
     return v;
 }
-inline float warp_max(const sycl::sub_group& sg, float v) {
-    for (int o = 16; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
-    return v;
-}
 
 // A row's block kbx, its offset in 32 bits: an int index into the block array made the compiler multiply and add the
 // addresses in 64 bits (two SIMD16 halves each on Xe).  A row is far below 4 GiB.
@@ -1272,14 +1268,8 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     // as native_expert_grouped's pass
                     float gv = res[warp * kM8Rows + lane], uv = res[warp * kM8Rows + 32 + lane];
                     swiglu_clamp(gv, uv, lim);
-                    const float xi = canon::silu_mul(gv, uv);
-                    const float amax = warp_max(sg, sycl::fabs(xi));
-                    const float sum = warp_sum(sg, xi);
-                    const float d = canon::q8_scale(amax);
-                    const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
-                    block_q8_1* y = hq + (size_t) (c0 + warp) * hb + it.get_group(1);
-                    y->qs[lane] = qv;
-                    if (lane == 0) y->ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+                    auto* y = reinterpret_cast<uint8_t*>(hq + (size_t) (c0 + warp) * hb + it.get_group(1));
+                    q8act::q8_1_block<q8act::Canon<32>>(sg, canon::silu_mul(gv, uv), y, lane);
                 }
             }
         });
@@ -1396,19 +1386,8 @@ bool down_ws_on(sycl::queue& q) {
 // n is a multiple of 32, so every sub-group is either wholly in range or wholly out of it.  canon_math.hpp's scale (the
 // experts' activations: the CPU's rows of an expert quantize alike).
 sycl::event launch_quantize_q8_1_canon(sycl::queue& q, const float* x, block_q8_1* y, long long n) {
-    const size_t total = (size_t) ((n + 255) / 256) * 256;
-    return q.parallel_for(sycl::nd_range<1>(total, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-        const long long i = (long long) it.get_global_linear_id();
-        if (i >= n) return;
-        const sycl::sub_group sg = it.get_sub_group();
-        const float xi = x[i];
-        const float amax = warp_max(sg, sycl::fabs(xi));
-        const float sum = warp_sum(sg, xi);
-        const float d = canon::q8_scale(amax);
-        const long long ib = i / 32, iqs = i % 32;
-        y[ib].qs[iqs] = canon::q8_value(xi, canon::q8_inv(d));
-        if (iqs == 0) y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
-    });
+    return q8act::quantize<1, q8act::Canon<32>>(q, n / 32, 0, q8act::Flat{x},
+                                                q8act::Q8_1{reinterpret_cast<uint8_t*>(y)});
 }
 
 // ---------------------------------------------------------------- dequant (dequantize.cuh)
@@ -2101,33 +2080,13 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     // row's products add their integer sums before the scale (seg_dot_canon; the CPU's canon_expert.cpp quantizes
     // its rows the same way).  A row of another width: a scale for each 32.  The sum of each 32 (the K-quants' min
     // term) as before.
-    block_q8_1* Y = (block_q8_1*) y;
-    if (n_cols % 256 == 0) {
-        const long long n8 = n / 8;
-        const size_t total = (size_t) ((n8 + 255) / 256) * 256;
-        sync_if_needed(stream, queue_for(stream).parallel_for(sycl::nd_range<1>(total, 256),
-                              [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
-            const long long j = (long long) it.get_global_linear_id();   // values 8j .. 8j + 7
-            const bool in = j < n8;
-            const sycl::sub_group sg = it.get_sub_group();
-            float v[8], a = 0.0f, sum = 0.0f;
-            for (int q = 0; q < 8; ++q) {
-                v[q] = in ? x[8 * j + q] : 0.0f;
-                a = sycl::fmax(a, sycl::fabs(v[q]));
-                sum += v[q];
-            }
-            const float amax = sycl::reduce_over_group(sg, a, sycl::maximum<float>());   // 32 lanes: 256 values
-            sum += sycl::permute_group_by_xor(sg, sum, 1);
-            sum += sycl::permute_group_by_xor(sg, sum, 2);
-            if (!in) return;
-            const float d = canon::q8_scale(amax), id = canon::q8_inv(d);
-            const long long ib = j / 4, o = 8 * (j % 4);
-            for (int q = 0; q < 8; ++q) Y[ib].qs[o + q] = canon::q8_value(v[q], id);
-            if (o == 0) Y[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
-        }), "quantize_q8_1_rows");
+    if (n_cols % 256 == 0) {   // 8 values a lane, the 256 a sub-group's
+        sync_if_needed(stream, q8act::quantize<8, q8act::Canon<256>>(queue_for(stream), n / 32, 0, q8act::Flat{x},
+                                                                     q8act::Q8_1{(uint8_t*) y}),
+                       "quantize_q8_1_rows");
         return;
     }
-    sync_if_needed(stream, launch_quantize_q8_1_canon(queue_for(stream), x, Y, n), "quantize_q8_1_rows");
+    sync_if_needed(stream, launch_quantize_q8_1_canon(queue_for(stream), x, (block_q8_1*) y, n), "quantize_q8_1_rows");
 }
 
 namespace {
@@ -2514,14 +2473,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             // rows of the same expert are the same bits
             float g = gate[i], u = up[i];
             swiglu_clamp(g, u, lim);
-            const float xi = canon::silu_mul(g, u);
-            const float amax = warp_max(sg, sycl::fabs(xi));
-            const float sum = warp_sum(sg, xi);
-            const float d = canon::q8_scale(amax);
-            const int8_t qv = canon::q8_value(xi, canon::q8_inv(d));
-            const long long ib = i / 32, iqs = i % 32;
-            hq[ib].qs[iqs] = qv;
-            if (iqs == 0) hq[ib].ds = ggml_half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+            q8act::q8_1_block<q8act::Canon<32>>(sg, canon::silu_mul(g, u), reinterpret_cast<uint8_t*>(hq + i / 32),
+                                                (int) (i % 32));
         });
     }
     }

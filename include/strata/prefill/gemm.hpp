@@ -57,6 +57,14 @@ public:
     /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
+    /// The products' warm-up, shared by the models: native() once a shape (type, N x K, ldy) a GPU in the process -
+    /// a library's first product of a shape loads its kernels for it (rocBLAS on the RX 9060 XT: 0.5 s for the
+    /// first product, 0.9 s more for the first of 32 rows) - on X's rows of zeros into a buffer the caller
+    /// overwrites.  A shape already warm on this Gemm's GPU is skipped: native_warm says whether it ran, native_cold
+    /// whether it would.
+    bool native_cold(int ggml_type, int64_t N, int64_t K, int64_t ldy = 0) const;
+    bool native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldy = 0);
 
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.

@@ -11,7 +11,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 #include "device_caps.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa
 #include "strata/kernels/device_arch_tag.hpp"
@@ -35,10 +35,6 @@ constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float value) {
     for (int offset = 16; offset; offset >>= 1) value += sycl::permute_group_by_xor(sg, value, offset);
-    return value;
-}
-inline float warp_max(const sycl::sub_group& sg, float value) {
-    for (int offset = 16; offset; offset >>= 1) value = sycl::fmax(value, sycl::permute_group_by_xor(sg, value, offset));
     return value;
 }
 
@@ -95,12 +91,8 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
                 }
                 output[row_offset + col] = v;
                 if (blocks == nullptr) continue;
-                const float amax = warp_max(sg, sycl::fabs(v));
-                const float sum = warp_sum(sg, v);
-                const float d = xe::q8_1_finite(amax / 127.0f);
                 const std::size_t i = row_offset + col;
-                blocks[i / 32].qs[i % 32] = xe::q8_1_quant(v, d, amax);
-                if (lane == 0) blocks[i / 32].ds = sycl::half2(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
+                q8act::q8_1_block(sg, v, reinterpret_cast<uint8_t*>(&blocks[i / 32]), (int) (i % 32));
             }
         });
     });

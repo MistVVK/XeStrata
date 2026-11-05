@@ -18,14 +18,17 @@
 // so the scales come as tiles too: loaded with stride 0, a column of one row's scale and a row of one output's, and
 // multiplied element by element with the int32 tile (iq_mmq_usable checks that an int32 tile and an FP32 one hold
 // their elements in the same order).  Intel's XMX take tiles of 8 x N x 32 on N lanes instead (intel_body), RDNA3 and
-// RDNA4 their WMMA instructions.
+// RDNA4 their WMMA instructions; the dense products of Q8_0 rows take NVIDIA's mma.sync from sm_80 on (iq_mmq_q8_rows).
+// The activations' blocks are q8_act.hpp's (iq_mmq_quantize).
 //
 // In a source file of its own, so its kernels are in a device image apart from the Intel-only ones.
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
+#include "nv_mma.hpp"
 #include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
@@ -876,16 +879,10 @@ struct Kernel {
             [[maybe_unused]] float* xul = local_as<float>(base + XU_OFF).get();
             [[maybe_unused]] float* wml = local_as<float>(base + WM_OFF).get();
             float* wsl = local_as<float>(base + WS_OFF).get();
-            using i8v = int __attribute__((ext_vector_type(8)));
-#if defined(__GFX12__)
-            using frag = int __attribute__((ext_vector_type(2)));
-            constexpr int KOFF = 8;   // bytes of K a lane holds past its half's start
-            auto row_of = [&](int el) { return hi * 8 + el; };
-#else
-            using frag = int __attribute__((ext_vector_type(4)));
-            constexpr int KOFF = 0;
-            auto row_of = [&](int el) { return el * 2 + hi; };
-#endif
+            using i8v = xe::wmma::iv8;     // amd_wmma.hpp's int8 operands and layouts
+            using frag = xe::wmma::s8f;
+            constexpr int KOFF = xe::wmma::KOFF;   // bytes of K a lane holds past its half's start
+            auto row_of = [&](int el) { return xe::wmma::row_of(hi, el); };
             float acc[SGM][SGN][8];
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j)
@@ -936,13 +933,7 @@ struct Kernel {
                                 bm[j] = *reinterpret_cast<const frag*>(bl + (ns + j * TN + lo) * LDB + b * 32 + kk + hi * KOFF);
                             for (int i = 0; i < SGM; ++i)
                                 for (int j = 0; j < SGN; ++j)
-#if defined(__GFX12__)
-                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a[i], true, bm[j],
-                                                                                              ci[i][j], false);
-#else
-                                    ci[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a[i], true, bm[j],
-                                                                                        ci[i][j], false);
-#endif
+                                    ci[i][j] = xe::wmma::mad_s8(a[i], bm[j], ci[i][j]);
                         }
                         for (int j = 0; j < SGN; ++j) {
                             const float ws = wsl[(2 * b + h) * WN + ns + j * TN + lo];   // this lane's column's
@@ -1217,6 +1208,166 @@ struct LayoutCheck {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
 };
 
+// ---------------------------------------------------------------- Q8 rows on NVIDIA's mma.sync (iq_mmq_q8_rows)
+// The dense product of kNativeQ8Rows' weights (each row's K int8 values, then its K / 32 fp16 scales) by T rows of
+// iq_mmq_quantize's activations, on mma.sync's m16n8k32 from sm_80 on.  A work-group of 8 warps computes 128 rows by
+// 128 outputs, each warp 64 x 32 of them as 4 x 4 tiles: one product a tile is one block of 32, its int32 sum (started
+// from 0x4B400000, exact_float's bits) scaled by the weights' scale less 12582912 w in one fma and by the row's into
+// the FP32 accumulator in another, two instructions an element.  K advances 128 values (4 blocks) at a time, the next
+// step's tiles copied to local memory (cp.async) while the warps multiply out of the other buffer.  RTX 4070,
+// Qwen-Image-2.1's products (8,192 x 3,072 x 3,072, x 12,288 x 3,072, x 3,072 x 12,288): 83, 91 and 72 TOPS, where
+// the joint_matrix form takes the same rows at 57, 56 and 48 (2026-11-05); K 128 a step in one work-group an SM (196
+// registers, 78 KiB of local memory) took 5.8 ms where K 64 with two work-groups an SM (capped at 128 registers) took
+// 7.2.
+namespace nvq8 {
+// [[maybe_unused]]: the kernel's body is in the sm_80+ device compile only
+[[maybe_unused]] constexpr int WM = 128, WN = 128, NSGN = 4, NSG = 8, LANES = NSG * SG;
+[[maybe_unused]] constexpr int SGM = 4, SGN = 4;   // a warp's m16 and n8 tiles: 64 x 32
+[[maybe_unused]] constexpr int LD = KC + 16;       // local row stride in bytes (ldmatrix's 8 rows in distinct banks)
+// two buffers each: the activations and the weights (int8, row stride LD), the activations' scales (FP32) and the
+// weights' (FP16), both [row][block]
+[[maybe_unused]] constexpr int A_BUF = WM * LD, B_BUF = WN * LD, XS_BUF = WM * NB * 4, WS_BUF = WN * NB * 2;
+[[maybe_unused]] constexpr int A_OFF = 0, B_OFF = A_OFF + 2 * A_BUF, XS_OFF = B_OFF + 2 * B_BUF,
+                               WS_OFF = XS_OFF + 2 * XS_BUF, LOCAL = WS_OFF + 2 * WS_BUF;
+[[maybe_unused]] constexpr int kMagicBits = 0x4B400000;
+[[maybe_unused]] constexpr float kMagic = 12582912.0f;
+
+struct Kernel {
+    const int8_t* x8;
+    const float* xs;
+    const uint8_t* w;
+    float* y;
+    int64_t T, K, ldy, row_bytes, tiles_m;
+    sycl::local_accessor<uint8_t, 1> lm;
+
+    void operator()(sycl::nd_item<1> it) const {
+#if STRATA_NV_MMA
+        namespace nv = xe::nv;
+        const int64_t g = (int64_t) it.get_group(0);
+        // M first: the work-groups that read a tile of W run side by side and find it in L2 (as mma_gemm)
+        const int64_t m0 = g % tiles_m * WM, n0 = g / tiles_m * WN;
+        const int lid = (int) it.get_local_id(0), lane = lid % SG, sgid = lid / SG;
+        const int ms = sgid / NSGN * (SGM * 16), ns = sgid % NSGN * (SGN * 8);
+        uint8_t* base = &lm[0];
+        const int64_t kb = K / 32, steps = K / KC;
+        // the step's tiles, 16 bytes a copy (rows past T zeros), and the scales a row's NB at once
+        auto issue = [&](int64_t s, int buf) {
+            const int64_t k0 = s * KC;
+            uint8_t* al = base + A_OFF + (size_t) buf * A_BUF;
+            uint8_t* bl = base + B_OFF + (size_t) buf * B_BUF;
+#pragma unroll
+            for (int v = lid; v < WM * (KC / 16); v += LANES) {
+                const int r = v / (KC / 16), c = v % (KC / 16) * 16;
+                const int64_t row = m0 + r;
+                nv::cp_async_ca<16>(al + (size_t) r * LD + c, x8 + (row < T ? row : 0) * K + k0 + c, row < T ? 16 : 0);
+            }
+#pragma unroll
+            for (int v = lid; v < WN * (KC / 16); v += LANES) {
+                const int r = v / (KC / 16), c = v % (KC / 16) * 16;
+                nv::cp_async_ca<16>(bl + (size_t) r * LD + c, w + (n0 + r) * row_bytes + k0 + c);
+            }
+            if (lid < WM) {
+                const int64_t row = m0 + lid;
+                nv::cp_async_ca<NB * 4>(base + XS_OFF + (size_t) buf * XS_BUF + (size_t) lid * NB * 4,
+                                        xs + (row < T ? row : 0) * kb + k0 / 32, row < T ? NB * 4 : 0);
+            } else if (lid < WM + WN) {
+                const int r = lid - WM;
+                nv::cp_async_ca<NB * 2>(base + WS_OFF + (size_t) buf * WS_BUF + (size_t) r * NB * 2,
+                                        w + (n0 + r) * row_bytes + K + k0 / 16);
+            }
+            nv::cp_async_commit();
+        };
+
+        float acc[SGM][SGN][4];
+#pragma unroll
+        for (int i = 0; i < SGM; ++i)
+#pragma unroll
+            for (int j = 0; j < SGN; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+        const int gr = lane / 4, gc = lane % 4 * 2;
+        issue(0, 0);
+        for (int64_t s = 0; s < steps; ++s) {
+            const int buf = (int) (s & 1);
+            // this step's copies landed, and every warp is past the last step, whose buffers the next copies take
+            nv::cp_async_wait<0>();
+            sycl::group_barrier(it.get_group());
+            if (s + 1 < steps) issue(s + 1, buf ^ 1);
+            const uint8_t* al = base + A_OFF + (size_t) buf * A_BUF;
+            const uint8_t* bl = base + B_OFF + (size_t) buf * B_BUF;
+            const float* xsl = reinterpret_cast<const float*>(base + XS_OFF + (size_t) buf * XS_BUF);
+            const sycl::half* wsl = reinterpret_cast<const sycl::half*>(base + WS_OFF + (size_t) buf * WS_BUF);
+#pragma unroll 1
+            for (int b = 0; b < NB; ++b) {
+                uint32_t af[SGM][4], bf[SGN / 2][4];
+#pragma unroll
+                for (int i = 0; i < SGM; ++i)   // rows lane % 16, bytes 16 (lane / 16) of the block
+                    nv::ldsm4(af[i],
+                              nv::smem_addr(al + (size_t) ((ms + i * 16 + lane % 16) * LD + b * 32 + lane / 16 * 16)));
+#pragma unroll
+                for (int j = 0; j < SGN / 2; ++j)   // outputs 8 (lane / 16) + lane % 8, bytes 16 (lane / 8 % 2)
+                    nv::ldsm4(bf[j], nv::smem_addr(bl + (size_t) ((ns + j * 16 + lane / 16 * 8 + lane % 8) * LD +
+                                                                   b * 32 + lane / 8 % 2 * 16)));
+                float sx[SGM][2], wf[SGN][2], wm[SGN][2];
+#pragma unroll
+                for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) sx[i][h] = xsl[(ms + i * 16 + gr + h * 8) * NB + b];
+#pragma unroll
+                for (int j = 0; j < SGN; ++j)
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        wf[j][q] = (float) wsl[(ns + j * 8 + gc + q) * NB + b];
+                        wm[j][q] = -kMagic * wf[j][q];
+                    }
+#pragma unroll
+                for (int i = 0; i < SGM; ++i)
+#pragma unroll
+                    for (int j = 0; j < SGN; ++j) {
+                        int c[4];
+                        nv::mma_s8(c, af[i], bf[j / 2][(size_t) (j % 2) * 2], bf[j / 2][(j % 2) * 2 + 1], kMagicBits);
+                        // c0, c1: row gr, outputs gc and +1; c2, c3: 8 rows on
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = sycl::fma(sycl::fma(sycl::bit_cast<float>(c[e]), wf[j][e % 2], wm[j][e % 2]),
+                                                     sx[i][e / 2], acc[i][j][e]);
+                    }
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < SGM; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int64_t row = m0 + ms + (int64_t) i * 16 + gr + (int64_t) h * 8;
+                if (row >= T) continue;
+#pragma unroll
+                for (int j = 0; j < SGN; ++j) {
+                    float* o = y + row * ldy + n0 + ns + (int64_t) j * 8 + gc;
+                    o[0] = acc[i][j][(size_t) 2 * h];
+                    o[1] = acc[i][j][2 * h + 1];
+                }
+            }
+#else
+        (void) it;
+#endif
+    }
+    auto get(syclex::properties_tag) const {
+        return syclex::properties{syclex::sub_group_size<32>, syclex::max_work_group_size<LANES>};
+    }
+};
+
+// the architecture this binary's device code for the GPU was compiled for (STRATA_NV_ARCH: 0 where it is not NVIDIA's)
+int device_arch(sycl::queue& q) {
+    int* out = sycl::malloc_shared<int>(1, q);
+    if (out == nullptr) return 0;
+    q.single_task([=] { *out = STRATA_NV_ARCH; }).wait();
+    const int a = *out;
+    sycl::free(out, q);
+    return a;
+}
+}  // namespace nvq8
+
 }  // namespace
 
 bool iq_mmq_usable(sycl::queue& q) {
@@ -1312,76 +1463,61 @@ bool iq_mmq_type_dup(int t) { return t == 10; }
 
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
                             int64_t rows, bool sums, bool dup) {
-    // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values
-    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1;
+    // dup (Q2_K, Dec<10>): each block written twice, as a row of 2 cols values.  8 values a lane (a block 4 lanes):
+    // 8,192 rows of 3,072 took the B70 264 us and the RTX 4070 285 where a block a work-item took 299 and 296, and a
+    // block a sub-group (a value a lane) 626 and 394 (2026-11-05)
+    const int64_t oc = dup ? 2 * cols : cols, nb = cols / 32;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
-    const int64_t nb = cols / 32, onb = oc / 32;
-    float* xu = xs + rows * onb;
-    return q.parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
-        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const float* xr = x + (int64_t) (ids ? ids[r] : r) * ld + b * 32;
-        float v[32], amax = 0.0f;
-        for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
-        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
-        uint32_t p[8];
-        int sum = 0;
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int q = (int) sycl::round(v[4 * j + k] * id);
-                sum += q;
-                u |= (uint32_t) (uint8_t) (int8_t) q << (8 * k);
-            }
-            p[j] = u;
-        }
-        for (int64_t c = 0; c < rep; ++c) {
-            const int64_t ob = b * rep + c;
-            u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
-            o[0] = u32x4{p[0], p[1], p[2], p[3]};
-            o[1] = u32x4{p[4], p[5], p[6], p[7]};
-            xs[r * onb + ob] = d;
-            if (sums) xu[r * onb + ob] = d * (float) sum;
-        }
-    });
+    float* xu = xs + rows * (oc / 32);
+    const q8act::FloatRows src{x, ids, ld};
+    if (sums) {
+        q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+        return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
+    }
+    q8act::Rows<false> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
+    return q8act::quantize<8, q8act::Mul>(q, rows * nb, nb, src, out);
 }
 
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
                                     int64_t ld, int64_t tokens, int k_used, bool sums, bool dup) {
     // as iq_mmq_quantize, with the rows reached from the token: the block of token t goes to its k_used rows
-    const int64_t oc = dup ? 2 * cols : cols, rep = dup ? 2 : 1, rows = tokens * k_used;
+    const int64_t oc = dup ? 2 * cols : cols, rows = tokens * k_used, nb = cols / 32;
     auto* x8 = static_cast<int8_t*>(xq);
     auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
-    const int64_t nb = cols / 32, onb = oc / 32;
-    float* xu = xs + rows * onb;
-    return q.parallel_for(sycl::range<1>((size_t) (tokens * nb)), [=](sycl::id<1> i) {
-        const int64_t t = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
-        const float* xr = x + t * ld + b * 32;
-        float v[32], amax = 0.0f;
-        for (int j = 0; j < 32; ++j) { v[j] = xr[j]; amax = sycl::fmax(amax, sycl::fabs(v[j])); }
-        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
-        uint32_t p[8];
-        int sum = 0;
-        for (int j = 0; j < 8; ++j) {
-            uint32_t u = 0;
-            for (int k = 0; k < 4; ++k) {
-                const int qv = (int) sycl::round(v[4 * j + k] * id);
-                sum += qv;
-                u |= (uint32_t) (uint8_t) (int8_t) qv << (8 * k);
-            }
-            p[j] = u;
-        }
-        for (int k = 0; k < k_used; ++k) {
-            const int64_t r = slot[t * k_used + k];
-            for (int64_t c = 0; c < rep; ++c) {
-                const int64_t ob = b * rep + c;
-                u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
-                o[0] = u32x4{p[0], p[1], p[2], p[3]};
-                o[1] = u32x4{p[4], p[5], p[6], p[7]};
-                xs[r * onb + ob] = d;
-                if (sums) xu[r * onb + ob] = d * (float) sum;
-            }
-        }
+    float* xu = xs + rows * (oc / 32);
+    const q8act::FloatRows src{x, nullptr, ld};
+    if (sums) {
+        q8act::Rows<true, true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1, slot, k_used};
+        return q8act::quantize<8, q8act::Mul>(q, tokens * nb, nb, src, out);
+    }
+    q8act::Rows<false, true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1, slot, k_used};
+    return q8act::quantize<8, q8act::Mul>(q, tokens * nb, nb, src, out);
+}
+
+bool iq_mmq_q8_rows_usable(sycl::queue& q) {
+    static core::PerDevice<bool> per_device;
+    return per_device.get(q.get_device(), [&q] {
+        if (no_xmx()) return false;
+        const sycl::device d = q.get_device();
+        if (d.get_backend() != sycl::backend::ext_oneapi_cuda) return false;
+        if (d.get_info<sycl::info::device::local_mem_size>() < (size_t) nvq8::LOCAL ||
+            d.get_info<sycl::info::device::max_work_group_size>() < (size_t) nvq8::LANES)
+            return false;
+        return nvq8::device_arch(q) >= 800;
+    });
+}
+
+sycl::event iq_mmq_q8_rows(sycl::queue& q, const void* xq, const void* w, float* y, int64_t T, int64_t N, int64_t K,
+                           int64_t ldy) {
+    const int64_t tiles_m = (T + nvq8::WM - 1) / nvq8::WM, tiles_n = N / nvq8::WN;
+    const auto* x8 = static_cast<const int8_t*>(xq);
+    const auto* xs = reinterpret_cast<const float*>(x8 + T * K);
+    const int64_t row_bytes = K / 32 * 34;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) nvq8::LOCAL), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (tiles_m * tiles_n) * nvq8::LANES, nvq8::LANES),
+                       nvq8::Kernel{x8, xs, static_cast<const uint8_t*>(w), y, T, K, ldy, row_bytes, tiles_m, lm});
     });
 }
 

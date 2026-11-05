@@ -153,7 +153,7 @@ private:
         int64_t n = 0, k = 0;   // n rows of k
         const void* d = nullptr;
         uint64_t row_bytes = 0;
-        bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
+        bool packed = false;    // Q8_0 rewritten as rows for iq_mmq_q8_rows (native_q8_0_to_rows)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
         bool w8t = false;       // w8 through w8t_: a block format of fewer bits than int8's rows, kept as it is and
                                 // written as int8 rows into the scratch at each product

@@ -227,18 +227,23 @@ struct LnMod {
     }
 };
 
-// A W8A8 product's int8 input straight from a row-wise op, rotated and quantized as qi_rows_i8 quantizes FP16 rows
-// (qi_kernels.cpp: kQiRotate values at a time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a
-// row), without the FP16 rows and their second pass between: on the RX 9060 XT those two passes were a fifth of
-// MOSS-Image's step (2026-10-29).  A work-group a row, a sub-group of 32 a group of kQiRotate values (8 a lane, in
-// registers), up to kMaxG groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W +
-// j % W of the group): its butterflies within the lane over j's bits and across the lanes over lane's, Sylvester's
-// Hadamard matrix whatever W is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic
-// (keep(t, c, v) writes it back where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the
-// value given it.
-template<class Op, int W> struct RowsI8Of {
-    static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = 4;
+// A W8A8 product's int8 input (qi_kernels.hpp: qi_rows_i8's rows) straight from a row-wise op: kQiRotate values at a
+// time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a row (q8_act.hpp's Mul rule), without
+// FP16 rows and a second pass between: on the RX 9060 XT those two passes were a fifth of MOSS-Image's step
+// (2026-10-29).  A work-group a row, a sub-group of 32 a group of kQiRotate values (8 a lane, in registers), up to G
+// groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W + j % W of the group): its
+// butterflies within the lane over j's bits and across the lanes over lane's, Sylvester's Hadamard matrix whatever W
+// is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic (keep(t, c, v) writes it back
+// where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the value given it (none: v).  Or
+// W values at once: raw_w, keep_w, out_w; or with the sub-group, load_sg (a lane's 8 values of a GGUF block, W 8).
+// row_scale(t), where the op has it: the row's own factor on its scale.
+template<class Op, int W, int G = 4> struct RowsI8Of {
+    static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = G;
     static_assert(W == 1 || W == 4 || W == V);
+    static_assert(G == 1 || G == 2 || G == 4);
+    static constexpr bool kSg = requires(const Op& o, const sycl::sub_group& sg, float* p) {
+        o.template load_sg<W>(sg, int64_t{}, int64_t{}, p);
+    };
     // an op's W values side by side in one access (raw_w, keep_w where it keeps them; out_w): RmsI8 on the RTX 4070
     // through scalar reads W values apart kept the L1 busy at 44% of the memory's bandwidth (2026-11-05)
     static constexpr bool kVec = W > 1 && requires(const Op& o, float* p) {
@@ -266,7 +271,9 @@ template<class Op, int W> struct RowsI8Of {
             const int64_t g = si + c * nsg;
             if (g >= gpr) continue;   // the whole sub-group
             const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
-            if constexpr (kVec) {   // W values a load: one access each, not W the lanes' accesses W values apart
+            if constexpr (kSg) {
+                op.template load_sg<W>(sg, r, k0, v[c]);
+            } else if constexpr (kVec) {   // W values a load: one access each, not W the lanes' accesses W values apart
 #pragma unroll
                 for (int h = 0; h < V / W; ++h) {
                     const int j = h * W;
@@ -298,7 +305,7 @@ template<class Op, int W> struct RowsI8Of {
                     const int j = h * W;
                     op.template out_w<W>(r, k0 + (int64_t) h * SG * W, &v[c][j], inv);
                 }
-            } else {
+            } else if constexpr (requires { op.out(r, k0, 1.f, inv); }) {
 #pragma unroll
                 for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
             }
@@ -350,25 +357,28 @@ template<class Op, int W> struct RowsI8Of {
                 }
             }
         }
-        if (si == 0 && lane == 0) s[r] = d;
+        if (si == 0 && lane == 0) {
+            if constexpr (requires { op.row_scale(r); }) s[r] = d * op.row_scale(r);
+            else s[r] = d;
+        }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
 };
 
-template<class Op, int W>
-inline void rows_i8_as(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, sycl::queue& qu) {
-    constexpr int64_t SG = RowsI8Of<Op, W>::SG, kMaxG = RowsI8Of<Op, W>::kMaxG;
+// G groups a sub-group: ceil(K / kQiRotate / G) sub-groups a row
+template<class Op, int W, int G = 4>
+inline sycl::event rows_i8_as(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, sycl::queue& qu) {
+    constexpr int64_t SG = RowsI8Of<Op, W, G>::SG;
     const int64_t gpr = K / kQiRotate;
     const auto max_sg =
         static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / SG;
-    if (K % kQiRotate != 0 || gpr > max_sg * kMaxG)
+    if (K % kQiRotate != 0 || gpr > max_sg * G)
         throw std::runtime_error("image engine: a W8A8 product takes rows of a multiple of 256 values, up to " +
-                                 std::to_string(max_sg * kMaxG * kQiRotate));
-    // the fewest sub-groups a row: a work-group of 1024 items (SiTU's 8192 values a sub-group's group each) took
-    // MOSS-Image's SiTU 2.76 ms a block on the RX 9060 XT, a quarter of them with 4 groups each 1.83 ms (2026-10-29)
-    const int64_t nsg = (gpr + kMaxG - 1) / kMaxG;
-    qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nsg * SG)), sycl::range<1>((size_t) (nsg * SG))),
-                    RowsI8Of<Op, W>{op, K, gpr, nsg, q, s});
+                                 std::to_string(max_sg * G * kQiRotate));
+    const int64_t nsg = (gpr + G - 1) / G;
+    return qu.parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (T * nsg * SG)), sycl::range<1>((size_t) (nsg * SG))),
+        RowsI8Of<Op, W, G>{op, K, gpr, nsg, q, s});
 }
 
 // rows_i8's timing passes, as a block's: x[t] += gate y[t] (a product's int32 sums, scaled), written back, then
@@ -473,6 +483,8 @@ inline int rows_i8_width(sycl::queue& qu) {
     });
 }
 
+// the fewest sub-groups a row (G 4): a work-group of 1024 items (SiTU's 8192 values a sub-group's group each) took
+// MOSS-Image's SiTU 2.76 ms a block on the RX 9060 XT, a quarter of them with 4 groups each 1.83 ms (2026-10-29)
 template<class Op> inline void rows_i8(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, void* st) {
     if (T <= 0) return;
     sycl::queue& qu = q_of(st);

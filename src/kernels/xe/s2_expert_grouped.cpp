@@ -14,6 +14,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/core/runtime.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_s2_expert_grouped
@@ -23,6 +24,24 @@
 #include <string>
 
 namespace strata::kernels {
+
+// swiglu_q8_launch's values, each written back to gate_up (SYCL names a kernel by its type: a namespace of its own)
+namespace s2_q8 {
+struct SwigluKeep {
+    static constexpr bool kRows = false;
+    float* gate_up;
+    long long n_pairs;
+    float operator()(int64_t, int64_t c, int j) const {
+        const int64_t i = c * 32 + j;
+        const float g = gate_up[i];
+        const float u = gate_up[n_pairs + i];
+        const float xv = (g / (1.0f + sycl::exp(-g))) * u;
+        gate_up[i] = xv;
+        return xv;
+    }
+};
+}  // namespace s2_q8
+
 namespace {
 
 using xe::dp4a;
@@ -126,35 +145,8 @@ sycl::event swiglu_launch(sycl::queue& q, float* gate_up, long long n_pairs) {
 // swiglu_launch and quantize_q8_0_scaled in one kernel (upstream 3281ac32): one sub-group a 32-value block, each lane
 // its value's SwiGLU (written back to gate_up) and the block's scaled Q8_0, the same arithmetic as the two launches
 sycl::event swiglu_q8_launch(sycl::queue& q, float* gate_up, long long n_pairs, uint8_t* blocks, float* scales) {
-    const long long n_blocks = n_pairs / 32;
-    const size_t groups = (size_t) ((n_blocks + 7) / 8);
-    return q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const long long b = (long long) it.get_group(0) * 8 + (long long) sg.get_group_linear_id();
-        if (b >= n_blocks) return;   // uniform over the sub-group
-        const int lane = (int) sg.get_local_linear_id();
-        const long long i = b * 32 + lane;
-        const float g = gate_up[i];
-        const float u = gate_up[n_pairs + i];
-        const float xv = (g / (1.0f + sycl::exp(-g))) * u;
-        gate_up[i] = xv;
-        uint8_t* out = blocks + b * 34;
-        float amax = sycl::fabs(xv);
-        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        const float sc = amax > 0.f ? amax / 127.f : 0.f;
-        const float inv = sc > 0.f ? 1.f / sc : 0.f;
-        if (lane == 0) {
-            scales[b] = sc;
-            const uint16_t d16bits = f16_from_f32(sc);
-            out[0] = (uint8_t) (d16bits & 0xFF);
-            out[1] = (uint8_t) (d16bits >> 8);
-        }
-        const float t = xv * inv;
-        const float r = t + (t >= 0.f ? 0.5f : -0.5f);
-        int v = (int) r;
-        v = v < -127 ? -127 : (v > 127 ? 127 : v);
-        out[2 + lane] = (uint8_t) (int8_t) v;
-    });
+    return q8act::quantize<1, q8act::Half>(q, n_pairs / 32, 0, s2_q8::SwigluKeep{gate_up, n_pairs},
+                                           q8act::Q8_0<>{blocks, scales});
 }
 
 sycl::event down_launch(sycl::queue& q, const uint8_t* blob_base, const int32_t* slot_index, const int32_t* dst_index,
@@ -572,28 +564,7 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
         const float eg = sycl::exp(-g);
         gu[i] = (g / (1.0f + eg)) * gu[pairs + i];
     });
-    q.parallel_for(sycl::range<1>((size_t) (n_hits * (FF / 32))), [=](sycl::id<1> id) {
-        const int c = (int) id[0];
-        const float* xb = gu + c * 32;
-        uint8_t* o = hq + (size_t) c * 34;
-        float amax = 0.0f;
-        for (int j = 0; j < 32; ++j) amax = sycl::fmax(amax, sycl::fabs(xb[j]));
-        const float s = amax > 0.0f ? amax / 127.0f : 0.0f;
-        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-        hs[c] = s;
-        const uint16_t bits = f16_from_f32(s);
-        o[0] = (uint8_t) bits;
-        o[1] = (uint8_t) (bits >> 8);
-        int sum = 0;
-        for (int j = 0; j < 32; ++j) {
-            const float t = xb[j] * inv;
-            int v = (int) (t + (t >= 0.0f ? 0.5f : -0.5f));
-            v = v < -127 ? -127 : (v > 127 ? 127 : v);
-            o[2 + j] = (uint8_t) (int8_t) v;
-            sum += v;
-        }
-        hh[c] = s * (float) sum;
-    });
+    q8act::quantize<1, q8act::Half>(q, n_hits * (FF / 32), 0, q8act::Flat{gu}, q8act::Q8_0<true>{hq, hs, hh});
     const auto e = cpu_order_projection<true>(q, blob_base, slot_index, dst_index, blob_bytes, hq, hs, hh, out, (int) n_hits);
     if (!stream) core::Runtime::get().wait(e, "moe_hit_grouped_s2_cpu_order");
 }

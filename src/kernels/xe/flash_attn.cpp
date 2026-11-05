@@ -33,6 +33,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "mma_gemm.hpp"
 #include "amd_wmma.hpp"
+#include "nv_mma.hpp"
 #include "device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_flash_attn
 #include "strata/kernels/device_arch_tag.hpp"
@@ -1582,11 +1583,7 @@ sycl::event launch_mma(sycl::queue& q, const float* qv, QsaAttnPools p, const in
 // registers, and the output stays in FP32 accumulators whose layout mma.sync defines.  Only the q.k partial sums cross
 // warps, added in a fixed order.  joint_matrix could not express the fragments or the copies: PromptAttnMma ran a
 // chunk of 32K at 14.0 ms, this at 7.4 (qsa_prompt_attn_parity, RTX 4070).  STRATA_PROMPT_ATTN_PTX=0: PromptAttnMma.
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
-#define STRATA_PA_PTX 1
-#else
-#define STRATA_PA_PTX 0
-#endif
+#define STRATA_PA_PTX STRATA_NV_MMA
 namespace pv2 {
 constexpr int CH = 32;
 struct Smem {
@@ -1604,23 +1601,9 @@ struct Smem {
     return cell * 64 + ((((byte >> 4) ^ (cell >> 1)) & 3) << 4) + (byte & 15);
 }
 #if STRATA_PA_PTX
-inline uint32_t smem_addr(const void* p) {
-    uint32_t a;
-    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
-    return a;
-}
-inline void cp_async16(void* smem, const void* gmem, bool valid) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(smem_addr(smem)), "l"(gmem),
-                 "r"(valid ? 16 : 0));
-}
-inline void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-inline void cp_async_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
-inline void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                 "{%0,%1,%2,%3};\n"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
+namespace nv = xe::nv;   // nv_mma.hpp
+using nv::cp_async_cg;
+using nv::cp_async_commit;
 #endif
 // two int8 codes (low byte first) as an exact half2: 1024 + (c + 128) built in the mantissa, minus 1152
 [[maybe_unused]] inline uint32_t i8x2_to_h2(uint32_t x) {
@@ -1703,8 +1686,8 @@ struct PromptAttnPtx {
                 const long long rr = sycl::select_from_group(sg, r, cell);
                 const bool ok = rr >= 0;
                 const size_t off = ok ? (size_t) rr * HD + (size_t) dim0 + (size_t) pc * 16 : 0;
-                pv2::cp_async16((int8_t*) &S.kv[st][warp][0][0][0] + swz(cell, pc * 16), p.k_q + off, ok);
-                pv2::cp_async16((int8_t*) &S.kv[st][warp][1][0][0] + swz(cell, pc * 16), p.v_q + off, ok);
+                pv2::cp_async_cg((int8_t*) &S.kv[st][warp][0][0][0] + swz(cell, pc * 16), p.k_q + off, ok);
+                pv2::cp_async_cg((int8_t*) &S.kv[st][warp][1][0][0] + swz(cell, pc * 16), p.v_q + off, ok);
             }
             ksr = r >= 0 ? f32_from_f16(p.k_scale[r * (HD / KV_Q8_GROUP) + warp]) : 0.0f;
             vsr = r >= 0 ? f32_from_f16(p.v_scale[r * (HD / KV_Q8_GROUP) + warp]) : 0.0f;
@@ -1728,7 +1711,7 @@ struct PromptAttnPtx {
             pv2::cp_async_commit();
             r_next = row_of(cell_next2);
             cell_next2 = cell_of((ci + 3) * CH + lane);
-            pv2::cp_async_wait1();
+            pv2::nv::cp_async_wait<1>();
             sycl::group_barrier(sg);
             const __attribute__((opencl_local)) int8_t* K = &S.kv[st][warp][0][0][0];
             const __attribute__((opencl_local)) int8_t* V = &S.kv[st][warp][1][0][0];
@@ -1742,8 +1725,8 @@ struct PromptAttnPtx {
                     uint32_t b[2];
                     b[0] = pv2::i8x2_to_h2(*reinterpret_cast<const uint16_t*>(K + swz(cell, kk * 16 + 2 * tig)));
                     b[1] = pv2::i8x2_to_h2(*reinterpret_cast<const uint16_t*>(K + swz(cell, kk * 16 + 2 * tig + 8)));
-                    pv2::mma16816(tg, qh[kk], b);
-                    pv2::mma16816(tg, ql[kk], b);
+                    pv2::nv::mma_f16<false>(tg, qh[kk], b[0], b[1]);
+                    pv2::nv::mma_f16<false>(tg, ql[kk], b[0], b[1]);
                 }
                 const int c = nt * 8 + 2 * tig;
                 const float s0 = S.sc[st][warp][0][c], s1 = S.sc[st][warp][0][c + 1];
@@ -1824,8 +1807,8 @@ struct PromptAttnPtx {
                         uint32_t b[2];
                         b[0] = pv2::i8x2_to_h2(x0);
                         b[1] = pv2::i8x2_to_h2(x1);
-                        pv2::mma16816(tmp[j], ah, b);
-                        pv2::mma16816(tmp[j], al, b);
+                        pv2::nv::mma_f16<false>(tmp[j], ah, b[0], b[1]);
+                        pv2::nv::mma_f16<false>(tmp[j], al, b[0], b[1]);
                     }
                 }
                 const float a0 = S.alpha[gid], a1 = S.alpha[gid + 8];

@@ -12,6 +12,7 @@
 #include "strata/core/gpu.hpp"
 
 #if STRATA_ONEMATH
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/rows_cols.hpp"
@@ -20,6 +21,8 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -534,6 +537,37 @@ bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
     (void) X; (void) W; (void) w_stride; (void) Y; (void) bounds; (void) G; (void) N; (void) K; (void) stream;
     return false;
 #endif
+}
+
+namespace {
+// the shapes warm on each GPU in the process (Gemm::native_warm)
+struct WarmShapes {
+    std::mutex mu;
+    std::set<std::tuple<int, int64_t, int64_t, int64_t>> of;
+};
+WarmShapes& warm_shapes(void* stream) {
+    static core::PerDevice<std::shared_ptr<WarmShapes>> per_device;
+    return *per_device.get(core::Runtime::get().stream(stream).get_device(),
+                           [] { return std::make_shared<WarmShapes>(); });
+}
+}  // namespace
+
+bool Gemm::native_cold(int ggml_type, int64_t N, int64_t K, int64_t ldy) const {
+    WarmShapes& w = warm_shapes(stream_);
+    std::lock_guard<std::mutex> lock(w.mu);
+    return ggml_type != 0 && w.of.count({ggml_type, N, K, ldy}) == 0;
+}
+
+bool Gemm::native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                       int64_t K, int64_t ldy) {
+    if (W_blocks == nullptr || ggml_type == 0) return false;
+    {
+        WarmShapes& w = warm_shapes(stream_);
+        std::lock_guard<std::mutex> lock(w.mu);
+        if (!w.of.insert({ggml_type, N, K, ldy}).second) return false;
+    }
+    native(X, ggml_type, W_blocks, Y, T, N, K, ldy);
+    return true;
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

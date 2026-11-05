@@ -109,6 +109,19 @@ inline void mad(sycl::sub_group, C& d, const A<E>& a, const B& b, const C& c) {
     }
 }
 
+// int8 (iq_mmq.cpp's products, the image engine's int8 attention): a lane's KN of A's row or B's column as bytes in
+// 32-bit words, the accumulator's eight int32 elements in the FP32 one's places
+using s8f = int __attribute__((ext_vector_type(KN / 4)));
+using iv8 = int __attribute__((ext_vector_type(8)));
+/// A . B + c, both operands signed int8
+inline iv8 mad_s8(const s8f& a, const s8f& b, const iv8& c) {
+#if defined(__GFX12__)
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#else
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#endif
+}
+
 // row-major: the accumulator's element (i, j) to p + i * ld + j
 template<typename P>
 inline void store(sycl::sub_group sg, const C& c, P p, size_t ld) {

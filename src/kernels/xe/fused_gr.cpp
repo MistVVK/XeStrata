@@ -12,7 +12,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
-#include "q8_1_finite.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
@@ -280,21 +280,9 @@ sycl::event gr_up_q8(sycl::queue& q, const GrMulti& m, const float* part, const 
                 // block is written here, a sub-group a token: native_quantize_q8_1's arithmetic on the same values
                 if (m.a[0].q8_mixed != nullptr) {
                     sycl::group_barrier(it.get_group());
-                    if (warp < T) {
-                        const float xi = mx[warp * COLS + lane];
-                        float amax = sycl::fabs(xi), sum = xi;
-                        for (int o = WARP / 2; o > 0; o >>= 1) {
-                            amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-                            sum += sycl::permute_group_by_xor(sg, sum, o);
-                        }
-                        const float d = xe::q8_1_finite(amax / 127.0f);
-                        uint8_t* blk = static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36;
-                        blk[4 + lane] = (uint8_t) xe::q8_1_quant(xi, d, amax);
-                        if (lane == 0) {
-                            const sycl::half2 ds(sycl::half(d), sycl::half(xe::q8_1_finite(sum)));
-                            *reinterpret_cast<sycl::half2*>(blk) = ds;
-                        }
-                    }
+                    if (warp < T)
+                        q8act::q8_1_block(sg, mx[warp * COLS + lane],
+                                          static_cast<uint8_t*>(tok(m, warp).q8_mixed) + (size_t) (d0 / 32) * 36, lane);
                 }
             }
         });
@@ -770,26 +758,8 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 
 void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void* stream) {
     if (nb <= 0) return;
-    // one sub-group a block: lane i takes value i, the block's max |x| by a butterfly
-    queue_for(stream).parallel_for(sycl::nd_range<1>((size_t) nb * WARP, WARP),
-                                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-        const sycl::sub_group sg = it.get_sub_group();
-        const int64_t b = (int64_t) it.get_group(0);
-        const int i = (int) sg.get_local_linear_id();
-        const float x = sycl::bit_cast<float>((uint32_t) src[b * 32 + i] << 16);
-        float amax = sycl::fabs(x);
-        for (int o = 16; o > 0; o >>= 1) amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, o));
-        const float d = amax / 127.0f;
-        const float id = d != 0.0f ? 1.0f / d : 0.0f;
-        uint8_t* blk = dst + b * 34;
-        blk[2 + i] = (uint8_t) (int8_t) sycl::round(x * id);
-        if (i == 0) {
-            const sycl::half h = (sycl::half) d;
-            const uint16_t hb = sycl::bit_cast<uint16_t>(h);
-            blk[0] = (uint8_t) (hb & 0xff);
-            blk[1] = (uint8_t) (hb >> 8);
-        }
-    });
+    // ggml's quantize_row_q8_0 of the BF16 values: one sub-group a block
+    q8act::quantize<1, q8act::Mul>(queue_for(stream), nb, 0, q8act::FlatBf16{src}, q8act::Q8_0<>{dst});
 }
 
 namespace {

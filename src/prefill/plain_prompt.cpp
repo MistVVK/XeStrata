@@ -287,27 +287,16 @@ bool PlainModel::prompt_warm_products(std::string& err) {
     // the RX 9060 XT: 0.5 s for the first product, 0.9 s more for the first of 32 rows): each dense shape the prompt
     // takes, once, on a chunk of zeros into the buffers the prompt overwrites.
     if (glm_) return true;   // GLM-5.3-Flash's first prompt loads its products' kernels itself
-    // A shape warmed once in the process on the GPU stays warm: a model opened again (MOSS-Image's text encoder, after
-    // each image) skips it, and a streamed layer whose shapes are all warm is not bound (the RTX 4070's 12 GB, the
-    // encoder with one layer resident: binding the other 31 to warm them took 3 s an image, 2026-11-05).
-    using Shape = std::tuple<int, int, int, int64_t>;
-    struct Warmed {
-        std::mutex mu;
-        std::set<Shape> of;
-    };
-    static PerDevice<std::shared_ptr<Warmed>> warmed_of;
-    Warmed& warmed = *warmed_of.get(Runtime::get().stream(cs_).get_device(), [] { return std::make_shared<Warmed>(); });
-    std::lock_guard<std::mutex> lock(warmed.mu);
+    // A shape warmed once in the process on the GPU stays warm (Gemm::native_warm): a model opened again
+    // (MOSS-Image's text encoder, after each image) skips it, and a streamed layer whose shapes are all warm is not
+    // bound (the RTX 4070's 12 GB, the encoder with one layer resident: binding the other 31 to warm them took 3 s
+    // an image, 2026-11-05).
     PromptBufs& P = pb_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     const int64_t T = P.T, HV = spec_.ssm_dt_rank;
-    std::set<Shape>& seen = warmed.of;
-    auto cold = [&](const W& w, int64_t ldy = 0) {
-        return w.type != 0 && seen.count({w.type, w.n_out, w.n_in, ldy}) == 0;
-    };
+    auto cold = [&](const W& w, int64_t ldy = 0) { return gm.native_cold(w.type, w.n_out, w.n_in, ldy); };
     auto warm = [&](const W& w, float* y, int64_t ldy = 0) {
-        if (w.data != nullptr && w.type != 0 && seen.insert({w.type, w.n_out, w.n_in, ldy}).second)
-            gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+        gm.native_warm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
     };
     try {
         if (!strata::gpu::memset_async(P.x16, 0, (size_t) (T * spec_.n_embd) * 2, cs_)) {

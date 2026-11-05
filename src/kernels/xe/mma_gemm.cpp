@@ -17,6 +17,7 @@
 // DP4a takes 20.  Loading the next step into registers while multiplying, to store it after, spilled (91-103 ms).
 #include "mma_gemm.hpp"
 #include "amd_wmma.hpp"
+#include "nv_mma.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "device_target.hpp"
 #include "strata/core/per_device.hpp"
@@ -72,32 +73,11 @@ constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 // m16n8k16, in PTX.  joint_matrix's CUDA loads read a 16 x 16 tile as 32-bit generic loads (four a lane, four times
 // the instructions of ldmatrix's), and the products of a 512 x 10240 x 2560 FP16 product ran at 46 TFLOP/s on the
 // RTX 4070 against cuBLAS's 60.  The sums are the same HMMA instructions in the same order.
-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(__SYCL_CUDA_ARCH__) && __SYCL_CUDA_ARCH__ >= 800
-#define STRATA_MMA_PTX 1
-inline uint32_t smem_addr(const void* p) {
-    uint32_t a;
-    asm("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }" : "=r"(a) : "l"(p));
-    return a;
-}
-inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
-}
-template<bool BF>
-inline void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    if constexpr (BF)   // NOLINT(bugprone-branch-clone): the asm strings differ (bf16, f16), which the check does not compare
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
-                     "{%8, %9}, {%0, %1, %2, %3};"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-    else
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
-                     "{%8, %9}, {%0, %1, %2, %3};"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-#else
-#define STRATA_MMA_PTX 0
+#define STRATA_MMA_PTX STRATA_NV_MMA
+#if STRATA_MMA_PTX
+using xe::nv::smem_addr;   // nv_mma.hpp
+using xe::nv::ldsm4;
+using xe::nv::mma_f16;
 #endif
 constexpr int PAD = 8;            // column-major B's row stride is KC + PAD (16-byte aligned rows)
 constexpr int VEC = 8;            // values a work-item copies at once (16 bytes)
@@ -351,8 +331,8 @@ struct Kernel {
                         for (int i = 0; i < SGM; ++i)
 #pragma unroll
                             for (int j = 0; j < SGN; ++j) {
-                                mma16816<BF>(pacc[i][2 * j], af[i], bf[j][0], bf[j][1]);
-                                mma16816<BF>(pacc[i][2 * j + 1], af[i], bf[j][2], bf[j][3]);
+                                mma_f16<BF>(pacc[i][2 * j], af[i], bf[j][0], bf[j][1]);
+                                mma_f16<BF>(pacc[i][2 * j + 1], af[i], bf[j][2], bf[j][3]);
                             }
                     }
                 }
