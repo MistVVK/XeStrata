@@ -38,12 +38,6 @@ constexpr uint64_t kTextWork = 1280 * kMiB;
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
-uint64_t free_vram() {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    return free;
-}
-
 // The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
 // (their code, their workspaces), other programs', and what the allocations take past their sizes.  The HIP runtime
 // takes a block of 1 to 2 MiB as 2 MiB and a larger one in steps of 2 MiB (the RX 9060 XT, ROCm 7.1 and 10.1,
@@ -298,11 +292,6 @@ uint64_t MossPipeline::held() const {
     return b;
 }
 
-void MossPipeline::fit(uint64_t reserve) {
-    const uint64_t have = held() + free_vram();
-    set_budget(have > reserve ? have - reserve : 0);
-}
-
 QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
                           const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                           const std::vector<LoraUse>& loras) {
@@ -344,11 +333,7 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
     nd.full = fixed + full.weight_bytes() + full.scratch_bytes() + full.block_bytes() +
               (states_given_ ? 0 : text_fixed() + te_layers_) + vis +
               std::max({full.activation_bytes(hw, n, max_text, 0, R), vae.scratch_bytes(h, w), base});
-    nd.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    nd.free = free;
-    nd.cap = vram_cap(total);
+    vram_into(nd);
     return nd;
 }
 
@@ -402,14 +387,9 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
-    int64_t mlp = 0;
     // an edit's references: their pass over the blocks takes the activations' rows too (set_refs; activation_bytes)
-    p.activations = hw > 0 ? d.activation_bytes(hw, n, max_text, 0, ref_rows_) : 0;
-    for (int64_t rows : {4096, 2048, 1024, 512}) {
-        if (hw == 0 || p.activations * 3 <= avail) break;
-        mlp = rows;
-        p.activations = d.activation_bytes(hw, n, max_text, rows, ref_rows_);
-    }
+    const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
+                                  [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows, ref_rows_); });
     if (avail < p.activations + dit_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is too small for this image");

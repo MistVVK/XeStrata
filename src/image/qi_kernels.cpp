@@ -3,8 +3,10 @@
 // src/image/qi_kernels.cpp - see include/strata/image/qi_kernels.hpp.
 
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/gelu.hpp"
 #include "dit_rows.hpp"
 
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
@@ -185,25 +187,31 @@ void rows_i8(const Src& src, int64_t rows, int64_t K, int8_t* q, float* s, void*
 
 }  // namespace qi_rows
 
-void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream) {
+void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream,
+                 const float* shift) {
     if (T <= 0) return;
-    constexpr size_t local = 256;
+    // a work-group a row: 128 lanes up to 512 channels (the VAEs' pixels), 256 past them (the DiTs' 3,072)
+    const size_t local = C <= 512 ? 128 : 256;
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) T * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
             const int64_t t = static_cast<int64_t>(it.get_group_linear_id()), lane = static_cast<int64_t>(it.get_local_linear_id());
             const float* r = x + t * C;
             float s = 0.f;
-            for (int64_t c = lane; c < C; c += local) s += r[c];
+            for (int64_t c = lane; c < C; c += (int64_t) local) s += r[c];
             const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
             float v = 0.f;
-            for (int64_t c = lane; c < C; c += local) {
+            for (int64_t c = lane; c < C; c += (int64_t) local) {
                 const float d = r[c] - mean;
                 v += d * d;
             }
             const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) /
                                                (float) C + kEps);
             const float* m = mod + (t < n_text ? C : 0);
-            for (int64_t c = lane; c < C; c += local) y16[t * C + c] = f16_from_f32((r[c] - mean) * inv * (1.f + m[c]));
+            for (int64_t c = lane; c < C; c += (int64_t) local) {
+                // one expression each, as the two kernels this replaced wrote them (the FMA they compile to)
+                y16[t * C + c] = f16_from_f32(shift != nullptr ? (r[c] - mean) * inv * (1.f + m[c]) + shift[c]
+                                                               : (r[c] - mean) * inv * (1.f + m[c]));
+            }
         });
     finish(stream, e, "qi_ln_mod16");
 }
@@ -331,7 +339,7 @@ void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream) {
     if (n <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
         const float v = x[i];
-        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v))));
+        y16[i] = f16_from_f32(gelu_tanh(v));
     });
     finish(stream, e, "qi_gelu16");
 }
@@ -432,6 +440,227 @@ void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t 
     finish(stream, e, "qi_im2col16");
 }
 
+namespace {
+// The GroupNorm(32) statistics (group_part and group_stats): a work-group a chunk of kGnChunk positions and
+// one of the 32 groups, the chunk sums reduced over at most kGnMaxChunk of them a work-group.  Every image VAE's
+// GroupNorm and HunyuanImage 3.0's entry and exit are the same reduction; only eps differs.
+constexpr int64_t kGnGroups = 32;      // every GroupNorm here: nn.GroupNorm(32, C)
+constexpr int64_t kGnChunk = 256;      // positions a chunk
+constexpr int64_t kGnMaxChunk = 256;   // chunks a reducer's work-group
+
+void group_part(const float* x, const float* mean, int64_t P, int64_t C, bool sq, float* part,
+                              void* stream) {
+    if (P <= 0) return;
+    const int64_t cg = C / kGnGroups, B = (P + kGnChunk - 1) / kGnChunk;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (B * kGnGroups * 32)), sycl::range<1>(32)), [=](sycl::nd_item<1> it) {
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const auto blk = static_cast<int64_t>(it.get_group_linear_id());
+            const int64_t b = blk / kGnGroups, g = blk - b * kGnGroups;
+            const int64_t p1 = std::min<int64_t>(P, (b + 1) * kGnChunk);
+            const float m = sq ? mean[g] : 0.f;
+            float a = 0.f, comp = 0.f;
+            for (int64_t p = b * kGnChunk + lane; p < p1; p += 32) {
+                const float* r = x + p * C + g * cg;
+                for (int64_t c = 0; c < cg; ++c) {
+                    const float d = r[c] - m;
+                    const float y = (sq ? d * d : d) - comp, t = a + y;
+                    comp = (t - a) - y;
+                    a = t;
+                }
+            }
+            a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
+            if (lane == 0) part[blk] = a;
+        });
+    (void) e;
+}
+
+void group_stats(const float* part, int64_t B, int64_t P, int64_t CG, float eps, bool sq,
+                               float* stats, float* mid, void* stream) {
+    const int64_t G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
+    if (G > 1) {
+        const auto e = queue_for(stream).parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (G * kGnGroups * 32)), sycl::range<1>(32)),
+            [=](sycl::nd_item<1> it) {
+                const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                const auto blk = static_cast<int64_t>(it.get_group_linear_id());
+                const int64_t gi = blk / kGnGroups, g = blk - gi * kGnGroups;
+                const int64_t b1 = std::min<int64_t>(B, (gi + 1) * kGnMaxChunk);
+                float a = 0.f, comp = 0.f;
+                for (int64_t b = gi * kGnMaxChunk + lane; b < b1; b += 32) {
+                    const float y = part[b * kGnGroups + g] - comp, t = a + y;
+                    comp = (t - a) - y;
+                    a = t;
+                }
+                a = sycl::reduce_over_group(it.get_group(), a, sycl::plus<float>());
+                if (lane == 0) mid[gi * kGnGroups + g] = a;
+            });
+        (void) e;
+        queue_for(stream).wait();   // the last level reads every group's entry
+    }
+    // one work-item a group, serial Kahan over the (at most kGnMaxChunk) entries of its slice, or over the B chunk
+    // sums themselves when they fit one reducer
+    const int64_t MG = G > 1 ? G : B;
+    const float* src = G > 1 ? mid : part;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) kGnGroups), [=](sycl::id<1> id) {
+        const auto g = static_cast<int64_t>(id[0]);
+        float a = 0.f, comp = 0.f;
+        for (int64_t i = 0; i < MG; ++i) {
+            const float y = src[i * kGnGroups + g] - comp, t = a + y;
+            comp = (t - a) - y;
+            a = t;
+        }
+        const float n = (float) P * (float) CG;   // FP32 here too (no device FP64): the sums are Kahan-folded
+        stats[g] = sq ? 1.0f / sycl::sqrt(a / n + eps) : a / n;   // and a 1e-7 share of a ratio is far under the
+    });                                                          // FP16 floor the convolutions set
+    (void) e;
+}
+// The group norm's statistics in one pass over x: chunks of kGnChunk pixels, a work-group a chunk whose lanes read
+// whole rows of channels (a lane one channel, R rows at a time: C R lanes), each lane its values' mean and squared
+// deviations, merged within each group (Chan's): part[(k kGnGroups + g) 3 + 0, 1, 2] = the count, the mean
+// and the squared deviations of chunk k's group g.  (A work-group a chunk and group, reading its C / 32 channels of
+// each pixel, and a second pass for the squares took MOSS-Image's VAE 64 ms of its 170 ms decode on the B70.)
+int64_t gn_chunks(int64_t HW) { return (HW + kGnChunk - 1) / kGnChunk; }
+int64_t gn_rows(int64_t C) { return sycl::max<int64_t>(1, 256 / C); }
+
+void gn_partial(const float* x, int64_t HW, int64_t C, float* part, void* s) {
+    const int64_t cg = C / kGnGroups, nk = gn_chunks(HW), R = gn_rows(C), local = C * R;
+    queue_for(s).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
+            lq(sycl::range<1>((size_t) local), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nk * local)), sycl::range<1>((size_t) local)),
+                       [=](sycl::nd_item<1> it) {
+            const auto k = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t r = lane / C, c = lane - r * C, p0 = k * kGnChunk, p1 = sycl::min(p0 + kGnChunk, HW);
+            // sums about the lane's first value (no division a value; the shift keeps them accurate in FP32)
+            const float k0 = p0 + r < p1 ? x[(p0 + r) * C + c] : 0.f;
+            float n = 0.f, s1 = 0.f, s2 = 0.f;
+            for (int64_t p = p0 + r; p < p1; p += R) {
+                const float d = x[p * C + c] - k0;
+                n += 1.f;
+                s1 += d;
+                s2 += d * d;
+            }
+            ln[lane] = n;
+            lm[lane] = n > 0.f ? k0 + s1 / n : 0.f;
+            lq[lane] = n > 0.f ? s2 - s1 * s1 / n : 0.f;
+            sycl::group_barrier(it.get_group());
+            if (lane < kGnGroups) {
+                float N = 0.f, M = 0.f, Q = 0.f;
+                for (int64_t rr = 0; rr < R; ++rr)
+                    for (int64_t j = 0; j < cg; ++j) {
+                        const int64_t e = rr * C + lane * cg + j;
+                        const float nb = ln[e];
+                        if (nb == 0.f) continue;
+                        const float t = N + nb, d = lm[e] - M;
+                        M += d * nb / t;
+                        Q += lq[e] + d * d * N * nb / t;
+                        N = t;
+                    }
+                float* o = part + (k * kGnGroups + lane) * 3;
+                o[0] = N;
+                o[1] = M;
+                o[2] = Q;
+            }
+        });
+    });
+}
+
+// stats[2 g] = group g's mean over every pixel, stats[2 g + 1] = 1 / its std, gn_partial's chunks merged (Chan's): a
+// work-group a group, each lane a stride of the chunks, then the lanes in a tree
+void gn_stats(const float* part, int64_t HW, int64_t C, float eps, float* mean, float* inv, void* s) {
+    (void) C;
+    constexpr int64_t local = 256;
+    const int64_t nk = gn_chunks(HW);
+    queue_for(s).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
+            lq(sycl::range<1>((size_t) local), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (kGnGroups * local)), sycl::range<1>((size_t) local)),
+                       [=](sycl::nd_item<1> it) {
+            const auto g = static_cast<int64_t>(it.get_group_linear_id());
+            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+            const auto merge = [](float& N, float& M, float& Q, float nb, float mb, float qb) {
+                if (nb == 0.f) return;
+                const float t = N + nb, d = mb - M;
+                M += d * nb / t;
+                Q += qb + d * d * N * nb / t;
+                N = t;
+            };
+            float N = 0.f, M = 0.f, Q = 0.f;
+            for (int64_t k = lane; k < nk; k += local) {
+                const float* e = part + (k * kGnGroups + g) * 3;
+                merge(N, M, Q, e[0], e[1], e[2]);
+            }
+            ln[lane] = N;
+            lm[lane] = M;
+            lq[lane] = Q;
+            for (int64_t half = local / 2; half > 0; half /= 2) {
+                sycl::group_barrier(it.get_group());
+                if (lane < half) {
+                    merge(N, M, Q, ln[lane + half], lm[lane + half], lq[lane + half]);
+                    ln[lane] = N;
+                    lm[lane] = M;
+                    lq[lane] = Q;
+                }
+            }
+            if (lane == 0) {
+                mean[g] = M;
+                inv[g] = 1.f / sycl::sqrt(Q / N + eps);
+            }
+        });
+    });
+}
+
+}  // namespace
+
+int64_t qi_group_norm_ws_floats(int64_t P) {
+    const int64_t B = (P + kGnChunk - 1) / kGnChunk, G = (B + kGnMaxChunk - 1) / kGnMaxChunk;
+    return 2 * kGnGroups + std::max((B + G) * kGnGroups, B * kGnGroups * 3);   // the two passes' sums, or the one's
+}
+
+void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
+                     uint16_t* y16, float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16) {
+    if (P <= 0) return;
+    if (C % kGnGroups != 0 || C % 8 != 0) throw std::invalid_argument("qi_group_norm16: C");
+    float* mean = ws, *inv = ws + kGnGroups, *part = ws + 2 * kGnGroups;
+    const int64_t B = (P + kGnChunk - 1) / kGnChunk, CG = C / kGnGroups;
+    // One pass where a pixel's channels fit a work-group's lanes (the VAEs' up to 1,024: the two passes took
+    // MOSS-Image's VAE 64 ms of its 170 ms decode on the B70), two (a mean, then the squares) past them (HunyuanImage
+    // 3.0's entry and exit, 4,096 channels)
+    static core::PerDevice<size_t> max_wg;
+    sycl::queue& q = queue_for(stream);
+    const size_t wg = max_wg.get(q.get_device(),
+                                 [&q] { return q.get_device().get_info<sycl::info::device::max_work_group_size>(); });
+    if ((size_t) (C * gn_rows(C)) <= wg) {
+        gn_partial(x, P, C, part, stream);
+        gn_stats(part, P, C, eps, mean, inv, stream);
+    } else {
+        float* mid = part + B * kGnGroups;
+        group_part(x, nullptr, P, C, false, part, stream);
+        group_stats(part, B, P, CG, eps, false, mean, mid, stream);
+        group_part(x, mean, P, C, true, part, stream);
+        group_stats(part, B, P, CG, eps, true, inv, mid, stream);
+    }
+    // 8 values a work-item, in one load and one store: a value each took 30 ms of MOSS-Image's decode on the B70
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C / 8)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % C;
+        const sycl::vec<float, 8> xv = *reinterpret_cast<const sycl::vec<float, 8>*>(x + i);
+        sycl::vec<uint16_t, 8> o, lo;
+        for (int j = 0; j < 8; ++j) {
+            const int64_t c = c0 + j, g = c / CG;
+            float v = (xv[j] - mean[g]) * inv[g] * w[c] + b[c];
+            if (scale != nullptr) v = v * (1.f + scale[c]) + shift[c];
+            if (silu) v = v / (1.f + sycl::exp(-v));
+            o[j] = f16_from_f32(v);
+            lo[j] = f16_from_f32(v - f32_from_f16(o[j]));
+        }
+        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(y16 + i) = o;
+        if (lo16 != nullptr) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(lo16 + i) = lo;
+    });
+    finish(stream, e, "qi_group_norm16");
+}
+
 void qi_softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* stream, int64_t ld) {
     if (rows <= 0) return;
     if (ld == 0) ld = n;
@@ -509,7 +738,7 @@ void qi_gelu_erf16(const float* x, int64_t n, uint16_t* y16, void* stream) {
     if (n <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
         const float v = x[i];
-        y16[i] = f16_from_f32(0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f)));
+        y16[i] = f16_from_f32(gelu_erf(v));
     });
     finish(stream, e, "qi_gelu_erf16");
 }

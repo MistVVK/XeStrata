@@ -7,7 +7,10 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/router_top10.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -194,10 +197,10 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         hunyuanimage3_add(out, sc.gu32, T * d.hidden, stream);
         // The router on the same FP32 norm (the gate runs float32 in the reference, and which experts a token
         // takes is a discrete choice no later rounding can undo).
-        hunyuanimage3_router_logits(sc.xn232, w.wg, T, d.hidden, d.experts, sc.logits, stream);
+        kernels::f32_gemm_rows(sc.xn232, d.hidden, w.wg, sc.logits, d.experts, d.hidden, d.experts, T, stream);
         // softmax, the top `topk`, renormalized over them (norm_topk_prob), and the rows grouped by expert, on the
         // device: only the experts' bounds come back, for the products' sizes
-        hunyuanimage3_router_topk(sc.logits, T, d.experts, d.topk, sc.d_idx, sc.d_tw, stream);
+        kernels::router_top10(sc.logits, (int) T, (int) d.experts, (int) d.topk, sc.d_idx, sc.d_tw, stream);
         hunyuanimage3_route_lists(sc.d_idx, sc.d_tw, T, d.topk, d.experts, sc.d_bounds, sc.d_rows, sc.d_w, sc.d_cursor,
                                   stream);
         gpu::device_sync();
@@ -208,7 +211,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
             const int64_t cnt = begin[(size_t) e + 1] - begin[(size_t) e];
             if (cnt == 0) continue;
             if (!experts.fill(e, sc.egu16, sc.edn16, err)) return false;
-            hunyuanimage3_gather16(sc.xr216, sc.d_rows + begin[(size_t) e], cnt, d.hidden, sc.gx16, stream);
+            prefill::gather_rows16(sc.xr216, sc.d_rows + begin[(size_t) e], sc.gx16, cnt, d.hidden, stream);
             gemm.f16(sc.gx16, sc.egu16, sc.eg32, cnt, w.egu_n, w.egu_k);
             hunyuanimage3_swiglu16_rotated(sc.eg32, cnt, d.inter, sc.gact16, stream);
             gemm.f16(sc.gact16, sc.edn16, sc.ed32, cnt, w.edn_n, w.edn_k);

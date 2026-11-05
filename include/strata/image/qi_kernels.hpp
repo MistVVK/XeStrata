@@ -14,8 +14,10 @@
 
 namespace strata::image {
 
-/// y16[t] = LayerNorm(x[t]) * (1 + mod[t < n_text][...]) (no affine, eps 1e-6), FP16.
-void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream);
+/// y16[t] = LayerNorm(x[t]) * (1 + mod[t < n_text][...]) (+ shift: the VAEs' modulation; no affine, eps 1e-6), FP16:
+/// the image engine's one modulated LayerNorm.
+void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream,
+                 const float* shift = nullptr);
 
 /// A W8A8 product's output left as its int32 sums (their bits in the FP32 array): value [t][n] = sum * sx[t] * sw[n].
 struct QiI8 {
@@ -162,6 +164,17 @@ void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_
 /// frames (3: the frames before and after, the 3D VAE's), k x k taps of stride s; C a multiple of 8.
 void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt, int k, int s, int pad,
                  int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream);
+
+/// The image engine's one GroupNorm(32): y16[p][c] = FP16(v), v = (x - mean[g]) * inv[g] * w[c] + b[c] over P
+/// positions of C channels (g = c / (C / 32), the statistics over every position and the group's channels: one
+/// pass of Chan's merges where a pixel's channels fit a work-group, two Kahan-folded passes past that), then
+/// v * (1 + scale[c]) + shift[c] with `scale` (a ResBlock's embedding), then silu;
+/// `lo16`: FP16(v - y16) too.  `ws`: qi_group_norm_ws_floats(P) floats, [0, 32) the means and [32, 64) the inverse
+/// deviations after.
+int64_t qi_group_norm_ws_floats(int64_t P);
+void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
+                     uint16_t* y16, float* ws, void* stream, const float* scale = nullptr, const float* shift = nullptr,
+                     uint16_t* lo16 = nullptr);
 
 /// p16[r][:ld] = FP16(softmax(scale sc[r][:n])) and zero past n, rows ld apart (0: n), FP32 statistics: a sub-group
 /// of 32 a row up to 1,024 columns (8 rows a work-group), a work-group of 256 a row past them.  The image engine's one

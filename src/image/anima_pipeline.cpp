@@ -34,12 +34,6 @@ sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
-uint64_t free_vram() {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    return free;
-}
-
 // RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque, as RGBA [4][H][W]
 // in 0 .. 1 (the VAE's encoder takes its first three channels)
 std::vector<float> base_rgba(const QiRef& f, int64_t W, int64_t H) {
@@ -207,11 +201,6 @@ uint64_t AnimaPipeline::held() const {
     return b;
 }
 
-void AnimaPipeline::fit(uint64_t reserve) {
-    const uint64_t have = held() + free_vram();
-    set_budget(have > reserve ? have - reserve : 0);
-}
-
 QiNeed AnimaPipeline::need(int64_t n_text, int64_t width, int64_t height,
                            const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                            const std::vector<LoraUse>& loras) {
@@ -234,11 +223,7 @@ QiNeed AnimaPipeline::need(int64_t n_text, int64_t width, int64_t height,
                std::max({dit.activation_bytes(hw, n, 512) + dit.block_min(), te, vae.scratch_min(), base});
     nd.full = fixed + full.weight_bytes() + full.scratch_bytes() + full.block_bytes() + te_size_->layer_bytes() +
               te_size_->activation_bytes(T) + std::max({full.activation_bytes(hw, n), vae.scratch_bytes(h, w), base});
-    nd.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    nd.free = free;
-    nd.cap = vram_cap(total);
+    vram_into(nd);
     return nd;
 }
 
@@ -286,13 +271,8 @@ QiPlan AnimaPipeline::plan(int64_t hw, int n, bool text) {
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
-    int64_t mlp = 0;
-    p.activations = hw > 0 ? d.activation_bytes(hw, n) : 0;
-    for (int64_t rows : {4096, 2048, 1024, 512}) {
-        if (hw == 0 || p.activations * 3 <= avail) break;
-        mlp = rows;
-        p.activations = d.activation_bytes(hw, n, rows);
-    }
+    const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
+                                  [&](int64_t rows) { return d.activation_bytes(hw, n, rows); });
     if (avail < p.activations + dit_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is too small for this image");

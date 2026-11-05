@@ -5504,8 +5504,7 @@ int main(int argc, char** argv) {
             free_b += (size_t) blas_bytes;   // the matrix library's VRAM is the reserve's (above)
             // --vram-free-mib: what was free at the start beyond it is not counted, so a start with a few MiB more
             // free gets the same cache
-            if (o.vram_free_mib >= 0 && start_free_b > ((size_t) o.vram_free_mib << 20))
-                free_b -= std::min(free_b, start_free_b - ((size_t) o.vram_free_mib << 20));
+            free_b = (size_t) strata::core::counted_free(free_b, start_free_b, o.vram_free_mib);
             // the draft layer's head and logits are allocated when it binds, after this: the CJK draft subset makes
             // them ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (upstream
             // b981f63)

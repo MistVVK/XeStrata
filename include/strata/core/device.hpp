@@ -12,6 +12,7 @@
 // runtime that discovers at token 4000 that it has overcommitted has already lost.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,13 @@ uint64_t max_alloc_limit_bytes();
 /// `free` and `total` as the engine sees them under STRATA_VRAM_LIMIT_MIB.  `held`: the bytes this process holds on the
 /// device, when the device's report may not show them yet.
 void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held = 0);
+/// The free VRAM a cache is sized from: `free` now, less what was free at the start (`free_at_start`) beyond
+/// `vram_free_mib` (setup's --vram-free-mib: a start with a few MiB more free gets the same cache; -1: all of it).
+inline uint64_t counted_free(uint64_t free, uint64_t free_at_start, int64_t vram_free_mib) {
+    if (vram_free_mib < 0) return free;
+    const uint64_t vf = (uint64_t) vram_free_mib << 20;
+    return free_at_start > vf ? free - std::min(free, free_at_start - vf) : free;
+}
 /// An integrated GPU's free memory: at most what Linux can give back, less STRATA_UMA_HEADROOM_GIB (default 6).
 void apply_uma_limit(uint64_t& free);
 /// A discrete GPU's free memory on Windows: at most what the OS's budget for this process leaves it

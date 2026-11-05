@@ -42,7 +42,6 @@ public:
     void set_budget(uint64_t bytes) override;
     uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     void release(bool all = false) override;
-    void fit(uint64_t reserve) override;
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,

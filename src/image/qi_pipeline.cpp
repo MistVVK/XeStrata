@@ -5,6 +5,7 @@
 #include "strata/image/qi_pipeline.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/img_start.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -40,12 +41,28 @@ void qi_ref_size(int64_t ref_w, int64_t ref_h, int64_t& w, int64_t& h) {
     h = std::max<int64_t>(32, (int64_t) std::nearbyint(vh / 32) * 32);
 }
 
+uint64_t free_vram() {
+    size_t free = 0, total = 0;
+    gpu::mem_info(&free, &total);
+    return free;
+}
+
+void ImagePipeline::fit(uint64_t reserve) {
+    const uint64_t have = held() + free_vram();
+    set_budget(have > reserve ? have - reserve : 0);
+}
+
+void ImagePipeline::vram_into(QiNeed& n) const {
+    size_t free = 0, total = 0;
+    gpu::mem_info(&free, &total);
+    n.held = held();
+    n.free = free;
+    n.cap = vram_cap(total);
+}
+
 uint64_t vram_cap(uint64_t total) {
     uint64_t cap = total > kMargin ? total - kMargin : 0;
-    if (const char* lim = std::getenv("STRATA_VRAM_LIMIT_MIB")) {
-        const uint64_t l = std::strtoull(lim, nullptr, 10) * kMiB;
-        if (l > 0) cap = std::min(cap, l > kMargin ? l - kMargin : 0);
-    }
+    if (const uint64_t l = core::vram_limit_bytes(); l > 0) cap = std::min(cap, l > kMargin ? l - kMargin : 0);
     return cap;
 }
 
@@ -99,13 +116,6 @@ uint64_t QiPipeline::held() const {
            te_->layers_vram() + dit_->activations_held() + vae_->scratch_held();
 }
 
-void QiPipeline::fit(uint64_t reserve) {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    const uint64_t have = held() + (uint64_t) free;
-    set_budget(have > reserve ? have - reserve : 0);
-}
-
 QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                         const std::vector<LoraUse>& loras) {
@@ -147,11 +157,7 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
     // the DiT's blocks resident (used 8 times an image), the encoder streamed (once a prompt), the VAE in one piece
     n.full = fixed + kv_all + dit.block_bytes() + te.layer_min() +
              std::max({dit.activation_bytes(T), vae.scratch_bytes(h, w), edit});
-    n.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    n.free = free;
-    n.cap = vram_cap(total);
+    vram_into(n);
     const uint64_t room = n.cap > n.least ? n.cap - n.least : 0;
     n.host = kv == 0 ? 0 : kv_all - std::min<uint64_t>(room / kv, (uint64_t) dit.blocks()) * kv;
     return n;
@@ -220,13 +226,8 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
                                                       " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = dit_->block_min(), te_min = te_->layer_min();
     // the DiT's activations, the MLP in bands of rows when the whole takes more than a third of what is there
-    int64_t mlp = 0;
-    p.activations = T > 0 ? dit_->activation_bytes(T) : 0;
-    for (int64_t rows : {4096, 2048, 1024, 512}) {
-        if (T == 0 || p.activations * 3 <= avail) break;
-        mlp = rows;
-        p.activations = dit_->activation_bytes(T, rows);
-    }
+    const int64_t mlp = mlp_bands(avail, T > 0, p.activations,
+                                  [&](int64_t rows) { return dit_->activation_bytes(T, rows); });
     // the room after the layers: the DiT's activations, and later the VAE's least (they take it in turn)
     // the encoder's buffers too: they come and go before the DiT's (generate frees them after the encode)
     const uint64_t work = std::max({p.activations, vae_->scratch_min(), te_->activation_bytes(n_ids)});

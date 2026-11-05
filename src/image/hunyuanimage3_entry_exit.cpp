@@ -28,6 +28,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/hunyuanimage3_host.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -86,7 +87,7 @@ uint64_t HunyuanImage3EntryExit::scratch_bytes(int64_t th, int64_t tw) const {
     b += (uint64_t) n * (uint64_t) latent_ * 4;       // vel32
     b += 2 * (uint64_t) hidden_ * 2;                  // emb16
     b += 2 * (uint64_t) hidden_ * 4;                  // es32: the widest embedding projection (2 * 4096)
-    b += (uint64_t) hunyuanimage3_group_ws_floats(n) * 4;
+    b += (uint64_t) qi_group_norm_ws_floats(n) * 4;
     return b;
 }
 
@@ -140,7 +141,7 @@ bool HunyuanImage3EntryExit::set_grid(int64_t th, int64_t tw, std::string& err) 
         vel32_ = static_cast<float*>(dev(n * latent_ * 4, "the velocity"));
         emb16_ = static_cast<uint16_t*>(dev(2 * hidden_ * 2, "the timestep embedding"));
         es32_ = static_cast<float*>(dev(2 * hidden_ * 4, "the embedding projection"));
-        gn_ws_ = static_cast<float*>(dev(hunyuanimage3_group_ws_floats(n) * 4, "the norms' statistics"));
+        gn_ws_ = static_cast<float*>(dev(qi_group_norm_ws_floats(n) * 4, "the norms' statistics"));
     } catch (const std::exception& e) {
         release_grid();
         err = e.what();
@@ -407,16 +408,9 @@ void HunyuanImage3EntryExit::conv1x1(const Conv& c, const uint16_t* in16, int64_
 
 void HunyuanImage3EntryExit::norm(const float* x, const Gn& g, const float* scale, const float* shift, int64_t P,
                                   uint16_t* y16, const char* tag) {
-    float* mean = gn_ws_, *inv = gn_ws_ + 32, *part = gn_ws_ + 64;
-    const int64_t B = (P + 255) / 256;   // the kernels' chunk of positions
-    float* mid = part + B * 32;
-    hunyuanimage3_group_part(x, nullptr, P, g.c, false, part, s_);
-    hunyuanimage3_group_stats(part, B, P, g.c / 32, kGnEps, false, mean, mid, s_);
-    hunyuanimage3_group_part(x, mean, P, g.c, true, part, s_);
-    hunyuanimage3_group_stats(part, B, P, g.c / 32, kGnEps, true, inv, mid, s_);
-    dump(stage_ + "_" + tag + "_mean", mean, 32);
-    dump(stage_ + "_" + tag + "_inv", inv, 32);
-    hunyuanimage3_group_apply16(x, mean, inv, g.w, g.b, scale, shift, P, g.c, true, y16, s_, y16 + P * g.c);
+    qi_group_norm16(x, P, g.c, g.w, g.b, kGnEps, true, y16, gn_ws_, s_, scale, shift, y16 + P * g.c);
+    dump(stage_ + "_" + tag + "_mean", gn_ws_, 32);
+    dump(stage_ + "_" + tag + "_inv", gn_ws_ + 32, 32);
     dump16(stage_ + "_" + tag + "_y16", y16, P * g.c);
 }
 

@@ -82,7 +82,7 @@ void rep_add(float* x, const float* tok, int64_t HW, int64_t O, int64_t I, void*
     });
 }
 
-// The group norm's statistics are the kernels' (hunyuanimage3_group_part and -stats): deterministic as the golden's
+// The group norm's statistics are qi_group_norm16's: deterministic as the golden's
 // comparisons need one.  The workspace they take is sized for the most positions one GroupNorm here can span.
 constexpr int64_t kMaxGnPositions = (int64_t) 256 * 256 * 256;   // 16.7 M positions
 constexpr int64_t kWsFloats = 2 * kGroups + (kMaxGnPositions / 256 + kMaxGnPositions / 256 / 256) * kGroups;
@@ -407,16 +407,8 @@ void HunyuanImage3Vae::conv(const Conv& c, const uint16_t* in16, int64_t T, int6
 // one GroupNorm(32, eps 1e-6) over P pixels of C channels and the swish after it (when `silu`), FP16 out
 void HunyuanImage3Vae::groupnorm(const float* x, const float* g, const float* b, int64_t P, int64_t C, bool silu,
                                  uint16_t* y16, const std::string& tag) {
-    float* mean = gn_ws_, *inv = gn_ws_ + kGroups, *part = gn_ws_ + 2 * kGroups;
-    const int64_t B = (P + 255) / 256;   // the kernels' chunk of positions
-    float* mid = part + B * kGroups;
-    hunyuanimage3_group_part(x, nullptr, P, C, false, part, s_);
-    hunyuanimage3_group_stats(part, B, P, C / kGroups, kEps, false, mean, mid, s_);
-    if (!tag.empty()) dump_stage(0, tag + "_stats", gn_ws_, 2 * kGroups);
-    hunyuanimage3_group_part(x, mean, P, C, true, part, s_);
-    hunyuanimage3_group_stats(part, B, P, C / kGroups, kEps, true, inv, mid, s_);
-    if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);
-    hunyuanimage3_group_apply16(x, mean, inv, g, b, nullptr, nullptr, P, C, silu, y16, s_);
+    qi_group_norm16(x, P, C, g, b, kEps, silu, y16, gn_ws_, s_);
+    if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);   // the means, then the inverse deviations
 }
 
 // GN -> swish -> conv1 -> GN -> swish -> conv2 -> + x.  The channels are equal in and out in every block of

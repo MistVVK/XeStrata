@@ -13,6 +13,7 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/image/gelu.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -66,7 +67,7 @@ struct Gelu {
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const {
         const float v = x.at(t, c);
-        return 0.5f * v * (1.f + sycl::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+        return gelu_tanh(v);
     }
     // |GELU(v)| <= v for v >= 0 and below 0.17 for v < 0: the row's scale without a tanh more a value (a power of two
     // at most one step larger, which costs FP16 nothing)
@@ -381,54 +382,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
 }
 
 std::pair<double, double> MfDit::time_forms(int64_t rows) const {
-    const int64_t T = rows, K = C_, N = F_;
-    if (T <= 0 || K <= 0 || N <= 0) return {0.0, 0.0};
-    std::vector<void*> held;
-    auto get = [&](size_t bytes) -> void* {
-        void* p = nullptr;
-        if (!gpu::alloc_device(&p, bytes)) return nullptr;
-        held.push_back(p);
-        gpu::memset_async(p, 0, bytes, s_);
-        return p;
-    };
-    auto best = [&](const std::function<void()>& run) {
-        double t = 1e30;
-        for (int i = 0; i < 4; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            run();
-            if (!gpu::stream_sync(s_)) return 0.0;
-            if (i > 0) t = std::min(t, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        }
-        return t;
-    };
-    double f16 = 0.0, w8 = 0.0;
-    try {
-        auto* x16 = static_cast<uint16_t*>(get((size_t) (T * K) * 2));
-        auto* w16 = static_cast<uint16_t*>(get((size_t) (N * K) * 2));
-        auto* y = static_cast<float*>(get((size_t) (T * N) * 4));
-        prefill::Gemm g;
-        std::string err;
-        if (x16 != nullptr && w16 != nullptr && y != nullptr && g.init(s_, 0, err))
-            f16 = best([&] { g.f16(x16, w16, y, T, N, K); });
-        if (x16 != nullptr && y != nullptr && prefill::Gemm::i8_usable(s_)) {
-            auto* x8 = static_cast<int8_t*>(get((size_t) (T * K)));
-            auto* w8p = static_cast<int8_t*>(get((size_t) (N * K)));
-            auto* sx = static_cast<float*>(get((size_t) T * 4));
-            auto* sw = static_cast<float*>(get((size_t) N * 4));
-            if (x8 != nullptr && w8p != nullptr && sx != nullptr && sw != nullptr)
-                w8 = best([&] {
-                    qi_rows_i8(x16, false, T, K, x8, sx, nullptr, s_);
-                    prefill::Gemm::i8(x8, w8p, reinterpret_cast<int32_t*>(y), T, N, K, N, s_);
-                    qi_i8_scale(y, T, N, N, sx, sw, nullptr, nullptr, s_);
-                });
-        }
-    } catch (const std::exception& e) {   // a form the library could not run: the 8-bit one is not chosen
-        std::fprintf(stderr, "image engine: timing Mage-Flow's DiT in 16 and 8 bits: %s (16 bits kept)\n", e.what());
-        w8 = 0.0;
-    }
-    gpu::stream_sync(s_);
-    for (void* p : held) gpu::free(p);
-    return {f16, w8};
+    return time_w8_f16(rows, C_, F_, "Mage-Flow's DiT", s_);
 }
 
 // Each block's weights, as they reach the GPU (resident, or a streamed slot): bf16 to FP16 (the FP16 blocks), and the

@@ -176,13 +176,6 @@ void HunyuanImage3Pipeline::release(bool all) {
     banks_set_ = dit_->bank_min();
 }
 
-void HunyuanImage3Pipeline::fit(uint64_t reserve) {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    const uint64_t have = held() + (uint64_t) free;
-    set_budget(have > reserve ? have - reserve : 0);
-}
-
 uint64_t HunyuanImage3Pipeline::held() const {
     if (dit_ == nullptr || vae_ == nullptr) return 0;
     return dit_->held() + vae_->weight_bytes() + vae_->scratch_held() + (around_ ? around_->held() : 0) +
@@ -414,11 +407,7 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
     // turn - the decode runs after the walk gives them back.  full: every bank resident as well, both buffers kept.
     n.least = fixed + dit_size_->bank_min() + std::max(act, vae_least);
     n.full = fixed + dit_size_->bank_bytes() + act + vae;
-    n.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    n.free = free;
-    n.cap = vram_cap(total);
+    vram_into(n);
     const uint64_t room = n.cap > fixed + std::max(act, vae) ? n.cap - fixed - std::max(act, vae) : 0;
     n.host = dit_size_->bank_bytes() - std::min(dit_size_->bank_bytes(), room);
     return n;

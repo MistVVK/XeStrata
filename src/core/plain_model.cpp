@@ -475,8 +475,7 @@ bool PlainModel::split_auto_points(std::string& err) {
         const OnDevice on(split_devs_[(size_t) d]);
         size_t f = 0, t = 0;
         if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: a GPU's memory is unknown"; return false; }
-        uint64_t free_b = f, total_b = t;
-        apply_vram_limit(free_b, total_b);
+        const uint64_t free_b = f, total_b = t;   // (mem_info applies STRATA_VRAM_LIMIT_MIB)
         const uint64_t reserve = std::clamp<uint64_t>(total_b / 32, 192ull << 20, 768ull << 20) + (1ull << 30) +
                                  (d == n - 1 ? head : 0);
         room[(size_t) d] = free_b > reserve ? (double) (free_b - reserve) : 0.0;
@@ -1187,8 +1186,7 @@ bool PlainModel::open_experts(std::string& err) {
         if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
         free_b = f;
         total_b_ = t;
-        apply_vram_limit(free_b, total_b_);
-        if (opt_.vram_free_mib >= 0) free_b = std::min<uint64_t>(free_b, (uint64_t) opt_.vram_free_mib << 20);
+        free_b = counted_free(free_b, free_b, opt_.vram_free_mib);   // (mem_info applies STRATA_VRAM_LIMIT_MIB)
     }
     // the prompt path's host buffers, for its longest chunk; the device ones are borrowed from the tier a prompt at a
     // time (prompt_borrow), so the tier is sized from all the free memory
@@ -1415,8 +1413,7 @@ bool PlainModel::open_dense(std::string& err) {
         if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
         free_b = f;
         total_b_ = t;
-        apply_vram_limit(free_b, total_b_);
-        if (opt_.vram_free_mib >= 0) free_b = std::min<uint64_t>(free_b, (uint64_t) opt_.vram_free_mib << 20);
+        free_b = counted_free(free_b, free_b, opt_.vram_free_mib);   // (mem_info applies STRATA_VRAM_LIMIT_MIB)
     }
     // what is allocated after (the products' libraries, the graphs) and the driver's margin, as open_experts leaves
     const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20

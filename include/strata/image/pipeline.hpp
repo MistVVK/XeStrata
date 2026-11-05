@@ -135,7 +135,7 @@ public:
     /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
     virtual void release(bool all = false) = 0;
     /// The budget set to what the engine holds and the VRAM free now, less `reserve` (another program's room).
-    virtual void fit(uint64_t reserve) = 0;
+    virtual void fit(uint64_t reserve);
     /// What the engine holds on the GPU now (an estimate of its own buffers).
     virtual uint64_t held() const = 0;
     /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
@@ -167,10 +167,31 @@ public:
                                           const std::function<void(const char*)>& stage = {}) = 0;
 
 protected:
+    /// n's held, free and cap: what the engine holds, the device's free VRAM and vram_cap of its memory (the end of
+    /// every model's need)
+    void vram_into(QiNeed& n) const;
+
     bool lora_bake_ = true;
 };
 
 /// The most the engine could have: a device's memory less the driver's margin, within STRATA_VRAM_LIMIT_MIB.
 uint64_t vram_cap(uint64_t total);
+/// The device's free VRAM now (gpu::mem_info).
+uint64_t free_vram();
+
+/// A plan's DiT MLP in bands of rows (4096 .. 512) while its activations take more than a third of `avail` ->
+/// the rows (0: the whole MLP at once), `activations` the bytes with them; `act(rows)` the activations' bytes with
+/// bands of `rows` (0: none), `any` false (no image rows): no activations.
+template <class F>
+int64_t mlp_bands(uint64_t avail, bool any, uint64_t& activations, const F& act) {
+    activations = any ? act(0) : 0;
+    int64_t mlp = 0;
+    for (int64_t rows : {4096, 2048, 1024, 512}) {
+        if (!any || activations * 3 <= avail) break;
+        mlp = rows;
+        activations = act(rows);
+    }
+    return mlp;
+}
 
 }  // namespace strata::image

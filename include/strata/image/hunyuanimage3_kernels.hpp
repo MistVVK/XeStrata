@@ -64,9 +64,6 @@ void hunyuanimage3_qk_rope_norm16(const float* qkv, const float* wq, const float
 /// product's rotated input in one pass.  gu [T][2 inter], out16 [T][inter]; inter is a multiple of 256.
 void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, uint16_t* out16, void* stream);
 
-/// out16[i][:] = x16[rows[i]][:], K FP16 values: the tokens one expert took, gathered for its product.
-void hunyuanimage3_gather16(const uint16_t* x16, const int32_t* rows, int64_t n_rows, int64_t K, uint16_t* out16,
-                  void* stream);
 
 /// x[rows[i]][:] += w[i] * y[i][:], rows of C: one expert's outputs back into the tokens, by their gate weights.
 void hunyuanimage3_scatter_scale_add(float* x, const float* y, const float* w, const int32_t* rows, int64_t n_rows, int64_t C,
@@ -95,42 +92,10 @@ void hunyuanimage3_im2col16(const uint16_t* in16, int64_t H, int64_t W, int64_t 
 /// y[r][:] += b[:], rows of N (a convolution's or a linear's bias over its product's FP32 output).
 void hunyuanimage3_bias_add32(float* y, const float* b, int64_t rows, int64_t N, void* stream);
 
-/// The FP32 floats `hunyuanimage3_group_norm16` takes for `P` positions: the mean, the inverse deviation, the
-/// chunk sums (32 groups of each of ceil(P / 256) chunks) and the reducers' level above them.
-int64_t hunyuanimage3_group_ws_floats(int64_t P);
-
-/// part[b * 32 + g] = group g's sum over chunk b of `P` positions of `C` channels, Kahan-folded with 32 lanes
-/// over the chunk's pixels (`sq`: of the squares about `mean`, which `mean` then holds): the first pass of a
-/// GroupNorm(32).  A group's statistics span a whole tensor, so the VAE's span its time axis too.
-void hunyuanimage3_group_part(const float* x, const float* mean, int64_t P, int64_t C, bool sq, float* part,
-                              void* stream);
-
-/// The chunk sums reduced to the mean (a / (P * CG)), or with `sq` to 1 / sqrt(var + eps) - the eps the caller's
-/// GroupNorm has (the VAE's 1e-6, the entry and the exit's 1e-5).
-void hunyuanimage3_group_stats(const float* part, int64_t B, int64_t P, int64_t CG, float eps, bool sq,
-                               float* stats, float* mid, void* stream);
-
-/// y16[p][c] = FP16(v) with v = (x - mean[g]) * inv[g] * w[c] + b[c] (g = c / CG, the affine nn.GroupNorm
-/// applies), then v = v * (1 + scale[c]) + shift[c] when `scale` is given (a ResBlock's embedding), then silu.
-void hunyuanimage3_group_apply16(const float* x, const float* mean, const float* inv, const float* w,
-                                 const float* b, const float* scale, const float* shift, int64_t P, int64_t C,
-                                 bool silu, uint16_t* y16, void* stream, uint16_t* lo16 = nullptr);
-
 /// dst16[:] = src16[:], n values: a meta token's row overwritten by its embedder's output.
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream);
 
-/// logits[t][e] = x[t][:] . w[e][:] (rows of C by E rows of C): the router, which decides where every token goes, so
-/// it keeps FP32 all the way in (`kernels::rms_norm_rows` to FP32) and sums over 32 lanes' partial sums (FP32, the
-/// reference's type; no FP64, which not every GPU has).  A FP16 operand there swaps near-tied experts and costs a
-/// few percent of the layer's output.
-void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, int64_t C, int64_t E, float* logits,
-                       void* stream);
 
-/// idx[t][j], wt[t][j] (j < K, at most 32): the K largest of token t's E logits in order (the lower expert first on
-/// a tie) and their softmax renormalized over the K - the reference's softmax, top-k and norm_topk_prob, whose full
-/// denominator cancels.
-void hunyuanimage3_router_topk(const float* logits, int64_t T, int64_t E, int64_t K, int32_t* idx, float* wt,
-                               void* stream);
 
 /// The routed rows grouped by expert: bounds[e] .. bounds[e + 1] (E + 1, from 0) of rows and w are expert e's tokens
 /// (in the order the device's atomics give, which changes no row's product) and their weights; `cursor` (E) is the

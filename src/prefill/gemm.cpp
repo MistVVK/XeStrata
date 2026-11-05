@@ -10,19 +10,15 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
-
-#if STRATA_ONEMATH
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+
+#if STRATA_ONEMATH
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/rows_cols.hpp"
 #include <oneapi/math/blas.hpp>
 #include <filesystem>
 #include <future>
-#include <memory>
-#include <mutex>
-#include <set>
-#include <tuple>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -36,7 +32,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 
 namespace strata::prefill {
 

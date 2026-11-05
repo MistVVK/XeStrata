@@ -8,6 +8,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/image/gelu.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -67,123 +68,6 @@ void release(std::vector<void*>& owned, void* p) {
 
 float silu(float x) { return x / (1.f + std::exp(-x)); }
 
-// The group norm's statistics in one pass over x: chunks of kGnChunk pixels, a work-group a chunk whose lanes read
-// whole rows of channels (a lane one channel, R rows at a time: C R lanes), each lane its values' mean and squared
-// deviations, merged within each group (Chan's): part[(k kGroups + g) 3 + 0, 1, 2] = the count, the mean
-// and the squared deviations of chunk k's group g.  (A work-group a chunk and group, reading its C / 32 channels of
-// each pixel, and a second pass for the squares took MOSS-Image's VAE 64 ms of its 170 ms decode on the B70.)
-constexpr int64_t kGnChunk = 256;
-int64_t gn_chunks(int64_t HW) { return (HW + kGnChunk - 1) / kGnChunk; }
-int64_t gn_rows(int64_t C) { return sycl::max<int64_t>(1, 256 / C); }
-
-void gn_partial(const float* x, int64_t HW, int64_t C, float* part, void* s) {
-    const int64_t cg = C / kGroups, nk = gn_chunks(HW), R = gn_rows(C), local = C * R;
-    q_of(s).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
-            lq(sycl::range<1>((size_t) local), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (nk * local)), sycl::range<1>((size_t) local)),
-                       [=](sycl::nd_item<1> it) {
-            const auto k = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t r = lane / C, c = lane - r * C, p0 = k * kGnChunk, p1 = sycl::min(p0 + kGnChunk, HW);
-            // sums about the lane's first value (no division a value; the shift keeps them accurate in FP32)
-            const float k0 = p0 + r < p1 ? x[(p0 + r) * C + c] : 0.f;
-            float n = 0.f, s1 = 0.f, s2 = 0.f;
-            for (int64_t p = p0 + r; p < p1; p += R) {
-                const float d = x[p * C + c] - k0;
-                n += 1.f;
-                s1 += d;
-                s2 += d * d;
-            }
-            ln[lane] = n;
-            lm[lane] = n > 0.f ? k0 + s1 / n : 0.f;
-            lq[lane] = n > 0.f ? s2 - s1 * s1 / n : 0.f;
-            sycl::group_barrier(it.get_group());
-            if (lane < kGroups) {
-                float N = 0.f, M = 0.f, Q = 0.f;
-                for (int64_t rr = 0; rr < R; ++rr)
-                    for (int64_t j = 0; j < cg; ++j) {
-                        const int64_t e = rr * C + lane * cg + j;
-                        const float nb = ln[e];
-                        if (nb == 0.f) continue;
-                        const float t = N + nb, d = lm[e] - M;
-                        M += d * nb / t;
-                        Q += lq[e] + d * d * N * nb / t;
-                        N = t;
-                    }
-                float* o = part + (k * kGroups + lane) * 3;
-                o[0] = N;
-                o[1] = M;
-                o[2] = Q;
-            }
-        });
-    });
-}
-
-// stats[2 g] = group g's mean over every pixel, stats[2 g + 1] = 1 / its std, gn_partial's chunks merged (Chan's): a
-// work-group a group, each lane a stride of the chunks, then the lanes in a tree
-void gn_stats(const float* part, int64_t HW, int64_t C, float* stats, void* s) {
-    (void) C;
-    constexpr int64_t local = 256;
-    const int64_t nk = gn_chunks(HW);
-    q_of(s).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
-            lq(sycl::range<1>((size_t) local), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (kGroups * local)), sycl::range<1>((size_t) local)),
-                       [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const auto merge = [](float& N, float& M, float& Q, float nb, float mb, float qb) {
-                if (nb == 0.f) return;
-                const float t = N + nb, d = mb - M;
-                M += d * nb / t;
-                Q += qb + d * d * N * nb / t;
-                N = t;
-            };
-            float N = 0.f, M = 0.f, Q = 0.f;
-            for (int64_t k = lane; k < nk; k += local) {
-                const float* e = part + (k * kGroups + g) * 3;
-                merge(N, M, Q, e[0], e[1], e[2]);
-            }
-            ln[lane] = N;
-            lm[lane] = M;
-            lq[lane] = Q;
-            for (int64_t half = local / 2; half > 0; half /= 2) {
-                sycl::group_barrier(it.get_group());
-                if (lane < half) {
-                    merge(N, M, Q, ln[lane + half], lm[lane + half], lq[lane + half]);
-                    ln[lane] = N;
-                    lm[lane] = M;
-                    lq[lane] = Q;
-                }
-            }
-            if (lane == 0) {
-                stats[2 * g] = M;
-                stats[2 * g + 1] = 1.f / sycl::sqrt(Q / N + kEps);
-            }
-        });
-    });
-}
-
-void gn_apply16(const float* x, const float* stats, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
-                uint16_t* y16, void* s) {
-    // 8 values a work-item, in one load and one store (C is a multiple of 32): a value each took 30 ms of MOSS-Image's
-    // decode on the B70
-    const int64_t cg = C / kGroups;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C / 8)), [=](sycl::id<1> id) {
-        const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % C;
-        const sycl::vec<float, 8> v = *reinterpret_cast<const sycl::vec<float, 8>*>(x + i);
-        sycl::vec<uint16_t, 8> o;
-        for (int j = 0; j < 8; ++j) {
-            const int64_t c = c0 + j, g = c / cg;
-            float u = (v[j] - stats[2 * g]) * stats[2 * g + 1] * w[c] + b[c];
-            if (silu_on) u = u / (1.f + sycl::exp(-u));
-            o[j] = f16_from_f32(u);
-        }
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(y16 + i) = o;
-    });
-}
-
 // a window's q, k (rows: its 32 x 32 positions, the latent's edge replicated past it) and v transposed ([C][1024]),
 // from qkv [HW][3 C]
 void win_gather16(const float* qkv, int64_t H, int64_t W, int64_t C, int64_t wy, int64_t wx, uint16_t* q16,
@@ -209,26 +93,9 @@ void win_scatter(const float* o, int64_t H, int64_t W, int64_t C, int64_t wy, in
     });
 }
 
-// y16[p] = LayerNorm(x[p]) over the channels (no affine) * (1 + scale) + shift: a work-group a pixel, its lanes over
-// the channels (a work-item a pixel, walking its channels three times, left the 4096 pixels of a 1024 x 1024 image's
-// latent too little to run at once)
+// y16[p] = LayerNorm(x[p]) over the channels (no affine) * (1 + scale) + shift: qi_ln_mod16's
 void ln_mod16(const float* x, const float* shift, const float* scale, int64_t HW, int64_t C, uint16_t* y16, void* s) {
-    constexpr size_t local = 128;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) HW * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto p = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* r = x + p * C;
-        float m = 0.f;
-        for (int64_t c = lane; c < C; c += (int64_t) local) m += r[c];
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::plus<float>()) / (float) C;
-        float v = 0.f;
-        for (int64_t c = lane; c < C; c += (int64_t) local) v += (r[c] - m) * (r[c] - m);
-        const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) / (float) C +
-                                           kEps);
-        for (int64_t c = lane; c < C; c += (int64_t) local)
-            y16[p * C + c] = f16_from_f32((r[c] - m) * inv * (1.f + scale[c]) + shift[c]);
-    });
+    qi_ln_mod16(x, scale, 0, HW, C, y16, s, shift);
 }
 
 // out = GELU(depthwise 3 x 3 convolution of t (zero outside) + bias), the exact (erf) GELU
@@ -243,7 +110,7 @@ void dw3x3_gelu(const float* t, const float* w, const float* b, int64_t H, int64
                 if (yy >= 0 && yy < H && xx >= 0 && xx < W)
                     a += w[c * 9 + (dy + 1) * 3 + dx + 1] * t[(yy * W + xx) * C + c];
             }
-        out[i] = 0.5f * a * (1.f + sycl::erf(a * 0.70710678118654752f));
+        out[i] = gelu_erf(a);
     });
 }
 
@@ -814,9 +681,7 @@ void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, f
 
 void MfVae::gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
                       uint16_t* y16) {
-    gn_partial(x, HW, C, gn_part_, s_);
-    gn_stats(gn_part_, HW, C, vec_, s_);
-    gn_apply16(x, vec_, w, b, HW, C, silu_on, y16, s_);
+    qi_group_norm16(x, HW, C, w, b, kEps, silu_on, y16, gn_part_, s_);
 }
 
 void MfVae::resblock(const Res& r, float*& x, int64_t H, int64_t W) {

@@ -269,13 +269,6 @@ void MfPipeline::use_loras(const QiRequest& r) {
     }
 }
 
-void MfPipeline::fit(uint64_t reserve) {
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    const uint64_t have = held() + (uint64_t) free;
-    set_budget(have > reserve ? have - reserve : 0);
-}
-
 QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                         const std::vector<LoraUse>& loras) {
@@ -315,11 +308,7 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
                dit.block_min() + te.layer_min();
     nd.full = fixed - dit.weight_bytes() + full.weight_bytes() + full.block_bytes() + te.layer_min() + lora +
               std::max({full.activation_bytes(hw, n, max_text), vae.scratch_bytes(h, w), te_act, edit});
-    nd.held = held();
-    size_t free = 0, total = 0;
-    gpu::mem_info(&free, &total);
-    nd.free = free;
-    nd.cap = vram_cap(total);
+    vram_into(nd);
     return nd;
 }
 
@@ -384,13 +373,8 @@ QiPlan MfPipeline::plan(int64_t hw, int n, int64_t max_text, int64_t n_ids) {
                                  " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min(), te_min = te_->layer_min();
     // the DiT's activations, the MLP in bands of rows when the whole takes more than a third of what is there
-    int64_t mlp = 0;
-    p.activations = hw > 0 ? d.activation_bytes(hw, n, max_text) : 0;
-    for (int64_t rows : {4096, 2048, 1024, 512}) {
-        if (hw == 0 || p.activations * 3 <= avail) break;
-        mlp = rows;
-        p.activations = d.activation_bytes(hw, n, max_text, rows);
-    }
+    const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
+                                  [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows); });
     const uint64_t work = std::max(p.activations, te_->activation_bytes(n_ids));
     if (avail < work + dit_min + te_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +

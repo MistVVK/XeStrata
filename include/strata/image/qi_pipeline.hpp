@@ -51,7 +51,6 @@ public:
     ~QiPipeline() override;
     /// The budget set to what the engine holds and the VRAM free now, less `reserve` (another program's room): taken
     /// before a request when the GPU's memory is shared.
-    void fit(uint64_t reserve) override;
     /// What the engine holds on the GPU now (an estimate of its own buffers).
     uint64_t held() const override;
 

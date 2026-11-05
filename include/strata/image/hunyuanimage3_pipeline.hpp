@@ -80,7 +80,6 @@ public:
     /// stay: the next request loads banks, not the model).  `all`: the parts themselves - the next request opens
     /// them again, which for this model means re-dequantizing its dense products.
     void release(bool all = false) override;
-    void fit(uint64_t reserve) override;
     uint64_t held() const override;
 
     /// The model's own warm-up: a 64 x 64 image of one step, the sequence its trim and positions take - the
