@@ -88,7 +88,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                 win[j] = src < 3 ? history[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
             }
             const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
-            const float sum = v0 * conv_w[c * 4] + v1 * conv_w[c * 4 + 1] + v2 * conv_w[c * 4 + 2] + x * conv_w[c * 4 + 3];
+            const float sum = v0 * conv_w[(size_t) c * 4] + v1 * conv_w[c * 4 + 1] + v2 * conv_w[c * 4 + 2] + x * conv_w[c * 4 + 3];
             float y = sum / (1.0f + sycl::exp(-sum));
             if ((int) it.get_group(1) < qk_heads) {   // uniform over the work-group
                 const float sq = warp_sum(sg, y * y);
@@ -120,7 +120,7 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
             const int src = n + j;   // the last three of [hist(3) | x_0..x_{n-1}]
             seq[j] = src < 3 ? history[c * 3 + src] : qkv[(size_t) (src - 3) * C + c];
         }
-        history[c * 3] = seq[0];
+        history[(size_t) c * 3] = seq[0];
         history[c * 3 + 1] = seq[1];
         history[c * 3 + 2] = seq[2];
     });
@@ -180,7 +180,7 @@ sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alph
             #pragma unroll
             for (int t = 0; t < MAX_T; ++t) {
                 if (!EXACT && t >= T) break;
-                const float* xa = x + (size_t) t * n + j * 8;
+                const float* xa = x + (size_t) t * n + (size_t) j * 8;
                 float a = acc[t];
                 a = sycl::fma(w0, xa[0], a); a = sycl::fma(w1, xa[1], a);
                 a = sycl::fma(w2, xa[2], a); a = sycl::fma(w3, xa[3], a);
@@ -375,7 +375,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
     return q.submit([&](sycl::handler& hd) {
         const bool silu = gdn_silu_gate();   // the closing norm's gate (gdn.hpp)
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-            red(sycl::range<1>(RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
+            red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(S * RG / WARP), hd);
         // one work-group per head; work-item tid = rg * 128 + col, as CUDA's (col, rg) block linearises
         // the q8_1 image takes registers: CUDA needs the work-group size bound for that kernel only
         const auto body = [=](const sycl::nd_item<1>& it) {
@@ -424,7 +424,7 @@ sycl::event gdn_step_plain(sycl::queue& q, float* state, const float* hbuf, int 
                 if (rg == 0) {
                     const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
                     const float scale = sycl::rsqrt(ss / (float) S + eps);
-                    const float zz = z[(size_t) t * value_dim + head * S + col];
+                    const float zz = z[(size_t) t * value_dim + (size_t) head * S + col];
                     const float gz = 1.0f / (1.0f + sycl::exp(-zz));
                     const float out = oc * scale * gamma[col] * (silu ? zz * gz : gz);
                     y[(size_t) t * value_dim + (size_t) (head * S + col)] = out;
@@ -1052,7 +1052,7 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs, float* out_p) {
-    const size_t items = 16 * 256;
+    const size_t items = (size_t) 16 * 256;
     const auto e = Q(stream).parallel_for(sycl::range<1>(items), [=](sycl::id<1> id) {
         const int row = *row_dev;
         for (int64_t i = (int64_t) id[0]; i < R_stride; i += (int64_t) items) R_dst[i] = R_src[(size_t) row * R_stride + i];
@@ -1250,9 +1250,9 @@ void logits_nonfinite_rows(const float* logits, int n_rows, int n, uint32_t* fla
 
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
     const long long stride = (long long) ids_stride;
-    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) n, 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
+    const auto e = Q(stream).parallel_for(sycl::nd_range<2>({(size_t) n, (size_t) 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
         const int q = (int) it.get_group(0);
-        int32_t* st = steps + q * 4;
+        int32_t* st = steps + (size_t) q * 4;
         const int n_kv = st[1];
         const int start = n_kv > window ? n_kv - window : 0;
         const int width = n_kv - start;

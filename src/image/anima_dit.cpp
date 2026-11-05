@@ -125,14 +125,15 @@ void heads16(const MfOut& x, int64_t T, int64_t Tp, int64_t heads, int64_t hd, c
     struct In {
         MfOut x;
         int64_t hd;
-        float at(int, int64_t t, int64_t h, int64_t d) const { return x.at(t, h * hd + d); }
+        auto head(int, int64_t t, int64_t h) const { return x.row(t, h * hd); }
     };
     struct Out {
         uint16_t* out;
         int64_t Tp, heads, hd;
         bool rows;
-        void put(int, int64_t t, int64_t h, int64_t d, float v) const {
-            out[(rows ? t * heads + h : h * Tp + t) * hd + d] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
+        auto out_head(int, int64_t t, int64_t h) const {
+            uint16_t* p = out + (rows ? t * heads + h : h * Tp + t) * hd;
+            return [p](int64_t d, float v) { p[d] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f)); };
         }
     };
     kernels::qk::Shape sh{T, heads, 0, hd};

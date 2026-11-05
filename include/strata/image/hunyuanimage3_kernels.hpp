@@ -65,10 +65,6 @@ void hunyuanimage3_qk_rope_norm16(const float* qkv, const float* wq, const float
 void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, uint16_t* out16, void* stream);
 
 
-/// x[rows[i]][:] += w[i] * y[i][:], rows of C: one expert's outputs back into the tokens, by their gate weights.
-void hunyuanimage3_scatter_scale_add(float* x, const float* y, const float* w, const int32_t* rows, int64_t n_rows, int64_t C,
-                           void* stream);
-
 /// x += v, n FP32 values (the residual).
 void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream);
 
@@ -99,7 +95,8 @@ void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, voi
 
 /// The routed rows grouped by expert: bounds[e] .. bounds[e + 1] (E + 1, from 0) of rows and w are expert e's tokens
 /// (in the order the device's atomics give, which changes no row's product) and their weights; `cursor` (E) is the
-/// fill's.  On the device: the caller reads `bounds` back for the experts' products.
+/// fill's.  On the device: the caller reads `bounds` back for the experts' products.  The engines' one device-side
+/// list: the LLMs' prompts list their rows on the host, with where each expert runs (prefill.cpp, plain_prompt.cpp).
 void hunyuanimage3_route_lists(const int32_t* idx, const float* wt, int64_t T, int64_t K, int64_t E, int32_t* bounds,
                                int32_t* rows, float* w, int32_t* cursor, void* stream);
 

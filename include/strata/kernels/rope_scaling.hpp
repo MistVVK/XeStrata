@@ -5,7 +5,7 @@
 // include/strata/kernels/rope_scaling.hpp - rope scaling: extending the context past the trained one.
 //
 // WHAT IT IS.  The artifact's RoPE is trained over `orig_ctx` positions (the artifact ships no
-// `rope.scaling` keys, so this is a pure runtime feature).  Scaling re-uses positions past that by
+// `rope.scaling` keys, so this is a pure runtime feature).  Scaling reuses positions past that by
 // rescaling the rotation angles.  Three types, the llama.cpp set:
 //
 //   none    freq_scale 1, no correction                      - today's behaviour, exactly

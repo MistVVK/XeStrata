@@ -843,7 +843,7 @@ inline void tq_states4(const uint8_t* qs, int t0, uint32_t s[4]) {
         const int off3 = (TqInfo<TY>::NS - 4 - t0) * K, wb = off3 >> 4, r = off3 & 15;
         const int wi1 = wb + 1 >= nwords ? wb + 1 - nwords : wb + 1;
         const int wi2 = wb + 2 >= nwords ? wb + 2 - nwords : wb + 2;
-        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);
+        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);  // NOLINT(clang-analyzer-security.ArrayBound): wb + 1 >= nwords implies wb + 2 >= nwords, which the analyzer takes apart
         if constexpr (tq_window_words<TY>() > 3) {
             const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
             v |= (uint64_t) qs16[wi3] << 48;
@@ -879,7 +879,7 @@ template<int TY> struct SplitTq {
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         const int l = iqs / 4;
         const block_q8_1* b8 = bq8_1 + l / 2;
-        const int* q8 = (const int*) b8->qs + 4 * (l & 1);
+        const int* q8 = (const int*) b8->qs + (size_t) 4 * (l & 1);
         int sumi = 0;
         for (int i = 0; i < 4; ++i) sumi = dp4a(r.q[i], q8[i], sumi);
         return r.d * (low_half(b8->ds) * TQ_LUT_I8_SCALE) * (float) sumi;
@@ -1041,7 +1041,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
             if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
             else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
         }();
-        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));  // NOLINT(bugprone-misplaced-widening-cast): a 32-bit product on purpose, kbx < nb
         for (int e = 0; e < NE; ++e)
             if (e < n) s[e] += F::S::apply(wd, x[e] + xo, iqs);
     }
@@ -1065,7 +1065,7 @@ inline void row_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
     for (int k = lane; k < nb * F::ipb; k += kWarp) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const auto wd = F::S::load(block_at<F>(row, kbx), 0, iqs);
-        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));
+        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32));  // NOLINT(bugprone-misplaced-widening-cast): a 32-bit product on purpose, kbx < nb
         for (int c = 0; c < NC; ++c) s[c] += F::S::apply(wd, x + (size_t) c * xstride + xo, iqs);
     }
     for (int c = 0; c < NC; ++c) out[c] = warp_sum(sg, s[c]);
@@ -1075,7 +1075,7 @@ template<int TY, int NC>
 sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                           int n_out) {
     const size_t groups = (size_t) ((n_out + 3) / 4);
-    return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, 4 * kWarp),
+    return q.parallel_for(sycl::nd_range<1>(groups * 4 * kWarp, (size_t) 4 * kWarp),
                           [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0) * 4 + (int) sg.get_group_linear_id();
@@ -1140,7 +1140,7 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
     constexpr int RPW = kWarp / LPR;
     const int row_lo = part == 1 ? (int) L.n_ff : 0, row_hi = part == 0 ? (int) L.n_ff : (int) (2 * L.n_ff);
     const size_t xgroups = (size_t) ((row_hi - row_lo + (int64_t) GU_ROWS * RPW - 1) / ((int64_t) GU_ROWS * RPW));
-    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, GU_ROWS * kWarp}),
+    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, (size_t) GU_ROWS * kWarp}),
                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
@@ -1175,7 +1175,7 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                                const block_q8_1* hq, NativeExpertLayout L, float* out) {
     constexpr int RPW = kWarp / LPR;
     const size_t xgroups = (size_t) ((L.n_embd + (int64_t) 8 * RPW - 1) / ((int64_t) 8 * RPW));
-    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * 8 * kWarp}, {1, 8 * kWarp}),
+    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * 8 * kWarp}, {1, (size_t) 8 * kWarp}),
                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
@@ -1401,7 +1401,7 @@ template<> inline sycl::half cvt<sycl::half>(float v) { return sycl::half(v); }
 template<int N, typename dst_t>
 inline void store(dst_t* y, const float* v) {
     sycl::vec<dst_t, N> o;
-    for (int j = 0; j < N; ++j) o[j] = cvt<dst_t>(v[j]);
+    for (int j = 0; j < N; ++j) o[j] = cvt<dst_t>(v[j]);  // NOLINT(clang-analyzer-core.CallAndMessage): every caller fills v[0 .. N)
     *reinterpret_cast<sycl::vec<dst_t, N>*>(y) = o;
 }
 
@@ -1420,10 +1420,10 @@ void dq_iq2_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint8_t aux8 = (uint8_t) (q2[il / 2] >> (8 * (il % 2)));
     const uint64_t grid = iq2xxs_grid[aux8];   // whole, and the signs computed: as dq_iq3_xxs
     const uint32_t aux32 = q2[2] | ((uint32_t) q2[3] << 16);
-    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) (aux32 >> 28)) * 0.25f;
     const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1433,10 +1433,10 @@ void dq_iq2_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* q2 = x[ibs].qs + 4 * ib;
     const uint64_t grid = iq2xs_grid[q2[il] & 511];   // whole, and the signs computed: as dq_iq3_xxs
-    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint32_t signs = ksigns_byte((uint8_t) (q2[il] >> 9));
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1445,10 +1445,10 @@ void dq_iq2_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int64_t il = tid % 4, ib = tid / 4;          // neighbours in one sub-block: contiguous writes
     const int y = (int) (32 * ib + 8 * il);
     const uint64_t grid = iq2s_grid[x[ibs].qs[4 * ib + il] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 0x300)];   // whole
-    const float d = (float) x[ibs].d * (0.5f + ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
+    const float d = (float) x[ibs].d * (0.5f + (float) ((x[ibs].scales[ib] >> 4 * (il / 2)) & 0xf)) * 0.25f;
     const uint32_t signs = x[ibs].qs[QK_K / 8 + 4 * ib + il];
     float v[8];
-    for (int j = 0; j < 8; ++j) v[j] = d * (int) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
+    for (int j = 0; j < 8; ++j) v[j] = d * (float) (uint8_t) (grid >> (8 * j)) * (signs & (1u << j) ? -1.f : 1.f);
     o.template put<8>(y, v);
 }
 template<typename Out>
@@ -1463,12 +1463,12 @@ void dq_iq3_xxs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint32_t grid1 = iq3xxs_grid[q3[2 * il + 0]];
     const uint32_t grid2 = iq3xxs_grid[q3[2 * il + 1]];
     const uint32_t aux32 = gas[0] | ((uint32_t) gas[1] << 16);
-    const float d = (float) x[ibs].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const float d = (float) x[ibs].d * (0.5f + (float) (aux32 >> 28)) * 0.5f;
     const uint32_t signs = ksigns_byte((uint8_t) ((aux32 >> 7 * il) & 127));
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
-        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
+        v[j + 0] = d * (float) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (float) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -1480,12 +1480,12 @@ void dq_iq3_s(const void* vx, int64_t ibs, const Out& o, int tid) {
     const uint8_t* qs = x[ibs].qs + 8 * ib;
     const uint32_t grid1 = iq3s_grid[qs[2 * il + 0] | ((x[ibs].qh[ib] << (8 - 2 * il)) & 256)];   // whole words
     const uint32_t grid2 = iq3s_grid[qs[2 * il + 1] | ((x[ibs].qh[ib] << (7 - 2 * il)) & 256)];
-    const float d = (float) x[ibs].d * (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
+    const float d = (float) x[ibs].d * (float) (1 + 2 * ((x[ibs].scales[ib / 2] >> 4 * (ib % 2)) & 0xf));
     const uint32_t signs = x[ibs].signs[4 * ib + il];
     float v[8];
     for (int j = 0; j < 4; ++j) {
-        v[j + 0] = d * (int) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
-        v[j + 4] = d * (int) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
+        v[j + 0] = d * (float) byte_of(grid1, j) * (signs & (1u << j) ? -1.f : 1.f);
+        v[j + 4] = d * (float) byte_of(grid2, j) * (signs & (1u << (j + 4)) ? -1.f : 1.f);
     }
     o.template put<8>(y, v);
 }
@@ -1510,7 +1510,7 @@ void dq_iq1_m(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int y = (int) (32 * ib + 8 * il);
     const uint16_t* sc = (const uint16_t*) x[ibs].scales;
     const int64_t ib16 = 2 * ib + il / 2;
-    const float d = iq1m_scale(sc) * (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
+    const float d = iq1m_scale(sc) * (float) (2 * ((sc[ib16 / 4] >> 3 * (ib16 % 4)) & 0x7) + 1);
     const float delta = x[ibs].qh[2 * ib + il / 2] & (0x08 << 4 * (il % 2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
     const uint32_t g = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((x[ibs].qh[2 * ib + il / 2] >> 4 * (il % 2)) & 7) << 8)];
     const uint32_t grid32[2] = {g & 0x0f0f0f0f, (g >> 4) & 0x0f0f0f0f};
@@ -1530,8 +1530,8 @@ void dq_iq4_nl(const void* vx, int64_t ibs, const Out& o, int tid) {
     const float d = (float) x[ib].d;
     float lo[4], hi[4];
     for (int j = 0; j < 4; ++j) {
-        lo[j] = d * (int8_t) byte_of((uint32_t) v.x, j);
-        hi[j] = d * (int8_t) byte_of((uint32_t) v.y, j);
+        lo[j] = d * (float) (int8_t) byte_of((uint32_t) v.x, j);
+        hi[j] = d * (float) (int8_t) byte_of((uint32_t) v.y, j);
     }
     o.template put<4>(y, lo);
     o.template put<4>(y + 16, hi);
@@ -1551,8 +1551,8 @@ void dq_q3_k(const void* vx, int64_t ibs, const Out& o, int tid) {
                           is < 8  ? (int8_t) ((x->scales[is - 0] & 0xF) | (((x->scales[is + 4] >> 2) & 3) << 4)) :
                           is < 12 ? (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is + 0] >> 4) & 3) << 4)) :
                                     (int8_t) ((x->scales[is - 8] >> 4) | (((x->scales[is - 4] >> 6) & 3) << 4));
-        const float dl = (float) x->d * (us - 32);
-        const uint8_t* q = x->qs + 32 * n;
+        const float dl = (float) x->d * (float) (us - 32);
+        const uint8_t* q = x->qs + (size_t) 32 * n;
         const uint8_t* hm = x->hmask;
         float v[4];
         for (int l = l0; l < l0 + 4; ++l)
@@ -1578,12 +1578,12 @@ void dq_iq4_xs(const void* vx, int64_t ibs, const Out& o, int tid) {
     const block_iq4_xs* x = (const block_iq4_xs*) vx + ibs;
     const int il = tid % 4, ib = tid / 4;              // neighbours in one sub-block, as dq_iq4_nl
     const int y = (int) (32 * ib + 4 * il);
-    const uint8_t* q4 = x->qs + 16 * ib + 4 * il;
-    const float d = (float) x->d * ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
+    const uint8_t* q4 = x->qs + (size_t) 16 * ib + (size_t) 4 * il;
+    const float d = (float) x->d * (float) ((((x->scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x->scales_h >> 2 * ib) & 3) << 4)) - 32);
     float lo[4], hi[4];
     for (int j = 0; j < 4; ++j) {
-        lo[j] = d * kvalues_iq4nl[q4[j] & 0xf];
-        hi[j] = d * kvalues_iq4nl[q4[j] >> 4];
+        lo[j] = d * (float) kvalues_iq4nl[q4[j] & 0xf];
+        hi[j] = d * (float) kvalues_iq4nl[q4[j] >> 4];
     }
     o.template put<4>(y, lo);
     o.template put<4>(y + 16, hi);
@@ -2201,7 +2201,7 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
     require(n % 256 == 0 && is_iq(t), "iq_dequant_f16");
-    sync_if_needed(stream, launch_dequant_flat<sycl::half>(queue_for(stream), t, src, n, (sycl::half*) dst),
+    sync_if_needed(stream, launch_dequant_flat<sycl::half>(queue_for(stream), t, src, n, reinterpret_cast<sycl::half*>(dst)),
                    "iq_dequant_f16");
 }
 
@@ -2251,7 +2251,7 @@ void embed_rows(const EmbedTable& tb, const int32_t* ids, int64_t token, int64_t
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream) {
     require(n_embd % 256 == 0 && is_iq(t), "iq_dequant_gu_f16");
     const int64_t per_row = n_embd / 256;
-    auto* y = (sycl::half*) dst;
+    auto* y = reinterpret_cast<sycl::half*>(dst);
     const int64_t nsb = n_ff * per_row;   // superblocks per matrix, eight a work-group
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<2>({2, (size_t) (nsb + 7) / 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
@@ -2269,8 +2269,8 @@ void iq_dequant_expert_f16(int t, const void* gate, const void* up, int64_t n_ff
                            int dt, const void* down, uint16_t* d_dst, void* stream) {
     require(n_embd % 256 == 0 && is_iq(t) && is_iq(dt), "iq_dequant_expert_f16");
     const int64_t per_row = n_embd / 256;
-    auto* y = (sycl::half*) gu_dst;
-    auto* yd = (sycl::half*) d_dst;
+    auto* y = reinterpret_cast<sycl::half*>(gu_dst);
+    auto* yd = reinterpret_cast<sycl::half*>(d_dst);
     const int64_t nsb = n_ff * per_row;   // superblocks per matrix (the down matrix has as many), eight a work-group
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<2>({3, (size_t) (nsb + 7) / 8 * 256}, {1, 256}), [=](sycl::nd_item<2> it) {
@@ -2382,9 +2382,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }();
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
-    float* up = (float*) ((uint8_t*) scratch + fa);
-    float* h = (float*) ((uint8_t*) scratch + 2 * fa);
-    block_q8_1* hq = (block_q8_1*) ((uint8_t*) scratch + 3 * fa);
+    float* up = reinterpret_cast<float*>((uint8_t*) scratch + fa);
+    float* h = reinterpret_cast<float*>((uint8_t*) scratch + 2 * fa);
+    block_q8_1* hq = reinterpret_cast<block_q8_1*>((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
     const size_t cg = (size_t) (v1 || grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
     // upstream's expert mode 8 (launch_native_gu_fused): its gate/up for the grid formats and IQ4_XS, its down for

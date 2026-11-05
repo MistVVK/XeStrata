@@ -35,7 +35,7 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     const size_t groups = (size_t) ((n_rows + rows_per_group - 1) / rows_per_group);
     const float scale = 1.0f / 16.0f;
     // one dimension: a prompt's rows (tokens x heads) pass the 65,535 work-groups a GPU's first dimension takes
-    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(groups * rows_per_group * WARP, rows_per_group * WARP),
+    const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(groups * rows_per_group * WARP, (size_t) rows_per_group * WARP),
                                                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         constexpr int N = 256;
         constexpr int el_w = N / WARP;   // 8
@@ -125,8 +125,8 @@ void kv_gather_q4_step(const uint8_t* k_q4, const uint8_t* v_q4, const int32_t* 
         const long long blk_idx = (long long) it.get_global_id(0);
         if (blk_idx >= total_blocks) return;
         const int t = (int) it.get_local_id(1);
-        const long long id = blk_idx / (kv_heads * blocks_per_head);
-        const int rem = (int) (blk_idx % (kv_heads * blocks_per_head));
+        const long long id = blk_idx / ((long long) kv_heads * blocks_per_head);
+        const int rem = (int) (blk_idx % ((long long) kv_heads * blocks_per_head));
         const int h = rem / blocks_per_head;
         const int b = rem % blocks_per_head;
         const int cell = ids[id];

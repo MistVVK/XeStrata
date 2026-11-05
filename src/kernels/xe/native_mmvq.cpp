@@ -118,7 +118,7 @@ inline int load_int(const void* p, int i) { return static_cast<const int*>(p)[i]
 // Preserve the pinned helper's pair of 16-bit loads and little-endian combine.
 inline int load_int_b2(const void* ptr, int i32) {
     const auto* x = static_cast<const uint16_t*>(ptr);
-    return (int) ((uint32_t) x[2 * i32] | ((uint32_t) x[2 * i32 + 1] << 16));
+    return (int) ((uint32_t) x[(size_t) 2 * i32] | ((uint32_t) x[2 * i32 + 1] << 16));
 }
 
 // The pinned nonlinear IQ4 codebook and its CUDA two-stage byte lookup.
@@ -152,10 +152,10 @@ inline float q5_q8_dot_impl(const int* vl, const int* vh, const int* u, const ui
         const int vh1i = ((vh[1] >> i) << 4) & 0x10101010;
         const int v0i = vl0i | vh0i;
         const int v1i = vl1i | vh1i;
-        const int dot1 = dp4a(v0i, u[2 * i], dp4a(v1i, u[2 * i + 1], 0));
-        const int dot2 = dp4a(0x01010101, u[2 * i], dp4a(0x01010101, u[2 * i + 1], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        const int dot1 = dp4a(v0i, u[(size_t) 2 * i], dp4a(v1i, u[2 * i + 1], 0));
+        const int dot2 = dp4a(0x01010101, u[(size_t) 2 * i], dp4a(0x01010101, u[2 * i + 1], 0));
+        sumf_d += d8[i] * (float) (dot1 * sc[i]);
+        sumf_m += d8[i] * (float) (dot2 * m[i]);
     }
     return low(dm5) * sumf_d - high(dm5) * sumf_m;
 }
@@ -168,10 +168,10 @@ inline float q4_q8_dot_impl(const int* v, const int* u, const uint8_t* sc, const
     for (int i = 0; i < 2; ++i) {
         const int v0i = (v[0] >> (4 * i)) & 0x0f0f0f0f;
         const int v1i = (v[1] >> (4 * i)) & 0x0f0f0f0f;
-        const int dot1 = dp4a(v1i, u[2 * i + 1], dp4a(v0i, u[2 * i], 0));
-        const int dot2 = dp4a(0x01010101, u[2 * i + 1], dp4a(0x01010101, u[2 * i], 0));
-        sumf_d += d8[i] * (dot1 * sc[i]);
-        sumf_m += d8[i] * (dot2 * m[i]);
+        const int dot1 = dp4a(v1i, u[2 * i + 1], dp4a(v0i, u[(size_t) 2 * i], 0));
+        const int dot2 = dp4a(0x01010101, u[2 * i + 1], dp4a(0x01010101, u[(size_t) 2 * i], 0));
+        sumf_d += d8[i] * (float) (dot1 * sc[i]);
+        sumf_m += d8[i] * (float) (dot2 * m[i]);
     }
     return low(dm4) * sumf_d - high(dm4) * sumf_m;
 }
@@ -198,11 +198,11 @@ inline float q2_q8_dot_impl(int v, const int* u, const uint8_t* scales, const ha
 inline float q6_q8_dot_impl(int vl, int vh, const int* u, const int8_t* scales, float d, const float* d8) {
     float sumf = 0.0f;
     for (int i = 0; i < 2; ++i) {
-        const int sc = scales[4 * i];
+        const int sc = scales[(size_t) 4 * i];  // NOLINT(bugprone-signed-char-misuse): Q6_K scales are signed
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
         const int vi = vsubss4(vil | vih, 0x20202020);
-        sumf += d8[i] * (dp4a(vi, u[i], 0) * sc);
+        sumf += d8[i] * (float) (dp4a(vi, u[i], 0) * sc);
     }
     return d * sumf;
 }
@@ -220,7 +220,7 @@ inline float small_q8_dot(const Q40Block* w, const Q81Block* x, int iqs) {
         sumi = dp4a(vi1, load_int(x->qs, iqs + i + 4), sumi);
     }
     const float d = (float) w->d;
-    return d * (sumi * low(x->ds) - 4 * high(x->ds));
+    return d * ((float) sumi * low(x->ds) - 4 * high(x->ds));
 }
 inline float small_q8_dot(const Q50Block* w, const Q81Block* x, int iqs) {
     int sumi = 0;
@@ -241,7 +241,7 @@ inline float small_q8_dot(const Q50Block* w, const Q81Block* x, int iqs) {
         sumi = dp4a(vi1, load_int(x->qs, iqs + i + 4), sumi);
     }
     const float d = (float) w->d;
-    return d * (sumi * low(x->ds) - 8 * high(x->ds));
+    return d * ((float) sumi * low(x->ds) - 8 * high(x->ds));
 }
 inline float small_q8_dot(const Q80Block* w, const Q81Block* x, int iqs) {
     int sumi = 0;
@@ -257,7 +257,7 @@ inline float small_q8_dot(const IQ4NLBlock* w, const Q81Block* x, int iqs) {
         sumi = dp4a(v.x, load_int(x->qs, iqs + i), sumi);
         sumi = dp4a(v.y, load_int(x->qs, iqs + i + 4), sumi);
     }
-    return (float) w->d * low(x->ds) * sumi;
+    return (float) w->d * low(x->ds) * (float) sumi;
 }
 
 // ---------------------------------------------------------------- per-format iteration traits
@@ -284,8 +284,8 @@ struct Q5KTraits {
     static W load(const Block* bq5, int iqs) {
         W r;
         r.bq8_offset = 2 * ((iqs / 2) / 4);
-        const uint8_t* ql = bq5->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4);
-        const uint8_t* qh = bq5->qh + 4 * ((iqs / 2) % 4);
+        const uint8_t* ql = bq5->qs + (size_t) 16 * r.bq8_offset + (size_t) 4 * ((iqs / 2) % 4);
+        const uint8_t* qh = bq5->qh + (size_t) 4 * ((iqs / 2) % 4);
         r.vl[0] = load_int(ql, 0);
         r.vl[1] = load_int(ql, 4);
         r.vh[0] = load_int(qh, 0) >> r.bq8_offset;
@@ -302,7 +302,7 @@ struct Q5KTraits {
         for (int i = 0; i < 2; ++i) {
             const Q81Block* bq8i = bq8 + r.bq8_offset + i;
             d8[i] = low(bq8i->ds);
-            u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
+            u[(size_t) 2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
             u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
         }
         return q5_q8_dot_impl(r.vl, r.vh, u, r.sc, r.sc + 2, r.dm, d8);
@@ -316,7 +316,7 @@ struct Q4KTraits {
     static W load(const Block* bq4, int iqs) {
         W r;
         r.bq8_offset = 2 * ((iqs / 2) / 4);
-        const uint8_t* ql = bq4->qs + 16 * r.bq8_offset + 4 * ((iqs / 2) % 4);
+        const uint8_t* ql = bq4->qs + (size_t) 16 * r.bq8_offset + (size_t) 4 * ((iqs / 2) % 4);
         r.v[0] = load_int(ql, 0);
         r.v[1] = load_int(ql, 4);
         uint16_t aux[2];
@@ -331,7 +331,7 @@ struct Q4KTraits {
         for (int i = 0; i < 2; ++i) {
             const Q81Block* bq8i = bq8 + r.bq8_offset + i;
             d8[i] = low(bq8i->ds);
-            u[2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
+            u[(size_t) 2 * i] = load_int(bq8i->qs, (iqs / 2) % 4);
             u[2 * i + 1] = load_int(bq8i->qs, (iqs / 2) % 4 + 4);
         }
         return q4_q8_dot_impl(r.v, u, r.sc, r.sc + 2, r.dm, d8);
@@ -347,7 +347,7 @@ struct Q20Traits {
     static W load(const Block* w, int iqs) {
         W r;
         r.d2 = (float) w->d;
-        const int16_t* qs = reinterpret_cast<const int16_t*>(w->qs) + iqs * 4;
+        const int16_t* qs = reinterpret_cast<const int16_t*>(w->qs) + (size_t) iqs * 4;
         for (int j = 0; j < 4; ++j) {
             const int q = qs[j];
             const uint32_t qe = (uint32_t) byte_perm(0x020100ff, 0x020100ff, (uint32_t) (q >> 0));
@@ -364,7 +364,7 @@ struct Q20Traits {
             sumi = dp4a(load_int(chunk->qs, j * 2), r.qx[j], sumi);
             sumi = dp4a(load_int(chunk->qs, j * 2 + 1), r.qy[j], sumi);
         }
-        return r.d2 * low(chunk->ds) * sumi;
+        return r.d2 * low(chunk->ds) * (float) sumi;
     }
 };
 // The signed values and the scales of a lane's Q3_K chunk are worked out once in load() and reused for every column
@@ -489,7 +489,7 @@ struct IQ4XSTraits {
             sumi = dp4a(r.v[j].y, load_int(x[iqs / 4].qs, j + 4), sumi);
         }
         sumi *= r.ls - 32;
-        return r.dw * low(x[iqs / 4].ds) * sumi;
+        return r.dw * low(x[iqs / 4].ds) * (float) sumi;
     }
 };
 // QI=4 for Q4_0/Q5_0/IQ4_NL and QI=8 for Q8_0. With VDR=2 this preserves the pinned 64/32-block iteration and
@@ -523,7 +523,7 @@ sycl::event launch_kernel(sycl::queue& q, const void* weights, const void* x_q8_
     constexpr int PW = NW - 1 > 0 ? NW - 1 : 1;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> partial(sycl::range<1>(PW * NCOLS * ROWS * WARP), h);
-        h.parallel_for(sycl::nd_range<1>(groups * NW * WARP, NW * WARP),
+        h.parallel_for(sycl::nd_range<1>(groups * NW * WARP, (size_t) NW * WARP),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
             const sycl::sub_group sg = it.get_sub_group();
@@ -814,6 +814,7 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
         case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        default: break;   // validate_shape took only 1 to 8 columns
     }
 }
 

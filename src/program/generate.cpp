@@ -9887,6 +9887,7 @@ int main(int argc, char** argv) {
                 blk.b = b;
                 blk.f = f;
                 blk.n = t - f;
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound): f + keep < t <= G.S <= kVerifyMaxT, checked above
                 while (blk.keep < blk.n && !sl.stop && outb[f + blk.keep - 1] == G.tok[f + blk.keep] &&
                        !is_eos(outb[f + blk.keep - 1]))
                     ++blk.keep;

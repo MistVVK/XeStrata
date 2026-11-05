@@ -132,7 +132,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
                 throw std::invalid_argument(std::string("ple_block: native key scratch overlaps output ") + item.name);
     }
     uint8_t* base = (uint8_t*) scratch;
-    float* d_scratch = (float*) base;
+    float* d_scratch = reinterpret_cast<float*>(base);
     uint8_t* d_act = base + ((float_bytes + 15) & ~(size_t) 15);
     float* d_key = d_scratch;
     float* d_query = d_key + hc_dim;

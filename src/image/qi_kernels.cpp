@@ -218,15 +218,18 @@ void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, in
 
 void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream,
                  const QiI8* i8) {
-    if (T <= 0) return;
-    const float* sx = i8 != nullptr ? i8->sx : nullptr;
-    const float* sw = i8 != nullptr ? i8->sw : nullptr;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        const float v = sx != nullptr ? (float) sycl::bit_cast<int32_t>(h[i]) * sx[t] * sw[c] : h[i];
-        x[i] += v * sycl::tanh(mod[(t < n_text ? C : 0) + c]);
-    });
+    // the DiTs' gated residual (dit_rows::gate_add_by), the gate the text's or the image's row of mod, through tanh
+    MfOut in;
+    in.C = C;
+    if (i8 != nullptr) {
+        in.i = reinterpret_cast<const int32_t*>(h);
+        in.sx = i8->sx;
+        in.sw = i8->sw;
+    } else {
+        in.f = h;
+    }
+    const auto e = dit_rows::gate_add_by(
+        x, in, [=](int64_t t, int64_t c) { return sycl::tanh(mod[(t < n_text ? C : 0) + c]); }, T, C, stream);
     finish(stream, e, "qi_gate_add");
 }
 
@@ -242,9 +245,14 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
     struct Heads {
         QkvIn in;
         int64_t heads, hd;
-        float at(int which, int64_t t, int64_t h, int64_t d) const {
-            const int64_t c = h * hd + d;
-            return in.at(which, t, t * heads * hd + c, c);
+        auto head(int which, int64_t t, int64_t h) const {
+            // QkvIn::at's value, the row's pointers and scale taken once (the selects, not s[which]: see QkvIn)
+            const int64_t c0 = h * hd;
+            const float* p = (which == 0 ? in.q : which == 1 ? in.k : in.v) + t * heads * hd + c0;
+            const bool i8 = in.i8;
+            const float sxt = i8 ? (which == 0 ? in.s[0].sx : which == 1 ? in.s[1].sx : in.s[2].sx)[t] : 0.f;
+            const float* sw = i8 ? (which == 0 ? in.s[0].sw : which == 1 ? in.s[1].sw : in.s[2].sw) + c0 : nullptr;
+            return [=](int64_t d) { return i8 ? (float) sycl::bit_cast<int32_t>(p[d]) * sxt * sw[d] : p[d]; };
         }
     };
     kernels::qk::Shape sh{T, heads, heads, head_dim};
@@ -266,8 +274,9 @@ void qi_text_qk_rope16(const float* q, const float* k, const float* v, const flo
     struct Heads {
         const float *q, *k, *v;
         int64_t qh, kvh, hd;
-        float at(int which, int64_t t, int64_t h, int64_t d) const {
-            return which == 0 ? q[(t * qh + h) * hd + d] : (which == 1 ? k : v)[(t * kvh + h) * hd + d];
+        auto head(int which, int64_t t, int64_t h) const {
+            const float* p = which == 0 ? q + (t * qh + h) * hd : (which == 1 ? k : v) + (t * kvh + h) * hd;
+            return [p](int64_t d) { return p[d]; };
         }
     };
     kernels::qk::Shape sh{T, q_heads, kv_heads, head_dim};
@@ -752,16 +761,23 @@ void qi_vit_qkv_rope16(const float* qkv, const int32_t* yx, int64_t T, int64_t h
     struct Rows {
         const float* qkv;
         int64_t C, hd;
-        float at(int which, int64_t t, int64_t h, int64_t d) const { return qkv[t * 3 * C + which * C + h * hd + d]; }
+        auto head(int which, int64_t t, int64_t h) const {
+            const float* p = qkv + t * 3 * C + which * C + h * hd;
+            return [p](int64_t d) { return p[d]; };
+        }
     };
     struct Padded {
         uint16_t *q16, *k16, *v16;
         int64_t heads, hd;
         float q_scale;
-        void put(int which, int64_t t, int64_t h, int64_t d, float v) const {
+        auto out_head(int which, int64_t t, int64_t h) const {
             uint16_t* dst = (which == 0 ? q16 : which == 1 ? k16 : v16) + (t * heads + h) * D;
-            dst[d] = f16_from_f32(which == 0 ? v * q_scale : v);
-            for (int64_t e = hd + d; e < D; e += hd) dst[e] = 0;
+            const float sc = which == 0 ? q_scale : 1.f;
+            const int64_t n = hd;
+            return [=](int64_t d, float v) {
+                dst[d] = f16_from_f32(v * sc);
+                for (int64_t e = n + d; e < D; e += n) dst[e] = 0;
+            };
         }
     };
     kernels::qk::Shape sh{T, heads, heads, hd};

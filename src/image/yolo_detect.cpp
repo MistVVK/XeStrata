@@ -371,7 +371,7 @@ bool YoloDetector::open(const std::string& path, std::string& err) {
             int index = -1, shortcut = 0;
             std::string from;
             es >> index >> L.mod >> from >> L.stride >> shortcut;
-            if (!es || index != (int) net.layers.size()) throw std::runtime_error(path + ": layer list entry: " + entry);
+            if (!es || index != (int) net.layers.size()) throw std::runtime_error(std::string(path).append(": layer list entry: ").append(entry));
             L.shortcut = shortcut != 0;
             std::stringstream fs(from);
             for (std::string v; std::getline(fs, v, ',');) {

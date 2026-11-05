@@ -57,13 +57,13 @@ void ref_step(std::vector<double>& state, const std::vector<float>& q, const std
         for (int j = 0; j < S; ++j) {
             if (decay_first) for (int i = 0; i < S; ++i) at(i, j, h) *= dec;
             double sk = 0;
-            for (int i = 0; i < S; ++i) sk += at(i, j, h) * (double) k[(size_t) (src * S + i)];
-            const double d = ((double) v[(size_t) (h * S + j)] - sk) * b;
-            for (int i = 0; i < S; ++i) at(i, j, h) += (double) k[(size_t) (src * S + i)] * d;
+            for (int i = 0; i < S; ++i) sk += at(i, j, h) * (double) k[(size_t) src * S + i];
+            const double d = ((double) v[(size_t) h * S + j] - sk) * b;
+            for (int i = 0; i < S; ++i) at(i, j, h) += (double) k[(size_t) src * S + i] * d;
             if (!decay_first) for (int i = 0; i < S; ++i) at(i, j, h) *= dec;
             double dot = 0;
-            for (int i = 0; i < S; ++i) dot += at(i, j, h) * (double) q[(size_t) (src * S + i)];
-            oo[(size_t) (h * S + j)] = (float) dot;
+            for (int i = 0; i < S; ++i) dot += at(i, j, h) * (double) q[(size_t) src * S + i];
+            oo[(size_t) h * S + j] = (float) dot;
         }
     }
     o = oo;
@@ -75,11 +75,11 @@ void ref_conv(std::vector<float>& cs, const std::vector<float>& x, const std::ve
     out.assign((size_t) C, 0.0f);
     for (int c = 0; c < C; ++c) {
         double acc = 0;
-        for (int i = 0; i < dc - 1; ++i) acc += (double) cs[(size_t) (i * C + c)] * (double) kern[(size_t) (i * C + c)];
-        acc += (double) x[(size_t) c] * (double) kern[(size_t) ((dc - 1) * C + c)];
+        for (int i = 0; i < dc - 1; ++i) acc += (double) cs[(size_t) i * C + c] * (double) kern[(size_t) i * C + c];
+        acc += (double) x[(size_t) c] * (double) kern[(size_t) (dc - 1) * C + c];
         out[(size_t) c] = (float) acc;
-        for (int i = 0; i < dc - 2; ++i) cs[(size_t) (i * C + c)] = cs[(size_t) ((i + 1) * C + c)];
-        cs[(size_t) ((dc - 2) * C + c)] = x[(size_t) c];
+        for (int i = 0; i < dc - 2; ++i) cs[(size_t) i * C + c] = cs[(size_t) (i + 1) * C + c];
+        cs[(size_t) (dc - 2) * C + c] = x[(size_t) c];
     }
 }
 
@@ -104,7 +104,7 @@ int main(int argc, char** argv) {
     const int S = 128, h_k = 16, h_v = 48;      // the artifact's real geometry
     strata::gpu::Stream cs = strata::gpu::stream_create();   // the native kernels take an explicit stream
     if (cs == nullptr) { std::fprintf(stderr, "gdn_parity: no stream\n"); return 1; }
-    std::mt19937 rng(2024);
+    std::mt19937 rng(2024);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
     std::normal_distribution<float> gauss(0.0f, 1.0f);
     int bad = 0;
 
@@ -236,14 +236,14 @@ int main(int argc, char** argv) {
         // mapping between them is written out below rather than assumed, in both directions.
         std::vector<float> cs_ref((size_t) (dc - 1) * C), x((size_t) C), kern((size_t) dc * C);
         for (int i = 0; i < dc - 1; ++i)
-            for (int c = 0; c < C; ++c) cs_ref[(size_t) (i * C + c)] = (float) (10 * (i + 1) + c);  // labelled
+            for (int c = 0; c < C; ++c) cs_ref[(size_t) i * C + c] = (float) (10 * (i + 1) + c);  // labelled
         for (int c = 0; c < C; ++c) x[(size_t) c] = (float) (100 + c);
         for (size_t i = 0; i < kern.size(); ++i) kern[i] = gauss(rng);
 
         auto to_dev_layout = [&](const std::vector<float>& r) {
             std::vector<float> d(r.size());
             for (int i = 0; i < dc - 1; ++i)
-                for (int c = 0; c < C; ++c) d[(size_t) (c * (dc - 1) + i)] = r[(size_t) (i * C + c)];
+                for (int c = 0; c < C; ++c) d[(size_t) c * (dc - 1) + i] = r[(size_t) i * C + c];
             return d;
         };
 
@@ -258,7 +258,7 @@ int main(int argc, char** argv) {
         // below is the ONLY place the two meet.
         std::vector<float> kW((size_t) C * dc);
         for (int c = 0; c < C; ++c)
-            for (int i = 0; i < dc; ++i) kW[(size_t) (c * dc + i)] = kern[(size_t) (i * C + c)];
+            for (int i = 0; i < dc; ++i) kW[(size_t) c * dc + i] = kern[(size_t) i * C + c];
         // and the rival reading, which must differ or the fixture cannot see a transposed weight
         std::vector<float> kW_wrong((size_t) C * dc);
         for (size_t i = 0; i < kern.size(); ++i) kW_wrong[i] = kern[i];
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
             std::vector<float> out_bad((size_t) C, 0.0f);
             for (int c = 0; c < C; ++c) {
                 double a = 0;
-                for (int i = 0; i < dc - 1; ++i) a += (double) cs2[(size_t) (i * C + c)] * (double) kW_wrong[(size_t) (c * dc + i)];
+                for (int i = 0; i < dc - 1; ++i) a += (double) cs2[(size_t) i * C + c] * (double) kW_wrong[(size_t) c * dc + i];
                 a += (double) x[(size_t) c] * (double) kW_wrong[(size_t) (c * dc + dc - 1)];
                 out_bad[(size_t) c] = (float) a;
             }
@@ -317,9 +317,9 @@ int main(int argc, char** argv) {
         const float eps = 1e-6f;
         for (int r = 0; r < rows; ++r) {
             double acc = 0;
-            for (int i = 0; i < cols; ++i) acc += (double) x_ref[(size_t) (r * cols + i)] * (double) x_ref[(size_t) (r * cols + i)];
+            for (int i = 0; i < cols; ++i) acc += (double) x_ref[(size_t) r * cols + i] * (double) x_ref[(size_t) r * cols + i];
             const float inv = (float) (1.0 / std::sqrt(acc + (double) eps));
-            for (int i = 0; i < cols; ++i) x_ref[(size_t) (r * cols + i)] *= inv;
+            for (int i = 0; i < cols; ++i) x_ref[(size_t) r * cols + i] *= inv;
         }
         // The rival reading puts THE SAME eps on the MEAN instead of on the squared norm, which at
         // ||x||^2 ~ 1152 and cols = 128 changes the divisor from sqrt(1152) to sqrt(9) - a factor of 11.3, so
@@ -328,9 +328,9 @@ int main(int argc, char** argv) {
         std::vector<float> x_mean = x;
         for (int r = 0; r < rows; ++r) {
             double acc = 0;
-            for (int i = 0; i < cols; ++i) acc += (double) x_mean[(size_t) (r * cols + i)] * (double) x_mean[(size_t) (r * cols + i)];
+            for (int i = 0; i < cols; ++i) acc += (double) x_mean[(size_t) r * cols + i] * (double) x_mean[(size_t) r * cols + i];
             const float inv = (float) (1.0 / std::sqrt(acc / cols + (double) eps));
-            for (int i = 0; i < cols; ++i) x_mean[(size_t) (r * cols + i)] *= inv;
+            for (int i = 0; i < cols; ++i) x_mean[(size_t) r * cols + i] *= inv;
         }
         const double rel_trap = rel_l1(x_ref, x_mean);
         std::printf("\n  %-42s %-4s (%.1f%% apart)\n", "eps on sum vs on mean is observable",
@@ -359,11 +359,11 @@ int main(int argc, char** argv) {
         const float eps = 1e-6f;
         for (int h = 0; h < hv2; ++h) {
             double acc = 0;
-            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) (h * S2 + i)] * (double) o[(size_t) (h * S2 + i)];
+            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) h * S2 + i] * (double) o[(size_t) h * S2 + i];
             const float inv = (float) (1.0 / std::sqrt(acc / S2 + (double) eps));
             for (int i = 0; i < S2; ++i)
-                y_ref[(size_t) (h * S2 + i)] = o[(size_t) (h * S2 + i)] * inv * sn[(size_t) i] *
-                                              sigmoid_f(z[(size_t) (h * S2 + i)]);
+                y_ref[(size_t) h * S2 + i] = o[(size_t) h * S2 + i] * inv * sn[(size_t) i] *
+                                            sigmoid_f(z[(size_t) h * S2 + i]);
         }
         float *d_o = nullptr, *d_z = nullptr, *d_sn = nullptr, *d_y = nullptr;
         d_o = static_cast<decltype(d_o)>(strata::parity::alloc_bytes(o.size() * 4));
@@ -385,12 +385,12 @@ int main(int argc, char** argv) {
         std::vector<float> y_silu(y_ref.size());
         for (int h = 0; h < hv2; ++h) {
             double acc = 0;
-            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) (h * S2 + i)] * (double) o[(size_t) (h * S2 + i)];
+            for (int i = 0; i < S2; ++i) acc += (double) o[(size_t) h * S2 + i] * (double) o[(size_t) h * S2 + i];
             const float inv = (float) (1.0 / std::sqrt(acc / S2 + (double) eps));
             for (int i = 0; i < S2; ++i) {
-                const float zz = z[(size_t) (h * S2 + i)];
-                y_silu[(size_t) (h * S2 + i)] =
-                    o[(size_t) (h * S2 + i)] * inv * sn[(size_t) i] * (zz / (1.0f + std::exp(-zz)));
+                const float zz = z[(size_t) h * S2 + i];
+                y_silu[(size_t) h * S2 + i] =
+                    o[(size_t) h * S2 + i] * inv * sn[(size_t) i] * (zz / (1.0f + std::exp(-zz)));
             }
         }
         const double rel_silu = rel_l1(y_ref, y_silu);

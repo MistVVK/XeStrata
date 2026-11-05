@@ -71,7 +71,7 @@ inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 bool gr_fast(sycl::queue& q) {
     static const int env = [] {
         const char* v = std::getenv("STRATA_GR_FAST");
-        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+        return v != nullptr ? (std::strtol(v, nullptr, 10) != 0 ? 1 : 0) : -1;
     }();
     return env >= 0 ? env != 0 : xe::sm70_table(q);
 }
@@ -81,7 +81,7 @@ inline float dot8(const uint4 w, const float* x) {
     float acc = 0.0f;
     const uint32_t v[4] = {w.x(), w.y(), w.z(), w.w()};
     for (int j = 0; j < 4; ++j) {
-        acc = sycl::fma(sycl::bit_cast<float>(v[j] << 16), x[2 * j], acc);
+        acc = sycl::fma(sycl::bit_cast<float>(v[j] << 16), x[(size_t) 2 * j], acc);
         acc = sycl::fma(sycl::bit_cast<float>(v[j] & 0xffff0000u), x[2 * j + 1], acc);
     }
     return acc;
@@ -403,7 +403,7 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
     static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "the kernel's geometry");
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
@@ -421,8 +421,8 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
                 const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
 #pragma unroll
-                for (int qq = 0; qq < 4; ++qq) w[p][qq] = load_u4(wrow, (size_t) (j + 8 * qq));
-                w[p][4] = load_u4(wrow, (size_t) (32 + j));
+                for (int qq = 0; qq < 4; ++qq) w[p][qq] = load_u4(wrow, (size_t) j + 8 * (size_t) qq);
+                w[p][4] = load_u4(wrow, 32 + (size_t) j);
                 if (j < T) {
                     rv[p] = my.R[i];
                     wn[p] = my.w_norm[i];
@@ -689,7 +689,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         // float4: a lane reads its 8 values as two 16-byte loads; one float at a time, the lanes' 32-byte stride put 8 of
         // them on each local-memory bank (RTX 4070: this kernel 53 us -> 40 us)
         sycl::local_accessor<sycl::float4, 1> lo(sycl::range<1>(kFusedGrMaxT * LR / 4), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(kFusedGrMaxT * HC * UPM_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) kFusedGrMaxT * HC * UPM_COLS), h);
         const TokArgs tok(h);
         h.parallel_for(sycl::nd_range<1>((size_t) UPM_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             tok.stage(m, it);
@@ -710,7 +710,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
                 const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
                 const uint16_t* wrow = m.a[0].w_up + (size_t) i * LR;
                 const uint4 wa = load_u4(wrow, (size_t) lane);
-                const uint4 wb = lane < LR / 8 - 32 ? load_u4(wrow, (size_t) (32 + lane)) : uint4(0, 0, 0, 0);
+                const uint4 wb = lane < LR / 8 - 32 ? load_u4(wrow, 32 + (size_t) lane) : uint4(0, 0, 0, 0);
                 float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
                 bool apply = false;
                 if (lane < T) {
@@ -845,7 +845,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     // the down projection (and the inject rows in one extra group), with the norm computed into local memory
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> xn(sycl::range<1>(D), h);
-        sycl::local_accessor<float, 1> part(sycl::range<1>(WARPS * HC), h);
+        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) WARPS * HC), h);
         sycl::local_accessor<float, 1> s_rs(sycl::range<1>(HC), h);
         h.parallel_for(sycl::nd_range<1>((size_t) (DOWN_BLOCKS + 1) * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -877,7 +877,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
     });
     const auto e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> lo(sycl::range<1>(LR), h);
-        sycl::local_accessor<float, 1> g(sycl::range<1>(HC * UP_COLS), h);
+        sycl::local_accessor<float, 1> g(sycl::range<1>((size_t) HC * UP_COLS), h);
         h.parallel_for(sycl::nd_range<1>((size_t) UP_BLOCKS * THREADS, THREADS), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_local_id(0), lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
@@ -893,7 +893,7 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
                 float acc = dot8(load_u4(wrow, (size_t) lane), xa);
                 if (lane < LR / 8 - 32) {
                     for (int e2 = 0; e2 < 8; ++e2) xa[e2] = lo[(32 + lane) * 8 + e2];
-                    acc += dot8(load_u4(wrow, (size_t) (32 + lane)), xa);
+                    acc += dot8(load_u4(wrow, 32 + (size_t) lane), xa);
                 }
                 acc = warp_sum(sg, acc);
                 if (lane == 0) {

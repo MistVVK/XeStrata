@@ -73,6 +73,20 @@ struct MfOut {
                                      : (rs != nullptr ? f[t * C + c] * rs[t] : f[t * C + c]);
         return b != nullptr ? v + b[c] : v;
     }
+    /// at(t, c0 + d) as r(d), the row's offsets taken once (the per-head kernels' reads: qk_norm_rope.hpp)
+    auto row(int64_t t, int64_t c0) const {
+        const int64_t o = t * C + c0;
+        const int32_t* ip = i != nullptr ? i + o : nullptr;
+        const float* fp = f != nullptr ? f + o : nullptr;
+        const float sxt = i != nullptr ? sx[t] : 0.f, rst = rs != nullptr ? rs[t] : 1.f;
+        const float* swp = sw != nullptr ? sw + c0 : nullptr;
+        const float* bp = b != nullptr ? b + c0 : nullptr;
+        const bool scaled = rs != nullptr;
+        return [=](int64_t d) {
+            const float v = ip != nullptr ? (float) ip[d] * sxt * swp[d] : (scaled ? fp[d] * rst : fp[d]);
+            return bp != nullptr ? v + bp[d] : v;
+        };
+    }
     /// at(t, c + p) for p below W, read W side by side (c and C multiples of W)
     template<int W> void at_w(int64_t t, int64_t c, float* o) const {
         if (i != nullptr) {

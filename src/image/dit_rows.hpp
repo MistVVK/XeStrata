@@ -152,9 +152,11 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
         MfOut q, k, v;
         const float* hs;
         int64_t hd;
-        float at(int which, int64_t t, int64_t h, int64_t d) const {
-            const int64_t c = h * hd + d;
-            return which == 0 ? q.at(t, c) : which == 1 ? k.at(t, c) : v.at(t, c) * (1.f / hs[h]);
+        auto head(int which, int64_t t, int64_t h) const {
+            const auto r = (which == 0 ? q : which == 1 ? k : v).row(t, h * hd);
+            const bool vs = which == 2;
+            const float inv = vs ? 1.f / hs[h] : 1.f;
+            return [=](int64_t d) { return vs ? r(d) * inv : r(d); };
         }
     };
     kernels::qk::Shape sh{T, heads, heads, hd};
@@ -572,12 +574,15 @@ inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int6
 // not one of its bias's)
 inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) { qi_bias_add(y, b, T, N, s); }
 
+// The DiTs' gated residual: x[t][c] += g(t, c) h[t][c]
+template<class G> sycl::event gate_add_by(float* x, const MfOut& h, G g, int64_t T, int64_t C, void* s) {
+    if (T <= 0) return {};
+    return kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) { x[t * C + c] += g(t, c) * h.at(t, c); });
+}
+
 // x[t] += gate * h[t] (per channel; gate null: 1)
 inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
-    if (T <= 0) return;
-    kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
-        x[t * C + c] += (gate != nullptr ? gate[c] : 1.f) * h.at(t, c);
-    });
+    (void) gate_add_by(x, h, [=](int64_t, int64_t c) { return gate != nullptr ? gate[c] : 1.f; }, T, C, s);
 }
 
 // The time (seconds) of one product of the DiT's FFN, T rows x K -> N, in 16 bits (prefill::Gemm::f16) and in 8

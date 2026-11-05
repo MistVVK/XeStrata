@@ -1037,12 +1037,19 @@ void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T
 }
 // one work-item per (token of the group, column): the token's rows summed in the group's row order
 void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
-                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+                     const float* u_w, int64_t n_u, float* acc, void* stream, int64_t width) {
     if (n_u <= 0) return;
-    strata::kernels::for_rows_cols(Q(stream), n_u, N, [=](int64_t u, int64_t d) {
+    const int64_t W = width > 0 ? width : N;
+    if (u_off == nullptr) {   // one row a token, the sum's one term (a loop and its bounds cost HunyuanImage 3.0 0.6%)
+        strata::kernels::for_rows_cols(Q(stream), n_u, W, [=](int64_t u, int64_t d) {
+            acc[(int64_t) u_tok[u] * W + d] += sycl::fma(u_w[u], Dm[u * W + d], 0.0f);
+        });
+        return;
+    }
+    strata::kernels::for_rows_cols(Q(stream), n_u, W, [=](int64_t u, int64_t d) {
         float s = 0.0f;
-        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
-        acc[(int64_t) u_tok[u] * N + d] += s;
+        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * W + d], s);
+        acc[(int64_t) u_tok[u] * W + d] += s;
     });
 }
 

@@ -557,7 +557,7 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     return failures ? 1 : 0;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape): an uncaught error ends the check with its message
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
     if (argc == 2 && std::string(argv[1]) == "--bf16-embd") return check_bf16_embd(strata::parity::stream());
     if (argc == 3 && std::string(argv[1]) == "--synthetic") return check_synthetic(argv[2], strata::parity::stream());
@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: native_expert_parity <shard1.gguf> [layer ...] | --bf16-embd | --synthetic GU/DOWN[@HxFF] | --synthetic-hadamard GU/DOWN[@HxFF]\n"); return 2; }
     strata::GgufFile gguf(argv[1]);
     std::vector<int> layers;
-    for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+    for (int i = 2; i < argc; ++i) layers.push_back((int) std::strtol(argv[i], nullptr, 10));
     if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
     const int E = 7;
     int failures = 0;

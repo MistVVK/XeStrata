@@ -88,9 +88,11 @@ void moe_combine(const float* D, const int32_t* slot, const float* w, const floa
 void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream);
 /// Layer-major prefill: one expert group's rows added into the super-chunk's accumulator, per token in a fixed order
 /// (deterministic, no atomics): for each u < n_u, acc[u_tok[u], :] += sum_{j in [u_off[u], u_off[u+1])} u_w[j] *
-/// Dm[u_rows[j], :].  The sum runs in the group's row order, not moe_combine's k order (FP32 rounding only).
+/// Dm[u_rows[j], :].  The sum runs in the group's row order, not moe_combine's k order (FP32 rounding only).  Rows of
+/// `width` (0: Qwen3.8-Flash-Next's 2560); u_off and u_rows null: token u's one row is row u (an expert's own rows,
+/// one a token: HunyuanImage 3.0's experts one after another).
 void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
-                     const float* u_w, int64_t n_u, float* acc, void* stream);
+                     const float* u_w, int64_t n_u, float* acc, void* stream, int64_t width = 0);
 
 // ---- QSA helpers
 /// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.  The rope

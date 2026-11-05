@@ -70,7 +70,7 @@ int main(int argc, char** argv) {
     };
 
     for (const Shape& s : shapes) {
-        std::mt19937 rng(4242);
+        std::mt19937 rng(4242);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> fx((size_t) s.n_in), fw((size_t) (s.n_in * s.n_out));
         for (auto& v : fx) v = g(rng);

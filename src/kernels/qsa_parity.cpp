@@ -288,8 +288,7 @@ std::vector<double> ref_indexer_scores(const std::vector<double>& pooled, int64_
             double dot = 0;
             for (int64_t d = 0; d < idx_dim; ++d)
                 dot += pooled[(size_t) b * idx_dim + d] * q_idx[(size_t) h * idx_dim + d];
-            if (!o.use_relu) s += dot;
-            else if (o.relu_per_head) s += dot > 0 ? dot : 0.0;
+            if (o.use_relu && o.relu_per_head) s += dot > 0 ? dot : 0.0;
             else s += dot;
         }
         if (o.use_relu && !o.relu_per_head) s = s > 0 ? s : 0.0;
@@ -400,7 +399,7 @@ int main(int argc, char** argv) try {
     const int64_t MAXC = strata::kernels::kTopkMaxCells;
     const float EPS = strata::kernels::qsa_rms_eps();
     const double THETA = strata::kernels::qsa_freq_base();
-    std::mt19937 rng(20260916u);
+    std::mt19937 rng(20260916u);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
     std::normal_distribution<double> gauss(0.0, 1.0);
     auto rnd = [&](double s) { return (float) (gauss(rng) * s); };
 
@@ -415,7 +414,7 @@ int main(int argc, char** argv) try {
         int mism = 0, subnormal = 0;
         for (int i = 0; i < kOracleN; ++i) {
             float f;
-            const uint32_t fb = kOracle[2 * i];
+            const uint32_t fb = kOracle[(size_t) 2 * i];
             std::memcpy(&f, &fb, 4);
             const uint16_t want = (uint16_t) kOracle[2 * i + 1];
             const uint16_t got = f16_from_f32(f);
@@ -693,8 +692,8 @@ int main(int argc, char** argv) try {
             for (auto& x : psum) x *= (double) R;
             std::vector<double> nm = want_raw, ns = psum;
             for (int64_t b = 0; b < n_bid; ++b) {
-                std::vector<double> m(nm.begin() + (size_t) b * IDXD, nm.begin() + (size_t) (b + 1) * IDXD);
-                std::vector<double> s(ns.begin() + (size_t) b * IDXD, ns.begin() + (size_t) (b + 1) * IDXD);
+                std::vector<double> m(nm.begin() + b * IDXD, nm.begin() + (b + 1) * IDXD);
+                std::vector<double> s(ns.begin() + b * IDXD, ns.begin() + (b + 1) * IDXD);
                 ref_rms_norm(m, w_kn, EPS);
                 ref_rms_norm(s, w_kn, EPS);
                 for (int64_t d = 0; d < IDXD; ++d) {
@@ -812,6 +811,7 @@ int main(int argc, char** argv) try {
             const int64_t width = strata::kernels::qsa_selection_width(n, S);
             const int64_t tail = n % R;
             std::vector<int32_t> want;
+            want.reserve((size_t) width);
             for (int64_t j = 0; j < width - tail; ++j) want.push_back((int32_t) j);
             for (int64_t j = n - tail; j < n; ++j) want.push_back((int32_t) j);
 

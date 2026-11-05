@@ -3,15 +3,18 @@
 // include/strata/kernels/qk_norm_rope.hpp - the one kernel that RMS-norms the heads of q and k and rotates them
 // (RoPE), for the image engine's DiTs and its text and vision readers alike (device code: SYCL files only).
 //
-// A job is one head of one row: q's heads, then k's, then (with `values`) v's, which are only copied.  A sub-group of
-// 32 a job, kJobs jobs a work-group, the lanes over the head's rotated pairs: (j, j + n_rot / 2) (kNeox) or (2j, 2j + 1)
+// A job is one head index of one row: its q head, then its k head and (with `values`) its v head, which is only copied
+// (a GQA's k and v heads past the q heads' count have none).  A sub-group of 32 a job, kJobs jobs a work-group, the
+// lanes over the head's rotated pairs: (j, j + n_rot / 2) (kNeox) or (2j, 2j + 1)
 // (interleaved), the columns past n_rot normed only.  The sum of squares is each lane's pairs' a a + b b, in turn,
 // then the sub-group's sum.  Every engine GPU has 32-wide sub-groups (core/device.cpp refuses one without).
 //
-// What differs between the models is in three small types the caller gives:
-//   In:  float at(int which, int64_t t, int64_t head, int64_t d)       which 0 q, 1 k, 2 v; the input's layout
-//   Ang: void cs(int64_t t, int64_t j, float& c, float& s)              the angle of pair j of row t (NoRope: none)
-//   Out: void put(int which, int64_t t, int64_t head, int64_t d, float)   the output's layout, type and repeats
+// What differs between the models is in three small types the caller gives, each bound to a head (or a row) once and
+// then read by the column, the columns counted in int - an index a column took 64-bit multiplies a value, which Intel's
+// GPUs have no instruction for (MOSS-Image's QK on the B70: 369 -> 468 us; the 64-bit column counts, 381 -> 390 us):
+//   In:  head(int which, int64_t t, int64_t h) -> r, float r(int64_t d)          which 0 q, 1 k, 2 v; the layout
+//   Ang: row(int64_t t) -> a, void a(int64_t j, float& c, float& s)               pair j's angle (NoRope: none)
+//   Out: out_head(int which, int64_t t, int64_t h) -> w, void w(int64_t d, float) the layout, type and repeats
 #pragma once
 
 #include "strata/kernels/f16_gpu.hpp"
@@ -20,6 +23,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace strata::kernels::qk {
@@ -29,7 +33,7 @@ constexpr int64_t kLanes = 32, kJobs = 8;
 /// no rotation: the heads normed only
 struct NoRope {
     static constexpr bool on = false;
-    void cs(int64_t, int64_t, float& c, float& s) const { c = 1.f; s = 0.f; }
+    auto row(int64_t) const { return [](int64_t, float& c, float& s) { c = 1.f; s = 0.f; }; }
 };
 
 /// cos and sin tables [T][half]
@@ -37,7 +41,10 @@ struct Tables {
     static constexpr bool on = true;
     const float *cos, *sin;
     int64_t half;
-    void cs(int64_t t, int64_t j, float& c, float& s) const { c = cos[t * half + j]; s = sin[t * half + j]; }
+    auto row(int64_t t) const {
+        const float *c0 = cos + t * half, *s0 = sin + t * half;
+        return [c0, s0](int64_t j, float& c, float& s) { c = c0[j]; s = s0[j]; };
+    }
 };
 
 /// an angle table [T][half] (HunyuanImage 3.0's)
@@ -45,10 +52,12 @@ struct Angles {
     static constexpr bool on = true;
     const float* ang;
     int64_t half;
-    void cs(int64_t t, int64_t j, float& c, float& s) const {
-        const float a = ang[t * half + j];
-        c = sycl::cos(a);
-        s = sycl::sin(a);
+    auto row(int64_t t) const {
+        const float* a0 = ang + t * half;
+        return [a0](int64_t j, float& c, float& s) {
+            c = sycl::cos(a0[j]);
+            s = sycl::sin(a0[j]);
+        };
     }
 };
 
@@ -64,19 +73,27 @@ struct Theta {
     int sec_h = 0, sec_w = 0;
     const int32_t* yx = nullptr;
     int64_t quarter = 0;
-    void cs(int64_t t, int64_t j, float& c, float& s) const {
-        float pos = (float) t;
-        int64_t f = j;
-        if (pos3 != nullptr)
-            pos = (float) (j % 3 == 1 && j < 3 * (int64_t) sec_h ? pos3[T + t]
-                           : j % 3 == 2 && j < 3 * (int64_t) sec_w ? pos3[2 * T + t] : pos3[t]);
-        else if (yx != nullptr) {
-            pos = (float) (j < quarter ? yx[2 * t] : yx[2 * t + 1]);
-            f = j < quarter ? j : j - quarter;
-        }
-        const float a = pos * sycl::pow(theta, -2.0f * (float) f / dim);
-        c = sycl::cos(a);
-        s = sycl::sin(a);
+    auto row(int64_t t) const {
+        // the row's positions: its own index, its three M-RoPE ones, or its y and x
+        const float pt = pos3 != nullptr ? (float) pos3[t] : yx != nullptr ? (float) yx[2 * t] : (float) t;
+        const float ph = pos3 != nullptr ? (float) pos3[T + t] : yx != nullptr ? (float) yx[2 * t + 1] : (float) t;
+        const float pw = pos3 != nullptr ? (float) pos3[2 * T + t] : pt;
+        const bool m3 = pos3 != nullptr, two = yx != nullptr;
+        const int64_t qu = quarter, sh = sec_h, sw = sec_w;
+        const float th = theta, dm = dim;
+        return [=](int64_t j, float& c, float& s) {
+            float pos = pt;
+            int64_t f = j;
+            if (m3)
+                pos = j % 3 == 1 && j < 3 * sh ? ph : j % 3 == 2 && j < 3 * sw ? pw : pt;
+            else if (two) {
+                pos = j < qu ? pt : ph;
+                f = j < qu ? j : j - qu;
+            }
+            const float a = pos * sycl::pow(th, -2.0f * (float) f / dm);
+            c = sycl::cos(a);
+            s = sycl::sin(a);
+        };
     }
 };
 
@@ -93,14 +110,18 @@ struct Rope {
     RopeKernelArgs ka;
     const int* positions;
     int64_t pos0;
-    void cs(int64_t t, int64_t j, float& c, float& s) const {
-        const int p = mrope_pos(mtab, positions != nullptr ? positions[t] : (int) (pos0 + t), (int) j);
-        if (cos != nullptr && p >= 0 && p < max_pos) {
-            c = cos[(int64_t) p * half + j];
-            s = sin[(int64_t) p * half + j];
-            return;
-        }
-        rope_cos_sin((float) p * sycl::pow(theta_scale, (float) j), scaled, ka, (int) j, c, s);
+    auto row(int64_t t) const {
+        const int pt = positions != nullptr ? positions[t] : (int) (pos0 + t);
+        const Rope r = *this;
+        return [r, pt](int64_t j, float& c, float& s) {
+            const int p = mrope_pos(r.mtab, pt, (int) j);
+            if (r.cos != nullptr && p >= 0 && p < r.max_pos) {
+                c = r.cos[(int64_t) p * r.half + j];
+                s = r.sin[(int64_t) p * r.half + j];
+                return;
+            }
+            rope_cos_sin((float) p * sycl::pow(r.theta_scale, (float) j), r.scaled, r.ka, (int) j, c, s);
+        };
     }
 };
 
@@ -109,29 +130,45 @@ struct Rows32 {
     const float* in;
     float* out;
     int64_t ld_in, ld_out, head_dim;
-    float at(int, int64_t t, int64_t head, int64_t d) const { return in[t * ld_in + head * head_dim + d]; }
-    void put(int, int64_t t, int64_t head, int64_t d, float v) const { out[t * ld_out + head * head_dim + d] = v; }
+    auto head(int, int64_t t, int64_t h) const {
+        const float* p = in + t * ld_in + h * head_dim;
+        return [p](int64_t d) { return p[d]; };
+    }
+    struct Put {
+        float* p;
+        void operator()(int64_t d, float v) const { p[d] = v; }
+    };
+    Put out_head(int, int64_t t, int64_t h) const { return {out + t * ld_out + h * head_dim}; }
 };
 
 /// FP16 rows out: q [T][q_heads][head_dim], k and v [T][kv_out][head_dim], each k and v head written `rep` times (to
-/// heads head rep .. + rep - 1: a GQA's k and v repeated for each q head they serve), clamped to FP16's range with
-/// `clamp`
+/// heads head rep .. + rep - 1: a GQA's k and v repeated for each q head they serve)
 struct Rows16 {
     uint16_t *q16, *k16, *v16;
     int64_t q_heads, kv_out, head_dim, rep = 1;
-    bool clamp = false;
-    void put(int which, int64_t t, int64_t head, int64_t d, float v) const {
-        const uint16_t h = f16_gpu::f16_from_f32(clamp ? sycl::clamp(v, -65504.f, 65504.f) : v);
-        if (which == 0) { q16[(t * q_heads + head) * head_dim + d] = h; return; }
-        uint16_t* dst = which == 1 ? k16 : v16;
-        for (int64_t r = 0; r < rep; ++r) dst[(t * kv_out + head * rep + r) * head_dim + d] = h;
+    struct Put {
+        uint16_t* p;
+        int64_t rep, head_dim;
+        void operator()(int64_t d, float v) const {
+            const uint16_t h = f16_gpu::f16_from_f32(v);
+            if (rep == 1) {   // the usual: one head
+                p[d] = h;
+                return;
+            }
+            for (int64_t r = 0; r < rep; ++r) p[r * head_dim + d] = h;
+        }
+    };
+    Put out_head(int which, int64_t t, int64_t h) const {
+        if (which == 0) return {q16 + (t * q_heads + h) * head_dim, 1, head_dim};
+        return {(which == 1 ? k16 : v16) + (t * kv_out + h * rep) * head_dim, rep, head_dim};
     }
 };
 
 /// What a launch does: q_heads and kv_heads heads of head_dim a row (n_rot of them rotated; 0: all), T rows.  wq and
-/// wk: the norms' weights (null: not normed); rope_first: rotated, then normed with the weights after (HunyuanImage
-/// 3.0's order; the rotation keeps the sum of squares), else normed and weighted, then rotated; values: v's heads
-/// copied too; tail: the columns past n_rot written (false: in place and not normed, left as they are).
+/// wk: the norms' weights (both null: not normed; one set, the other tensor's heads none); rope_first: rotated, then
+/// normed with the weights after (HunyuanImage 3.0's order; the rotation keeps the sum of squares), else normed and
+/// weighted, then rotated; values: v's heads copied too; tail: the columns past n_rot written (false: in place and not
+/// normed, left as they are).
 struct Shape {
     int64_t T, q_heads, kv_heads, head_dim, n_rot = 0;
     const float *wq = nullptr, *wk = nullptr;
@@ -139,13 +176,68 @@ struct Shape {
     bool neox = true, rope_first = false, values = true, tail = true;
 };
 
-template <class In, class Ang, class Out>
-sycl::event qk_norm_rope(sycl::queue& q, const Shape& sh, const In in, const Ang ang, const Out out) {
-    const int64_t hd = sh.head_dim, n_rot = sh.n_rot > 0 ? sh.n_rot : hd, half = n_rot / 2;
-    const int64_t per_row = sh.q_heads + sh.kv_heads * (sh.values ? 2 : 1), n = sh.T * per_row;
-    const int64_t qh = sh.q_heads, kvh = sh.kv_heads;
+/// One head of row t, of q (WHICH 0) or k (1): the job's arithmetic, WHICH a constant (the input and output it reads
+/// and writes resolved when the kernel is compiled)
+template <int WHICH, bool NEOX, bool ROPE_FIRST, bool NORM, class In, class Ang, class Out>
+inline void qk_head(const sycl::sub_group& sg, const In& in, const Ang& ang, const Out& out, const float* w, float eps,
+                    int64_t t, int64_t head, int64_t hd64, int64_t n_rot64, bool tail) {
+    constexpr bool neox = NEOX, rope_first = ROPE_FIRST;
+    const int lane = (int) sg.get_local_linear_id(), hd = (int) hd64, n_rot = (int) n_rot64, half = n_rot / 2;
+    const auto x = in.head(WHICH, t, head);
+    const auto y = out.out_head(WHICH, t, head);
+    const auto rot = ang.row(t);
+    float r = 1.f;
+    if (NORM) {
+        float ss = 0.f;
+        for (int p = lane; p < half; p += (int) kLanes) {
+            const float a = x(neox ? p : 2 * p);
+            const float b = x(neox ? p + half : 2 * p + 1);
+            ss += a * a + b * b;
+        }
+        for (int d = n_rot + lane; d < hd; d += (int) kLanes) {
+            const float a = x(d);
+            ss += a * a;
+        }
+        r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + eps);
+    }
+    for (int p = lane; p < half; p += (int) kLanes) {
+        const int i0 = neox ? p : 2 * p, i1 = neox ? p + half : 2 * p + 1;
+        float a = x(i0), b = x(i1), c, s;
+        rot(p, c, s);
+        // rope.hpp's rope_neox_pair: a' = a c - b s, b' = a s + b c
+        if (rope_first) {
+            const float a2 = a * c - b * s, b2 = a * s + b * c;
+            a = NORM ? a2 * r * w[i0] : a2;
+            b = NORM ? b2 * r * w[i1] : b2;
+        } else {
+            if (NORM) {
+                a = a * r * w[i0];
+                b = b * r * w[i1];
+            }
+            if (Ang::on) {
+                const float a2 = a * c - b * s;
+                b = a * s + b * c;
+                a = a2;
+            }
+        }
+        y(i0, a);
+        y(i1, b);
+    }
+    if (!tail) return;
+    for (int d = n_rot + lane; d < hd; d += (int) kLanes) {
+        const float a = x(d);
+        y(d, NORM ? a * r * w[d] : a);
+    }
+}
+
+template <bool NEOX, bool ROPE_FIRST, bool NORM, class In, class Ang, class Out>
+sycl::event qk_norm_rope_t(sycl::queue& q, const Shape& sh, const In in, const Ang ang, const Out out) {
+    const int64_t hd = sh.head_dim, n_rot = sh.n_rot > 0 ? sh.n_rot : hd;
+    const int64_t qh = sh.q_heads, kvh = sh.kv_heads, nh = std::max(qh, kvh), n = sh.T * nh;
     const float *wq = sh.wq, *wk = sh.wk, eps = sh.eps;
-    const bool neox = sh.neox, rope_first = sh.rope_first, tail = sh.tail || sh.wq != nullptr || sh.wk != nullptr;
+    const bool values = sh.values, tail = sh.tail || NORM;
+    // a job a row's head index h: its q head (h < q_heads), its k head and v head (h < kv_heads), one after the other
+    // in the same sub-group - jobs of one tensor each ran the RTX 4070's Qwen-Image 4.0 -> 5.1 s an image
     return q.parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) ((n + kJobs - 1) / kJobs * kJobs * kLanes)),
                           sycl::range<1>((size_t) (kJobs * kLanes))),
@@ -153,59 +245,35 @@ sycl::event qk_norm_rope(sycl::queue& q, const Shape& sh, const In in, const Ang
             const auto sg = it.get_sub_group();
             const int64_t job = (int64_t) it.get_group_linear_id() * kJobs + (int64_t) sg.get_group_linear_id();
             if (job >= n) return;   // the whole sub-group
-            const int64_t t = job / per_row, k = job - t * per_row;
-            const int which = k < qh ? 0 : k < qh + kvh ? 1 : 2;
-            const int64_t head = which == 0 ? k : which == 1 ? k - qh : k - qh - kvh;
-            const int64_t lane = (int64_t) sg.get_local_linear_id();
-            if (which == 2) {
-                for (int64_t d = lane; d < hd; d += kLanes) out.put(2, t, head, d, in.at(2, t, head, d));
-                return;
-            }
-            const float* w = which == 0 ? wq : wk;
-            auto lo = [&](int64_t p) { return neox ? p : 2 * p; };
-            auto hi = [&](int64_t p) { return neox ? p + half : 2 * p + 1; };
-            float r = 1.f;
-            if (w != nullptr) {
-                float ss = 0.f;
-                for (int64_t p = lane; p < half; p += kLanes) {
-                    const float a = in.at(which, t, head, lo(p)), b = in.at(which, t, head, hi(p));
-                    ss += a * a + b * b;
+            const int64_t t = job / nh, h = job - t * nh;
+            if (h < qh) qk_head<0, NEOX, ROPE_FIRST, NORM>(sg, in, ang, out, wq, eps, t, h, hd, n_rot, tail);
+            if (h < kvh) {
+                qk_head<1, NEOX, ROPE_FIRST, NORM>(sg, in, ang, out, wk, eps, t, h, hd, n_rot, tail);
+                if (values) {
+                    const auto x = in.head(2, t, h);
+                    const auto y = out.out_head(2, t, h);
+                    for (int d = (int) sg.get_local_linear_id(); d < (int) hd; d += (int) kLanes) y(d, x(d));
                 }
-                for (int64_t d = n_rot + lane; d < hd; d += kLanes) {
-                    const float a = in.at(which, t, head, d);
-                    ss += a * a;
-                }
-                r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + eps);
-            }
-            for (int64_t p = lane; p < half; p += kLanes) {
-                const int64_t i0 = lo(p), i1 = hi(p);
-                float a = in.at(which, t, head, i0), b = in.at(which, t, head, i1), c, s;
-                ang.cs(t, p, c, s);
-                // rope.hpp's rope_neox_pair: a' = a c - b s, b' = a s + b c
-                if (rope_first) {
-                    const float a2 = a * c - b * s, b2 = a * s + b * c;
-                    a = w != nullptr ? a2 * r * w[i0] : a2;
-                    b = w != nullptr ? b2 * r * w[i1] : b2;
-                } else {
-                    if (w != nullptr) {
-                        a = a * r * w[i0];
-                        b = b * r * w[i1];
-                    }
-                    if (Ang::on) {
-                        const float a2 = a * c - b * s;
-                        b = a * s + b * c;
-                        a = a2;
-                    }
-                }
-                out.put(which, t, head, i0, a);
-                out.put(which, t, head, i1, b);
-            }
-            if (!tail) return;
-            for (int64_t d = n_rot + lane; d < hd; d += kLanes) {
-                const float a = in.at(which, t, head, d);
-                out.put(which, t, head, d, w != nullptr ? a * r * w[d] : a);
             }
         });
+}
+
+/// The kernel's forms: the pairs' layout, the order of the rotation and the norm, and whether there is a norm, as
+/// constants (the per-head kernels this replaced had them so; as run-time flags in the loops they cost MOSS-Image's
+/// QK on the B70 a quarter more)
+template <class In, class Ang, class Out>
+sycl::event qk_norm_rope(sycl::queue& q, const Shape& sh, const In in, const Ang ang, const Out out) {
+    const bool norm = sh.wq != nullptr || sh.wk != nullptr;
+    if (sh.neox) {
+        if (sh.rope_first) return norm ? qk_norm_rope_t<true, true, true>(q, sh, in, ang, out)
+                                       : qk_norm_rope_t<true, true, false>(q, sh, in, ang, out);
+        return norm ? qk_norm_rope_t<true, false, true>(q, sh, in, ang, out)
+                    : qk_norm_rope_t<true, false, false>(q, sh, in, ang, out);
+    }
+    if (sh.rope_first) return norm ? qk_norm_rope_t<false, true, true>(q, sh, in, ang, out)
+                                   : qk_norm_rope_t<false, true, false>(q, sh, in, ang, out);
+    return norm ? qk_norm_rope_t<false, false, true>(q, sh, in, ang, out)
+                : qk_norm_rope_t<false, false, false>(q, sh, in, ang, out);
 }
 
 }  // namespace strata::kernels::qk

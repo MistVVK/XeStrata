@@ -116,7 +116,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
             int sum = 0;
             for (int ii = 0; ii < 16; ++ii) sum += qs[j * 16 + ii];
             const int16_t s16 = (int16_t) sum;
-            std::memcpy(bsums + 2 * j, &s16, 2);
+            std::memcpy(bsums + (size_t) 2 * j, &s16, 2);
         }
         const float d = 1.0f / iscale;
         std::memcpy(out, &d, 4);

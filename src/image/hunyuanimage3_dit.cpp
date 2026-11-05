@@ -215,8 +215,10 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
             gemm.f16(sc.gx16, sc.egu16, sc.eg32, cnt, w.egu_n, w.egu_k);
             hunyuanimage3_swiglu16_rotated(sc.eg32, cnt, d.inter, sc.gact16, stream);
             gemm.f16(sc.gact16, sc.edn16, sc.ed32, cnt, w.edn_n, w.edn_k);
-            hunyuanimage3_scatter_scale_add(out, sc.ed32, sc.d_w + begin[(size_t) e], sc.d_rows + begin[(size_t) e], cnt,
-                                  d.hidden, stream);
+            // the expert's rows back into their tokens by their weights: the LLMs' scatter of a group's rows
+            // (each token once an expert, so no two work-items add to one value)
+            prefill::moe_scatter_add(sc.ed32, sc.d_rows + begin[(size_t) e], nullptr, nullptr, sc.d_w + begin[(size_t) e],
+                                     cnt, out, stream, d.hidden);
         }
         gpu::device_sync();
         return true;

@@ -138,6 +138,10 @@ struct PleCapture {
 };
 
 bool load_capture(const char* in_path, const char* out_path, PleCapture& c) {
+    auto rd = [](std::FILE* file, std::vector<float>& v, long long n) {
+        v.resize((size_t) n);
+        return n == 0 || std::fread(v.data(), 4, (size_t) n, file) == (size_t) n;
+    };
     std::FILE* fi = std::fopen(in_path, "rb");
     if (!fi) return false;
     int32_t h[5] = {0};
@@ -158,10 +162,6 @@ bool load_capture(const char* in_path, const char* out_path, PleCapture& c) {
     if (file_size(in_path) != in_bytes || file_size(out_path) != out_bytes) {
         std::fclose(fi); return false;
     }
-    auto rd = [](std::FILE* file, std::vector<float>& v, long long n) {
-        v.resize((size_t) n);
-        return n == 0 || std::fread(v.data(), 4, (size_t) n, file) == (size_t) n;
-    };
     bool ok = rd(fi, c.emb, nt * nd) && rd(fi, c.hidden, nt * hcd) && rd(fi, c.w_key, hcd * nd) &&
               rd(fi, c.w_value, nd * nd) && rd(fi, c.w_nk, hcd) && rd(fi, c.w_nq, hcd) && rd(fi, c.w_nc, hcd) &&
               rd(fi, c.w_conv, hcd * c.kern) && rd(fi, c.hist, hist * hcd);
@@ -204,7 +204,7 @@ int history_advance_regression() {
     int bad = 0;
     for (int token = 0; token < 12; ++token) {
         for (size_t c = 0; c < channels; ++c) {
-            normalized[c] = float((token + 1) * 1000000 + c); // distinct exactly represented integers
+            normalized[c] = float((size_t) (token + 1) * 1000000 + c); // distinct exactly represented integers
             for (size_t r = 0; r + 1 < rows; ++r) expected[c * rows + r] = expected[c * rows + r + 1];
             expected[c * rows + rows - 1] = normalized[c];
         }
@@ -212,7 +212,7 @@ int history_advance_regression() {
         ck(cudaGraphLaunch(executable, stream), "history captured advance");
         ck(cudaStreamSynchronize(stream), "history captured advance sync");
         ck(cudaMemcpy(actual.data(), history, count * sizeof(float), cudaMemcpyDeviceToHost), "history readback");
-        if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {
+        if (std::memcmp(actual.data(), expected.data(), count * sizeof(float)) != 0) {  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             std::printf("  history advance mismatch after token %d\n", token);
             ++bad;
         }
@@ -246,8 +246,9 @@ int main(int argc, char** argv) {
     bool check_fixtures = false;
     std::string pack = "pack/full";
     // --gguf, else $STRATA_PLE_GGUF, else the development layout (run from the engine root)
-    std::string gguf = std::getenv("STRATA_PLE_GGUF") ? std::getenv("STRATA_PLE_GGUF")
-                                                      : "../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf";
+    const char* gguf_env = std::getenv("STRATA_PLE_GGUF");
+    std::string gguf = gguf_env ? gguf_env
+                                : "../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf";
     std::string in_bin = "bench/micro/ple_in.bin", out_bin = "bench/micro/ple_out.bin";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -660,7 +661,7 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&d_kc, key_codes.size()), "kc");
     ck(cudaMalloc(&d_vb, value_bf16.size() * 2), "vb");
     ck(cudaMalloc(&d_c1, conv1d_f16.size() * 2), "c1");
-    ck(cudaMalloc(&d_g, k::NG_HC * 4), "g");
+    ck(cudaMalloc(&d_g, (size_t) k::NG_HC * 4), "g");
     ck(cudaMalloc(&d_v, nd * 4), "v");
     ck(cudaMalloc(&d_gd, hcd * 4), "gd");
     ck(cudaMalloc(&d_nm, hcd * 4), "nm");
@@ -747,7 +748,7 @@ int main(int argc, char** argv) {
     ck(cudaDeviceSynchronize(), "ple_block sync");
         ck(cudaMemcpy(dev_key.data(), d_ck, hcd * 4, cudaMemcpyDeviceToHost), "rck");
         ck(cudaMemcpy(dev_value.data(), d_cv, nd * 4, cudaMemcpyDeviceToHost), "rcv");
-        ck(cudaMemcpy(dev_gate.data(), d_g, k::NG_HC * 4, cudaMemcpyDeviceToHost), "rg");
+        ck(cudaMemcpy(dev_gate.data(), d_g, (size_t) k::NG_HC * 4, cudaMemcpyDeviceToHost), "rg");
         ck(cudaMemcpy(dev_gated.data(), d_gd, hcd * 4, cudaMemcpyDeviceToHost), "rgd");
         ck(cudaMemcpy(dev_norm.data(), d_nm, hcd * 4, cudaMemcpyDeviceToHost), "rnm");
         ck(cudaMemcpy(dev_conv.data(), d_co, hcd * 4, cudaMemcpyDeviceToHost), "rco");
@@ -824,7 +825,7 @@ int main(int argc, char** argv) {
             ck(cudaGraphLaunch(executable, stream), "native PLE replay");
             ck(cudaStreamSynchronize(stream), "native PLE replay sync");
             ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "native PLE replay result");
-            const bool captured = std::memcmp(native_result.data(), replay.data(), hcd * sizeof(float)) == 0;
+            const bool captured = std::memcmp(native_result.data(), replay.data(), hcd * sizeof(float)) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             std::printf("  native PLE captured selection: %s\n", captured ? "byte-identical" : "FAIL");
             if (!captured) ++bad;
             ck(cudaGraphExecDestroy(executable), "native PLE graph exec destroy");
@@ -834,7 +835,7 @@ int main(int argc, char** argv) {
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
             ck(cudaDeviceSynchronize(), "restored PLE sync");
             ck(cudaMemcpy(replay.data(), d_cr, hcd * sizeof(float), cudaMemcpyDeviceToHost), "restored PLE result");
-            const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * sizeof(float)) == 0;
+            const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * sizeof(float)) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             std::printf("  restored PLE default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
         }
@@ -919,7 +920,7 @@ int main(int argc, char** argv) {
                     ck(cudaGraphLaunch(executable, stream), "native PLE key replay");
                     ck(cudaStreamSynchronize(stream), "native PLE key replay sync");
                     ck(cudaMemcpy(replay.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "native PLE key replay read");
-                    if (std::memcmp(actual_result.data(), replay.data(), hcd * 4) != 0) ++bad;
+                    if (std::memcmp(actual_result.data(), replay.data(), hcd * 4) != 0) ++bad;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
                 }
                 nw.key_native_data = native_data;
             }
@@ -939,7 +940,7 @@ int main(int argc, char** argv) {
             k::ple_block(d_emb, d_hid, d_hist, w, out, ple_ws, nullptr);
             ck(cudaDeviceSynchronize(), "native PLE default restore sync");
             ck(cudaMemcpy(replay.data(), d_cr, hcd * 4, cudaMemcpyDeviceToHost), "native PLE default restore read");
-            const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * 4) == 0;
+            const bool restored = std::memcmp(dev_res.data(), replay.data(), hcd * 4) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             std::printf("  native PLE key graph/repeat/buffer guards checked; restored default: %s\n", restored ? "byte-identical" : "FAIL");
             if (!restored) ++bad;
         }
@@ -958,8 +959,8 @@ int main(int argc, char** argv) {
             std::vector<float> compact_norm(hcd), compact_result(hcd);
             ck(cudaMemcpy(compact_norm.data(), compact.normalized, hcd * sizeof(float), cudaMemcpyDeviceToHost), "compact PLE normalized");
             ck(cudaMemcpy(compact_result.data(), d_hid, hcd * sizeof(float), cudaMemcpyDeviceToHost), "compact PLE result");
-            const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 &&
-                               std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;
+            const bool equal = std::memcmp(compact_norm.data(), dev_norm.data(), hcd * sizeof(float)) == 0 &&  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
+                               std::memcmp(compact_result.data(), dev_res.data(), hcd * sizeof(float)) == 0;  // NOLINT(bugprone-suspicious-memory-comparison): bit-exact
             std::printf("  PLE separate exports and in-place hidden result: %s\n", equal ? "byte-identical" : "FAIL");
             if (!equal) ++bad;
             ck(cudaMemcpy(d_hid, cap.hidden.data(), hcd * sizeof(float), cudaMemcpyHostToDevice), "restore PLE hidden input");

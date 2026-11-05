@@ -182,7 +182,7 @@ int mmvf_block_size(int64_t n_in) {
     int best = 32;
     int64_t best_iterations = (n_in + 63) / 64;
     for (int candidate = 64; candidate <= 256; candidate += 32) {
-        const int64_t iterations = (n_in + 2 * candidate - 1) / (2 * candidate);
+        const int64_t iterations = (n_in + (int64_t) 2 * candidate - 1) / ((int64_t) 2 * candidate);
         if (iterations < best_iterations) {
             best_iterations = iterations;
             best = candidate;
@@ -244,13 +244,14 @@ void dispatch_mmvf(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* 
         case 192: launch_mmvf<192, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
         case 224: launch_mmvf<224, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
         case 256: launch_mmvf<256, NT, EXACT>(q, x, ldx, w, y, ldy, (int) n_in, n_out, n_tok, aux); break;
+        default: break;   // mmvf_block_size gives only the eight sizes above
     }
 }
 
 // the multi-row call's kernels: the window's usual row counts with their loop fixed at compile time (upstream
 // 104a8485); rows: 4 rows a work-group
 void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
-                    int64_t n_in, int64_t n_out, int n_tok, bool rows, MmvfAux aux = {}) {
+                    int64_t n_in, int64_t n_out, int n_tok, bool rows, const MmvfAux& aux = {}) {
     switch (n_tok) {
         case 2: dispatch_mmvf<2, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
         case 3: dispatch_mmvf<3, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;

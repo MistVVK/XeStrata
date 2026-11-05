@@ -83,7 +83,7 @@ inline float row_dot_s2_q8(const uint8_t* codes, const uint8_t* scales, const ui
         for (int j = 0; j < 8; ++j) {
             const int cw = code_word(cb[j]);
             int xw;
-            std::memcpy(&xw, xq + 4 * j, 4);   // a block_q8_0's data is never 4-byte aligned
+            std::memcpy(&xw, xq + (size_t) 4 * j, 4);   // a block_q8_0's data is never 4-byte aligned
             s = dp4a(cw, xw, s);
             hx = dp4a(ones, xw, hx);
         }
@@ -186,12 +186,12 @@ inline float row_dot_cpu_order(const sycl::sub_group& sg, const uint8_t* codes, 
     float acc = 0.0f;
     float corr = 0.0f;
     for (int b = 0; b < blocks; ++b) {
-        const float d = f16_at(scales + 2 * b);
-        const int lo = dot4(codes + b * 16 + lane, (const int8_t*) (xq + (size_t) (2 * b) * 34 + 2) + lane * 4);
-        const int hi = dot4(codes + b * 16 + 8 + lane, (const int8_t*) (xq + (size_t) (2 * b + 1) * 34 + 2) + lane * 4);
-        acc = sycl::fma(d * xs[2 * b], (float) lo, acc);
+        const float d = f16_at(scales + (size_t) 2 * b);
+        const int lo = dot4(codes + (size_t) b * 16 + lane, (const int8_t*) (xq + (size_t) (2 * b) * 34 + 2) + (size_t) lane * 4);
+        const int hi = dot4(codes + (size_t) b * 16 + 8 + lane, (const int8_t*) (xq + (size_t) (2 * b + 1) * 34 + 2) + (size_t) lane * 4);
+        acc = sycl::fma(d * xs[(size_t) 2 * b], (float) lo, acc);
         acc = sycl::fma(d * xs[2 * b + 1], (float) hi, acc);
-        if (lane == 0) corr = corr + d * (hx[2 * b] + hx[2 * b + 1]);
+        if (lane == 0) corr = corr + d * (hx[(size_t) 2 * b] + hx[2 * b + 1]);
     }
     acc = acc + sycl::permute_group_by_xor(sg, acc, 4);
     acc = acc + sycl::permute_group_by_xor(sg, acc, 1);
@@ -268,7 +268,7 @@ void hit_pipeline(const uint8_t* blob_base, const int32_t* slot_index, const int
     const uint64_t q8_bytes = ((uint64_t) n * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
+    float* h_scales = reinterpret_cast<float*>((uint8_t*) scratch + gu_bytes + q8_bytes);
     gu_launch(q, blob_base, slot_index, blob_bytes, x_q8_0, x_scales, gate_up, (int) n, d_count, dst_index, tok_div);
     void* s = &q;
     if (x_scales != nullptr) {
@@ -401,11 +401,11 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
     float* gate_up = (float*) scratch;
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
-    float* h_scales = (float*) ((uint8_t*) scratch + gu_bytes + q8_bytes);
+    float* h_scales = reinterpret_cast<float*>((uint8_t*) scratch + gu_bytes + q8_bytes);
     const int cap_e = (int) cap_entries;
     q.submit([&](sycl::handler& hd) {
-        sycl::local_accessor<int, 1> xs_q(sycl::range<1>(GMAX * (H / 4)), hd);   // the entries' int8 activations as words
-        sycl::local_accessor<float, 1> xs_d(sycl::range<1>(GMAX * (H / 32)), hd);
+        sycl::local_accessor<int, 1> xs_q(sycl::range<1>((size_t) GMAX * (H / 4)), hd);   // the entries' int8 activations as words
+        sycl::local_accessor<float, 1> xs_d(sycl::range<1>((size_t) GMAX * (H / 32)), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) cap_groups, (size_t) (2 * FF / GU_ROWS) * 256}, {1, 256}),
                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -420,7 +420,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 const int8_t* qq = (const int8_t*) (xb + 2);
                 for (int w = 0; w < 8; ++w) {
                     int v;
-                    std::memcpy(&v, qq + 4 * w, 4);
+                    std::memcpy(&v, qq + (size_t) 4 * w, 4);
                     xs_q[k * (H / 4) + c * 8 + w] = v;
                 }
             }
@@ -468,8 +468,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     }
     const float* hs = x_scales != nullptr ? h_scales : nullptr;
     const auto e = q.submit([&](sycl::handler& hd) {
-        sycl::local_accessor<int, 1> hs_q(sycl::range<1>(GMAX * (FF / 4)), hd);
-        sycl::local_accessor<float, 1> hs_d(sycl::range<1>(GMAX * (FF / 32)), hd);
+        sycl::local_accessor<int, 1> hs_q(sycl::range<1>((size_t) GMAX * (FF / 4)), hd);
+        sycl::local_accessor<float, 1> hs_d(sycl::range<1>((size_t) GMAX * (FF / 32)), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) cap_groups, (size_t) (H / D_ROWS) * 256}, {1, 256}),
                         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -484,7 +484,7 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
                 const int8_t* qq = (const int8_t*) (xb + 2);
                 for (int w = 0; w < 8; ++w) {
                     int v;
-                    std::memcpy(&v, qq + 4 * w, 4);
+                    std::memcpy(&v, qq + (size_t) 4 * w, 4);
                     hs_q[k * (FF / 4) + c * 8 + w] = v;
                 }
             }
@@ -544,9 +544,9 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
     const uint64_t scale_bytes = ((uint64_t) n_hits * (FF / 32) * 4 + 15) & ~15ull;
     float* gu = (float*) scratch;
     uint8_t* hq = (uint8_t*) scratch + gu_bytes;
-    float* hs = (float*) (hq + q8_bytes);
-    float* hh = (float*) ((uint8_t*) hs + scale_bytes);
-    float* xh = (float*) ((uint8_t*) hh + scale_bytes);
+    float* hs = reinterpret_cast<float*>(hq + q8_bytes);
+    float* hh = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(hs) + scale_bytes);
+    float* xh = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(hh) + scale_bytes);
     // the input's correction term: scale * sum of its int8 values, per chunk
     q.parallel_for(sycl::range<1>(H / 32), [=](sycl::id<1> id) {
         const int c = (int) id[0];

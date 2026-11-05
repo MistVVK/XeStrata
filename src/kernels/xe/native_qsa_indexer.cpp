@@ -135,7 +135,7 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency and explicit stream");
     const std::size_t pos_span = n_steps == 1 || pos_stride <= 0 ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
     const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,std::size_t(D)*4},{b.tail,std::size_t(R-1)*D*4},
-        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
+        {b.dead,std::size_t(D)*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
     for (const auto& span : spans) validate(span);
     for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
         if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");

@@ -170,10 +170,11 @@ void hunyuanimage3_qk_rope_norm16(const float* qkv, const float* wq, const float
     struct In {
         const float* qkv;
         int64_t kv_heads, groups, hd;
-        float at(int which, int64_t t, int64_t h, int64_t d) const {
+        auto head(int which, int64_t t, int64_t h) const {
             const int64_t kv = which == 0 ? h / groups : h;
             const int64_t slot = which == 0 ? h % groups : which == 1 ? groups : groups + 1;
-            return qkv[((t * kv_heads + kv) * (groups + 2) + slot) * hd + d];
+            const float* p = qkv + ((t * kv_heads + kv) * (groups + 2) + slot) * hd;
+            return [p](int64_t d) { return p[d]; };
         }
     };
     // rotate_half with the SAME angle for both halves, then the norm (the reference's order): the rotation is
@@ -208,17 +209,6 @@ void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, u
         });
     });
     finish(stream, e, "hunyuanimage3_swiglu16_rotated");
-}
-
-void hunyuanimage3_scatter_scale_add(float* x, const float* y, const float* w, const int32_t* rows, int64_t n_rows,
-                           int64_t C, void* stream) {
-    if (n_rows <= 0) return;
-    const auto e = kernels::for_rows_cols(queue_for(stream), n_rows, C, [=](int64_t r, int64_t c) {
-            sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device> target(
-                x[(int64_t) rows[r] * C + c]);
-            target += w[r] * y[r * C + c];
-        });
-    finish(stream, e, "hunyuanimage3_scatter_scale_add");
 }
 
 void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream) { kernels::add_inplace(x, v, n, stream); }
