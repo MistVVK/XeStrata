@@ -36,6 +36,11 @@ struct CropBox {
 /// `src` (RGBA8) at w x h by Pillow's Lanczos, its support widened by the scale when it shrinks (an upscale's base
 /// image: the IMG line's UPSCALE).
 QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h);
+/// The same on the GPU: `src` (RGBA8, sw x sh, a device pointer) into `dst` (RGBA8, w x h), on the image engine's
+/// queue (the runtime's default stream), done when it returns; std::runtime_error when the GPU has no room for its
+/// scratch (lanczos_resize_bytes).
+void lanczos_resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h);
+uint64_t lanczos_resize_bytes(int64_t sw, int64_t sh, int64_t w, int64_t h);
 
 /// The IMG and NEED lines' CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height>[,<ref_w>,<ref_h>] -> the box;
 /// std::invalid_argument when the word is not that.

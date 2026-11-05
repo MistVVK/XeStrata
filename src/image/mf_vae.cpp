@@ -290,15 +290,6 @@ void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int
     });
 }
 
-// out16 [2 H][2 W][C] = x [H][W][C] repeated (nearest), FP16
-void up2_16(const float* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * H * W * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C, Y = p / (2 * W), X = p - Y * 2 * W;
-        out16[i] = f16_from_f32(x[((Y / 2) * W + X / 2) * C + c]);
-    });
-}
-
 // q16 [T][C], k16 [T][C] and v transposed vt16 [C][T] from qkv [T][3 C]
 void qkv_split16(const float* qkv, int64_t T, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
@@ -1233,7 +1224,7 @@ void MfVae::f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t
         for (const F2Res& r : l.blocks) f2_resblock(r, x, H, W);
         if (!l.blocks.empty()) c = l.blocks.back().c2.out;
         if (l.up.out > 0) {
-            up2_16(x, H, W, c, a16_, s_);
+            qi_up2x16(x, H, W, c, a16_, s_);
             H *= 2;
             W *= 2;
             float *y = nullptr, *unused = nullptr;

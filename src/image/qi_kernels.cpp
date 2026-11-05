@@ -20,6 +20,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::image {
 
@@ -421,7 +422,8 @@ namespace {
 // KT and K known (the VAEs' 3 x 3: its divisions by constants), else 0 and kt, k read at run time
 template <int KT, int K>
 sycl::event im2col_launch(sycl::queue& q, const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt_,
-                          int k_, int s, int pad, int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16) {
+                          int k_, int s, int pad, int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16,
+                          int64_t ldx) {
     const int64_t C8 = C / 8, kt = KT > 0 ? KT : kt_, k = K > 0 ? K : k_, kk2 = k * k, taps = kt * kk2;
     return q.parallel_for(sycl::range<1>((size_t) (rows * taps * C8)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
@@ -432,21 +434,65 @@ sycl::event im2col_launch(sycl::queue& q, const uint16_t* in16, int64_t T, int64
         using V = sycl::vec<uint16_t, 8>;
         V v(0);
         if (tt >= 0 && tt < T && y >= 0 && y < H && x >= 0 && x < W)
-            v = *reinterpret_cast<const V*>(in16 + ((tt * H + y) * W + x) * C + c8);
+            v = *reinterpret_cast<const V*>(in16 + ((tt * H + y) * W + x) * ldx + c8);
         *reinterpret_cast<V*>(col16 + rk * C + c8) = v;
     });
 }
 }  // namespace
 
 void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt, int k, int s, int pad,
-                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream) {
+                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream, int64_t ldx) {
     if (rows <= 0) return;
-    if (C % 8 != 0 || (kt != 1 && kt != 3)) throw std::invalid_argument("qi_im2col16: C or kt");
+    if (ldx == 0) ldx = C;
+    if (C % 8 != 0 || ldx % 8 != 0 || ldx < C || (kt != 1 && kt != 3))
+        throw std::invalid_argument("qi_im2col16: C, ldx or kt");
     sycl::queue& q = queue_for(stream);
-    const sycl::event e = k != 3 ? im2col_launch<0, 0>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16)
-                          : kt == 1 ? im2col_launch<1, 3>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16)
-                                    : im2col_launch<3, 3>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16);
+    const sycl::event e =
+        k != 3    ? im2col_launch<0, 0>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16, ldx)
+        : kt == 1 ? im2col_launch<1, 3>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16, ldx)
+                  : im2col_launch<3, 3>(q, in16, T, H, W, C, kt, k, s, pad, OH, OW, p0, rows, col16, ldx);
     finish(stream, e, "qi_im2col16");
+}
+
+void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, QiAct act, float slope,
+                     const uint16_t* res, uint16_t* dst, int64_t ld, int64_t off, void* stream, uint16_t* dst2,
+                     int64_t from2) {
+    if (T <= 0 || O <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * O)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t q = i / O, o = i - q * O;
+        float v = y[q * ldy + o] + (bias != nullptr ? bias[o] : 0.f);
+        if (act == QiAct::silu) v = v / (1.f + sycl::exp(-v));
+        else if (act == QiAct::leaky) v = v > 0.f ? v : v * slope;
+        if (res != nullptr) v += f32_from_f16(res[q * O + o]);
+        const uint16_t h = f16_from_f32(v);
+        if (dst != nullptr) dst[q * ld + off + o] = h;
+        if (dst2 != nullptr && o >= from2) dst2[q * (O - from2) + o - from2] = h;
+    });
+    finish(stream, e, "qi_conv_store16");
+}
+
+namespace {
+template <class T>
+void up2x16(const T* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    if (H * W * C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (4 * H * W * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / C, c = i - p * C, Y = p / (2 * W), X = p - Y * 2 * W;
+        const T v = x[((Y / 2) * W + X / 2) * C + c];
+        if constexpr (std::is_same_v<T, float>) out16[i] = f16_from_f32(v);
+        else out16[i] = v;
+    });
+    finish(stream, e, "qi_up2x16");
+}
+}  // namespace
+
+void qi_up2x16(const float* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    up2x16(x, H, W, C, out16, stream);
+}
+
+void qi_up2x16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream) {
+    up2x16(x16, H, W, C, out16, stream);
 }
 
 namespace {

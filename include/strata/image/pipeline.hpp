@@ -46,6 +46,9 @@ struct QiRequest {
     // an upscale: the base image resized to the request's size (Lanczos) before it is drawn again (strata_image's
     // UPSCALE; the pipelines take it at that size)
     bool upscale = false;
+    // its first pass by an upscaler (strata_image's UPS:<name>[:<path>], strata/upscale/upscale.hpp) rather than Lanczos
+    // alone, and that pass's color correction (UPSCOLOR:, upscale.hpp's names; empty: the upscaler's own); empty: Lanczos
+    std::string upscaler, upscaler_color;
     // an upscale past the model's size, drawn again in tiles as Ultimate SD Upscale does (strata_image's TILES:): the
     // tile's side, the context around it and the blend at its edges, in pixels; 0: one drawing
     int64_t tile = 0, tile_pad = 0, tile_blur = 0;

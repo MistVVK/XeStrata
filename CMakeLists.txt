@@ -722,7 +722,8 @@ if(STRATA_ENABLE_XE)
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
                            src/image/image_lora.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
-                           src/image/img_start.cpp src/image/img_crop.cpp src/image/yolo_detect.cpp
+                           src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
+                           src/upscale/upscale.cpp src/upscale/esrgan.cpp src/image/yolo_detect.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
@@ -795,7 +796,7 @@ if(STRATA_ENABLE_XE)
     target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp src/image/qi_conv_onednn.cpp)
     target_link_libraries(strata_image PRIVATE strata_dnnl)
     set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
-                 APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
+                 src/upscale/esrgan.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
   # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256
@@ -956,8 +957,8 @@ if(STRATA_ENABLE_XE)
       set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
       # (not the detector's: the engine's own convolutions beat cuDNN's there, 8.3 against 9.0 ms a face on the
       # RTX 4070, 2026-11-05)
-      set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp APPEND PROPERTY
-                   COMPILE_DEFINITIONS STRATA_CUDNN=1)
+      set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/upscale/esrgan.cpp
+                   APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
       target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_cudnn_frontend ON)   # its license text goes with the packages
     else()

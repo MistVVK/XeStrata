@@ -4,8 +4,9 @@
 tool needs one, not by setup and never bundled.
 
 The weights are tools/image/qimage.py's AUX entries: each names a FILES entry (its repository, path, size and SHA-256
-at the revision REVISIONS pins), what converts it for the engine (AUX "convert": "yolo" runs tools/image/yolo_pt.py in
-a process of its own, with a time limit) and the file the engine reads, in AUX_DIR beside the image models.
+at the revision REVISIONS pins), what converts it for the engine (AUX "convert": "yolo" runs tools/image/yolo_pt.py,
+"esrgan" tools/image/esrgan.py, in a process of its own, with a time limit) and the file the engine reads, in AUX_DIR
+beside the image models.
 
     status = image_aux.ensure("yolo-face", aux_dir, say)
 
@@ -39,6 +40,7 @@ from typing import Callable
 RETRY_S = 30            # what the tool's result suggests before the chat asks again
 CONVERT_TIMEOUT_S = 600
 CHUNK = 1 << 20
+CONVERTERS = {"yolo": "yolo_pt.py", "esrgan": "esrgan.py"}   # AUX "convert" -> its tool in tools/image
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}   # name -> its download's state, while one runs or after it failed
@@ -231,11 +233,11 @@ def _fetch(url: str, part_of: Path, size: int, sha: str, job: dict, say, name: s
 
 
 def _convert(a: dict, src: Path, out: Path, sha: str, say, name: str) -> None:
-    """The downloaded file as the engine reads it, in a process of its own (yolo_pt.py: it reads the pickle without
-    running it), renamed into place when complete, then its .done mark."""
-    if a.get("convert") == "yolo":
+    """The downloaded file as the engine reads it, in a process of its own (yolo_pt.py, esrgan.py: they read the pickle
+    without running it), renamed into place when complete, then its .done mark."""
+    if a.get("convert") in CONVERTERS:
         say(f"image tools: converting {name} to safetensors (the weights' values as they are)")
-        tool = Path(__file__).resolve().parent.parent / "tools" / "image" / "yolo_pt.py"
+        tool = Path(__file__).resolve().parent.parent / "tools" / "image" / CONVERTERS[a["convert"]]
         r = subprocess.run([sys.executable, "-I", str(tool), str(src), str(out), "--sha256", sha],
                            capture_output=True, text=True, timeout=CONVERT_TIMEOUT_S, check=False)
         if r.returncode != 0:

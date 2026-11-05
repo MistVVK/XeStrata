@@ -79,34 +79,39 @@ std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows
 
 constexpr int64_t kX = 11, kW = 12, kB = 13, kR = 14, kY = 15;   // the convolution's tensors
 
-// x [H][W][C] (FP16) by w [O][k][k][C] (FP16), stride 1 and padding k / 2, plus the bias and the residual where given,
-// into y [H][W][O] (FP32): the bias and the residual (y itself, read and written in the same pass) as the
-// convolution's epilogue
+// x [H][W][C] (FP16, a pixel's stride ldx) by w [O][k][k][C] (FP16), stride 1 and padding k / 2, plus the bias and the
+// residual where given, into y [H][W][O] (FP32 or FP16 by y16, a pixel's stride ldy): the bias, the LeakyReLU (`leaky`
+// 0 or more: its slope) and the residual (y itself, read and written in the same pass) as the convolution's epilogue
 std::shared_ptr<fe::graph::Graph> conv_graph(cudnnHandle_t handle, int64_t H, int64_t W, int64_t C, int64_t O,
-                                             int64_t k, bool bias, bool add) {
+                                             int64_t k, bool bias, bool add, int64_t ldx, int64_t ldy, bool y16,
+                                             float leaky) {
     auto g = std::make_shared<fe::graph::Graph>();
     g->set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
     auto X = g->tensor(fe::graph::Tensor_attributes().set_name("X").set_uid(kX).set_dim({1, C, H, W}).set_stride(
-        {H * W * C, 1, W * C, C}));
+        {H * W * ldx, 1, W * ldx, ldx}));
     auto Wt = g->tensor(fe::graph::Tensor_attributes().set_name("W").set_uid(kW).set_dim({O, C, k, k}).set_stride(
         {k * k * C, 1, k * C, C}));
     const int64_t p = k / 2;
     auto Y = g->conv_fprop(
         X, Wt, fe::graph::Conv_fprop_attributes().set_padding({p, p}).set_stride({1, 1}).set_dilation({1, 1}));
-    const std::vector<int64_t> yd{1, O, H, W}, ys{H * W * O, 1, W * O, O};
+    const std::vector<int64_t> yd{1, O, H, W}, ys{H * W * ldy, 1, W * ldy, ldy};
     if (bias) {
         auto B = g->tensor(fe::graph::Tensor_attributes().set_name("B").set_uid(kB).set_dim({1, O, 1, 1}).set_stride(
             {O, 1, O, O}).set_data_type(fe::DataType_t::FLOAT));
         Y = g->pointwise(Y, B, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
     }
+    if (leaky >= 0.0f)
+        Y = g->pointwise(Y, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::RELU_FWD)
+                                .set_relu_lower_clip_slope(leaky));
     if (add) {
         auto R = g->tensor(fe::graph::Tensor_attributes().set_name("R").set_uid(kR).set_dim(yd).set_stride(ys)
-                               .set_data_type(fe::DataType_t::FLOAT));
+                               .set_data_type(y16 ? fe::DataType_t::HALF : fe::DataType_t::FLOAT));
         Y = g->pointwise(Y, R, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
     }
-    Y->set_output(true).set_dim(yd).set_stride(ys).set_uid(kY).set_data_type(fe::DataType_t::FLOAT);
+    Y->set_output(true).set_dim(yd).set_stride(ys).set_uid(kY).set_data_type(y16 ? fe::DataType_t::HALF
+                                                                                  : fe::DataType_t::FLOAT);
     // the fallback heuristics too: mode A alone found no plan for these (cuDNN 9 on the RTX 4070, 2026-11-02)
     if (!g->build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good())
         throw std::runtime_error("cuDNN builds no convolution plan");
@@ -240,11 +245,19 @@ namespace strata::image::conv {
 
 bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
            const float* bias, bool add, float* y) {
+    return cudnn(q, x, H, W, C, w, O, k, bias, add, y, Form{});
+}
+
+bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
+           const float* bias, bool add, void* y, const Form& f) {
     namespace fe = cudnn_frontend;
+    if (add && f.leaky >= 0.0f) return false;
+    const int64_t lx = f.ldx > 0 ? f.ldx : C, ly = f.ldy > 0 ? f.ldy : O;
     std::lock_guard<std::mutex> lock(sdpa::g_mu);
     sdpa::Cudnn& d = sdpa::g_cudnn[q.get_device()];
     if (d.conv_failed) return false;
-    const std::vector<int64_t> key{H, W, C, O, k, bias != nullptr, add};
+    const std::vector<int64_t> key{H, W, C, O, k, bias != nullptr, add, lx, ly, f.y16,
+                                   f.leaky >= 0.0f ? (int64_t) (f.leaky * 1e6f) : -1};
     try {
         if (d.handle == nullptr) sdpa::open_cudnn(d.handle);
     } catch (const std::exception& e) {
@@ -258,7 +271,8 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
         if (fe::detail::set_stream(d.handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
         auto it = d.convs.find(key);
         if (it == d.convs.end())
-            it = d.convs.emplace(key, sdpa::conv_graph(d.handle, H, W, C, O, k, bias != nullptr, add)).first;
+            it = d.convs.emplace(key, sdpa::conv_graph(d.handle, H, W, C, O, k, bias != nullptr, add, lx, ly,
+                                                                   f.y16, f.leaky)).first;
         if (!it->second) return false;
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");

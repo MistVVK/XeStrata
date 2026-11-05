@@ -10,10 +10,10 @@ serve/images.py starts it (its environment the server's engine's: the same GPU a
 server of the same image model and GPU finds it at the same address (images.daemon_address).  ADDR: a Unix socket's
 path, or on Windows a file the daemon writes its loopback port and a random token to (a client sends the token
 first).  The lines are strata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
-and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO, DETECT) waits for the engine and
-gets its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after its step;
-QUIT closes the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers STOPPED once
-the engine is gone.  Without a client and a request for --idle seconds (default 1800)
+and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO, DETECT, UPS, UPSNEED) waits for
+the engine and gets its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after
+its step; QUIT closes the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers
+STOPPED once the engine is gone.  Without a client and a request for --idle seconds (default 1800)
 the daemon ends, and so it does when the engine ends.
 """
 from __future__ import annotations
@@ -30,7 +30,8 @@ import threading
 import time
 
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "FIT": ("BUDGET",), "BUDGET": ("BUDGET",),
-           "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",)}
+           "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",), "UPS": ("UPSCALED",),
+           "UPSNEED": ("NEED",)}
 START_TIMEOUT_S = 600
 
 

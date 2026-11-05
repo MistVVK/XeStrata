@@ -69,7 +69,9 @@
 //                            full> the drawing's colors matched to the picture's as it goes back (off, the default;
 //                            auto by the part kept around the paint; full by the whole cut: CropStitch::stitch);
 //                            UPSCALE: the base image (INIT:, else the first REF:) Lanczos-resized to the line's size
-//                            first (an upscale's second pass; its time in crop_s);
+//                            first (an upscale's second pass; its time in crop_s); UPS:<name>[:<path>] with it: that
+//                            upscaler's (UPS's) first, then the drawing (its time in ups_s), UPSCOLOR:<m> its color
+//                            correction (UPS's COLOR:);
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
 //                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
 //                            %XX'd, the word's whitespace being the line's);
@@ -96,6 +98,18 @@
 //                            come from the chat's engine (MOSS-Image: no text encoder counted)
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
+//                            UPS:<name>[:<path>] [UPSCOLOR:<m>] UPSIN:<width>,<height>[,<out width>,<out height>]: an
+//                            upscale's first pass by that upscaler from a base image of that size to the line's size
+//                            (or the out size: an upscale in tiles), before the drawing (the larger of the two counted)
+//   UPS <width> <height> <in> <out> <name>[:<path>] [COLOR:<none|lab|adain|wavelet>] [SEED:<s>] [TILE:<n>]
+//                            the picture <in> upscaled to width x height by the upscaler <name> (strata/upscale/
+//                            upscale.hpp: lanczos, or realesrgan with its weights' <path>, %XX'd as LORA:'s), no image
+//                            model run, its RGBA8 rows to <out>; COLOR: the color correction (the upscaler's own
+//                            when none is named); TILE: the tiles' largest core      -> STAGE upscale, then UPSCALED
+//                            width=... height=... upscale_s=... model_s=... resize_s=... color_s=... color=...
+//                            tile=... tiles=...
+//   UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
+//                            the VRAM that upscale needs (from the files)                   -> NEED as NEED's
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
@@ -110,6 +124,11 @@
 // GPU has no room) and lets its buffers go, then says READY budget_mib=<M>.  A model whose sequence has a shape of its
 // own (HunyuanImage 3.0, whose ids carry the image block) warms up with one of its own: the pipeline says so in
 // warm_up_request.
+//
+//   strata-image --upscale IMAGE --upscaler NAME [--model PATH] --out IMAGE.rgba [--width W --height H | --scale S]
+//                [--color none|lab|adain|wavelet] [--tile N] [--budget-mib M] [--repeat N]
+// An upscaler alone (strata/upscale/upscale.hpp), no image model: the image at W x H (or S times its size), a line of
+// its times a run.
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -122,6 +141,7 @@
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
 #include "strata/image/yolo_detect.hpp"
+#include "strata/upscale/upscale.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -149,6 +169,7 @@
 namespace {
 
 namespace si = strata::image;
+namespace su = strata::upscale;
 
 std::vector<int32_t> parse_ids(const std::string& s) {
     std::vector<int32_t> ids;
@@ -274,6 +295,8 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word == "EDITFMT:aitk") r.refs_aitk = true;
         else if (word == "EDITFMT:moss") r.refs_aitk = false;
         else if (word == "UPSCALE") r.upscale = true;
+        else if (word.rfind("UPS:", 0) == 0) r.upscaler = word.substr(4);
+        else if (word.rfind("UPSCOLOR:", 0) == 0) r.upscaler_color = word.substr(9);
         else if (word.rfind("TILES:", 0) == 0) {
             const std::vector<int32_t> v = parse_ids(word.substr(6));
             if (v.size() != 3 || v[0] < 256 || v[1] < 0 || v[2] < 0)
@@ -377,6 +400,27 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
         if (word.rfind("EDITFMT:", 0) == 0 || word.rfind("COLOR:", 0) == 0 || word == "UPSCALE" ||
             word.rfind("TILES:", 0) == 0)
             continue;
+        if (word.rfind("UPS:", 0) == 0) {
+            r.upscaler = word.substr(4);
+            continue;
+        }
+        if (word.rfind("UPSCOLOR:", 0) == 0) {
+            r.upscaler_color = word.substr(9);
+            continue;
+        }
+        if (word.rfind("UPSIN:", 0) == 0) {
+            const std::vector<int32_t> v = parse_ids(word.substr(6));
+            if ((v.size() != 2 && v.size() != 4) || std::any_of(v.begin(), v.end(), [](int32_t x) { return x <= 0; }))
+                throw std::invalid_argument("UPSIN:<width>,<height>[,<out width>,<out height>]: " + word);
+            r.init.width = v[0];   // only its size: the base image an upscale starts from
+            r.init.height = v[1];
+            if (v.size() == 4) {   // the upscale's own size, past the drawing's (TILES:)
+                r.upscale = true;
+                r.width = v[2];
+                r.height = v[3];
+            }
+            continue;
+        }
         if (word.rfind("PIC:", 0) == 0) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
             int64_t w = 0, h = 0;
             if (!si::image_size(word.substr(4), w, h)) throw std::invalid_argument("not an image: " + word);
@@ -524,6 +568,83 @@ struct Detectors {
     }
 };
 
+// The upscalers the process has opened (strata/upscale/upscale.hpp), by their name and file (UPS:'s <name>[:<path>]):
+// each opened once, its weights kept beside the image model's (RealESRGAN's 33 MiB) until RELEASE ALL, its scratch let
+// go after each run
+struct Upscalers {
+    std::map<std::string, std::unique_ptr<su::UpscaleModel>> open;
+    su::UpscaleModel& get(const std::string& spec) {
+        auto& m = open[spec];
+        if (!m) {
+            const size_t colon = spec.find(':');
+            const std::string name = spec.substr(0, colon);
+            const std::string path = colon == std::string::npos ? "" : decoded_path(spec.substr(colon + 1));
+            try {
+                m = su::open_model(name, path);
+            } catch (...) {
+                open.erase(spec);
+                throw;
+            }
+        }
+        return *m;
+    }
+    uint64_t held() const {
+        uint64_t n = 0;
+        for (const auto& m : open) n += m.second->held();
+        return n;
+    }
+    void release(bool all) {
+        for (auto& m : open) m.second->release(all);
+        if (all) open.clear();
+    }
+};
+
+// The VRAM an upscale may take now: what the budget leaves beside the image model's holdings, within the free VRAM
+// (the upscaler's own holdings counted as its)
+uint64_t ups_room(si::ImagePipeline& p, su::UpscaleModel& m) {
+    size_t free = 0, total = 0;
+    strata::gpu::mem_info(&free, &total);
+    const uint64_t b = p.budget(), held = p.held();
+    return std::min<uint64_t>((uint64_t) free + m.held(), b > held ? b - held : 0);
+}
+
+// `src` upscaled by `m` as `rq` asks, in the room the image model leaves: its cache given back first where that is
+// too little for the upscaler's smallest tiles, then its parts
+si::QiRef run_upscale(si::ImagePipeline& p, su::UpscaleModel& m, const si::QiRef& src, const su::Request& rq,
+                      su::Report& rep) {
+    const su::ColorFix color = rq.color_set ? rq.color : m.info().color;
+    const uint64_t least = su::UpscaleRunner::least_bytes(m, src.width, src.height, rq.width, rq.height, color);
+    uint64_t avail = ups_room(p, m);
+    if (avail < least) {
+        p.release(false);
+        avail = ups_room(p, m);
+    }
+    if (avail < least) {
+        p.release(true);
+        avail = ups_room(p, m);
+    }
+    return su::UpscaleRunner::run(m, src, rq, avail, &rep);
+}
+
+// An upscale's base image at w x h before it is drawn again: by the request's upscaler (its time added to `ups_s`),
+// else Lanczos
+si::QiRef upscale_base(si::ImagePipeline& p, Upscalers& ups, const si::QiRequest& r, const si::QiRef& base, int64_t w,
+                       int64_t h, double& ups_s) {
+    if (r.upscaler.empty()) return si::lanczos_resize(base, w, h);
+    const auto t0 = std::chrono::steady_clock::now();
+    su::Request rq;
+    rq.width = w;
+    rq.height = h;
+    if (!r.upscaler_color.empty()) {
+        rq.color = su::parse_color(r.upscaler_color);
+        rq.color_set = true;
+    }
+    su::Report rep;
+    si::QiRef out = run_upscale(p, ups.get(r.upscaler), base, rq, rep);
+    ups_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    return out;
+}
+
 // DETECT's answer: "DETECT n=<count> detect_s=<seconds> boxes=<x0>,<y0>,<x1>,<y1>,<score>,<class>;..." (the boxes on
 // the picture, highest score first), each mask (a segmentation head's, with `masks` given) written to <masks>.<i> as
 // width x height bytes, 255 inside.  The detection's buffers are freed after it (`keep`: kept for the next, a timing's
@@ -556,19 +677,20 @@ bool takes_guidance(si::ImagePipeline& p) {
     return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr;
 }
 
-// An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image Lanczos-resized to the
-// line's size, then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
+// An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image at the line's size
+// (upscale_base: Lanczos, or the line's upscaler), then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
 // from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
 // r.tile_blur (Crop and Stitch's steps: img_crop.hpp), the next tile cut from the picture as it now is.  The tiles'
 // times summed into `t`, the last one's plan in `pl`, the resizes and the cuts' time in `cut_s`.
 std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0, si::QiTimes& t, si::QiPlan& pl,
-                                   double& cut_s, Lines& in) {
+                                   double& cut_s, Lines& in, Upscalers& ups, double& ups_s) {
     const si::QiRef* base0 = !r0.init.rgba.empty() ? &r0.init : !r0.refs.empty() ? &r0.refs[0] : nullptr;
     if (base0 == nullptr) throw std::invalid_argument("TILES: a base image (INIT: or the first REF:)");
     const int64_t W = r0.width, H = r0.height, T = r0.tile;
     auto t0 = std::chrono::steady_clock::now();
-    si::QiRef pic = si::lanczos_resize(*base0, W, H);
-    cut_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double ups0 = ups_s;
+    si::QiRef pic = upscale_base(p, ups, r0, *base0, W, H, ups_s);
+    cut_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() - (ups_s - ups0);
     const int64_t nx = (W + T - 1) / T, ny = (H + T - 1) / T;
     int index = 0;
     for (int64_t ty = 0; ty < ny; ++ty)
@@ -626,6 +748,7 @@ std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0
 int serve(si::ImagePipeline& p) {
     Loras loras;   // the adapters' files, read once for the requests that name them
     Detectors detectors;
+    Upscalers ups;
     {
         // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead.  A model whose
@@ -682,17 +805,20 @@ int serve(si::ImagePipeline& p) {
                     if (crop) throw std::invalid_argument("TILES: not with CROP:");
                     si::QiTimes t;
                     si::QiPlan pl;
-                    double cut_s = 0.0;
-                    const auto img = upscale_tiles(p, r, t, pl, cut_s, in);
+                    double cut_s = 0.0, ups_s = 0.0;
+                    const auto img = upscale_tiles(p, r, t, pl, cut_s, in, ups, ups_s);
                     write_file(out, img);
-                    std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), cut_s);
+                    std::printf("IMAGE %s crop_s=%.3f ups_s=%.3f\n", plan_kv(t, pl).c_str(), cut_s, ups_s);
                     std::fflush(stdout);
                     continue;
                 }
-                if (r.upscale) {   // the base image at the line's size by Lanczos before it is drawn again
+                double ups_s = 0.0;   // the upscaler's time (UPS:), apart from crop_s
+                if (!r.upscaler.empty() && !r.upscale) throw std::invalid_argument("UPS: with UPSCALE");
+                if (r.upscale) {   // the base image at the line's size (Lanczos, or the upscaler) before it is drawn again
                     si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
                     if (base == nullptr) throw std::invalid_argument("UPSCALE: a base image (INIT: or the first REF:)");
-                    timed([&] { *base = si::lanczos_resize(*base, r.width, r.height); });
+                    timed([&] { *base = upscale_base(p, ups, r, *base, r.width, r.height, ups_s); });
+                    crop_s -= ups_s;
                 }
                 if (crop) {
                     si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
@@ -732,10 +858,58 @@ int serve(si::ImagePipeline& p) {
                     timed([&] { whole = cs->stitch(img, r.crop_color); });
                     write_file(out, whole);
                     std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s);
+                } else if (r.upscale) {
+                    write_file(out, img);
+                    std::printf("IMAGE %s crop_s=%.3f ups_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s, ups_s);
                 } else {
                     write_file(out, img);
                     std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
                 }
+            } else if (op == "UPS") {   // UPS <width> <height> <in> <out> <name>[:<path>] [COLOR:] [SEED:] [TILE:]
+                su::Request rq;
+                std::string src, dst, spec;
+                ls >> rq.width >> rq.height >> src >> dst >> spec;
+                if (!ls || spec.empty())
+                    throw std::invalid_argument("UPS <width> <height> <in> <out> <name>[:<path>] [COLOR:<m>]");
+                for (std::string word; ls >> word;) {
+                    if (word.rfind("COLOR:", 0) == 0) {
+                        rq.color = su::parse_color(word.substr(6));
+                        rq.color_set = true;
+                    }
+                    else if (word.rfind("SEED:", 0) == 0) rq.seed = std::stoull(word.substr(5));
+                    else if (word.rfind("TILE:", 0) == 0) rq.max_tile = std::stoll(word.substr(5));
+                    else throw std::invalid_argument("UPS: unknown word " + word);
+                }
+                su::UpscaleModel& m = ups.get(spec);
+                const si::QiRef pic = read_image(src);
+                std::printf("STAGE upscale\n");
+                std::fflush(stdout);
+                const auto t0 = std::chrono::steady_clock::now();
+                su::Report rep;
+                const si::QiRef big = run_upscale(p, m, pic, rq, rep);
+                const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                write_file(dst, big.rgba);
+                std::printf("UPSCALED width=%lld height=%lld upscale_s=%.3f model_s=%.3f resize_s=%.3f color_s=%.3f "
+                            "color=%s tile=%lld tiles=%lld\n", (long long) big.width, (long long) big.height, secs,
+                            rep.model_s, rep.resize_s, rep.color_s, rep.color_applied ? su::color_name(rep.color) : "none",
+                            (long long) rep.tile, (long long) rep.tiles);
+            } else if (op == "UPSNEED") {   // UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:]
+                int64_t w = 0, h = 0, iw = 0, ih = 0;
+                std::string spec, word;
+                ls >> w >> h >> iw >> ih >> spec;
+                if (!ls || spec.empty())
+                    throw std::invalid_argument("UPSNEED <width> <height> <in width> <in height> <name>[:<path>]");
+                su::UpscaleModel& m = ups.get(spec);
+                su::ColorFix color = m.info().color;
+                if (ls >> word && word.rfind("COLOR:", 0) == 0) color = su::parse_color(word.substr(6));
+                size_t free = 0, total = 0;
+                strata::gpu::mem_info(&free, &total);
+                const uint64_t least = su::UpscaleRunner::least_bytes(m, iw, ih, w, h, color);
+                const uint64_t full = su::UpscaleRunner::full_bytes(m, iw, ih, w, h, color);
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0\n",
+                            (unsigned long long) (least >> 20), (unsigned long long) (full >> 20),
+                            (unsigned long long) ((p.held() + ups.held()) >> 20), (unsigned long long) (free >> 20),
+                            (unsigned long long) (full >> 20));
             } else if (op == "DETECT") {   // DETECT <weights> <picture> <threshold> [<masks>]
                 std::string weights, pic, masks;
                 float conf = 0.5f;
@@ -776,6 +950,16 @@ int serve(si::ImagePipeline& p) {
                     moss->set_states_given(false);
                     moss->set_pictures_given({});
                 }
+                if (!lr.upscaler.empty()) {   // the upscaler runs before the drawing, the image model's cache given back
+                    su::UpscaleModel& m = ups.get(lr.upscaler);
+                    const int64_t iw = lr.init.width > 0 ? lr.init.width : w, ih = lr.init.height > 0 ? lr.init.height : h;
+                    const int64_t ow = lr.upscale ? lr.width : w, oh = lr.upscale ? lr.height : h;
+                    const su::ColorFix c = lr.upscaler_color.empty() ? m.info().color : su::parse_color(lr.upscaler_color);
+                    // its weights stay beside the drawing's
+                    nd.least = std::max(nd.least + m.weight_bytes(), su::UpscaleRunner::least_bytes(m, iw, ih, ow, oh, c));
+                    nd.full = std::max(nd.full + m.weight_bytes(),
+                                       nd.held + su::UpscaleRunner::full_bytes(m, iw, ih, ow, oh, c));
+                }
                 if (crop) {
                     const uint64_t cb = si::CropStitch::bytes(crop->width, crop->height, crop->w, crop->h, w, h,
                                                               crop->ref_w, crop->ref_h);
@@ -806,6 +990,7 @@ int serve(si::ImagePipeline& p) {
                 ls >> what;
                 p.release(what == "ALL");
                 detectors.release(what == "ALL");
+                ups.release(what == "ALL");
                 std::printf("RELEASE ok\n");
             } else if (!op.empty()) {
                 throw std::invalid_argument("unknown request " + op);
@@ -832,6 +1017,68 @@ int serve(si::ImagePipeline& p) {
     return 0;
 }
 
+// --upscale: an upscaler alone, no image model (tools, checks and timings)
+int upscale_main(int argc, char** argv) {
+    std::string in, out, name, model;
+    su::Request rq;
+    double scale = 0.0;
+    uint64_t budget = 0;
+    int repeat = 1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto val = [&]() -> std::string {
+            if (i + 1 >= argc) throw std::invalid_argument(a + " needs a value");
+            return argv[++i];
+        };
+        if (a == "--upscale") in = val();
+        else if (a == "--upscaler") name = val();
+        else if (a == "--model") model = val();
+        else if (a == "--out") out = val();
+        else if (a == "--width") rq.width = std::stoll(val());
+        else if (a == "--height") rq.height = std::stoll(val());
+        else if (a == "--scale") scale = std::stod(val());
+        else if (a == "--color") {
+            rq.color = su::parse_color(val());
+            rq.color_set = true;
+        }
+        else if (a == "--tile") rq.max_tile = std::stoll(val());
+        else if (a == "--seed") rq.seed = std::stoull(val());
+        else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
+        else if (a == "--repeat") repeat = std::stoi(val());
+        else throw std::invalid_argument("unknown option " + a);
+    }
+    if (in.empty() || out.empty() || name.empty()) {
+        std::fprintf(stderr, "usage: %s --upscale IMAGE --upscaler lanczos|realesrgan [--model WEIGHTS] --out "
+                     "IMAGE.rgba [--width W --height H | --scale S] [--color none|lab|adain|wavelet] [--tile N] "
+                     "[--budget-mib M] [--repeat N]\n", argv[0]);
+        return 2;
+    }
+    const std::unique_ptr<su::UpscaleModel> m = su::open_model(name, model);
+    const si::QiRef src = read_image(in);
+    if (rq.width <= 0 || rq.height <= 0) {
+        const double s = scale > 0.0 ? scale : (m->info().scale > 0 ? m->info().scale : 2.0);
+        rq.width = (int64_t) std::lround((double) src.width * s);
+        rq.height = (int64_t) std::lround((double) src.height * s);
+    }
+    for (int k = 0; k < std::max(1, repeat); ++k) {
+        size_t free = 0, total = 0;
+        strata::gpu::mem_info(&free, &total);
+        const uint64_t room = (uint64_t) free + m->held();
+        const uint64_t avail = budget > 0 ? std::min<uint64_t>(budget, room) : room;
+        const auto t0 = std::chrono::steady_clock::now();
+        su::Report rep;
+        const si::QiRef big = su::UpscaleRunner::run(*m, src, rq, avail, &rep);
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        write_file(out, big.rgba);
+        std::printf("UPSCALED width=%lld height=%lld upscale_s=%.3f model_s=%.3f resize_s=%.3f color_s=%.3f color=%s "
+                    "tile=%lld tiles=%lld\n", (long long) big.width, (long long) big.height, secs, rep.model_s,
+                    rep.resize_s, rep.color_s, rep.color_applied ? su::color_name(rep.color) : "none",
+                    (long long) rep.tile, (long long) rep.tiles);
+        std::fflush(stdout);
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -847,6 +1094,7 @@ int main(int argc, char** argv) {
 #endif
     }
     try {
+        if (argc >= 2 && std::string(argv[1]) == "--upscale") return upscale_main(argc, argv);
         // --detect <weights> <picture> [<threshold> [<masks>]]: the detector alone, no image model (tools and checks)
         if (argc >= 4 && std::string(argv[1]) == "--detect") {
             Detectors d;

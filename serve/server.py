@@ -7576,6 +7576,11 @@ def make_handler(svc: Service):
                           "defaults": m["defaults"],
                           "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
                          for m in svc.images.models()]
+                # the upscalers: POST /v1/images/upscale
+                data += [{"id": name, **common, "status": {"value": "loaded"},
+                          "architecture": {"input_modalities": ["image"], "output_modalities": ["image"]},
+                          "upscale": {"method": method, "scale": 4 if method == "realesrgan" else None}}
+                         for name, method in images_api.UPSCALE_MODELS.items()]
             return data
 
         def do_POST(self):
@@ -7675,6 +7680,9 @@ def make_handler(svc: Service):
             try:
                 if path == "/v1/images/edits":                # a form (OpenAI's multipart) or JSON: read there
                     self._images_edit()
+                    return
+                if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
+                    self._images_upscale()
                     return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -7880,6 +7888,40 @@ def make_handler(svc: Service):
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job, req.get("stream") is True, edit=True)
+
+        def _images_upscale(self):
+            """POST /v1/images/upscale (LocalAI's upscale; images_api.upscale_request): one image in a multipart form
+            (image), or JSON (image: a data: URL, an http(s) URL or a path, or {"image_url": ...}), made larger by an
+            upscaler and with extra_params' redraw drawn again by the image model, in the GPU's turn; the answer as
+            OpenAI's images API gives one (created, data[].b64_json or url)."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            body = self._body()
+            ctype = self.headers.get("Content-Type", "") or ""
+            if ctype.lower().startswith("multipart/form-data"):
+                fields, files = parse_multipart(ctype, body)
+                fields.pop("mask", None)
+            else:
+                fields = json.loads(body or b"{}")
+                if not isinstance(fields, dict):
+                    raise ValueError("send a JSON object or a multipart form")
+                src = fields.pop("image", None)
+                url = src.get("image_url") if isinstance(src, dict) else src
+                if isinstance(url, dict):
+                    url = url.get("url")
+                if not isinstance(url, str) or not url:
+                    raise ValueError("image: a data: URL, an http(s) URL or a path")
+                self._no_local_sources([url])
+                files = [svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)]
+            if len(files) != 1:
+                raise ValueError("image: one image")
+            req, model = images_api.upscale_request(fields)
+            gen = svc.images.pick_edit(model, True)
+            images_api.check_tool(gen.cfg, "upscale_image")
+            job = images_api.parse_edit_request(req, [Vision.normalize(files[0], keep_alpha=True)], gen.cfg)
+            self._image_job(gen, job, edit=True)
 
         def _image_job(self, gen, job, stream=False, edit=False):
             """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one

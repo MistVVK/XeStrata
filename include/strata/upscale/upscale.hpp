@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/upscale/upscale.hpp - the upscalers' common frame: a model (UpscaleModel) says what it is and makes
+// a clip of frames larger, nothing else; the driver (UpscaleRunner) does what does not depend on the model - the
+// resize to the size asked for, the padding to the model's multiples, the tiles, the color correction - so that a
+// model added later (SeedVR2, a diffusion model that takes the frames at their target size) takes the same path.
+//
+// A model is a `clip` model: each clip of frames on its own (an image is a clip of one frame).  Its native scale says
+// how it is fed: RealESRGAN x4plus (scale 4) takes the frames at their own size and gives them four times as large, the
+// driver then resizing that to the size asked for (Lanczos, as ComfyUI's ImageUpscaleWithModel followed by its
+// ImageScale does); a model of scale 0 takes the frames at the size asked for (the driver resizes them first, by
+// Lanczos, and pads them to the model's multiple by repeating the edges, then cuts the padding off again).  A model
+// with a context (a convolutional one: what a pixel sees is near it) runs on tiles of the frame, each with that many
+// pixels of the frame around it, as large as the VRAM allows (the whole frame where it fits); the tiles' outputs are
+// put together from their cores.
+//
+// Lanczos is a model of its own here (scale 0, nothing to run): the plain resize, chosen the same way as the others.
+//
+// The color correction (color::, img_color.hpp, which Crop and Stitch's color match shares) moves the output's colors
+// back toward the input's: lab (each CIE Lab channel's mean and spread), adain (each RGB channel's), wavelet (the
+// output's high frequencies over the input's low ones, the input Lanczos-resized to the output's size) or none.  These
+// are SeedVR2's names for its corrections (vLLM-Omni's color_correction_method); each model has its default.
+#pragma once
+
+#include "strata/image/pipeline.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace strata::upscale {
+
+using image::QiRef;
+
+enum class ColorFix { none, lab, adain, wavelet };
+
+/// "none", "lab", "adain" or "wavelet" -> the correction; std::invalid_argument for another word.
+ColorFix parse_color(const std::string& word);
+const char* color_name(ColorFix c);
+
+/// What a model is, as the driver needs to know it.
+struct ModelInfo {
+    std::string name;              // the request's word for it ("lanczos", "realesrgan")
+    int scale = 0;                 // a native factor (the frames go in at their size); 0: at the size asked for
+    int64_t multiple = 1;          // the sides of what it takes, a multiple of this (padded to it)
+    int64_t frame_min = 1;         // a clip's frames: frame_min + k * frame_step (the last frame repeated up to it)
+    int64_t frame_step = 1;
+    int64_t context = 0;           // 0: the frame whole; else tiles, this many pixels of the frame around each core
+    int64_t min_tile = 64;         // the smallest core a tile shrinks to before the run fails for want of VRAM
+    ColorFix color = ColorFix::none;   // the correction it takes when the request names none
+    bool identity = false;         // nothing to run (Lanczos): the driver's resize is all of it
+};
+
+class UpscaleModel {
+public:
+    virtual ~UpscaleModel() = default;
+    virtual const ModelInfo& info() const = 0;
+    /// The weights' bytes on the GPU (held between runs until release(true)).
+    virtual uint64_t weight_bytes() const = 0;
+    /// The bytes a run of a clip of `frames` frames of w x h input pixels takes besides the weights (its scratch), and
+    /// its largest single buffer (against the device's largest allocation).
+    virtual uint64_t clip_bytes(int64_t w, int64_t h, int64_t frames) const = 0;
+    virtual uint64_t clip_largest(int64_t w, int64_t h, int64_t frames) const = 0;
+    /// A clip: `in` [frames][h][w][4] RGBA8 on the GPU -> `out` [frames][h * s][w * s][4] (s the native scale, 1 for a
+    /// model of scale 0).  The weights go to the GPU first when they are not there; done when it returns.  Throws
+    /// std::runtime_error when the GPU has no room (the driver tries a smaller tile).
+    virtual void run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, uint8_t* out, uint64_t seed) = 0;
+    /// Lets the scratch go; `all`: the weights too.
+    virtual void release(bool all) = 0;
+    /// What it holds on the GPU now.
+    virtual uint64_t held() const = 0;
+};
+
+/// The model `name` ("lanczos", "realesrgan") from its weights' file `path` (none for Lanczos) -> the model;
+/// std::invalid_argument for a name it does not know, std::runtime_error for a file that is not the model's.
+std::unique_ptr<UpscaleModel> open_model(const std::string& name, const std::string& path);
+
+/// One upscale's request: the size asked for, the correction (`color_set` false: the model's own), a seed (a
+/// diffusion model's noise), the largest tile's core (0: as large as the VRAM allows).
+struct Request {
+    int64_t width = 0, height = 0;
+    ColorFix color = ColorFix::none;
+    bool color_set = false;
+    uint64_t seed = 0;
+    int64_t max_tile = 0;
+};
+
+/// What a run did: its parts' seconds, the tiles' core and count (0: the frame whole), the correction applied.
+struct Report {
+    double model_s = 0.0, resize_s = 0.0, color_s = 0.0;
+    int64_t tile = 0, tiles = 0;
+    ColorFix color = ColorFix::none;
+    bool color_applied = false;   // false where the statistics gave nothing to move (a flat image)
+};
+
+class UpscaleRunner {
+public:
+    /// `src` (RGBA8) at r.width x r.height through `m`, in `avail` bytes of VRAM (the model's weights included): the
+    /// tiles from it (halved while an allocation fails, down to the model's min_tile, then std::runtime_error).  The
+    /// model's scratch is let go at the end; its weights stay.
+    static QiRef run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep = nullptr);
+    /// The VRAM a run of an sw x sh image to w x h takes: `least` with the smallest tiles, `full` the frame whole.
+    static uint64_t least_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
+                                ColorFix color);
+    static uint64_t full_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h, ColorFix color);
+};
+
+}  // namespace strata::upscale

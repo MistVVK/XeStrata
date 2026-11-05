@@ -123,21 +123,13 @@ void letterbox(const uint8_t* rgba, int64_t W, int64_t H, int64_t nw, int64_t nh
     });
 }
 
-// a convolution's output y [HW][ldy] (FP32) finished: + bias (null: in y already), SiLU, + res [HW][O] (null: none),
-// to FP16 at dst [HW][ld] from channel `off`, and its channels from `from2` on also to dst2 [HW][O - from2] (null:
-// none)
+// a convolution's output y [HW][ldy] (FP32) finished (qi_conv_store16, on the queue without a wait): + bias (null:
+// in y already), SiLU, + res [HW][O] (null: none), to FP16 at dst [HW][ld] from channel `off`, and its channels from
+// `from2` on also to dst2 [HW][O - from2] (null: none)
 void store(const float* y, int64_t HW, int64_t O, int64_t ldy, const float* bias, bool silu, const uint16_t* res,
            uint16_t* dst, int64_t ld, int64_t off, uint16_t* dst2, int64_t from2) {
-    queue().parallel_for(sycl::range<1>((size_t) (HW * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i / O, o = i - q * O;
-        float v = y[q * ldy + o] + (bias != nullptr ? bias[o] : 0.f);
-        if (silu) v = v / (1.f + sycl::exp(-v));
-        if (res != nullptr) v += f32_from_f16(res[q * O + o]);
-        const uint16_t h = f16_from_f32(v);
-        if (dst != nullptr) dst[q * ld + off + o] = h;
-        if (dst2 != nullptr && o >= from2) dst2[q * (O - from2) + o - from2] = h;
-    });
+    qi_conv_store16(y, HW, O, ldy, bias, silu ? QiAct::silu : QiAct::none, 0.f, res, dst, ld, off,
+                    &core::Runtime::get().compute(), dst2, from2);
 }
 
 // y [HW][O] += b [O]

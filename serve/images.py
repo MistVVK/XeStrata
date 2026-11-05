@@ -196,6 +196,16 @@ UPSCALE_MAX_SIDE = 4096
 UPSCALE_TILE = 1024
 UPSCALE_PAD = 128
 UPSCALE_BLUR = 32
+# an upscale's first pass, by the engine's upscalers (src/upscale: UPS:, the UPS line): "auto" is RealESRGAN where the
+# picture is drawn again after it (its finer edges for the drawing to start from) and where it is not too, until SeedVR2
+# (which draws no second pass) is here; each method's weights (image_aux's), none for Lanczos
+UPSCALE_METHODS = ("auto", "lanczos", "realesrgan")
+UPSCALE_WEIGHTS = {"realesrgan": "realesrgan"}
+# the color corrections after it (vLLM-Omni's SeedVR2 color_correction_method's names): none by default, as ComfyUI's
+# ImageUpscaleWithModel corrects nothing
+UPSCALE_COLORS = ("none", "lab", "adain", "wavelet")
+# /v1/images/upscale's models (its `model`, and /v1/models' entries) -> the method
+UPSCALE_MODELS = {"realesrgan-x4plus": "realesrgan", "lanczos": "lanczos"}
 # the Detailer (fix_image, the edits' `fix`): Impact Pack's FaceDetailer's steps and defaults (bbox_threshold 0.5,
 # bbox_dilation 10, bbox_crop_factor 3, drop_size 10, denoise 0.5, noise_mask_feather 20), its guide_size 1024 for
 # the models that draw about 1 MP (ComfyUI's 512 is SD 1.5's) and its max_size the Crop and Stitch drawing's
@@ -1102,11 +1112,14 @@ def img2img_strength(steps: int) -> float:
 
 
 def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
-    """An upscale (the edits' `upscale`, the chat's upscale_image), as ComfyUI's two-pass workflows make one: `image`
-    Lanczos-resized by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU and drawn again
-    from it at `strength` (UPSCALE_STRENGTH), an img2img of the whole picture (job["init"], job["upscale"]); past the
-    model's max_side, in tiles as Ultimate SD Upscale draws them (job["tiles"]: UPSCALE_TILE pixels, UPSCALE_PAD of
-    context around each, UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most."""
+    """An upscale (the edits' `upscale`, the chat's upscale_image, /v1/images/upscale), as ComfyUI's two-pass workflows
+    make one: `image` made larger by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU by
+    `method` (UPSCALE_METHODS: Lanczos, or an upscaler model whose weights image_aux fetches; job["upscaler"]) with its
+    color correction (`color`, UPSCALE_COLORS), then with `redraw` (the default) drawn again from it at `strength`
+    (UPSCALE_STRENGTH), an img2img of the whole picture (job["init"], job["upscale"]); past the model's max_side, in
+    tiles as Ultimate SD Upscale draws them (job["tiles"]: UPSCALE_TILE pixels, UPSCALE_PAD of context around each,
+    UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most.  Without redraw, the first pass alone (job["ups_only"]:
+    no image model run, one image, the prompt not needed)."""
     v = req["upscale"]
     if isinstance(v, str):   # a form's field
         try:
@@ -1115,24 +1128,46 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
             v = None
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         v = {"scale": v}
-    if not isinstance(v, dict) or not set(v) <= {"scale", "strength"}:
-        raise ImageRequestError('upscale: {"scale": 1.5 or 2, "strength": 0.35} (or the scale alone)')
+    if not isinstance(v, dict) or not set(v) <= {"scale", "strength", "method", "redraw", "color"}:
+        raise ImageRequestError('upscale: {"scale": 1.5 or 2, "method": "auto", "redraw": true, "strength": 0.35, '
+                                '"color": "none"} (or the scale alone)')
     try:
         scale = float(v.get("scale", 2))
     except (TypeError, ValueError):
         raise ImageRequestError("upscale.scale: a number") from None
     if not 1.0 < scale <= UPSCALE_MAX_SCALE:
         raise ImageRequestError(f"upscale.scale: above 1, at most {UPSCALE_MAX_SCALE:g}")
+    method = v.get("method") or "auto"
+    if method not in UPSCALE_METHODS:
+        raise ImageRequestError(f"upscale.method: one of {', '.join(UPSCALE_METHODS)}, not {method!r}")
+    color = v.get("color") or "none"
+    if color not in UPSCALE_COLORS:
+        raise ImageRequestError(f"upscale.color: one of {', '.join(UPSCALE_COLORS)}, not {color!r}")
+    redraw = v.get("redraw", True)
+    if isinstance(redraw, str):   # a form's field
+        redraw = redraw.strip().lower() not in ("false", "0", "no", "off", "")
+    if not isinstance(redraw, bool):
+        raise ImageRequestError("upscale.redraw: true or false")
+    if not redraw and v.get("strength") is not None:
+        raise ImageRequestError("upscale.strength: only with redraw")
     w0, h0 = image_dims(image)
     w, h = (max(SIZE_STEP, round(x * scale / SIZE_STEP) * SIZE_STEP) for x in (w0, h0))
     if max(w, h) > UPSCALE_MAX_SIDE:
         raise ImageRequestError(f"upscale: {w}x{h} passes {UPSCALE_MAX_SIDE} pixels a side")
+    upscaler = {"method": "realesrgan" if method == "auto" else method, "asked": method, "color": color}
     side = int(cfg.get("max_side") or 2048)
+    if not redraw:
+        job = parse_request({**req, "prompt": str(req.get("prompt") or "").strip() or "upscale", "n": 1,
+                             "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
+        job.pop("bucket", None)
+        job.update(width=w, height=h, init=image, ups_only=True, upscaler=upscaler, n=1)
+        return job
     tiled = max(w, h) > side
     job = parse_request({**req, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
     job["width"], job["height"] = w, h
     job["init"] = image
     job["upscale"] = True
+    job["upscaler"] = upscaler
     if tiled:
         job["tiles"] = {"tile": UPSCALE_TILE, "pad": UPSCALE_PAD, "blur": UPSCALE_BLUR}
     strength = parse_strength({"strength": v.get("strength", UPSCALE_STRENGTH)})
@@ -1140,7 +1175,47 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     if run < 1:
         raise ImageRequestError(f"upscale.strength: {strength:g} runs none of the {job['steps']} steps")
     job["strength"], job["steps_run"] = strength, run
+    if cfg.get("schedule") == "turbo":
+        # the Turbo's own sigmas start a strength of 0.35 high (its schedule is a picture's from noise): the redraw
+        # came out another picture (another face, a bow for a tie, 2026-11-05); the base model's, as fix_job takes
+        job["sigmas"] = base_sigmas(job["steps"], *made_size(job))
     return job
+
+
+def upscale_request(fields: dict) -> tuple[dict, str | None]:
+    """POST /v1/images/upscale's fields (LocalAI's: model, scale; OpenAI's and vLLM-Omni's response_format,
+    output_format, output_compression, seed; prompt for a redraw; extra_params: vLLM-Omni's color_correction_method,
+    and redraw, redraw_strength and redraw_model, XeStrata's) -> (the edits' request with its `upscale`, the image model
+    a redraw names or None).  `model` is an upscaler (UPSCALE_MODELS' ids, or a method's name; none: auto); the scale
+    its own where it has one (RealESRGAN x4plus's 4), else 2; no redraw unless extra_params asks for one."""
+    extra = fields.get("extra_params") or {}
+    if isinstance(extra, str):   # a form's field
+        try:
+            extra = json.loads(extra)
+        except ValueError:
+            raise ImageRequestError("extra_params: a JSON object") from None
+    if not isinstance(extra, dict):
+        raise ImageRequestError("extra_params: a JSON object")
+    model = fields.get("model") or "auto"
+    method = UPSCALE_MODELS.get(model, model)
+    if method not in UPSCALE_METHODS:
+        raise ImageRequestError(f"model: an upscaler, one of {', '.join(['auto', *UPSCALE_MODELS])}, not {model!r}")
+    up: dict = {"method": method, "scale": fields.get("scale") or (4 if method == "realesrgan" else 2),
+                "redraw": extra.get("redraw", False)}
+    if extra.get("color_correction_method") is not None:
+        up["color"] = extra["color_correction_method"]
+    if extra.get("redraw_strength") is not None:
+        up["strength"] = extra["redraw_strength"]
+    if isinstance(up["scale"], str):   # a form's field
+        try:
+            up["scale"] = float(up["scale"])
+        except ValueError:
+            raise ImageRequestError("scale: a number") from None
+    req = {k: fields[k] for k in ("prompt", "negative_prompt", "response_format", "output_format",
+                                  "output_compression", "seed", "steps", "num_inference_steps") if k in fields}
+    req["upscale"] = up
+    model_name = extra.get("redraw_model")
+    return req, model_name if isinstance(model_name, str) and model_name else None
 
 
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
@@ -1668,6 +1743,9 @@ def usage(job: dict) -> dict:
     reference images' DiT tokens in, the made images' DiT tokens out (a token a 16 x 16 pixel square).  HunyuanImage
     3.0's ids carry the image block and the reference images' blocks themselves, so their shares are taken out of the
     text (a reference's: its VAE grid and its 1024 SigLIP2 slots)."""
+    if job.get("ups_only"):   # no image model run: no tokens
+        return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "input_tokens_details": {"text_tokens": 0, "image_tokens": 0}}
     mw, mh = made_size(job)
     text = len(job.get("ids") or ())
     block = (mw // SIZE_STEP) * (mh // SIZE_STEP)
@@ -2688,7 +2766,7 @@ class ImageGen:
                     else "")
                  + (f" COLOR:{job['color_match']}" if job.get("crop") and not job["crop"].get("empty")
                     and job.get("color_match") else "")
-                 + (" UPSCALE" if job.get("upscale") else "")
+                 + (" UPSCALE" + ImageGen._ups_words(job, need) if job.get("upscale") else "")
                  + ("" if not job.get("tiles") else
                     f" TILES:{job['tiles']['tile']},{job['tiles']['pad']},{job['tiles']['blur']}")
                  + (" EDITFMT:aitk" if job.get("edit_format", "").startswith("ai-toolkit") else "")
@@ -2703,10 +2781,39 @@ class ImageGen:
                 words += " INIT:-"
         return words
 
+    @staticmethod
+    def _ups_spec(job: dict) -> str:
+        """The engine's name of an upscale's upscaler: <method>[:<its weights' path, %XX'd as LORA:'s>]
+        (job["upscaler"]["path"], set by upscaler_weights)."""
+        u = job["upscaler"]
+        return u["method"] + (f":{lora_api.encode_path(u['path'])}" if u.get("path") else "")
+
+    @staticmethod
+    def _ups_words(job: dict, need: bool = False) -> str:
+        """An upscale's first pass on IMG and NEED: UPS:<spec> and its color correction (UPSCOLOR:), none for Lanczos
+        alone (the engine's own resize); NEED's the base image's size too (UPSIN:)."""
+        u = job.get("upscaler") or {}
+        if not u or u["method"] == "lanczos" and u.get("color", "none") == "none":
+            return ""
+        words = f" UPS:{ImageGen._ups_spec(job)}" + (f" UPSCOLOR:{u['color']}" if u.get("color", "none") != "none"
+                                                     else "")
+        if need:   # an upscale in tiles: the whole size too (NEED's is a tile's)
+            words += " UPSIN:{},{}".format(*image_dims(job["init"])) + (
+                f",{job['width']},{job['height']}" if job.get("tiles") else "")
+        return words
+
     def need(self, job: dict) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
         resident), held_mib (what it holds now), free_mib (the device's free VRAM), cap_mib (the most the engine could
-        have) and host_mib (the prefix cache in pinned RAM at cap_mib)."""
+        have) and host_mib (the prefix cache in pinned RAM at cap_mib).  An upscale without a drawing (ups_only): its
+        upscaler's (UPSNEED)."""
+        if job.get("ups_only"):
+            w0, h0 = image_dims(job["init"])
+            u = job["upscaler"]
+            with self.lock:
+                self._ready()
+                return self.engine.ask(f"UPSNEED {job['width']} {job['height']} {w0} {h0} {self._ups_spec(job)} "
+                                       f"COLOR:{u['color']}", "NEED", 600)
         with self.lock:
             self._ready()
             w, h = made_size(job)
@@ -2777,6 +2884,35 @@ class ImageGen:
             raise (LoraRejected if isinstance(e, LoraRejected) else ImageJobFailed)(why) from e
         finally:
             self._unstage_refine(job2)
+
+    def upscale(self, job: dict, cancel: threading.Event | None = None) -> tuple[bytes, dict]:
+        """An upscale without a drawing (job["ups_only"]): the engine's upscaler on job["init"] -> (the PNG, the
+        engine's figures: upscale_s and its parts model_s, resize_s, color_s, the color applied, the tiles)."""
+        timeout = float(self.cfg.get("timeout_s") or 3600)
+        u = job["upscaler"]
+        with self.lock:
+            self._ready()
+            work = Path(tempfile.mkdtemp(prefix="upscale-", dir=self.dir))
+            try:
+                pic, out = work / "picture", work / "out.rgba"
+                pic.write_bytes(job["init"])
+                self._live(stage="upscale", sampling_at=None)
+                try:
+                    got = self.engine.ask(f"UPS {job['width']} {job['height']} {pic} {out} {self._ups_spec(job)} "
+                                          f"COLOR:{u['color']} SEED:{job['seed']}", "UPSCALED", timeout, cancel)
+                except ImageJobFailed as e:
+                    self.totals["failed"] += 1
+                    why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
+                    self._say(f"image job failed: {why}")
+                    raise ImageJobFailed(why) from e
+                png = png_rgba(out.read_bytes(), job["width"], job["height"], job["width"], job["height"])
+            finally:
+                for f in work.iterdir():
+                    with contextlib.suppress(OSError):
+                        f.unlink()
+                with contextlib.suppress(OSError):
+                    work.rmdir()
+        return png, got
 
     def detect(self, weights: Path, picture: bytes, threshold: float = FIX_THRESHOLD,
                masks: bool = False) -> tuple[list[dict], float]:
@@ -3010,7 +3146,8 @@ class ImageGen:
         fmt = job.get("output_format") or "png"
         applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
         for i, png in enumerate(images):
-            item = {"revised_prompt": model_prompt(job), "seed": job["seed"] + i}
+            item = {"seed": job["seed"] + i} if job.get("ups_only") else \
+                {"revised_prompt": model_prompt(job), "seed": job["seed"] + i}
             if applied:   # the adapters this image was made with
                 item["lora"] = [dict(u) for u in applied]
             img = encode_image(png, fmt, job.get("output_compression", 100), job.get("background") == "opaque")
@@ -3026,7 +3163,8 @@ class ImageGen:
     # ---- the progress the Monitor shows (/metrics' live.image) and the jobs that ended (its Requests table)
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
                     "refs": "Reading the reference images",
-                    "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)"}
+                    "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)",
+                    "upscale": "Upscaling"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -3231,14 +3369,16 @@ TOOLS: list[dict[str, Any]] = [
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "upscale_image",
-     "description": "Make an image larger and finer, drawn again from it (the same picture).",
+     "description": "Make an image larger by an upscaler and, by default, draw it again finer (the same picture).",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "what the image shows"},
+         "prompt": {"type": "string", "description": "what the image shows (needed with redraw)"},
          "image": {"type": "string",
                    "description": "a /v1/images/files/... link; default the conversation's last image"},
          "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
-         "seed": {"type": "integer"}},
-         "required": ["prompt"]}},
+         "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
+         "redraw": {"type": "boolean", "description": "draw it again after the upscaler (default true)"},
+         "strength": {"type": "number", "description": "with redraw: how much may change (default 0.35)"},
+         "seed": {"type": "integer"}}}},
     {"name": "fix_image",
      "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer); the rest of "
                     "the image kept.",
@@ -3750,7 +3890,8 @@ class ImageTools:
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
             if name == "upscale_image":
-                req["upscale"] = {"scale": args["scale"]} if args.get("scale") not in (None, "") else {}
+                req["upscale"] = {k: args[k] for k in ("scale", "method", "redraw", "strength")
+                                  if args.get(k) not in (None, "")}
             if name == "fix_image":
                 req["fix"] = {"parts": args.get("parts") or ["face"],
                               **({"strength": args["strength"]} if args.get("strength") not in (None, "") else {})}
@@ -3820,6 +3961,12 @@ class ImageTools:
                             f": no {', '.join(job['fix']['parts'])} found, the image is as it was")
                          + "".join(f"; skipped {r['part']} ({r['skipped']})" for r in regs + fx["left_out"]
                                    if "skipped" in r) + ".")
+            if job.get("upscaler"):   # how it was made larger
+                u = job["upscaler"]
+                text += (f" upscale_image made it larger by {u['method']}"
+                         + (" (auto's choice)" if u["asked"] == "auto" else "")
+                         + (f", then drew it again at strength {job['strength']:g}." if not job.get("ups_only")
+                            else ", not drawn again."))
             seen = self._seen(gen, images[0])
             ok = True
         except AuxPending as e:   # the tool's weights are downloading: not an image, not an error to retry now
@@ -4067,6 +4214,10 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     first, in the chat model's turn."""
     if job.get("fix"):
         return fix_images(svc, gen, job, cancel)
+    if job.get("upscaler"):
+        upscaler_weights(gen, job)
+    if job.get("ups_only"):
+        return upscale_images(svc, gen, job, cancel)
     if job.get("enhance") and not job.get("enhanced"):
         enhance_prompt(svc, gen, job, cancel)
     gen.check_n(job)
@@ -4095,6 +4246,38 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     gen.last = figures
     gen.end(None)
     return images, figures, used
+
+
+def upscaler_weights(gen: ImageGen, job: dict) -> None:
+    """An upscale's upscaler weights (image_aux's, UPSCALE_WEIGHTS): their path into job["upscaler"], or AuxPending
+    while they download (the upscale is not made with another method meanwhile)."""
+    u = job["upscaler"]
+    name = UPSCALE_WEIGHTS.get(u["method"])
+    if name is None:
+        return
+    got = image_aux.ensure(name, image_aux.aux_dir(gen.cfg), gen._say)
+    if got["status"] != "ready":
+        raise AuxPending([got])
+    u["path"] = got["path"]
+
+
+def upscale_images(svc, gen: ImageGen, job: dict,
+                   cancel: threading.Event | None = None) -> tuple[list[bytes], dict, str]:
+    """An upscale without a drawing (job["ups_only"]) in the GPU's turn: the engine's upscaler alone, no image model
+    run (its cache given back where the upscaler needs the room)."""
+    t0 = time.monotonic()
+    with gpu_turn(svc, gen, job, cancel) as policy:
+        png, got = gen.upscale(job, cancel)
+    u = job["upscaler"]
+    figures = {"seconds": round(time.monotonic() - t0, 2), "n": 1, "seed": job["seed"], "engine": "strata-image",
+               "size": f"{job['width']}x{job['height']}", "text_encode_ms": 0.0, "sampling_s": 0.0,
+               "vae_decode_s": 0.0,
+               "upscale": {"method": u["method"], "asked": u["asked"], "color": got.get("color", "none"),
+                           **{k: float(got[k]) for k in ("upscale_s", "model_s", "resize_s", "color_s") if k in got},
+                           **{k: int(got[k]) for k in ("tile", "tiles") if k in got}}}
+    gen.last = figures
+    gen.end(None)
+    return [png], figures, policy
 
 
 def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -> dict:

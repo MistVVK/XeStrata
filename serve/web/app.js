@@ -3038,6 +3038,7 @@ function imgDefaults() {
   $("img-strength-f").hidden = !refs;
   const one = ($("img-ref").files || []).length === 1;   // upscale and extend take the one image they grow
   $("img-up-f").hidden = $("img-ext-f").hidden = $("img-fix-f").hidden = !one;
+  $("img-up-m-f").hidden = $("img-up-r-f").hidden = !one || !$("img-up").value;
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
@@ -3713,6 +3714,7 @@ async function imgStream(r, prompt) {
 $("img-neg").oninput = () => { imgNegHint(); imgCount(); };
 $("img-cfg").addEventListener("input", imgNegHint);
 $("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
+$("img-up").onchange = () => imgDefaults();   // the upscaler's fields with a scale
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
@@ -3760,7 +3762,11 @@ $("img-form").onsubmit = async (ev) => {
       body.fix = {parts: $("img-fix").value.split(",")};
       if (body.strength !== undefined) body.fix.strength = body.strength;
       delete body.size;
-    } else if (!mask && refs.length === 1 && $("img-up").value) body.upscale = {scale: Number($("img-up").value)};
+    } else if (!mask && refs.length === 1 && $("img-up").value) {   // the upscaler, then the drawing (or not)
+      body.upscale = {scale: Number($("img-up").value), method: $("img-up-m").value, redraw: $("img-up-r").checked};
+      if ($("img-up-r").checked && body.strength !== undefined) body.upscale.strength = body.strength;
+      delete body.strength;
+    }
     else if (!mask && refs.length === 1 && $("img-ext").value) body.extend = {aspect: $("img-ext").value};
     if (body.upscale || body.extend) delete body.size;   // the size is the grown image's
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";

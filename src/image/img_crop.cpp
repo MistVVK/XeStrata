@@ -5,6 +5,7 @@
 #include "strata/image/img_crop.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/image/img_color.hpp"
 #include "strata/core/runtime.hpp"
 
 #include <sycl/sycl.hpp>
@@ -301,29 +302,45 @@ uint8_t* rgba8_device(Buffers& b, const std::vector<uint8_t>& v) { return b.put(
 
 }  // namespace
 
+void lanczos_resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h) {
+    if (sw <= 0 || sh <= 0 || w <= 0 || h <= 0)
+        throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
+    Buffers b;
+    const int64_t n = w * h;
+    float* planes = b.get<float>((size_t) (4 * n));
+    {
+        Resize rz(b, sw, sh, w, h, true);
+        float* mid = b.get<float>((size_t) (4 * sh * w));
+        rows_rgba8(src, sw, sh, 0, 0, sh, rz.tx, rz.lox, rz.wx, mid);
+        columns(mid, 4, sh, w, rz.ty, rz.loy, rz.wy, planes, 0.0f, 255.0f);
+    }
+    done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        for (int c = 0; c < 4; ++c) dst[i * 4 + c] = (uint8_t) sycl::round(planes[c * n + i]);
+    }), "resize: outputs");
+}
+
+uint64_t lanczos_resize_bytes(int64_t sw, int64_t sh, int64_t w, int64_t h) {
+    (void) sw;
+    const auto taps = [](int64_t in, int64_t out) {   // a side's weights: a = 3, widened by the scale when it shrinks
+        const int64_t k = 2 * (int64_t) std::ceil(3.0 * std::max(1.0, (double) in / (double) out)) + 1;
+        return (uint64_t) out * (uint64_t) (k * 4 + 4);
+    };
+    return (uint64_t) (4 * w * h) * 4 + (uint64_t) (4 * sh * w) * 4 + taps(sw, w) + taps(sh, h);
+}
+
 QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) {
     if (src.width <= 0 || src.height <= 0 || src.rgba.size() != (size_t) (src.width * src.height * 4) || w <= 0 ||
         h <= 0)
         throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
     Buffers b;
     const uint8_t* pic = rgba8_device(b, src.rgba);
-    const int64_t n = w * h;
-    float* planes = b.get<float>((size_t) (4 * n));
-    {
-        Resize rz(b, src.width, src.height, w, h, true);
-        float* mid = b.get<float>((size_t) (4 * src.height * w));
-        rows_rgba8(pic, src.width, src.height, 0, 0, src.height, rz.tx, rz.lox, rz.wx, mid);
-        columns(mid, 4, src.height, w, rz.ty, rz.loy, rz.wy, planes, 0.0f, 255.0f);
-    }
-    uint8_t* out = b.get<uint8_t>((size_t) (4 * n));
-    done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0];
-        for (int c = 0; c < 4; ++c) out[i * 4 + c] = (uint8_t) sycl::round(planes[c * n + i]);
-    }), "resize: outputs");
+    uint8_t* out = b.get<uint8_t>((size_t) (4 * w * h));
+    lanczos_resize_device(pic, src.width, src.height, out, w, h);
     QiRef r;
     r.width = w;
     r.height = h;
-    r.rgba.resize((size_t) (4 * n));
+    r.rgba.resize((size_t) (4 * w * h));
     gpu::copy(r.rgba.data(), out, r.rgba.size());
     return r;
 }
@@ -458,90 +475,22 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     }
 }
 
-// sRGB (0 .. 255) <-> CIE Lab, D65, as kornia's rgb_to_lab and lab_to_rgb (ComfyUI's ColorTransfer)
-inline void to_lab(float r, float g, float b, float* lab) {
-    auto lin = [](float v) { v /= 255.0f; return v > 0.04045f ? sycl::pow((v + 0.055f) / 1.055f, 2.4f) : v / 12.92f; };
-    const float R = lin(r), G = lin(g), B = lin(b);
-    const float x = (0.412453f * R + 0.357580f * G + 0.180423f * B) / 0.95047f;
-    const float y = 0.212671f * R + 0.715160f * G + 0.072169f * B;
-    const float z = (0.019334f * R + 0.119193f * G + 0.950227f * B) / 1.08883f;
-    auto f = [](float t) { return t > 0.008856f ? sycl::cbrt(t) : 7.787f * t + 4.0f / 29.0f; };
-    const float fx = f(x), fy = f(y), fz = f(z);
-    lab[0] = 116.0f * fy - 16.0f;
-    lab[1] = 500.0f * (fx - fy);
-    lab[2] = 200.0f * (fy - fz);
-}
-
-inline void from_lab(const float* lab, float* rgb) {
-    const float fy = (lab[0] + 16.0f) / 116.0f, fx = lab[1] / 500.0f + fy, fz = sycl::fmax(fy - lab[2] / 200.0f, 0.0f);
-    auto inv = [](float t) { return t > 0.2068966f ? t * t * t : (t - 4.0f / 29.0f) / 7.787f; };
-    const float x = inv(fx) * 0.95047f, y = inv(fy), z = inv(fz) * 1.08883f;
-    const float R = 3.2404813432005266f * x - 1.5371515162713185f * y - 0.4985363261688878f * z;
-    const float G = -0.9692549499965682f * x + 1.8759900014898907f * y + 0.0415559265582928f * z;
-    const float B = 0.0556466391351772f * x - 0.2040413383665112f * y + 1.0573110696453443f * z;
-    auto gam = [](float v) { return v > 0.0031308f ? 1.055f * sycl::pow(v, 1.0f / 2.4f) - 0.055f : 12.92f * v; };
-    rgb[0] = sycl::clamp(gam(R), 0.0f, 1.0f) * 255.0f;
-    rgb[1] = sycl::clamp(gam(G), 0.0f, 1.0f) * 255.0f;
-    rgb[2] = sycl::clamp(gam(B), 0.0f, 1.0f) * 255.0f;
-}
+namespace {
 
 // the drawing's Lab channels moved to the picture's mean and spread (Reinhard): the statistics of the pixels the blend
-// mask keeps (below kKept, both opaque; `whole`: every opaque one), summed a work-group at a time on the GPU and the
-// groups' sums on the host in doubles
-void color_match(Buffers& bufs, uint8_t* drawn, const uint8_t* orig, const float* blend, int64_t n, bool whole) {
-    constexpr int kV = 13;   // per image the 3 channels' sums and squares' sums, and the count
+// mask keeps (below kKept, both opaque; `whole`: every opaque one); none where too few pixels or a flat channel give
+// no statistics
+void color_match(uint8_t* drawn, const uint8_t* orig, const float* blend, int64_t n, bool whole) {
     // the pixels the stitch keeps as the picture's, nearly: the blend mask's Gaussian reaches most of a cut 1.2 times
     // the paint, and at exactly 0 a face's cut kept none (1120 x 928, 2026-11-05)
     constexpr float kKept = 0.05f;
-    const size_t wg = 256, groups = (size_t) ((n + (int64_t) wg - 1) / (int64_t) wg);
-    float* part = bufs.get<float>(groups * kV);
-    float* lab = bufs.get<float>((size_t) (3 * n));   // the drawing's Lab, kept for the transform (pow and cbrt once)
-    done(queue().parallel_for(sycl::nd_range<1>(groups * wg, wg), [=](sycl::nd_item<1> it) {
-        const int64_t i = (int64_t) it.get_global_id(0);
-        float v[kV] = {};
-        if (i < n) to_lab(drawn[i * 4], drawn[i * 4 + 1], drawn[i * 4 + 2], lab + 3 * i);
-        if (i < n && drawn[i * 4 + 3] == 255 && orig[i * 4 + 3] == 255 && (whole || blend[i] < kKept)) {
-            float b[3];
-            const float* a = lab + 3 * i;
-            to_lab(orig[i * 4], orig[i * 4 + 1], orig[i * 4 + 2], b);
-            for (int c = 0; c < 3; ++c) {
-                v[c] = a[c];
-                v[3 + c] = a[c] * a[c];
-                v[6 + c] = b[c];
-                v[9 + c] = b[c] * b[c];
-            }
-            v[12] = 1.0f;
-        }
-        for (int k = 0; k < kV; ++k) {
-            const float s = sycl::reduce_over_group(it.get_group(), v[k], sycl::plus<float>());
-            if (it.get_local_id(0) == 0) part[it.get_group(0) * kV + k] = s;
-        }
-    }), "crop: color statistics");
-    std::vector<float> host(groups * kV);
-    gpu::copy(host.data(), part, host.size() * sizeof(float));
-    double sum[kV] = {};
-    for (size_t g = 0; g < groups; ++g)
-        for (int k = 0; k < kV; ++k) sum[k] += host[g * kV + k];
-    // too few pixels kept (a paint over most of the cut) or a flat channel: no statistics to go by
-    if (sum[12] < 1024.0) return;
-    float scale[3], offset[3];
-    for (int c = 0; c < 3; ++c) {
-        const double md = sum[c] / sum[12], mo = sum[6 + c] / sum[12];
-        const double sd = std::sqrt(std::max(0.0, sum[3 + c] / sum[12] - md * md));
-        const double so = std::sqrt(std::max(0.0, sum[9 + c] / sum[12] - mo * mo));
-        if (sd < 1e-3 || so < 1e-3) return;
-        scale[c] = (float) (so / sd);
-        offset[c] = (float) (mo - so / sd * md);
-    }
-    const float s0 = scale[0], s1 = scale[1], s2 = scale[2], o0 = offset[0], o1 = offset[1], o2 = offset[2];
-    done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0];
-        const float m[3] = {lab[3 * i] * s0 + o0, lab[3 * i + 1] * s1 + o1, lab[3 * i + 2] * s2 + o2};
-        float rgb[3];
-        from_lab(m, rgb);
-        for (int c = 0; c < 3; ++c) drawn[i * 4 + c] = (uint8_t) sycl::round(rgb[c]);
-    }), "crop: color match");
+    const float* m = whole ? nullptr : blend;
+    const color::Stats d = color::stats(drawn, n, color::Space::lab, m, kKept, orig);
+    const color::Stats o = color::stats(orig, n, color::Space::lab, m, kKept, drawn);
+    color::transfer(drawn, n, color::Space::lab, d, o, 1024.0);
 }
+
+}  // namespace
 
 std::vector<uint8_t> CropStitch::stitch(const std::vector<uint8_t>& made, int color) const {
     const int64_t W = box_.width, H = box_.height, bw = box_.w, bh = box_.h, n = gw_ * gh_;
@@ -551,7 +500,7 @@ std::vector<uint8_t> CropStitch::stitch(const std::vector<uint8_t>& made, int co
     uint8_t* pic = rgba8_device(b, base_);
     uint8_t* drawn = rgba8_device(b, made);
     const float* bm = b.put(blend_);
-    if (color > 0) color_match(b, drawn, crop_dev_ != nullptr ? crop_dev_ : rgba8_device(b, crop_.rgba), bm, n, color == 2);
+    if (color > 0) color_match(drawn, crop_dev_ != nullptr ? crop_dev_ : rgba8_device(b, crop_.rgba), bm, n, color == 2);
     // the drawing at the box's size (Lanczos) and the blend mask with it (bilinear)
     float* planes = b.get<float>((size_t) (4 * bw * bh));
     {

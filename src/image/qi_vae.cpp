@@ -116,15 +116,6 @@ void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uin
                          Rms16{x, g, HW, C, silu, out16});
 }
 
-// out16 [2H][2W][C] = x [H][W][C], nearest
-void up2x16(const float* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * H * W * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, P = i / C, X = P % (2 * W), Y = P / (2 * W);
-        out16[i] = f16_from_f32(x[((Y / 2) * W + X / 2) * C + c]);
-    });
-}
-
 // y [2H][2W][cout] += the up block's input xin [H][W][cin] spread: channel c of pixel (2h + a, 2w + b) is the input
 // channel ((c * ft + ft - 1) * 4 + 2a + b) / rep of pixel (h, w), rep = cout * ft * 4 / cin (one frame, the first
 // chunk's last of its ft)
@@ -618,7 +609,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
             c = r.c1.out;
         }
         if (u.up.out > 0) {
-            up2x16(x, H, W, co, a16_, s_);
+            qi_up2x16(x, H, W, co, a16_, s_);
             float* y = x == t0_ ? t1_ : t0_;
             conv(u.up, a16_, 2 * H, 2 * W, y);
             if (keep != nullptr) {

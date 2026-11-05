@@ -101,6 +101,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "mradermacher/Qwen3-0.6B-Base-GGUF": "b8b11a6dbbb14c739e25018f3f77abac860c28f4",               # 2026-11-02
     "google-t5/t5-base": "a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1",                               # 2026-11-02
     "Bingsu/adetailer": "53cc19de382014514d9d4038601d261a7faa9b7b",                                # 2026-11-05
+    "lllyasviel/Annotators": "982e7edaec38759d914a963c48c4726685de7d96",                           # 2026-11-05
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -124,6 +125,9 @@ _AN = "circlestone-labs/Anima"
 _AN29 = "Gazingstars123/Anima-2.9B"
 _Q306 = "mradermacher/Qwen3-0.6B-Base-GGUF"
 _AD = "Bingsu/adetailer"   # the Detailer's YOLOv8 detectors (fix_image)
+# the upscaler RealESRGAN x4plus: xinntao/Real-ESRGAN's release file (v0.1.0's RealESRGAN_x4plus.pth, the same bytes),
+# as ControlNet's annotators keep it
+_ANN = "lllyasviel/Annotators"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -284,6 +288,8 @@ FILES = {
                   "70b540063fbc385736d8258970744a4afbc4cbf7932134bae3b24cdadeadec06"),
     "yolo-person": (_AD, "person_yolov8m-seg.pt", 54_827_683,
                     "c8ab26f517173b1fe8342d336a09f443eb61cb08dcbfc78d53fff4c2547ae81e"),
+    "realesrgan-x4plus": (_ANN, "RealESRGAN_x4plus.pth", 67_040_989,
+                          "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -399,18 +405,22 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
 IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "fix_image")
 # The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
-# with ("yolo": tools/image/yolo_pt.py, a PyTorch checkpoint to safetensors; None: used as it is), the file the engine
-# reads, and the license shown when it is downloaded.  They live in AUX_DIR beside the image models' folders; the
-# server fetches one the first time a tool needs it (setup does not).
+# with ("yolo": tools/image/yolo_pt.py, "esrgan": tools/image/esrgan.py, each a PyTorch checkpoint to safetensors; None:
+# used as it is), the file the engine reads, and the license shown when it is downloaded.  They live in AUX_DIR beside
+# the image models' folders; the server fetches one the first time a tool needs it (setup does not).
 AUX_DIR = "image-tools"
 _YOLO_LICENSE = ("Apache-2.0 by its publisher (Bingsu/adetailer, https://huggingface.co/Bingsu/adetailer); trained "
                  "with Ultralytics YOLOv8, whose models Ultralytics holds to be under AGPL-3.0 by default "
                  "(https://www.ultralytics.com/license)")
+_ESRGAN_LICENSE = ("BSD-3-Clause, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's Real-ESRGAN "
+                   "(https://github.com/xinntao/Real-ESRGAN)")
 AUX = {
     "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
     "yolo-hand": {"file": "yolo-hand", "convert": "yolo", "out": "hand_yolov8s.safetensors", "license": _YOLO_LICENSE},
     "yolo-person": {"file": "yolo-person", "convert": "yolo", "out": "person_yolov8m-seg.safetensors",
                     "license": _YOLO_LICENSE},
+    "realesrgan": {"file": "realesrgan-x4plus", "convert": "esrgan", "out": "RealESRGAN_x4plus.safetensors",
+                   "license": _ESRGAN_LICENSE},
 }
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
@@ -563,7 +573,8 @@ def parse_choices(value: str) -> list[tuple[str, str | None]]:
 def aux_note() -> str:
     """What setup says of the image tools' weights, which it does not fetch (AUX)."""
     return ("The image tools' weights are fetched by the server the first time a tool needs them (not now): "
-            f"fix_image's YOLOv8 detectors (face_yolov8m, hand_yolov8s, person_yolov8m-seg), {_YOLO_LICENSE}")
+            f"fix_image's YOLOv8 detectors (face_yolov8m, hand_yolov8s, person_yolov8m-seg), {_YOLO_LICENSE}; the "
+            f"upscaler RealESRGAN x4plus, {_ESRGAN_LICENSE}")
 
 
 def license_note(dit: str) -> str:

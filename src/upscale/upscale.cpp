@@ -1,0 +1,319 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/upscale/upscale.cpp - see include/strata/upscale/upscale.hpp.
+
+#include "strata/upscale/upscale.hpp"
+
+#include "strata/core/device.hpp"
+#include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/image/img_color.hpp"
+#include "strata/image/img_crop.hpp"
+#include "strata/upscale/esrgan.hpp"
+
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace strata::upscale {
+
+namespace {
+
+sycl::queue& queue() { return core::Runtime::get().stream(nullptr); }
+
+void done(const sycl::event& e, const char* what) { core::Runtime::get().wait(e, what); }
+
+double since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// a device buffer, freed with it
+struct Buf {
+    uint8_t* p = nullptr;
+    Buf() = default;
+    explicit Buf(uint64_t bytes) {
+        if (bytes > core::max_alloc_bytes())
+            throw std::runtime_error("upscale: a picture past the device's largest allocation");
+        if (!gpu::alloc_device(&p, (size_t) bytes))
+            throw std::runtime_error(std::string("upscale: GPU memory: ") + gpu::last_error());
+    }
+    Buf(const Buf&) = delete;
+    Buf& operator=(const Buf&) = delete;
+    Buf& operator=(Buf&& o) noexcept {
+        std::swap(p, o.p);
+        return *this;
+    }
+    ~Buf() {
+        if (p != nullptr) gpu::free(p);
+    }
+};
+
+// Lanczos: the driver's resize alone
+class Lanczos final : public UpscaleModel {
+public:
+    Lanczos() {
+        info_.name = "lanczos";
+        info_.identity = true;
+    }
+    const ModelInfo& info() const override { return info_; }
+    uint64_t weight_bytes() const override { return 0; }
+    uint64_t clip_bytes(int64_t, int64_t, int64_t) const override { return 0; }
+    uint64_t clip_largest(int64_t, int64_t, int64_t) const override { return 0; }
+    void run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, uint8_t* out, uint64_t) override {
+        if (in != out) gpu::copy(out, in, (size_t) (frames * w * h * 4));
+    }
+    void release(bool) override {}
+    uint64_t held() const override { return 0; }
+
+private:
+    ModelInfo info_;
+};
+
+// the frames a clip of `n` takes: frame_min + k * frame_step, at least n
+int64_t clip_frames(const ModelInfo& in, int64_t n) {
+    if (n <= in.frame_min) return in.frame_min;
+    const int64_t step = std::max<int64_t>(1, in.frame_step);
+    return in.frame_min + (n - in.frame_min + step - 1) / step * step;
+}
+
+int64_t padded(int64_t side, int64_t multiple) { return (side + multiple - 1) / multiple * multiple; }
+
+// what lives through the whole run beside the model's work: the input, the model's output at its size and the output
+// at the size asked for (where they differ), and the correction's reference and scratch
+uint64_t frame_bytes(const ModelInfo& in, int64_t sw, int64_t sh, int64_t w, int64_t h, ColorFix color) {
+    const int64_t s = in.scale > 0 ? in.scale : 1;
+    const int64_t mw = in.scale > 0 ? sw * s : padded(w, in.multiple), mh = in.scale > 0 ? sh * s : padded(h, in.multiple);
+    uint64_t b = (uint64_t) (sw * sh * 4) + (uint64_t) (mw * mh * 4) * (uint64_t) clip_frames(in, 1);
+    if (in.scale > 0 ? (mw != w || mh != h) : true) b += (uint64_t) (w * h * 4);
+    // the resize's scratch (once at a time): the model's output to w x h, or the input to it
+    uint64_t post = in.scale > 0 ? image::lanczos_resize_bytes(mw, mh, w, h) : image::lanczos_resize_bytes(sw, sh, w, h);
+    if (color == ColorFix::wavelet)
+        post = std::max(post, (uint64_t) (w * h * 4) + std::max(image::lanczos_resize_bytes(sw, sh, w, h),
+                                                                   image::color::wavelet_bytes(w, h)));
+    return b + post;
+}
+
+// the window of a tile: its core of at most `t` and the context around it, within the side
+int64_t window(int64_t t, int64_t context, int64_t side) { return std::min(side, t + 2 * context); }
+
+}  // namespace
+
+ColorFix parse_color(const std::string& word) {
+    if (word == "none") return ColorFix::none;
+    if (word == "lab") return ColorFix::lab;
+    if (word == "adain") return ColorFix::adain;
+    if (word == "wavelet") return ColorFix::wavelet;
+    throw std::invalid_argument("upscale: a color correction of none, lab, adain or wavelet, not " + word);
+}
+
+const char* color_name(ColorFix c) {
+    switch (c) {
+    case ColorFix::lab: return "lab";
+    case ColorFix::adain: return "adain";
+    case ColorFix::wavelet: return "wavelet";
+    case ColorFix::none: break;
+    }
+    return "none";
+}
+
+std::unique_ptr<UpscaleModel> open_model(const std::string& name, const std::string& path) {
+    if (name == "lanczos") return std::make_unique<Lanczos>();
+    if (name == "realesrgan") {
+        if (path.empty()) throw std::invalid_argument("upscale: realesrgan needs its weights' file");
+        return std::make_unique<Esrgan>(path);
+    }
+    throw std::invalid_argument("upscale: no upscaler " + name + " (lanczos, realesrgan)");
+}
+
+uint64_t UpscaleRunner::least_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
+                                    ColorFix color) {
+    const ModelInfo& in = m.info();
+    uint64_t work = 0;
+    if (!in.identity) {
+        const int64_t fw = in.scale > 0 ? sw : padded(w, in.multiple), fh = in.scale > 0 ? sh : padded(h, in.multiple);
+        const int64_t t = in.context > 0 ? in.min_tile : std::max(fw, fh);
+        const int64_t ww = window(t, in.context, fw), wh = window(t, in.context, fh), s = std::max(1, in.scale);
+        const uint64_t tiles = in.context > 0 && (ww < fw || wh < fh) ? (uint64_t) (ww * wh) * 4 * (1 + s * s) : 0;
+        work = m.weight_bytes() + m.clip_bytes(ww, wh, clip_frames(in, 1)) + tiles;
+    }
+    return frame_bytes(in, sw, sh, w, h, color) + work;
+}
+
+uint64_t UpscaleRunner::full_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
+                                   ColorFix color) {
+    const ModelInfo& in = m.info();
+    uint64_t work = 0;
+    if (!in.identity) {
+        const int64_t fw = in.scale > 0 ? sw : padded(w, in.multiple), fh = in.scale > 0 ? sh : padded(h, in.multiple);
+        work = m.weight_bytes() + m.clip_bytes(fw, fh, clip_frames(in, 1));
+    }
+    return frame_bytes(in, sw, sh, w, h, color) + work;
+}
+
+QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, uint64_t avail, Report* rep) {
+    const ModelInfo& in = m.info();
+    const int64_t sw = src.width, sh = src.height, w = r.width, h = r.height;
+    if (sw <= 0 || sh <= 0 || src.rgba.size() != (size_t) (sw * sh * 4))
+        throw std::invalid_argument("upscale: an empty image");
+    if (w <= 0 || h <= 0) throw std::invalid_argument("upscale: no size to upscale to");
+    Report local;
+    Report& rp = rep != nullptr ? *rep : local;
+    rp = Report{};
+    rp.color = r.color_set ? r.color : in.color;
+    const int64_t nfr = clip_frames(in, 1);
+    Buf pic((uint64_t) (sw * sh * 4));
+    gpu::copy(pic.p, src.rgba.data(), src.rgba.size());
+    // the model's input: the picture as it is (a native scale), or the picture at the size asked for, padded to the
+    // model's multiple by repeating its edges (the padding cut off again after)
+    const int s = in.scale > 0 ? in.scale : 1;
+    const int64_t fw = in.scale > 0 ? sw : padded(w, in.multiple), fh = in.scale > 0 ? sh : padded(h, in.multiple);
+    const int64_t mw = fw * s, mh = fh * s;   // the model's output
+    Buf feed, made((uint64_t) (mw * mh * 4) * (uint64_t) nfr);
+    const uint8_t* fin = pic.p;
+    auto t0 = std::chrono::steady_clock::now();
+    if (in.scale == 0) {
+        feed = Buf((uint64_t) (fw * fh * 4) * (uint64_t) nfr);
+        if (fw == w && fh == h) {
+            image::lanczos_resize_device(pic.p, sw, sh, feed.p, w, h);
+        } else {
+            Buf sized((uint64_t) (w * h * 4));
+            image::lanczos_resize_device(pic.p, sw, sh, sized.p, w, h);
+            uint8_t* f = feed.p;
+            const uint8_t* z = sized.p;
+            done(queue().parallel_for(sycl::range<2>((size_t) fh, (size_t) fw), [=](sycl::id<2> id) {
+                const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+                const int64_t yy = sycl::min(y, h - 1), xx = sycl::min(x, w - 1);
+                for (int c = 0; c < 4; ++c) f[(y * fw + x) * 4 + c] = z[(yy * w + xx) * 4 + c];
+            }), "upscale: padding");
+        }
+        for (int64_t k = 1; k < nfr; ++k)   // the frame repeated up to the model's least clip
+            gpu::copy(feed.p + k * fw * fh * 4, feed.p, (size_t) (fw * fh * 4));
+        fin = feed.p;
+        rp.resize_s += since(t0);
+    }
+    // the model, the frame whole or in tiles of the largest core whose run fits the VRAM left
+    t0 = std::chrono::steady_clock::now();
+    if (in.identity) {
+        m.run_clip(fin, fw, fh, nfr, made.p, r.seed);
+    } else {
+        const uint64_t fixed = frame_bytes(in, sw, sh, w, h, rp.color) + m.weight_bytes();
+        const uint64_t room = avail > fixed ? avail - fixed : 0;
+        int64_t T = std::max(fw, fh);
+        if (r.max_tile > 0) T = std::min(T, r.max_tile);
+        if (in.context > 0) {
+            const auto fits = [&](int64_t t) {
+                const int64_t ww = window(t, in.context, fw), wh = window(t, in.context, fh);
+                const bool tiled = ww < fw || wh < fh;
+                return m.clip_bytes(ww, wh, nfr) + (tiled ? (uint64_t) (ww * wh) * 4 * (1 + s * s) : 0) <= room &&
+                       m.clip_largest(ww, wh, nfr) <= core::max_alloc_bytes();
+            };
+            while (T > in.min_tile && !fits(T)) T = std::max(in.min_tile, T / 2);
+        }
+        for (;;) {
+            try {
+                const int64_t nx = in.context > 0 ? (fw + T - 1) / T : 1, ny = in.context > 0 ? (fh + T - 1) / T : 1;
+                if (nx * ny == 1) {
+                    m.run_clip(fin, fw, fh, nfr, made.p, r.seed);
+                    rp.tile = 0;
+                    rp.tiles = 0;
+                } else {
+                    // the cores as even as the side allows; each window the core and the context around it, moved
+                    // inside the frame, so that every tile has one shape
+                    const int64_t cw = (fw + nx - 1) / nx, ch = (fh + ny - 1) / ny;
+                    const int64_t ww = window(cw, in.context, fw), wh = window(ch, in.context, fh);
+                    Buf tin((uint64_t) (ww * wh * 4) * (uint64_t) nfr), tout((uint64_t) (ww * wh * s * s * 4) * (uint64_t) nfr);
+                    int64_t count = 0;
+                    for (int64_t ty = 0; ty < ny; ++ty)
+                        for (int64_t tx = 0; tx < nx; ++tx) {
+                            const int64_t c0x = tx * cw, c1x = std::min(fw, c0x + cw);
+                            const int64_t c0y = ty * ch, c1y = std::min(fh, c0y + ch);
+                            if (c0x >= c1x || c0y >= c1y) continue;
+                            const int64_t x0 = std::clamp<int64_t>(c0x - in.context, 0, fw - ww);
+                            const int64_t y0 = std::clamp<int64_t>(c0y - in.context, 0, fh - wh);
+                            uint8_t* ti = tin.p;
+                            uint8_t* to = tout.p;
+                            uint8_t* mo = made.p;
+                            const int64_t frames = nfr;
+                            done(queue().parallel_for(sycl::range<3>((size_t) frames, (size_t) wh, (size_t) ww),
+                                                      [=](sycl::id<3> id) {
+                                const int64_t f = (int64_t) id[0], y = (int64_t) id[1], x = (int64_t) id[2];
+                                const uint8_t* a = fin + ((f * fh + y0 + y) * fw + x0 + x) * 4;
+                                uint8_t* b = ti + ((f * wh + y) * ww + x) * 4;
+                                for (int c = 0; c < 4; ++c) b[c] = a[c];
+                            }), "upscale: tile");
+                            m.run_clip(tin.p, ww, wh, nfr, tout.p, r.seed);
+                            // the core's part of the output, into the model's output at its place
+                            const int64_t ow = ww * s, oh = wh * s, ox = (c0x - x0) * s, oy = (c0y - y0) * s;
+                            const int64_t kw = (c1x - c0x) * s, kh = (c1y - c0y) * s, px = c0x * s, py = c0y * s;
+                            done(queue().parallel_for(sycl::range<3>((size_t) frames, (size_t) kh, (size_t) kw),
+                                                      [=](sycl::id<3> id) {
+                                const int64_t f = (int64_t) id[0], y = (int64_t) id[1], x = (int64_t) id[2];
+                                const uint8_t* a = to + ((f * oh + oy + y) * ow + ox + x) * 4;
+                                uint8_t* b = mo + ((f * mh + py + y) * mw + px + x) * 4;
+                                for (int c = 0; c < 4; ++c) b[c] = a[c];
+                            }), "upscale: tile out");
+                            ++count;
+                        }
+                    rp.tile = T;
+                    rp.tiles = count;
+                }
+                break;
+            } catch (const std::runtime_error&) {   // no room for this tile: a smaller one, as ComfyUI shrinks its own
+                if (in.context <= 0 || T <= in.min_tile) {
+                    m.release(false);
+                    throw;
+                }
+                m.release(false);
+                T = std::max(in.min_tile, T / 2);
+            }
+        }
+        m.release(false);
+    }
+    rp.model_s += since(t0);
+    // the first frame at the size asked for
+    t0 = std::chrono::steady_clock::now();
+    Buf sized;
+    uint8_t* out = made.p;
+    if (in.scale > 0 && (mw != w || mh != h)) {
+        sized = Buf((uint64_t) (w * h * 4));
+        image::lanczos_resize_device(made.p, mw, mh, sized.p, w, h);
+        out = sized.p;
+    } else if (mw != w || mh != h) {   // the padding cut off
+        sized = Buf((uint64_t) (w * h * 4));
+        uint8_t* z = sized.p;
+        const uint8_t* a = made.p;
+        done(queue().parallel_for(sycl::range<2>((size_t) h, (size_t) w), [=](sycl::id<2> id) {
+            const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+            for (int c = 0; c < 4; ++c) z[(y * w + x) * 4 + c] = a[(y * mw + x) * 4 + c];
+        }), "upscale: crop");
+        out = sized.p;
+    }
+    rp.resize_s += since(t0);
+    // the colors moved back toward the input's
+    t0 = std::chrono::steady_clock::now();
+    namespace color = image::color;
+    if (rp.color == ColorFix::lab || rp.color == ColorFix::adain) {
+        const color::Space sp = rp.color == ColorFix::lab ? color::Space::lab : color::Space::rgb;
+        const color::Stats from = color::stats(out, w * h, sp), to = color::stats(pic.p, sw * sh, sp);
+        rp.color_applied = color::transfer(out, w * h, sp, from, to, 1.0);
+    } else if (rp.color == ColorFix::wavelet) {
+        Buf ref((uint64_t) (w * h * 4));
+        image::lanczos_resize_device(pic.p, sw, sh, ref.p, w, h);
+        color::wavelet(out, ref.p, w, h);
+        rp.color_applied = true;
+    }
+    rp.color_s += since(t0);
+    QiRef res;
+    res.width = w;
+    res.height = h;
+    res.rgba.resize((size_t) (w * h * 4));
+    gpu::copy(res.rgba.data(), out, res.rgba.size());
+    return res;
+}
+
+}  // namespace strata::upscale
