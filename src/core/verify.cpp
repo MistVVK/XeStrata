@@ -345,7 +345,7 @@ struct Bump {
     uint8_t* base = nullptr;
     uint64_t used = 0;
     template <typename T> T* take(uint64_t n) {
-        T* p = base ? (T*) (base + used) : nullptr;
+        T* p = base ? reinterpret_cast<T*>(base + used) : nullptr;
         used += (n * sizeof(T) + 255) & ~255ull;
         return p;
     }
@@ -661,7 +661,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
-        sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
+        sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
         one_ = b.take<int32_t>(4);
@@ -822,7 +822,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
     auto join = [&](int i) { return strata::gpu::stream_join(cs, df_side_[i]); };
     // see Verifier::commit; not in a pipelined window (always_publish_), which a misprediction rolls back
     const bool self_commit = T == 1 && !batch_rec_ && !always_publish_ && one_token_self_commit();
-    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) { if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs); };
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     bool gate_later_[2] = {false, false};   // the group's shared rows still to be scaled by the combine (pre -> post)
@@ -1208,7 +1208,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 } else
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
-                    const int32_t* step_t = step_ + t * kStepCount;
+                    const int32_t* step_t = step_ + (size_t) t * kStepCount;
                     if (st.kv_hybrid) {   // K8V4: the used pool for both halves (layer.cpp)
                         const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
                         const bool mirror = st.host.present();   // streamed: the host copy too
@@ -1235,7 +1235,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 for (int t = tb; t < te; ++t) {
                     const QsaState& sx = slot_ss(t).qsa_states[qi];
                     const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                    native_qsa_indexer_append(idx_raw + t * ID, step_ + t * kStepCount + kStepPos, 0,
+                    native_qsa_indexer_append(idx_raw + t * ID, step_ + (size_t) t * kStepCount + kStepPos, 0,
                                               (const float*) wikn->data, EPS, ib, s, sx.max_cells,
                                               rope_scaling(), cs);
                 }
@@ -1297,15 +1297,15 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                     qsa_block_scores_rows(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
                 else
                     qsa_block_scores(st.idx_pooled, st.idx_dead, q_win, st_win, n, max_blocks_, s, sc_win, cs);
-                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
+                qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + (size_t) tb * kStepCount, n, max_blocks_, cap_, s,
                                sel_ + (size_t) tb * cap_, cs);
                 stamp(l, 11, grp);
                 // KV streaming: the n selections' blocks resident (device-side, inside the graph)
-                qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, n, cap_, cs);
+                qsa_kv_resolve(st, *g_, sel_ + (size_t) tb * cap_, step_ + (size_t) tb * kStepCount, n, cap_, cs);
                 stamp(l, 12, grp);
                 const QsaAttnPools pools = qsa_attn_pools(st);
                 if (qbr && !join(0)) { err = std::string("verify branch: ") + strata::gpu::last_error(); return false; }
-                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount, cap_,
+                qsa_decode_attn_batch(qcur_ + tb * NH * HD, pools, sel_ + (size_t) tb * cap_, step_ + (size_t) tb * kStepCount, cap_,
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
@@ -1351,7 +1351,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             try {
                 // the shared expert's scalar gate as one more work-group of the router's launch (upstream b08cf3e1)
                 const WeightRef* w_sg = v.get("ffn_gate_inp_shexp.weight");
-                if (lfuse_gate && w_sg != nullptr && w_sg->kind == WeightKind::Bf16InF32 && shared_expert_native_bf16())
+                if (lfuse_gate && w_sg != nullptr && w_sg->kind == WeightKind::Bf16InF32)
                     g_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
                                                             logits_ + tb * NE, NE, N, NE, n, (const uint16_t*) w_sg->data,
                                                             sh_g_ + tb, 1, cs);
@@ -1399,7 +1399,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                                  (const int32_t*) (m_rpl_w_ + ((size_t) l * (size_t) MT + (size_t) tb) * (size_t) K),
                                  (int64_t) n * K, cs);
         }
-        if (device_plan_ || recording_res_)   // E-6: every routed expert resident: this group's plan without the host
+        if ((device_plan_ || recording_res_) && hits_.d_res != nullptr)   // E-6: every routed expert resident: this group's plan without the host
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
@@ -1435,13 +1435,9 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             }();
             qdedup = qdedup_on && strata::kernels::cpu::expert_layout().native;
             if (qdedup) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-            if (!(qdedup && shared_expert_native_bf16())) {
-                if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, cs);   // contiguous rows
-                else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, cs);
-            }
             try {
                 // the window's combine scales the shared rows itself (upstream b08cf3e1; the same bits, a launch fewer)
-                gate_later_[grp] = shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data,
+                gate_later_[grp] = shared_expert_multi(n, xm, nsw, (const uint16_t*) wgi->data,
                                                        sh_gate_ + (size_t) tb * g.n_ff, sh_up_ + (size_t) tb * g.n_ff,
                                                        sh_g_ + tb, shared_ + tb * N, N, g.n_ff, cs,
                                                        lfuse_gate && dec_batch && n > 1 && native_moe_combine_enabled(),
@@ -1497,7 +1493,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         const int32_t* p_dst = p_start + capx + 1;
         const int32_t* p_tok = p_dst + capx;
         const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
-        const unsigned long long* p_ptr = (const unsigned long long*) (pl + ptr_off);
+        const unsigned long long* p_ptr = reinterpret_cast<const unsigned long long*>(pl + ptr_off);
         const unsigned long long* p_ptr2 = p_ptr + capx;
         const int32_t* p_start2 = pl + ptr_off + 4 * capx;
         float* hit_out = hit_out_ + (size_t) tb * K * N;
@@ -1951,7 +1947,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const QsaShapes s = shapes_of(g);
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
-        qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
+        qsa_step_fill(h_step_ + (size_t) t * kStepCount, pos0 + t, s);
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) (pos0 + t);
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
         int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
@@ -2191,7 +2187,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.start = base + 4;
     sink_.dst = sink_.start + cap + 1;
     sink_.tok = sink_.dst + cap;
-    sink_.ptr = (unsigned long long*) (base + ptr_off);
+    sink_.ptr = reinterpret_cast<unsigned long long*>(base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
     const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);

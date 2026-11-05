@@ -14,6 +14,7 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_q8_mma
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/kernels/matrix_report.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -97,26 +98,26 @@ struct Kernel {
         // the step's tiles, 16 bytes a copy (rows past T zeros), and the scales a row's NB at once
         auto issue = [&](int64_t s, int buf) {
             const int64_t k0 = s * KC;
-            uint8_t* al = base + A_OFF + buf * A_BUF;
-            uint8_t* bl = base + B_OFF + buf * B_BUF;
+            uint8_t* al = base + A_OFF + (size_t) buf * A_BUF;
+            uint8_t* bl = base + B_OFF + (size_t) buf * B_BUF;
 #pragma unroll
             for (int v = lid; v < WM * (KC / 16); v += LANES) {
                 const int r = v / (KC / 16), c = v % (KC / 16) * 16;
                 const int64_t row = m0 + r;
-                cp_async<16>(al + r * LD + c, x8 + (row < T ? row : 0) * K + k0 + c, row < T ? 16 : 0);
+                cp_async<16>(al + (size_t) r * LD + c, x8 + (row < T ? row : 0) * K + k0 + c, row < T ? 16 : 0);
             }
 #pragma unroll
             for (int v = lid; v < WN * (KC / 16); v += LANES) {
                 const int r = v / (KC / 16), c = v % (KC / 16) * 16;
-                cp_async<16>(bl + r * LD + c, w + (n0 + r) * row_bytes + k0 + c);
+                cp_async<16>(bl + (size_t) r * LD + c, w + (n0 + r) * row_bytes + k0 + c);
             }
             if (lid < WM) {
                 const int64_t row = m0 + lid;
-                cp_async<NB * 4>(base + XS_OFF + buf * XS_BUF + lid * NB * 4, xs + (row < T ? row : 0) * kb + k0 / 32,
+                cp_async<NB * 4>(base + XS_OFF + (size_t) buf * XS_BUF + (size_t) lid * NB * 4, xs + (row < T ? row : 0) * kb + k0 / 32,
                                  row < T ? NB * 4 : 0);
             } else if (lid < WM + WN) {
                 const int r = lid - WM;
-                cp_async<NB * 2>(base + WS_OFF + buf * WS_BUF + r * NB * 2, w + (n0 + r) * row_bytes + K + k0 / 16);
+                cp_async<NB * 2>(base + WS_OFF + (size_t) buf * WS_BUF + (size_t) r * NB * 2, w + (n0 + r) * row_bytes + K + k0 / 16);
             }
             cp_async_commit();
         };
@@ -137,20 +138,20 @@ struct Kernel {
             cp_async_wait0();
             sycl::group_barrier(it.get_group());
             if (s + 1 < steps) issue(s + 1, buf ^ 1);
-            const uint8_t* al = base + A_OFF + buf * A_BUF;
-            const uint8_t* bl = base + B_OFF + buf * B_BUF;
-            const float* xsl = reinterpret_cast<const float*>(base + XS_OFF + buf * XS_BUF);
-            const sycl::half* wsl = reinterpret_cast<const sycl::half*>(base + WS_OFF + buf * WS_BUF);
+            const uint8_t* al = base + A_OFF + (size_t) buf * A_BUF;
+            const uint8_t* bl = base + B_OFF + (size_t) buf * B_BUF;
+            const float* xsl = reinterpret_cast<const float*>(base + XS_OFF + (size_t) buf * XS_BUF);
+            const sycl::half* wsl = reinterpret_cast<const sycl::half*>(base + WS_OFF + (size_t) buf * WS_BUF);
 #pragma unroll 1
             for (int b = 0; b < NB; ++b) {
                 uint32_t af[SGM][4], bf[SGN / 2][4];
 #pragma unroll
                 for (int i = 0; i < SGM; ++i)   // rows lane % 16, bytes 16 (lane / 16) of the block
-                    ldsm4(af[i], smem_addr(al + (ms + i * 16 + lane % 16) * LD + b * 32 + lane / 16 * 16));
+                    ldsm4(af[i], smem_addr(al + (size_t) ((ms + i * 16 + lane % 16) * LD + b * 32 + lane / 16 * 16)));
 #pragma unroll
                 for (int j = 0; j < SGN / 2; ++j)   // outputs 8 (lane / 16) + lane % 8, bytes 16 (lane / 8 % 2)
-                    ldsm4(bf[j], smem_addr(bl + (ns + j * 16 + lane / 16 * 8 + lane % 8) * LD + b * 32 +
-                                           lane / 8 % 2 * 16));
+                    ldsm4(bf[j], smem_addr(bl + (size_t) ((ns + j * 16 + lane / 16 * 8 + lane % 8) * LD + b * 32 +
+                                                           lane / 8 % 2 * 16)));
                 float sx[SGM][2], wf[SGN][2], wm[SGN][2];
 #pragma unroll
                 for (int i = 0; i < SGM; ++i)
@@ -168,7 +169,7 @@ struct Kernel {
 #pragma unroll
                     for (int j = 0; j < SGN; ++j) {
                         int c[4];
-                        mma16832(c, af[i], bf[j / 2][(j % 2) * 2], bf[j / 2][(j % 2) * 2 + 1], kMagicBits);
+                        mma16832(c, af[i], bf[j / 2][(size_t) (j % 2) * 2], bf[j / 2][(j % 2) * 2 + 1], kMagicBits);
                         // c0, c1: row gr, outputs gc and +1; c2, c3: 8 rows on
 #pragma unroll
                         for (int e = 0; e < 4; ++e)
@@ -181,12 +182,12 @@ struct Kernel {
         for (int i = 0; i < SGM; ++i)
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
-                const int64_t row = m0 + ms + i * 16 + gr + h * 8;
+                const int64_t row = m0 + ms + (int64_t) i * 16 + gr + (int64_t) h * 8;
                 if (row >= T) continue;
 #pragma unroll
                 for (int j = 0; j < SGN; ++j) {
-                    float* o = y + row * ldy + n0 + ns + j * 8 + gc;
-                    o[0] = acc[i][j][2 * h];
+                    float* o = y + row * ldy + n0 + ns + (int64_t) j * 8 + gc;
+                    o[0] = acc[i][j][(size_t) 2 * h];
                     o[1] = acc[i][j][2 * h + 1];
                 }
             }
@@ -230,8 +231,7 @@ int device_arch(sycl::queue& q) {
 bool q8_mma_usable(sycl::queue& q) {
     static core::PerDevice<bool> per_device;
     return per_device.get(q.get_device(), [&q] {
-        const char* off = std::getenv("STRATA_NO_XMX");
-        if (off != nullptr && std::strtol(off, nullptr, 10) != 0) return false;
+        if (no_xmx()) return false;
         const sycl::device d = q.get_device();
         if (d.get_backend() != sycl::backend::ext_oneapi_cuda) return false;
         if (d.get_info<sycl::info::device::local_mem_size>() < (size_t) LOCAL ||

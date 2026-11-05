@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <vector>
 
 namespace strata::kernels::xe {
 
@@ -63,6 +64,13 @@ template<class Name>
 int work_group_upto_1024_of(const sycl::queue& q) {
     const size_t m = std::min(max_work_group(q), kernel_work_group<Name>(q));
     return m >= 1024 ? 1024 : m >= 512 ? 512 : 256;
+}
+
+/// Whether the device runs sub-groups of `width` work-items (its sub_group_sizes, asked once a device).
+inline bool has_sub_group(const sycl::device& d, size_t width) {
+    static core::PerDevice<std::vector<size_t>> per_device;
+    const auto& s = per_device.get(d, [&d] { return d.get_info<sycl::info::device::sub_group_sizes>(); });
+    return std::find(s.begin(), s.end(), width) != s.end();
 }
 
 /// Whether `q`'s device runs FP64 kernels.

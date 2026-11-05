@@ -7,10 +7,12 @@
 // `gpu` and `gpulayer`), and tile/local-memory versions come once the values agree.
 
 #include "strata/image/hunyuanimage3_kernels.hpp"
+#include "strata/image/qi_kernels.hpp"
 
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/kernels/rows_cols.hpp"
 
 #include <sycl/sycl.hpp>
@@ -183,63 +185,27 @@ void hunyuanimage3_qk_rope_norm16(const float* qkv, const float* wq, const float
                         uint16_t* k16, uint16_t* v16, void* stream) {
     if (T <= 0) return;
     const int64_t groups = q_heads / kv_heads;      // the reference's num_key_value_groups
-    const int64_t row = q_heads + 2 * kv_heads;     // one token's (q head | k head | v head) jobs
-    constexpr size_t local = 128;                   // one work-group a (token, head): head_dim 128 channels
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * row * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const int64_t job = (int64_t) it.get_group_linear_id();
-            const int64_t t = job / row, which = job % row;
-            const int64_t lane = (int64_t) it.get_local_linear_id();
-            // the file's order: [kv head][q head of that group, then k, then v][head_dim]
-            int64_t src = 0;
-            const float* w = nullptr;
-            uint16_t* dst = nullptr;
-            int64_t dst_head = 0;
-            if (which < q_heads) {
-                const int64_t kv = which / groups, g = which % groups;
-                src = (t * kv_heads + kv) * (groups + 2) + g;
-                w = wq;
-                dst = q16;
-                dst_head = which;
-            } else if (which < q_heads + kv_heads) {
-                const int64_t kv = which - q_heads;
-                src = (t * kv_heads + kv) * (groups + 2) + groups;
-                w = wk;
-                dst = k16;
-                dst_head = kv * groups;   // written to each of the q heads this KV head serves, below
-            } else {
-                const int64_t kv = which - q_heads - kv_heads;
-                src = (t * kv_heads + kv) * (groups + 2) + groups + 1;
-                dst = v16;
-                dst_head = kv * groups;
-            }
-            const float* x = qkv + src * head_dim;
-            if (which >= q_heads + kv_heads) {            // v: only the repeat
-                for (int64_t r = 0; r < groups; ++r) dst[((t * q_heads) + dst_head + r) * head_dim + lane] =
-                    f16_from_f32(x[lane]);
-                return;
-            }
-            float s = 0.f;
-            for (int64_t c = lane; c < head_dim; c += (int64_t) local) s += x[c] * x[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) head_dim + eps);
-            // The rope before the norm, as the reference does.  The rotation is orthogonal on each pair, so the
-            // head's sum of squares - the norm's denominator - is the same before and after it: reading it off
-            // `x` is the same number, to rounding.
-            const int64_t half = head_dim / 2;
-            const int64_t j = lane < half ? lane : lane - half;                // the pair's low column
-            const float a = x[lane], partner = x[lane < half ? lane + half : j];
-            // (the partner is the OTHER half of the pair: for the upper column that is `x[j]`, not `x[j + half]`, which
-            // is the column itself - written the second way, this kernel turned every head's upper 64 columns into
-            // a*(cos + sin) and cost the layer 6% of q, 63% of k: `probe stages`, B70 and the CPU golden, 2026-10-24)
-            const float c0 = sycl::cos(ang[t * (head_dim / 2) + j]), s0 = sycl::sin(ang[t * (head_dim / 2) + j]);
-            // rotate_half, the SAME angle for both halves, then the norm (the reference's order)
-            const float rot = lane < half ? a * c0 - partner * s0 : a * c0 + partner * s0;
-            const float val = rot * inv * w[lane];
-            const int64_t reps = which < q_heads ? 1 : groups;   // q has its own head; k serves `groups`
-            for (int64_t r = 0; r < reps; ++r)
-                dst[((t * q_heads) + dst_head + r) * head_dim + lane] = f16_from_f32(val);
-        });
+    // the file's order: [kv head][q head of that group, then k, then v][head_dim]
+    struct In {
+        const float* qkv;
+        int64_t kv_heads, groups, hd;
+        float at(int which, int64_t t, int64_t h, int64_t d) const {
+            const int64_t kv = which == 0 ? h / groups : h;
+            const int64_t slot = which == 0 ? h % groups : which == 1 ? groups : groups + 1;
+            return qkv[((t * kv_heads + kv) * (groups + 2) + slot) * hd + d];
+        }
+    };
+    // rotate_half with the SAME angle for both halves, then the norm (the reference's order): the rotation is
+    // orthogonal on each pair, so the head's sum of squares - the norm's denominator - is the same before and after
+    // it.  k and v written to each of the q heads their KV head serves.
+    kernels::qk::Shape sh{T, q_heads, kv_heads, head_dim};
+    sh.wq = wq;
+    sh.wk = wk;
+    sh.eps = eps;
+    sh.rope_first = true;
+    const auto e = kernels::qk::qk_norm_rope(queue_for(stream), sh, In{qkv, kv_heads, groups, head_dim},
+                                             kernels::qk::Angles{ang, head_dim / 2},
+                                             kernels::qk::Rows16{q16, k16, v16, q_heads, q_heads, head_dim, groups});
     finish(stream, e, "hunyuanimage3_qk_rope_norm16");
 }
 
@@ -408,30 +374,11 @@ void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream, 
 
 void hunyuanimage3_im2col16(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows,
                             uint16_t* col16, void* stream) {
-    if (rows <= 0) return;
-    if (C % 8 != 0) throw std::runtime_error("hunyuanimage3_im2col16: C is not a multiple of 8");
-    const int64_t C8 = C / 8;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c8 = (i % C8) * 8, rk = i / C8, r = rk / 9, tap = rk - r * 9;
-        const int64_t p = p0 + r, x = p % W, y = p / W;
-        const int64_t yy = y + tap / 3 - 1, xx = x + tap % 3 - 1;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (yy >= 0 && yy < H && xx >= 0 && xx < W)
-            v = *reinterpret_cast<const V*>(in16 + (yy * W + xx) * C + c8);
-        *reinterpret_cast<V*>(col16 + (r * 9 + tap) * C + c8) = v;
-    });
-    finish(stream, e, "hunyuanimage3_im2col16");
+    qi_im2col16(in16, 1, H, W, C, 1, 3, 1, 1, H, W, p0, rows, col16, stream);
 }
 
 void hunyuanimage3_bias_add32(float* y, const float* b, int64_t rows, int64_t N, void* stream) {
-    if (rows <= 0 || N <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * N)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % N];
-    });
-    finish(stream, e, "hunyuanimage3_bias_add32");
+    qi_bias_add(y, b, rows, N, stream);
 }
 
 int64_t hunyuanimage3_group_ws_floats(int64_t P) {

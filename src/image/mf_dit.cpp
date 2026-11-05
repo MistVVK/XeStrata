@@ -43,7 +43,6 @@ using namespace dit_rows;
 
 // kTypeW8: int8 rows rotated as qi_rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8, kTypeF32 = 32;
-constexpr float kEps = 1e-6f;
 
 template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
     T* p = nullptr;
@@ -61,24 +60,6 @@ void release(std::vector<void*>& owned, void* p) {
     gpu::free(p);
 }
 
-// LayerNorm(x[t]) (no affine, eps 1e-6) * (1 + scale) + shift
-struct LnMod {
-    const float *x, *shift, *scale;
-    int64_t C;
-    template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
-        const float* r = x + t * C;
-        float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += r[c];
-        const float mean = reduce(s) / (float) C;
-        float v = 0.f;
-        for (int64_t c = lane; c < C; c += step) v += (r[c] - mean) * (r[c] - mean);
-        return {mean, 1.f / sycl::sqrt(reduce(v) / (float) C + kEps)};
-    }
-    float value(int64_t t, int64_t c, const Stats& st) const {
-        return (x[t * C + c] - st.mean) * st.inv * (1.f + scale[c]) + shift[c];
-    }
-};
-
 // GELU (tanh form) of x
 struct Gelu {
     MfOut x;
@@ -91,78 +72,6 @@ struct Gelu {
     // at most one step larger, which costs FP16 nothing)
     float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }
 };
-
-// For each row and head: q and k RMS-normed over the head (weights wq, wk; eps 1e-6) and rotated pairwise (2j, 2j + 1)
-// by cos[t][j], sin[t][j] (rope false: not rotated), v divided by its head's scale; FP16 out
-struct QkRope {
-    MfOut q, k, v;
-    const float *wq, *wk, *cos, *sin;
-    bool rope;
-    const float* hs;
-    int64_t T, heads, hd;
-    uint16_t *q16, *k16, *v16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t i = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        if (i >= T * heads) return;
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * heads * hd + c0, half = hd / 2;
-        const auto lane = static_cast<int64_t>(sg.get_local_linear_id());
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + 2 * j), b = src.at(t, c0 + 2 * j + 1);
-                ss += a * a + b * b;
-            }
-            const float r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + kEps);
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + 2 * j) * r * w[2 * j], b = src.at(t, c0 + 2 * j + 1) * r * w[2 * j + 1];
-                const float c = rope ? cos[t * half + j] : 1.f, sn = rope ? sin[t * half + j] : 0.f;
-                dst[2 * j] = f16_from_f32(a * c - b * sn);
-                dst[2 * j + 1] = f16_from_f32(a * sn + b * c);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = lane; d < hd; d += kSG) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
-void qk_rope_v16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk, const float* cos,
-                 const float* sin, bool rope, const float* hs, int64_t T, int64_t heads, int64_t hd, uint16_t* q16,
-                 uint16_t* k16, uint16_t* v16, void* s) {
-    if (T <= 0) return;
-    sycl::queue& qu = q_of(s);
-    if (has_sg32(qu)) {
-        qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T * heads + kRows - 1) / kRows * kRows * kSG)),
-                                          sycl::range<1>((size_t) (kRows * kSG))),
-                        QkRope{q, k, v, wq, wk, cos, sin, rope, hs, T, heads, hd, q16, k16, v16});
-        return;
-    }
-    const int64_t C = heads * hd, half = hd / 2;
-    qu.parallel_for(sycl::range<1>((size_t) (T * heads)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * C + c0;
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t d = 0; d < hd; ++d) ss += src.at(t, c0 + d) * src.at(t, c0 + d);
-            const float r = 1.f / sycl::sqrt(ss / (float) hd + kEps);
-            for (int64_t j = 0; j < half; ++j) {
-                const float a = src.at(t, c0 + 2 * j) * r * w[2 * j], b = src.at(t, c0 + 2 * j + 1) * r * w[2 * j + 1];
-                const float c = rope ? cos[t * half + j] : 1.f, sn = rope ? sin[t * half + j] : 0.f;
-                dst[2 * j] = f16_from_f32(a * c - b * sn);
-                dst[2 * j + 1] = f16_from_f32(a * sn + b * c);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = 0; d < hd; ++d) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    });
-}
 
 // y[n] = x . w[n] + b[n]: w N rows of Q8_0 blocks (K / 32 of them, 34 bytes: an FP16 scale and 32 int8 values),
 // x FP32; a work-group of 32 a row, reading it as 16-bit words, neighbouring items neighbouring words (a row of 3072
@@ -201,14 +110,6 @@ void f32_vec(const float* w, const float* x, const float* b, float* y, int64_t N
         for (int64_t k = lane; k < K; k += local) acc += row[k] * x[k];
         acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
         if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
-    });
-}
-
-// p's n bf16 values rewritten in place as FP16, saturated at FP16's largest (a weight past it is not Mage-Flow's)
-void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = kernels::f32_from_bf16(p[id[0]]);
-        p[id[0]] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
     });
 }
 
@@ -1220,7 +1121,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
         modulation(tsil, b.tmod, base, mod_t_, f(b.b_tmod));
         // q, k, v of the image rows and of the text rows
         rows16(LnMod{img_, mod_i_, mod_i_ + C, C}, R, C, h16_, rs_, s_);
-        // (the products' sums are scaled by their readers, head_max and qk_rope_v16)
+        // (the products' sums are scaled by their readers, head_max and qk_rope16)
         const MfOut q = product(h16_, rs_, b.q, base, q_, R, f(b.b_q), false, true);
         const MfOut k = product(h16_, rs_, b.k, base, k_, R, f(b.b_k), b.q.type == kTypeW8, true);
         const MfOut v = product(h16_, rs_, b.v, base, v_, R, f(b.b_v), b.k.type == kTypeW8, true);
@@ -1235,10 +1136,10 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
             const MfOut vi = v.from(i * HW);
             head_max(tv.from(r0), Lt, vi, HW, heads_, hd_, vpart_, s_);
             head_scale(vpart_, Lt + HW, heads_, hs_ + i * heads_, s_);
-            qk_rope_v16(tq.from(r0), tk.from(r0), tv.from(r0), f(b.ntq), f(b.ntk), nullptr, nullptr, false,
-                        hs_ + i * heads_, Lt, heads_, hd_, jq16_ + o, jk16_ + o, jv16_ + o, s_);
-            qk_rope_v16(q.from(i * HW), k.from(i * HW), vi, f(b.nq), f(b.nk), cos_, sin_, true, hs_ + i * heads_, HW,
-                        heads_, hd_, jq16_ + o + Lt * C, jk16_ + o + Lt * C, jv16_ + o + Lt * C, s_);
+            qk_rope16(tq.from(r0), tk.from(r0), tv.from(r0), f(b.ntq), f(b.ntk), nullptr, nullptr, hs_ + i * heads_,
+                      Lt, heads_, hd_, false, jq16_ + o, jk16_ + o, jv16_ + o, s_);
+            qk_rope16(q.from(i * HW), k.from(i * HW), vi, f(b.nq), f(b.nk), cos_, sin_, hs_ + i * heads_, HW, heads_,
+                      hd_, false, jq16_ + o + Lt * C, jk16_ + o + Lt * C, jv16_ + o + Lt * C, s_);
             // every row sees every key (the text rows too: Mage-Flow's joint attention has no mask), so all of
             // them go to the GPU maker's attention where there is one
             qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, Lt + HW, heads_, hd_, 0, jo16_, s_);

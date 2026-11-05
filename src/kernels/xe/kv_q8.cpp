@@ -77,8 +77,8 @@ void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
                     lane[t] = hv;
                     sycl::group_barrier(it.get_group());
                     if (t < KV_Q8_GROUP / 2) {
-                        const uint32_t w = lane[2 * t] | (lane[2 * t + 1] << 16);
-                        const long long at = row_id * head_dim + g * KV_Q8_GROUP;
+                        const uint32_t w = lane[2 * (size_t) t] | (lane[2 * (size_t) t + 1] << 16);
+                        const long long at = (long long) row_id * head_dim + (long long) g * KV_Q8_GROUP;
                         if (host.k_pool != nullptr) reinterpret_cast<uint32_t*>((is_v ? host.v_pool : host.k_pool) + at)[t] = w;
                         if (stage.k_pool != nullptr) reinterpret_cast<uint32_t*>((is_v ? stage.v_pool : stage.k_pool) + at)[t] = w;
                     }
@@ -108,8 +108,9 @@ void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
                 lane[t] = (uint32_t) (uint8_t) (int8_t) q;
                 sycl::group_barrier(it.get_group());
                 if (t < KV_Q8_GROUP / 4) {
-                    const uint32_t w = lane[4 * t] | (lane[4 * t + 1] << 8) | (lane[4 * t + 2] << 16) | (lane[4 * t + 3] << 24);
-                    const long long at = row_id * head_dim + g * KV_Q8_GROUP;
+                    const size_t i = 4 * (size_t) t;
+                    const uint32_t w = lane[i] | (lane[i + 1] << 8) | (lane[i + 2] << 16) | (lane[i + 3] << 24);
+                    const long long at = (long long) row_id * head_dim + (long long) g * KV_Q8_GROUP;
                     if (host.k_q != nullptr) reinterpret_cast<uint32_t*>((is_v ? host.v_q : host.k_q) + at)[t] = w;
                     if (stage.k_q != nullptr) reinterpret_cast<uint32_t*>((is_v ? stage.v_q : stage.k_q) + at)[t] = w;
                 }

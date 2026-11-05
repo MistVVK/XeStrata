@@ -66,39 +66,6 @@ void release(std::vector<void*>& owned, void* p) {
 
 float silu(float x) { return x / (1.f + std::exp(-x)); }
 
-// col16[r][(dy * 3 + dx) * C + c] = in16[y + dy - 1][x + dx - 1][c] (0 outside), pixel p0 + r = y * W + x; C a
-// multiple of 8
-void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
-             void* s) {
-    const int64_t C8 = C / 8;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
-        const int64_t p = p0 + r, y = p / W + kk / 3 - 1, x = p % W + kk % 3 - 1;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (y >= 0 && y < H && x >= 0 && x < W) v = *reinterpret_cast<const V*>(in16 + (y * W + x) * C + c8);
-        *reinterpret_cast<V*>(col16 + rk * C + c8) = v;
-    });
-}
-
-// the Flux2 VAE encoder's downsampling: col16[r][(dy * 3 + dx) * C + c] = in16[2 y + dy][2 x + dx][c] (0 past the
-// bottom and right edges: the 0, 1, 0, 1 padding before the 3 x 3 convolution of stride 2), output pixel p0 + r =
-// y * (W / 2) + x
-void im2col3_s2(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
-                void* s) {
-    const int64_t C8 = C / 8, Wo = W / 2;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
-        const int64_t p = p0 + r, y = 2 * (p / Wo) + kk / 3, x = 2 * (p % Wo) + kk % 3;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (y < H && x < W) v = *reinterpret_cast<const V*>(in16 + (y * W + x) * C + c8);
-        *reinterpret_cast<V*>(col16 + rk * C + c8) = v;
-    });
-}
-
 // The group norm's statistics in one pass over x: chunks of kGnChunk pixels, a work-group a chunk whose lanes read
 // whole rows of channels (a lane one channel, R rows at a time: C R lanes), each lane its values' mean and squared
 // deviations, merged within each group (Chan's): part[(k kGroups + g) 3 + 0, 1, 2] = the count, the mean
@@ -228,20 +195,6 @@ void win_gather16(const float* qkv, int64_t H, int64_t W, int64_t C, int64_t wy,
         q16[i] = f16_from_f32(r[c]);
         k16[i] = f16_from_f32(r[C + c]);
         vt16[c * kWinTok + t] = f16_from_f32(r[2 * C + c]);
-    });
-}
-
-// p16[r] = softmax(scale sc[r]) over a row of n
-void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
-        const auto r = static_cast<int64_t>(id[0]);
-        const float* row = sc + r * n;
-        float m = -INFINITY;
-        for (int64_t j = 0; j < n; ++j) m = sycl::fmax(m, row[j] * scale);
-        float sum = 0.f;
-        for (int64_t j = 0; j < n; ++j) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sum;
-        for (int64_t j = 0; j < n; ++j) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
     });
 }
 
@@ -841,7 +794,7 @@ void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
         const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
         for (int64_t p0 = 0; p0 < HW; p0 += rows) {
             const int64_t n = std::min(rows, HW - p0);
-            im2col3(in16, H, W, c.in, p0, n, col16_, s_);
+            qi_im2col16(in16, 1, H, W, c.in, 1, 3, 1, 1, H, W, p0, n, col16_, s_);
             gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
         }
     }
@@ -852,7 +805,7 @@ void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, f
     const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
     for (int64_t p0 = 0; p0 < HWo; p0 += rows) {
         const int64_t n = std::min(rows, HWo - p0);
-        im2col3_s2(in16, H, W, c.in, p0, n, col16_, s_);
+        qi_im2col16(in16, 1, H, W, c.in, 1, 3, 2, 0, H / 2, W / 2, p0, n, col16_, s_);
         gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
     }
     if (c.b != nullptr) qi_bias_add(out, c.b, HWo, c.out, s_);
@@ -886,7 +839,7 @@ void MfVae::attention(const Attn& a, float* x, int64_t H, int64_t W) {
         for (int64_t wx = 0; wx * kWin < W; ++wx) {
             win_gather16(qkv, H, W, C_, wy, wx, q16, k16, vt16, s_);
             gemm_.f16(q16, k16, scores_, kWinTok, kWinTok, C_);
-            softmax16(scores_, kWinTok, kWinTok, 1.0f / std::sqrt((float) C_), p16, s_);
+            qi_softmax16(scores_, kWinTok, kWinTok, 1.0f / std::sqrt((float) C_), p16, s_);
             gemm_.f16(p16, vt16, ow, kWinTok, C_, kWinTok);
             win_scatter(ow, H, W, C_, wy, wx, o, s_);
         }

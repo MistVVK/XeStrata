@@ -39,8 +39,9 @@ set(STRATA_LICENSE contrib CACHE STRING "build mode: free or contrib")
 set_property(CACHE STRATA_LICENSE PROPERTY STRINGS free contrib)
 if(STRATA_LICENSE STREQUAL "contrib-icpx")
   message(FATAL_ERROR "STRATA_LICENSE=contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed; use "
-                      "-DSTRATA_LICENSE=contrib (contrib-llvm: intel/llvm, -DCMAKE_CXX_COMPILER=.tools/intel-llvm-contrib/"
-                      "install/bin/clang++ or .tools/intel-llvm/install/bin/clang++), or -DSTRATA_LICENSE=free")
+                      "-DSTRATA_LICENSE=contrib (contrib-llvm: intel/llvm, "
+                      "-DCMAKE_CXX_COMPILER=.tools/intel-llvm-contrib/install/bin/clang++ or "
+                      ".tools/intel-llvm/install/bin/clang++), or -DSTRATA_LICENSE=free")
 elseif(NOT STRATA_LICENSE MATCHES "^(free|contrib)$")
   message(FATAL_ERROR "STRATA_LICENSE=${STRATA_LICENSE}: free or contrib")
 endif()
@@ -122,8 +123,8 @@ message(STATUS "AMD architectures '${_strata_hip_archs}'")
 function(strata_utf8_manifest target)
   if(WIN32)
     # a .manifest source reaches only MSVC's link: clang's GNU driver passes the file to lld-link itself
-    set(_manifest "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/strata-utf8.manifest")
-    target_link_options(${target} PRIVATE "LINKER:/MANIFESTINPUT:${_manifest}")
+    set(manifest_path "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/strata-utf8.manifest")
+    target_link_options(${target} PRIVATE "LINKER:/MANIFESTINPUT:${manifest_path}")
   endif()
 endfunction()
 
@@ -928,9 +929,9 @@ if(STRATA_ENABLE_XE)
   endif()
   # NVIDIA GPUs (contrib-llvm): cuDNN's SDPA and the VAEs' convolutions through cudnn-frontend (Apache-2.0,
   # header-only, the tag pinned here), which opens cuDNN at run time (libcudnn.so.9, cudnn64_9.dll: the user's
-  # installation, not free software; without it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for Linux and Windows) are found under
-  # STRATA_CUDNN_ROOT, CUDNN_PATH or the CUDA toolkit's folder, outside a cross build's roots too; the build goes on
-  # without them.
+  # installation, not free software; without it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for
+  # Linux and Windows) are found under STRATA_CUDNN_ROOT, CUDNN_PATH or the CUDA toolkit's folder, outside a cross
+  # build's roots too; the build goes on without them.
   set(STRATA_CUDNN_ROOT "" CACHE PATH "cuDNN's folder (its include/cudnn.h), for the image attention on NVIDIA GPUs")
   if(_strata_cuda_archs AND STRATA_LICENSE STREQUAL "contrib")
     find_path(_strata_cudnn_inc cudnn.h NO_CACHE NO_CMAKE_FIND_ROOT_PATH

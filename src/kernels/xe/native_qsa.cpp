@@ -86,7 +86,7 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
             sycl::group_barrier(it.get_group());
             float partial = lane < BlockSize / 32 ? sums[lane] : 0.0f;
             partial = warp_sum(sg, partial);
-            const float mean = partial / n_cols;
+            const float mean = partial / static_cast<float>(n_cols);
             const float scale = sycl::rsqrt(mean + epsilon);
             Q81* blocks = static_cast<Q81*>(q8);
             for (std::size_t col = tid; col < std::size_t(n_cols); col += Threads) {
@@ -121,7 +121,7 @@ void norm_group(sycl::queue& q, const float* input, const float* gamma_all, floa
         float partial = 0.0f;
         for (std::size_t col = tid; col < std::size_t(n_cols); col += Threads) partial += in[col] * in[col];
         // the reduction's reads of the input precede its result, so the operation may run in place
-        const float scale = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), partial, sycl::plus<float>()) / n_cols +
+        const float scale = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), partial, sycl::plus<float>()) / (float) n_cols +
                                         epsilon);
         for (std::size_t col = tid; col < std::size_t(n_cols); col += Threads) {
             const float v = gamma ? scale * in[col] * gamma[col] : scale * in[col];
@@ -140,11 +140,7 @@ void norm_group(sycl::queue& q, const float* input, const float* gamma_all, floa
 // work-items a row in the block's arithmetic.  q8_1 out needs the 32-wide sub-groups (each block one's); the native
 // entry points stay pinned, the form their q8_1 and fused RoPE forms match bit for bit (rope_parity).
 bool sixteen_wide(const sycl::device& d) {
-    static core::PerDevice<bool> per_device;
-    return per_device.get(d, [&d] {
-        const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
-        return std::find(sgs.begin(), sgs.end(), (size_t) 16) != sgs.end();
-    });
+    return xe::has_sub_group(d, 16);
 }
 
 void launch_norm(sycl::queue& q, const float* input, const float* gamma, float* output, int n_cols, int n_rows,

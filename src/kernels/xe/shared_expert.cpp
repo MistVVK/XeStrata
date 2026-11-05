@@ -28,8 +28,6 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int WARP = 32;
-bool native_bf16 = false;
 
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
@@ -38,69 +36,10 @@ sycl::queue& queue_for(void* stream) {
 
 size_t round_up(size_t n, size_t b) { return (n + b - 1) / b * b; }
 
-// silu(gate) * up with the silu in DOUBLE, as ref/moe.py computes it (D: double where the device has FP64, float
-// elsewhere; device_caps.hpp)
-template <typename D>
-void swiglu_t(sycl::queue& q, const float* gate, const float* up, float* out, int n) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        const D x = (D) gate[i];
-        out[i] = (float) (x / ((D) 1 + sycl::exp(-x))) * up[i];
-    });
-}
-void swiglu(sycl::queue& q, const float* gate, const float* up, float* out, int n) {
-    if (xe::has_fp64(q)) swiglu_t<double>(q, gate, up, out, n);
-    else swiglu_t<float>(q, gate, up, out, n);
-}
-
 // ggml unary op_silu then the gated multiply, in FP32
 void native_swiglu(sycl::queue& q, const float* gate, const float* up, float* out, int n) {
     q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
         out[i] = gate[i] / (1.0f + sycl::exp(-gate[i])) * up[i];
-    });
-}
-
-template <typename D>
-inline D warp_sum_d(const sycl::sub_group& sg, D v) {
-    for (int off = 16; off > 0; off >>= 1) v += sycl::permute_group_by_xor(sg, v, off);
-    return sycl::group_broadcast(sg, v, 0);
-}
-
-// sigmoid(dot(x, w)) over BF16 operands, accumulated in double (float without FP64): one work-group of 256, then a
-// two-level warp sum
-template <typename D>
-void scalar_gate_t(sycl::queue& q, const uint16_t* x_bf16, const uint16_t* w_bf16, float* out, int n_embd) {
-    constexpr int GATE_THREADS = 256;
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<D, 1> scratch(sycl::range<1>(GATE_THREADS / WARP), h);
-        h.parallel_for(sycl::nd_range<1>(GATE_THREADS, GATE_THREADS),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int tid = (int) it.get_local_id(0);
-            D acc = 0;
-            for (int i = tid; i < n_embd; i += GATE_THREADS)
-                acc += (D) f32_from_bf16(x_bf16[i]) * (D) f32_from_bf16(w_bf16[i]);
-            sycl::group_barrier(it.get_group());
-            const int lane = tid & 31, warp = tid >> 5;
-            acc = warp_sum_d(sg, acc);
-            if (lane == 0) scratch[warp] = acc;
-            sycl::group_barrier(it.get_group());
-            constexpr int nw = GATE_THREADS / WARP;
-            if (warp == 0) {
-                acc = tid < nw ? scratch[tid] : (D) 0;
-                acc = warp_sum_d(sg, acc);
-                if (tid == 0) out[0] = (float) ((D) 1 / ((D) 1 + sycl::exp(-acc)));
-            }
-        });
-    });
-}
-void scalar_gate(sycl::queue& q, const uint16_t* x_bf16, const uint16_t* w_bf16, float* out, int n_embd) {
-    if (xe::has_fp64(q)) scalar_gate_t<double>(q, x_bf16, w_bf16, out, n_embd);
-    else scalar_gate_t<float>(q, x_bf16, w_bf16, out, n_embd);
-}
-
-void scale_rows(sycl::queue& q, float* out, const float* g, int n, int n_tok) {
-    q.parallel_for(sycl::range<2>((size_t) n_tok, (size_t) n), [=](sycl::id<2> id) {
-        out[id[0] * n + id[1]] *= g[id[0]];
     });
 }
 
@@ -124,10 +63,8 @@ void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n
 
 }  // namespace
 
-void shared_expert_set_native_bf16(bool enabled) { native_bf16 = enabled; }
-bool shared_expert_native_bf16() { return native_bf16; }
 
-bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
+bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {
     if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
@@ -161,20 +98,16 @@ bool shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
-    if (native_bf16 && g_ready) {
+    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    if (g_ready) {
         // the router's launch computed the raw gates
-    } else if (native_bf16 && batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
+    } else if (batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
     } else {
-        for (int t = 0; t < n_tok; ++t) {
-            if (native_bf16) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
-            else scalar_gate(q, x_bf16 + (size_t) t * n_embd, gate_inp_bf16, g + t, (int) n_embd);
-        }
+        for (int t = 0; t < n_tok; ++t) bf16_gemv_fp32_mmvf(x + (size_t) t * n_embd, gate_inp_bf16, g + t, n_embd, 1, stream);
     }
-    if (native_bf16 && gate_later) return true;                             // the combine scales the rows
-    if (native_bf16) sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);   // g holds the raw gates
-    else scale_rows(q, out, g, (int) n_embd, n_tok);                       // scalar_gate wrote the sigmoids
+    if (gate_later) return true;                             // the combine scales the rows
+    sigmoid_scale_rows(q, out, g, (int) n_embd, n_tok);      // g holds the raw gates
     return false;
 }
 
@@ -186,7 +119,7 @@ uint64_t shared_expert_scratch_bytes(int64_t n_ff) {
     return a * 2 + q0 + qk + 32;
 }
 
-void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* x_bf16, const SForm& gate_form,
+void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gate_form,
                    const uint8_t* gate_codes, const float* gate_scales, const float* gate_off,
                    const SForm& up_form, const uint8_t* up_codes, const float* up_scales, const float* up_off,
                    const SForm& down_form, const uint8_t* down_codes, const float* down_scales,
@@ -194,13 +127,11 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32,
                    const NativeSharedWeights* native) {
     if (n_embd <= 0 || n_ff <= 0) return;
-    const bool use_native = native_bf16;
     const bool native_gate = native && native->gate_data && native_mmvq_supported(native->gate_type);
     const bool native_up = native && native->up_data && native_mmvq_supported(native->up_type);
     const bool native_down = native && native->down_data && native_mmvq_supported(native->down_type);
     const bool native_projection = native_gate || native_up || native_down;
-    if ((use_native || native_gate || native_up) && !x_f32)
-        throw std::invalid_argument("shared_expert native input projection requires unrounded x_f32");
+    if (!x_f32) throw std::invalid_argument("shared_expert requires the unrounded x_f32 (its scalar gate reads it)");
     if (native_projection) {
         if (!native->q8_1 || !stream || n_embd > INT_MAX || n_ff > INT_MAX)
             throw std::invalid_argument("shared_expert native projections require scratch, stream and int32 dimensions");
@@ -218,15 +149,15 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     // Every step below is enqueued on the caller's queue without waiting; a null stream waits once at the end.
     void* s = &q;
 
-    uint8_t* p = (uint8_t*) scratch;
+    uint8_t* p = reinterpret_cast<uint8_t*>(scratch);
     const uint64_t a = round_up((uint64_t) n_ff * 4, 16);
     const uint64_t q0 = round_up((uint64_t) (n_ff / 32) * 34, 16);
     const uint64_t qk = round_up((uint64_t) (n_ff / 256) * 292, 16);
-    float* gate = (float*) p;
-    float* up = (float*) (p + a);
+    float* gate = reinterpret_cast<float*>(p);
+    float* up = reinterpret_cast<float*>(p + a);
     uint8_t* h_q8_0 = (uint8_t*) (p + a * 2);
     uint8_t* h_q8k = (uint8_t*) (p + a * 2 + q0);
-    float* g = (float*) (p + a * 2 + q0 + qk);
+    float* g = reinterpret_cast<float*>(p + a * 2 + q0 + qk);
 
     // which activation this projection wants, read from its own form (SForm::act_kind)
     auto gemv = [&](const SForm& f, const uint8_t* codes, const float* scales, const float* off,
@@ -245,8 +176,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         native_mmvq(native->up_type, native->up_data, native->q8_1, up, (int) n_embd, (int) n_ff, 1, s);
     else
         gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
-    if (native_projection) native_swiglu(q, gate, up, gate, (int) n_ff);
-    else swiglu(q, gate, up, gate, (int) n_ff);
+    native_swiglu(q, gate, up, gate, (int) n_ff);
 
     // down, with the intermediate quantized to the down weight's own activation contract
     if (native_down) {
@@ -261,13 +191,8 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     }
 
     // the per-token scalar gate, from the ORIGINAL hidden state, then the multiply
-    if (use_native) {
-        bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, s);
-        sigmoid_scale_rows(q, out, g, (int) n_embd, 1);
-    } else {
-        scalar_gate(q, x_bf16, gate_inp_bf16, g, (int) n_embd);
-        scale_rows(q, out, g, (int) n_embd, 1);
-    }
+    bf16_gemv_fp32_mmvf(x_f32, gate_inp_bf16, g, n_embd, 1, s);
+    sigmoid_scale_rows(q, out, g, (int) n_embd, 1);
     if (!stream) core::Runtime::get().finish(q);
 }
 

@@ -962,6 +962,7 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     // the largest dense weight, dequantized at once (Gemm::native slices past 2^25 values)
     b.gemm_elems = (int64_t) mtp_eh_.n_in * mtp_eh_.n_out;   // 0 without the MTP layer
     std::vector<const Block*> all;
+    all.reserve(blocks_.size() + 1);
     for (const Block& bl : blocks_) all.push_back(&bl);
     if (has_mtp_) all.push_back(&mtp_);
     for (const Block* bl : all)

@@ -64,4 +64,12 @@ void build_rope_table(int n_rot, const RopeScaling& scaling, int max_pos, float*
 void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
                      const float* sin_tab, const int* pos, void* stream);
 
+/// The LLMs' one RoPE (qk_norm_rope.hpp's kernel, the heads rotated only): T rows of `heads` heads of head_dim, a row
+/// ld_in floats apart in `x` and ld_out in `out` (in place where out is x), the first n_rot of each head rotated in
+/// pairs (i, i + n_rot / 2) at positions[t] (null: pos0 + t), Qwen3.8-Flash-Next's IMRoPE sections and the session's
+/// table where n_rot is 64, else the angle computed under `scaling`.  rope_neox_apply, native_rope_apply and the
+/// prompt's rope are this.
+void rope_rows(const float* x, float* out, int64_t T, int64_t heads, int head_dim, int64_t ld_in, int64_t ld_out,
+               int n_rot, const RopeScaling& scaling, const int* positions, int64_t pos0, void* stream);
+
 }  // namespace strata::kernels

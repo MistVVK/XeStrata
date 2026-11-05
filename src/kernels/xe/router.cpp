@@ -215,10 +215,10 @@ bool native_router_takes(int n_expert, int k) { return (n_expert == 512 || n_exp
 
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream, int n_expert) {
     require_shape(n_expert, "native router");
-    const size_t lb = (size_t) n_expert * 4;
-    if (!stream || !valid(logits, lb) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
-        || overlap(logits, lb, ids, 10 * 4) || overlap(logits, lb, weights, 10 * 4)
-        || overlap(ids, 10 * 4, weights, 10 * 4))
+    const size_t lb = (size_t) n_expert * 4, ob = 10 * sizeof(float);
+    if (!stream || !valid(logits, lb) || !valid(ids, ob) || !valid(weights, ob)
+        || overlap(logits, lb, ids, ob) || overlap(logits, lb, weights, ob)
+        || overlap(ids, ob, weights, ob))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
     launch_native_router_n(queue_for(stream, true), logits, ids, weights, 1, n_expert);
 }

@@ -34,6 +34,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "../kernels/xe/amd_wmma.hpp"
+#include "../kernels/xe/attn_parts.hpp"
+#include "../kernels/xe/device_caps.hpp"
 #include "../kernels/xe/device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_gdn_tc
 #include "strata/kernels/device_arch_tag.hpp"
@@ -57,11 +59,6 @@ constexpr int SHLD = S + 8;       // the split state's rows in local memory (hal
 constexpr int YLD = GCH + 8;      // the split Y / D rows (halves)
 constexpr int SLD = S + 4;        // the state's FP32 rows (floats)
 constexpr int XLD = GCH + 4;      // X^T, QS^T, D^T's FP32 rows (floats)
-
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-}
 
 template<typename A>
 inline auto at(const A& a, size_t off) {
@@ -519,27 +516,8 @@ struct GdnTcScan {
     }
 };
 
-// the scan's path for the device: 0-3 as Path<>, -1 none (as qi_attn.cpp's pick)
-int pick_path(const sycl::device& d) {
-    if (env_on("STRATA_NO_XMX")) return -1;
-    if (kernels::xe::amd_wmma(d)) return 3;
-    const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
-    struct Shape { int m, n, k, sg; };
-    const Shape shapes[] = {{8, 16, 16, 16}, {8, 8, 16, 8}, {16, 16, 16, 32}};
-    for (int i = 0; i < 3; ++i) {
-        const Shape& s = shapes[i];
-        if (std::find(sgs.begin(), sgs.end(), (size_t) s.sg) == sgs.end()) continue;
-        for (const auto& c : kernels::matrix_combinations(d)) {
-            const bool m = c.msize == (size_t) s.m || (c.msize == 0 && c.max_msize >= (size_t) s.m);
-            const bool n = c.nsize == (size_t) s.n || (c.nsize == 0 && c.max_nsize >= (size_t) s.n);
-            const bool k = c.ksize == (size_t) s.k || (c.ksize == 0 && c.max_ksize >= (size_t) s.k);
-            if (c.atype == mx::matrix_type::fp16 && c.btype == mx::matrix_type::fp16 &&
-                c.ctype == mx::matrix_type::fp32 && c.dtype == mx::matrix_type::fp32 && m && n && k)
-                return i;
-        }
-    }
-    return -1;
-}
+// the scan's path for the device: 0-3 as the attention's Path<> (attn_parts.hpp), -1 none
+int pick_path(const sycl::device& d) { return kernels::xe::attn::path(d); }
 
 // what a device runs: the path, the scan's sub-groups a work-group, the chunks a super-block and its scratch
 struct TcDev {
@@ -582,8 +560,7 @@ int scan_fit(sycl::queue& q) {
     const sycl::device d = q.get_device();
     const size_t local = d.get_info<sycl::info::device::local_mem_size>();
     const size_t wg = d.get_info<sycl::info::device::max_work_group_size>();
-    const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (Pr::LOCAL * 4 > local || (size_t) Pr::NT > wg || std::find(sgs.begin(), sgs.end(), (size_t) 32) == sgs.end())
+    if (Pr::LOCAL * 4 > local || (size_t) Pr::NT > wg || !kernels::xe::has_sub_group(d, 32))
         return 0;
     int nsg = 4;
     while (nsg > 1 && ((size_t) nsg * K::SG_BYTES > local || (size_t) nsg * K::SG > wg)) nsg /= 2;

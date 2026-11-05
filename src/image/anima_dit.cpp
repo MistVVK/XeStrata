@@ -79,24 +79,6 @@ std::string dotted(std::string s) {
     return s;
 }
 
-// LayerNorm(x[t]) (no affine, eps 1e-6) * (1 + scale) + shift
-struct LnMod {
-    const float *x, *shift, *scale;
-    int64_t C;
-    template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
-        const float* r = x + t * C;
-        float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += r[c];
-        const float mean = reduce(s) / (float) C;
-        float v = 0.f;
-        for (int64_t c = lane; c < C; c += step) v += (r[c] - mean) * (r[c] - mean);
-        return {mean, 1.f / sycl::sqrt(reduce(v) / (float) C + kEps)};
-    }
-    float value(int64_t t, int64_t c, const Stats& st) const {
-        return (x[t * C + c] - st.mean) * st.inv * (1.f + scale[c]) + shift[c];
-    }
-};
-
 // RMSNorm(x[t]) * w (eps 1e-6), times the row's factor where given (the T5 ids' weights)
 struct RmsW {
     const float *x, *w, *row;
@@ -131,152 +113,33 @@ struct GeluErf {
     float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }
 };
 
-// For each row and head: q and k RMS-normed over the head (wq, wk; eps 1e-6) and rotated in pairs (j, j + hd / 2) by
-// cos[t][j], sin[t][j], v divided by its head's scale; FP16 out (the self-attention's, MossDit's form)
-struct QkRope {
-    MfOut q, k, v;
-    const float *wq, *wk, *cos, *sin, *hs;
-    int64_t T, heads, hd;
-    uint16_t *q16, *k16, *v16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t i = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        if (i >= T * heads) return;
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * heads * hd + c0, half = hd / 2;
-        const auto lane = static_cast<int64_t>(sg.get_local_linear_id());
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + j), b = src.at(t, c0 + half + j);
-                ss += a * a + b * b;
-            }
-            const float r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + kEps);
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + j) * r * w[j], b = src.at(t, c0 + half + j) * r * w[half + j];
-                const float c = cos[t * half + j], sn = sin[t * half + j];
-                dst[j] = f16_from_f32(a * c - b * sn);
-                dst[half + j] = f16_from_f32(b * c + a * sn);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = lane; d < hd; d += kSG) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
-void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk, const float* cos,
-               const float* sin, const float* hs, int64_t T, int64_t heads, int64_t hd, uint16_t* q16, uint16_t* k16,
-               uint16_t* v16, void* s) {
-    if (T <= 0) return;
-    sycl::queue& qu = q_of(s);
-    if (has_sg32(qu)) {
-        qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T * heads + kRows - 1) / kRows * kRows * kSG)),
-                                          sycl::range<1>((size_t) (kRows * kSG))),
-                        QkRope{q, k, v, wq, wk, cos, sin, hs, T, heads, hd, q16, k16, v16});
-        return;
-    }
-    const int64_t C = heads * hd, half = hd / 2;
-    qu.parallel_for(sycl::range<1>((size_t) (T * heads)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * C + c0;
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t d = 0; d < hd; ++d) ss += src.at(t, c0 + d) * src.at(t, c0 + d);
-            const float r = 1.f / sycl::sqrt(ss / (float) hd + kEps);
-            for (int64_t j = 0; j < half; ++j) {
-                const float a = src.at(t, c0 + j) * r * w[j], b = src.at(t, c0 + half + j) * r * w[half + j];
-                const float c = cos[t * half + j], sn = sin[t * half + j];
-                dst[j] = f16_from_f32(a * c - b * sn);
-                dst[half + j] = f16_from_f32(b * c + a * sn);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = 0; d < hd; ++d) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    });
-}
-
 // A head-major copy for the library's products: row t's head h RMS-normed over the head (w; null: not normed) and
 // rotated in pairs (j, j + hd / 2) by cos[t][j], sin[t][j] (null: not rotated), into out [heads][Tp][hd] (rows past T
-// left as they are: zero), or with `rows` into out [T][heads hd] (the fused attention's layout).  A sub-group of 32 a row's head, its values read side by side (QkRope's form); a work-item a
-// row's head without sub-groups of 32.
-struct Heads16 {
-    MfOut x;
-    int64_t T, Tp, heads, hd;
-    const float *w, *cos, *sin;
-    uint16_t* out;
-    bool rows;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t i = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        if (i >= T * heads) return;
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, half = hd / 2;
-        const auto lane = static_cast<int64_t>(sg.get_local_linear_id());
-        uint16_t* dst = out + (rows ? t * heads + h : h * Tp + t) * hd;
-        float r = 1.f;
-        if (w != nullptr) {
-            float ss = 0.f;
-            for (int64_t j = lane; j < hd; j += kSG) ss += x.at(t, c0 + j) * x.at(t, c0 + j);
-            r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + kEps);
-        }
-        for (int64_t j = lane; j < half; j += kSG) {
-            float a = x.at(t, c0 + j) * r, b = x.at(t, c0 + half + j) * r;
-            if (w != nullptr) {
-                a *= w[j];
-                b *= w[half + j];
-            }
-            if (cos != nullptr) {
-                const float c = cos[t * half + j], sn = sin[t * half + j], a2 = a * c - b * sn;
-                b = b * c + a * sn;
-                a = a2;
-            }
-            dst[j] = f16_from_f32(sycl::clamp(a, -65504.f, 65504.f));
-            dst[half + j] = f16_from_f32(sycl::clamp(b, -65504.f, 65504.f));
-        }
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
+// left as they are: zero), or with `rows` into out [T][heads hd] (the fused attention's layout).  qk_norm_rope.hpp's kernel, the head's
+// values clamped to FP16's range.
 void heads16(const MfOut& x, int64_t T, int64_t Tp, int64_t heads, int64_t hd, const float* w, const float* cos,
              const float* sin, uint16_t* out, void* s, bool rows = false) {
     if (T <= 0) return;
-    sycl::queue& q = q_of(s);
-    if (has_sg32(q)) {
-        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T * heads + kRows - 1) / kRows * kRows * kSG)),
-                                         sycl::range<1>((size_t) (kRows * kSG))),
-                       Heads16{x, T, Tp, heads, hd, w, cos, sin, out, rows});
-        return;
-    }
-    q.parallel_for(sycl::range<1>((size_t) (T * heads)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, half = hd / 2;
-        uint16_t* dst = out + (rows ? t * heads + h : h * Tp + t) * hd;
-        float r = 1.f;
-        if (w != nullptr) {
-            float ss = 0.f;
-            for (int64_t d = 0; d < hd; ++d) ss += x.at(t, c0 + d) * x.at(t, c0 + d);
-            r = 1.f / sycl::sqrt(ss / (float) hd + kEps);
+    struct In {
+        MfOut x;
+        int64_t hd;
+        float at(int, int64_t t, int64_t h, int64_t d) const { return x.at(t, h * hd + d); }
+    };
+    struct Out {
+        uint16_t* out;
+        int64_t Tp, heads, hd;
+        bool rows;
+        void put(int, int64_t t, int64_t h, int64_t d, float v) const {
+            out[(rows ? t * heads + h : h * Tp + t) * hd + d] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
         }
-        for (int64_t j = 0; j < half; ++j) {
-            float a = x.at(t, c0 + j) * r, b = x.at(t, c0 + half + j) * r;
-            if (w != nullptr) {
-                a *= w[j];
-                b *= w[half + j];
-            }
-            if (cos != nullptr) {
-                const float c = cos[t * half + j], sn = sin[t * half + j], a2 = a * c - b * sn;
-                b = b * c + a * sn;
-                a = a2;
-            }
-            dst[j] = f16_from_f32(sycl::clamp(a, -65504.f, 65504.f));
-            dst[half + j] = f16_from_f32(sycl::clamp(b, -65504.f, 65504.f));
-        }
-    });
+    };
+    kernels::qk::Shape sh{T, heads, 0, hd};
+    sh.wq = w;
+    sh.values = false;
+    const In in{x, hd};
+    const Out o{out, Tp, heads, hd, rows};
+    if (cos != nullptr) kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::Tables{cos, sin, hd / 2}, o);
+    else kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::NoRope{}, o);
 }
 
 // out [T][C] = v's rows in FP16 (the fused attention's values)
@@ -295,57 +158,6 @@ void values_t16(const MfOut& v, int64_t T, int64_t Tp, int64_t heads, int64_t hd
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t t = i / (heads * hd), c = i - t * heads * hd, h = c / hd, d = c - h * hd;
         out[(h * hd + d) * Tp + t] = f16_from_f32(sycl::clamp(v.at(t, c), -65504.f, 65504.f));
-    });
-}
-
-// p16[r] = softmax(scale * s[r]) over the first n of its ld columns, the rest zero: a sub-group of 32 a row (kRows
-// rows a work-group), or without sub-groups of 32 a work-group of 256 a row
-struct Softmax16 {
-    const float* sc;
-    int64_t rows, n, ld;
-    float scale;
-    uint16_t* p16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t r = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        if (r >= rows) return;
-        const auto lane = static_cast<int64_t>(sg.get_local_linear_id());
-        const float* row = sc + r * ld;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += kSG) m = sycl::fmax(m, row[j]);
-        m = sycl::reduce_over_group(sg, m, sycl::maximum<float>()) * scale;
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += kSG) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(sg, sum, sycl::plus<float>());
-        uint16_t* out = p16 + r * ld;
-        for (int64_t j = lane; j < ld; j += kSG)
-            out[j] = j < n ? f16_from_f32(sycl::exp(row[j] * scale - m) * inv) : (uint16_t) 0;
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
-void softmax16(const float* sc, int64_t rows, int64_t n, int64_t ld, float scale, uint16_t* p16, void* s) {
-    sycl::queue& q = q_of(s);
-    if (has_sg32(q)) {
-        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((rows + kRows - 1) / kRows * kRows * kSG)),
-                                         sycl::range<1>((size_t) (kRows * kSG))),
-                       Softmax16{sc, rows, n, ld, scale, p16});
-        return;
-    }
-    constexpr size_t local = 256;
-    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
-                   [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * ld;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += local) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        for (int64_t j = lane; j < ld; j += local)
-            p16[r * ld + j] = j < n ? f16_from_f32(sycl::exp(row[j] * scale - m) * inv) : (uint16_t) 0;
     });
 }
 
@@ -433,14 +245,6 @@ void to_tokens(const float* in, int64_t HW, int64_t L, float* out, void* s) {
 
 // x[t] += y[t] (the adapter's residuals)
 void add_rows(float* x, const float* y, int64_t n, void* s) { qi_axpy(x, y, 1.0f, n, s); }
-
-// p's n bf16 values rewritten in place as FP16, saturated at FP16's largest
-void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = kernels::f32_from_bf16(p[id[0]]);
-        p[id[0]] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
-    });
-}
 
 uint16_t bf16_of(float f) {
     uint32_t u = 0;
@@ -1051,7 +855,7 @@ void AnimaDit::attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, con
     const float scale = 1.f / std::sqrt((float) hd);
     for (int64_t h = 0; h < heads; ++h) {
         gemm_.f16(qh16_ + h * Tq * hd, kv + h * Tp * hd, sc_, Tq, Tp, hd);
-        softmax16(sc_, Tq, Tk, Tp, scale, p16_, s_);
+        qi_softmax16(sc_, Tq, Tk, scale, p16_, s_, Tp);
         gemm_.f16(p16_, kv + heads * Tp * hd + h * hd * Tp, out + h * hd, Tq, hd, Tp, C);
     }
 }
@@ -1307,8 +1111,8 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
             dirty_[0] = HW;
             head_max(v.from(r0), HW, MfOut{}, 0, heads_, hd_, vpart_, s_);
             head_scale(vpart_, HW, heads_, hs_, s_);
-            qk_rope16(q.from(r0), k.from(r0), v.from(r0), f(b.sqn), f(b.skn), cos_, sin_, hs_, HW, heads_, hd_, jq16_,
-                      jk16_, jv16_, s_);
+            qk_rope16(q.from(r0), k.from(r0), v.from(r0), f(b.sqn), f(b.skn), cos_, sin_, hs_, HW, heads_, hd_, true,
+                      jq16_, jk16_, jv16_, s_);
             qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, false);
             rows16(Heads{jo16_, hs_, C, hd_}, HW, C, o16_ + r0 * C, rs_o_ + r0, s_);
         }

@@ -315,6 +315,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
             return false;
         }
         std::vector<const Block*> all;
+        all.reserve(blocks_.size() + 1);
         for (const Block& b : blocks_) all.push_back(&b);
         if (has_mtp_) {
             all.push_back(&mtp_);

@@ -38,10 +38,10 @@ void embedding_gather(const uint8_t* codes, const float* scales, const float* of
     if ((code_bits != 2 && code_bits != 4 && code_bits != 8) || group_elems <= 0)
         throw core::DeviceError("invalid packed embedding geometry");
     const auto event = queue_for(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> index) {
-        const int64_t i = index[0];
+        const int64_t i = static_cast<int64_t>(index[0]);
         const int per_byte = 8 / code_bits;
         const unsigned mask = (1u << code_bits) - 1u;
-        const int code = (codes[i / per_byte] >> ((i % per_byte) * code_bits)) & mask;
+        const int code = static_cast<int>((codes[i / per_byte] >> ((i % per_byte) * code_bits)) & mask);
         const float product = static_cast<float>(code + code_bias) * scales[i / group_elems];
         // This translation unit disables contraction to preserve the packed-row format's rounding.
         out[i] = product + (offsets ? offsets[i / group_elems] : 0.0f);
@@ -55,7 +55,7 @@ void gdn_gate(const float* alpha, const float* dt, const float* ssm_a, float* ga
     if (h_v <= 0 || n_tokens > std::numeric_limits<int64_t>::max() / h_v)
         throw core::DeviceError("invalid gate dimensions");
     const auto event = queue_for(stream).parallel_for(sycl::range<1>(n_tokens * h_v), [=](sycl::id<1> index) {
-        const int64_t i = index[0], h = i % h_v;
+        const int64_t i = static_cast<int64_t>(index[0]), h = i % h_v;
         const float x = alpha[i] + dt[h];
         gate[i] = (x > 20.0f ? x : sycl::log1p(sycl::exp(x))) * ssm_a[h];
     });

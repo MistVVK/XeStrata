@@ -35,6 +35,7 @@
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
+#include "device_caps.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -422,7 +423,7 @@ template<> struct Dec<11> {   // Q3_K: d (6-bit scale - 32) ((2-bit value | high
         Sub r;
         for (int k = 0; k < 8; ++k) {   // values 0-15 from qs[32n..] and hmask[0..], 16-31 from qs[32n + 16..]
             const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
-            const uint32_t q = ((uint32_t) get_int_b2(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+            const uint32_t q = ((uint32_t) get_int_b2(b->qs + (size_t) 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
             const uint32_t h = ((uint32_t) get_int_b2(b->hmask, l / 4) >> (4 * n + j)) & 0x01010101u;
             r.v[k] = (((q | (h << 2)) | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
         }
@@ -446,7 +447,7 @@ template<> struct Dec<10> {
         if (sb % 2 == 0) {
             for (int k = 0; k < 8; ++k) {
                 const int l = k < 4 ? 4 * k : 16 + 4 * (k - 4);
-                r.v[k] = ((uint32_t) get_int_b4(b->qs + 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
+                r.v[k] = ((uint32_t) get_int_b4(b->qs + (size_t) 32 * n, l / 4) >> (2 * j)) & 0x03030303u;
             }
             const float d = (float) b->dm[0];
             r.s0 = d * (float) (sc0 & 0x0F);
@@ -1078,14 +1079,12 @@ bool intel_layout_ok(sycl::queue& q) {
 int intel_shape_of(sycl::queue& q) {
     static core::PerDevice<int> per_device;
     return per_device.get(q.get_device(), [&q] {
-        const char* no = std::getenv("STRATA_NO_XMX");
-        if (no != nullptr && std::strtol(no, nullptr, 10) != 0) return 0;
+        if (no_xmx()) return 0;
         const sycl::device d = q.get_device();
-        const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
         const auto combos = matrix_combinations(d);
         for (int is = 1; is <= 2; ++is) {
             const size_t n = is == 1 ? 16 : 8;
-            if (std::find(sgs.begin(), sgs.end(), n) == sgs.end()) continue;
+            if (!xe::has_sub_group(d, n)) continue;
             bool rep = false;
             for (const auto& c : combos) {
                 const bool m = c.msize == 8 || (c.msize == 0 && c.max_msize >= 8);
@@ -1175,14 +1174,8 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
 #undef STRATA_MMQ_LAUNCH
 }
 
-bool env_on(const char* name) {
-    const char* v = std::getenv(name);
-    return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-}
-
 bool shape_reported(const sycl::device& d) {
-    const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sgs.begin(), sgs.end(), (size_t) SG) == sgs.end()) return false;
+    if (!xe::has_sub_group(d, (size_t) SG)) return false;
     for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == (size_t) TM || (c.msize == 0 && c.max_msize >= (size_t) TM);
         const bool n = c.nsize == (size_t) TN || (c.nsize == 0 && c.max_nsize >= (size_t) TN);
@@ -1229,7 +1222,7 @@ struct LayoutCheck {
 bool iq_mmq_usable(sycl::queue& q) {
     static core::PerDevice<bool> per_device;
     return per_device.get(q.get_device(), [&q] {
-        if (env_on("STRATA_NO_XMX")) return false;
+        if (no_xmx()) return false;
         const sycl::device d = q.get_device();
         const bool wmma = xe::amd_wmma(d);   // its int8 WMMA: the STRATA_IQ_MMQ_WMMA body
         if (!wmma && !shape_reported(d)) return intel_shape_of(q) != 0;   // Intel's XMX shapes (intel_body)

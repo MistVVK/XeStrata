@@ -202,7 +202,7 @@ struct Kernel {
             sycl::group_barrier(sg);
             for (int kk = 0; kk < D / TK; ++kk)
                 Ops::load(sg, qa[kk], sycl::address_space_cast<sycl::access::address_space::local_space,
-                                                                sycl::access::decorated::no>(qh + kk * TK), D);
+                                                                sycl::access::decorated::no>(qh + (size_t) kk * TK), D);
             sycl::group_barrier(sg);
         } else {
             for (int kk = 0; kk < D / TK; ++kk)

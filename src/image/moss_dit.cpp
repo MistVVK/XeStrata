@@ -188,76 +188,6 @@ struct HeadsI8 {
     float out(int64_t, int64_t, float v, float) const { return v; }
 };
 
-// For each row and head: q and k RMS-normed over the head (weights wq, wk; eps 1e-6) and rotated in pairs (j,
-// j + head_dim / 2) by cos[t][j], sin[t][j] (tables [T][head_dim / 2]), v divided by its head's scale; FP16 out
-struct QkRope {
-    MfOut q, k, v;
-    const float *wq, *wk, *cos, *sin, *hs;
-    int64_t T, heads, hd;
-    uint16_t *q16, *k16, *v16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t i = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        if (i >= T * heads) return;
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * heads * hd + c0, half = hd / 2;
-        const auto lane = static_cast<int64_t>(sg.get_local_linear_id());
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + j), b = src.at(t, c0 + half + j);
-                ss += a * a + b * b;
-            }
-            const float r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + kEps);
-            for (int64_t j = lane; j < half; j += kSG) {
-                const float a = src.at(t, c0 + j) * r * w[j], b = src.at(t, c0 + half + j) * r * w[half + j];
-                const float c = cos[t * half + j], sn = sin[t * half + j];
-                dst[j] = f16_from_f32(a * c - b * sn);
-                dst[half + j] = f16_from_f32(b * c + a * sn);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = lane; d < hd; d += kSG) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
-void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk, const float* cos,
-               const float* sin, const float* hs, int64_t T, int64_t heads, int64_t hd, uint16_t* q16, uint16_t* k16,
-               uint16_t* v16, void* s) {
-    if (T <= 0) return;
-    sycl::queue& qu = q_of(s);
-    if (has_sg32(qu)) {
-        qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T * heads + kRows - 1) / kRows * kRows * kSG)),
-                                          sycl::range<1>((size_t) (kRows * kSG))),
-                        QkRope{q, k, v, wq, wk, cos, sin, hs, T, heads, hd, q16, k16, v16});
-        return;
-    }
-    const int64_t C = heads * hd, half = hd / 2;
-    qu.parallel_for(sycl::range<1>((size_t) (T * heads)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / heads, h = i - t * heads, c0 = h * hd, o = t * C + c0;
-        for (int which = 0; which < 2; ++which) {
-            const MfOut& src = which == 0 ? q : k;
-            const float* w = which == 0 ? wq : wk;
-            uint16_t* dst = (which == 0 ? q16 : k16) + o;
-            float ss = 0.f;
-            for (int64_t d = 0; d < hd; ++d) ss += src.at(t, c0 + d) * src.at(t, c0 + d);
-            const float r = 1.f / sycl::sqrt(ss / (float) hd + kEps);
-            for (int64_t j = 0; j < half; ++j) {
-                const float a = src.at(t, c0 + j) * r * w[j], b = src.at(t, c0 + half + j) * r * w[half + j];
-                const float c = cos[t * half + j], sn = sin[t * half + j];
-                dst[j] = f16_from_f32(a * c - b * sn);
-                dst[half + j] = f16_from_f32(b * c + a * sn);
-            }
-        }
-        const float inv = 1.f / hs[h];
-        for (int64_t d = 0; d < hd; ++d) v16[o + d] = f16_from_f32(v.at(t, c0 + d) * inv);
-    });
-}
-
 // an edit's references beside a context (MossDit::set_refs): hs[h] = the larger of a context's and the references'
 // scale of head h, powers of two both
 void hs_max(float* hs, const float* other, int64_t heads, void* s) {
@@ -275,14 +205,6 @@ void ref_values(const uint16_t* v16, const float* from, const float* to, int64_t
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t h = (i % C) / hd;
         out[i] = f16_from_f32(f32_from_f16(v16[i]) * (from[h] / to[h]));
-    });
-}
-
-// p's n bf16 values rewritten in place as FP16, saturated at FP16's largest
-void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = kernels::f32_from_bf16(p[id[0]]);
-        p[id[0]] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
     });
 }
 
@@ -1369,8 +1291,8 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
         head_scale(vpart_, T, heads_, hs_, s_);
         const int64_t rk = (int64_t) cur_block_ * ref_rows_ * C;
         if (P > 0) hs_max(hs_, ref_hs_ + cur_block_ * heads_, heads_, s_);
-        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o + PO * C,
-                  jk16_ + o + PO * C, jv16_ + o + PO * C, s_);
+        qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, true,
+                  jq16_ + o + PO * C, jk16_ + o + PO * C, jv16_ + o + PO * C, s_);
         if (P > 0 && !kept) {
             gpu::copy_async(jk16_ + o, ref_k16_ + rk, (size_t) (P * C) * 2, s_);
             ref_values(ref_v16_ + rk, ref_hs_ + cur_block_ * heads_, hs_, P, heads_, hd_, jv16_ + o, s_);

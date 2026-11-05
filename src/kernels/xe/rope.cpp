@@ -11,6 +11,7 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_rope
@@ -18,6 +19,7 @@
 
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -129,25 +131,39 @@ void build_rope_table(int n_rot, const RopeScaling& sc, int max_pos, float* cos_
     }
 }
 
-// One work-item per row, as in the CUDA kernel: the tail copy and the rotation of a row never race.
+namespace {
+sycl::event rope_launch(sycl::queue& q, const float* x, float* out, int64_t T, int64_t heads, int head_dim,
+                        int64_t ld_in, int64_t ld_out, int n_rot, const qk::Rope& ang) {
+    qk::Shape sh{T, heads, 0, head_dim, n_rot};
+    sh.values = false;
+    sh.tail = x != out;
+    const qk::Rows32 rows{x, out, ld_in, ld_out, head_dim};
+    return qk::qk_norm_rope(q, sh, rows, ang, rows);
+}
+}  // namespace
+
+void rope_rows(const float* x, float* out, int64_t T, int64_t heads, int head_dim, int64_t ld_in, int64_t ld_out,
+               int n_rot, const RopeScaling& scaling, const int* positions, int64_t pos0, void* stream) {
+    if (T <= 0) return;
+    // Match pinned host-side float powf before device powf/trigonometry.
+    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
+    // the IMRoPE sections and the float64 angle table are Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over
+    // the whole head (llm-jp-4.1) computes its angles
+    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
+    const qk::Rope ang{n_rot == 64 ? mrope_table() : nullptr, tab.cos, tab.sin, tab.max_pos, n_rot / 2, theta_scale,
+                       scaling.type != RopeScalingType::None, scaling.kernel_args(n_rot), positions, pos0};
+    rope_launch(queue_for(stream), x, out, T, heads, head_dim, ld_in, ld_out, n_rot, ang);
+}
+
+// the session's table at every position (the image path's per-pair position)
 void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int n_rot, const float* cos_tab,
                      const float* sin_tab, const int* pos, void* stream) {
     if (rows <= 0 || n_rot <= 0) return;
     if (n_rot % 2 != 0 || n_rot > head_dim)
         throw core::DeviceError("rope_neox_apply: n_rot " + std::to_string(n_rot) + " must be even and <= head_dim " +
                                 std::to_string(head_dim));
-    const int32_t* mtab = mrope_table();
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) rows), [=](sycl::id<1> id) {
-        const int64_t r = (int64_t) id[0];
-        const int half = n_rot / 2;
-        const float* xr = x + r * head_dim;
-        float* orow = out + r * head_dim;
-        for (int d = n_rot; d < head_dim; ++d) orow[d] = xr[d];      // the PARTIAL rotation's untouched tail
-        for (int i = 0; i < half; ++i) {
-            const size_t toff = (size_t) mrope_pos(mtab, pos[r], i) * half;   // the image path's per-pair position
-            rope_neox_pair(xr[i], xr[half + i], cos_tab[toff + i], sin_tab[toff + i], orow[i], orow[half + i]);
-        }
-    });
+    const qk::Rope ang{mrope_table(), cos_tab, sin_tab, INT_MAX, n_rot / 2, 0.f, false, {}, pos, 0};
+    const auto e = rope_launch(queue_for(stream), x, out, rows, 1, head_dim, head_dim, head_dim, n_rot, ang);
     if (!stream) core::Runtime::get().wait(e, "rope_neox_apply");
 }
 
@@ -169,35 +185,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
         overlaps(positions, size_t(rows) * sizeof(int), x, bytes)) {
         throw std::invalid_argument("native RoPE buffers partially overlap");
     }
-    auto& q = queue_for(stream);
-    // Match pinned host-side float powf before device powf/trigonometry.
-    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
-    // the IMRoPE sections and the float64 angle table are Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over
-    // the whole head (llm-jp-4.1) computes its angles
-    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;
-    const int width = head_dim;
-    const bool scaled = scaling.type != RopeScalingType::None;
-    const RopeKernelArgs ka = scaling.kernel_args(n_rot);
-    const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
-    // one dimension: a prompt's rows (tokens x heads) pass the 65,535 a GPU's first dimension takes
-    q.parallel_for(sycl::range<1>((size_t) rows * (size_t) (width / 2)), [=](sycl::id<1> id) {
-        const int row = (int) (id[0] / (size_t) (width / 2)), pair = (int) (id[0] % (size_t) (width / 2));
-        const size_t start = size_t(row) * width;
-        if (pair >= n_rot / 2) {
-            if (x != out) {
-                out[start + 2 * pair] = x[start + 2 * pair];
-                out[start + 2 * pair + 1] = x[start + 2 * pair + 1];
-            }
-            return;
-        }
-        const int p = mrope_pos(mtab, positions[row], pair);
-        float c, s;
-        if (!rope_tab_cs(tab, p, pair, c, s))
-            rope_cos_sin((float) p * sycl::pow(theta_scale, float(pair)), scaled, ka, pair, c, s);
-        const float a = x[start + pair], b = x[start + pair + n_rot / 2];
-        out[start + pair] = a * c - b * s;
-        out[start + pair + n_rot / 2] = a * s + b * c;
-    });
+    rope_rows(x, out, rows, 1, head_dim, head_dim, head_dim, n_rot, scaling, positions, 0, stream);
 }
 
 bool native_norm_rope_usable(int head_dim, int n_rot) {

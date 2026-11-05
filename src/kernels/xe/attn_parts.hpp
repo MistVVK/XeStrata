@@ -6,6 +6,7 @@
 #pragma once
 
 #include "amd_wmma.hpp"
+#include "device_caps.hpp"
 #include "device_target.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -99,14 +100,13 @@ template<> struct Path<3> { using Ops = Wm; };
 // The form the device takes, from its matrix combinations and sub-group sizes; -1: none (no FP16 matrix engines, or
 // STRATA_NO_XMX=1)
 inline int path(const sycl::device& d) {
-    if (const char* v = std::getenv("STRATA_NO_XMX"); v != nullptr && std::strtol(v, nullptr, 10) != 0) return -1;
+    if (no_xmx()) return -1;
     if (amd_wmma(d)) return 3;
-    const auto sgs = d.get_info<sycl::info::device::sub_group_sizes>();
     struct S { int m, n, k, sg; };
     const S shapes[] = {{8, 16, 16, 16}, {8, 8, 16, 8}, {16, 16, 16, 32}};
     for (int i = 0; i < 3; ++i) {
         const S& s = shapes[i];
-        if (std::find(sgs.begin(), sgs.end(), (size_t) s.sg) == sgs.end()) continue;
+        if (!has_sub_group(d, (size_t) s.sg)) continue;
         for (const auto& c : matrix_combinations(d)) {
             const bool m = c.msize == (size_t) s.m || (c.msize == 0 && c.max_msize >= (size_t) s.m);
             const bool n = c.nsize == (size_t) s.n || (c.nsize == 0 && c.max_nsize >= (size_t) s.n);

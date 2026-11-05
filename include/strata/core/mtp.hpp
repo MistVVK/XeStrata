@@ -262,7 +262,6 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float* sh_scratch_ = nullptr;
-    uint16_t* x_bf16_ = nullptr;
     float* head_logits_ = nullptr;
     float* dummy_inj_ = nullptr;
     int64_t cap_ = 0, attn_scratch_floats_ = 0;

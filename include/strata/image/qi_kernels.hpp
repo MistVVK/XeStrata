@@ -157,8 +157,21 @@ void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_
 
 // --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
 
-/// y[t, :] += b, T rows of N.
-void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream);
+/// The image engine's one unfold for its convolutions: col16[r][(dt k k + dy k + dx) C + c] = in16[t + dt - 1][oy s + dy -
+/// pad][ox s + dx - pad][c] (0 outside), output pixel p0 + r = (t OH + oy) OW + ox, in16 [T][H][W][C], kt 1 or 3
+/// frames (3: the frames before and after, the 3D VAE's), k x k taps of stride s; C a multiple of 8.
+void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt, int k, int s, int pad,
+                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream);
+
+/// p16[r][:ld] = FP16(softmax(scale sc[r][:n])) and zero past n, rows ld apart (0: n), FP32 statistics: a sub-group
+/// of 32 a row up to 1,024 columns (8 rows a work-group), a work-group of 256 a row past them.  The image engine's one
+/// softmax (the VAEs' attention, Anima's).
+void qi_softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* stream, int64_t ld = 0);
+
+/// y[t, :N] += b (+ add[t, :], null: none), T rows of N, a row ldy apart (0: N); b null: nothing.  The image engine's
+/// one bias add (the DiTs', the VAEs', the vision readers').
+void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream, const float* add = nullptr,
+                 int64_t ldy = 0);
 
 /// y16 = LayerNorm(x) * w + b per row of C (eps), FP16 out.
 void qi_layer_norm16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps, uint16_t* y16,

@@ -236,7 +236,7 @@ struct Options {
     bool gr_fp32_activations = false;  // pinned CUDA single-token BF16 activation contract
     bool gr_native_mmvf = false;       // pinned projection reduction tree as well as FP32 inputs
     bool native_bf16 = false;          // SSM gates, router and indexer projections only
-    bool native_bf16_extra = false;    // PLE value and shared expert scalar gate
+    bool native_bf16_extra = false;    // PLE value
     bool native_ple_key = false;       // unchanged Q2_0 key and CUDA Q8_1 activations
     bool native_moe_combine = false;   // pinned fused CUDA weighted reduction
     bool native_gdn = false;          // pinned CUDA recurrence and preprocessing
@@ -598,7 +598,7 @@ void usage() {
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
                  "  --gr-native-mmvf      experimental pinned GR norm/projections; implies FP32 activations\n"
                  "  --native-bf16         experimental CUDA-oracle SSM/router/indexer BF16 projections\n"
-                 "  --native-bf16-extra   experimental CUDA-oracle PLE/shared gate BF16 projections\n"
+                 "  --native-bf16-extra   experimental CUDA-oracle PLE BF16 projections\n"
                  "  --native-ple-key      experimental native PLE key; requires --native-dense-gguf\n"
                  "  --native-moe-combine  experimental pinned CUDA routed/shared combination\n"
                  "  --native-gdn          experimental pinned CUDA GDN norms/gates/recurrence\n"
@@ -3024,7 +3024,7 @@ int main(int argc, char** argv) {
             }
         };
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-        const bool on = o.serve && multi_gpu && split_devs.size() == 1 && !(ae != nullptr && std::atoi(ae) == 0) &&
+        const bool on = o.serve && multi_gpu && split_devs.size() == 1 && !(ae != nullptr && std::strtol(ae, nullptr, 10) == 0) &&
                         !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && !helpers && xe2(0) && xe2(split_devs[0]);
         o.pipeline_windows = on ? 2 : 0;
         if (on)
@@ -4360,7 +4360,6 @@ int main(int argc, char** argv) {
     strata::core::layer_set_native_bf16(o.native_bf16);
     strata::core::layer_set_native_flash_attn_short(o.native_flash_attn_short);
     strata::kernels::ple_set_native_bf16(o.native_bf16_extra);
-    strata::kernels::shared_expert_set_native_bf16(o.native_bf16_extra);
     strata::kernels::native_moe_combine_set_enabled(o.native_moe_combine);
     strata::kernels::native_gdn_set_enabled(o.native_gdn);
     strata::kernels::native_router_set_enabled(o.native_router);
@@ -9980,6 +9979,8 @@ int main(int argc, char** argv) {
             struct Blk { int b = 0, f = 0, n = 0, keep = 1; };
             Blk blks[strata::kernels::kVerifyMaxT];
             int nb = 0;
+            // batch_launch_rows took at most kVerifyMaxT rows, what blks and outb hold
+            if (G.S > strata::kernels::kVerifyMaxT) return false;
             std::vector<int> keep(bs.size(), 1);
             for (int t = 0; t < G.S;) {
                 const int b = G.rows[t];
@@ -13955,8 +13956,8 @@ int main(int argc, char** argv) {
         // STRATA_SPEC_WATCH=<seconds> (diagnostics, off by default; upstream 4c3edf476): the serve watchdog for this
         // loop.  A run whose verify windows and prompt chunks stop beating for that long prints the stage it is in and
         // the stall report, then ends.
-        if (const char* sw = std::getenv("STRATA_SPEC_WATCH"); sw != nullptr && std::atoi(sw) > 0) {
-            const int limit = std::atoi(sw);
+        if (const char* sw = std::getenv("STRATA_SPEC_WATCH"); sw != nullptr && std::strtol(sw, nullptr, 10) > 0) {
+            const int limit = (int) std::strtol(sw, nullptr, 10);
             strata::core::progress().busy.store(true);
             std::thread([limit] {
                 strata::core::Progress& pr = strata::core::progress();

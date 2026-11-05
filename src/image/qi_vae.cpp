@@ -108,60 +108,12 @@ struct Rms16 {
 };
 
 // out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`): a sub-group of 32 a pixel, the
-// sum within it; where the GPU has no sub-groups of 32, a work-group a pixel and its sum over the work-group (through
-// local memory and barriers: RX 9060 XT 14.8 ms a call on average in a 1024 x 1024 decode)
+// sum within it (a work-group a pixel and its sum through local memory and barriers took the RX 9060 XT 14.8 ms a
+// call on average in a 1024 x 1024 decode)
 void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uint16_t* out16, void* s) {
-    sycl::queue& q = q_of(s);
-    static core::PerDevice<bool> sg32;
-    const bool by_sg = sg32.get(q.get_device(), [&q] {
-        const auto sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
-        return std::find(sizes.begin(), sizes.end(), (size_t) 32) != sizes.end();
-    });
-    if (by_sg) {
-        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + Rms16::PIX - 1) / Rms16::PIX * Rms16::LANES)),
-                                         sycl::range<1>((size_t) Rms16::LANES)),
-                       Rms16{x, g, HW, C, silu, out16});
-        return;
-    }
-    constexpr size_t local = 128;
-    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) HW * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto p = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* r = x + p * C;
-        float ss = 0.f;
-        for (int64_t c = lane; c < C; c += local) ss += r[c] * r[c];
-        const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) /
-                                           (float) C + 1e-12f);
-        for (int64_t c = lane; c < C; c += local) {
-            float v = r[c] * inv * g[c];
-            if (silu) v = v / (1.f + sycl::exp(-v));
-            out16[p * C + c] = f16_from_f32(v);
-        }
-    });
-}
-
-// col16[r][(dy * 3 + dx) * C + c] = in16[y + dy - 1][x + dx - 1][c] (0 outside), pixel p0 + r = y * W + x
-void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
-             void* s) {
-    // one dimension (a CUDA grid's second is capped at 65535 blocks: the rows of a band pass it), the channels fastest
-    const int64_t C8 = C / 8;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
-        const int64_t p = p0 + r, y = p / W + kk / 3 - 1, x = p % W + kk % 3 - 1;
-        sycl::vec<uint16_t, 8> v(0);
-        if (y >= 0 && y < H && x >= 0 && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in16 + (y * W + x) * C + c8);
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(col16 + (r * 9 + kk) * C + c8) = v;
-    });
-}
-
-// y[r][o] += b[o] (+ add[r][o])
-void bias_add(float* y, const float* b, const float* add, int64_t rows, int64_t O, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % O] + (add ? add[i] : 0.f);
-    });
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + Rms16::PIX - 1) / Rms16::PIX * Rms16::LANES)),
+                                           sycl::range<1>((size_t) Rms16::LANES)),
+                         Rms16{x, g, HW, C, silu, out16});
 }
 
 // out16 [2H][2W][C] = x [H][W][C], nearest
@@ -195,24 +147,6 @@ void split_qkv16(const float* qkv, int64_t HW, int64_t C, uint16_t* q16, uint16_
         q16[i] = f16_from_f32(qkv[p * 3 * C + c]);
         k16[i] = f16_from_f32(qkv[p * 3 * C + C + c]);
         vt16[c * HW + p] = f16_from_f32(qkv[p * 3 * C + 2 * C + c]);
-    });
-}
-
-// p16[r] = softmax(scale * s[r]) over n columns
-void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
-    constexpr size_t local = 256;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * n;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += local) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        for (int64_t j = lane; j < n; j += local) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
     });
 }
 
@@ -267,22 +201,6 @@ void rgba_tokens16(const float* rgba, int64_t HW, int64_t Cp, int64_t n, uint16_
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t p = i / Cp, c = i - p * Cp;
         out16[i] = f16_from_f32(c < n ? rgba[c * HW + p] * 2.f - 1.f : 0.f);
-    });
-}
-
-// col16[r][(dy * 3 + dx) * C + c] = in16[2y + dy][2x + dx][c] (0 past the bottom and right edges: the downsampler's
-// zero padding of one row and column there), output pixel p0 + r = y * (W / 2) + x
-void im2col3s2(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
-               void* s) {
-    const int64_t Wo = W / 2;
-    const int64_t C8 = C / 8;   // one dimension, as im2col3
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
-        const int64_t p = p0 + r, y = 2 * (p / Wo) + kk / 3, x = 2 * (p % Wo) + kk % 3;
-        sycl::vec<uint16_t, 8> v(0);
-        if (y < H && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in16 + (y * W + x) * C + c8);
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(col16 + (r * 9 + kk) * C + c8) = v;
     });
 }
 
@@ -556,11 +474,11 @@ void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
         const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
         for (int64_t p0 = 0; p0 < HW; p0 += rows) {
             const int64_t n = std::min(rows, HW - p0);
-            im2col3(in16, H, W, c.in, p0, n, col16_, s_);
+            qi_im2col16(in16, 1, H, W, c.in, 1, 3, 1, 1, H, W, p0, n, col16_, s_);
             gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
         }
     }
-    bias_add(out, c.b, nullptr, HW, c.out, s_);
+    qi_bias_add(out, c.b, HW, c.out, s_);
 }
 
 void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin) {
@@ -590,7 +508,7 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g,
     float* sc = t2_;
     gemm_.f16(q16, k16, sc, HW, HW, C);
     uint16_t* p16 = col16_;
-    softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
+    qi_softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, qkv, HW, C, HW);   // O = P . V (V^T's rows are V's columns)
     kernels::f32_to_f16_bulk(qkv, a16_, HW * C, s_);
     conv(proj, a16_, H, W, x, true);
@@ -780,10 +698,10 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
             const int64_t Ho = H / 2, Wo = W / 2, K = 9 * c, rows = std::max<int64_t>(1, col_cap_ / K);
             for (int64_t p0 = 0; p0 < Ho * Wo; p0 += rows) {
                 const int64_t n = std::min(rows, Ho * Wo - p0);
-                im2col3s2(a16_, H, W, c, p0, n, col16_, s_);
+                qi_im2col16(a16_, 1, H, W, c, 1, 3, 2, 0, H / 2, W / 2, p0, n, col16_, s_);
                 gemm_.f16(col16_, d.down.w, y + p0 * d.down.out, n, d.down.out, K);
             }
-            bias_add(y, d.down.b, nullptr, Ho * Wo, d.down.out, s_);
+            qi_bias_add(y, d.down.b, Ho * Wo, d.down.out, s_);
             x = y;
             fs = 2;
         }

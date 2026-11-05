@@ -13,6 +13,7 @@
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/rope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/rows_cols.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -197,7 +198,7 @@ void gr_mix_r(const float* R, const float* rs, const float* w, const float* g, f
         const int64_t i = (int64_t) id[0], t = i / N, d = i % N;
         float s = 0.0f;
         for (int c = 0; c < HC; ++c) {
-            const int64_t j = t * D + c * N + d;
+            const int64_t j = t * D + (int64_t) c * N + d;
             const float x = R[j] * rs[t * HC + c] * w[(int64_t) c * N + d];   // gr_norm's value, bit for bit
             s = sycl::fma(x, sigm(g[j]), s);
         }
@@ -1047,29 +1048,11 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
 
 // ---------------------------------------------------------------- QSA helpers
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream) {
-    const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / 64.0f);
-    const int32_t* mtab = strata::kernels::mrope_table();
-    const bool scaled = scaling.type != strata::kernels::RopeScalingType::None;
-    const strata::kernels::RopeKernelArgs ka = scaling.kernel_args(64);
-    const strata::kernels::RopeTab tab = strata::kernels::rope_table_for(scaling);
-    // one dimension: T x heads rows pass the 65,535 a GPU's first dimension takes
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * heads) * 32), [=](sycl::id<1> id) {
-        const int64_t row = (int64_t) id[0] / 32;   // t * heads + h
-        const int pair = (int) (id[0] % 32);       // 0..31
-        const int64_t t = row / heads, hh = row % heads;
-        float* p = x + t * ld + hh * dim;
-        const int rp = strata::kernels::mrope_pos(mtab, (int) (pos0 + t), pair);
-        float c, s;
-        if (!strata::kernels::rope_tab_cs(tab, rp, pair, c, s))
-            strata::kernels::rope_cos_sin((float) rp * sycl::pow(theta_scale, (float) pair), scaled, ka, pair, c, s);
-        const float a = p[pair], b = p[pair + 32];
-        p[pair] = a * c - b * s;
-        p[pair + 32] = a * s + b * c;
-    });
+    strata::kernels::rope_rows(x, x, T, heads, (int) dim, ld, ld, 64, scaling, nullptr, pos0, stream);
 }
 void split_q(const float* qf, float* q, int64_t T, void* stream) {
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * 24 * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
+        const int64_t i = (int64_t) id[0], t = i / ((int64_t) 24 * 256), h = (i / 256) % 24, d = i % 256;
         q[i] = qf[t * 24 * 512 + h * 512 + d];
     });
 }

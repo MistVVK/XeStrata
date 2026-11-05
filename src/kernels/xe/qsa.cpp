@@ -307,7 +307,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
     auto* vs = reinterpret_cast<uint64_t*>(v_scratch);
     const auto e = queue_for(stream).parallel_for(sycl::nd_range<1>(grid_for(cap_total, 256), 256), [=](sycl::nd_item<1> it) {
         const long long n_ids = (long long) step[kStepWidth];
-        const int per = head_dim / 4;                       // 4 halfs per 8-byte word
+        const int per = head_dim / 4;                       // 4 halves per 8-byte word
         const long long total = n_ids * kv_heads * per;
         const long long i = (long long) it.get_global_id(0);
         if (i >= total) return;

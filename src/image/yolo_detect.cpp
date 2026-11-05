@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -119,21 +120,6 @@ void letterbox(const uint8_t* rgba, int64_t W, int64_t H, int64_t nw, int64_t nh
             }
         }
         for (int k = 0; k < kInC; ++k) o[k] = f16_from_f32(k < 3 ? c[k] / 255.f : 0.f);
-    });
-}
-
-// col[r][(dy * k + dx) * C + c] = in[oy * s + dy - p][ox * s + dx - p][c] (0 outside), output pixel p0 + r = oy * OW
-// + ox; C a multiple of 8
-void im2col(const uint16_t* in, int64_t H, int64_t W, int64_t C, int k, int s, int p, int64_t OW, int64_t p0,
-            int64_t rows, uint16_t* col) {
-    const int64_t C8 = C / 8, kk2 = (int64_t) k * k;
-    queue().parallel_for(sycl::range<1>((size_t) (rows * kk2 * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t rk = i / C8, r = rk / kk2, kk = rk - r * kk2, c8 = (i - rk * C8) * 8;
-        const int64_t q = p0 + r, y = (q / OW) * s + kk / k - p, x = (q % OW) * s + kk % k - p;
-        sycl::vec<uint16_t, 8> v(0);
-        if (y >= 0 && y < H && x >= 0 && x < W) v = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(in + (y * W + x) * C + c8);
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(col + (r * kk2 + kk) * C + c8) = v;
     });
 }
 
@@ -390,7 +376,7 @@ bool YoloDetector::open(const std::string& path, std::string& err) {
             int index = -1, shortcut = 0;
             std::string from;
             es >> index >> L.mod >> from >> L.stride >> shortcut;
-            if (!es || index != (int) net.layers.size()) throw std::runtime_error(path + ": layer list entry: " += entry);
+            if (!es || index != (int) net.layers.size()) throw std::runtime_error(path + ": layer list entry: " + entry);
             L.shortcut = shortcut != 0;
             std::stringstream fs(from);
             for (std::string v; std::getline(fs, v, ',');) {
@@ -539,7 +525,7 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
         if (col == nullptr) col = net.pool.get<uint16_t>((size_t) (kColBytes / 2));
         for (int64_t p0 = 0; p0 < HW; p0 += rows) {
             const int64_t n = std::min(rows, HW - p0);
-            im2col(x.p, x.h, x.w, c.in, (int) c.k, (int) c.s, p, OW, p0, n, col);
+            qi_im2col16(x.p, 1, x.h, x.w, c.in, 1, (int) c.k, (int) c.s, p, OH, OW, p0, n, col, nullptr);
             gemm_.f16(col, c.w, y + p0 * c.outp, n, c.outp, K);
         }
         return false;

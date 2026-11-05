@@ -23,6 +23,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_mma_gemm
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "device_caps.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -84,7 +85,7 @@ inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
 }
 template<bool BF>
 inline void mma16816(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-    if constexpr (BF)
+    if constexpr (BF)   // NOLINT(bugprone-branch-clone): the asm strings differ (bf16, f16), which the check does not compare
         asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, "
                      "{%8, %9}, {%0, %1, %2, %3};"
                      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
@@ -453,8 +454,7 @@ sycl::event launch(sycl::queue& q, const E* X, const E* W, int64_t w_stride, flo
 }
 
 bool reported(const sycl::device& d, mx::matrix_type in, const Shape& s) {
-    const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sg.begin(), sg.end(), (size_t) s.sg) == sg.end()) return false;
+    if (!xe::has_sub_group(d, (size_t) s.sg)) return false;
     for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == (size_t) s.m || (c.msize == 0 && c.max_msize >= (size_t) s.m);
         const bool n = c.nsize == (size_t) s.n || (c.nsize == 0 && c.max_nsize >= (size_t) s.n);
@@ -613,7 +613,7 @@ bool mma_forced() {
 }
 
 bool mma_usable(const sycl::queue& q, bool bf16) {
-    static const bool off = env_on("STRATA_NO_XMX") && !mma_forced();
+    static const bool off = no_xmx() && !mma_forced();
     return !off && shape(q, bf16) >= 0;
 }
 

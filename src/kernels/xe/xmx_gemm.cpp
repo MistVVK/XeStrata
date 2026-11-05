@@ -22,6 +22,7 @@
 #include "device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_xmx_gemm
 #include "strata/kernels/device_arch_tag.hpp"
+#include "device_caps.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -193,9 +194,8 @@ sycl::event dispatch(sycl::queue& q, const E* X, const E* W, float* Y, int64_t T
 // accumulators, and 16-wide sub-groups, as the device (and the SYCL runtime) reports them.  Otherwise the products go
 // to dp4a_gemm.  STRATA_NO_XMX=1 forces that path, to compare the two.
 bool device_has_xmx(const sycl::device& d, mx::matrix_type in) {
-    if (const char* v = std::getenv("STRATA_NO_XMX"); v != nullptr && std::strtol(v, nullptr, 10) != 0) return false;
-    const auto sg = d.get_info<sycl::info::device::sub_group_sizes>();
-    if (std::find(sg.begin(), sg.end(), size_t(16)) == sg.end()) return false;
+    if (no_xmx()) return false;
+    if (!xe::has_sub_group(d, 16)) return false;
     for (const auto& c : matrix_combinations(d)) {
         const bool m = c.msize == TM || (c.msize == 0 && c.max_msize >= TM);
         const bool n = c.nsize == TN || (c.nsize == 0 && c.max_nsize >= TN);

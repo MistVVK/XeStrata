@@ -49,7 +49,7 @@ namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_att
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
 constexpr int Q8K_ELEMS_PER_BLOCK = 256;
 constexpr float RMS_EPS = 1e-6f;
-const std::string EMBEDDING_NAME = "token_embd.weight";
+constexpr const char* EMBEDDING_NAME = "token_embd.weight";
 // qwen4exp.attention.layer_norm_rms_epsilon, used for BOTH norms here
 /// A Q8_K buffer needs `n` a multiple of 256 and `n/256` blocks of 292 bytes.
 uint64_t q8k_bytes(int64_t n) { return (uint64_t) (n / Q8K_ELEMS_PER_BLOCK) * Q8K_BYTES_PER_BLOCK; }
@@ -405,7 +405,6 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
 // the rest, `ffn_up_shexp` Q2_0 on 13, and `ffn_down_shexp` is LEGACY in every layer (IQ4_NL/Q4_0/Q5_0/
 // Q8_0/Q2_0, `n_in` 640 so Q8_K is impossible).  So BOTH quantized images of the activation are produced
 // and each projection takes the one its own form asks for.
-f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     if (!w_sgate->native_data || !w_sup->native_data) {
         quantize_q8_K(x, b.x_q8k, g.n_embd, stream);
         quantize_q8_0(x, b.x_q8_0, g.n_embd, stream);
@@ -418,7 +417,7 @@ f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
     native.q8_1 = w_sgate->native_q8_1 ? w_sgate->native_q8_1 :
                   w_sup->native_q8_1 ? w_sup->native_q8_1 : w_sdown->native_q8_1;
     try {
-        shared_expert(b.x_q8_0, b.x_q8k, b.x_bf16, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
+        shared_expert(b.x_q8_0, b.x_q8k, f_gate, p_gate.codes, p_gate.scales, p_gate.offset,
                       f_up, p_up.codes, p_up.scales, p_up.offset, f_down, p_down.codes, p_down.scales,
                       p_down.offset, (const uint16_t*) w_ginp->data, b.sh_scratch, b.shared,
                       g.n_embd, g.n_ff, /*tpr=*/32, stream, x, &native);
@@ -483,7 +482,7 @@ namespace {using strata::kernels::QsaIndexerBuffers;using strata::kernels::QsaSh
 QsaShapes qsa_shapes(const ModelGeometry& g) {    QsaShapes s = strata::kernels::qsa_real_shapes();    s.n_head = g.n_head;    s.n_head_kv = g.n_head_kv;    s.head_dim = g.head_dim;    s.idx_n_head = g.idx_q_heads;    s.idx_dim = g.idx_key_dim;    return s;}
 uint64_t align_up16(uint64_t n) { return (n + 15) & ~15ull; }
 /// One cursor over an arena, so every region is 16-byte aligned without a list of hand-added offsets.
-struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = (T*) (p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
+struct Cursor {    uint8_t* p;    uint64_t used = 0;    template <typename T>    T* take(uint64_t count) {        T* r = reinterpret_cast<T*>(p + used);        used = align_up16(used + count * sizeof(T));        return r;    }    uint8_t* take_bytes(uint64_t n) {        uint8_t* r = p + used;        used = align_up16(used + n);        return r;    }};
 // `TPR` and `gemv_quantized` live in the FIRST anonymous namespace, above, because `gdn_layer` needs the
 // dispatch too and the two must not be able to drift.
 }
@@ -656,7 +655,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
                            g_kv_int8 || g_kv_hybrid) + (uint64_t) 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + (uint64_t) 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
@@ -787,7 +786,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host = strata::kernels::KvHostPools{};
     if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
-        const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+        const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + (uint64_t) 4 * 256;
         uint8_t* h = nullptr;
         uint8_t* d = nullptr;
         if (!strata::gpu::alloc_host((void**) &h, bytes) ||

@@ -82,45 +82,6 @@ void rep_add(float* x, const float* tok, int64_t HW, int64_t O, int64_t I, void*
     });
 }
 
-// col16[r][tap * C + c] = in16[(t + dt, y + dy, x + dx)][c] (0 outside the tensor), output pixel p0 + r with its
-// linear (t, y, x) index, taps in (dt, dy, dx) order matching the weight packing below.  kt 3: the three time
-// taps with symmetric zero padding; kt 1: the CENTER tap only - a T = 1 tensor's other taps multiply padding
-// that is zero, which VAE.md measured as exactly 0.0 on the whole image path (and the loader keeps 1 / 3 of the
-// weights, 340 M of the 510 M numbers those twelve convolutions hold).  C a multiple of 8 (the vec8 unfold).
-void im2col3d(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int64_t kt, int64_t p0,
-              int64_t rows, uint16_t* col16, void* s) {
-    const int64_t C8 = C / 8, taps = kt * 9;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * taps * C8)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c8 = (i % C8) * 8, rk = i / C8, r = rk / taps, tap = rk - r * taps;
-        const int64_t p = p0 + r, x = p % W, y = (p / W) % H, t = p / (W * H);
-        const int64_t dt = kt == 3 ? tap / 9 - 1 : 0, dy = (tap % 9) / 3 - 1, dx = tap % 3 - 1;
-        const int64_t tt = t + dt, yy = y + dy, xx = x + dx;
-        using V = sycl::vec<uint16_t, 8>;
-        V v(0);
-        if (tt >= 0 && tt < T && yy >= 0 && yy < H && xx >= 0 && xx < W)
-            v = *reinterpret_cast<const V*>(in16 + ((tt * H + yy) * W + xx) * C + c8);
-        *reinterpret_cast<V*>(col16 + (r * taps + tap) * C + c8) = v;
-    });
-}
-
-// y [rows][O] += b[i % O] (contiguous)
-void bias_add(float* y, const float* b, int64_t rows, int64_t O, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % O];
-    });
-}
-
-// the same for a matrix written into wider rows: y [rows][ldy] at columns 0 .. O += b
-void bias_add_ld(float* y, const float* b, int64_t rows, int64_t O, int64_t ldy, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % O;
-        y[(i / O) * ldy + c] += b[c];
-    });
-}
-
 // The group norm's statistics are the kernels' (hunyuanimage3_group_part and -stats): deterministic as the golden's
 // comparisons need one.  The workspace they take is sized for the most positions one GroupNorm here can span.
 constexpr int64_t kMaxGnPositions = (int64_t) 256 * 256 * 256;   // 16.7 M positions
@@ -135,24 +96,6 @@ void split_qkv16(const float* qkv, int64_t P, int64_t C, uint16_t* q16, uint16_t
         q16[i] = f16_from_f32(qkv[p * 3 * C + c]);
         k16[i] = f16_from_f32(qkv[p * 3 * C + C + c]);
         vt16[c * P + p] = f16_from_f32(qkv[p * 3 * C + 2 * C + c]);
-    });
-}
-
-// p16[r][j] = FP16(softmax(scale * sc[r][:])) over the row, FP32 statistics (a work-group a row)
-void softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
-    constexpr size_t local = 256;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * n;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += local) sum += sycl::exp(row[j] * scale - m);
-        const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        for (int64_t j = lane; j < n; j += local) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
     });
 }
 
@@ -454,11 +397,11 @@ void HunyuanImage3Vae::conv(const Conv& c, const uint16_t* in16, int64_t T, int6
         const int64_t K = c.kt * 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
         for (int64_t p0 = 0; p0 < P; p0 += rows) {
             const int64_t n = std::min(rows, P - p0);
-            im2col3d(in16, T, H, W, c.in, c.kt, p0, n, col16_, s_);
+            qi_im2col16(in16, T, H, W, c.in, (int) c.kt, 3, 1, 1, H, W, p0, n, col16_, s_);
             gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
         }
     }
-    bias_add(out, c.b, P, c.out, s_);
+    qi_bias_add(out, c.b, P, c.out, s_);
 }
 
 // one GroupNorm(32, eps 1e-6) over P pixels of C channels and the swish after it (when `silu`), FP16 out
@@ -508,18 +451,18 @@ void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& a
     gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
     gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
     gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
-    bias_add_ld(qkv, aq.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + C, ak.b, P, C, 3 * C, s_);
-    bias_add_ld(qkv + 2 * C, av.b, P, C, 3 * C, s_);
+    qi_bias_add(qkv, aq.b, P, C, s_, nullptr, 3 * C);
+    qi_bias_add(qkv + C, ak.b, P, C, s_, nullptr, 3 * C);
+    qi_bias_add(qkv + 2 * C, av.b, P, C, s_, nullptr, 3 * C);
     uint16_t *q16 = a16_ + P * C, *k16 = a16_ + 2 * P * C, *vt16 = a16_ + 3 * P * C;
     split_qkv16(qkv, P, C, q16, k16, vt16, s_);
     gemm_.f16(q16, k16, scores_, P, P, C);
     uint16_t* p16 = col16_;
-    softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
+    qi_softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, tmp32_, P, C, P);   // O = P . V (V^T's rows are V's columns)
     kernels::f32_to_f16_bulk(tmp32_, a16_, P * C, s_);
     gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
-    bias_add(tmp32_, aproj.b, P, C, s_);
+    qi_bias_add(tmp32_, aproj.b, P, C, s_);
     hunyuanimage3_add(x, tmp32_, P * C, s_);
 }
 

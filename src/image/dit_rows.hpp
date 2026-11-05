@@ -12,8 +12,10 @@
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -127,16 +129,42 @@ inline float pow2_scale(float amax) {
     return amax > kRowLim ? sycl::exp2(sycl::ceil(sycl::log2(amax / kRowLim))) : 1.f;
 }
 
-inline bool has_sg32(sycl::queue& q) {
-    static core::PerDevice<bool> sg32;
-    return sg32.get(q.get_device(), [&q] {
-        const auto sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
-        return std::find(sizes.begin(), sizes.end(), (size_t) 32) != sizes.end();
+// a BF16 tensor's values as FP16, in place, clamped to FP16's range (the DiTs' 16-bit weights)
+inline void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
+    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float v = kernels::f32_from_bf16(p[id[0]]);
+        p[id[0]] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
     });
 }
 
+// q, k and v [T][heads hd] -> FP16 [T][heads][hd]: q and k RMS-normed over the head (wq, wk; eps 1e-6) and rotated in
+// pairs by cos[t][j], sin[t][j] (tables [T][hd / 2]; null: not rotated), (j, j + hd / 2) with `neox` (Qwen-Image's
+// heirs: MOSS-Image, Anima) or (2j, 2j + 1) (Mage-Flow); v divided by its head's scale hs (qk_norm_rope.hpp)
+inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk,
+                      const float* cos, const float* sin, const float* hs, int64_t T, int64_t heads, int64_t hd,
+                      bool neox, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s) {
+    if (T <= 0) return;
+    struct Heads {
+        MfOut q, k, v;
+        const float* hs;
+        int64_t hd;
+        float at(int which, int64_t t, int64_t h, int64_t d) const {
+            const int64_t c = h * hd + d;
+            return which == 0 ? q.at(t, c) : which == 1 ? k.at(t, c) : v.at(t, c) * (1.f / hs[h]);
+        }
+    };
+    kernels::qk::Shape sh{T, heads, heads, hd};
+    sh.wq = wq;
+    sh.wk = wk;
+    sh.neox = neox;
+    const Heads in{q, k, v, hs, hd};
+    const kernels::qk::Rows16 out{q16, k16, v16, heads, heads, hd};
+    if (cos != nullptr) kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::Tables{cos, sin, hd / 2}, out);
+    else kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::NoRope{}, out);
+}
+
 // A row-wise kernel writing FP16 with each row's scale: Op (LnMod, Gelu, Heads below) gives a row's statistics and its
-// values; a sub-group of 32 a row, 8 rows a work-group (or, without sub-groups of 32, a work-item a row).
+// values; a sub-group of 32 a row, 8 rows a work-group (every engine GPU has them: core/device.cpp).
 constexpr int64_t kSG = 32, kRows = 8;
 
 // the row's scale is taken from a bound of |op.value| where the op has a cheaper one than the value itself
@@ -170,25 +198,32 @@ template<class Op> struct Rows16 {
 template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16_t* y16, float* rs, void* s) {
     if (T <= 0) return;
     sycl::queue& q = q_of(s);
-    if (has_sg32(q)) {
-        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T + kRows - 1) / kRows * kRows * kSG)),
-                                         sycl::range<1>((size_t) (kRows * kSG))),
-                       Rows16<Op>{op, T, C, y16, rs});
-        return;
-    }
-    q.parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
-        const auto t = static_cast<int64_t>(id[0]);
-        const auto st = op.stats(t, 0, 1, [](float v) { return v; });
-        float m = 0.f;
-        for (int64_t c = 0; c < C; ++c) m = sycl::fmax(m, bound(op, t, c, st));
-        const float sc = pow2_scale(m), inv = 1.f / sc;
-        for (int64_t c = 0; c < C; ++c) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
-        rs[t] = sc;
-    });
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T + kRows - 1) / kRows * kRows * kSG)),
+                                     sycl::range<1>((size_t) (kRows * kSG))),
+                   Rows16<Op>{op, T, C, y16, rs});
 }
 
 struct Stats {
     float mean = 0.f, inv = 1.f;
+};
+
+// LayerNorm(x[t]) over the channels (no affine; eps 1e-6) * (1 + scale) + shift: the DiTs' modulated norm (rows16's
+// Op)
+struct LnMod {
+    const float *x, *shift, *scale;
+    int64_t C;
+    template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
+        const float* r = x + t * C;
+        float s = 0.f;
+        for (int64_t c = lane; c < C; c += step) s += r[c];
+        const float mean = reduce(s) / (float) C;
+        float v = 0.f;
+        for (int64_t c = lane; c < C; c += step) v += (r[c] - mean) * (r[c] - mean);
+        return {mean, 1.f / sycl::sqrt(reduce(v) / (float) C + 1e-6f)};
+    }
+    float value(int64_t t, int64_t c, const Stats& st) const {
+        return (x[t * C + c] - st.mean) * st.inv * (1.f + scale[c]) + shift[c];
+    }
 };
 
 // A W8A8 product's int8 input straight from a row-wise op, rotated and quantized as qi_rows_i8 quantizes FP16 rows
@@ -457,7 +492,7 @@ struct Heads {
 };
 
 // The per-head kernels below: a sub-group of 32 a row's head (its values read side by side, kSG apart), kRows heads a
-// work-group; a work-item a row's head without sub-groups of 32.
+// work-group.
 
 // part[r][h] = the largest |v| of row r's head h, rows of a ([na][C]) then b ([nb][C])
 struct HeadMax {
@@ -483,20 +518,9 @@ inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int
     const int64_t n = (na + nb) * heads;
     if (n <= 0) return;
     sycl::queue& q = q_of(s);
-    if (has_sg32(q)) {
-        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((n + kRows - 1) / kRows * kRows * kSG)),
-                                         sycl::range<1>((size_t) (kRows * kSG))),
-                       HeadMax{a, b, na, nb, heads, hd, part});
-        return;
-    }
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t r = i / heads, h = i - r * heads;
-        float m = 0.f;
-        for (int64_t d = 0; d < hd; ++d)
-            m = sycl::fmax(m, sycl::fabs(r < na ? a.at(r, h * hd + d) : b.at(r - na, h * hd + d)));
-        part[i] = m;
-    });
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((n + kRows - 1) / kRows * kRows * kSG)),
+                                     sycl::range<1>((size_t) (kRows * kSG))),
+                   HeadMax{a, b, na, nb, heads, hd, part});
 }
 
 // hs[h] = the scale of head h over the rows' part: a work-group a head, its items striding the rows
@@ -530,13 +554,7 @@ inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int6
 
 // y[t] += b (the weight's own bias, after a product whose output an OFT turned: a rotation of the weight's rows is
 // not one of its bias's)
-inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) {
-    if (T <= 0 || b == nullptr) return;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y[i] += b[i % N];
-    });
-}
+inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) { qi_bias_add(y, b, T, N, s); }
 
 // x[t] += gate * h[t] (per channel; gate null: 1)
 inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {

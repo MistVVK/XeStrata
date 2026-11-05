@@ -21,6 +21,11 @@ bool no_bf16_mma() {
     return v;
 }
 
+bool no_xmx() {
+    static const bool v = env_on("STRATA_NO_XMX");
+    return v;
+}
+
 std::vector<mx::combination> matrix_combinations(const sycl::device& d) {
     static const bool no_int8 = env_on("STRATA_NO_INT8_MMA");
     std::vector<mx::combination> out;

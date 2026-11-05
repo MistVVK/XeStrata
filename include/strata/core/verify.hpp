@@ -615,7 +615,6 @@ private:
     int32_t* one_ = nullptr;
     float* ple_key_ = nullptr;   ///< the window rows' PLE key and value projections (ple_batch)
     float* ple_val_ = nullptr;   ///< device 1: a one-token window's n_keep (it commits itself)
-    uint16_t* sh_bf16_ = nullptr;
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;

@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
 
     const long long n_embd = 256, n_ff = 64;      // small, so the host reference can be a plain loop
     const int tpr = 32;
-    std::mt19937 rng(77);
+    std::mt19937 rng(77);   // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
     std::normal_distribution<float> gauss(0.0f, 1.0f);
 
     // POSITIVE activations, so the sign of each projection is set by the sign of its weights.
@@ -123,19 +123,13 @@ int main(int argc, char** argv) {
     std::vector<float> ginp((size_t) n_embd);
     for (auto& v : ginp) v = gauss(rng) * 0.05f;
 
-    // THE SCALAR GATE'S TWO OPERANDS ARE BF16, because `ffn_gate_inp_shexp` is a BF16 weight and ggml converts
-    // the activation to the weight's `vec_dot_type`.  The reference therefore dots the bf16 IMAGES of both, not
-    // the originals - and the kernel is handed the same bf16 images.  Rounding both here rather than only on
-    // the device is what keeps the comparison honest: rounding one side alone would show up as a fixed offset
-    // in the gate and be blamed on the kernel.
-    std::vector<uint16_t> hx_bf16((size_t) n_embd), hginp_bf16((size_t) n_embd);
-    for (long long i = 0; i < n_embd; ++i) {
-        hx_bf16[(size_t) i] = strata::kernels::bf16_from_f32(fx[(size_t) i]);
-        hginp_bf16[(size_t) i] = strata::kernels::bf16_from_f32(ginp[(size_t) i]);
-    }
+    // The scalar gate's weight is BF16 (`ffn_gate_inp_shexp`) and its activation the unrounded x, as the native gate
+    // (bf16_gemv_fp32_mmvf) reads them: the reference dots the weight's bf16 image with x itself.
+    std::vector<uint16_t> hginp_bf16((size_t) n_embd);
+    for (long long i = 0; i < n_embd; ++i) hginp_bf16[(size_t) i] = strata::kernels::bf16_from_f32(ginp[(size_t) i]);
 
     // ---- host reference, exactly as ref/moe.py writes it
-    auto reference = [&](bool silu_on_up, bool elementwise_gate) {
+    auto reference = [&](bool silu_on_up, [[maybe_unused]] bool elementwise_gate) {
         std::vector<float> gp((size_t) n_ff, 0.0f), upp((size_t) n_ff, 0.0f);
         for (long long r = 0; r < n_ff; ++r) {
             double a = 0, b = 0;
@@ -177,19 +171,17 @@ int main(int argc, char** argv) {
         }
         double dot = 0;
         for (long long i = 0; i < n_embd; ++i)
-            dot += (double) strata::kernels::f32_from_bf16(hx_bf16[(size_t) i]) * (double) strata::kernels::f32_from_bf16(hginp_bf16[(size_t) i]);
+            dot += (double) fx[(size_t) i] * (double) strata::kernels::f32_from_bf16(hginp_bf16[(size_t) i]);   // the gate reads x unrounded
         const double sg = 1.0 / (1.0 + std::exp(-dot));
-        for (long long o = 0; o < n_embd; ++o) {
-            out[(size_t) o] = elementwise_gate ? (float) ((double) out[(size_t) o] * sg)
-                                               : (float) ((double) out[(size_t) o] * sg);
-        }
+        // the gate is one scalar per row, so an elementwise gate scales the row as the broadcast one does
+        for (long long o = 0; o < n_embd; ++o) out[(size_t) o] = (float) ((double) out[(size_t) o] * sg);
         return out;
     };
 
     // ---- device side
     uint16_t* d_x = nullptr;
     uint8_t* d_x_used = nullptr;   // the Q8_0 image the kernel now takes
-    uint16_t *d_xb = nullptr, *d_ginpb = nullptr;
+    uint16_t* d_ginpb = nullptr;
     uint8_t *d_gc = nullptr, *d_uc = nullptr, *d_dc = nullptr;
     float *d_gs = nullptr, *d_us = nullptr, *d_ds = nullptr, *d_ginp = nullptr, *d_out = nullptr;
     d_x = static_cast<decltype(d_x)>(strata::parity::alloc_bytes(hx.size() * sizeof(uint16_t)));
@@ -200,7 +192,6 @@ int main(int argc, char** argv) {
     d_us = static_cast<decltype(d_us)>(strata::parity::alloc_bytes(us.size() * sizeof(float)));
     d_ds = static_cast<decltype(d_ds)>(strata::parity::alloc_bytes(ds.size() * sizeof(float)));
     d_ginp = static_cast<decltype(d_ginp)>(strata::parity::alloc_bytes(ginp.size() * sizeof(float)));
-    d_xb = static_cast<decltype(d_xb)>(strata::parity::alloc_bytes(hx_bf16.size() * sizeof(uint16_t)));
     d_ginpb = static_cast<decltype(d_ginpb)>(strata::parity::alloc_bytes(hginp_bf16.size() * sizeof(uint16_t)));
     d_out = static_cast<decltype(d_out)>(strata::parity::alloc_bytes((size_t) n_embd * sizeof(float)));
     strata::parity::copy_bytes_in(d_x, hx.data(), hx.size() * sizeof(uint16_t));
@@ -211,7 +202,6 @@ int main(int argc, char** argv) {
     strata::parity::copy_bytes_in(d_us, us.data(), us.size() * sizeof(float));
     strata::parity::copy_bytes_in(d_ds, ds.data(), ds.size() * sizeof(float));
     strata::parity::copy_bytes_in(d_ginp, ginp.data(), ginp.size() * sizeof(float));
-    strata::parity::copy_bytes_in(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t));
     strata::parity::copy_bytes_in(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t));
 
     const strata::kernels::SForm f{2, -1, 64, strata::kernels::Codebook::Affine, false, /*act_kind=*/0};
@@ -220,8 +210,8 @@ int main(int argc, char** argv) {
     // reference here computed with the fp16 values, so the two agreed on a number the reference model would not
     // produce.  A fixture that agrees with the kernel about the wrong activation is not a check.
     hx0.assign((size_t) (n_embd / 32) * 34, 0);
+    float* d_xf = nullptr;   // x unrounded, as the layer passes it (the scalar gate reads it)
     {
-        float* d_xf = nullptr;
         uint8_t* d_x0 = nullptr;
         d_xf = static_cast<decltype(d_xf)>(strata::parity::alloc_bytes((size_t) n_embd * 4));
         d_x0 = static_cast<decltype(d_x0)>(strata::parity::alloc_bytes(hx0.size()));
@@ -235,8 +225,8 @@ int main(int argc, char** argv) {
     // layer does, so the test exercises the real contract instead of a private one.
     float* d_scratch = nullptr;
     d_scratch = static_cast<decltype(d_scratch)>(strata::parity::alloc_bytes(strata::kernels::shared_expert_scratch_bytes(n_ff)));
-    strata::kernels::shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
-                                   d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr);
+    strata::kernels::shared_expert(d_x_used, nullptr, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
+                                   d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, nullptr, d_xf);
     std::vector<float> got((size_t) n_embd);
     strata::parity::copy_bytes_out(got.data(), d_out, got.size() * sizeof(float));
 
@@ -323,34 +313,28 @@ int main(int argc, char** argv) {
         if (!in_range) ++bad;
     }
 
-    // Isolate the BF16 scalar gate: keep the quantized expert inputs fixed and vary only its F32/BF16
-    // activation. A zero scalar weight first exposes half the ungated output without duplicating the GEMVs.
+    // Isolate the BF16 scalar gate: keep the quantized expert inputs fixed and vary only its F32 activation. A zero
+    // scalar weight first exposes half the ungated output without duplicating the GEMVs.
     {
         using namespace strata::kernels;
         std::vector<uint16_t> zeros((size_t) n_embd, 0), basis(zeros);
         basis[0] = bf16_from_f32(1.0f);
         std::vector<float> witness((size_t) n_embd, 0.0f);
-        witness[0] = 1.00390625f;
-        std::vector<uint16_t> witness_bf16((size_t) n_embd, 0);
-        witness_bf16[0] = bf16_from_f32(witness[0]);
+        witness[0] = 1.00390625f;   // not a BF16 value: the gate reads x unrounded
         float* d_witness = nullptr;
         d_witness = static_cast<decltype(d_witness)>(strata::parity::alloc_bytes(witness.size() * sizeof(float)));
         strata::parity::copy_bytes_in(d_witness, witness.data(), witness.size() * sizeof(float));
-        auto run = [&](void* stream, const float* x_float = nullptr) {
-            shared_expert(d_x_used, nullptr, d_xb, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
+        auto run = [&](void* stream, const float* x_float) {
+            shared_expert(d_x_used, nullptr, f, d_gc, d_gs, nullptr, f, d_uc, d_us, nullptr, f,
                           d_dc, d_ds, nullptr, d_ginpb, d_scratch, d_out, n_embd, n_ff, tpr, stream, x_float);
         };
         strata::parity::copy_bytes_in(d_ginpb, zeros.data(), zeros.size() * sizeof(uint16_t));
-        run(nullptr);
-        std::vector<float> half_output((size_t) n_embd), legacy((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
+        run(nullptr, d_witness);
+        std::vector<float> half_output((size_t) n_embd), native((size_t) n_embd), replay((size_t) n_embd);
         strata::parity::copy_bytes_out(half_output.data(), d_out, half_output.size() * sizeof(float));
         strata::parity::copy_bytes_in(d_ginpb, basis.data(), basis.size() * sizeof(uint16_t));
-        strata::parity::copy_bytes_in(d_xb, witness_bf16.data(), witness_bf16.size() * sizeof(uint16_t));
-        run(nullptr);
-        strata::parity::copy_bytes_out(legacy.data(), d_out, legacy.size() * sizeof(float));
-        shared_expert_set_native_bf16(true);
         bool refused_missing = false;
-        try { run(nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
+        try { run(nullptr, nullptr); } catch (const std::invalid_argument&) { refused_missing = true; }
         if (!refused_missing) ++bad;
         namespace sx = sycl::ext::oneapi::experimental;
         auto& cq = strata::core::Runtime::get().compute();
@@ -366,29 +350,26 @@ int main(int argc, char** argv) {
             magnitude += std::fabs((double) expected);
         }
         const double rel = error / (magnitude > 1e-30 ? magnitude : 1e-30);
-        const double visible = rel_l1(native, legacy);
-        const bool correct = std::isfinite(rel) && rel < 2e-6 && visible > 1e-5 && refused_missing;
-        std::printf("  native shared scalar gate: %s (ref rel %.3e, BF16 separation %.3e, missing input %s)\n",
-                    correct ? "pass" : "FAIL", rel, visible, refused_missing ? "refused" : "FAIL");
+        const bool correct = std::isfinite(rel) && rel < 2e-6 && refused_missing;
+        std::printf("  shared scalar gate: %s (ref rel %.3e, missing input %s)\n", correct ? "pass" : "FAIL", rel,
+                    refused_missing ? "refused" : "FAIL");
         if (!correct) ++bad;
         sx::command_graph graph(cq.get_context(), cq.get_device());
         graph.begin_recording(cq);
         run(stream, d_witness);
         graph.end_recording(cq);
         auto executable = graph.finalize();
-        shared_expert_set_native_bf16(false);
         cq.ext_oneapi_graph(executable);
         strata::parity::sync();
         strata::parity::copy_bytes_out(replay.data(), d_out, replay.size() * sizeof(float));
         const bool captured = std::memcmp(native.data(), replay.data(), native.size() * sizeof(float)) == 0;
-        std::printf("  native shared captured selection: %s\n", captured ? "byte-identical" : "FAIL");
+        std::printf("  shared gate captured: %s\n", captured ? "byte-identical" : "FAIL");
         if (!captured) ++bad;
         strata::parity::copy_bytes_in(d_ginpb, hginp_bf16.data(), hginp_bf16.size() * sizeof(uint16_t));
-        strata::parity::copy_bytes_in(d_xb, hx_bf16.data(), hx_bf16.size() * sizeof(uint16_t));
-        run(nullptr);
+        run(nullptr, d_xf);
         strata::parity::copy_bytes_out(replay.data(), d_out, replay.size() * sizeof(float));
         const bool restored = std::memcmp(got.data(), replay.data(), got.size() * sizeof(float)) == 0;
-        std::printf("  restored shared default: %s\n", restored ? "byte-identical" : "FAIL");
+        std::printf("  the first call again: %s\n", restored ? "byte-identical" : "FAIL");
         if (!restored) ++bad;
     }
 
@@ -404,7 +385,7 @@ int main(int argc, char** argv) {
     // the kernel against the correct reference would pass against either.
     {
         const long long n_embd2 = 256, k2 = 10;
-        std::mt19937 rng2(31337);
+        std::mt19937 rng2(31337);   // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the inputs reproducible
         std::normal_distribution<float> g2(0.0f, 1.0f);
         std::vector<float> parts((size_t) (k2 * n_embd2)), w((size_t) k2), shared((size_t) n_embd2);
         for (auto& v : parts) v = g2(rng2);
@@ -452,7 +433,7 @@ int main(int argc, char** argv) {
 
         const double rel_k = rel_l1(want, got);
         std::printf("  %-42s rel %.3e\n", "moe_combine vs reference", rel_k);
-        // Both sides accumulate in double over the same k terms, so this is order-only.
+        // The kernel sums in FP32 (ggml's order), the reference in double: 10 terms, so FP32 rounding only.
         if (!(rel_k <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++bad; }
 
         // a null `shared` must mean "no shared expert", not "add nothing but leave it undefined"
