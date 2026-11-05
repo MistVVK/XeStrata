@@ -1680,8 +1680,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                                                   (uint64_t) (wemb->ne0 / (8 / wemb->code_bits)),
                                                   (uint64_t) (wemb->ne0 / wemb->group_elems), emb, m.cs);
         }
-        rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
-        to_f16(emb, en16, nb * Nn, m.cs);
+        kernels::rms_norm_rows(emb, w_ne, 1, emb, nullptr, (int) (Nn), (int) (nb), EPS, m.cs);
+        kernels::f32_to_f16_bulk(emb, en16, nb * Nn, m.cs);
         m.gemm.native(en16, mtp.tensor_q8_type("fc_embedding.weight"), w_fe, e2, nb, Nn, Nn);
         if (!strata::gpu::copy_async(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, m.cs)) {
             err = "prefill: the draft rows' copy failed";
@@ -1690,8 +1690,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         if (mtp.hnorm_per_stream())   // --mtp-hnorm stream: as the drafter's own pass (mtp.cpp)
             strata::kernels::native_qsa_rms_norm_grouped(hn, w_nh, hn, (int) Nn, (int) g.hc, (int) (nb * g.hc), EPS, m.cs);
         else
-            rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
-        to_f16(hn, hn16, nb * HCN, m.cs);
+            kernels::rms_norm_rows(hn, w_nh, 1, hn, nullptr, (int) (HCN), (int) (nb), EPS, m.cs);
+        kernels::f32_to_f16_bulk(hn, hn16, nb * HCN, m.cs);
         m.gemm.native(hn16, mtp.tensor_q8_type("fc_hidden.weight"), w_fh, h2, nb * g.hc, Nn, Nn);   // every stream through fc_hidden
         strata::kernels::add_streams_broadcast(h2, e2, Rm, Nn, (int) g.hc, (int) nb, m.cs);
         // the attention hyper-connection's read (its mixed input only: this pass writes nothing back)
@@ -1703,7 +1703,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         // K and V into the drafter's cache, as the prompt path's QSA layers append theirs
         m.gemm.native(mixed_h, mtp.tensor_q8_type("self_attn.k_proj.weight"), w_k, Kc, nb, KV, Nn);
         m.gemm.native(mixed_h, mtp.tensor_q8_type("self_attn.v_proj.weight"), w_v, Vc, nb, KV, Nn);
-        rms_rows(Kc, w_kn, nb * g.n_head_kv, g.head_dim, g.head_dim, EPS, m.cs);
+        kernels::rms_norm_rows(Kc, w_kn, 1, Kc, nullptr, (int) (g.head_dim), (int) (nb * g.n_head_kv), EPS, m.cs);
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, strata::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own pass stores them (mtp.cpp)
             strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
@@ -2412,7 +2412,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
                         if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, true);
                     } else {
-                        to_f16(emb, e16, nb * N, m.cs);
+                        kernels::f32_to_f16_bulk(emb, e16, nb * N, m.cs);
                         m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
                         to_bf16(emb, e16, nb * N, m.cs, e16_lo);
                     }
@@ -2541,7 +2541,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
+                    kernels::rms_norm_rows(m.Kc, (const float*) wkn->data, 1, m.Kc, nullptr, 256, (int) (T * 2), EPS,
+                                           m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
                     // chunk's cells go to the host copy, the staging pool, and the VRAM slots of resident blocks
@@ -2581,10 +2582,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     if (!kva_state_only) {   // KVA: a state-only layer has no queries
                         split_q(m.Qf, m.q, T, m.cs);
-                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                        kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
+                                               EPS, m.cs);
                         rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
                         if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
-                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                        kernels::rms_norm_rows(m.q_idx, (const float*) wiqn->data, 1, m.q_idx, nullptr, 128,
+                                               (int) (T * 4), EPS, m.cs);
                         rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
@@ -2737,7 +2740,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
-                    gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);
+                    kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * 24), 256, m.cs, m.attn_h);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                     ++qsa_index;
                 } else {
@@ -4792,7 +4795,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             m.gemm.bf16(e16, pw.key_bf16, key, nb, HD, N);
                             if (e16_lo) m.gemm.bf16(e16_lo, pw.key_bf16, key, nb, HD, N, 0, true);
                         } else {
-                            to_f16(emb, e16, nb * N, cs);
+                            kernels::f32_to_f16_bulk(emb, e16, nb * N, cs);
                             m.gemm.native(e16, pw.key_native_type, pw.key_native_data, key, nb, HD, N);
                             to_bf16(emb, e16, nb * N, cs, e16_lo);
                         }
@@ -4888,7 +4891,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                         if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                         if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                        rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, cs);
+                        kernels::rms_norm_rows(m.Kc, (const float*) wkn->data, 1, m.Kc, nullptr, 256, (int) (T * 2),
+                                               EPS, cs);
                         rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), cs);
                         const bool staged = st.kv_mode == 1;
                         if (staged) {
@@ -4924,10 +4928,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                           &st.host, staged ? &m.stage : nullptr);
                         }
                         split_q(m.Qf, m.q, T, cs);
-                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, cs);
+                        kernels::rms_norm_rows(m.q, (const float*) wqn->data, 1, m.q, nullptr, 256, (int) (T * 24),
+                                               EPS, cs);
                         rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), cs);
                         if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, cs);
-                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, cs);
+                        kernels::rms_norm_rows(m.q_idx, (const float*) wiqn->data, 1, m.q_idx, nullptr, 128,
+                                               (int) (T * 4), EPS, cs);
                         rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), cs);
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
@@ -4974,7 +4980,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             }
                         if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, cs);
                         pt.mark(kPfQsa, cs);
-                        gate_attn(m.attn, m.Qf, m.attn_h, T, cs);
+                        kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * 24), 256, cs, m.attn_h);
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
                         ++qsa_index;
                     } else {

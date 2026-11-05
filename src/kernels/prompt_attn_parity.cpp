@@ -89,6 +89,7 @@ int check(const char* name, int64_t nh, int64_t nkv, int64_t hd, int64_t pos0, i
     par::Device dev;
     k::QsaShapes s = k::qsa_real_shapes();
     s.n_head = nh; s.n_head_kv = nkv; s.head_dim = hd;
+    s.page_size = 64;   // the plain models' pages (plain_model.cpp): FP16 pools take the shared kernel (flash_attn.hpp)
     const int64_t PS = s.page_size, cells = pos0 + T, pages = (cells + PS - 1) / PS + 1, rows = pages * nkv * PS;
     const int64_t G = nh / nkv;
     std::mt19937 rng(91 + (unsigned) (nh + hd + T));

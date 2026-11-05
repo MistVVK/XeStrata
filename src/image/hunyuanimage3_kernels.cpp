@@ -89,43 +89,6 @@ using hunyuanimage3_detail::kRouterLanes;
 using hunyuanimage3_detail::kRouterMaxTopk;
 using hunyuanimage3_detail::queue_for;
 
-void hunyuanimage3_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, float eps, uint16_t* y16,
-                    void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + eps);
-            uint16_t* yr = y16 + r * C;
-            for (int64_t c = lane; c < C; c += (int64_t) local) yr[c] = f16_from_f32(xr[c] * inv * w[c]);
-        });
-    finish(stream, e, "hunyuanimage3_rms_norm16");
-}
-
-void hunyuanimage3_rms_norm32(const float* x, const float* w, int64_t rows, int64_t C, float eps, float* y32, void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + eps);
-            float* yr = y32 + r * C;
-            for (int64_t c = lane; c < C; c += (int64_t) local) yr[c] = xr[c] * inv * w[c];
-        });
-    finish(stream, e, "hunyuanimage3_rms_norm32");
-}
-
 void hunyuanimage3_rotate16_from32(const float* x32, int64_t rows, int64_t K, int64_t block, uint16_t* out16, void* stream) {
     if (rows <= 0 || block <= 1) return;
     if (block != 256) throw std::runtime_error("hunyuanimage3_rotate16_from32: only the 256-wide group is implemented");

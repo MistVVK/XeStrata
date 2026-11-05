@@ -15,6 +15,7 @@
 #include "strata/kernels/native_gr_norm.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_gr
 #include "strata/kernels/device_arch_tag.hpp"
@@ -27,7 +28,6 @@
 
 namespace strata::kernels {
 
-template <int BlockSize> class GrRmsNormKernel;   // asked for its work-group (work_group_upto_1024)
 
 namespace {
 
@@ -177,39 +177,6 @@ void check_shape(int n, int hc) {
 }
 size_t rounded(size_t n) { return (n + THREADS - 1) / THREADS * THREADS; }
 
-template <int BlockSize>
-void launch_weighted_rms_norm(sycl::queue& q, const float* input, const float* gamma, float* output, int n_cols,
-                              int n_rows, float epsilon) {
-    q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
-        h.parallel_for<GrRmsNormKernel<BlockSize>>(sycl::nd_range<1>((size_t) n_rows * BlockSize, BlockSize),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            const sycl::sub_group sg = it.get_sub_group();
-            const int tid = (int) it.get_local_id(0);
-            const size_t row_offset = it.get_group(0) * (size_t) n_cols;
-            const float* in = input + row_offset;
-            const float* ga = gamma + row_offset;
-            float* out = output + row_offset;
-            float partial = 0.0f;
-            for (int col = tid; col < n_cols; col += BlockSize) {
-                const float value = in[col];
-                partial += value * value;
-            }
-            // Pinned block_reduce<SUM,BlockSize>: every sub-group repeats the final xor reduction.
-            for (int o = 16; o > 0; o >>= 1) partial += sycl::permute_group_by_xor(sg, partial, o);
-            const int lane = tid % 32;
-            if (lane == 0) sums[tid / 32] = partial;
-            sycl::group_barrier(it.get_group());
-            partial = 0.0f;
-            if (lane < BlockSize / 32) partial = sums[lane];
-            for (int o = 16; o > 0; o >>= 1) partial += sycl::permute_group_by_xor(sg, partial, o);
-            const float mean = partial / n_cols;
-            const float scale = sycl::rsqrt(mean + epsilon);
-            for (int col = tid; col < n_cols; col += BlockSize) out[col] = scale * in[col] * ga[col];
-        });
-    });
-}
-
 }  // namespace
 
 void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
@@ -220,13 +187,8 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* 
     check_pointer(input, msg);
     check_pointer(gamma, msg);
     check_pointer(output, msg);
-    auto& q = queue_for(stream);
-    // a device that takes no 1024-item work-group sums the long rows in another order
-    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<GrRmsNormKernel>(q);
-    if (wg == 1024) launch_weighted_rms_norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon);
-    else if (wg == 512) launch_weighted_rms_norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon);
-    else launch_weighted_rms_norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon);
-    if (!stream) core::Runtime::get().finish(q);
+    // a gamma row each row: the engines' one RMSNorm with as many groups as rows (native_qsa.hpp), the same sums
+    rms_norm_rows(input, gamma, n_rows, output, nullptr, n_cols, n_rows, epsilon, stream);
 }
 
 void native_gr_down_silu(float* lo, int hc_lr, int hc, void* stream) {

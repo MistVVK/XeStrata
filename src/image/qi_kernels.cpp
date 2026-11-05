@@ -7,7 +7,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
-#include "f16_gpu.hpp"
+#include "strata/kernels/f16_gpu.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -23,8 +23,8 @@ namespace {
 namespace syclex = sycl::ext::oneapi::experimental;
 
 using strata::kernels::f32_from_bf16;
-using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
-using f16_gpu::f32_from_f16;
+using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using kernels::f16_gpu::f32_from_f16;
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
@@ -551,17 +551,6 @@ void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_
     finish(stream, e, "qi_attention_causal");
 }
 
-void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream) {
-    if (T <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * inter)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / inter, c = i - t * inter;
-        const float g = gu[t * 2 * inter + c], u = gu[t * 2 * inter + inter + c];
-        h16[i] = f16_from_f32(u * g / (1.f + sycl::exp(-g)));
-    });
-    finish(stream, e, "qi_swiglu16");
-}
-
 void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream) {
     if (rows <= 0) return;
     auto* x8 = static_cast<int8_t*>(xq);
@@ -627,31 +616,6 @@ void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col
         y[(int64_t) i[0] * ldy + (int64_t) i[1]] *= col[(int64_t) i[1]];
     });
     finish(stream, e, "qi_rows_scale");
-}
-
-void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream) {
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        y16[i] = f16_from_f32(x[i]);
-    });
-    finish(stream, e, "qi_to_f16");
-}
-
-void qi_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, uint16_t* y16, void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t local = 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-            const float* xr = x + r * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += local) s += xr[c] * xr[c];
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) /
-                                               (float) C + kEps);
-            for (int64_t c = lane; c < C; c += local) y16[r * C + c] = f16_from_f32(xr[c] * inv * w[c]);
-        });
-    finish(stream, e, "qi_rms_norm16");
 }
 
 void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream) {

@@ -10,7 +10,8 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "f16_gpu.hpp"
+#include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
@@ -29,8 +30,8 @@ namespace syclex = sycl::ext::oneapi::experimental;
 
 namespace {
 
-using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
-using f16_gpu::f32_from_f16;
+using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using kernels::f16_gpu::f32_from_f16;
 
 // Qwen/Qwen-Image-2.1's vae/config.json: latents_mean and latents_std (the DiT's latent is (z - mean) / std)
 const float kMean[64] = {0.5126f, 0.7721f, -0.0631f, 1.3506f, -0.7855f, -2.1025f, -0.3458f, 1.3722f, 1.8873f,
@@ -571,7 +572,7 @@ void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin)
     if (r.sc.w != nullptr) {
         float* y = x == t0_ ? t1_ : t0_;   // the block's output: the shortcut's channels are not x's
         conv(r.c2, a16_, H, W, y);
-        qi_to_f16(x, HW * cin, a16_, s_);
+        kernels::f32_to_f16_bulk(x, a16_, HW * cin, s_);
         conv(r.sc, a16_, H, W, y, true);
         x = y;
     } else {
@@ -591,7 +592,7 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g,
     uint16_t* p16 = col16_;
     softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, qkv, HW, C, HW);   // O = P . V (V^T's rows are V's columns)
-    qi_to_f16(qkv, HW * C, a16_, s_);
+    kernels::f32_to_f16_bulk(qkv, a16_, HW * C, s_);
     conv(proj, a16_, H, W, x, true);
 }
 
@@ -681,7 +682,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
     float* x = t0_;
     unnorm_tokens16(z, mean_, std_, pq_.in, H * W, a16_, s_);
     conv(pq_, a16_, H, W, t1_);
-    qi_to_f16(t1_, H * W * pq_.out, a16_, s_);
+    kernels::f32_to_f16_bulk(t1_, a16_, H * W * pq_.out, s_);
     conv(cin_, a16_, H, W, x);
     resblock(mid0_, x, H, W, c);
     attention(x, H, W, c, ag_, aqkv_, aproj_);
@@ -774,7 +775,7 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
         }
         int64_t fs = 1;
         if (d.down.out > 0) {   // zero row and column after the edge, then the 3 x 3 convolution of stride 2
-            qi_to_f16(x, H * W * c, a16_, s_);
+            kernels::f32_to_f16_bulk(x, a16_, H * W * c, s_);
             float* y = x == t0_ ? t1_ : t0_;
             const int64_t Ho = H / 2, Wo = W / 2, K = 9 * c, rows = std::max<int64_t>(1, col_cap_ / K);
             for (int64_t p0 = 0; p0 < Ho * Wo; p0 += rows) {
@@ -800,7 +801,7 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
     rms16(x, egout_, H * W, c, true, a16_, s_);
     float* y = x == t0_ ? t1_ : t0_;
     conv(eout_, a16_, H, W, y);
-    qi_to_f16(y, H * W * eout_.out, a16_, s_);
+    kernels::f32_to_f16_bulk(y, a16_, H * W * eout_.out, s_);
     conv(quant_, a16_, H, W, t2_);
     norm_latent(t2_, H * W, quant_.out, pq_.in, mean_, std_, z, s_);
     gpu::stream_sync(s_);

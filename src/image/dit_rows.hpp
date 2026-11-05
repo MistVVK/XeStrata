@@ -13,7 +13,7 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "f16_gpu.hpp"
+#include "strata/kernels/f16_gpu.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -33,8 +33,8 @@
 namespace strata::image::dit_rows {
 
 namespace syclex = sycl::ext::oneapi::experimental;
-using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
-using f16_gpu::f32_from_f16;
+using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using kernels::f16_gpu::f32_from_f16;
 
 inline sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 

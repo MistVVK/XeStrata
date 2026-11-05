@@ -58,11 +58,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     const int64_t IH = s.idx_n_head, ID = s.idx_key_length;
     const float eps = (float) s.rms_eps, hc_eps = (float) s.hc_eps;
     const int iters = (int) s.hc_sinkhorn_iters;
-    const k::QsaShapes qs = [&] {   // the step records' positions (glm5_idx_steps reads kStepPos only)
-        k::QsaShapes q = k::qsa_real_shapes();
-        q.n_head = s.n_head; q.n_head_kv = nkv_; q.head_dim = s.key_length; q.n_rot = s.rope_dims;
-        return q;
-    }();
+    const k::QsaShapes qs = attn_shapes();   // the step records' positions (glm5_idx_steps reads kStepPos only)
     k::QsaShapes sel;
     sel.idx_block = s.idx_kpool;
     sel.idx_top_k = s.idx_top_k;
@@ -88,7 +84,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
             return;
         }
         if (ldx != n_in) throw std::runtime_error("plain prompt (GLM): an FP16 product of strided rows");
-        prefill::to_f16(x, P.x16, T * n_in, cs);
+        kernels::f32_to_f16_bulk(x, P.x16, T * n_in, cs);
         gm.native(P.x16, type, w, y, T, n_out, n_in, ldy);
     };
     auto dense = [&](const W& w, const float* x, float* y, int64_t T) {
@@ -257,7 +253,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
                     k::glm5_router_sigmoid(P.rlog, b.router_b, (int) T, (int) E, (int) K, s.expert_weights_norm, scale,
                                            P.ids, P.w, cs);
-                    if (!P.int8) prefill::to_f16(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
+                    if (!P.int8) kernels::f32_to_f16_bulk(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
                     const int64_t ml = s.moe_index(l);
                     if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
                                        [&](int stage) { mark(stage == 1 ? 2 : 3); }, rst, err))

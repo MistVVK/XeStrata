@@ -18,6 +18,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -516,7 +517,7 @@ void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& a
     uint16_t* p16 = col16_;
     softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
     gemm_.f16(p16, vt16, tmp32_, P, C, P);   // O = P . V (V^T's rows are V's columns)
-    qi_to_f16(tmp32_, P * C, a16_, s_);
+    kernels::f32_to_f16_bulk(tmp32_, a16_, P * C, s_);
     gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
     bias_add(tmp32_, aproj.b, P, C, s_);
     hunyuanimage3_add(x, tmp32_, P * C, s_);
@@ -527,7 +528,7 @@ void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& a
 void HunyuanImage3Vae::downsample(const Down& d, const float* x, int64_t T, int64_t H, int64_t W, int64_t C,
                                   float* y) {
     const int64_t P = T * H * W;
-    qi_to_f16(x, P * C, a16_, s_);
+    kernels::f32_to_f16_bulk(x, a16_, P * C, s_);
     conv(d.down, a16_, T, H, W, tmp32_);
     const int64_t r1 = d.temporal ? 2 : 1, factor = 4 * r1;
     dcae_fold_down(tmp32_, x, T, H, W, d.down.out, C, r1, factor * C / d.out, y, s_);
@@ -538,7 +539,8 @@ void HunyuanImage3Vae::downsample(const Down& d, const float* x, int64_t T, int6
 void HunyuanImage3Vae::upsample(const Up& u, const float* x, int64_t T, int64_t H, int64_t W, int64_t C,
                                 float* y) {
     const int64_t P = T * H * W;
-    qi_to_f16(x, P * C, a16_, s_);   // the conv reads the block's output FP16, as the reference's conv3d does
+    // the conv reads the block's output FP16, as the reference's conv3d does
+    kernels::f32_to_f16_bulk(x, a16_, P * C, s_);
     conv(u.up, a16_, T, H, W, tmp32_);
     const int64_t r1 = u.temporal ? 2 : 1;
     dcae_split(tmp32_, x, T, H, W, C, u.up.out / (4 * r1), r1, y, s_);

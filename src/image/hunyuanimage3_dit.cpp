@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -168,7 +169,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
     }
     try {
         // --- attention: the norm, the save's rotation, qkv, the rope and the qk-norm, the block's mask, o
-        hunyuanimage3_rms_norm32(x, w.n_in, T, d.hidden, d.eps, sc.xn32, stream);
+        kernels::rms_norm_rows(x, w.n_in, 1, sc.xn32, nullptr, (int) (d.hidden), (int) (T), d.eps, stream);
         hunyuanimage3_rotate16_from32(sc.xn32, T, d.hidden, d.rotate, sc.xr16, stream);
         gemm.f16(sc.xr16, w.qkv, sc.qkv32, T, w.qkv_n, w.qkv_k);
         hunyuanimage3_rope_angles(pos_y, pos_x, T, d.head_dim, d.theta, sc.ang, stream);
@@ -184,7 +185,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         hunyuanimage3_add(out, sc.o32, T * d.hidden, stream);
 
         // --- the MLP: the shared expert, then the routed ones on the router's FP32 logits
-        hunyuanimage3_rms_norm32(out, w.n_post, T, d.hidden, d.eps, sc.xn232, stream);
+        kernels::rms_norm_rows(out, w.n_post, 1, sc.xn232, nullptr, (int) (d.hidden), (int) (T), d.eps, stream);
         hunyuanimage3_rotate16_from32(sc.xn232, T, d.hidden, d.rotate, sc.xr216, stream);
         gemm.f16(sc.xr216, w.sgu, sc.gu32, T, w.sgu_n, w.sgu_k);
         hunyuanimage3_swiglu16_rotated(sc.gu32, T, d.inter, sc.act16, stream);

@@ -244,10 +244,6 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     });
 }
 
-void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { y[i] = hf(x[i]); });
-}
 void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
@@ -1085,11 +1081,13 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
         h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
     });
 }
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width) {
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width, int64_t ld) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
-        const float a = g[i];
-        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
+    if (ld <= 0) ld = width;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], r = i / width, at = r * ld + (i - r * width);
+        const float a = g[at];
+        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
     });
 }
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
@@ -1145,21 +1143,6 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
 }
 
 // ---------------------------------------------------------------- QSA helpers
-void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
-    if (rows <= 0) return;
-    Q(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> sh(sycl::range<1>(32), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) rows * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            float* r = x + (int64_t) it.get_group(0) * ld;
-            const int tid = (int) it.get_local_id(0);
-            float ss = 0.0f;
-            for (int64_t c = tid; c < cols; c += 256) ss += r[c] * r[c];
-            const float s = sycl::rsqrt(block_sum(it, ss, &sh[0]) / (float) cols + eps);
-            sycl::group_barrier(it.get_group());
-            for (int64_t c = tid; c < cols; c += 256) r[c] = s * r[c] * w[c];
-        });
-    });
-}
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0, const strata::kernels::RopeScaling& scaling, void* stream) {
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / 64.0f);
     const int32_t* mtab = strata::kernels::mrope_table();
@@ -1184,12 +1167,6 @@ void split_q(const float* qf, float* q, int64_t T, void* stream) {
     Q(stream).parallel_for(sycl::range<1>((size_t) (T * 24 * 256)), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0], t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
         q[i] = qf[t * 24 * 512 + h * 512 + d];
-    });
-}
-void gate_attn(const float* a, const float* qf, uint16_t* o16, int64_t T, void* stream) {
-    Q(stream).parallel_for(sycl::range<1>((size_t) (T * 24 * 256)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], t = i / (24 * 256), h = (i / 256) % 24, d = i % 256;
-        o16[i] = hf(a[i] * (1.0f / (1.0f + sycl::exp(-qf[t * 24 * 512 + h * 512 + 256 + d]))));
     });
 }
 

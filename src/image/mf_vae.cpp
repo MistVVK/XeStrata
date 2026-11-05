@@ -9,7 +9,8 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "f16_gpu.hpp"
+#include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
@@ -30,8 +31,8 @@ namespace gpu = strata::gpu;
 // name and signature in another image file (qi_vae.cpp's to_rgba) gave its kernel to both.
 namespace mf_vae_detail {
 
-using f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
-using f16_gpu::f32_from_f16;
+using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
+using kernels::f16_gpu::f32_from_f16;
 
 constexpr int64_t kPatch = 16, kPix = kPatch * kPatch;   // a latent position's pixels
 constexpr int64_t kWin = 32, kWinTok = kWin * kWin;       // the CoD decoder's attention windows
@@ -889,7 +890,7 @@ void MfVae::attention(const Attn& a, float* x, int64_t H, int64_t W) {
             gemm_.f16(p16, vt16, ow, kWinTok, C_, kWinTok);
             win_scatter(ow, H, W, C_, wy, wx, o, s_);
         }
-    qi_to_f16(o, HW * C_, a16_, s_);
+    kernels::f32_to_f16_bulk(o, a16_, HW * C_, s_);
     conv(a.proj, a16_, H, W, x, true);
 }
 
@@ -1069,9 +1070,9 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
     patchify16(rgb, h, w, b.a16, s_);
     conv(e_patch_, b.a16, h, w, hs);
     for (const DiCo& d : enc_head_) dico(d, hs, h, w, b);
-    qi_to_f16(hs, n * Ch, b.a16, s_);
+    kernels::f32_to_f16_bulk(hs, b.a16, n * Ch, s_);
     conv(e_down_, b.a16, h, w, ls);
-    qi_to_f16(ls, n * C_, b.a16, s_);
+    kernels::f32_to_f16_bulk(ls, b.a16, n * C_, s_);
     conv(e_fuse_, b.a16, h, w, hs);   // the state [n][C] (in hs's room)
     for (const DiCo& d : enc_blocks_) dico(d, hs, h, w, b);
     ln_mod16(hs, e_norm_, e_norm_ + C_, n, C_, b.a16, s_);
@@ -1103,7 +1104,7 @@ void MfVae::decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     grow(h, w);
     const int64_t HW = h * w, H = h * kPatch, W = w * kPatch;
     // the CoD decoder: the condition [HW][C]
-    qi_to_f16(z, HW * cin_.in, a16_, s_);
+    kernels::f32_to_f16_bulk(z, a16_, HW * cin_.in, s_);
     float* x = x_;
     conv(cin_, a16_, h, w, x);
     resblock(res_[0], x, h, w);
@@ -1114,7 +1115,7 @@ void MfVae::decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     gn_silu16(x, gnw_, gnb_, HW, C_, true, a16_);
     conv(cout_, a16_, h, w, cond_);
     // the denoiser's blocks on the per-patch state
-    qi_to_f16(cond_, HW * C_, a16_, s_);
+    kernels::f32_to_f16_bulk(cond_, a16_, HW * C_, s_);
     conv(s_in_, a16_, h, w, s_state_);
     DiCoBufs b;
     b.t0 = t0_;
@@ -1125,10 +1126,10 @@ void MfVae::decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
     // the per-pixel MLP, a band of patches at a time
     for (int64_t p0 = 0; p0 < HW; p0 += cap_band_) {
         const int64_t np = std::min(cap_band_, HW - p0);
-        qi_to_f16(cond_ + p0 * C_, np * C_, a16_, s_);
+        kernels::f32_to_f16_bulk(cond_ + p0 * C_, a16_, np * C_, s_);
         gemm_.f16(a16_, yx_.w, yxb_, np, yx_.out, yx_.in);
         qi_bias_add(yxb_, yx_.b, np, yx_.out, s_);
-        qi_to_f16(s_state_ + p0 * C_, np * C_, a16_, s_);
+        kernels::f32_to_f16_bulk(s_state_ + p0 * C_, a16_, np * C_, s_);
         gemm_.f16(a16_, ce_.w, ceb_, np, ce_.out, ce_.in);
         qi_bias_add(ceb_, ce_.b, np, ce_.out, s_);
         pixel_mlp(yxb_, ceb_, px_, dct_, p0, np, w, H, W, rgb, s_);
@@ -1363,7 +1364,7 @@ void MfVae::f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W) {
     gn_silu16(t, r.n2w, r.n2b, HW, r.c1.out, true, a16_);
     if (r.nin.out > 0) {
         conv(r.c2, a16_, H, W, y);
-        qi_to_f16(x, HW * r.nin.in, a16_, s_);
+        kernels::f32_to_f16_bulk(x, a16_, HW * r.nin.in, s_);
         conv(r.nin, a16_, H, W, y, true);
         x = y;
     } else {
@@ -1386,7 +1387,7 @@ void MfVae::f2_attention(const Attn& a, float* x, int64_t H, int64_t W) {
         softmax_wg16(f2_q_, n, T, 1.0f / std::sqrt((float) C), f2_p16_, s_);
         gemm_.f16(f2_p16_, vt16, o + r0 * C, n, C, T);
     }
-    qi_to_f16(o, T * C, a16_, s_);
+    kernels::f32_to_f16_bulk(o, a16_, T * C, s_);
     conv(a.proj, a16_, H, W, x, true);
 }
 
@@ -1396,7 +1397,7 @@ void MfVae::f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int
     W = 2 * w;
     f2_unpatch16(z, f2_mean_, f2_std_, h, w, a16_, s_);
     conv(f2_pq_, a16_, H, W, f2_t_);
-    qi_to_f16(f2_t_, H * W * f2_pq_.out, a16_, s_);
+    kernels::f32_to_f16_bulk(f2_t_, a16_, H * W * f2_pq_.out, s_);
     x = f2_x_;
     conv(cin_, a16_, H, W, x);
     f2_resblock(f2_mid_[0], x, H, W);
@@ -1659,7 +1660,7 @@ void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
         for (const F2Res& r : l.blocks) f2_resblock(r, x, H, W);
         if (!l.blocks.empty()) c = l.blocks.back().c2.out;
         if (l.down.out > 0) {
-            qi_to_f16(x, H * W * c, a16_, s_);
+            kernels::f32_to_f16_bulk(x, a16_, H * W * c, s_);
             float *y = nullptr, *unused = nullptr;
             f2_others(x, y, unused);
             conv_s2(l.down, a16_, H, W, y);
@@ -1677,7 +1678,7 @@ void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
     f2_others(x, m, t);
     conv(f2_eout_, a16_, H, W, m);
     if (f2_qc_.out > 0) {
-        qi_to_f16(m, H * W * f2_eout_.out, a16_, s_);
+        kernels::f32_to_f16_bulk(m, a16_, H * W * f2_eout_.out, s_);
         conv(f2_qc_, a16_, H, W, t);
         m = t;
     }

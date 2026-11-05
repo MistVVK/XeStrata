@@ -84,15 +84,6 @@ bool mapped(size_t bytes, void** h, void** d) {
     return strata::gpu::device_pointer(d, *h);
 }
 
-k::QsaShapes attn_shapes(const ModelSpec& s, int64_t n_head_kv) {
-    k::QsaShapes q = k::qsa_real_shapes();
-    q.n_head = s.n_head;
-    q.n_head_kv = n_head_kv;
-    q.head_dim = s.key_length;
-    q.n_rot = s.rope_dims;
-    return q;
-}
-
 }  // namespace
 
 PlainModel::PlainModel() = default;
@@ -708,7 +699,7 @@ bool PlainModel::load_qwen(std::string& err) {
     const int64_t C = 2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner;
     state_bytes_ = (size_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state) * 4;
     conv_bytes_ = (size_t) (C * (s.ssm_d_conv - 1)) * 4;
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     gdn_state_.assign((size_t) n_gdn, nullptr);
     gdn_conv_.assign((size_t) n_gdn, nullptr);
     for (int64_t l = lb_; l < le_; ++l) {
@@ -1834,7 +1825,7 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
 
 std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, size_t cells) const {
     const KvPtrs p = kv_ptrs(a, slot);
-    const size_t HD = (size_t) attn_shapes(spec_, nkv_).head_dim;
+    const size_t HD = (size_t) attn_shapes().head_dim;
     const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
                  q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
     std::vector<StatePart> v;
@@ -1846,7 +1837,7 @@ std::vector<PlainModel::StatePart> PlainModel::kv_planes(size_t a, int slot, siz
 }
 
 bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
-    const size_t HD = (size_t) attn_shapes(spec_, nkv_).head_dim;
+    const size_t HD = (size_t) attn_shapes().head_dim;
     const size_t codes = cells * HD, scales = cells * (HD / k::KV_Q8_GROUP) * 2,
                  q4 = cells * (size_t) k::kv_q4_bytes_per_head((int) HD);
     bool ok = true;
@@ -1884,7 +1875,7 @@ bool PlainModel::alloc_kv(KvPtrs& p, size_t cells, bool vmm) {
 }
 
 bool PlainModel::kv_map(int64_t cells, std::string& err) {
-    const k::QsaShapes qs = attn_shapes(spec_, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const uint64_t G = vmm_granularity();
     const int64_t pages = (cells + qs.page_size - 1) / qs.page_size;
     for (size_t i = 0; i < kv_vmm_.size(); ++i) {
@@ -1912,7 +1903,7 @@ constexpr int64_t kKvGrowStep = 8192;
 bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
     if (kv_cells_ < 0 || cells <= kv_cells_) return true;
     const int64_t target = std::min<int64_t>(opt_.max_cells, (cells + kKvGrowStep - 1) / kKvGrowStep * kKvGrowStep);
-    const k::QsaShapes qs = attn_shapes(spec_, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const uint64_t G = vmm_granularity();
     const int64_t pages = (target + qs.page_size - 1) / qs.page_size;
     uint64_t need = 0;
@@ -1941,7 +1932,7 @@ bool PlainModel::kv_trim(int64_t cells, std::string& err) {
     if (kv_cells_ < target + 2 * kKvGrowStep) return true;
     if (!settle_swaps(true, err)) return false;
     if (!strata::gpu::device_sync()) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
-    const k::QsaShapes qs = attn_shapes(spec_, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const uint64_t G = vmm_granularity();
     const int64_t pages = (target + qs.page_size - 1) / qs.page_size;
     for (size_t i = 0; i < kv_vmm_.size(); ++i) {
@@ -1962,7 +1953,7 @@ bool PlainModel::kv_trim(int64_t cells, std::string& err) {
 void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n, const float* kc, const float* vc,
                                  strata::gpu::Stream cs) {
     const KvPtrs p = kv_ptrs(a, slot);
-    const k::QsaShapes qs = attn_shapes(spec_, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
     if (p.k_q4 != nullptr) {
         k::kv_append_q4_steps(p.k_q4, p.v_q4, page_table_, steps, k::kStepCount, n, kc, vc, qs, cs);
@@ -2095,6 +2086,18 @@ int64_t PlainModel::file_reads() const {
 
 uint64_t PlainModel::file_read_bytes() const {
     return in_ram_ || src_ == nullptr ? 0 : static_cast<const FileExpertSource*>(src_)->file_read_bytes();
+}
+
+k::QsaShapes PlainModel::attn_shapes() const {
+    k::QsaShapes q = k::qsa_real_shapes();
+    q.n_head = spec_.n_head;
+    q.n_head_kv = nkv_;
+    q.head_dim = spec_.key_length;
+    q.n_rot = spec_.rope_dims;
+    // pages of 64 cells: a page's cells of a KV head are one run of rows, which the prompt's attention reads 64 at
+    // a time where they are (flash_attn.hpp); Qwen3.8-Flash-Next's 4 are its indexer's blocks, which these lack
+    q.page_size = 64;
+    return q;
 }
 
 std::vector<int64_t> PlainModel::split_points() const {
@@ -2269,7 +2272,7 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
     }
     // the attention layers (the MTP layer's too): the pages that hold the tokens, page by page in order (the page
     // table is the identity)
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const int64_t pages = std::min<int64_t>(n_pages_, (tokens + qs.page_size - 1) / qs.page_size);
     const size_t cells = (size_t) (pages * qs.n_head_kv * qs.page_size);
     for (size_t a = 0; a < k_pool_.size(); ++a)
@@ -2343,8 +2346,7 @@ bool PlainModel::copy_session(int from, int to, int64_t tokens, bool recurrent_o
 // blocks, the MTP layer's on the last), while the slots take at most half the VRAM free now: the expert tier sizes
 // itself from what is left after them (open_experts)
 bool PlainModel::alloc_batch_slots(std::string& err) {
-    const ModelSpec& s = spec_;
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const int want = std::min(opt_.batch_slots, opt_.max_t);
     // --batch-mtp: each slot's recurrent states after its first row as well (a draft that fails goes back to them)
     const bool snaps = opt_.batch_mtp && model_mtp_;
@@ -2465,11 +2467,10 @@ bool PlainModel::reset(std::string& err) {
         if (!st->reset(err)) return false;
     }
     if (glm_) return reset_glm5(err);
-    const ModelSpec& s = spec_;
     bool ok = true;
     for (float* p : gdn_state_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, state_bytes_));
     for (float* p : gdn_conv_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, conv_bytes_));
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
     // (--kv-grow: the cells mapped)
     const size_t live = kv_cells_ < 0 ? cells
@@ -2503,7 +2504,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert, K = s.n_expert_used;
     const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp;
     const float eps = (float) s.rms_eps;
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     const int64_t NKV = qs.n_head_kv;
     const k::GdnShapes gs{S, HK, HV};
     const k::RopeScaling& rs = k::rope_scaling();
@@ -2696,7 +2697,7 @@ bool PlainModel::record_window(int T, strata::gpu::Stream cs, std::string& err,
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
-    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
+    const int64_t NKV = attn_shapes().n_head_kv;
     k::copy_from_mapped(x_, first() ? m_emb_ : m_in_, (int64_t) T * N, cs);   // the embeddings, or the rows handed on
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
@@ -2728,7 +2729,7 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
-    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
+    const int64_t NKV = attn_shapes().n_head_kv;
     k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
@@ -2757,7 +2758,7 @@ bool PlainModel::record_mtp_slots(int T, strata::gpu::Stream cs, std::string& er
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head;
     const float eps = (float) s.rms_eps;
-    const int64_t NKV = attn_shapes(s, nkv_).n_head_kv;
+    const int64_t NKV = attn_shapes().n_head_kv;
     k::copy_from_mapped(x_, m_emb_, (int64_t) T * N, cs);
     k::copy_i32_from_mapped(step_, m_step_, (int64_t) T * k::kStepCount, cs);
     k::copy_i32_from_mapped(pos_, m_pos_, (int64_t) opt_.max_t * (NH + NKV), cs);
@@ -2891,7 +2892,7 @@ bool PlainModel::run_window(int T, bool mtp, std::string& err) {
 bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb, const int64_t* rows_pos) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head;
-    const k::QsaShapes qs = attn_shapes(s, nkv_);
+    const k::QsaShapes qs = attn_shapes();
     for (int t = 0; t < T; ++t) {
         if (tokens[t] < 0 || tokens[t] >= n_vocab_) { err = "plain model: a token is out of the vocabulary"; return false; }
         const int64_t p = rows_pos != nullptr ? rows_pos[t] : pos + t;

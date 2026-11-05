@@ -105,8 +105,6 @@ void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_
 void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
                     void* stream);
 
-/// h16[t, i] = gu[t, inter + i] * silu(gu[t, i]) (the fused gate_up product: gate first, then up).
-void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream);
 
 /// The activations of an int8 product (kernels::iq_mmq_quantize's layout, without the sums): rows x cols (a multiple of
 /// 32) of x16 as int8 with a scale for each 32.
@@ -127,8 +125,8 @@ void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t*
 /// the int8 rows qi_rows_i8 makes of kernels::dequant_f16's output; false for another type (nothing is written).
 bool qi_rows_i8_blocks(int type, const void* blocks, int64_t rows, int64_t K, int8_t* q, float* s, void* stream);
 
-/// qi_rows_i8 of qi_swiglu16's values, from the gate_up product's int32 sums gu [T][2 inter] (scaled by g): the down
-/// product's int8 input in one pass.
+/// qi_rows_i8 of the SwiGLU's values (prefill::swiglu_pair's), from the gate_up product's int32 sums gu [T][2 inter]
+/// (scaled by g): the down product's int8 input in one pass.
 void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
 
 /// y [T][N] (row stride ldy) holds a W8A8 product's int32 sums (their bits): y = sum * sx[t] * sw[n] + bias[n], in
@@ -141,11 +139,6 @@ void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, c
 /// the weight's rows' factors, y's rows the weight's row0 on).
 void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col, void* stream);
 
-/// y16 = FP16(x), n elements.
-void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream);
-
-/// y16[r] = FP16(x[r] / rms(x[r]) * w) (eps 1e-6), rows of C.
-void qi_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, uint16_t* y16, void* stream);
 
 /// y16 = FP16(GELU(x)), GELU's tanh form, n elements.
 void qi_gelu16(const float* x, int64_t n, uint16_t* y16, void* stream);

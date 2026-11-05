@@ -17,14 +17,10 @@
 
 namespace strata::image {
 
-/// y16[r][:] = FP16(x[r][:] / sqrt(mean(x[r]^2) + eps) * w) (rows of C, FP32 in): the model's eps is 1e-5
-/// (config.rms_norm_eps; qi_rms_norm16 has the other image models' 1e-6 baked in).
-void hunyuanimage3_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, float eps, uint16_t* y16, void* stream);
-
-/// The same norm, FP32 out: what the router multiplies by.  Its logits decide which of the 64 experts a token
-/// takes, and a FP16 activation there moves a logit by ~1e-3 - enough to swap a near-tie's expert and change that
-/// token's output by a few percent (measured on the B70 with the w4a8 file and the CPU golden, 2026-10-24).
-void hunyuanimage3_rms_norm32(const float* x, const float* w, int64_t rows, int64_t C, float eps, float* y32, void* stream);
+// The layer's RMSNorm is the engines' one (kernels::rms_norm_rows, native_qsa.hpp) at the model's eps 1e-5
+// (config.rms_norm_eps), FP16 out, or FP32 where the router multiplies by it: its logits decide which of the 64
+// experts a token takes, and a FP16 activation there moves a logit by ~1e-3 - enough to swap a near-tie's expert and
+// change that token's output by a few percent (measured on the B70 with the w4a8 file and the CPU golden, 2026-10-24).
 
 /// The save's rotation of an FP32 input: the same groups, FP32 in and FP16 out.  The layer's activations have a
 /// few enormous channels (the model's "massive activations": absmax 464 where the rms is 7), and the rotation
@@ -128,7 +124,7 @@ void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids,
 void hunyuanimage3_copy16(const uint16_t* src16, uint16_t* dst16, int64_t n, void* stream);
 
 /// logits[t][e] = x[t][:] . w[e][:] (rows of C by E rows of C): the router, which decides where every token goes, so
-/// it keeps FP32 all the way in (`hunyuanimage3_rms_norm32`) and sums over 32 lanes' partial sums (FP32, the
+/// it keeps FP32 all the way in (`kernels::rms_norm_rows` to FP32) and sums over 32 lanes' partial sums (FP32, the
 /// reference's type; no FP64, which not every GPU has).  A FP16 operand there swaps near-tied experts and costs a
 /// few percent of the layer's output.
 void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, int64_t C, int64_t E, float* logits,

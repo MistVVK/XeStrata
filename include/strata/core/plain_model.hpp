@@ -468,6 +468,9 @@ public:
     int64_t ram_staged() const { return complement_ != nullptr ? complement_->ram_staged() : 0; }
     /// The layer split's first blocks after GPU 0's (empty: one GPU).
     std::vector<int64_t> split_points() const;
+    /// The attention's shapes the kernels take (heads, head_dim, rotated dims, the K/V cache's cells a page: the layout
+    /// a saved conversation's pools are in), the one place they are made.
+    strata::kernels::QsaShapes attn_shapes() const;
     /// Writes what this run learned as a profile (rank_learned_profile: the experts in VRAM now, then by the routing
     /// counted since the load, then by the profile it started from), for the next load's `profile`.
     bool save_profile(const std::string& path, std::string& err) const;

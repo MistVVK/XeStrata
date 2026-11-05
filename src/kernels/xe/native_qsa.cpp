@@ -11,6 +11,7 @@
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
+#include "strata/kernels/f16_gpu.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_qsa
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -46,9 +47,10 @@ static_assert(sizeof(Q81) == 36, "a q8_1 block is 36 bytes");
 // gamma: `groups` rows of n_cols, row r takes gamma row r % groups (1: one gamma for every row)
 // q8 (n_cols a multiple of 32): the output also as q8_1 blocks, each the 32 columns one sub-group writes in a pass,
 // with native_quantize_q8_1's reductions over the stored values, so the blocks are that kernel's bit for bit
+// gamma null: no weight; out16: the output as FP16 instead of `output` (null then)
 template <int BlockSize>
 void norm(sycl::queue& q, const float* input, const float* gamma_all, float* output, int n_cols, int n_rows,
-          float epsilon, int groups = 1, void* q8 = nullptr) {
+          float epsilon, int groups = 1, void* q8 = nullptr, uint16_t* out16 = nullptr) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
         h.parallel_for<NormKernel<BlockSize>>(sycl::nd_range<1>(std::size_t(n_rows) * BlockSize, BlockSize),
@@ -56,9 +58,9 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = int(it.get_local_id(0));
             const std::size_t row_offset = it.get_group(0) * std::size_t(n_cols);
-            const float* gamma = gamma_all + (it.get_group(0) % std::size_t(groups)) * std::size_t(n_cols);
+            const float* gamma =
+                gamma_all ? gamma_all + (it.get_group(0) % std::size_t(groups)) * std::size_t(n_cols) : nullptr;
             const float* in = input + row_offset;
-            float* out = output + row_offset;
             float partial = 0.0f;
             for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize) {
                 const float x = in[col];
@@ -75,8 +77,12 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
             const float scale = sycl::rsqrt(mean + epsilon);
             Q81* blocks = static_cast<Q81*>(q8);
             for (std::size_t col = tid; col < std::size_t(n_cols); col += BlockSize) {
-                const float v = scale * in[col] * gamma[col];
-                out[col] = v;
+                const float v = gamma ? scale * in[col] * gamma[col] : scale * in[col];
+                if (out16 != nullptr) {
+                    out16[row_offset + col] = f16_gpu::f16_from_f32(v);
+                    continue;
+                }
+                output[row_offset + col] = v;
                 if (blocks == nullptr) continue;
                 const float amax = warp_max(sg, sycl::fabs(v));
                 const float sum = warp_sum(sg, v);
@@ -116,6 +122,20 @@ sycl::queue& queue_for(void* stream) {
 }
 
 }  // namespace
+
+void rms_norm_rows(const float* input, const float* gamma, int groups, float* output, uint16_t* out16, int n_cols,
+                   int n_rows, float epsilon, void* stream) {
+    if (n_rows <= 0) return;
+    elements(n_cols, n_rows);
+    if (!std::isfinite(epsilon) || epsilon < 0.0f || groups < 1 || (output == nullptr) == (out16 == nullptr))
+        throw std::invalid_argument("rms_norm_rows: a finite nonnegative epsilon, groups, one output");
+    auto& q = core::Runtime::get().stream(stream);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<NormKernel>(q);
+    if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, nullptr, out16);
+    else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, nullptr, out16);
+    else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, groups, nullptr, out16);
+    if (!stream) core::Runtime::get().finish(q);
+}
 
 void native_qsa_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_qsa_enabled() { return enabled.load(std::memory_order_relaxed); }
@@ -163,14 +183,15 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
 }
 
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
-                           int n_head, int head_dim, void* stream) {
+                           int n_head, int head_dim, void* stream, uint16_t* out16) {
     const auto count = elements(head_dim, n_head);
-    buffers(attn, count * 4, q_full, count * 8, output, stream);
+    if (out16 == nullptr) buffers(attn, count * 4, q_full, count * 8, output, stream);
     queue_for(stream).parallel_for(sycl::range<1>(count), [=](sycl::id<1> id) {
         const std::size_t i = id[0], head = i / head_dim, channel = i % head_dim;
         const float raw = q_full[head * 2 * head_dim + head_dim + channel];
         const float sigmoid = 1.0f / (1.0f + sycl::exp(-raw));
-        output[i] = attn[i] * sigmoid;
+        if (out16 != nullptr) out16[i] = f16_gpu::f16_from_f32(attn[i] * sigmoid);
+        else output[i] = attn[i] * sigmoid;
     });
 }
 

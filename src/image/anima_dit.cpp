@@ -14,6 +14,7 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -1031,7 +1032,7 @@ void AnimaDit::time_embedding(float sigma) {
 
 void AnimaDit::modulation(const W& w1, const W& w2, const uint8_t* base, float* out) {
     product(e16_, nullptr, w1, base, mh_, 1, nullptr);
-    qi_to_f16(mh_, w1.n, m16_, s_);
+    kernels::f32_to_f16_bulk(mh_, m16_, w1.n, s_);
     product(m16_, nullptr, w2, base, out, 1, nullptr);
     add_rows(out, alora_, w2.n, s_);
 }
@@ -1283,7 +1284,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     ensure(HW, n);
     rope_tables(h, w);
     // the patches through the embedder (each context's image rows the same at the start)
-    qi_to_f16(x, HW * TV, h16_, s_);
+    kernels::f32_to_f16_bulk(x, h16_, HW * TV, s_);
     product(h16_, nullptr, xemb_, nullptr, x_, HW, nullptr);
     for (int i = 1; i < n; ++i) gpu::copy_async(x_ + i * HW * C, x_, (size_t) (HW * C) * 4, s_);
     time_embedding(sigma);

@@ -904,7 +904,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         folder.id = "engine=" STRATA_VERSION "\n" + model_id + "\nmodel=" +
                     strata::core::conversation_file_identity(opt.gguf) + "\nkv_int8=" +
                     std::to_string((int) opt.kv_int8) + " kv_q4=" + std::to_string(opt.kv_q4) + " kv_ram=" +
-                    std::to_string((int) opt.kv_ram) + " cvec=" + std::to_string((unsigned long long) cvecs.digest) +
+                    std::to_string((int) opt.kv_ram) + " kv_page=" + std::to_string((long long) model.attn_shapes().page_size) +
+                    " cvec=" + std::to_string((unsigned long long) cvecs.digest) +
                     " split=";
         for (const int64_t k : model.split_points()) folder.id += std::to_string((long long) k) + ",";
         std::string ferr;

@@ -14,6 +14,8 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -143,12 +145,12 @@ int main(int argc, char** argv) {
                                              q16, k16, v16, s);
         };
         auto products_rest = [&]() {
-            strata::image::qi_to_f16(a, T * C, h16, s);
+            strata::kernels::f32_to_f16_bulk(a, h16, T * C, s);
             gemm.native(h16, wo.type, wo.d, q, T, wo.n, wo.k);
             strata::image::qi_gate_add(x, q, mod(1), n_text, T, C, s);
             strata::image::qi_ln_mod16(x, mod(2), n_text, T, C, h16, s);
             gemm.native(h16, wgu.type, wgu.d, gu, T, wgu.n, wgu.k);
-            strata::image::qi_swiglu16(gu, T, inter, h16, s);
+            strata::prefill::swiglu_pair(gu, gu + inter, h16, T, s, inter, 2 * inter);
             gemm.native(h16, wd.type, wd.d, q, T, wd.n, wd.k);
             strata::image::qi_gate_add(x, q, mod(3), n_text, T, C, s);
         };

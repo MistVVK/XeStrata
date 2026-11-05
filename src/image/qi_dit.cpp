@@ -14,6 +14,8 @@
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/q8_mma.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/prefill/kernels.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -430,7 +432,7 @@ void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64
         return;
     }
     product(h16_, wgu, gu_, mr);
-    qi_swiglu16(gu_, mr, inter_, h16_, s_);
+    prefill::swiglu_pair(gu_, gu_ + inter_, h16_, mr, s_, inter_, 2 * inter_);
     product(h16_, wdown, h_, mr);
     qi_gate_add(x, h_, gate, n_text, mr, C_, s_);
 }
@@ -520,7 +522,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
     n_text_ = n_pre;
     float* raw = q_;   // the encoder's states, then the projection's first product, then the projected rows
     put_async(raw, ctx, (size_t) (n_ctx * C_) * 4, s_);
-    qi_rms_norm16(raw, tnorm_, n_ctx, C_, h16_, s_);
+    kernels::rms_norm_rows(raw, tnorm_, 1, nullptr, h16_, (int) (C_), (int) (n_ctx), 1e-6f, s_);
     product(h16_, tin_, k_, n_ctx);
     qi_gelu16(k_, n_ctx * C_, h16_, s_);
     product(h16_, tout_, v_, n_ctx);

@@ -70,8 +70,10 @@ void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* s
 /// h16[n, r] = fp16(silu(gu[n, 2r]) * gu[n, 2r + 1])   (the interleaved expert gate/up)
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream);
 /// h16[n, r] = fp16(silu(g[n, r]) * u[n, r])   (the shared expert, gate and up separate, n rows of `width`: Qwen3.8's
-/// 640, qwen35moe's 512)
-void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640);
+/// 640, qwen35moe's 512; the image engine's blocks), FP16's range saturated; g's and u's rows `ld` apart (0: width),
+/// h16's width apart
+void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640,
+                 int64_t ld = 0);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// Gather rows: dst[i, :] = x[src[i], :] (n rows of `width` floats).
@@ -91,16 +93,12 @@ void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off
                      const float* u_w, int64_t n_u, float* acc, void* stream);
 
 // ---- QSA helpers
-/// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
-void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream);
 /// NEOX rotary on the first 64 dims of each head: x [T, heads, dim] at positions pos0 + t.  The rope
 /// scaling (rope_scaling.hpp) rides in as the process config - none is today's arithmetic exactly.
 void rope(float* x, int64_t T, int64_t heads, int64_t dim, int64_t ld, int64_t pos0,
           const strata::kernels::RopeScaling& scaling, void* stream);
 /// q_full [T, 24, 512] (q | gate per head) -> q [T, 24, 256]
 void split_q(const float* q_full, float* q, int64_t T, void* stream);
-/// attn[t, h, d] *= sigmoid(q_full[t, h, 256 + d]) -> out16 (fp16 bits: the o-projection is quantized)
-void gate_attn(const float* attn, const float* q_full, uint16_t* out16, int64_t T, void* stream);
 
 /// K and V of T consecutive cells (positions pos0..pos0+T-1; K normed and rotated) into the paged pools: FP16
 /// (`k_pool`/`v_pool`) or INT8 codes + FP16 scale per 64 (`k_q`...), the decode append's arithmetic.
@@ -110,8 +108,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
                void* stream, const strata::kernels::KvHostPools* host = nullptr,
                const strata::kernels::KvHostPools* stage = nullptr);
 
-/// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
-void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+/// fp32 -> bf16, n elements (the prompt GEMMs' BF16 activations; their FP16 ones: kernels::f32_to_f16_bulk).
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo = nullptr);
 /// bf16 -> fp16 bits, n elements, finite values past FP16's range saturated at +-65504 (Inf and NaN stay): exact for
 /// every value in FP16's normal range (Gemm::bf16 through FP16)

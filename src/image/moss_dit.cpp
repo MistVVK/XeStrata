@@ -14,6 +14,7 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -1306,7 +1307,7 @@ void MossDit::time_embedding(float timestep) {
     product(t16_, nullptr, t1_, nullptr, temb_, 1, b_t1_);
     qi_silu(temb_, C_, h16, s_);
     product(h16, nullptr, t2_, nullptr, temb_, 1, b_t2_);
-    qi_to_f16(temb_, C_, h16 + C_, s_);
+    kernels::f32_to_f16_bulk(temb_, h16 + C_, C_, s_);
     product(h16 + C_, nullptr, smod_, nullptr, mod_, 1, b_smod_);
     product(h16 + C_, nullptr, hmod_, nullptr, head_, 1, b_hmod_);
 }
@@ -1480,7 +1481,7 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
     ensure(HW, n, maxL);
     for (int i = 0; i < n; ++i) rope_tables(ctx_[i], h, w);
     // each context's rows: the image's input projection (the same rows in each), then its text embedder's rows
-    qi_to_f16(x, HW * in_ch_, h16_, s_);
+    kernels::f32_to_f16_bulk(x, h16_, HW * in_ch_, s_);
     product(h16_, nullptr, vin_, nullptr, x_, HW, b_vin_);
     for (int i = 0; i < n; ++i) {
         if (i > 0) gpu::copy_async(x_ + off[(size_t) i] * C, x_, (size_t) (HW * C) * 4, s_);
@@ -1567,7 +1568,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, bool text_start) {
     gpu::copy(ds, sv.data(), sv.size() * 4);
     int64_t o = 0;
     for (const RefLatent& f : refs) {
-        qi_to_f16(f.tokens, f.h * f.w * in_ch_, h16_ + o * in_ch_, s_);
+        kernels::f32_to_f16_bulk(f.tokens, h16_ + o * in_ch_, f.h * f.w * in_ch_, s_);
         o += f.h * f.w;
     }
     product(h16_, nullptr, vin_, nullptr, x_, R, b_vin_);

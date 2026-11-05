@@ -8,7 +8,11 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/prefill/kernels.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -136,9 +140,13 @@ void QiText::ensure(int64_t T) {
     h_ = alloc<float>(allocs_, T * C_);
     gu_ = alloc<float>(allocs_, T * 2 * inter_);
     h16_ = alloc<uint16_t>(allocs_, T * std::max({C_, inter_, qd}));
-    q16_ = alloc<uint16_t>(allocs_, T * qd);
-    k16_ = alloc<uint16_t>(allocs_, T * kv);
-    v16_ = alloc<uint16_t>(allocs_, T * kv);
+    // Q, K and V in FP16 hold their rows rounded up as the shared attention reads them (qi_attn_rows), zero at first
+    // (the rows past a prompt then hold an earlier prompt's values, finite, which the mask leaves out)
+    const int64_t TP = qi_attn_rows(T);
+    q16_ = alloc<uint16_t>(allocs_, TP * qd);
+    k16_ = alloc<uint16_t>(allocs_, TP * kv);
+    v16_ = alloc<uint16_t>(allocs_, TP * kv);
+    for (uint16_t* p : {q16_, k16_, v16_}) gpu::memset(p, 0, (size_t) (TP * (p == q16_ ? qd : kv)) * 2);
     rows_ = alloc<uint8_t>(allocs_, (int64_t) (T * (int64_t) embd_row_bytes_));
     cap_T_ = T;
 }
@@ -146,7 +154,8 @@ void QiText::ensure(int64_t T) {
 uint64_t QiText::activation_bytes(int64_t T) const {
     const int64_t kv = kv_heads_ * head_dim_, qd = heads_ * head_dim_;
     return (uint64_t) T * ((uint64_t) (2 * C_ + 2 * qd + 2 * kv + 2 * inter_) * 4 +
-                           (uint64_t) std::max({C_, inter_, qd}) * 2 + (uint64_t) (qd + 2 * kv) * 2 + embd_row_bytes_);
+                           (uint64_t) std::max({C_, inter_, qd}) * 2 + embd_row_bytes_) +
+           (uint64_t) qi_attn_rows(T) * (uint64_t) (qd + 2 * kv) * 2;
 }
 
 void QiText::drop_activations() {
@@ -314,7 +323,7 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
         const uint8_t* base = layers_stream_.begin(li);
         auto w = [base](const W& x) { return base + reinterpret_cast<uintptr_t>(x.d); };
         auto f = [base](uint64_t off) { return reinterpret_cast<const float*>(base + off); };
-        qi_rms_norm16(x_, f(l.attn_norm), T, C_, h16_, s_);
+        kernels::rms_norm_rows(x_, f(l.attn_norm), 1, nullptr, h16_, (int) (C_), (int) (T), 1e-6f, s_);
         gemm_.native(h16_, l.q.type, w(l.q), q_, T, l.q.n, l.q.k);
         gemm_.native(h16_, l.k.type, w(l.k), k_, T, l.k.n, l.k.k);
         gemm_.native(h16_, l.v.type, w(l.v), v_, T, l.v.n, l.v.k);
@@ -333,19 +342,35 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
             qi_repeat_kv16(v16_, T, heads_, kv_heads_, head_dim_, vx, s_);
             done = qi_sdpa(q16_, kx, vx, 0, T, T, heads_, head_dim_, h16_, s_, true);
         }
+        if (!done) {   // the attention the plain models' prompt shares (flash_attn.hpp), on the matrix engines
+            kernels::FlashAttnArgs fa;
+            fa.q = q16_;
+            fa.q_ld = heads_ * head_dim_;
+            fa.k = k16_;
+            fa.v = v16_;
+            fa.kv_ld = kv_heads_ * head_dim_;
+            fa.n_head = heads_;
+            fa.n_kv = kv_heads_;
+            fa.head_dim = head_dim_;
+            fa.rows = fa.keys = fa.n_causal = fa.row_end = T;
+            fa.out = h16_;
+            fa.out_ld = heads_ * head_dim_;
+            fa.scale = 1.0f / std::sqrt((float) head_dim_);
+            done = kernels::flash_attn(fa, s_);
+        }
         if (!done) {
             qi_attention_causal(q16_, k16_, v16_, T, heads_, kv_heads_, head_dim_, a_, s_);
-            qi_to_f16(a_, T * heads_ * head_dim_, h16_, s_);
+            kernels::f32_to_f16_bulk(a_, h16_, T * heads_ * head_dim_, s_);
         }
         gemm_.native(h16_, l.o.type, w(l.o), h_, T, l.o.n, l.o.k);
         lora_add(l.o, h16_, T, h_, l.o.n);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);
-        qi_rms_norm16(x_, f(l.ffn_norm), T, C_, h16_, s_);
+        kernels::rms_norm_rows(x_, f(l.ffn_norm), 1, nullptr, h16_, (int) (C_), (int) (T), 1e-6f, s_);
         gemm_.native(h16_, l.gate.type, w(l.gate), gu_, T, l.gate.n, l.gate.k, 2 * inter_);
         gemm_.native(h16_, l.up.type, w(l.up), gu_ + inter_, T, l.up.n, l.up.k, 2 * inter_);
         lora_add(l.gate, h16_, T, gu_, 2 * inter_);
         lora_add(l.up, h16_, T, gu_ + inter_, 2 * inter_);
-        qi_swiglu16(gu_, T, inter_, h16_, s_);
+        prefill::swiglu_pair(gu_, gu_ + inter_, h16_, T, s_, inter_, 2 * inter_);
         gemm_.native(h16_, l.down.type, w(l.down), h_, T, l.down.n, l.down.k);
         lora_add(l.down, h16_, T, h_, l.down.n);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);

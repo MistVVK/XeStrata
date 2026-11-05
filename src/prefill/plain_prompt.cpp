@@ -767,7 +767,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             k::xmx_gemm_grouped(P.xs16, P.dq_gu, P.gu_elems, P.gu, dbnd, G, max_rows, 2 * FF, N, cs);
         // gate rows then up rows (the GGUF order): h = silu(gate) * up, then FP16 for the down product
         prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, /*interleaved=*/false, cs);
-        prefill::to_f16(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
+        kernels::f32_to_f16_bulk(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
         if (!prefill::Gemm::f16_groups(P.h16, P.dq_d, P.d_elems, P.dm, hbnd, G, N, FF, cs))
             k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, max_rows, N, FF, cs);
     }
@@ -980,15 +980,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const int64_t E = s.n_expert, K = s.n_expert_used;
     const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
-    const k::QsaShapes qs = [&] {
-        k::QsaShapes q = k::qsa_real_shapes();
-        q.n_head = NH; q.n_head_kv = NKV; q.head_dim = HD; q.n_rot = s.rope_dims;
-        return q;
-    }();
+    const k::QsaShapes qs = attn_shapes();
     const k::RopeScaling& rs = k::rope_scaling();
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
-    auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
+    auto f16 = [&](const float* x, int64_t rows, int64_t cols) { kernels::f32_to_f16_bulk(x, P.x16, rows * cols, cs); };
     // a dense product from float rows x (ldx a row) in int8 below dense_native_rows_ rows where the weight is the int8
     // products'; false: the caller takes Gemm::native from the FP16 copy
     const bool dense_on = dense_int8_env() && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8

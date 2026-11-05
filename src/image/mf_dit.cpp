@@ -15,6 +15,8 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -1164,7 +1166,7 @@ void MfDit::set_context(int i, const float* states, int64_t rows) {
     float* x = alloc<float>(allocs_, rows * txt_dim_);
     uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_);
     gpu::copy(x, states, (size_t) (rows * txt_dim_) * 4);
-    qi_rms_norm16(x, txt_norm_, rows, txt_dim_, x16, s_);
+    kernels::rms_norm_rows(x, txt_norm_, 1, nullptr, x16, (int) (txt_dim_), (int) (rows), 1e-6f, s_);
     c.txt0 = alloc<float>(allocs_, rows * C_);
     product(x16, nullptr, txt_in_, nullptr, c.txt0, rows, b_txt_in_);
     gpu::stream_sync(s_);
@@ -1189,7 +1191,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
         gpu::copy_async(xin_ + TW * in_ch_, refs_, (size_t) (ref_rows_ * in_ch_) * 4, s_);
         x = xin_;
     }
-    qi_to_f16(x, HW * in_ch_, h16_, s_);
+    kernels::f32_to_f16_bulk(x, h16_, HW * in_ch_, s_);
     product(h16_, nullptr, img_in_, nullptr, img_, HW, b_img_in_);
     for (int i = 1; i < n; ++i) gpu::copy_async(img_ + i * HW * C, img_, (size_t) (HW * C) * 4, s_);
     std::vector<int64_t> toff(2, 0);
