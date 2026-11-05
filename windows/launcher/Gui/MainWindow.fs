@@ -575,7 +575,7 @@ type MainWindow() as this =
                 Content =
                     stack 2.0 [
                         text "EXPERIMENTAL - speed projection (off unless you choose it)"
-                        muted "A small control vector applied while the model runs (layers 4-44). It changes how the model answers: its package describes it as a refusal-direction projection (the model declines far fewer requests). When on, the web app can switch it off per chat."
+                        muted "A small control vector applied while the model runs (layers 4-44). It changes how the model answers: its package describes it as a refusal-direction projection (the model declines far fewer requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or huihui-ai's abliterated version as the model instead (the refusals removed in its weights)."
                     ]
             )
         let vector = TextBox(PlaceholderText = "(optional) another control vector, a GGUF file", MinWidth = 420.0)

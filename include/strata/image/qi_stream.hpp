@@ -12,7 +12,8 @@
 //
 // Where a streamed layer's copy reads from is measured when streaming starts, once a process (Source):
 //   - the file's pages themselves, when the GPU's copies from pageable memory run near its copies from page-locked
-//     memory (the runtime stages them well): nothing is held in RAM for the layers;
+//     memory (the runtime stages them well): nothing is held in RAM for the layers.  Not measured where the GPU's
+//     copies cannot read the file's pages at all (gpu::copies_read_mapped_files: Level Zero);
 //   - else page-locked memory: the layer's own copy in host USM (its home), filled on its first pass and kept while
 //     streaming lasts, so the later passes are a DMA alone;
 //   - else (no home) a page-locked relay of the largest layer per slot, filled on several threads from the file's

@@ -190,7 +190,7 @@ class QuietWaitPolicy(unittest.TestCase):
             gen = engine.generate([], 10, {}, threading.Event())
             with self.assertRaises(server.EngineSilent):
                 next(gen)                  # must fail before yielding an overdue heartbeat to a slow consumer
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
         self.assertNotIn('STOP', engine.proc.stdin.getvalue())
 
     def test_polling_keeps_ten_second_heartbeats(self):

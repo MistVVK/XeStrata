@@ -86,6 +86,11 @@ inline bool device_pointer(void** d, const void* h) {
 /// nor a registration, which is for copies only.
 bool kernels_read_host(const void* p);
 bool kernels_read_registered();
+/// Whether the current GPU's copies can read a mapped file's pages in place (neither USM nor registered).  Not a Level
+/// Zero GPU's: the B70's copies of HunyuanImage 3.0's streamed layers from the model file's pages hung on the compute
+/// queue and faulted the copy engine (bcs: Engine memory CAT error, DEVICE_LOST; compute-runtime 26.31 on Linux 7.0's
+/// xe, 2026-11-05), where the same layers from page-locked memory passed.
+bool copies_read_mapped_files();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);

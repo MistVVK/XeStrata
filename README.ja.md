@@ -126,7 +126,8 @@ BETA のモデルは、画像の生成にまだ対応していません。画像
 | Gyro | **Gyro-L** | 108 GB | 59 GB（RAM と VRAM で 61 GB） | Gyro-M より遅い。Gyro の中でいちばん良い |
 | Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB（RAM と VRAM で 37 GB） | Gyro-M より遅い。コードでは良く、ほかは弱い |
 | Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB（RAM と VRAM で 28 GB） | Gyro-M くらいの速さ。Gyro-Coder-L より低い |
-| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い。IQ3_S より良い |
+| Unsloth | **UD-Q2_0**、**UD-IQ2_XS**、**UD-Q2_K_XL**、**UD-IQ3_XXS**、**UD-Q3_K_XL** | 71〜90 GB | 48 GB | Unsloth Dynamic v3.1 の 2〜3 ビット。RAM が約 61〜80 GB より少ないと遅い |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 84 GB より少ないと遅い。IQ3_S より良い |
 | Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | RAM 64 GB の PC では遅い。さらに良い |
 | Unsloth（実験的） | **UD-Q5_K_XL**、**UD-Q6_K_XL**、**Q8_0** | 158〜188 GB | 108〜136 GB | RAM の多い PC 向け。Q8_0 が元のモデルにいちばん近い |
 | AtomicChat | **AD-4.27bpw**、**AD-5.00bpw** | 94・110 GB | 61 GB | IQ3_S と同じくらいの速さと品質 |
@@ -140,13 +141,14 @@ BETA のモデルは、画像の生成にまだ対応していません。画像
   UD-Q4_K_XL より大きなものは実験的で、XeStrata では動かしていません。
 - **[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)**: Swift 1.5（IQ2_XS、IQ3_XXS）と Unsloth（UD-IQ4_XS、UD-Q4_K_XL、Q8_0）から拒否の方向を取り除いた版です。
   安全のための抑えも弱まっているので、書いたものを確かめてください。
+- **[SC117 の abliterated 版](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)**: 元のモデルの 4 つの大きさ（Q2_0、IQ2_XS、IQ3_XXS、IQ3_S）に、OrcaRouter の拒否を取り除いた重みを移した版です。[Swift 1.5 の版](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)もあります。
+  安全のための抑えも弱まっているので、書いたものを確かめてください。
 - **[AtomicChat](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF)**: AtomicChat による量子化です。エキスパートは IQ3_S と同じくらいの大きさで、n-gram の表が 5 ビット（AD-4.27bpw）か 8 ビット（AD-5.00bpw）です。2 つの答えの品質はほぼ同じです。
   AD-3.84bpw は、エキスパートの一部が XeStrata のカーネルにない形式（MXFP4）なので入れられません。
 
 モデルのエキスパート（[しくみ](#しくみ)）は、すべて RAM に置きます。RAM が目安より少なくても、GPU の VRAM が大きければ
 **省 RAM モード**で動きます（[詳細](docs/DETAILS.ja.md#ram-がモデルより少ないとき省-ram-モード)）。
 版ごとの説明は [DETAILS](docs/DETAILS.ja.md#モデルの選び方) にあります。
-OrcaRouter の Flash-Next Uncensored IQ3_XXS は setup のメニューにはなく、変換の手順は [ORCA](docs/ORCA.ja.md) にあります。
 モデルのファイルには、それぞれのライセンスが適用されます。
 
 ### 画像の生成（任意）
@@ -377,12 +379,13 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) による圧縮版と、
      [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)。
    - UkisAI による [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
-   - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
+   - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-Q2_0〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
    - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) と [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
+   - SC117 による [abliterated 版](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)と [Swift 1.5 の abliterated 版](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)（拒否を取り除いた重みは OrcaRouter のもの）。
    - AtomicChat による [AD-4.27bpw と AD-5.00bpw](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj、[拒否を外した版](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)は dealignai）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
-     Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
+     Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（[拒否を外した版](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)は llmfan46 の重みを SC117 が量子化）、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、akhaliq の MOSS-Image-Edit-HQ）、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base、Detailer の検出器の Bingsu の adetailer（Ultralytics YOLOv8 で学習）（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 

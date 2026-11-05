@@ -112,6 +112,7 @@
 // warm_up_request.
 
 #include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
 #include "strata/image/anima_pipeline.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
@@ -834,6 +835,7 @@ int serve(si::ImagePipeline& p) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    strata::core::route_stop_signals();   // a stop signal ends the engine after its GPU queues are drained
     // oneMath's rocBLAS backend times hipBLASLt's first algorithms on a shape's first product and keeps the fastest:
     // an image model's few shapes repeat every step (RX 9060 XT: its int8 products 20 to 40% faster), where the text
     // engine's change with each prompt (it leaves the timing off)

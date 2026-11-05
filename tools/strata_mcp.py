@@ -52,21 +52,43 @@ CONFIG = "xestrata-"                                  # setup's run configs: xes
 # What setup.py offers, used only when setup.py cannot be imported (the numbers are setup's MODELS / FAMILIES /
 # CONTEXTS; tools/test_strata_mcp.py checks they still match).
 FALLBACK_MODELS = {
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
+             "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift")},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift")},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
-    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
-                           "less than ~80 GB of RAM part of its experts are read from the SSD",
-                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth", "huihui-unsloth"),
+    "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
+                         "with less than ~61 GB of RAM part of its experts are read from the SSD",
+                "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
+                "vision": True},
+    "UD-IQ2_XS": {"about": "2-bit i-quant (Unsloth Dynamic v3.1), experts about the GSQ-RCO IQ3_XXS's size; on a PC "
+                           "with less than ~66 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 75.8, "ram_gb": 48, "arena_gb": 42.3, "families": ("unsloth",), "budget": True,
+                  "vision": True},
+    "UD-Q2_K_XL": {"about": "2- to 3-bit (Unsloth Dynamic v3.1), experts between the GSQ-RCO IQ3_XXS and IQ3_S in "
+                            "size; on a PC with less than ~70 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 79.6, "ram_gb": 48, "arena_gb": 46.0, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-IQ3_XXS": {"about": "3-bit i-quant (Unsloth Dynamic v3.1), experts the GSQ-RCO IQ3_S's size; on a PC with "
+                            "less than ~74 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 83.6, "ram_gb": 48, "arena_gb": 50.3, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-Q3_K_XL": {"about": "3-bit (Unsloth Dynamic v3.1), experts between IQ3_S and UD-IQ4_XS in size; on a PC with "
+                            "less than ~80 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 89.5, "ram_gb": 48, "arena_gb": 56.2, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic v3.1), between IQ3_S and UD-Q4_K_XL in quality; on a PC "
+                           "with less than ~84 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 60.4, "families": ("unsloth", "huihui-unsloth"),
                   "budget": True, "vision": True},
-    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
-                            "experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
+    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic v3.1), EXPERIMENTAL: the best quality, but on a 64 GB PC part of "
+                            "its experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth", "huihui-unsloth"),
                    # upstream #967: images allowed (setup warns: untested)
                    "budget": True, "experimental": True, "vision": True},
@@ -107,9 +129,9 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB "
-                                                                  "of RAM part of its experts are read from the SSD "
-                                                                  "(UD-Q4_K_XL, 111 GB: experimental)",
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB "
+                                                                  "downloads) and 5 to 8 bits; with too little RAM "
+                                                                  "part of the experts are read from the SSD",
                 "tag": "unsloth-", "vision": False},
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)",
              "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
@@ -126,6 +148,13 @@ FALLBACK_FAMILIES = {
                        "about": "Qwen3.8-Flash-Next with its refusals removed (abliteration), as Unsloth's 4- and "
                                 "8-bit files: far fewer refusals, and its safety filtering is reduced, so check what "
                                 "it writes", "tag": "huihui-unsloth-", "vision": False},
+    "sc117": {"title": "Qwen3.8-Flash-Next GSQ-RCO (abliterated)",
+              "about": "the original's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer "
+                       "refusals, and its safety filtering is reduced, so check what it writes", "tag": "sc117-"},
+    "sc117-swift": {"title": "Swift 1.5 GSQ-RCO (abliterated)",
+                    "about": "Swift 1.5's four sizes with OrcaRouter's refusal removal (abliteration) put in: far "
+                             "fewer refusals, and its safety filtering is reduced, so check what it writes",
+                    "tag": "sc117-swift-"},
     "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)",
                    "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table "
                             "at 5 or 8 bits; 94 and 110 GB downloads", "tag": "atomicchat-"},
@@ -139,6 +168,10 @@ FALLBACK_FAMILIES = {
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
                                                     "4-, 6- and 8-bit files", "tag": "qwen36-"},
+    "qwen36-uncensored": {"title": "Qwen3.6-35B-A3B (uncensored)",
+                          "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, "
+                                   "and its safety filtering is reduced, so check what it writes",
+                          "tag": "qwen36-uncensored-"},
     "qwen35": {"title": "Qwen3.5-9B",
                "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
                "tag": "qwen35-"},

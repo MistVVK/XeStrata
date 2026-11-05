@@ -2381,37 +2381,6 @@ void install_fatal_signals() {
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) (void) sigaction(sig, &sa, nullptr);
 #endif
 }
-// SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
-// compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
-// other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
-// stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
-void route_stop_signals() {
-#if defined(_WIN32)
-    // Windows has no signal masks; Ctrl+C reaches a thread of its own already, and the server ends the engine with
-    // taskkill, not a signal
-#else
-    sigset_t set;
-    sigemptyset(&set);
-    sigaddset(&set, SIGTERM);
-    sigaddset(&set, SIGINT);
-    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
-    // The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when
-    // the process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended
-    // as everyday use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as
-    // well (the runtime's own copies), and none once drained, 2026-10-15.
-    std::thread([set] {
-        int sig = 0;
-        while (sigwait(&set, &sig) != 0) {}
-        std::thread([sig] {
-            std::this_thread::sleep_for(std::chrono::seconds(5));
-            _exit(128 + sig);
-        }).detach();
-        strata::core::Runtime::finish_all();
-        _exit(128 + sig);
-    }).detach();
-#endif
-}
-
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -2419,7 +2388,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
-    route_stop_signals();
+    strata::core::route_stop_signals();
     strata::core::progress_at("starting: reading the options and opening the GPUs");
     // `strata --version` / `-V` (also `strata generate --version`): the version and nothing else, before any GPU is
     // touched (upstream b7dd070d)

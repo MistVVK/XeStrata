@@ -250,6 +250,11 @@ void LayerStream::choose_source(Slot& s) {
         }
     }
     std::lock_guard<std::mutex> g(g_from_file_mu);
+    if (g_from_file < 0 && !gpu::copies_read_mapped_files()) {   // not measured: the measurement's copy is the fault
+        g_from_file = 0;
+        std::fprintf(stderr, "image engine (layers): a streamed layer is copied from page-locked memory (this GPU's "
+                             "copies do not read the file's pages)\n");
+    }
     if (g_from_file < 0) {
         // the largest streamed layer, both ways, the best of two each: its pages read first (the relay's fill), so
         // the copy from the file's pages finds them in the cache as a pass does

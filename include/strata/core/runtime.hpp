@@ -23,6 +23,9 @@ bool device_free_memory(const sycl::device& d, uint64_t& free);
 /// The version of the Intel Graphics Compiler whose GEP simplification the runtime turned off for the engine's
 /// Level Zero GPU ("2.28.4"; "unknown" when the library carries none), empty when it did not (src/core/device.cpp).
 std::string compiler_workaround();
+/// Ends the process on SIGTERM and SIGINT after the GPUs' queues are drained (at most 5 s), on a thread of its own; called
+/// first in main, before any thread exists (src/core/device.cpp).
+void route_stop_signals();
 
 // One runtime per engine device: its context owns its queues and every USM allocation made on it. Cross-queue
 // consumers must depend on the producer event; in-order applies within a queue.  Device 0 is the GPU find_devices

@@ -5105,7 +5105,7 @@ class SilentEngine(unittest.TestCase):
             next(gen)
         self.assertIsInstance(cm.exception, EngineDied)          # every EngineDied path handles it
         self.assertLess(time.monotonic() - t0, 5)
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
         self.assertFalse(engine.alive())                          # the next request restarts it
         self.assertIn("#481", engine.death_note())
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
@@ -5129,14 +5129,14 @@ class SilentEngine(unittest.TestCase):
         engine.lines.put("PP 100 300 1000 100.0")
         self.later(engine, 1.0, "PP 200 300 2000 100.0", "T 7", "DONE 1 300 2000 1 length")
         self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [None, None, 7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_long_first_chunk_is_allowed(self):
         # 100 prompt tokens at the slowest prompt reading (50 tok/s): 2 s on top of the silence before the first PP
         engine = self.bare(0.3)
         self.later(engine, 1.0, "PP 100 100 1000 100.0", "DONE 0 100 1000 0 length")
         self.assertEqual(list(engine.generate([1] * 100, 10, {}, threading.Event())), [None])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_stop_never_acknowledged(self):
         from serve.server import EngineSilent
@@ -5147,7 +5147,7 @@ class SilentEngine(unittest.TestCase):
         with self.assertRaises(EngineSilent):
             gen.close()                                           # the consumer stopped: STOP, then the drain
         self.assertIn("STOP", engine.proc.stdin.getvalue())
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
         self.assertFalse(engine.alive())
 
     def test_frozen_engine_is_ended_by_the_stall_watchdog(self):
@@ -5165,7 +5165,7 @@ class SilentEngine(unittest.TestCase):
                 next(gen)
         self.assertLess(time.monotonic() - t0, 10)
         self.assertIn("frozen", str(cm.exception))
-        engine.proc.kill.assert_called_once()
+        engine.proc.terminate.assert_called_once()   # SIGTERM first: the engine drains its GPU queues
 
     def test_a_working_silent_engine_is_not_ended_by_the_stall_watchdog(self):
         from serve import server
@@ -5175,7 +5175,7 @@ class SilentEngine(unittest.TestCase):
         self.later(engine, 3.0, "T 7", "DONE 1 1 1 1 length")
         with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
             self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_a_busy_gpu_is_not_a_frozen_engine(self):
         # #1317: no CPU and no disk, but the GPU is at work (a long prompt chunk on a slow card): not ended
@@ -5186,7 +5186,7 @@ class SilentEngine(unittest.TestCase):
         self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
         with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
             self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-        engine.proc.kill.assert_not_called()
+        engine.proc.terminate.assert_not_called()
 
     def test_no_reading_means_no_kill_and_zero_is_off(self):
         from serve import server
@@ -5196,7 +5196,7 @@ class SilentEngine(unittest.TestCase):
             self.later(engine, 2.5, "T 7", "DONE 1 1 1 1 length")
             with mock.patch.object(server, "ENGINE_STALL_S", stall):
                 self.assertEqual(list(engine.generate([1], 10, {}, threading.Event())), [7])
-            engine.proc.kill.assert_not_called()
+            engine.proc.terminate.assert_not_called()
 
     def test_engine_frozen_samples(self):
         from serve.server import engine_frozen
@@ -5852,6 +5852,8 @@ class LazyVision(unittest.TestCase):
             def kill(self):
                 self.killed = True
 
+            terminate = kill                            # ends as an engine ends on SIGTERM
+
             def wait(self, timeout=None):
                 return 0
 
@@ -5888,8 +5890,13 @@ class LazyVision(unittest.TestCase):
             class P:
                 stdin, stdout, killed = io.StringIO(), io.StringIO("oops" + chr(10)), False
 
+                def poll(self):
+                    return 0 if P.killed else None
+
                 def kill(self):
                     P.killed = True
+
+                terminate = kill                        # ends as an engine ends on SIGTERM
 
                 def wait(self, timeout=None):
                     return 0
@@ -5925,6 +5932,8 @@ class VisionShutdown(unittest.TestCase):
 
                 def kill(self):
                     pass
+
+                terminate = kill
 
             v.proc = Proc()
             v.close()
@@ -6088,7 +6097,8 @@ class UntimedReads(unittest.TestCase):
         v.dir, v.lock, v.cache, v.dead = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}, \
             None
         v.stopped = False
-        v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, wait=silent.wait,
+        v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
+                                 wait=silent.wait,
                                  poll=lambda: 1 if silent.killed else None)
         v.lines = queue.Queue()
         threading.Thread(target=server.Vision._read, args=(v.proc, v.lines), daemon=True).start()
@@ -6115,8 +6125,8 @@ class UntimedReads(unittest.TestCase):
     def test_vision_ready_read_times_out(self):
         import serve.server as server
         silent = self.Silent()
-        proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, wait=silent.wait,
-                               poll=lambda: None)
+        proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
+                               wait=silent.wait, poll=lambda: None)
         v = server.Vision.__new__(server.Vision)
         v.spawn = (["strata-vision"], None, None)
         v.dir = Path(tempfile.mkdtemp(prefix="strata-vision-test-"))

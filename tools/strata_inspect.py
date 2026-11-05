@@ -48,6 +48,11 @@ KNOWN = [
      "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS"),
     ("swift", "IQ3_S", "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF", "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S"),
     ("coder", "IQ1_M", "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF", "IQ1_M/"),
+    ("unsloth", "UD-Q2_0", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_0/"),
+    ("unsloth", "UD-IQ2_XS", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ2_XS/"),
+    ("unsloth", "UD-Q2_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL/"),
+    ("unsloth", "UD-IQ3_XXS", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ3_XXS/"),
+    ("unsloth", "UD-Q3_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q3_K_XL/"),
     ("unsloth", "UD-IQ4_XS", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ4_XS/"),
     ("unsloth", "UD-Q4_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q4_K_XL/"),
     ("unsloth", "UD-Q5_K_XL", "unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q5_K_XL/"),
@@ -56,8 +61,9 @@ KNOWN = [
     ("atomicchat", "AD-4.27bpw", "AtomicChat/Qwen3.8-Flash-Next-GGUF", "Qwen3.8-Flash-Next-AD-4.27bpw-"),
     ("atomicchat", "AD-5.00bpw", "AtomicChat/Qwen3.8-Flash-Next-GGUF", "Qwen3.8-Flash-Next-AD-5.00bpw-"),
 ]
-# the repositories KNOWN reads from Hugging Face (not on ModelScope)
-HF_ONLY = {"AtomicChat/Qwen3.8-Flash-Next-GGUF"}
+# the repositories KNOWN reads from Hugging Face (not on ModelScope, or behind there: Unsloth's v3.1 of 2026-11-04 had
+# no UD-Q2_0 or UD-IQ2_XS on ModelScope on 2026-11-05)
+HF_ONLY = {"AtomicChat/Qwen3.8-Flash-Next-GGUF", "unsloth/Qwen3.8-Flash-Next-GGUF"}
 
 
 def read_headers(files: list) -> tuple[str | None, list[dict]]:

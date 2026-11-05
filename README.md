@@ -130,7 +130,8 @@ The size: the same model, compressed more or less.
 | Gyro | **Gyro-L** | 108 GB | 59 GB (61 GB of RAM and VRAM) | slower than Gyro-M; the best of the Gyro sizes |
 | Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB (37 GB of RAM and VRAM) | slower than Gyro-M; good at code, weaker elsewhere |
 | Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB (28 GB of RAM and VRAM) | about Gyro-M's speed; below Gyro-Coder-L |
-| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 80 GB of RAM; better than IQ3_S |
+| Unsloth | **UD-Q2_0**, **UD-IQ2_XS**, **UD-Q2_K_XL**, **UD-IQ3_XXS**, **UD-Q3_K_XL** | 71-90 GB | 48 GB | Unsloth Dynamic v3.1's 2 to 3 bits; slow with less than about 61-80 GB of RAM |
+| Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | slow with less than about 84 GB of RAM; better than IQ3_S |
 | Unsloth (experimental) | **UD-Q4_K_XL** | 111 GB | 48 GB | slow on a 64 GB PC; better still |
 | Unsloth (experimental) | **UD-Q5_K_XL**, **UD-Q6_K_XL**, **Q8_0** | 158-188 GB | 108-136 GB | for PCs with a lot of RAM; Q8_0 the closest to the original model |
 | AtomicChat | **AD-4.27bpw**, **AD-5.00bpw** | 94, 110 GB | 61 GB | about IQ3_S's speed and quality |
@@ -144,13 +145,14 @@ The size: the same model, compressed more or less.
   Those larger than UD-Q4_K_XL are experimental and have not been run in XeStrata.
 - **[huihui-ai's abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF):** Swift 1.5 (IQ2_XS, IQ3_XXS) and Unsloth's (UD-IQ4_XS, UD-Q4_K_XL, Q8_0) with the refusal direction removed.
   Their safety filtering is weaker too, so check what they write.
+- **[SC117's abliterated versions](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF):** the original's four sizes (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) with OrcaRouter's weights, which have the refusals removed, put in; [Swift 1.5's](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) too.
+  Their safety filtering is weaker too, so check what they write.
 - **[AtomicChat](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF):** AtomicChat's quantization. The experts are about IQ3_S's size, and the n-gram table is 5-bit (AD-4.27bpw) or 8-bit (AD-5.00bpw); the two answer at much the same quality.
   AD-3.84bpw cannot be installed: part of its experts are stored in a format XeStrata's kernels do not read (MXFP4).
 
 All of the model's experts ([How it works](#how-it-works)) are kept in RAM. With less RAM than that but a GPU with a
 lot of VRAM, it runs in the **low-RAM mode** ([details](docs/DETAILS.md#less-ram-than-the-model-the-low-ram-mode)).
 Each version is described in [DETAILS](docs/DETAILS.md#which-model).
-OrcaRouter's Flash-Next Uncensored IQ3_XXS is not in setup's menu; how to convert it is in [ORCA](docs/ORCA.md).
 Each model's own license applies to its files.
 
 ### Image generation (optional)
@@ -393,12 +395,13 @@ permission under GPL section 7, what goes in, and how to report).
    - compressed versions and the [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF) by
      [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
    - [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF), by UkisAI;
-   - UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF);
+   - UD-Q2_0 to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0, by [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF);
    - [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) and [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), by agentionai;
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai;
+   - the [GSQ-RCO abliterated versions](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) and [those of Swift 1.5](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF), by SC117 (the weights with the refusals removed are OrcaRouter's);
    - [AD-4.27bpw and AD-5.00bpw](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF), by AtomicChat;
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj, the [version with its refusals removed](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF) by dealignai), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
-     [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
+     [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the [version with its refusals removed](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF) llmfan46's, quantized by SC117) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, akhaliq's MOSS-Image-Edit-HQ), CircleStone Labs' Anima with Wan 2.1's VAE, Qwen3-VL, Qwen3.5-9B and Qwen3-0.6B-Base as the text encoders, and Bingsu's adetailer (trained with Ultralytics YOLOv8) as the Detailer's detectors ([IMAGE](docs/IMAGE.md#licenses)).
 

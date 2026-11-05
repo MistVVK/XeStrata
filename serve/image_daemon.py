@@ -165,7 +165,13 @@ class Daemon:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            # SIGTERM first: strata-image drains its GPU queues on it before it exits (at most 5 s); a SIGKILL alone
+            # left a copy running that read unmapped memory (the B70: an engine memory fault and a reset)
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 def write(f, line: str) -> None:

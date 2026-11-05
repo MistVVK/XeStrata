@@ -77,6 +77,7 @@ from serve import places  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
+from serve import kernel_check  # noqa: E402
 from serve import release_check  # noqa: E402
 from serve import loop_guard  # noqa: E402
 from serve import debuglog  # noqa: E402
@@ -553,6 +554,24 @@ DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
                    "script) or --draft-vocab en (English and code, ~215 MiB less than the default). Run "
                    f"{SETUP_CMD} --draft-vocab en once and the model keeps it; or a smaller --context in setup.")
+
+
+def end_gpu_process(proc, grace: float = 10.0) -> None:
+    """End a GPU process the server cannot wait for: SIGTERM first, on which the engines drain their GPU queues before
+    they exit (at most 5 s: route_stop_signals in src/core/device.cpp), then SIGKILL when it is still there after
+    `grace`.  A SIGKILL alone left a copy running that read memory the exit had unmapped: on the B70 (xe) an engine
+    memory fault, a reset of the copy engine, and once a GPU wedged until a reboot."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+    except OSError:
+        pass
 
 
 def exit_text(rc: int | None) -> str:
@@ -1095,10 +1114,7 @@ class StrataEngine:
         loading.set()
         if self.max_context <= 0:
             if timed_out or start_err is not None:      # still loading, hung or failed: end it, so the turn is not held
-                try:
-                    self.proc.kill()
-                except OSError:
-                    pass
+                end_gpu_process(self.proc)
             try:                                        # its pipes and our handle on its log (the log stays)
                 self.proc.wait(timeout=5)
                 if self.proc.stdin is not None:
@@ -2511,9 +2527,9 @@ class StrataEngine:
                             "the end of the engine log to an issue at github.com/MistVVK/XeStrata/issues.")
         self.ended = True                               # not alive from now: the next request restarts it
         proc = self.proc
+        end_gpu_process(proc)
         try:
             if proc is not None:
-                proc.kill()
                 proc.wait(timeout=20)                       # restart() -> close() handles one that is still exiting
         except (OSError, AttributeError, subprocess.TimeoutExpired):
             pass
@@ -2547,8 +2563,8 @@ class StrataEngine:
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
+            end_gpu_process(proc)
             try:
-                proc.kill()
                 proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
@@ -2849,10 +2865,7 @@ class Vision:
         """Start the encoder again after an unload; the cache of encoded images is kept.  RuntimeError when it does
         not start (it is then marked dead, so images are off until the server restarts)."""
         if self.proc is not None:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
+            end_gpu_process(self.proc)
             self._close_stdin()
         try:
             self._start()
@@ -2877,7 +2890,7 @@ class Vision:
         proc = self.proc
         try:
             if proc is not None:
-                proc.kill()
+                end_gpu_process(proc)
                 proc.wait(timeout=10)
         except Exception:
             pass
@@ -3071,7 +3084,7 @@ class Vision:
                 self.proc.stdin.flush()
                 self.proc.wait(timeout=10)
             except Exception:
-                self.proc.kill()
+                end_gpu_process(self.proc)
         self._close_stdin()
 
     def close(self):
@@ -3794,6 +3807,7 @@ class Service:
         self.split_pci: list | None = None   # a layer split's other cards (the Monitor reads them too)
         self.gpu_roles: list | None = None   # every engine's cards and their roles (gpu_roles; the Monitor's tabs)
         self.updates = release_check.Checker()           # GET/POST /update: whether a newer release is out
+        self.xe_kernel: str | None = None   # a kernel whose xe driver lacks a fix (serve/kernel_check.py; the web app)
         self.status_lock = threading.Lock()
         self.mcp: McpHub | None = None                   # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
@@ -4582,7 +4596,7 @@ class Service:
                 "script_guard": dict(self.script_guard_counts, default=script_guard_name(self.script_guard)),
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now,
-                "engine_failure": self.engine_failure}
+                "engine_failure": self.engine_failure, "xe_kernel": self.xe_kernel}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -10361,6 +10375,12 @@ def main() -> int:
             print(f"       from other devices: http://{address}:{a.port}/", flush=True)
         if not svc.api_key:
             print("       WARNING: " + open_server_warning(a.port, tools=svc.mcp is not None), flush=True)
+
+    def check_kernel():                                 # Debian's debsecan asks the security tracker: off the start
+        svc.xe_kernel = kernel_check.unfixed_release()
+        if svc.xe_kernel:
+            print("[strata] WARNING: " + kernel_check.text(svc.xe_kernel), flush=True)
+    threading.Thread(target=check_kernel, daemon=True, name="kernel-check").start()
     if release_check.enabled():                         # at the start and every six hours, said here once
         svc.updates.watch(lambda line: print("[strata] " + line, flush=True))
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older

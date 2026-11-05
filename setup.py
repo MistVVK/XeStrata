@@ -75,7 +75,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from serve import places, release_check
+from serve import kernel_check, places, release_check
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
@@ -101,16 +101,21 @@ HF_REVISIONS = {
     # 2026-10-07: the commit that adds Swift's IQ3_S (upstream e193161de)
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": "5348543e0147355ac9cbcb031184a3546350988e",  # 2026-09-29
-    "unsloth/Qwen3.8-Flash-Next-GGUF": "38bb39ee97821de2c9009abb7e93950eec396e66",                   # 2026-09-30
+    # 2026-11-04: Unsloth's Dynamic v3.1 (UD-Q2_0 to UD-Q4_K_XL); the 5- to 8-bit files are those of 2026-09-30
+    "unsloth/Qwen3.8-Flash-Next-GGUF": "d96201194f103c906994f283f504209dc8d2a10c",
     "ornith-ai/Ornith-1.5-35B-A3B-GGUF": "12393612fd4f730ff5aadc23e9b8f9648aa49ceb",                 # 2026-10-11
     "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": "0bfdfe7f6c424de60481c26379c9d821469f75f1",         # 2026-10-11
     "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF": "38ab997c00045ce9fb858b16d7d914193f9e9917",      # 2026-11-03
     "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": "044a4447c2da94b489484927355665b819eb3d4b",           # 2026-10-11
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
+    "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF":
+        "313e55f61a045dd18ac023d28fe845ee35988a5d",                                                  # 2026-10-03
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "90a3350cd800ec1fe0d1660a38414ad9e985782f",    # 2026-10-24
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "3db919a964b1f0ae0d1000ba7be90b3e38b1f7a3",  # 10-24
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
@@ -271,29 +276,55 @@ GYRO_CODER_FILES = {
 }
 
 MODELS: dict[str, dict[str, Any]] = {
-    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0},
+    "Q2_0": {"about": "2-bit, the fastest", "download_gb": 66.4, "ram_gb": 48, "arena_gb": 34.0,
+             "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ2_XS": {"about": "2-bit i-quant, a little better quality, close in speed", "download_gb": 68.0, "ram_gb": 48,
-               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift")},
+               "arena_gb": 35.5, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     "IQ3_XXS": {"about": "3-bit i-quant, better quality, slower (more CPU work per token)", "download_gb": 75.8,
-                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift")},
+                "ram_gb": 60, "arena_gb": 42.9, "families": ("qwen", "swift", "huihui-swift", "sc117", "sc117-swift")},
     # matches the full BF16 model on the published benchmarks; Swift 1.5 got an IQ3_S tier of its own (#1651)
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
-                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3},
+                       "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
+              "families": ("qwen", "swift", "sc117", "sc117-swift")},
     # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
-    # upstream #621: Unsloth's UD-IQ4_XS - IQ3_S gate/up experts with IQ4_NL (43 layers) or Q8_0 (5) downs, the dense
-    # side as UD-Q4_K_XL's; three shards.  Its 59.5 GB of experts: a RAM budget of them, like UD-Q4_K_XL, but far
-    # fewer read from the SSD on a 64 GB PC and none from ~80 GB of RAM.  Images: the same base model and encoder
-    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic), between IQ3_S and UD-Q4_K_XL in quality; on a PC with "
-                           "less than ~80 GB of RAM part of its experts are read from the SSD",
-                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 59.5, "families": ("unsloth", "huihui-unsloth"),
-                  "budget": True, "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
-    # EXPERIMENTAL (upstream's UD-Q4_K_XL support, 3889344 / 872af82): Unsloth's 4-bit file; its 77 GB of experts do not
+    # Unsloth's Dynamic v3.1 (2026-11-04), 2 to 4 bits: IQ2_XXS to IQ4_XS (or Q4_K / Q5_K) gate/up experts with
+    # Q2_0, IQ4_NL, Q5_0 or Q5_1 downs, which the expert kernels read; the n-gram table in the last shard (IQ4_NL, the
+    # same file for the sizes of three shards, and for those of four).  A RAM budget of the experts, the rest read
+    # from the GGUF files in place; "about" gives the RAM that holds them all ("arena_gb" + UNSLOTH_RAM_LEFT_GB).
+    # Not run here.  Images: the same base model and encoder
+    "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
+                         "with less than ~61 GB of RAM part of its experts are read from the SSD",
+                "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
+                "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
+    "UD-IQ2_XS": {"about": "2-bit i-quant (Unsloth Dynamic v3.1), experts about the GSQ-RCO IQ3_XXS's size; on a PC "
+                           "with less than ~66 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 75.8, "ram_gb": 48, "arena_gb": 42.3, "families": ("unsloth",), "budget": True,
+                  "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
+    "UD-Q2_K_XL": {"about": "2- to 3-bit (Unsloth Dynamic v3.1), experts between the GSQ-RCO IQ3_XXS and IQ3_S in "
+                            "size; on a PC with less than ~70 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 79.6, "ram_gb": 48, "arena_gb": 46.0, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-IQ3_XXS": {"about": "3-bit i-quant (Unsloth Dynamic v3.1), experts the GSQ-RCO IQ3_S's size; on a PC with "
+                            "less than ~74 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 83.6, "ram_gb": 48, "arena_gb": 50.3, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    "UD-Q3_K_XL": {"about": "3-bit (Unsloth Dynamic v3.1), experts between IQ3_S and UD-IQ4_XS in size; on a PC with "
+                            "less than ~80 GB of RAM part of its experts are read from the SSD",
+                   "download_gb": 89.5, "ram_gb": 48, "arena_gb": 56.2, "families": ("unsloth",), "budget": True,
+                   "vision": True},
+    # upstream #621: UD-IQ4_XS, v3.1 since 2026-11-04 (four shards; huihui-ai's copy keeps v3.0's three, its "forms")
+    "UD-IQ4_XS": {"about": "~4-bit i-quant (Unsloth Dynamic v3.1), between IQ3_S and UD-Q4_K_XL in quality; on a PC "
+                           "with less than ~84 GB of RAM part of its experts are read from the SSD",
+                  "download_gb": 93.7, "ram_gb": 48, "arena_gb": 60.4, "families": ("unsloth", "huihui-unsloth"),
+                  "budget": True, "vision": True},
+    # EXPERIMENTAL (upstream's UD-Q4_K_XL support, 3889344 / 872af82): Unsloth's 4-bit file (v3.1 since 2026-11-04, the
+    # same 77 GB of experts and four shards as v3.0's, which huihui-ai's copy has); its experts do not
     # fit a 64 GB PC, so the engine keeps a RAM budget of them (--resident-budget-gib, chosen below) and reads the rest
     # from the GGUF files in place
-    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its "
-                            "experts come from the SSD while it answers, so it is slower than the 2-3-bit "
+    "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic v3.1), EXPERIMENTAL: the best quality, but on a 64 GB PC part of "
+                            "its experts come from the SSD while it answers, so it is slower than the 2-3-bit "
                             "models", "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0,
                    "families": ("unsloth", "huihui-unsloth"), "budget": True, "experimental": True,
                    # upstream #967: images are allowed (the same base model and image encoder as UD-IQ4_XS), with a
@@ -351,26 +382,62 @@ MODELS: dict[str, dict[str, Any]] = {
                    "download_gb": 110.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
                    "file": "Qwen3.8-Flash-Next-AD-5.00bpw-Q5_K_M-M64-0000{i}-of-00003.gguf", "vision": True},
 }
-# The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
-# download (check_shards reads the other model files' directories; these are also hashed once).
-UNSLOTH_SHARDS = {
+# Unsloth's Dynamic v3.1 files (UD-Q2_0 to UD-Q4_K_XL) at the pinned revision: name -> (bytes, sha256), the Hub's
+# LFS pointers, checked after the download (check_shards reads the other model files' directories; these are also
+# hashed once).
+UNSLOTH_V31_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf":
+        (10946618, "38803c4e8d13077165aa9854502b3d4e7fef750e72a21d27a38ee42089f96ad6"),
+    "Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf":
+        (41738806688, "57af20207d5f18fa72fba503806d98d65f58ba3982fe55c89c6ed6e691471acc"),
+    "Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf":
+        (10946618, "91e8dc8f1428ce25d48fd1f711e4bf1f42215c5bac0f32eeb5608e6ec7ae91e9"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf":
+        (47021008288, "11a67c82f54a9edf683d6b708062de78d803921a18a6cb2bf1dd55949b4ef9bd"),
+    "Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf":
+        (10946618, "297e174dc185f2bf3ab1856461059cb8a05aa741bc27edf42461cde87e5420af"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf":
+        (49732486272, "a4782511810bb61bd6b3236607a0aad05b1bfa04b90356defd202bb17e7db16d"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf":
+        (1037181344, "4dffc4a1cea7ad484f2d5c711b747840e459b040b636cc8ddaa524d01e60662e"),
+    "Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf":
+        (10946618, "9d5644b371ffac921427c8021cc7242dab8e3ba37d7b48d1e79fe3770fbf9915"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf":
+        (49946027488, "aacaff3bdb9032c2c3be428167930809735f65d3cfb204eba07d85e421e7ddf4"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf":
+        (4869325888, "ef8f14e790ab471b363f146d5e8664eefbaf03e5776f317a1fb96a2bc7707b07"),
+    "Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf":
+        (10946618, "7666000ba91eb5527f8e12e0414de36766dc82a082876337f7827c2caa859143"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00004.gguf":
+        (49742117248, "e954cb3044ae087a003ce8cc1631c9d40fe15ae64a8befcf4aa06457848c647c"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00004.gguf":
+        (10911746208, "fcce26b1e5e6e54559a7e7c2f8d6e37067ec695ff1f14bce662810bde78abe1f"),
+    "Qwen3.8-Flash-Next-UD-Q3_K_XL-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf":
+        (10946618, "93ff23a08e5cd7501f24fa16f5b415d5807d0175e04edd3ed6a7a41b601a4eef"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf":
+        (49604491008, "13d5dc8b93d039e4cfade5a9af7037f10c97f7ec4e53f75bd2e9ae34aae54aeb"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf":
+        (15256783680, "f6b9b5934908a2043732269dd740155d0f921d0763a1dcdd3452246311651f87"),
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf":
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf":
-        (10946624, "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082"),
+        (10946618, "acc44040f74d0e55fb89c3967056cce5dbda1bcc52e909c3ba6fc72b5e9c0858"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf":
-        (49859583136, "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9"),
+        (49720539552, "45792ae869072d8229384c51c7c73dd959e191505252b41dd71852d9746f5ce4"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf":
-        (49376141504, "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3"),
+        (32803030176, "8c76e79d444b16a663d9c8db54e585ed3b1da13eebd2619c37b0c355da803c82"),
     "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf":
-        (12087983520, "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a"),
-}
-# UD-IQ4_XS's three shards at the same revision (sizes and SHA-256: the Hub's LFS pointers; upstream #621)
-UNSLOTH_IQ4_XS_SHARDS = {
-    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf":
-        (10946624, "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4"),
-    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf":
-        (49835229856, "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7"),
-    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf":
-        (43836407744, "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833"),
+        (28800138432, "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"),
 }
 # Unsloth's bigger files (upstream 0.1.44), offered without a run here (the user's decision of 2026-10-14)
 UNSLOTH_BIG_SHARDS = {
@@ -523,6 +590,49 @@ CODER_FILES = {
     "mmproj-Qwen3.8-Flash-Next-BF16.gguf":
         (907543008, "b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0"),
 }
+# SC117's abliterated copies of ISTA-DASLab's four sizes: OrcaRouter's abliterated ssm_out, attention output and
+# shared and routed expert down tensors put into ISTA-DASLab's files (Q2_0's re-encoded with ISTA-DASLab's block
+# scales), the rest of the files as ISTA-DASLab's.  Shard 2 (the n-gram table) is ISTA-DASLab's file byte for byte.
+# name -> (bytes, sha256) at the pinned revision.
+SC117_FILES = {
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf":
+        (39665015072, "4acc3ebb5050d20117bdc77fc39200e709dfe2b2367f3522c95b9112a30aff81"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf":
+        (55063448064, "40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296c"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf":
+        (47342144896, "03b11926b41a3d7f7a008882b1bc7a6330a3c9c43d3cad4598d31dc73042fdc5"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf":
+        (38021379872, "1620faf21c845524cbe38dcbbaf850b8d155c2299df05d8b7bfb43b642c4647e"),
+    "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf":
+        (28800138432, "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"),
+}
+# SC117's abliterated copies of Swift 1.5's four sizes, made the same way (the donor's types kept: IQ4_XS and the
+# like).  Swift's shard 2 holds layers 13-47, its own file for each size.  name -> (bytes, sha256) at the pinned
+# revision.
+SC117_SWIFT_FILES = {
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00001-of-00002.gguf":
+        (39791412224, "ea68dd601c4911415b4461f53accecd99d6d38aa06cb0b6722e8f7fb6556d9da"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ2_XS-00002-of-00002.gguf":
+        (28359413504, "bdec0a9242f2a266ff517280ea6a5934e4a246f0ed8eb7a462c07434ffea161b"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf":
+        (44849330016, "638fbd42a01c7b39a9b7b21c5c8dc5eb1876222d8bd268d471304b647fcd6f94"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf":
+        (38699929024, "091a4f6a53697a12a2ea1e5e1d61414410d50c0d44e971304602bba6873fd23d"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf":
+        (39771812960, "83f75959e296a6380c98d5b6e906a0cde175077ffac2419fd56e7e15969d55dd"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00002-of-00002.gguf":
+        (36056143040, "aa59f45eaa3c02069016903862a5f8d73adfdb7ca97f9cab25f7494e9ac4b1a3"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00001-of-00002.gguf":
+        (39797110944, "745a93a8b3e86e5553899259b7ad7e6d0cf889b69e6a334f4a70965a1a828113"),
+    "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-Q2_0-00002-of-00002.gguf":
+        (26710079616, "5b91b79a4bbee162761c16b9a47a3434c3f8be0ad6bf34849318d9efcb4b6aa1"),
+}
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
@@ -533,6 +643,8 @@ CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
 HUIHUI = "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF"
 HUIHUI_URL = "https://huggingface.co/" + HUIHUI
+SC117 = "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
+SC117_SWIFT = "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"
 FAMILIES: dict[str, dict[str, Any]] = {
     "qwen": {"title": "Qwen3.8-Flash-Next", "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
              "about": "the original model",
@@ -558,17 +670,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF"),
               "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-coder",
               "profile": "expert-profile-coder.bin"},
-    # Unsloth's UD-IQ4_XS (three shards, upstream #621) and the EXPERIMENTAL UD-Q4_K_XL (four) of the original model;
-    # "experimental" and "vision" are per model (MODELS)
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's ~4-bit quantizations",
-                "about": "UD-IQ4_XS: a 94 GB download; with less than ~80 GB of RAM part of its experts are read from "
-                         "the SSD (UD-Q4_K_XL, 111 GB: experimental)",
+    # Unsloth's Dynamic v3.1 from 2 to 4 bits (UD-Q2_0 to the EXPERIMENTAL UD-Q4_K_XL) and the 5- to 8-bit files of
+    # the original model; "shards", "experimental" and "vision" are per model (MODELS)
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's Dynamic v3.1 quantizations",
+                "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB downloads) and 5 to 8 bits; with too "
+                         "little RAM part of the experts are read from the SSD",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
                 "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
                 "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-unsloth",
                 "vision": False, "pack_args": ["--compat-bf16"],
-                "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
+                "sha256": {**UNSLOTH_V31_SHARDS, **UNSLOTH_BIG_SHARDS}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
              "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
@@ -610,12 +722,42 @@ FAMILIES: dict[str, dict[str, Any]] = {
                                 "it writes",
                        "hf": hf(HUIHUI) + "{d}/",
                        "dirs": {"UD-IQ4_XS": "unsloth-UD-IQ4_XS", "UD-Q4_K_XL": "unsloth-UD-Q4_K_XL", "Q8_0": "Q8_0"},
+                       # made from Unsloth's v3.0: its UD-IQ4_XS is three shards (v3.1's is four)
+                       "forms": {"UD-IQ4_XS": {"shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf"}},
                        "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "huihui-unsloth-",
                        "mmproj_hf": hf(HUIHUI), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
                        "name": "qwen3.8-flash-next-abliterated", "vision": False, "pack_args": ["--compat-bf16"],
                        "sha256": HUIHUI_FILES,
                        "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; huihui-ai's abliterated copy): "
                                   + HUIHUI_URL},
+    # SC117's abliterated copies of the original's four sizes (SC117_FILES); after the regular families, never the
+    # default.  Images: the original's vision encoder, which SC117's model card says to use
+    "sc117": {"title": "Qwen3.8-Flash-Next GSQ-RCO (abliterated)",
+              "by": "SC117's uncensored version of ISTA-DASLab's GSQ-RCO files",
+              "about": "the original's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer "
+                       "refusals, and its safety filtering is reduced, so check what it writes",
+              "hf": hf(SC117) + "{q}/",
+              "file": "Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf", "tag": "sc117-",
+              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+              "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-gsq-rco-abliterated",
+              "sha256": SC117_FILES,
+              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; SC117's abliterated copy): "
+                         "https://huggingface.co/" + SC117},
+    # SC117's abliterated copies of Swift 1.5's four sizes (SC117_SWIFT_FILES): IQ3_S at the repository's top, the
+    # others in folders ("dirs"); never the default.  Images: Swift 1.5's vision encoder, as the huihui-ai copy's
+    "sc117-swift": {"title": "Swift 1.5 GSQ-RCO (abliterated)",
+                    "by": "SC117's uncensored version of Swift 1.5",
+                    "about": "Swift 1.5's four sizes with OrcaRouter's refusal removal (abliteration) put in: far "
+                             "fewer refusals, and its safety filtering is reduced, so check what it writes",
+                    "hf": hf(SC117_SWIFT) + "{d}",
+                    "dirs": {"Q2_0": "Q2_0/", "IQ2_XS": "IQ2_XS/", "IQ3_XXS": "IQ3_XXS/", "IQ3_S": ""},
+                    "file": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-{q}-0000{i}-of-00002.gguf",
+                    "tag": "sc117-swift-",
+                    "mmproj_hf": hf("ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                    "mmproj": "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf", "name": "swift-1.5-gsq-rco-abliterated",
+                    "sha256": SC117_SWIFT_FILES,
+                    "license": "Swift Open License 1.0 (Swift 1.5's; SC117's abliterated copy): "
+                               "https://huggingface.co/" + SC117_SWIFT},
     # AtomicChat's AD quantizations (ATOMICCHAT_FILES, the sizes AD-4.27bpw and AD-5.00bpw): after the regular
     # families, never the default.  Images: the original's vision encoder (the same base model)
     "atomicchat": {"title": "Qwen3.8-Flash-Next (AtomicChat)", "by": "AtomicChat's AD quantizations",
@@ -641,6 +783,8 @@ _ORNITH_UNC = "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF"
 _ORNITH_UNC_FILE = "Ornith-1.5-35B-A3B-CRACK-{}.gguf"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
 _QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
+_QWEN36_UNC = "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF"
+_QWEN36_UNC_FILE = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-{}.gguf"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
 _QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
 _QWEN35_HAU = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
@@ -749,6 +893,30 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                             "about": "8-bit, the closest to the full model"},
                }},
 }
+# Qwen3.6-35B-A3B with its refusals removed (llmfan46's Heretic + MPOA, the MTP layer kept), quantized by SC117 with
+# APEX: the precision of each tensor by its role and layer.  Their experts: Q5_K and Q6_K (Balanced), IQ4_XS, Q5_K and
+# Q6_K (Quality), Q3_K and Q4_K (Compact), IQ2_S, Q3_K and Q8_0 (MINI); the dense weights Q3_K to Q8_0.  Not run here;
+# the kernels take every one of these types
+PLAIN_FAMILIES["qwen36-uncensored"] = {
+    "title": "Qwen3.6-35B-A3B (uncensored)", "by": "llmfan46 (Apache-2.0), APEX GGUFs by SC117, from Qwen's model",
+    "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, and its safety "
+             "filtering is reduced, so check what it writes",
+    "tag": "qwen36-uncensored-", "name": "qwen3.6-35b-a3b-uncensored", "max_context": 262144, "plain": True,
+    "profile": "expert-profile-qwen36.bin", "draft_vocab": True,
+    "models": {
+        "APEX-I-Quality": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Quality"), "size": 23514746272,
+                           "sha256": "31a6a415d4de270cdd2128103a671202f4b92b6eb30c5f87934f3b06fc2a55cc",
+                           "about": "the best of the four by its authors' numbers (APEX's mixed 4 to 6 bits)"},
+        "APEX-I-Balanced": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Balanced"), "size": 25962671520,
+                            "sha256": "782636c45124fd40bf55254f802aba3b6c14e53d36f7a60f724f332761e9aa89",
+                            "about": "5 and 6 bits, its authors' all-rounder"},
+        "APEX-I-Compact": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Compact"), "size": 17016624544,
+                           "sha256": "ff82d1993140be550f21f17ec9e93697a060d71ce15d8f6089c911032b448058",
+                           "about": "3 and 4 bits, smaller and a little lower in quality"},
+        "APEX-I-MINI": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("MINI"), "size": 14273277376,
+                        "sha256": "e4eae0e289b36039faa26f955ca021025754e0c56130a16746749bb1491118d4",
+                        "about": "2 and 3 bits, the smallest, lower in quality"},
+    }}
 # Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
 # K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
 # read pictures through Unsloth's mmproj: HauhauCS's has the same 334 tensors byte for byte (only its metadata
@@ -823,10 +991,12 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
-    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
+    "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_V31_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
+    SC117: SC117_FILES,
+    SC117_SWIFT: SC117_SWIFT_FILES,
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": ATOMICCHAT_FILES,
 }
 for _fam in PLAIN_FAMILIES.values():                 # the other models' files, from their own tables
@@ -846,6 +1016,9 @@ ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba
 # the families it applies to: the Coder and Unsloth's files are the same model's residual stream (Unsloth's: the
 # user's decision of 2026-10-22)
 SPEED_PROJECTION_FAMILIES = ("qwen", "coder", "unsloth")
+# the versions with the refusals removed in their weights, which setup points to when the projection is chosen; the
+# projection itself is never applied to them (not in SPEED_PROJECTION_FAMILIES)
+ABLITERATED_FAMILIES = ("sc117", "sc117-swift", "huihui-swift", "huihui-unsloth")
 
 
 def esp_release_url(name: str) -> str:
@@ -1779,6 +1952,16 @@ def check_igc(makers: set) -> None:
         say_driver_update(lts)
 
 
+def check_xe_kernel(makers: set) -> None:
+    """Says, without stopping, when an Intel GPU runs on the xe driver of a kernel without the fix of CVE-2026-68264
+    (serve/kernel_check.py): the driver can crash on a retried GPU memory bind, which the engine cannot avoid."""
+    if WIN or "intel" not in makers:
+        return
+    rel = kernel_check.unfixed_release()
+    if rel is not None:
+        warn(kernel_check.text(rel))
+
+
 IOMMU_PT = {   # the kernel option iommu=pt, set the way each distribution's boot loader takes it
     "ubuntu": ["echo 'GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT iommu=pt\"' | "
                "sudo tee /etc/default/grub.d/90-iommu-pt.cfg", "sudo update-grub"],
@@ -2074,6 +2257,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
         windows_libs(makers, gfx, yes, install)
         return
     check_igc(makers)
+    check_xe_kernel(makers)
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
     check_pdf()
@@ -3316,8 +3500,8 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("XeStrata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's UD-IQ4_XS and UD-Q4_K_XL only: other GGUFs (Unsloth's "
-                   "UD-IQ3_XXS or UD-Q2_K_XL, K-quants) cannot be used")
+                   "1.5's; the Coder's IQ1_M) and Unsloth's (UD-Q2_0 to UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0) "
+                   "only: other GGUFs (K-quants of other makers) cannot be used")
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -4931,12 +5115,24 @@ def low_ram_fits(model, ram, vram_gb) -> bool:
 
 
 def model_file(fam: dict, model: str, i: int) -> str:
-    """Shard i's file name: the family's pattern, or the model's own (UD-IQ4_XS has three shards, not four)."""
-    return MODELS.get(model, {}).get("file", fam["file"]).format(q=model, i=i)
+    """Shard i's file name: the family's own form of the size, the size's, or the family's pattern (UD-Q2_0 has three
+    shards, not four; huihui-ai's UD-IQ4_XS three, Unsloth's four)."""
+    form = {**MODELS.get(model, {}), **fam.get("forms", {}).get(model, {})}
+    return form.get("file", fam["file"]).format(q=model, i=i)
+
+
+def default_size(names: list, ram: float) -> str:
+    """The size setup recommends of a family's `names`: IQ3_XXS from 60 GB of RAM where it is one, else for the sizes
+    with a RAM budget (Unsloth's) the largest regular one whose experts all stay in RAM, else the first."""
+    if "IQ3_XXS" in names:
+        return "IQ3_XXS" if ram >= 60 else names[0]
+    fit = [m for m in names if MODELS[m].get("budget") and not MODELS[m].get("experimental")
+           and MODELS[m]["arena_gb"] + UNSLOTH_RAM_LEFT_GB <= ram]
+    return max(fit, key=lambda m: MODELS[m]["arena_gb"]) if fit else names[0]
 
 
 def model_shards(fam: dict, model: str) -> int:
-    return MODELS.get(model, {}).get("shards", fam.get("shards", 2))
+    return fam.get("forms", {}).get(model, MODELS.get(model, {})).get("shards", fam.get("shards", 2))
 
 
 def resident_budget_gib(model, ram, kv_ram_gb=0.0) -> int:
@@ -7132,7 +7328,7 @@ def describe() -> dict:
         else:
             names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
                            key=lambda m: bool(MODELS[m].get("experimental")))
-            rec = names[names.index("IQ3_XXS")] if ram >= 60 and "IQ3_XXS" in names else names[0]
+            rec = default_size(names, ram)
             for m in names:
                 d = MODELS[m]
                 low = not d.get("budget") and low_ram_needed(m, ram) and low_ram_fits(m, ram, vram)
@@ -7844,7 +8040,7 @@ def main() -> int:
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {d['download_gb']:.0f} GB") +
             f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    rec = str(names.index(default_size(names, ram)) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
     if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install
@@ -8011,6 +8207,17 @@ def main() -> int:
             esp_choice = ("on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y"
                           else "off")
         if esp_choice.lower() not in ("off", "no", "n", "0"):
+            # the user's decision of 2026-11-05: fewer refusals are offered as the abliterated versions (refusals
+            # removed in the weights), the vector only when it is still wanted after that
+            alt = [f for f in ABLITERATED_FAMILIES if f in MODELS[model].get("families", ("qwen", "swift"))]
+            hint = " or ".join(f"{SETUP_CMD} --setup --family {f}" + (f" --model {model}" if alt else "")
+                               for f in alt or ABLITERATED_FAMILIES)
+            confirm_risk("for fewer refusals XeStrata recommends an abliterated version, SC117's or huihui-ai's (the "
+                         "refusals removed in the weights), not the experimental speed projection: " + hint,
+                         bool(a.experimental_speed_projection), a.yes,
+                         "the experimental speed projection was not turned on",
+                         f"install an abliterated version ({hint}), or pass --experimental-speed-projection on "
+                         "--yes to use the projection anyway", "  Turn on the experimental speed projection anyway?")
             esp = (ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1")
                    else Path(esp_choice).expanduser().resolve())
             if not esp.is_file() and esp == ESP_VECTOR and PACKAGED:
@@ -8103,10 +8310,12 @@ def main() -> int:
             if s.exists() and done(s):
                 ok(f"{s.name} already downloaded")
                 continue
-            # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
+            # the original's shard 2 is the same file for all its sizes, the Coder and SC117's copies: reuse one that
+            # is already here
             other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf")
                      if done(p)]
-            if family in ("qwen", "coder") and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
+            if family in ("qwen", "coder", "sc117") and s.name.endswith("00002-of-00002.gguf") and other \
+                    and not s.exists():
                 try:
                     os.link(other[0], s)
                     mark(s)

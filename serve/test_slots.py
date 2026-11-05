@@ -80,6 +80,8 @@ class FakeProc:
     def kill(self):
         self.killed = True
 
+    terminate = kill                                    # ends as an engine ends on SIGTERM
+
     def wait(self, timeout=None):
         return -9
 

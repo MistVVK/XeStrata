@@ -21,6 +21,8 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #if defined(__has_include)
@@ -45,6 +47,7 @@
 #include <mutex>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -266,9 +269,39 @@ static void sycl_code_cache() {
 #endif
 }
 
+// What the RAM and the kernel's memory compaction did between the engine's start and a stop on a GPU fault, said with
+// the fault: the B70's copy engine faulted (Fault response -EBUSY) while the page cache turned over, and the xe driver
+// mapped the registered host memory again after each move of its pages (#42; 2026-10-22's trace: 83k to 134k
+// invalidations where a healthy run has one).  The start's numbers are taken as the engine lists its GPUs.  Linux only.
+struct HostCounters {
+    long long compact_stall = -1, compact_success = 0, pgmigrate_success = 0;
+};
+HostCounters host_counters() {
+    HostCounters c;
+#if !defined(_WIN32)
+    if (std::FILE* f = std::fopen("/proc/vmstat", "r")) {
+        char line[128];
+        c.compact_stall = 0;
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            char* sp = std::strchr(line, ' ');
+            if (sp == nullptr) continue;
+            *sp = '\0';
+            const long long v = std::strtoll(sp + 1, nullptr, 10);
+            if (std::strcmp(line, "compact_stall") == 0) c.compact_stall = v;
+            else if (std::strcmp(line, "compact_success") == 0) c.compact_success = v;
+            else if (std::strcmp(line, "pgmigrate_success") == 0) c.pgmigrate_success = v;
+        }
+        std::fclose(f);
+    }
+#endif
+    return c;
+}
+HostCounters g_start_counters;
+
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
+        g_start_counters = host_counters();
         const CompilerWorkaround w = intel_compiler_workaround();
         std::vector<sycl::device> found = find_devices();
         if (w.set && std::any_of(found.begin(), found.end(), [](const sycl::device& d) {
@@ -292,8 +325,37 @@ thread_local int t_current = 0;
     q.single_task<ProbeKernel>([] {});
 }
 
+// The start's counters against the fault's, with the RAM's state then (HostCounters).
+void report_host_at_fault() {
+#if !defined(_WIN32)
+    long long free_kb = -1, cached_kb = -1, dirty_kb = -1;
+    if (std::FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[128];
+        // NOLINTNEXTLINE(clang-analyzer-unix.BlockInCriticalSection): /proc never blocks, and the process ends next
+        while (std::fgets(line, sizeof line, f) != nullptr) {
+            char* colon = std::strchr(line, ':');
+            if (colon == nullptr) continue;
+            *colon = '\0';
+            const long long v = std::strtoll(colon + 1, nullptr, 10);
+            if (std::strcmp(line, "MemFree") == 0) free_kb = v;
+            else if (std::strcmp(line, "Cached") == 0) cached_kb = v;
+            else if (std::strcmp(line, "Dirty") == 0) dirty_kb = v;
+        }
+        std::fclose(f);
+    }
+    const HostCounters now = host_counters();
+    if (free_kb < 0 || now.compact_stall < 0 || g_start_counters.compact_stall < 0) return;
+    std::fprintf(stderr, "Xe runtime: at the fault: RAM free %lld MiB, page cache %lld MiB, dirty %lld MiB; since the "
+                         "start the kernel compacted memory %lld times (%lld stalls) and moved %lld pages\n",
+                 free_kb >> 10, cached_kb >> 10, dirty_kb >> 10, now.compact_success - g_start_counters.compact_success,
+                 now.compact_stall - g_start_counters.compact_stall,
+                 now.pgmigrate_success - g_start_counters.pgmigrate_success);
+#endif
+}
+
 [[noreturn]] void fatal(const char* message) {
     std::fprintf(stderr, "Xe runtime: %s; terminating without releasing in-flight allocations\n", message);
+    report_host_at_fault();
     std::fflush(stderr);
     std::_Exit(1);
 }
@@ -366,9 +428,14 @@ sycl::async_handler Runtime::handler() {
     };
 }
 
+namespace {
+void settle_vram(const sycl::device& d);
+}  // namespace
+
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
     transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    settle_vram(device_);
     marks_by_barrier_ = measure_marks();
 }
 
@@ -654,6 +721,37 @@ void Runtime::finish_all() noexcept {
     }
 }
 
+// SIGTERM and SIGINT end the engine at once, as their default action does, but on a thread of their own.  While the GPU
+// compiler (IGC) translates a kernel it takes them over and longjmps to the translating thread, so one delivered to any
+// other thread aborted the engine ("longjmp causes uninitialized stack frame"; the server's SIGTERM after a QUIT, or a
+// stop while the kernels are built).  Blocked before any thread exists, so every thread inherits the mask.
+// The GPUs' queues are drained first, for at most 5 s: on the B70 (xe driver) a copy-engine job still queued when the
+// process ended read memory the exit had unmapped (an engine memory fault, and a reset).  Of 7 engines ended as everyday
+// use's bench ends them (the server's process group at once) 4 faulted, with STRATA_COPY_ENGINE=0 as well (the
+// runtime's own copies), and none once drained, 2026-10-15.
+void route_stop_signals() {
+#if defined(_WIN32)
+    // Windows has no signal masks; Ctrl+C reaches a thread of its own already, and the server ends the engine with
+    // taskkill, not a signal
+#else
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) return;
+    std::thread([set] {
+        int sig = 0;
+        while (sigwait(&set, &sig) != 0) {}
+        std::thread([sig] {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            _exit(128 + sig);
+        }).detach();
+        Runtime::finish_all();
+        _exit(128 + sig);
+    }).detach();
+#endif
+}
+
 void Runtime::free(void* pointer) noexcept {
     if (!pointer) return;
     try {
@@ -761,6 +859,34 @@ bool i915_gpu(const std::string& pci) {
     (void) pci;
 #endif
     return false;
+}
+
+// A card of the xe driver whose VRAM a process that just ended is still giving back: the driver clears and frees it with
+// jobs of its own on the copy engine, and a start that took tens of GB meanwhile was refused its memory, then the
+// driver's own copy job faulted again and again and the GPU was wedged until a reboot (the B70, Linux 7.0, 2026-10-21:
+// an engine started right after the one before it ended on SIGTERM).  The start waits while the driver's count of the
+// VRAM in use falls, at most 20 s; where nothing is being given back that is one reading 100 ms after the first.
+void settle_vram(const sycl::device& d) {
+    if (integrated_gpu(d) || !d.has(sycl::aspect::ext_intel_pci_address)) return;
+    std::string pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+    for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+    uint64_t total = 0, used = 0;
+    if (!xe_vram(pci, total, used)) return;
+    constexpr uint64_t kStill = 64ull << 20;   // less than this given back in 100 ms: settled
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t first = used;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        uint64_t now = 0;
+        if (!xe_vram(pci, total, now)) return;
+        const bool falling = now + kStill < used;
+        used = now;
+        if (!falling || std::chrono::steady_clock::now() - t0 > std::chrono::seconds(20)) break;
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (s > 0.5)
+        std::fprintf(stderr, "Xe runtime: GPU %s: waited %.1f s while the driver gave back %llu MiB of VRAM\n",
+                     pci.c_str(), s, (unsigned long long) ((first > used ? first - used : 0) >> 20));
 }
 
 bool driver_free_memory(const sycl::device& d, uint64_t& free) {

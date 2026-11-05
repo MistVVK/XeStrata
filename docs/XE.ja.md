@@ -591,7 +591,6 @@ decode のカーネルの確認では、`rope_parity`、`router_top10_parity`、
 | Swift 1.5 IQ2_XS | 動く | 7（0.151） | 推測なし = suffix。MTP は異なる |
 | Swift 1.5 IQ3_XXS | 動く | 62（0.058、3 候補） | 異なる（キャッシュの大きさも実行ごとに違った） |
 | Swift 1.5 Q2_0 | 動く（注） | 25（0.273） | 推測なし = suffix。MTP は異なる |
-| OrcaRouter IQ3_XXS（互換の手順） | **動かしていない**: リポジトリが gated で、ダウンロードに Hugging Face のログインが要る | — | — |
 
 注: Swift 1.5 Q2_0 は、層 13 のエキスパートのテンソルが 2 つのシャードにまたがります。
 pack の索引は、テンソルごとにシャードを記録します。

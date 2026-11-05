@@ -147,7 +147,7 @@ It tells Strix Halo (gfx1151) apart by name, names the Radeon 8060S / 8050S / 80
 The kernel's boot options `ttm.pages_limit` and `ttm.page_pool_size` (in 4 KiB pages) give the GPU more of the shared memory.
 Setup changes no host setting.
 The engine counts an integrated GPU's free memory as the smaller of what its runtime reports and what Linux can give back (`MemAvailable`) less 6 GiB (upstream 004b15cd; `STRATA_UMA_HEADROOM_GIB` changes the 6).
-For the models that keep a RAM budget of their experts (UD-Q4_K_XL, UD-IQ4_XS), setup writes the expert cache as a number, not `auto` (upstream #1715).
+For the models that keep a RAM budget of their experts (Unsloth's), setup writes the expert cache as a number, not `auto` (upstream #1715).
 The cache and the budget draw on the same RAM, so `auto`, sized from the memory free at start, would count what the budget has not taken yet and leave the OS nothing.
 The number is the RAM less 24 GB and the budget (and a KV cache streamed to RAM), in slots; `--expert-cache N` in the config's `args` sets another.
 
@@ -236,16 +236,27 @@ Its license is the Swift Open License 1.0: read it on the model page.
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Or: Unsloth's UD-IQ4_XS
+### Or: Unsloth's Dynamic v3.1 (UD-Q2_0 to UD-IQ4_XS)
 
-**[Unsloth's UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** is a ~4-bit i-quant of the original model in three shards (94 GB; upstream #621).
-Its experts' gate and up are IQ3_S (IQ4_XS in one layer) and its downs IQ4_NL (Q8_0 in five layers), 59.5 GB of them.
+**[Unsloth's Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (2026-11-04) are 2- to 4-bit versions of the original model (upstream #621's UD-IQ4_XS is now this version too).
+The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and Q5_0; the n-gram table is in the last shard (IQ4_NL).
+
+| Size | Download | Experts | RAM that holds them all |
+| --- | ---: | ---: | ---: |
+| UD-Q2_0 | 70.5 GB | 37.4 GB | about 61 GB |
+| UD-IQ2_XS | 75.8 GB | 42.3 GB | about 66 GB |
+| UD-Q2_K_XL | 79.6 GB | 46.0 GB | about 70 GB |
+| UD-IQ3_XXS | 83.6 GB | 50.3 GB | about 74 GB |
+| UD-Q3_K_XL | 89.5 GB | 56.2 GB | about 80 GB |
+| UD-IQ4_XS | 93.7 GB | 60.4 GB | about 84 GB |
+
 The dense side and the RAM budget are as UD-Q4_K_XL's below (`--resident-budget-gib N`; setup chooses the RAM less 24 GB).
-With about 80 GB of RAM every expert fits it.
+With less RAM the experts that do not fit are read from the SSD while it answers.
+setup recommends the largest size whose experts all fit the RAM (UD-Q4_K_XL aside).
 setup asks about images (on by default); the image encoder is the original model's.
 
 ```sh
-./setup.sh --setup --family unsloth --model UD-IQ4_XS
+./setup.sh --setup --family unsloth --model UD-IQ3_XXS
 ```
 
 On an Arc Pro B70 (32 GB) with an i7-14700 and 96 GB of RAM (a 55 GiB RAM budget), 96 tokens of a short chat decoded at 32.5 / 32.8 tokens/s, and the answer read correctly.
@@ -337,13 +348,33 @@ It is weaker outside code. Images work too (with the original model's image enco
 They refuse far less, and their safety filtering is weaker, so check what they write.
 
 - `--family huihui-swift`: Swift 1.5's IQ2_XS and IQ3_XXS, under the Swift Open License 1.0.
-- `--family huihui-unsloth`: Unsloth's UD-IQ4_XS, UD-Q4_K_XL and Q8_0, under the Qwen Community License 1.0.
+- `--family huihui-unsloth`: Unsloth's UD-IQ4_XS (the three shards from before Dynamic v3.1), UD-Q4_K_XL and Q8_0, under the Qwen Community License 1.0.
 
 The files' names, shards and sizes are the originals'; the weights differ. The picture readers are the originals'.
 The experimental speed projection does not work with them.
 
 ```sh
 ./setup.sh --setup --family huihui-swift --model IQ2_XS
+```
+
+### Or: SC117's abliterated versions
+
+**[SC117's abliterated versions](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)** are ISTA-DASLab's four sizes (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S) with the weights of OrcaRouter's abliterated version put in (`--family sc117`).
+What was put in is each layer's `ssm_out`, `attn_output` and the shared and routed experts' down; the rest is ISTA-DASLab's files as they are.
+They refuse far less, and their safety filtering is weaker, so check what they write.
+
+The projections put in are Q8_0, so the first shard is 0.2 to 0.4 GB larger than the original's.
+The second shard (the n-gram table) is the original's file, shared with the original when that is installed.
+The picture reader and the MTP draft head are the original model's.
+The experimental speed projection does not work with them. The license is the Qwen Community License 1.0.
+
+Swift 1.5's four sizes have the same done to them ([SC117's abliterated versions of Swift 1.5](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF), `--family sc117-swift`).
+The projections put in keep the abliterated version's types (IQ4_XS and the like), and the second shard is a file of its own for each size.
+The picture reader is Swift 1.5's, and the license is the Swift Open License 1.0.
+
+```sh
+./setup.sh --setup --family sc117 --model IQ3_XXS
+./setup.sh --setup --family sc117-swift --model IQ3_XXS
 ```
 
 ### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash)
@@ -368,6 +399,7 @@ Qwen3.5-9B keeps every weight in the GPU's VRAM.
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
   Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
   UD-Q6_K_XL and Q8_0 with the MTP layer.
+  llmfan46's version with its refusals removed by Heretic and MPOA, the MTP layer kept, quantized by SC117 with APEX, [Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF) (Apache-2.0; APEX-I-Quality, APEX-I-Balanced, APEX-I-Compact and APEX-I-MINI, 14.3 to 26.0 GB), can be chosen too (`--family qwen36-uncensored`). It refuses far less and its safety filtering is weaker, so check what it writes.
 - **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)** (Qwen, Apache-2.0): a dense thinking model of 9B
   that reads images too, context up to 256K. The GGUFs are Unsloth's Q4_K_M, Q6_K, Q8_0 and BF16.
   HauhauCS's version with its refusals removed,
@@ -419,6 +451,7 @@ The others are made of the same tensor types, checked on those files and in the 
 ./setup.sh --setup --family ornith-uncensored --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family qwen36-uncensored --model APEX-I-Quality
 ./setup.sh --setup --family qwen35 --model Q4_K_M
 ./setup.sh --setup --family qwen35-uncensored --model Q8_0
 ./setup.sh --setup --family glm53 --model UD-IQ3_XXS
@@ -602,7 +635,7 @@ With the packages, run `xestrata` instead of `./setup.sh`: the same options, and
 
 **The first time** it asks a few questions and does the rest:
 
-1. **Which model?** Qwen3.8-Flash-Next (the original), Swift 1.5, the Coder, or Unsloth's UD-IQ4_XS or UD-Q4_K_XL (experimental).
+1. **Which model?** Qwen3.8-Flash-Next (the original), Swift 1.5, the Coder, or Unsloth's (UD-Q2_0 to UD-IQ4_XS, the experimental UD-Q4_K_XL and others).
 1. **Which size?** It recommends one for your RAM.
 1. **How much context?** 8K to 256K tokens; it recommends one for your GPU.
    384K and 512K are offered too, as experiments: past the trained length (262,144) setup adds RoPE scaling.
@@ -708,7 +741,7 @@ Put them there with their original names, or point setup at them with `--gguf-di
 To see what a file really holds before using or downloading it, `./setup.sh --inspect <file>` (upstream #911) reads only its headers (a few MB, also over the network).
 It shows every weight group's real bits per weight and storage types, and whether the file is one setup installs (under any name), stored like one of them, or not one XeStrata runs (another architecture, or experts in a format no kernel reads).
 It takes a file, a folder, a URL, `ms:owner/repo` (ModelScope) or `hf:owner/repo`, optionally followed by a variant name.
-A name says little: Unsloth's `UD-IQ3_XXS` stores its routed experts at 3.22 bits per weight, `UD-Q4_K_XL` at 5.10, the original `Q2_0` at 2.25 and `IQ3_S` at 3.33.
+A name says little: Unsloth's `UD-IQ3_XXS` (Dynamic v3.1) stores its routed experts at 3.33 bits per weight, `UD-Q4_K_XL` at 5.10, the original `Q2_0` at 2.25 and `IQ3_S` at 3.33.
 To download from a Hugging Face mirror, set `HF_ENDPOINT` (e.g. `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`):
 the pinned revisions and the checks are the same, and the MTP tensors come from the same host.
 Every model file setup downloads has a fixed size and SHA-256 (upstream e193161de).
@@ -1981,8 +2014,9 @@ so measure it on your own prompts; the Monitor marks every request ESP or stock.
 
 **Turning it on (at setup).** `./setup.sh --setup` asks "Turn on the experimental speed projection?" (default: no),
 or pass `--experimental-speed-projection on` (`off`, or a path to another vector GGUF).
+When it is chosen, setup recommends SC117's and huihui-ai's abliterated versions instead, which have the refusals removed in their weights ([above](#or-sc117s-abliterated-versions)), and asks whether to use the projection anyway (no by default); with `--experimental-speed-projection on --yes` it is turned on without asking.
 The deb and rpm packages do not carry the vector: with it turned on, setup downloads the vector and its license from the installed version's tag on GitHub into `experimental-speed-projection/` in the data folder.
-Only for the original Qwen3.8-Flash-Next (the Coder and Unsloth's files included), not Swift 1.5 or huihui-ai's abliterated copies.
+Only for the original Qwen3.8-Flash-Next (the Coder and Unsloth's files included), not Swift 1.5 or huihui-ai's and SC117's abliterated copies.
 It writes these engine flags (llama.cpp's) into `xestrata-<model>.json`:
 
 ```text
@@ -2026,6 +2060,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | `... gives this GPU no XMX` | The compiler gives the GPU no XMX; choose from setup's options. It runs without XMX, with prefill taking about 1.6 times as long ([BUILD.md](BUILD.md#the-sycl-compiler)). |
 | `no SYCL compiler for the engine` | There is no SYCL compiler: install the distribution's DPC++, or pass `--intel-llvm-build`. |
 | `alloc_device: ... refused` at start | A driver state that refuses device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); compute-runtime 26.22 works around an xe kernel bug fixed in Linux 7.1 - on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34). On the B70 it happened 3 times in about 120 starts). The engine retries the allocation in pieces and starts with what it gets. While the card is in that state, only a reboot brings it back. On Ubuntu 24.04/26.04, update the driver from the [graphics PPA](BUILD.md#packages) ([XE.md](XE.md#the-output-heads-vram-refusal)). |
+| setup, the server or the web page says "lacks the fix of the xe driver's CVE-2026-68264" | The running kernel's xe driver lacks the fix of CVE-2026-68264 (drm/xe/pt: Reset current_op in xe_pt_update_ops_init()): a GPU memory bind that is retried can write past its array and crash the driver. When an Intel GPU runs on the xe driver, Ubuntu's kernel build is compared with the fixed ones on [Ubuntu's CVE page](https://ubuntu.com/security/CVE-2026-68264) (7.0.0-38.38 and later for 26.04's `linux` and 24.04's `linux-hwe-7.0`), Debian asks `debsecan` and Arch `arch-audit` (other distributions are not checked). Update the kernel and reboot. A container (Podman, incus) runs on the host's kernel, so update the host's. |
 | The start log says `IGC's GEP simplification is off` | Intel Graphics Compiler (IGC) 2.27 to 2.30 (Ubuntu 26.04's 2.28.4 among them) miscompile some reads for Xe2 and later GPUs (the Arc B-series, Lunar Lake, Panther Lake): the GPU reads past its buffer and stops, or the answers are wrong. On Linux, when the installed IGC is one of those and there is an Xe2 or later GPU, the engine sets `IGC_EnableGEPSimplification=0` when it starts, which turns that optimization off (on the B70 the decode of a 1K prompt is 5 to 10% slower, 32K the same). A value you set yourself, `IGC_EnableGEPSimplification=1`, is kept. For full speed, use Fedora 44 (its IGC is 2.32 or later), or [install with Podman](../README.md#podman) (Fedora 44 inside). On Ubuntu 24.04/26.04 there is also the way of moving to the HWE kernel with the [graphics PPA](BUILD.md#packages) (IGC alone cannot be updated: the PPA installs the driver with it, and that driver is for the HWE kernel). |
 | setup says `the IOMMU translates the GPU's memory accesses` | The IOMMU translates the GPU's memory accesses. Each start shows tens of GB of RAM to the GPU, and the kernel then allocates an I/O address for every page: a start soon after the engine stopped can copy to the GPU tens of times slower (`pre-filled ... MB/s` in the start log). Starting Linux with `iommu=pt` avoids it (the PC's own devices reach memory directly; devices passed to a virtual machine keep the IOMMU). Run the commands setup shows and restart the PC. |
 | setup says `memory compaction may move the expert arena under the Intel GPU` | Memory compaction can move pages of the expert arena registered with the Intel GPU, and each time the GPU's driver maps the whole arena again. With the IOMMU translating, the GPU's copies can stall or fail with a copy-engine error (`Engine memory CAT error`, #42). The engine locks the arena in RAM, so with `vm.compact_unevictable_allowed` at 0 compaction leaves it alone. Run the commands setup shows (no restart needed). The memlock limit has to allow the arena too. |
@@ -2097,11 +2132,13 @@ The model files are not part of it; their licenses apply to them (below).
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
-  UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
+  UD-Q2_0 to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
   Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
-  The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
-  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
+  The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai;
+  the GSQ-RCO abliterated versions: [SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117 (the weights with the refusals removed are OrcaRouter's);
+  Swift 1.5's GSQ-RCO abliterated versions: [SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117.
+  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the version with its refusals removed llmfan46's, as SC117's [APEX GGUFs](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the Detailer's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,

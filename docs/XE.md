@@ -604,7 +604,6 @@ The tensor inventory pins the files.
 | Swift 1.5 IQ2_XS | runs | 7 (0.151) | no drafts = suffix; MTP differs |
 | Swift 1.5 IQ3_XXS | runs | 62 (0.058, three candidates) | differ (the cache size also differed between runs) |
 | Swift 1.5 Q2_0 | runs (note) | 25 (0.273) | no drafts = suffix; MTP differs |
-| OrcaRouter IQ3_XXS (compatibility procedure) | **not run**: the repository is gated and needs a Hugging Face login to download | — | — |
 
 Note: in Swift 1.5 Q2_0, layer 13's expert tensors span both shards.
 The pack index names a shard per tensor.

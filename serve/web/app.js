@@ -555,9 +555,15 @@ function render(m) {
     toast("warn", tr("igc.toast", "Intel's compiler slows the decode"), tr("igc.toastText", "IGC {version} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}), 12000,
           {label: tr("show", "Show"), run: () => showTab("about")});
   }
+  // a kernel whose xe driver lacks the fix of CVE-2026-68264 (serve/kernel_check.py); said once a release
+  if (m.xe_kernel && store.get("xekernel-told", "") !== m.xe_kernel) {
+    store.set("xekernel-told", m.xe_kernel);
+    toast("warn", tr("xekernel.toast", "Update the Linux kernel"), tr("xekernel.toastText", "Linux {version} lacks the fix of the xe driver's CVE-2026-68264: a GPU memory bind that is retried can crash the driver. Update the kernel. A container (Podman, incus) runs on the host's kernel, so update the host's.", {version: m.xe_kernel}), 15000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
+  }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (tab === "about") renderAbout(eng, hw, st, m.xe_kernel);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -982,7 +988,7 @@ function gpuPlanRows(eng, hw, st) {
     `${c.mem_total ? `, ${gb(c.mem_total, 0)} GB` : ""}: ${(c.roles || []).filter((r) => r !== "text" || !(c.roles || []).some((x) => x === "prefill" || x === "decode"))
       .map((r) => roleName(c, r)).join(tr("about.gpuPlanComma", ", "))}`])];
 }
-function renderAbout(eng, hw, st) {
+function renderAbout(eng, hw, st, xeKernel) {
   const kv = {int8: tr("about.kv8", "8-bit"), q4_0: tr("about.kv4", "4-bit (Hadamard-rotated)"), fp16: tr("about.kv16", "16-bit")}[eng.kv] || eng.kv;
   const drafts = Math.max(0, (eng.mtp_max || eng.spec) - 1);
   facts($("facts-engine"), [
@@ -1000,6 +1006,7 @@ function renderAbout(eng, hw, st) {
     ...imageModelRows(eng.image_models),
     [tr("about.projection", "Experimental speed projection"), projectionText(eng.cvec)],
     [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
+    [tr("xekernel.label", "Linux kernel"), xeKernel ? tr("xekernel.about", "Linux {version} lacks the fix of the xe driver's CVE-2026-68264 (a GPU memory bind that is retried can crash the driver). Update the kernel; a container (Podman, incus) runs on the host's kernel.", {version: xeKernel}) : null],
   ]);
   facts($("facts-hw"), [
     ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("about.gpuUnreadable", "not readable (xe driver)")],

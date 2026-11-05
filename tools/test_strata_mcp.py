@@ -559,13 +559,15 @@ class Helpers(unittest.TestCase):
         self.assertEqual(list(S.CONTEXTS), M.FALLBACK_CONTEXTS)
 
     def test_unsloth_sizes(self):
-        """UD-IQ4_XS is a regular size, listed first (the family's default); UD-Q4_K_XL stays experimental, and
-        UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
+        """Dynamic v3.1's UD-Q2_0 to UD-IQ4_XS are regular sizes, listed first by size; UD-Q4_K_XL stays experimental,
+        and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
         s = M.Strata(HERE.parent)
+        regular = ["UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS"]
         for models in (s.tables()[0], M.FALLBACK_MODELS):
             self.assertEqual(s.sizes_of(models, "unsloth"),
-                             ["UD-IQ4_XS", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
-            self.assertFalse(models["UD-IQ4_XS"].get("experimental"))
+                             [*regular, "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
+            for m in regular:
+                self.assertFalse(models[m].get("experimental"))
             for m in ("UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"):
                 self.assertTrue(models[m].get("experimental"))
         fam = next(f for f in s.model_table({"ram_gb": 63.7, "gpus": []}) if f["family"] == "unsloth")

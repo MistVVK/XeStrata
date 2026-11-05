@@ -129,7 +129,7 @@ Strix Halo（gfx1151）は名前で見分け、Radeon 8060S / 8050S / 8040S を�
 GPU が使える共有のメモリを増やすのは、カーネルの起動の選択肢 `ttm.pages_limit` と `ttm.page_pool_size`（4 KiB のページの数）です。
 setup はホストの設定を変えません。
 エンジンは、内蔵 GPU の空きを、ランタイムが報告する値と、Linux が返せるメモリ（`MemAvailable`）から 6 GiB を引いた値の小さい方として数えます（upstream 004b15cd、`STRATA_UMA_HEADROOM_GIB` で 6 を変えられます）。
-エキスパートを RAM の予算で持つモデル（UD-Q4_K_XL、UD-IQ4_XS）では、setup はエキスパートのキャッシュを `auto` でなく数で書きます（upstream #1715）。
+エキスパートを RAM の予算で持つモデル（Unsloth の版）では、setup はエキスパートのキャッシュを `auto` でなく数で書きます（upstream #1715）。
 キャッシュと予算は同じ RAM を使うので、起動時の空きから決める `auto` は予算がまだ取っていない分まで数え、OS の分が残らなくなります。
 数は、RAM から 24 GB と予算（と RAM に置く KV）を引いた分のスロットで、設定の `args` の `--expert-cache N` で変えられます。
 
@@ -218,16 +218,27 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Unsloth の UD-IQ4_XS
+### Unsloth の Dynamic v3.1（UD-Q2_0〜UD-IQ4_XS）
 
-**[Unsloth の UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** は、元のモデルの約 4 ビットの i-quant で、3 つのシャード（94 GB）です（upstream #621）。
-エキスパートの gate・up は IQ3_S（1 層は IQ4_XS）、down は IQ4_NL（5 層は Q8_0）で、59.5 GB あります。
+**[Unsloth の Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（2026-11-04）は、元のモデルの 2〜4 ビットの版です（upstream #621 の UD-IQ4_XS もこの版に替わりました）。
+エキスパートの gate・up は IQ2_XXS〜IQ4_XS、down は Q2_0・IQ4_NL・Q5_0 で、n-gram の表は最後のシャード（IQ4_NL）にあります。
+
+| 大きさ | ダウンロード | エキスパート | すべて RAM に入る RAM |
+| --- | ---: | ---: | ---: |
+| UD-Q2_0 | 70.5 GB | 37.4 GB | 約 61 GB |
+| UD-IQ2_XS | 75.8 GB | 42.3 GB | 約 66 GB |
+| UD-Q2_K_XL | 79.6 GB | 46.0 GB | 約 70 GB |
+| UD-IQ3_XXS | 83.6 GB | 50.3 GB | 約 74 GB |
+| UD-Q3_K_XL | 89.5 GB | 56.2 GB | 約 80 GB |
+| UD-IQ4_XS | 93.7 GB | 60.4 GB | 約 84 GB |
+
 密な部分と、RAM の予算の扱いは、下の UD-Q4_K_XL と同じです（`--resident-budget-gib N`、setup は RAM から 24 GB を引いた値を選びます）。
-RAM が約 80 GB あれば、すべてのエキスパートが RAM に入ります。
+RAM がそれより少ないと、入らないエキスパートを答えている間に SSD から読みます。
+setup は、すべてのエキスパートが RAM に入るうちでいちばん大きい版を勧めます（UD-Q4_K_XL は除きます）。
 setup は画像を尋ね（既定はオン）、画像のエンコーダーは元のモデルのものです。
 
 ```sh
-./setup.sh --setup --family unsloth --model UD-IQ4_XS
+./setup.sh --setup --family unsloth --model UD-IQ3_XXS
 ```
 
 Arc Pro B70（32 GB）と i7-14700、RAM 96 GB（RAM の予算 55 GiB）で、短い会話で 96 トークンを書かせると、decode は 32.5 / 32.8 トークン/秒で、答えは意味の通る文でした。
@@ -319,13 +330,33 @@ RAM だけで動かすなら、Gyro-Coder-L は 35 GB、Gyro-Coder は 26 GB 要
 拒否はずっと少なくなり、安全のための抑えも弱まっているので、書いたものを確かめてください。
 
 - `--family huihui-swift`: Swift 1.5 の IQ2_XS と IQ3_XXS。ライセンスは Swift Open License 1.0 です。
-- `--family huihui-unsloth`: Unsloth の UD-IQ4_XS、UD-Q4_K_XL、Q8_0。ライセンスは Qwen Community License 1.0 です。
+- `--family huihui-unsloth`: Unsloth の UD-IQ4_XS（Dynamic v3.1 より前の 3 シャードのもの）、UD-Q4_K_XL、Q8_0。ライセンスは Qwen Community License 1.0 です。
 
 ファイルの名前・シャード・大きさは元の版と同じで、重みが違います。画像の読み手は元の版のものです。
 実験的な速度向上用の射影は使えません。
 
 ```sh
 ./setup.sh --setup --family huihui-swift --model IQ2_XS
+```
+
+### SC117 の abliterated 版
+
+**[SC117 の abliterated 版](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)** は、ISTA-DASLab の 4 つの大きさ（Q2_0、IQ2_XS、IQ3_XXS、IQ3_S）に、OrcaRouter の abliterated 版の重みを移したものです（`--family sc117`）。
+移したのは各層の `ssm_out`、`attn_output`、共有エキスパートとエキスパートの down で、ほかは ISTA-DASLab のファイルのままです。
+拒否はずっと少なくなり、安全のための抑えも弱まっているので、書いたものを確かめてください。
+
+移した射影は Q8_0 なので、1 つ目のシャードは元より 0.2〜0.4 GB 大きくなります。
+2 つ目のシャード（n-gram の表）は元と同じファイルで、元の版が入っていれば共有します。
+画像の読み手と MTP の推測のヘッドは元のモデルのものです。
+実験的な速度向上用の射影は使えません。ライセンスは Qwen Community License 1.0 です。
+
+Swift 1.5 の 4 つの大きさに同じように移した版もあります（[SC117 の Swift 1.5 の abliterated 版](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)、`--family sc117-swift`）。
+移した射影は元の abliterated 版の型（IQ4_XS など）のままで、2 つ目のシャードは大きさごとに別のファイルです。
+画像の読み手は Swift 1.5 のもので、ライセンスは Swift Open License 1.0 です。
+
+```sh
+./setup.sh --setup --family sc117 --model IQ3_XXS
+./setup.sh --setup --family sc117-swift --model IQ3_XXS
 ```
 
 ### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash）
@@ -341,6 +372,7 @@ Qwen3.5-9B は、重みをすべて GPU の VRAM に置きます。
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**（Qwen、Apache-2.0）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の思考する MoE です。文脈は 256K まで。
   GGUF は Unsloth が MTP の層付きで作った UD-Q4_K_XL・UD-Q6_K_XL・Q8_0 です。
+  llmfan46 が Heretic と MPOA で拒否を外し MTP の層を残した版を、SC117 が APEX で量子化した [Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)（Apache-2.0、APEX-I-Quality・APEX-I-Balanced・APEX-I-Compact・APEX-I-MINI、14.3〜26.0 GB）も選べます（`--family qwen36-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
 - **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)**（Qwen、Apache-2.0）: 9B の密な思考するモデルで、画像も読めます。文脈は 256K まで。
   GGUF は Unsloth の Q4_K_M・Q6_K・Q8_0・BF16 です。
   HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)（Apache-2.0、同じ 4 つの大きさ）も選べます（`--family qwen35-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
@@ -385,6 +417,7 @@ setup は GPU の VRAM に入る最も大きな版を勧め、入らない組み
 ./setup.sh --setup --family ornith-uncensored --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family qwen36-uncensored --model APEX-I-Quality
 ./setup.sh --setup --family qwen35 --model Q4_K_M
 ./setup.sh --setup --family qwen35-uncensored --model Q8_0
 ./setup.sh --setup --family glm53 --model UD-IQ3_XXS
@@ -564,7 +597,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
 
 **初回**は、いくつか質問をして、あとは自分で進めます。
 
-1. **どのモデルか**: Qwen3.8-Flash-Next（元のモデル）、Swift 1.5、Coder、Unsloth の UD-IQ4_XS か UD-Q4_K_XL（実験的）。
+1. **どのモデルか**: Qwen3.8-Flash-Next（元のモデル）、Swift 1.5、Coder、Unsloth の版（UD-Q2_0〜UD-IQ4_XS、実験的な UD-Q4_K_XL など）。
 1. **どの大きさか**: RAM に合ったものを勧めます。
 1. **文脈の長さ**: 8K〜256K トークン。GPU に合った長さを勧めます。
    384K と 512K も選べますが、学習した長さ（262,144）を超えるので、RoPE の拡張を足す実験的なものです。
@@ -669,7 +702,7 @@ setup の手順 5 は、ファイルを置く場所（`XeStrata-data/models/<大
 使ったりダウンロードしたりする前に、ファイルが本当は何かを見るには `./setup.sh --inspect <ファイル>` を使います（upstream #911）。
 ヘッダーだけ（数 MB、ネットワーク越しでも）を読み、重みの部分ごとの実際のビット数と型、setup が入れるファイルのどれか（名前によらない）、そのどれかと同じ形で保存されているか、XeStrata で動かないもの（別のアーキテクチャ、どのカーネルも読まない形式のエキスパート）かを示します。
 ファイル、フォルダー、URL、`ms:owner/repo`（ModelScope）、`hf:owner/repo` を渡せ、後ろに大きさの名前を足せます。
-名前はあてになりません。Unsloth の `UD-IQ3_XXS` はエキスパートを 1 重みあたり 3.22 ビット、`UD-Q4_K_XL` は 5.10 ビット、元の `Q2_0` は 2.25 ビット、`IQ3_S` は 3.33 ビットで保存しています。
+名前はあてになりません。Unsloth の `UD-IQ3_XXS`（Dynamic v3.1）はエキスパートを 1 重みあたり 3.33 ビット、`UD-Q4_K_XL` は 5.10 ビット、元の `Q2_0` は 2.25 ビット、`IQ3_S` は 3.33 ビットで保存しています。
 Hugging Face のミラーから取るなら、`HF_ENDPOINT` を設定します（例: `HF_ENDPOINT=https://hf-mirror.com ./setup.sh`）。
 固定したリビジョンと確認は同じで、MTP のテンソルも同じホストから取ります。
 setup がダウンロードするモデルのファイルは、どれも大きさと SHA-256 を固定しています（upstream e193161de）。
@@ -1929,8 +1962,9 @@ Monitor は、要求ごとに ESP か stock かを示します。
 
 **有効にする（setup で）**: `./setup.sh --setup` が「Turn on the experimental speed projection?」と尋ねます（既定は no）。
 または `--experimental-speed-projection on`（`off`、または別のベクトルの GGUF のパス）を渡します。
+有効にしようとすると、setup は代わりに、重みから拒否を取り除いた SC117 と huihui-ai の abliterated 版（[上](#sc117-の-abliterated-版)）を勧め、それでも使うかを尋ねます（既定は no）。`--experimental-speed-projection on --yes` なら、尋ねずに有効にします。
 deb と rpm のパッケージにはベクトルが入っていないので、有効にすると、setup が入れた版のタグから GitHub にあるベクトルとそのライセンスをデータフォルダの `experimental-speed-projection/` にダウンロードします。
-元の Qwen3.8-Flash-Next（Coder と Unsloth の版を含む）だけで使え、Swift 1.5 と huihui-ai の abliterated 版では使えません。
+元の Qwen3.8-Flash-Next（Coder と Unsloth の版を含む）だけで使え、Swift 1.5 と、huihui-ai と SC117 の abliterated 版では使えません。
 setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<model>.json` に書きます。
 
 ```text
@@ -1974,6 +2008,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
 | 起動時に `alloc_device: ... refused` | VRAM に空きがあっても確保を断るドライバーの状態です（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。Linux 7.1 で直った xe カーネルのバグを、compute-runtime 26.22 が回避します。XeStrata の側では [#34](https://github.com/MistVVK/XeStrata/issues/34)。B70 では約 120 回の起動に 3 回起きました）。エンジンは確保を小分けにしてやり直し、確保できる分だけで起動します。カードがそのままのときは再起動でしか戻りません。Ubuntu 24.04/26.04 では [graphics PPA でドライバーを更新](BUILD.ja.md#パッケージ)してください（[XE.ja.md](XE.ja.md#出力ヘッドの-vram-の確保が断られる)）。 |
+| setup・サーバー・Web の画面に「lacks the fix of the xe driver's CVE-2026-68264」と出る | 動いているカーネルの xe ドライバーに CVE-2026-68264 の修正（drm/xe/pt: Reset current_op in xe_pt_update_ops_init()）が入っていません。GPU のメモリーの割り当て（bind）がやり直されると、ドライバーが範囲外に書いて落ちることがあります。Intel の GPU が xe ドライバーで動いているときに、Ubuntu はカーネルの版を [Ubuntu の CVE のページ](https://ubuntu.com/security/CVE-2026-68264)の修正版（26.04 の `linux` と 24.04 の `linux-hwe-7.0` は 7.0.0-38.38 以降）と比べ、Debian は `debsecan`、Arch は `arch-audit` に聞いて判定します（他のディストリビューションでは判定しません）。カーネルを更新して再起動してください。コンテナ（Podman、incus）はホストのカーネルで動くので、ホストのカーネルを更新します。 |
 | 起動のログに `IGC's GEP simplification is off` と出る | Intel Graphics Compiler（IGC）の 2.27〜2.30（Ubuntu 26.04 の 2.28.4 など）は、Xe2 以降の GPU（Arc B シリーズ、Lunar Lake、Panther Lake）向けに一部の読みを誤って訳し、GPU が範囲外を読んで止まるか、答えが狂います。Linux のエンジンは、入っている IGC がその版で、Xe2 以降の GPU があるとき、起動時に `IGC_EnableGEPSimplification=0` を設定してその最適化を切ります（B70 では 1K の decode が 5〜10% 遅くなり、32K は変わりません）。自分で `IGC_EnableGEPSimplification=1` を設定していれば、そちらが優先されます。元の速さで動かすには、Fedora 44 を使うか（IGC が 2.32 以降です）、[Podman で入れます](../README.ja.md#podman)（中は Fedora 44 です）。Ubuntu 24.04/26.04 では、HWE カーネルにして [Intel の graphics PPA](BUILD.ja.md#パッケージ) を入れる道もあります（IGC だけの更新はできません: PPA はドライバーも一緒に入れ、そのドライバーは HWE カーネル用です）。 |
 | setup が `the IOMMU translates the GPU's memory accesses` と言う | IOMMU が GPU のメモリの読み書きを変換しています。起動のたびに数十 GB の RAM を GPU に見せるとき、カーネルがページごとに I/O のアドレスを割り当てるため、止めてすぐ起動し直すと GPU への写しが何十倍も遅くなることがあります（起動のログの `pre-filled ... MB/s`）。Linux を `iommu=pt` 付きで起動すると避けられます（PC 自身の機器は直接メモリを読み書きし、仮想マシンに渡した機器は IOMMU を使い続けます）。setup が示すコマンドを実行し、PC を再起動します。 |
 | setup が `memory compaction may move the expert arena under the Intel GPU` と言う | メモリの compaction が、Intel の GPU に登録したエキスパートのアリーナのページを動かすことがあり、そのたびに GPU のドライバーがアリーナ全体を写し直します。IOMMU が変換していると、GPU のコピーが止まったり、コピーエンジンのエラー（`Engine memory CAT error`）になったりします（#42）。エンジンはアリーナを RAM に固定するので、`vm.compact_unevictable_allowed` を 0 にすれば compaction が動かさなくなります。setup が示すコマンドを実行します（再起動は要りません）。memlock の上限も、アリーナの分要ります。 |
@@ -2042,11 +2077,13 @@ Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコー�
   Coder は [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
-  UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
+  UD-Q2_0〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
   Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
   Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
-  abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
-  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)、拒否を外した版は dealignai の [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）、Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と HauhauCS の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+  abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)、
+  GSQ-RCO の abliterated 版は SC117 の [SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)（拒否を取り除いた重みは OrcaRouter のもの）、
+  Swift 1.5 の GSQ-RCO の abliterated 版は SC117 の [SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF)。
+  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)、拒否を外した版は dealignai の [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（拒否を外した版は llmfan46 の重みを SC117 が量子化した [APEX の GGUF](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)）と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）、Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と HauhauCS の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
   画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の ComfyUI 向けの単一ファイル）、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、ComfyUI の形は PedroMarinhoDev。akhaliq の MOSS-Image-Edit-HQ の armV5 と armV6）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）、Detailer の検出器の Bingsu の adetailer（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`、Ultralytics YOLOv8 で学習。公開元は Apache 2.0、Ultralytics は YOLO で学習したモデルを既定で AGPL-3.0 とする）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
