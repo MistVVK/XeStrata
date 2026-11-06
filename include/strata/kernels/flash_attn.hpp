@@ -92,6 +92,21 @@ struct FlashAttnI8Stats {
 /// or its buffers do not fit (nothing written).  A null stream waits.
 bool flash_attn_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                    int64_t r0, int64_t first, uint16_t* out16, void* stream, const FlashAttnI8Stats* st = nullptr);
+/// The causal form (the LLMs' prompt): Tq query rows of `heads` heads, row t at position pos0 + t, against the Tk
+/// cells of `pools` (pages of page_size cells, FP16, int8 or Q4_0; key j at position j) of kv_heads heads (query head h
+/// reads KV head h / (heads / kv_heads)), each row seeing the keys up to its position; q16 and out16
+/// [Tq][heads head_dim], FP16.  Its buffers are the stream's, kept for the next call.  False (nothing launched) where
+/// no int8 kernel takes it here (the GPU, head_dim) or its buffers would cut into the GPU's reserve: the caller's
+/// 16-bit path.
+bool flash_attn_i8_causal(const uint16_t* q16, const QsaAttnPools& pools, int64_t page_size, int64_t Tq, int64_t Tk,
+                          int64_t heads, int64_t kv_heads, int64_t head_dim, int64_t pos0, uint16_t* out16,
+                          void* stream);
+/// Takes the stream's buffers of flash_attn_i8_causal for Tq rows over Tk keys now (before an engine plans its memory
+/// around them; false: not on this GPU, or past a 32nd of its memory), or gives them back (a caller that will not
+/// take it).
+bool flash_attn_i8_causal_prepare(int64_t Tq, int64_t Tk, int64_t heads, int64_t kv_heads, int64_t head_dim,
+                                  void* stream);
+void flash_attn_i8_causal_release(void* stream);
 /// A prefix of P keys made once (flash_attn_i8_prefix_bytes of device memory, from their k16 and v16) that
 /// flash_attn_i8_prefixed's T rows attend to after their own keys, its values at their scales times v_from / v_to (a
 /// head's).

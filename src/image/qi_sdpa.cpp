@@ -15,6 +15,7 @@
 #include "qi_sdpa.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/sdpa_onednn.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -120,7 +121,8 @@ bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int6
 #if STRATA_ONEDNN
     // oneDNN's GPU kernels are Intel's: its Level Zero and OpenCL devices
     if (be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl)
-        return sdpa::onednn(q, q16, k16, v16, q0, q1, T, heads, head_dim, out16);
+        return kernels::onednn_sdpa(q16 + q0 * heads * head_dim, k16, v16, q1 - q0, T, heads, heads, head_dim, out16,
+                                    stream);
 #endif
     (void) k16, (void) v16, (void) T, (void) heads, (void) head_dim, (void) out16, (void) q16;
     return false;

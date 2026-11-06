@@ -847,8 +847,8 @@ if(STRATA_ENABLE_XE)
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
   # tag pinned here; Ubuntu's libdnnl-sycl is built for another SYCL runtime than intel/llvm's), built with the engine's
   # compiler for Intel GPUs only (its SYCL GPU runtime, no CPU runtime) beside the build, and linked to the image engine
-  # alone (the text engine does not load it).  Windows: cross-built as the engine is, without its VTune hooks (their
-  # assembly is MASM's).
+  # and the kernels (the plain models' prompt attention, the int8 products).  Windows: cross-built as the engine is,
+  # without its VTune hooks (their assembly is MASM's).
   option(STRATA_ONEDNN "the image attention and the VAEs' convolutions through oneDNN on Intel GPUs" ON)
   set(STRATA_ONEDNN_SOURCE "" CACHE STRING
       "oneDNN's source archive (a local file or URL) to build from (empty: fetch the pinned one)")
@@ -899,14 +899,16 @@ if(STRATA_ENABLE_XE)
       set_target_properties(strata_dnnl PROPERTIES IMPORTED_LOCATION ${_strata_dnnl_lib})
     endif()
     add_dependencies(strata_image strata_onednn)
-    target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp src/image/qi_conv_onednn.cpp)
+    target_sources(strata_image PRIVATE src/image/qi_conv_onednn.cpp)
     target_link_libraries(strata_image PRIVATE strata_dnnl)
-    # and the int8 products with scaled BF16 out on Intel GPUs (kernels::i8_gemm_bf16)
+    # and the int8 products with scaled BF16 out on Intel GPUs (kernels::i8_gemm_bf16), the SDPA the image attention
+    # and the plain models' prompt share (kernels::onednn_sdpa)
     add_dependencies(strata_kernels strata_onednn)
+    target_sources(strata_kernels PRIVATE src/kernels/xe/sdpa_onednn.cpp)
     target_link_libraries(strata_kernels PRIVATE strata_dnnl)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
-    set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
-                 src/upscale/esrgan.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
+    set_property(SOURCE src/image/qi_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
+                 src/image/yolo_detect.cpp src/upscale/esrgan.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
   # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256

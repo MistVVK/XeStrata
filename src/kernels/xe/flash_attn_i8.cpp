@@ -27,6 +27,9 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <type_traits>
+#include <unordered_map>
 
 namespace strata::kernels {
 
@@ -59,27 +62,45 @@ constexpr int VLD = CH;           // a dim's row of V^T in local memory (bytes; 
 constexpr int SLICES = 32;        // the key stats' partial sums: slices of the keys
 
 // the per-device buffers, grown to the largest T asked: int8 Q and K [T][heads D], V^T [heads][Tp / CH][D][CH], their
-// scales; Q and its scales 8 rows past Tp (JmKernel's tiles from a first row r0 leaves anywhere)
+// scales; Q and its scales 8 rows past Tp (JmKernel's tiles from a first row r0 leaves anywhere).  A causal attention
+// (run_causal) asks for its queries' Tq rows of Cq apart, fewer than its keys', and at most a 32nd of the GPU's
+// memory (fit: past that the caller's 16-bit kernel, not a later allocation of the engine's failing)
 struct Bufs {
     int8_t *q = nullptr, *k = nullptr, *vt = nullptr;
     float *sq = nullptr, *sk = nullptr, *sv = nullptr, *mean = nullptr, *part = nullptr, *sw = nullptr;
-    int64_t cap_t = 0, cap_c = 0;
-    bool grow(int64_t T, int64_t C, int64_t heads) {
-        const int64_t Tp = (T + CH - 1) / CH * CH;
-        if (Tp <= cap_t && C <= cap_c) return true;
+    int64_t cap_t = 0, cap_c = 0, cap_qt = 0, cap_qc = 0, cap_h = 0;
+    size_t held = 0;   // the bytes held now (given back before the larger ones are taken)
+    void release() {
         for (void* p : {(void*) q, (void*) k, (void*) vt, (void*) sq, (void*) sk, (void*) sv, (void*) mean, (void*) part,
                         (void*) sw})
             if (p != nullptr) strata::gpu::free(p);
         *this = Bufs{};
-        if (!strata::gpu::alloc_device(&q, (size_t) ((Tp + 8) * C)) ||
-            !strata::gpu::alloc_device(&k, (size_t) (Tp * C)) || !strata::gpu::alloc_device(&vt, (size_t) (Tp * C)) ||
-            !strata::gpu::alloc_device(&sq, (size_t) ((Tp + 8) * heads) * 4) ||
-            !strata::gpu::alloc_device(&sk, (size_t) (Tp * heads) * 4) || !strata::gpu::alloc_device(&sv, (size_t) C * 4) ||
-            !strata::gpu::alloc_device(&mean, (size_t) C * 4) || !strata::gpu::alloc_device(&sw, (size_t) C * 4) ||
-            !strata::gpu::alloc_device(&part, (size_t) 2 * SLICES * C * 4))
+    }
+    bool grow(int64_t T, int64_t C, int64_t heads, int64_t Tq = -1, int64_t Cq = -1, int64_t hq = -1,
+              bool fit = false) {
+        if (Tq < 0) Tq = T, Cq = C, hq = heads;
+        const int64_t Tp = (T + CH - 1) / CH * CH, Tqp = (Tq + CH - 1) / CH * CH;
+        const int64_t hs = std::max({heads, hq, cap_h});
+        if (Tp <= cap_t && C <= cap_c && Tqp <= cap_qt && Cq <= cap_qc && hs <= cap_h) return true;
+        const int64_t qt = std::max(Tqp, cap_qt), qc = std::max(Cq, cap_qc), t = std::max(Tp, cap_t),
+                      c = std::max(C, cap_c);
+        const size_t need = (size_t) ((qt + 8) * qc + 2 * t * c + (qt + 8) * hs * 4 + t * hs * 4 + 3 * c * 4 +
+                                      c * 2 * SLICES * 4);
+        size_t free_b = 0, total_b = 0;
+        if (fit && (!strata::gpu::mem_info(&free_b, &total_b) || need > total_b / 32 || free_b + held < need))
             return false;
-        cap_t = Tp;
-        cap_c = C;
+        release();
+        if (!strata::gpu::alloc_device(&q, (size_t) ((qt + 8) * qc)) ||
+            !strata::gpu::alloc_device(&k, (size_t) (t * c)) || !strata::gpu::alloc_device(&vt, (size_t) (t * c)) ||
+            !strata::gpu::alloc_device(&sq, (size_t) ((qt + 8) * hs) * 4) ||
+            !strata::gpu::alloc_device(&sk, (size_t) (t * hs) * 4) || !strata::gpu::alloc_device(&sv, (size_t) c * 4) ||
+            !strata::gpu::alloc_device(&mean, (size_t) c * 4) || !strata::gpu::alloc_device(&sw, (size_t) c * 4) ||
+            !strata::gpu::alloc_device(&part, (size_t) 2 * SLICES * c * 4)) {
+            release();
+            return false;
+        }
+        cap_t = t, cap_c = c, cap_qt = qt, cap_qc = qc, cap_h = hs;
+        held = need;
         return true;
     }
 };
@@ -87,6 +108,19 @@ struct Bufs {
 Bufs& bufs_of(sycl::queue& q) {
     static core::PerDevice<std::shared_ptr<Bufs>> of;
     return *of.get(q.get_device(), [] { return std::make_shared<Bufs>(); });
+}
+
+// a causal attention's: a stream's own (two engines on a GPU, an LLM's prompt beside an image's, at once)
+std::mutex causal_mu;
+std::unordered_map<const sycl::queue*, std::unique_ptr<Bufs>>& causal_bufs() {
+    static std::unordered_map<const sycl::queue*, std::unique_ptr<Bufs>> of;
+    return of;
+}
+Bufs& causal_bufs_of(sycl::queue& q) {
+    std::lock_guard<std::mutex> g(causal_mu);
+    auto& p = causal_bufs()[&q];
+    if (!p) p = std::make_unique<Bufs>();
+    return *p;
 }
 
 // NVIDIA's mma.sync from sm_80 on (NvKernel): m16n8k32 s8 . s8 into s32, ldmatrix for the B operands out of local
@@ -159,18 +193,80 @@ int kind_of(sycl::queue& q) {
     });
 }
 
+// Where key_stats and prep_i8 read K and V: value (t, c) of the keys' rows [T][C] (c: a head's dims after the heads
+// before it).  Dense: FP16 rows (the image engine's).  Paged: the plain models' pools (qsa_decode_attn.hpp), a cell
+// t on page table[t / ps] at its KV head c / hd: FP16, int8 codes with an FP16 scale a 64 values, or Q4_0 blocks.
+struct Dense {
+    const uint16_t* p;
+    Dense(const uint16_t* p_) : p(p_) {}
+    float at(int64_t t, int64_t c, int64_t C) const { return f32_from_f16(p[t * C + c]); }
+    // a lane's U values from column c (zeros where !in)
+    template <int U> void load(int64_t t, int64_t c, int64_t C, bool in, float (&x)[U]) const {
+#pragma unroll
+        for (int w = 0; w < U / 4; ++w) {
+            const uint16_t* r = p + t * C + c + (int64_t) 4 * w;
+            const sycl::vec<uint16_t, 4> v =
+                in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(r) : sycl::vec<uint16_t, 4>(0);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) x[4 * w + u] = f32_from_f16(v[u]);
+        }
+    }
+};
+struct Paged {
+    const uint16_t* f16 = nullptr;
+    const int8_t* i8 = nullptr;
+    const uint16_t* sc = nullptr;   // i8's scales
+    const uint8_t* q4 = nullptr;
+    const int32_t* table = nullptr;
+    int64_t kv_heads = 0, ps = 0, hd = 0;
+    float at(int64_t t, int64_t c, int64_t) const {
+        const int64_t h = c / hd, d = c - h * hd, cell = ((int64_t) table[t / ps] * kv_heads + h) * ps + t % ps;
+        if (f16 != nullptr) return f32_from_f16(f16[cell * hd + d]);
+        if (i8 != nullptr) return (float) i8[cell * hd + d] * f32_from_f16(sc[cell * (hd / 64) + d / 64]);
+        const uint8_t* blk = q4 + (cell * (hd / 32) + d / 32) * 18;   // block_q4_0 (kv_q4.hpp): its scale, 16 bytes
+        const int j = (int) (d % 32);
+        const int code = j < 16 ? blk[2 + j] & 15 : blk[2 + j - 16] >> 4;
+        return (float) (code - 8) * f32_from_f16((uint16_t) (blk[0] | blk[1] << 8));
+    }
+    // a lane's U values (within one head and, for i8, one group of 64): the cell found once
+    template <int U> void load(int64_t t, int64_t c, int64_t C, bool in, float (&x)[U]) const {
+        if (!in) {
+#pragma unroll
+            for (int u = 0; u < U; ++u) x[u] = 0.f;
+            return;
+        }
+        const int64_t h = c / hd, d = c - h * hd, cell = ((int64_t) table[t / ps] * kv_heads + h) * ps + t % ps;
+        if (f16 != nullptr) {
+            Dense(f16 + cell * hd + d).load(0, 0, 0, true, x);
+        } else if (i8 != nullptr) {
+            const float m = f32_from_f16(sc[cell * (hd / 64) + d / 64]);
+#pragma unroll
+            for (int w = 0; w < U / 4; ++w) {
+                const auto v = *reinterpret_cast<const sycl::vec<int8_t, 4>*>(i8 + cell * hd + d + (int64_t) 4 * w);
+#pragma unroll
+                for (int u = 0; u < 4; ++u) x[4 * w + u] = (float) v[u] * m;
+            }
+        } else {
+#pragma unroll
+            for (int u = 0; u < U; ++u) x[u] = at(t, c + u, C);
+        }
+    }
+};
+
 // the keys' sums and the values' largest magnitudes over slices of the keys: part [2][SLICES][C]
-void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t C, float* part,
-               float* mean, float* sv) {
+template <class Src = Dense>
+void key_stats(sycl::queue& q, std::type_identity_t<const Src&> k16, std::type_identity_t<const Src&> v16, int64_t T,
+               int64_t C, float* part, float* mean, float* sv) {
     // mean null: V's alone; sv null: K's alone (the other given: FlashAttnI8Stats)
     const bool with_k = mean != nullptr, with_v = sv != nullptr;
-    q.parallel_for(sycl::range<2>((size_t) SLICES, (size_t) C), [=](sycl::id<2> id) {
+    const Src k = k16, v = v16;
+    q.parallel_for(sycl::range<2>((size_t) SLICES, (size_t) C), [=, k16 = k, v16 = v](sycl::id<2> id) {
         const int64_t sl = (int64_t) id[0], c = (int64_t) id[1];
         const int64_t t0 = T * sl / SLICES, t1 = T * (sl + 1) / SLICES;
         float sum = 0.f, mx = 0.f;
         for (int64_t t = t0; t < t1; ++t) {
-            if (with_k) sum += f32_from_f16(k16[t * C + c]);
-            if (with_v) mx = sycl::fmax(mx, sycl::fabs(f32_from_f16(v16[t * C + c])));
+            if (with_k) sum += k16.at(t, c, C);
+            if (with_v) mx = sycl::fmax(mx, sycl::fabs(v16.at(t, c, C)));
         }
         part[sl * C + c] = sum;
         part[(SLICES + sl) * C + c] = mx;
@@ -187,7 +283,7 @@ void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t
     });
 }
 
-// Q's and K's rows (a (row, head)'s 128 values, less `mean` for K) as int8 with their scales (Q's times `qmul`), and V
+// Q's and K's rows (a (row, head)'s HD values, less `mean` for K) as int8 with their scales (Q's times `qmul`), and V
 // as int8 by its (head, dim) scales, transposed into vt [heads][Tp / CH][D][CH] (a chunk's V^T in one piece, which the
 // attention reads at once: a dim's CH bytes Tp apart were 2% slower on the RX 9060 XT): one kernel, a work-group a head
 // and RB keys, V^T built in local memory so its rows go out RB bytes at a time; rows and keys past T up to Tp zero.
@@ -196,77 +292,114 @@ void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t
 // [heads][D][Tp]: its B operand read column-major, a row Tp bytes long (a chunk's rows of 32 bytes were below the 64
 // a 2D block load takes, and V read row-major, which int8 takes through a VNNI transform, left the B70's threads
 // hanging; IGC 2.41.16, 2026-11-06).
-void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* mean,
+template <int HD = D, class Src = Dense>
+void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src&> k16,
+             std::type_identity_t<const Src&> v16, const float* mean,
              const float* sv, int64_t T, int64_t Tp, int64_t heads, float qmul, int8_t* q8, int8_t* k8, int8_t* vt,
-             float* sq, float* sk) {
+             float* sq, float* sk, bool rot = false) {
+    constexpr int U = HD / 32;   // a lane's dims of a row
+    static_assert(U % 4 == 0 && (U & (U - 1)) == 0, "whole words of 4 a lane, a power of 2 for the transform");
     const int kind = kind_of(q);
-    const bool with_q = q16 != nullptr, nv = kind == 2, whole = kind == 3 || kind == 4;
+    // q16 null: the keys and values alone; k8 null: the queries alone (their own rows and heads: a causal attention's)
+    const bool with_q = q16 != nullptr, with_kv = k8 != nullptr, nv = kind == 2, whole = kind == 3 || kind == 4;
     const int64_t nc = Tp / CH;
     constexpr int RB = 128, WG = 256, TLD = RB + 4;   // V^T's rows in the tile: 4 lanes' dims a bank apart
-    const int64_t C = heads * D;
+    const int64_t C = heads * HD;
+    const Src ks = k16, vs = v16;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<int8_t, 1> tile(sycl::range<1>((size_t) (D * TLD)), h);
+        sycl::local_accessor<int8_t, 1> tile(sycl::range<1>((size_t) (HD * TLD)), h);
         sycl::local_accessor<float, 1> kmx(sycl::range<1>((size_t) RB), h);   // NvKernel's: a key's largest |k|
         // the heads the fast dimension: the groups at work together read whole rows, not one head's slice of
         // rows C * 2 bytes apart
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) ((Tp + RB - 1) / RB), (size_t) (heads * WG)),
                                          sycl::range<2>(1, WG)),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                       [=, k16 = ks, v16 = vs](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
             const int64_t hd = (int64_t) it.get_group(1), t0 = (int64_t) it.get_group(0) * RB;
             const int lid = (int) it.get_local_id(1);
             sycl::sub_group sg = it.get_sub_group();
             const int wave = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
-            // Q and K: a wave a row at a time, 4 dims a lane; V into the tile by its scales
-            float isv[4], mn[4];
+            // rot: a row's dims (U a lane) through the normalized Walsh-Hadamard transform, Q's and K's alike
+            auto hadamard = [&](float (&x)[U]) {
 #pragma unroll
-            for (int u = 0; u < 4; ++u) {
-                isv[u] = 1.f / sv[(int64_t) hd * D + (int64_t) lane * 4 + u];
-                mn[u] = mean[(int64_t) hd * D + (int64_t) lane * 4 + u];
+                for (int m = 1; m < U; m <<= 1)
+#pragma unroll
+                    for (int u = 0; u < U; ++u)
+                        if ((u & m) == 0) {
+                            const float a0 = x[u], a1 = x[u + m];
+                            x[u] = a0 + a1;
+                            x[u + m] = a0 - a1;
+                        }
+#pragma unroll
+                for (int m = 1; m < 32; m <<= 1) {
+                    const bool hi = (lane & m) != 0;
+#pragma unroll
+                    for (int u = 0; u < U; ++u) {
+                        const float o = sycl::permute_group_by_xor(sg, x[u], m);
+                        x[u] = hi ? o - x[u] : x[u] + o;
+                    }
+                }
+                const float n = 1.f / sycl::sqrt((float) HD);
+#pragma unroll
+                for (int u = 0; u < U; ++u) x[u] *= n;
+            };
+            auto store = [&](int8_t* p, const float (&x)[U], float inv) {
+#pragma unroll
+                for (int w = 0; w < U / 4; ++w) {
+                    uint32_t wd = 0;
+#pragma unroll
+                    for (int u = 0; u < 4; ++u)
+                        wd |= (uint32_t) (uint8_t) (int8_t) sycl::rint(x[4 * w + u] * inv) << (8 * u);
+                    *reinterpret_cast<uint32_t*>(p + (int64_t) 4 * w) = wd;
+                }
+            };
+            // Q and K: a wave a row at a time, U dims a lane; V into the tile by its scales
+            float isv[U], mn[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {   // the queries alone: none (sv and mean the keys' heads')
+                isv[u] = with_kv ? 1.f / sv[(int64_t) hd * HD + (int64_t) lane * U + u] : 1.f;
+                mn[u] = with_kv ? mean[(int64_t) hd * HD + (int64_t) lane * U + u] : 0.f;
             }
             for (int tt = wave; tt < sycl::min<int64_t>(RB, Tp - t0); tt += WG / 32) {
-                const int64_t t = t0 + tt, base = t * C + (int64_t) hd * D + (int64_t) lane * 4;
+                const int64_t t = t0 + tt, col = (int64_t) hd * HD + (int64_t) lane * U, base = t * C + col;
                 const bool in = t < T;
-                const sycl::vec<uint16_t, 4> z(0);
-                const bool inq = in && with_q;
-                const sycl::vec<uint16_t, 4> xq = inq ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(q16 + base)
-                                                      : z,
-                                             xk = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(k16 + base) : z,
-                                             xv = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(v16 + base) : z;
-                float vq[4], vk[4];
+                float vq[U], vk[U], vv[U];
+                Dense(q16).load(t, col, C, in && with_q, vq);
+                k16.load(t, col, C, in, vk);
+                v16.load(t, col, C, in, vv);
                 float mq = 0.f, mk = 0.f;
 #pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    vq[u] = f32_from_f16(xq[u]);
-                    vk[u] = in ? f32_from_f16(xk[u]) - mn[u] : 0.f;
-                    tile[(lane * 4 + u) * TLD + tt] = (int8_t) sycl::rint(f32_from_f16(xv[u]) * isv[u]);
+                for (int u = 0; u < U; ++u) {
+                    if (in) vk[u] -= mn[u];
+                    tile[(lane * U + u) * TLD + tt] = (int8_t) sycl::rint(vv[u] * isv[u]);
+                }
+                if (rot) {
+                    hadamard(vq);
+                    hadamard(vk);
+                }
+#pragma unroll
+                for (int u = 0; u < U; ++u) {
                     mq = sycl::fmax(mq, sycl::fabs(vq[u]));
                     mk = sycl::fmax(mk, sycl::fabs(vk[u]));
                 }
                 mq = sycl::reduce_over_group(sg, mq, sycl::maximum<float>());
                 mk = sycl::reduce_over_group(sg, mk, sycl::maximum<float>());
                 const float cq = mq > 0.f ? mq / 127.f : 1.f, ck = mk > 0.f ? mk / 127.f : 1.f;
-                const float iq = 1.f / cq, ik = 1.f / ck;
-                uint32_t wq = 0, wk = 0;
-#pragma unroll
-                for (int u = 0; u < 4; ++u) {
-                    wq |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vq[u] * iq) << (8 * u);
-                    wk |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vk[u] * ik) << (8 * u);
-                }
-                if (with_q) *reinterpret_cast<uint32_t*>(q8 + base) = wq;
-                if (!nv) *reinterpret_cast<uint32_t*>(k8 + base) = wk;
+                if (with_q) store(q8 + base, vq, 1.f / cq);
+                if (with_kv && !nv) store(k8 + base, vk, 1.f / ck);
                 if (lane == 0) {
                     if (with_q) sq[t * heads + hd] = cq * qmul;
-                    if (!nv) sk[t * heads + hd] = ck;
+                    if (with_kv && !nv) sk[t * heads + hd] = ck;
                     else kmx[tt] = mk;
                 }
             }
             sycl::group_barrier(it.get_group());
+            if (!with_kv) return;
             if (nv) {
                 // NvKernel's K: a scale for the 8 keys of a chunk a lane holds (columns 8 j + 2 g and + 1 of the
                 // chunk's tiles of 8, g its lane % 4): the lane's scores take one scale, their maximum taken before
                 // it and their exponents one FMA each (SageAttention's per-thread scales); sk [Tp / CH][4][heads]
                 for (int tt = wave; tt < sycl::min<int64_t>(RB, Tp - t0); tt += WG / 32) {
-                    const int64_t t = t0 + tt, base = t * C + (int64_t) hd * D + (int64_t) lane * 4;
+                    const int64_t t = t0 + tt, col = (int64_t) hd * HD + (int64_t) lane * U, base = t * C + col;
                     const int kk = (int) (t % CH), g = kk % 8 / 2, c0 = tt - kk;   // c0: the chunk's first in the tile
                     float gm = 0.f;
 #pragma unroll
@@ -274,22 +407,20 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
                         gm = sycl::fmax(gm, kmx[c0 + 8 * j + 2 * g]);
                         gm = sycl::fmax(gm, kmx[c0 + 8 * j + 2 * g + 1]);
                     }
-                    const float ck = gm > 0.f ? gm / 127.f : 1.f, ik = 1.f / ck;
+                    const float ck = gm > 0.f ? gm / 127.f : 1.f;
                     const bool in = t < T;
-                    const sycl::vec<uint16_t, 4> xk =
-                        in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(k16 + base) : sycl::vec<uint16_t, 4>(0);
-                    uint32_t wk = 0;
+                    float vk[U];
+                    k16.load(t, col, C, in, vk);
 #pragma unroll
-                    for (int u = 0; u < 4; ++u) {
-                        const float v = in ? f32_from_f16(xk[u]) - mn[u] : 0.f;
-                        wk |= (uint32_t) (uint8_t) (int8_t) sycl::rint(v * ik) << (8 * u);
-                    }
-                    *reinterpret_cast<uint32_t*>(k8 + base) = wk;
+                    for (int u = 0; u < U; ++u)
+                        if (in) vk[u] -= mn[u];
+                    if (rot) hadamard(vk);
+                    store(k8 + base, vk, 1.f / ck);
                     if (lane == 0 && kk < 8 && kk % 2 == 0) sk[((t / CH) * 4 + g) * heads + hd] = ck;
                 }
             }
             const int nk = (int) sycl::min<int64_t>(RB, Tp - t0);
-            for (int i = lid; i < D * RB / 4; i += WG) {   // V^T along the keys, 4 a work-item
+            for (int i = lid; i < HD * RB / 4; i += WG) {   // V^T along the keys, 4 a work-item
                 const int d = i / (RB / 4), tt = i % (RB / 4) * 4;
                 if (tt >= nk) continue;
                 uint32_t w;
@@ -300,8 +431,8 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
                 } else {
                     w = *reinterpret_cast<const uint32_t*>(&tile[d * TLD + tt]);
                 }
-                const int64_t at = whole ? ((int64_t) hd * D + d) * Tp + t0 + tt
-                                         : (((int64_t) hd * nc + (t0 + tt) / CH) * D + d) * CH + (t0 + tt) % CH;
+                const int64_t at = whole ? ((int64_t) hd * HD + d) * Tp + t0 + tt
+                                         : (((int64_t) hd * nc + (t0 + tt) / CH) * HD + d) * CH + (t0 + tt) % CH;
                 *reinterpret_cast<uint32_t*>(vt + at) = w;
             }
         });
@@ -322,7 +453,10 @@ struct Seg {
     int64_t T = 0, Tp = 0;
 };
 
+// CAUSAL, HD and QN as NvKernel's (QN: the query tiles a wave, fewer for the larger head's registers)
+template <bool CAUSAL, int HD = D, int QN = QT>
 struct Kernel {
+    static constexpr int D = HD, KLD = HD + 16, QT = QN;   // as the namespace's for this head size
     const int8_t *q8, *k8, *vt;
     const float *sq, *sk, *sv;
     uint16_t* out16;
@@ -331,6 +465,7 @@ struct Kernel {
     sycl::local_accessor<int8_t, 1> kl, vl;       // two chunks' K [CH][KLD] and V^T [D][VLD]
     sycl::local_accessor<float, 1> skl, svl;      // two chunks' key scales [CH], the head's V scales [D] (and the
                                                   // second segment's turn [D] after them)
+    int64_t kv_heads = 0, causal = 0;             // CAUSAL's, as NvKernel's
 
     // the work-group as an attribute, not a property: intel/llvm bounds an AMD kernel's registers by it from the
     // attribute only (see iq_mmq.cpp), and the 32 queries a wave need more than the 192 VGPRs of a 1024-lane group
@@ -349,13 +484,15 @@ struct Kernel {
         const int lo = lane & 15, hi = lane >> 4, lid = (int) it.get_local_id(1);
         auto row_of = [&](int e) { return wm::row_of(hi, e); };   // the accumulator's row of element e (column lo)
         const int64_t h = (int64_t) it.get_group(0), C = heads * D;
+        const int64_t KH = CAUSAL ? kv_heads : heads, hk = CAUSAL ? h / (heads / KH) : h, CK = KH * D;
         // the wave's QT tiles of 16 queries: my0 + 16 qt + lo
-        const int64_t my0 = r0 + (int64_t) it.get_group(1) * NW * 16 * QT + (int64_t) wave * 16 * QT;
+        const int64_t wg0 = r0 + (int64_t) it.get_group(1) * NW * 16 * QT;
+        const int64_t my0 = wg0 + (int64_t) wave * 16 * QT;
         const bool live = my0 < row_end;
         int8_t* K0 = kl.get_multi_ptr<sycl::access::decorated::no>().get();
         int8_t* V0 = vl.get_multi_ptr<sycl::access::decorated::no>().get();
         for (int i = lid; i < D; i += NW * 32) {
-            svl[i] = sv[h * D + i];
+            svl[i] = sv[hk * D + i];
             if (b.T > 0) svl[D + i] = b.sw[h * D + i];
         }
         // the queries as B operands of S^T (column lo: a query, K values kk * 16 + hi KOFF ..), their scales
@@ -364,7 +501,8 @@ struct Kernel {
         fv8 o[QT][D / 16];   // O^T: rows the dims nt * 16 + row_of(e), column the lane's query
 #pragma unroll
         for (int qt = 0; qt < QT; ++qt) {
-            const int64_t qr = sycl::min<int64_t>(my0 + 16 * qt + lo, Tp - 1);
+            // causal: Q's rows those of the queries (its buffer row_end long), else of the keys
+            const int64_t qr = sycl::min<int64_t>(my0 + 16 * qt + lo, (CAUSAL ? row_end : Tp) - 1);
 #pragma unroll
             for (int kk = 0; kk < D / 16; ++kk)
                 qb[qt][kk] = *reinterpret_cast<const frag*>(q8 + qr * C + h * D + kk * 16 + hi * KOFF);
@@ -381,23 +519,27 @@ struct Kernel {
         static_assert(CH <= NW * 32, "a work-item a key's scale");
         u4 rk[PIECES], rv[PIECES];
         float rs = 0.f;
-        // chunk ci: the first segment's ci, else the second's ci - na
-        const int64_t na = Tp / CH, nch = na + b.Tp / CH;
+        // chunk ci: the first segment's ci, else the second's ci - na; causal: the first's up to the work-group's last
+        // row's last key
+        const int64_t wg_last = sycl::min<int64_t>(row_end, wg0 + (int64_t) NW * 16 * QT) - 1;
+        const int64_t na = CAUSAL ? sycl::min<int64_t>(Tp / CH, (wg_last + causal + CH) / CH) : Tp / CH,
+                      nch = na + b.Tp / CH;
         auto fetch = [&](int64_t ci) {
             const bool sb = ci >= na;
-            const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T, nc = sb ? b.Tp / CH : na;
+            const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T, nc = sb ? b.Tp / CH : Tp / CH;
             const int8_t *kp = sb ? b.k : k8, *vp = sb ? b.vt : vt;
             const float* sp = sb ? b.sk : sk;
+            const int64_t kc = sb ? C : CK, kh = sb ? h : hk, sh = sb ? heads : KH;
 #pragma unroll
             for (int p = 0; p < PIECES; ++p) {
                 const int i = lid + p * NW * 32;
                 if (i >= KV16) break;
                 const int kr = i / (D / 16), c = i % (D / 16) * 16;
-                rk[p] = *reinterpret_cast<const u4*>(kp + (j0 + kr) * C + h * D + c);
+                rk[p] = *reinterpret_cast<const u4*>(kp + (j0 + kr) * kc + kh * D + c);
                 const int d = i / (CH / 16), cv = i % (CH / 16) * 16;
-                rv[p] = *reinterpret_cast<const u4*>(vp + ((h * nc + j0 / CH) * D + d) * CH + cv);
+                rv[p] = *reinterpret_cast<const u4*>(vp + ((kh * nc + j0 / CH) * D + d) * CH + cv);
             }
-            if (lid < CH) rs = j0 + lid < lim ? sp[(j0 + lid) * heads + h] : 0.f;
+            if (lid < CH) rs = j0 + lid < lim ? sp[(j0 + lid) * sh + kh] : 0.f;
         };
         auto stash = [&](int bf) {
             int8_t* Kb = K0 + bf * CH * KLD;
@@ -417,9 +559,10 @@ struct Kernel {
         if (nch > 1) fetch(1);
         int bf = 0;
         for (int64_t ci = 0; ci < nch; ++ci, bf ^= 1) {
-          if (live) {   // a wave past the rows shares the loads, nothing else
-            const bool sb = ci >= na;
-            const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T;
+          const bool sb = ci >= na;
+          const int64_t j0 = (sb ? ci - na : ci) * CH, lim = sb ? b.T : T;
+          // a wave past the rows (or, causal, whose rows see none of the chunk) shares the loads, nothing else
+          if (live && !(CAUSAL && !sb && j0 > my0 + (int64_t) (16 * QT - 1) + causal)) {
             if (sb && ci == na) {   // the second segment's V scales from here on
 #pragma unroll
                 for (int qt = 0; qt < QT; ++qt)
@@ -457,7 +600,9 @@ struct Kernel {
                     const float ks = sk_[kr];
 #pragma unroll
                     for (int qt = 0; qt < QT; ++qt) {
-                        s[qt][nt][e] = in ? (float) c[qt][e] * ks : -INFINITY;
+                        // causal: the key past the lane's query's last
+                        const bool seen = !CAUSAL || sb || j0 + kr <= my0 + (int64_t) (16 * qt + lo) + causal;
+                        s[qt][nt][e] = in && seen ? (float) c[qt][e] * ks : -INFINITY;
                         cmx[qt] = sycl::fmax(cmx[qt], s[qt][nt][e]);
                     }
                 }
@@ -485,7 +630,9 @@ struct Kernel {
                 // 0.022 so); such a chunk's ps is 0 and it adds nothing
                 ps[qt] = m[qt] == -INFINITY ? 0.f : sycl::native::exp2(cmx[qt] - m[qt]) / 127.f;
                 float sum = 0.f;
-                const float off = 6.98868468677217f - cmx[qt];   // log2 127: the values times 127 in exp2's argument
+                // log2 127: the values times 127 in exp2's argument; a query that sees none of the chunk (causal) has
+                // a cmx of -inf, and exp2 of -inf + inf would be NaN in its sum
+                const float off = cmx[qt] == -INFINITY ? 0.f : 6.98868468677217f - cmx[qt];
 #pragma unroll
                 for (int nt = 0; nt < CH / 16; ++nt) {
                     // 0 .. 127, rounded and packed a byte at a time by v_cvt_pk_u8_f32 (a score past T: exp2 of -inf,
@@ -593,7 +740,11 @@ constexpr int SC = 1;             // the layout's chunks a step
 constexpr int NK = SC * CH;       // keys a step
 constexpr int NVLD = NK + 16;     // a dim's row of V^T in local memory (bytes; 8 rows of an ldmatrix in distinct banks)
 
+// CAUSAL: a causal attention's (run_causal), its members below read; else the image engine's, without their tests.
+// HD: the head's dims (D the image engine's; 256 a causal attention's too)
+template <bool CAUSAL, int HD = D>
 struct NvKernel {
+    static constexpr int D = HD, KLD = HD + 16;   // as the namespace's for this head size
     const int8_t *q8, *k8, *vt;
     const float *sq, *sk, *sv;
     uint16_t* out16;
@@ -603,9 +754,12 @@ struct NvKernel {
     sycl::local_accessor<float, 1> skl, svl;      // two steps' key scales [SC][4] (prep_i8's), the
                                                   // head's V scales [D] (and the second
                                                   // segment's turn [D] after them)
+    // CAUSAL's: the keys' and values' heads (query head h reads KV head h / (heads / kv_heads)), and query row t
+    // sees the keys j <= t + causal only
+    int64_t kv_heads = 0, causal = 0;
 
     [[sycl::reqd_work_group_size(1, NNW * 32), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(32))]]
-    STRATA_NV_MINWG(NVMIN)
+    STRATA_NV_MINWG(HD == 128 ? NVMIN : 1)
     void operator()(sycl::nd_item<2> it) const {
 #if STRATA_NV_I8
         constexpr int kMagic = 0x4b400000;      // 1.5 * 2^23's bits
@@ -614,20 +768,25 @@ struct NvKernel {
         const int wave = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
         const int g = lane >> 2, t4 = lane & 3, lid = (int) it.get_local_id(1);
         const int64_t h = (int64_t) it.get_group(0), C = heads * D;
-        const int64_t my0 = r0 + (int64_t) it.get_group(1) * NNW * 16 * NQ + (int64_t) wave * 16 * NQ;
+        const int64_t KH = CAUSAL ? kv_heads : heads, hk = CAUSAL ? h / (heads / KH) : h, CK = KH * D;
+        const int64_t wg0 = r0 + (int64_t) it.get_group(1) * NNW * 16 * NQ;
+        const int64_t my0 = wg0 + (int64_t) wave * 16 * NQ;
         const bool live = my0 < row_end;
         int8_t* K0 = kl.get_multi_ptr<sycl::access::decorated::no>().get();
         int8_t* V0 = vl.get_multi_ptr<sycl::access::decorated::no>().get();
         for (int i = lid; i < D; i += NNW * 32) {
-            svl[i] = sv[h * D + i];
+            svl[i] = sv[hk * D + i];
             if (b.T > 0) svl[D + i] = b.sw[h * D + i];
         }
         // the members as values (the lambdas below take them so, not through the kernel object)
         const int8_t *const ka = k8, *const kb2 = b.k, *const va = vt, *const vb2 = b.vt;
         const float *const ska = sk, *const skb = b.sk;
         const int64_t Ta = T, Tb = b.T;
-        // the steps: the first segment's, then the second's, each from a chunk of CH keys
-        const int64_t na = Tp / CH, nb = b.Tp / CH, sa = (na + SC - 1) / SC, nsteps = sa + (nb + SC - 1) / SC;
+        // the steps: the first segment's, then the second's, each from a chunk of CH keys; causal: the first's up to
+        // the work-group's last row's last key
+        const int64_t wg_last = sycl::min<int64_t>(row_end, wg0 + (int64_t) NNW * 16 * NQ) - 1;
+        const int64_t na = CAUSAL ? sycl::min<int64_t>(Tp / CH, (wg_last + causal + CH) / CH) : Tp / CH,
+                      nb = b.Tp / CH, sa = (na + SC - 1) / SC, nsteps = sa + (nb + SC - 1) / SC;
         auto step_of = [=](int64_t si, bool& sb, int64_t& c0, int& nc) {
             sb = si >= sa;
             c0 = (sb ? si - sa : si) * SC;
@@ -641,7 +800,7 @@ struct NvKernel {
         const int kr0 = lid / (D / 16), vd0 = lid / (CH / 16);
         const uint32_t ks_at = (uint32_t) (kr0 * KLD + lid % (D / 16) * 16),
                        vs_at = (uint32_t) (vd0 * NVLD + lid % (CH / 16) * 16);
-        const int64_t kg_at = (int64_t) kr0 * C + (int64_t) (lid % (D / 16)) * 16,
+        const int64_t kg_at = (int64_t) kr0 * CK + (int64_t) (lid % (D / 16)) * 16,
                       vg_at = (int64_t) vd0 * CH + (int64_t) (lid % (CH / 16)) * 16;
         const uint32_t ks0 = nv::smem_addr(K0), vs0 = nv::smem_addr(V0);
         float rs = 0.f;
@@ -650,12 +809,12 @@ struct NvKernel {
             int64_t c0;
             int nc;
             step_of(si, sb, c0, nc);
-            const int8_t* kp = (sb ? kb2 : ka) + c0 * CH * C + h * D + kg_at;
-            const int8_t* vp = (sb ? vb2 : va) + (h * (sb ? nb : na) + c0) * D * CH + vg_at;
+            const int8_t* kp = (sb ? kb2 : ka) + c0 * CH * CK + hk * D + kg_at;
+            const int8_t* vp = (sb ? vb2 : va) + (hk * (sb ? nb : Tp / CH) + c0) * D * CH + vg_at;
             const uint32_t kb = ks0 + (uint32_t) bf * NK * KLD + ks_at, vb = vs0 + (uint32_t) bf * D * NVLD + vs_at;
 #pragma unroll
             for (int p = 0; p < KP; ++p)
-                if (kr0 + p * KR < nc * CH) nv::cp_async_cg(kb + (uint32_t) (p * KR * KLD), kp + (int64_t) p * KR * C);
+                if (kr0 + p * KR < nc * CH) nv::cp_async_cg(kb + (uint32_t) (p * KR * KLD), kp + (int64_t) p * KR * CK);
 #pragma unroll
             for (int p = 0; p < SC; ++p)
 #pragma unroll
@@ -665,7 +824,7 @@ struct NvKernel {
                                         vp + ((int64_t) p * D + (int64_t) dq * VD) * CH);
             nv::cp_async_commit();
             // the step's key scales: 4 a chunk (the keys a lane holds, its lane % 4's), [chunk][4][heads]
-            if (lid < 4 * SC) rs = lid / 4 < nc ? (sb ? skb : ska)[((c0 + lid / 4) * 4 + lid % 4) * heads + h] : 0.f;
+            if (lid < 4 * SC) rs = lid / 4 < nc ? (sb ? skb : ska)[((c0 + lid / 4) * 4 + lid % 4) * KH + hk] : 0.f;
         };
         // the queries as A operands (rows g and g + 8 of a tile, K values t4 * 4 .. and 16 + t4 * 4 .. of each 32),
         // the two rows' scales, references and sums (a lane's part of its quad's)
@@ -682,7 +841,7 @@ struct NvKernel {
         for (int qt = 0; qt < NQ; ++qt) {
 #pragma unroll
             for (int r = 0; r < 2; ++r) {
-                const int64_t qr = sycl::min<int64_t>(my0 + (16 * qt + g + 8 * r), Tp - 1);
+                const int64_t qr = sycl::min<int64_t>(my0 + (16 * qt + g + 8 * r), (CAUSAL ? row_end : Tp) - 1);
 #pragma unroll
                 for (int ks = 0; ks < D / 32; ++ks) {
                     const int8_t* p = q8 + qr * C + h * D + (ks * 32 + t4 * 4);
@@ -759,9 +918,17 @@ struct NvKernel {
                     }
                 uint32_t pa[NQ][NK / 32][4];
                 float ps[NQ][2];
-                // the scores, P and its sums; a step that ends past the segment's last key (edge) masks the keys
-                // after it
+                // the scores, P and its sums; a step that ends past the segment's last key or, causal, past a row's
+                // last key (edge) masks the keys after them
                 auto scores = [&](auto edge, int qt) __attribute__((always_inline)) {
+                    int klim[2] = {kmax, kmax};   // rows g and g + 8: the step's keys they see
+                    if constexpr (decltype(edge)::value)
+                        if (CAUSAL && !sb)
+#pragma unroll
+                            for (int r = 0; r < 2; ++r)
+                                klim[r] = (int) sycl::max<int64_t>(
+                                    0, sycl::min<int64_t>(my0 + (int64_t) (16 * qt + g + 8 * r) + causal + 1 - j0,
+                                                          (int64_t) kmax));
                     // the lane's keys of a chunk share a scale (sk_[chunk * 4 + t4]): their maximum is taken on the
                     // sums' bits (kMagicF + the sum, as a float: increasing with the sum), then scaled
                     float ksc[SC];   // the lane's keys' scale in each chunk of the step
@@ -777,7 +944,7 @@ struct NvKernel {
                         for (int e = 0; e < 4; ++e) {
                             s[j][e] = sycl::bit_cast<float>(acc[qt][j][e]);
                             if constexpr (decltype(edge)::value)
-                                if (j * 8 + 2 * t4 + (e & 1) >= kmax) s[j][e] = -INFINITY;
+                                if (j * 8 + 2 * t4 + (e & 1) >= klim[e >> 1]) s[j][e] = -INFINITY;
                             bmx[j / (CH / 8)][e >> 1] = sycl::fmax(bmx[j / (CH / 8)][e >> 1], s[j][e]);
                         }
                     float cmx[2], a[SC][2], b[SC][2];
@@ -846,8 +1013,11 @@ struct NvKernel {
                 };
 #pragma unroll
                 for (int qt = 0; qt < NQ; ++qt) {
-                    if (kmax == NK) scores(std::false_type{}, qt);
-                    else scores(std::true_type{}, qt);
+                    // causal: a tile whose first row sees the step's last key takes no masks
+                    if (kmax == NK && (!CAUSAL || sb || j0 + NK - 1 <= my0 + (int64_t) (16 * qt) + causal))
+                        scores(std::false_type{}, qt);
+                    else
+                        scores(std::true_type{}, qt);
                 }
 #pragma unroll
                 for (int qt = 0; qt < NQ; ++qt)
@@ -1245,7 +1415,7 @@ void launch(sycl::queue& q, const Bufs& b, const float* sv, int64_t T, int64_t T
         const int64_t rows = (int64_t) NNW * 16 * NQ;
         const size_t groups = (size_t) ((row_end - r0 + rows - 1) / rows);
         q.submit([&](sycl::handler& h) {
-            NvKernel k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
+            NvKernel<false> k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
                        sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * NK * KLD)), h),
                        sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * D * NVLD)), h),
                        sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (4 * NK)), h),
@@ -1289,7 +1459,7 @@ void launch(sycl::queue& q, const Bufs& b, const float* sv, int64_t T, int64_t T
     }
     const size_t groups = (size_t) ((row_end - r0 + (int64_t) NW * 16 * QT - 1) / ((int64_t) NW * 16 * QT));
     q.submit([&](sycl::handler& h) {
-        Kernel k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
+        Kernel<false> k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
                  sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * CH * KLD)), h),
                  sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * D * VLD)), h),
                  sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * CH)), h),
@@ -1353,6 +1523,54 @@ bool run_prefixed(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, cons
     return true;
 }
 
+// A causal attention (the LLMs' prompt, flash_attn_i8_causal): Tq query rows of `heads` heads (row t at position
+// pos0 + t) against Tk keys of kv_heads heads (key j at position j), the query head h reading KV head
+// h / (heads / kv_heads), all FP16 rows [rows][heads HD] and [keys][kv_heads HD]; out16 [Tq][heads HD].  NvKernel
+// and Kernel (the other kinds: false, the caller's 16-bit kernel).  Q and K go through the Hadamard transform before
+// their int8 (prep_i8's rot): an LLM's few large dims of Q and K took the others' precision, and the first token's KL
+// from the matrix engines' kernel was 0.137 on a 4K prompt of random tokens to llm-jp-4.1, 0.017 rotated (text: 0.0119
+// and 0.0097 the mean of six, the FP16 kernel's 0.0091; RTX 4070, 2026-11-07).
+template <int HD>
+bool run_causal(sycl::queue& q, const uint16_t* q16, const Paged& k16, const Paged& v16, int64_t Tq, int64_t Tk,
+                int64_t heads, int64_t kv_heads, int64_t pos0, uint16_t* out16) {
+    const int kind = kind_of(q);
+    if ((kind != 1 && kind != 2) || kv_heads <= 0 || heads % kv_heads != 0 || Tq > Tk || pos0 + Tq > Tk) return false;
+    Bufs& b = causal_bufs_of(q);
+    const int64_t C = heads * HD, CK = kv_heads * HD, Tkp = (Tk + CH - 1) / CH * CH, Tqp = (Tq + CH - 1) / CH * CH;
+    if (!b.grow(Tk, CK, kv_heads, Tq, C, heads, true)) return false;   // the keys' rows, the queries'
+    key_stats<Paged>(q, k16, v16, Tk, CK, b.part, b.mean, b.sv);
+    prep_i8<HD, Paged>(q, nullptr, k16, v16, b.mean, b.sv, Tk, Tkp, kv_heads, 0.f, nullptr, b.k, b.vt, nullptr, b.sk,
+                       true);
+    prep_i8<HD>(q, q16, q16, q16, b.mean, b.sv, Tq, Tqp, heads, 1.4426950408889634f / std::sqrt((float) HD), b.q,
+                nullptr, nullptr, b.sq, nullptr, true);
+    const float* sv = b.sv;
+    if (kind == 1) {
+        using K = Kernel<true, HD, HD == 128 ? QT : 1>;
+        const int64_t rows = (int64_t) NW * 16 * K::QT;
+        const size_t groups = (size_t) ((Tq + rows - 1) / rows);
+        q.submit([&](sycl::handler& h) {
+            K k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, Tk, Tkp, heads, 0, 0, Tq, Seg{},
+                sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * CH * K::KLD)), h),
+                sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * HD * VLD)), h),
+                sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * CH)), h),
+                sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * HD)), h), kv_heads, pos0};
+            h.parallel_for(sycl::nd_range<2>({(size_t) heads, groups * NW * 32}, {1, (size_t) NW * 32}), k);
+        });
+        return true;
+    }
+    const int64_t rows = (int64_t) NNW * 16 * NQ;
+    const size_t groups = (size_t) ((Tq + rows - 1) / rows);
+    q.submit([&](sycl::handler& h) {
+        NvKernel<true, HD> k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, Tk, Tkp, heads, 0, 0, Tq, Seg{},
+                             sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * NK * (HD + 16))), h),
+                             sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * HD * NVLD)), h),
+                             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (4 * NK)), h),
+                             sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (2 * HD)), h), kv_heads, pos0};
+        h.parallel_for(sycl::nd_range<2>({(size_t) heads, groups * NNW * 32}, {1, (size_t) NNW * 32}), k);
+    });
+    return true;
+}
+
 }  // namespace i8
 }  // namespace
 
@@ -1374,6 +1592,46 @@ bool flash_attn_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16
     if (!i8::run(q, q16, k16, v16, T, heads, r0, first, T, out16, st)) return false;
     if (!stream) q.wait();
     return true;
+}
+
+bool flash_attn_i8_causal(const uint16_t* q16, const QsaAttnPools& pools, int64_t page_size, int64_t Tq, int64_t Tk,
+                          int64_t heads, int64_t kv_heads, int64_t head_dim, int64_t pos0, uint16_t* out16,
+                          void* stream) {
+    if (Tq <= 0) return true;
+    if (pools.page_table == nullptr || (head_dim != 128 && head_dim != 256)) return false;
+    i8::Paged k, v;
+    k.table = v.table = pools.page_table;
+    k.kv_heads = v.kv_heads = kv_heads;
+    k.ps = v.ps = page_size;
+    k.hd = v.hd = head_dim;
+    k.f16 = pools.k_pool, v.f16 = pools.v_pool;
+    if (k.f16 == nullptr) k.i8 = pools.k_q, k.sc = pools.k_scale, k.q4 = k.i8 == nullptr ? pools.k_q4 : nullptr;
+    if (v.f16 == nullptr) v.i8 = pools.v_q, v.sc = pools.v_scale, v.q4 = v.i8 == nullptr ? pools.v_q4 : nullptr;
+    auto none = [](const i8::Paged& p) { return p.f16 == nullptr && p.i8 == nullptr && p.q4 == nullptr; };
+    if (none(k) || none(v)) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const bool ok = head_dim == 128 ? i8::run_causal<128>(q, q16, k, v, Tq, Tk, heads, kv_heads, pos0, out16)
+                                    : i8::run_causal<256>(q, q16, k, v, Tq, Tk, heads, kv_heads, pos0, out16);
+    if (!ok) return false;
+    if (!stream) q.wait();
+    return true;
+}
+
+bool flash_attn_i8_causal_prepare(int64_t Tq, int64_t Tk, int64_t heads, int64_t kv_heads, int64_t head_dim,
+                                  void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (i8::kind_of(q) != 1 && i8::kind_of(q) != 2) return false;
+    return i8::causal_bufs_of(q).grow(Tk, kv_heads * head_dim, kv_heads, Tq, heads * head_dim, heads, true);
+}
+
+void flash_attn_i8_causal_release(void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    std::lock_guard<std::mutex> g(i8::causal_mu);
+    auto& of = i8::causal_bufs();
+    if (auto it = of.find(&q); it != of.end()) {
+        q.wait();
+        it->second->release();
+    }
 }
 
 uint64_t flash_attn_i8_prefix_bytes(int64_t P, int64_t heads) { return i8::Prefix::bytes(P, heads); }
