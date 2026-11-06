@@ -723,7 +723,8 @@ if(STRATA_ENABLE_XE)
                            src/image/image_lora.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
-                           src/upscale/upscale.cpp src/upscale/esrgan.cpp src/image/yolo_detect.cpp
+                           src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
+                           src/upscale/seedvr2.cpp src/image/yolo_detect.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
@@ -990,6 +991,8 @@ if(STRATA_ENABLE_XE)
   add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
+  add_executable(strata-image-seedvr2-probe src/upscale/seedvr2_probe.cpp)
+  target_link_libraries(strata-image-seedvr2-probe PRIVATE strata_image)
   add_executable(strata-image-moss-text-probe src/image/moss_text_probe.cpp)
   target_link_libraries(strata-image-moss-text-probe PRIVATE strata_image)
   add_executable(strata-image-moss-dit-probe src/image/moss_dit_probe.cpp)

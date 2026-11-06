@@ -300,10 +300,20 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
      `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
    - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
 - **描き足し**: `extend` に `{"left": 256, "bottom": 128}` のような上下左右の画素か、`{"aspect": "16:9"}` のような形を付けると、1 枚目の画像の外側を描き足します（ComfyUI の ImagePadForOutpaint と同じく、足した部分と、元の画像の縁から 40 ピクセルの内側を描き直し、元の画像のそれより内側はそのまま残します）。足した部分は縁の画素で下塗りします。形を付けたときは、足りない向きの両側に同じだけ足します。マスクとは一緒に使えません。出力は足した後の大きさで、一辺は `max_side` までです。
-- **拡大**: `upscale` に `{"scale": 2}`（倍率は 1 より大きく 4 まで）を付けると、1 枚目の画像を拡大の手段で大きくし、その大きさで strength 0.35 で描き直します（ComfyUI でよく使う 2 段描きと同じ。`{"scale": 2, "strength": 0.5}` で strength も変えられます）。拡大した大きさが `max_side` を超えるときは、Ultimate SD Upscale と同じく 1024 ピクセルのタイル（周りに 128 ピクセル、縁を 32 ピクセルぼかす。Ultimate SD Upscale の既定の 32 と 8 では、タイルの境目にかかる服が崩れたため広げています）に分けて描き直します。一辺は 4096 までです。マスク・`extend` と一緒には使えません。
-   - `method` は拡大の手段です。`lanczos`（Lanczos の拡大）、`realesrgan`（超解像のモデル RealESRGAN x4plus。4 倍にしてから、頼んだ大きさに Lanczos で縮めます。ComfyUI の ImageUpscaleWithModel と ImageScale と同じ）、`auto`（既定。描き直すときも描き直さないときも RealESRGAN）。RealESRGAN の重みは初めて使うときにサーバーが取ります（下の「補助の重み」）。取っている間は、Lanczos に替えずに「取っている途中」と返します。
-   - `redraw` を `false` にすると、描き直さずに拡大の手段だけで大きくします（画像のモデルは動かず、`prompt` も要りません。`n` は 1）。
-   - `color` は拡大の後の色の補正で、`none`（既定）、`lab`（CIE Lab のチャンネルごとの平均と広がりを元の画像に合わせる）、`adain`（RGB で同じことをする）、`wavelet`（細かい成分は拡大の結果、粗い成分は元の画像を Lanczos で拡大したもの）です。
+- **拡大**: `upscale` に `{"scale": 2}`（倍率は 1 より大きく 4 まで）を付けると、1 枚目の画像を拡大の手段で大きくします（ComfyUI の拡大のノードと同じく、それだけでは描き直しません）。`{"scale": 2, "redraw": true}` で、その大きさで strength 0.35 で描き直します（ComfyUI でよく使う 2 段描きと同じ。`"strength": 0.5` で strength も変えられます）。描き直す大きさが `max_side` を超えるときは、Ultimate SD Upscale と同じく 1024 ピクセルのタイル（周りに 128 ピクセル、縁を 32 ピクセルぼかす。Ultimate SD Upscale の既定の 32 と 8 では、タイルの境目にかかる服が崩れたため広げています）に分けて描き直します。一辺は 4096 までです。マスク・`extend` と一緒には使えません。
+   - `method` は拡大の手段です。
+      - `lanczos`: Lanczos の拡大。
+      - `realesrgan`: 超解像のモデル RealESRGAN x4plus。4 倍にしてから、頼んだ大きさに Lanczos で縮めます（ComfyUI の ImageUpscaleWithModel と ImageScale と同じ）。
+      - `seedvr2`: ByteDance Seed の SeedVR2。頼んだ大きさに Lanczos で拡大した画像を、拡散のモデルが 1 ステップで復元します（ComfyUI の SeedVR2 と同じ手順）。`variant` で `7b`（既定。写真や動画のフレーム）、`7b-sharp`（アニメ、ぼやけた画像、細部をくっきりさせたいとき）、`3b` を選べます。GPU のメモリに 16 ビットの 7B が入るときは 16 ビット、入らないときは 8 ビット（int8_convrot）を使い、VRAM に入らない層は RAM から流します。8 ビットの 7B が VRAM と RAM のどちらにも入らないときだけ 3B にします。
+      - `auto`（既定）: 描き直すときは RealESRGAN、描き直さないときは SeedVR2。SeedVR2 が GPU のメモリに入らないときは RealESRGAN にし、応答にそう書きます。
+      - 拡大のモデルの重みは、初めて使うときにサーバーが取ります（下の「補助の重み」。SeedVR2 の 7B は 16 ビットで 16.5 GB、8 ビットで 8.3 GB、VAE は 0.5 GB）。取っている間は、ほかの手段に替えずに「取っている途中」と返します。
+   - `redraw` を付けないか `false` のときは、拡大の手段だけで大きくします（画像のモデルは動かず、`prompt` も要りません。`n` は 1）。`true` で描き直し、そのときは `prompt` も要ります。
+   - `color` は拡大の後の色の補正で、元の画像を Lanczos で同じ大きさにしたものに色を寄せます。名前は vLLM-Omni と ComfyUI の SeedVR2 と同じです。
+      - `wavelet`: 細かい成分は拡大の結果、粗い成分は元の画像のもの。
+      - `lab`: `wavelet` の後、CIE Lab の各チャンネルの値の分布を元の画像の分布に順位ごとに合わせます（明るさは 8 割を拡大の結果のまま残す）。
+      - `adain`: RGB の各チャンネルの平均と広がりを合わせます。
+      - `none`: 補正しません。
+      - 付けないときは手段の既定で、RealESRGAN は `none`（ComfyUI の ImageUpscaleWithModel と同じ）、SeedVR2 は `lab` です。
 - **部分を直す（Detailer）**: `fix` に `{"parts": ["face", "hands"], "strength": 0.5}`（部分の名前の並びだけでも書けます）を付けると、1 枚目の画像から顔（`face`）・手（`hands`）・人物（`person`）を見つけ、1 か所ずつ描き直します（ComfyUI の Impact Pack の FaceDetailer の手順と既定値）。
    - 見つけるのは YOLOv8 の検出器（Bingsu/adetailer の `face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）で、点数 0.5 以上のものです。重みは setup では取らず、初めて使うときにサーバーが取ります（下の「補助の重み」）。
    - 見つけた部分の箱の 3 倍の範囲を切り出し、約 1024x1024 ピクセルに拡大して strength 0.5 で描き直し、縮めて貼り戻します（上の「マスク」の切り出しと同じ部品です）。描き直すのは、顔と手では箱を、人物では人の形のマスクを、Impact Pack と同じく 10×10 の正方形で広げた部分（上と左に 4、下と右に 5 ピクセル）で、貼り戻しの縁を 20 ピクセルぼかします。
@@ -322,7 +332,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 
 LocalAI の拡大と同じ形です。multipart の `image`（1 枚）・`model`・`scale`、または JSON（`image` に data: URL か http(s) の URL）で送ります。応答は OpenAI の画像の形（`created`、`data[].b64_json` か `url`）です。
 
-- `model` は拡大の手段です。`realesrgan-x4plus`（RealESRGAN x4plus）、`lanczos`、`auto`（付けないときも `auto`）。これらは `/v1/models` にも出ます。`scale` の既定は RealESRGAN では 4、ほかは 2 です。
+- `model` は拡大の手段です。`realesrgan-x4plus`（RealESRGAN x4plus）、`seedvr2-7b`・`seedvr2-7b-sharp`・`seedvr2-3b`（SeedVR2）、`lanczos`、`auto`（付けないときも `auto`）。これらは `/v1/models` にも出ます。`scale` の既定は RealESRGAN では 4、ほかは 2 です。
 - vLLM-Omni の画像の共通の欄 `response_format`・`output_format`・`output_compression`・`seed` も受けます。
 - `extra_params` に、色の補正 `color_correction_method`（vLLM-Omni の SeedVR2 と同じ名前。`none`・`lab`・`adain`・`wavelet`）と、XeStrata の拡張の `redraw`（`true` で拡大の後に画像のモデルで描き直す。既定は `false`）・`redraw_strength`（描き直しの strength、既定 0.35）・`redraw_model`（描き直す画像のモデル、既定は既定のモデル）を書けます。描き直すときは `prompt` も要ります。
 - 中身は上の「拡大」と同じです（`upscale` の `method`・`redraw`・`strength`・`color`）。応答の `strata` の `upscale` に、使った手段、色の補正、拡大の時間（`upscale_s`、そのうちモデル `model_s`・大きさの合わせ `resize_s`・色の補正 `color_s`）、タイルに分けたときはその大きさと数（`tile`・`tiles`）が入ります。
@@ -339,7 +349,7 @@ LocalAI の拡大と同じ形です。multipart の `image`（1 枚）・`model`
 - `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
   `extend_image` は、会話の最後の画像の外側を描き足します（上の「描き足し」と同じ。引数は上下左右の画素か `aspect`）。
-  `upscale_image` は、会話の最後の画像を大きく、細かく描き直します（上の「拡大」と同じ。引数は `scale`（既定は 2）・`method`・`redraw`・`strength`）。「そのまま大きく」なら描き直さず、「大きく、細かく描き込んで」なら描き直す、という使い分けは、スキルの `tools/upscale_image` に書いてあります。
+  `upscale_image` は、会話の最後の画像を大きくし、`redraw` で細かく描き直します（上の「拡大」と同じ。引数は `scale`（既定は 2）・`method`・`redraw`（既定は描き直さない）・`strength`）。「そのまま大きく」なら描き直さず、「大きく、細かく描き込んで」なら描き直す、という使い分けは、スキルの `tools/upscale_image` に書いてあります。
   `fix_image` は、会話の最後の画像の顔・手・人物を見つけて描き直します（上の「部分を直す」と同じ。引数は `parts` と `strength`）。重みを取っている間は、その旨を返し、チャットのモデルは後で呼び直します。
   Qwen-Image-2.1 と Mage-Flow では、`generate_image` と `edit_image` に `guidance`（上の「サンプリングのガイダンス」の名前の配列）も渡します。CFG の要る 3 つは、モデルの既定で CFG が掛かるときだけ並べます。使いどころは `image_skill` の `guidance` に書いてあります。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
@@ -517,6 +527,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
   VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。
 - 文の読み手（Qwen3-VL、AtomicChat と huihui-ai の版、Qwen3.5-9B と HauhauCS の版、Qwen3-0.6B-Base）には、それぞれのライセンスが適用されます。
+- 拡大の SeedVR2（7B、7B sharp、3B）の重みと VAE は、ByteDance Seed の [SeedVR](https://github.com/ByteDance-Seed/SeedVR) で、Apache-2.0 です。サーバーは Comfy-Org の [SeedVR2](https://huggingface.co/Comfy-Org/SeedVR2) にあるもの（16 ビットと int8_convrot）をそのまま使います。
 - 拡大の RealESRGAN x4plus の重みは、Xintao Wang・Liangbin Xie・Chao Dong・Ying Shan の [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) で、BSD-3-Clause です。
   サーバーは、公式の v0.1.0 のリリースと同じファイル（`RealESRGAN_x4plus.pth`、SHA-256 で同じと確かめたもの）を [lllyasviel/Annotators](https://huggingface.co/lllyasviel/Annotators) から取り、`tools/image/esrgan.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換です。
 - Detailer の検出器（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）は Bingsu の [adetailer](https://huggingface.co/Bingsu/adetailer) で、公開元のライセンスは Apache 2.0 です。

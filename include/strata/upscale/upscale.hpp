@@ -16,10 +16,12 @@
 //
 // Lanczos is a model of its own here (scale 0, nothing to run): the plain resize, chosen the same way as the others.
 //
-// The color correction (color::, img_color.hpp, which Crop and Stitch's color match shares) moves the output's colors
-// back toward the input's: lab (each CIE Lab channel's mean and spread), adain (each RGB channel's), wavelet (the
-// output's high frequencies over the input's low ones, the input Lanczos-resized to the output's size) or none.  These
-// are SeedVR2's names for its corrections (vLLM-Omni's color_correction_method); each model has its default.
+// The color correction (color::, img_color.hpp, whose statistics Crop and Stitch's color match shares) moves the
+// output's colors back toward the input's (Lanczos-resized to the output's size): wavelet (the output's high
+// frequencies over the input's low ones), lab (the wavelet's, then each CIE Lab channel matched to the input's
+// distribution, the lightness mostly kept: SeedVR2's), adain (each RGB channel's mean and spread) or none.  These are
+// SeedVR2's names for its corrections (vLLM-Omni's color_correction_method, ComfyUI's SeedVR2PostProcessing); each
+// model has its default.
 #pragma once
 
 #include "strata/image/pipeline.hpp"
@@ -57,6 +59,12 @@ public:
     virtual const ModelInfo& info() const = 0;
     /// The weights' bytes on the GPU (held between runs until release(true)).
     virtual uint64_t weight_bytes() const = 0;
+    /// The least of the GPU's memory the weights run in (a model that streams its layers: those that stay and the
+    /// slots the others pass through); weight_bytes where they are all held.
+    virtual uint64_t weight_least() const { return weight_bytes(); }
+    /// The VRAM the next run may take for its weights and its scratch (a model that streams its layers keeps as many
+    /// of them as that leaves room for).
+    virtual void set_room(uint64_t bytes) { (void) bytes; }
     /// The bytes a run of a clip of `frames` frames of w x h input pixels takes besides the weights (its scratch), and
     /// its largest single buffer (against the device's largest allocation).
     virtual uint64_t clip_bytes(int64_t w, int64_t h, int64_t frames) const = 0;
@@ -69,6 +77,9 @@ public:
     virtual void release(bool all) = 0;
     /// What it holds on the GPU now.
     virtual uint64_t held() const = 0;
+    /// The last run's parts' seconds as key=value words (a model of several parts: SeedVR2's encode, DiT, decode);
+    /// empty where it has none to tell.
+    virtual std::string parts() const { return {}; }
 };
 
 /// The model `name` ("lanczos", "realesrgan") from its weights' file `path` (none for Lanczos) -> the model;

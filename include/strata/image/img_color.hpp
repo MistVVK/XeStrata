@@ -32,10 +32,18 @@ Stats stats(const uint8_t* rgba, int64_t n, Space space, const float* mask = nul
 bool transfer(uint8_t* rgba, int64_t n, Space space, const Stats& from, const Stats& to, double least);
 
 /// rgba (w x h) with its high frequencies kept and `ref`'s (w x h too) low ones: `levels` blurs of the kernel
-/// [1 2 1] x [1 2 1] / 16, dilated 1, 2, 4 ... pixels, the edges repeated; the image less its low part plus ref's.
+/// [1 2 1] x [1 2 1] / 16, dilated 1, 2, 4 ... pixels (at most an eighth of the shorter side), the edges repeated; the
+/// image less its low part plus ref's.
 void wavelet(uint8_t* rgba, const uint8_t* ref, int64_t w, int64_t h, int levels = 5);
 
 /// The VRAM wavelet() takes for w x h pixels.
 uint64_t wavelet_bytes(int64_t w, int64_t h);
+
+/// SeedVR2's lab correction (vLLM-Omni's and ComfyUI's color_correction_method "lab"): the wavelet correction toward
+/// ref, then in CIE Lab (the reference's matrices) each channel given ref's distribution, rank for rank (a histogram
+/// of 65536 bins of the channel's range: a bin's pixels take ref's value at their middle rank), the lightness kept
+/// `lum_weight` the corrected image's own.
+void lab_match(uint8_t* rgba, const uint8_t* ref, int64_t w, int64_t h, float lum_weight = 0.8f);
+uint64_t lab_match_bytes(int64_t w, int64_t h);
 
 }  // namespace strata::image::color

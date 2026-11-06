@@ -102,6 +102,7 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "google-t5/t5-base": "a9723ea7f1b39c1eae772870f3b547bf6ef7e6c1",                               # 2026-11-02
     "Bingsu/adetailer": "53cc19de382014514d9d4038601d261a7faa9b7b",                                # 2026-11-05
     "lllyasviel/Annotators": "982e7edaec38759d914a963c48c4726685de7d96",                           # 2026-11-05
+    "Comfy-Org/SeedVR2": "df48879708206a403d2a61acd55578c2e80fd233",                               # 2026-11-06
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -128,6 +129,7 @@ _AD = "Bingsu/adetailer"   # the Detailer's YOLOv8 detectors (fix_image)
 # the upscaler RealESRGAN x4plus: xinntao/Real-ESRGAN's release file (v0.1.0's RealESRGAN_x4plus.pth, the same bytes),
 # as ControlNet's annotators keep it
 _ANN = "lllyasviel/Annotators"
+_SV = "Comfy-Org/SeedVR2"   # the upscaler SeedVR2 (ByteDance Seed's), its DiTs in FP16 and int8_convrot and its VAE
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -290,6 +292,20 @@ FILES = {
                     "c8ab26f517173b1fe8342d336a09f443eb61cb08dcbfc78d53fff4c2547ae81e"),
     "realesrgan-x4plus": (_ANN, "RealESRGAN_x4plus.pth", 67_040_989,
                           "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"),
+    "seedvr2-vae": (_SV, "vae/ema_vae_fp16.safetensors", 501_324_814,
+                    "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"),
+    "seedvr2-7b-fp16": (_SV, "diffusion_models/seedvr2_7b_fp16.safetensors", 16_480_583_960,
+                        "2742ca6fee63bc5cc1773f426dd4b07b78cad27f51c9ea5cd42b035e6b592252"),
+    "seedvr2-7b-int8": (_SV, "diffusion_models/seedvr2_7b_int8_convrot.safetensors", 8_334_897_976,
+                        "5aa0d25fc9d35e449b659d0c9a5dcb22e2a4fa04032101b95a39da42b32c1be6"),
+    "seedvr2-7b-sharp-fp16": (_SV, "diffusion_models/seedvr2_7b_sharp_fp16.safetensors", 16_480_583_960,
+                              "70823bca54b9c24eeb56e1c452697c7c2a430867e58db0e376c6e260f3a4489d"),
+    "seedvr2-7b-sharp-int8": (_SV, "diffusion_models/seedvr2_7b_sharp_int8_convrot.safetensors", 8_334_897_976,
+                              "db48be2f1cc7e36b01a2aa529810f5d9c6a971edd29be225cf1b0eb18d51c366"),
+    "seedvr2-3b-fp16": (_SV, "diffusion_models/seedvr2_3b_fp16.safetensors", 6_784_268_336,
+                        "98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660"),
+    "seedvr2-3b-int8": (_SV, "diffusion_models/seedvr2_3b_int8_convrot.safetensors", 3_458_259_704,
+                        "c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -414,6 +430,8 @@ _YOLO_LICENSE = ("Apache-2.0 by its publisher (Bingsu/adetailer, https://hugging
                  "(https://www.ultralytics.com/license)")
 _ESRGAN_LICENSE = ("BSD-3-Clause, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's Real-ESRGAN "
                    "(https://github.com/xinntao/Real-ESRGAN)")
+_SEEDVR2_LICENSE = ("Apache-2.0, ByteDance Seed's SeedVR2 (https://github.com/ByteDance-Seed/SeedVR), as Comfy-Org "
+                    "repackaged it (https://huggingface.co/Comfy-Org/SeedVR2)")
 AUX = {
     "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
     "yolo-hand": {"file": "yolo-hand", "convert": "yolo", "out": "hand_yolov8s.safetensors", "license": _YOLO_LICENSE},
@@ -421,6 +439,12 @@ AUX = {
                     "license": _YOLO_LICENSE},
     "realesrgan": {"file": "realesrgan-x4plus", "convert": "esrgan", "out": "RealESRGAN_x4plus.safetensors",
                    "license": _ESRGAN_LICENSE},
+    # SeedVR2: its VAE beside the DiTs, under the name the engine looks for (strata/upscale/seedvr2.hpp)
+    "seedvr2-vae": {"file": "seedvr2-vae", "convert": None, "out": "ema_vae_fp16.safetensors",
+                    "license": _SEEDVR2_LICENSE},
+    **{f"seedvr2-{v}-{q}": {"file": f"seedvr2-{v}-{q}", "convert": None,
+                            "out": Path(FILES[f"seedvr2-{v}-{q}"][1]).name, "license": _SEEDVR2_LICENSE}
+       for v in ("7b", "7b-sharp", "3b") for q in ("fp16", "int8")},
 }
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
@@ -574,7 +598,7 @@ def aux_note() -> str:
     """What setup says of the image tools' weights, which it does not fetch (AUX)."""
     return ("The image tools' weights are fetched by the server the first time a tool needs them (not now): "
             f"fix_image's YOLOv8 detectors (face_yolov8m, hand_yolov8s, person_yolov8m-seg), {_YOLO_LICENSE}; the "
-            f"upscaler RealESRGAN x4plus, {_ESRGAN_LICENSE}")
+            f"upscalers RealESRGAN x4plus, {_ESRGAN_LICENSE}, and SeedVR2 (7B, 7B sharp, 3B), {_SEEDVR2_LICENSE}")
 
 
 def license_note(dit: str) -> str:

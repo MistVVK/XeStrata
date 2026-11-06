@@ -10,6 +10,7 @@
 #include "strata/image/img_color.hpp"
 #include "strata/image/img_crop.hpp"
 #include "strata/upscale/esrgan.hpp"
+#include "strata/upscale/seedvr2.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -92,9 +93,10 @@ uint64_t frame_bytes(const ModelInfo& in, int64_t sw, int64_t sh, int64_t w, int
     if (in.scale > 0 ? (mw != w || mh != h) : true) b += (uint64_t) (w * h * 4);
     // the resize's scratch (once at a time): the model's output to w x h, or the input to it
     uint64_t post = in.scale > 0 ? image::lanczos_resize_bytes(mw, mh, w, h) : image::lanczos_resize_bytes(sw, sh, w, h);
-    if (color == ColorFix::wavelet)
+    if (color == ColorFix::wavelet || color == ColorFix::lab)
         post = std::max(post, (uint64_t) (w * h * 4) + std::max(image::lanczos_resize_bytes(sw, sh, w, h),
-                                                                   image::color::wavelet_bytes(w, h)));
+                                                                   color == ColorFix::lab ? image::color::lab_match_bytes(w, h)
+                                                                                          : image::color::wavelet_bytes(w, h)));
     return b + post;
 }
 
@@ -127,7 +129,11 @@ std::unique_ptr<UpscaleModel> open_model(const std::string& name, const std::str
         if (path.empty()) throw std::invalid_argument("upscale: realesrgan needs its weights' file");
         return std::make_unique<Esrgan>(path);
     }
-    throw std::invalid_argument("upscale: no upscaler " + name + " (lanczos, realesrgan)");
+    if (name == "seedvr2") {
+        if (path.empty()) throw std::invalid_argument("upscale: seedvr2 needs its DiT's file");
+        return std::make_unique<Seedvr2>(path);
+    }
+    throw std::invalid_argument("upscale: no upscaler " + name + " (lanczos, realesrgan, seedvr2)");
 }
 
 uint64_t UpscaleRunner::least_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
@@ -139,7 +145,7 @@ uint64_t UpscaleRunner::least_bytes(const UpscaleModel& m, int64_t sw, int64_t s
         const int64_t t = in.context > 0 ? in.min_tile : std::max(fw, fh);
         const int64_t ww = window(t, in.context, fw), wh = window(t, in.context, fh), s = std::max(1, in.scale);
         const uint64_t tiles = in.context > 0 && (ww < fw || wh < fh) ? (uint64_t) (ww * wh) * 4 * (1 + s * s) : 0;
-        work = m.weight_bytes() + m.clip_bytes(ww, wh, clip_frames(in, 1)) + tiles;
+        work = m.weight_least() + m.clip_bytes(ww, wh, clip_frames(in, 1)) + tiles;
     }
     return frame_bytes(in, sw, sh, w, h, color) + work;
 }
@@ -201,8 +207,9 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
     if (in.identity) {
         m.run_clip(fin, fw, fh, nfr, made.p, r.seed);
     } else {
-        const uint64_t fixed = frame_bytes(in, sw, sh, w, h, rp.color) + m.weight_bytes();
+        const uint64_t frame = frame_bytes(in, sw, sh, w, h, rp.color), fixed = frame + m.weight_least();
         const uint64_t room = avail > fixed ? avail - fixed : 0;
+        m.set_room(avail > frame ? avail - frame : 0);
         int64_t T = std::max(fw, fh);
         if (r.max_tile > 0) T = std::min(T, r.max_tile);
         if (in.context > 0) {
@@ -297,14 +304,15 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
     // the colors moved back toward the input's
     t0 = std::chrono::steady_clock::now();
     namespace color = image::color;
-    if (rp.color == ColorFix::lab || rp.color == ColorFix::adain) {
-        const color::Space sp = rp.color == ColorFix::lab ? color::Space::lab : color::Space::rgb;
-        const color::Stats from = color::stats(out, w * h, sp), to = color::stats(pic.p, sw * sh, sp);
-        rp.color_applied = color::transfer(out, w * h, sp, from, to, 1.0);
-    } else if (rp.color == ColorFix::wavelet) {
+    if (rp.color == ColorFix::adain) {
+        const color::Stats from = color::stats(out, w * h, color::Space::rgb),
+                           to = color::stats(pic.p, sw * sh, color::Space::rgb);
+        rp.color_applied = color::transfer(out, w * h, color::Space::rgb, from, to, 1.0);
+    } else if (rp.color == ColorFix::wavelet || rp.color == ColorFix::lab) {   // against the input at the output's size
         Buf ref((uint64_t) (w * h * 4));
         image::lanczos_resize_device(pic.p, sw, sh, ref.p, w, h);
-        color::wavelet(out, ref.p, w, h);
+        if (rp.color == ColorFix::lab) color::lab_match(out, ref.p, w, h);
+        else color::wavelet(out, ref.p, w, h);
         rp.color_applied = true;
     }
     rp.color_s += since(t0);

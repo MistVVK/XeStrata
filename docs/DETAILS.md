@@ -2139,7 +2139,7 @@ The model files are not part of it; their licenses apply to them (below).
   the GSQ-RCO abliterated versions: [SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117 (the weights with the refusals removed are OrcaRouter's);
   Swift 1.5's GSQ-RCO abliterated versions: [SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117.
   The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the version with its refusals removed llmfan46's, as SC117's [APEX GGUFs](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
-  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the Detailer's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default), and the upscaler, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's RealESRGAN x4plus (BSD-3-Clause; the official release's file, fetched from lllyasviel/Annotators) ([IMAGE](IMAGE.md#licenses)).
+  The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the Detailer's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default), and the upscalers, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's RealESRGAN x4plus (BSD-3-Clause; the official release's file, fetched from lllyasviel/Annotators) and ByteDance Seed's SeedVR2 7B, 7B sharp and 3B with its VAE (Apache-2.0; Comfy-Org's repackaging) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
   the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
@@ -2189,9 +2189,20 @@ The model files are not part of it; their licenses apply to them (below).
      times to the size asked for follow ComfyUI's (GPL-3.0) ImageUpscaleWithModel and ImageScale. The `.pth` weights are
      converted to safetensors by `tools/image/esrgan.py` (no torch: `yolo_pt.py`'s reader). The code is written
      without copying theirs.
-   - The upscale's color corrections (`src/image/img_color.cpp`): their names (`lab`, `adain`, `wavelet`, `none`)
-     follow [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) SeedVR2's `color_correction_method`,
-     and `lab`'s conversion ComfyUI's ColorTransfer (kornia's CIE Lab). The code is written without copying theirs.
+   - SeedVR2 (`src/upscale/seedvr2_dit.cpp`, `seedvr2.cpp`; its VAE `src/image/mf_vae.cpp`'s LDM path): the 7B's DiT
+     is written from ByteDance Seed's [SeedVR](https://github.com/ByteDance-Seed/SeedVR) (Apache-2.0) `models/dit`,
+     the 3B's from its `models/dit_v2` (the windows, the joint attention of the text and a window, the RoPE, the
+     modulation, the time embedding) and Comfy-Org's weights' names and shapes; the 3B checked against
+     [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) `vllm_omni/diffusion/models/seedvr2/`. The
+     one step (the noise, the condition latent times 0.9152, the velocity taken off) and the image's handling before
+     and after follow ComfyUI's (GPL-3.0) SeedVR2 nodes, whose outputs it was checked against; int8_convrot's rotation
+     is ComfyUI's regular Hadamard. The code is written without copying theirs.
+   - The upscale's color corrections (`src/image/img_color.cpp`): their names (`lab`, `adain`, `wavelet`, `none`) and
+     the steps of `wavelet` (five dilated blurs) and `lab` (`wavelet`'s, then each CIE Lab channel matched rank for
+     rank, the lightness kept 0.8) follow [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) and
+     ComfyUI's (GPL-3.0) SeedVR2 color corrections; the ranks are matched by a histogram of 65,536 bins, not a sort.
+     Crop and Stitch's color match's CIE Lab follows ComfyUI's ColorTransfer (kornia's CIE Lab). The code is written
+     without copying theirs.
    - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors
      (GPL-3.0), its `comfy_extras/nodes_cfg.py`, `nodes_apg.py` and `nodes_slg.py`: the image sampling's guidance
      (`src/image/guidance.cpp`, `serve/images.py`'s `GUIDANCE_METHODS`), its formulas, where they apply (before or

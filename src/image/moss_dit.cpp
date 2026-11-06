@@ -75,21 +75,10 @@ std::string name_list(const std::vector<std::string>& names) {
     return out;
 }
 
-// RMSNorm(x[t]) * w (eps 1e-6), then * (1 + scale) + shift where the time gives them (null: not)
-struct RmsMod {
-    const float *x, *w, *shift, *scale;
-    int64_t C;
-    template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
-        const float* r = x + t * C;
-        float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += r[c] * r[c];
-        return {0.f, 1.f / sycl::sqrt(reduce(s) / (float) C + kEps)};
-    }
-    float value(int64_t t, int64_t c, const Stats& st) const {
-        const float y = x[t * C + c] * st.inv * w[c];
-        return scale != nullptr ? y * (1.f + scale[c]) + shift[c] : y;
-    }
-};
+// RMSNorm(x[t]) * w (eps 1e-6), then * (1 + scale) + shift where the time gives them (null: not): dit_rows' RmsAffine
+RmsAffine rms_mod(const float* x, const float* w, const float* shift, const float* scale, int64_t C) {
+    return RmsAffine{x, w, scale, shift, C, kEps, true};
+}
 
 // x as it is (the text encoder's states, for their FP16 rows' scales)
 struct Plain {
@@ -113,7 +102,7 @@ struct Situ {
     float bound(int64_t, int64_t) const { return 0.f; }
 };
 
-// RowsI8Of's ops (a W8A8 product's input without the FP16 rows): RmsMod's rows, after x += gate * add where add is a
+// RowsI8Of's ops (a W8A8 product's input without the FP16 rows): rms_mod's rows, after x += gate * add where add is a
 // deferred product (gate_add, its sums written back to x); Situ's; the attention's output times its heads' scales
 struct RmsI8 {
     static constexpr bool kRms = true, kKeep = true;
@@ -1221,7 +1210,7 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     }
     // q, k, v of every row (the products' sums scaled by their readers)
     if (i8) rows_i8(RmsI8{x, pre, pre_gate, n1, shift_a, scale_a, C}, R, C, xq8_, i8_slot(), s_);
-    else rows16(RmsMod{x, n1, shift_a, scale_a, C}, R, C, h16_, rs_, s_);
+    else rows16(rms_mod(x, n1, shift_a, scale_a, C), R, C, h16_, rs_, s_);
     const MfOut q = product(h16_, rs_, *w[0], base, q_, R, b(0), i8, true);
     const MfOut k = product(h16_, rs_, *w[1], base, k_, R, b(1), w[0]->type == kTypeW8, true);
     const MfOut v = product(h16_, rs_, *w[2], base, v_, R, b(2), w[1]->type == kTypeW8, true);
@@ -1297,7 +1286,7 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
             pend_ = {d, gate_f, x, R};
             continue;
         }
-        rows16(RmsMod{x + m0 * C, n2, shift_f, scale_f, C}, mr, C, h16_, rs_, s_);
+        rows16(rms_mod(x + m0 * C, n2, shift_f, scale_f, C), mr, C, h16_, rs_, s_);
         // SiTU reads the first product's sums with rs_, so its own rows' scales go to rs2_
         rows16(Situ{product(h16_, rs_, *w[4], base, gu_, mr, b(4), false, true), F_}, mr, F_, h16_, rs2_, s_);
         gate_add(x + m0 * C, product(h16_, rs2_, *w[5], base, a_, mr, b(5), false, true), gate_f, mr, C, s_);
@@ -1393,7 +1382,7 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
     flush_pending();
     // the head: each context's image rows normed, scaled and shifted by the time, projected to the latent's channels
     for (int i = 0; i < n; ++i) {
-        rows16(RmsMod{x_ + off[(size_t) i] * C, fnorm_, head_, head_ + C, C}, HW, C, h16_, rs_, s_);
+        rows16(rms_mod(x_ + off[(size_t) i] * C, fnorm_, head_, head_ + C, C), HW, C, h16_, rs_, s_);
         product(h16_, rs_, fout_, nullptr, out + i * HW * in_ch_, HW, nullptr);
     }
 }

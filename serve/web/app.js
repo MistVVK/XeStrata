@@ -3763,7 +3763,9 @@ $("img-form").onsubmit = async (ev) => {
       if (body.strength !== undefined) body.fix.strength = body.strength;
       delete body.size;
     } else if (!mask && refs.length === 1 && $("img-up").value) {   // the upscaler, then the drawing (or not)
-      body.upscale = {scale: Number($("img-up").value), method: $("img-up-m").value, redraw: $("img-up-r").checked};
+      const [method, variant] = $("img-up-m").value.split(":");   // SeedVR2's variant after the colon
+      body.upscale = {scale: Number($("img-up").value), method, redraw: $("img-up-r").checked};
+      if (variant) body.upscale.variant = variant;
       if ($("img-up-r").checked && body.strength !== undefined) body.upscale.strength = body.strength;
       delete body.strength;
     }

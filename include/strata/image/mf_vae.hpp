@@ -32,6 +32,13 @@
 // whole latent (the middle's attention and the group norms there over all of it) and the rest in overlapping tiles (4
 // tokens, 64 pixels, on each side shared), blended linearly across the overlap as ComfyUI's tiled decode does; the
 // group norms of the tiled levels take each tile's statistics.
+//
+// SeedVR2's VAE (ByteDance-Seed/SeedVR's video_vae_v3, as Comfy-Org's ema_vae_fp16 names it, diffusers' names) is the
+// same LDM VAE inflated to video; an image is a clip of one frame, where its causal convolutions (the first frame
+// repeated before it) are 2D ones whose kernels are their time taps summed, as they are read.  Its latent is 16
+// channels with no batch norm and no post_quant_conv (a token: 2 x 2 positions of them, 64 values, as the Flux2 VAE's
+// 128), and an upsampling is a 1 x 1 convolution to 4 c whose output spread over 2 x 2 positions is the larger image
+// (the frames it would add in time left out), then the convolution.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -73,7 +80,9 @@ public:
     /// The latent tokens z [h w][128] (device FP32) of rgb: the posterior's mean, plus exp(logvar / 2) eps when `eps`
     /// (device [h w][128] standard normal) is given (the reference samples the posterior).  The Flux2 VAE's is the
     /// mean (eps is not read).
-    void encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z);
+    /// The Flux2 VAE's within `limit` bytes of scratch where it can be: in tiles of tokens whose latents are blended
+    /// across their overlap where the whole does not fit.
+    void encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z, uint64_t limit = UINT64_MAX);
     /// The GPU memory an encode of an h x w latent works in.
     uint64_t encode_scratch_bytes(int64_t h, int64_t w) const;
 
@@ -122,7 +131,7 @@ private:
         uint16_t* a16 = nullptr;
     };
     Conv conv_w(class SafeTensors& st, const std::string& name, bool bias = true, int64_t col0 = 0,
-                int64_t cols = -1);
+                int64_t cols = -1, const std::vector<int64_t>* rows = nullptr);
     const float* vec(class SafeTensors& st, const std::string& name);
     const float* upload(const std::vector<float>& v);
     Attn attn_w(class SafeTensors& st, const std::string& norm, const std::string (&qkv)[3], const std::string& proj,
@@ -145,6 +154,8 @@ private:
     struct F2Level {
         std::vector<F2Res> blocks;
         Conv up;            // the convolution after the 2x upsampling (out 0: the last level, none)
+        Conv shuffle;       // SeedVR2's: the 1 x 1 convolution to 4 c whose 2 x 2 spread is the upsampling (out 0:
+                            // nearest)
     };
     // the Flux2 VAE's encoder: a level's blocks, then its downsampling (out 0: the last level, none)
     struct F2Down {
@@ -158,15 +169,20 @@ private:
     void f2_attention(const Attn& a, float* x, int64_t H, int64_t W);
     F2Sizes f2_enc_walk(int64_t h, int64_t w) const;
     void f2_encode(const float* rgb, int64_t h, int64_t w, float* z);
+    void f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, int64_t th, int64_t tw);
     void f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c);
     void f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t& c);
     void f2_tail(const float* x, int64_t H, int64_t W, int64_t c, float* rgb);
     void f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
-    void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t t);
+    void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t th, int64_t tw);
     F2Sizes f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, bool tail) const;
     uint64_t f2_bytes(const F2Sizes& z) const;
-    uint64_t f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t t) const;
-    std::pair<int, int64_t> f2_tiling(int64_t h, int64_t w, uint64_t limit) const;
+    uint64_t f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t th, int64_t tw) const;
+    struct F2Tiling {
+        int k = -1;
+        int64_t th = 0, tw = 0;
+    };
+    F2Tiling f2_tiling(int64_t h, int64_t w, uint64_t limit) const;
     uint64_t f2_least_bytes(int64_t h, int64_t w) const;
     uint64_t f2_scratch_bytes(int64_t h, int64_t w) const;
     void f2_grow(const F2Sizes& z);
@@ -204,6 +220,7 @@ private:
     // convolution after it, conv_in, the middle (two ResNet blocks around the attention), the levels from the
     // smallest, and norm_out / conv_out in gnw_, gnb_ and cout_
     bool f2_ = false, tiled_ = false;
+    int64_t f2_lc_ = 32;       // the latent's channels: a token holds 2 x 2 positions of them (SeedVR2's VAE: 16)
     const float *f2_mean_ = nullptr, *f2_std_ = nullptr;
     Conv f2_pq_;
     F2Res f2_mid_[2];

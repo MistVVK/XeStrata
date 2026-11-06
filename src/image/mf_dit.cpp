@@ -13,7 +13,6 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
-#include "strata/image/gelu.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -60,19 +59,6 @@ void release(std::vector<void*>& owned, void* p) {
     owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
     gpu::free(p);
 }
-
-// GELU (tanh form) of x
-struct Gelu {
-    MfOut x;
-    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
-    float value(int64_t t, int64_t c, const Stats&) const {
-        const float v = x.at(t, c);
-        return gelu_tanh(v);
-    }
-    // |GELU(v)| <= v for v >= 0 and below 0.17 for v < 0: the row's scale without a tanh more a value (a power of two
-    // at most one step larger, which costs FP16 nothing)
-    float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }
-};
 
 // y[n] = x . w[n] + b[n]: w N rows of Q8_0 blocks (K / 32 of them, 34 bytes: an FP16 scale and 32 int8 values),
 // x FP32; a work-group of 32 a row, reading it as 16-bit words, neighbouring items neighbouring words (a row of 3072
@@ -1107,13 +1093,13 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
             const int64_t mr = std::min(mlp_rows_, R - m0);
             rows16(LnMod{img_ + m0 * C, mod_i_ + 3 * C, mod_i_ + 4 * C, C}, mr, C, h16_, rs_, s_);
             // the GELU reads the first product's sums with rs_, so its own rows' scales go to rs2_
-            rows16(Gelu{product(h16_, rs_, b.imlp1, base, gu_, mr, f(b.b_imlp1), false, true)}, mr, F_, h16_, rs2_,
+            rows16(GeluTanh{product(h16_, rs_, b.imlp1, base, gu_, mr, f(b.b_imlp1), false, true)}, mr, F_, h16_, rs2_,
                    s_);
             gate_add(img_ + m0 * C, product(h16_, rs2_, b.imlp2, base, a_, mr, f(b.b_imlp2), false, true),
                      mod_i_ + 5 * C, mr, C, s_);
         }
         rows16(LnMod{txt_, mod_t_ + 3 * C, mod_t_ + 4 * C, C}, L, C, h16_, rs_, s_);
-        rows16(Gelu{product(h16_, rs_, b.tmlp1, base, gu_, L, f(b.b_tmlp1), false, true)}, L, F_, h16_, rs2_, s_);
+        rows16(GeluTanh{product(h16_, rs_, b.tmlp1, base, gu_, L, f(b.b_tmlp1), false, true)}, L, F_, h16_, rs2_, s_);
         gate_add(txt_, product(h16_, rs2_, b.tmlp2, base, a_, L, f(b.b_tmlp2), false, true), mod_t_ + 5 * C, L, C,
                  s_);
         blocks_stream_.end(bi);

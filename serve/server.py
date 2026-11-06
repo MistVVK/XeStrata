@@ -7579,8 +7579,9 @@ def make_handler(svc: Service):
                 # the upscalers: POST /v1/images/upscale
                 data += [{"id": name, **common, "status": {"value": "loaded"},
                           "architecture": {"input_modalities": ["image"], "output_modalities": ["image"]},
-                          "upscale": {"method": method, "scale": 4 if method == "realesrgan" else None}}
-                         for name, method in images_api.UPSCALE_MODELS.items()]
+                          "upscale": {"method": method, **({"variant": variant} if variant else {}),
+                                      "scale": 4 if method == "realesrgan" else None}}
+                         for name, (method, variant) in images_api.UPSCALE_MODELS.items()]
             return data
 
         def do_POST(self):

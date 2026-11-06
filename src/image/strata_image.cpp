@@ -110,7 +110,8 @@
 //                            tile=... tiles=...
 //   UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
 //                            the VRAM that upscale needs (from the files)                   -> NEED as NEED's
-//   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
+//   FREE                     the free VRAM, what the engine holds and the GPU's memory     -> FREE free_mib=... held_mib=...
+//                                                                                              total_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
 //   RELEASE [ALL]            frees the layers, activations and buffers (the cache); ALL also the parts' fixed weights
@@ -626,8 +627,15 @@ si::QiRef run_upscale(si::ImagePipeline& p, su::UpscaleModel& m, const si::QiRef
     return su::UpscaleRunner::run(m, src, rq, avail, &rep);
 }
 
+constexpr uint64_t kUpsReserve = 512ull << 20;   // upscale_base's
+
 // An upscale's base image at w x h before it is drawn again: by the request's upscaler (its time added to `ups_s`),
-// else Lanczos
+// else Lanczos.  The drawing plans its layers on the budget, which the free VRAM at the start set: after the upscaler
+// the budget is fitted again as FIT does, the server's reserve (reserve_mib, 512) kept for what the drawing's
+// libraries take outside it (the RX 9060 XT's second two-pass upscale ran out with 36 MiB to spare, RealESRGAN's
+// weights and its libraries' state kept).  An upscaler that holds more than the reserve (SeedVR2's gigabytes) is let
+// go first, weights and all, the VRAM it gives back added to the budget; a smaller one (RealESRGAN's 64 MiB) stays
+// for the next
 si::QiRef upscale_base(si::ImagePipeline& p, Upscalers& ups, const si::QiRequest& r, const si::QiRef& base, int64_t w,
                        int64_t h, double& ups_s) {
     if (r.upscaler.empty()) return si::lanczos_resize(base, w, h);
@@ -641,6 +649,14 @@ si::QiRef upscale_base(si::ImagePipeline& p, Upscalers& ups, const si::QiRequest
     }
     su::Report rep;
     si::QiRef out = run_upscale(p, ups.get(r.upscaler), base, rq, rep);
+    if (ups.held() > kUpsReserve) {   // what it gives back goes to the budget (a FIT while it was held left it out)
+        const uint64_t before = p.held() + si::free_vram();
+        ups.release(true);
+        const uint64_t after = p.held() + si::free_vram();
+        if (after > before) p.set_budget(p.budget() + (after - before));
+    }
+    if (const uint64_t have = p.held() + si::free_vram(); have < p.budget() + kUpsReserve)
+        p.set_budget(have > kUpsReserve ? have - kUpsReserve : 0);
     ups_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return out;
 }
@@ -889,10 +905,11 @@ int serve(si::ImagePipeline& p) {
                 const si::QiRef big = run_upscale(p, m, pic, rq, rep);
                 const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 write_file(dst, big.rgba);
+                const std::string parts = m.parts();
                 std::printf("UPSCALED width=%lld height=%lld upscale_s=%.3f model_s=%.3f resize_s=%.3f color_s=%.3f "
-                            "color=%s tile=%lld tiles=%lld\n", (long long) big.width, (long long) big.height, secs,
+                            "color=%s tile=%lld tiles=%lld%s%s\n", (long long) big.width, (long long) big.height, secs,
                             rep.model_s, rep.resize_s, rep.color_s, rep.color_applied ? su::color_name(rep.color) : "none",
-                            (long long) rep.tile, (long long) rep.tiles);
+                            (long long) rep.tile, (long long) rep.tiles, parts.empty() ? "" : " ", parts.c_str());
             } else if (op == "UPSNEED") {   // UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:]
                 int64_t w = 0, h = 0, iw = 0, ih = 0;
                 std::string spec, word;
@@ -906,10 +923,11 @@ int serve(si::ImagePipeline& p) {
                 strata::gpu::mem_info(&free, &total);
                 const uint64_t least = su::UpscaleRunner::least_bytes(m, iw, ih, w, h, color);
                 const uint64_t full = su::UpscaleRunner::full_bytes(m, iw, ih, w, h, color);
+                // cap: the GPU's whole memory (what the upscaler could have with every other program's let go)
                 std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0\n",
                             (unsigned long long) (least >> 20), (unsigned long long) (full >> 20),
                             (unsigned long long) ((p.held() + ups.held()) >> 20), (unsigned long long) (free >> 20),
-                            (unsigned long long) (full >> 20));
+                            (unsigned long long) (total >> 20));
             } else if (op == "DETECT") {   // DETECT <weights> <picture> <threshold> [<masks>]
                 std::string weights, pic, masks;
                 float conf = 0.5f;
@@ -973,8 +991,8 @@ int serve(si::ImagePipeline& p) {
             } else if (op == "FREE") {
                 size_t free = 0, total = 0;
                 strata::gpu::mem_info(&free, &total);
-                std::printf("FREE free_mib=%llu held_mib=%llu\n", (unsigned long long) (free >> 20),
-                            (unsigned long long) (p.held() >> 20));
+                std::printf("FREE free_mib=%llu held_mib=%llu total_mib=%llu\n", (unsigned long long) (free >> 20),
+                            (unsigned long long) (p.held() >> 20), (unsigned long long) (total >> 20));
             } else if (op == "BUDGET") {
                 uint64_t mib = 0;
                 ls >> mib;
@@ -1070,10 +1088,11 @@ int upscale_main(int argc, char** argv) {
         const si::QiRef big = su::UpscaleRunner::run(*m, src, rq, avail, &rep);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         write_file(out, big.rgba);
+        const std::string parts = m->parts();
         std::printf("UPSCALED width=%lld height=%lld upscale_s=%.3f model_s=%.3f resize_s=%.3f color_s=%.3f color=%s "
-                    "tile=%lld tiles=%lld\n", (long long) big.width, (long long) big.height, secs, rep.model_s,
+                    "tile=%lld tiles=%lld%s%s\n", (long long) big.width, (long long) big.height, secs, rep.model_s,
                     rep.resize_s, rep.color_s, rep.color_applied ? su::color_name(rep.color) : "none",
-                    (long long) rep.tile, (long long) rep.tiles);
+                    (long long) rep.tile, (long long) rep.tiles, parts.empty() ? "" : " ", parts.c_str());
         std::fflush(stdout);
     }
     return 0;

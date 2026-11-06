@@ -13,8 +13,9 @@
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
 
-#if STRATA_ONEDNN || STRATA_CUDNN
 #include "dit_rows.hpp"
+#include "tile_sides.hpp"
+#if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
 #endif
 
@@ -257,14 +258,28 @@ void posterior(const float* mom, const float* eps, int64_t n, int64_t Z, float* 
 }
 
 // the Flux2 VAE's input: out16[Y][X][c] = z[(Y / 2) w + X / 2][4 c + 2 (Y % 2) + X % 2] std + mean (the same index):
-// the batch norm undone and each token's 128 values spread over 2 x 2 positions of 32 channels
-void f2_unpatch16(const float* z, const float* mean, const float* sd, int64_t h, int64_t w, uint16_t* out16, void* s) {
+// the batch norm undone (none without mean: SeedVR2's) and each token's 4 Lc values spread over 2 x 2 positions of Lc
+// channels
+void f2_unpatch16(const float* z, const float* mean, const float* sd, int64_t h, int64_t w, int64_t Lc,
+                  uint16_t* out16, void* s) {
     const int64_t W = 2 * w;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * h * w * 32)), [=](sycl::id<1> id) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * h * w * Lc)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / 32, c = i - p * 32, Y = p / W, X = p - Y * W;
+        const int64_t p = i / Lc, c = i - p * Lc, Y = p / W, X = p - Y * W;
         const int64_t k = 4 * c + 2 * (Y % 2) + X % 2;
-        out16[i] = f16_from_f32(z[((Y / 2) * w + X / 2) * 128 + k] * sd[k] + mean[k]);
+        const float v = z[((Y / 2) * w + X / 2) * 4 * Lc + k];
+        out16[i] = f16_from_f32(mean != nullptr ? v * sd[k] + mean[k] : v);
+    });
+}
+
+// SeedVR2's upsampling: out16[2 Y + x][2 X + y][c] = in[Y][X][(2 x + y) C + c], in [H][W][4 C] (its 1 x 1
+// convolution's output, the reference's "(x y z c)" channels with the time's z = 0 kept)
+void f2_shuffle16(const float* in, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* s) {
+    const int64_t W2 = 2 * W;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * H * W * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / C, c = i - p * C, Y2 = p / W2, X2 = p - Y2 * W2;
+        out16[i] = f16_from_f32(in[((Y2 / 2) * W + X2 / 2) * 4 * C + (2 * (Y2 % 2) + X2 % 2) * C + c]);
     });
 }
 
@@ -279,14 +294,16 @@ void f2_rgb8_16(const float* rgb, int64_t HW, uint16_t* out16, void* s) {
 }
 
 // f2_unpatch16's inverse: z[(Y / 2) w + X / 2][4 c + 2 (Y % 2) + X % 2] = (m[Y][X][c] - mean) / std (the same
-// index) over the posterior's mean, the first 32 of the moments m [2 h][2 w][64]
-void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int64_t w, float* z, void* s) {
+// index; as it is without mean) over the posterior's mean, the first Lc of the moments m [2 h][2 w][2 Lc]
+void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int64_t w, int64_t Lc, float* z,
+              void* s) {
     const int64_t W = 2 * w;
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * h * w * 32)), [=](sycl::id<1> id) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * h * w * Lc)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / 32, c = i - p * 32, Y = p / W, X = p - Y * W;
+        const int64_t p = i / Lc, c = i - p * Lc, Y = p / W, X = p - Y * W;
         const int64_t k = 4 * c + 2 * (Y % 2) + X % 2;
-        z[((Y / 2) * w + X / 2) * 128 + k] = (m[p * 64 + c] - mean[k]) / sd[k];
+        const float v = m[p * 2 * Lc + c];
+        z[((Y / 2) * w + X / 2) * 4 * Lc + k] = mean != nullptr ? (v - mean[k]) / sd[k] : v;
     });
 }
 
@@ -330,10 +347,11 @@ void tile_gather(const float* x, int64_t w, int64_t C, int64_t y0, int64_t x0, i
     });
 }
 
-// a tile's image trgb [3][TH][TW] (at Y0, X0 of the image [3][H][W]) into acc (3 planes, then the weights' plane),
-// weighted by a linear ramp over `ramp` pixels on each side that another tile shares (top, bottom, left, right)
+// a tile's image trgb [C][TH][TW] ([TH][TW][C] with `hwc`: an encoded tile's tokens) at Y0, X0 of [H][W] into acc
+// (C planes, then the weights' plane), weighted by a linear ramp over `ramp` positions on each side that another tile
+// shares (top, bottom, left, right)
 void tile_blend(const float* trgb, int64_t TH, int64_t TW, int64_t Y0, int64_t X0, int64_t H, int64_t W, int64_t ramp,
-                bool top, bool bottom, bool left, bool right, float* acc, void* s) {
+                bool top, bool bottom, bool left, bool right, float* acc, void* s, int64_t C = 3, bool hwc = false) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (TH * TW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t y = i / TW, x = i - y * TW;
@@ -345,16 +363,17 @@ void tile_blend(const float* trgb, int64_t TH, int64_t TW, int64_t Y0, int64_t X
         if (right) wx = sycl::fmin(wx, ((float) (TW - x) - 0.5f) / r);
         const float wt = wy * wx;
         const int64_t o = (Y0 + y) * W + X0 + x, HW = H * W;
-        for (int64_t c = 0; c < 3; ++c) acc[c * HW + o] += wt * trgb[c * TH * TW + i];
-        acc[3 * HW + o] += wt;
+        for (int64_t c = 0; c < C; ++c) acc[c * HW + o] += wt * (hwc ? trgb[i * C + c] : trgb[c * TH * TW + i]);
+        acc[C * HW + o] += wt;
     });
 }
 
-// rgb [3][HW] = acc's planes over its weights
-void tile_finish(const float* acc, int64_t HW, float* rgb, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (3 * HW)), [=](sycl::id<1> id) {
+// out [C][HW] ([HW][C] with `hwc`) = acc's planes over its weights
+void tile_finish(const float* acc, int64_t HW, float* rgb, void* s, int64_t C = 3, bool hwc = false) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        rgb[i] = acc[i] / acc[3 * HW + i % HW];
+        const int64_t c = hwc ? i % C : i / HW, p = hwc ? i / C : i % HW;
+        rgb[i] = acc[c * HW + p] / acc[C * HW + p];
     });
 }
 
@@ -403,32 +422,50 @@ const float* MfVae::vec(SafeTensors& st, const std::string& name) {
     return upload(st.f32(name));
 }
 
-// a convolution's (or linear layer's) weights as FP16 [out][k][k][in], input columns col0 .. col0 + cols of them
-MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, int64_t col0, int64_t cols) {
+// a convolution's (or linear layer's) weights as FP16 [out][k][k][in], input columns col0 .. col0 + cols of them; a
+// video convolution's [out][in][kt][k][k] (SeedVR2's VAE) as the 2D one it is on an image's one frame, its time taps
+// summed (the frame repeated before it, as its causal padding has it); `rows` (null: all) the output rows taken, in
+// that order
+MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, int64_t col0, int64_t cols,
+                          const std::vector<int64_t>* rows) {
     const SafeTensor* t = st.find(name + ".weight");
-    if (t == nullptr || (t->shape.size() != 4 && t->shape.size() != 2))
+    if (t == nullptr || (t->shape.size() != 5 && t->shape.size() != 4 && t->shape.size() != 2))
         throw std::runtime_error("image engine (Mage-VAE): no " + name);
     Conv c;
-    c.out = t->shape[0];
-    const int64_t in = t->shape[1];
+    const int64_t all = t->shape[0], in = t->shape[1], kt = t->shape.size() == 5 ? t->shape[2] : 1;
+    c.out = rows != nullptr ? (int64_t) rows->size() : all;
     c.in = cols < 0 ? in - col0 : cols;
-    c.k = t->shape.size() == 4 ? t->shape[2] : 1;
+    c.k = t->shape.size() >= 4 ? t->shape[t->shape.size() - 1] : 1;
     if (c.in % 8 != 0) throw std::runtime_error("image engine (Mage-VAE): " + name + ": input channels not 8s");
     weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
     if (!dry_) {
-        const auto w = st.f32(name + ".weight");   // [out][in][k][k]
+        const auto w = st.f32(name + ".weight");   // [out][in][kt][k][k]
         std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
-        for (int64_t o = 0; o < c.out; ++o)
+        for (int64_t o = 0; o < c.out; ++o) {
+            const int64_t src = rows != nullptr ? (*rows)[(size_t) o] : o;
             for (int64_t i = 0; i < c.in; ++i)
                 for (int64_t dy = 0; dy < c.k; ++dy)
-                    for (int64_t dx = 0; dx < c.k; ++dx)
-                        h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] =
-                            kernels::f16_from_f32(w[(size_t) (((o * in + col0 + i) * c.k + dy) * c.k + dx)]);
+                    for (int64_t dx = 0; dx < c.k; ++dx) {
+                        float v = 0.f;
+                        for (int64_t z = 0; z < kt; ++z)
+                            v += w[(size_t) ((((src * in + col0 + i) * kt + z) * c.k + dy) * c.k + dx)];
+                        h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] = kernels::f16_from_f32(v);
+                    }
+        }
         uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
         gpu::copy(d, h.data(), h.size() * 2);
         c.w = d;
     }
-    if (bias) c.b = vec(st, name + ".bias");
+    if (bias) {
+        if (rows == nullptr) {
+            c.b = vec(st, name + ".bias");
+        } else {
+            const auto b = st.f32(name + ".bias");
+            std::vector<float> v;
+            for (const int64_t r : *rows) v.push_back(b[(size_t) r]);
+            c.b = upload(v);
+        }
+    }
     return c;
 }
 
@@ -468,7 +505,8 @@ bool MfVae::open(const std::string& path, void* stream, std::string& err, bool d
         dry_ = dry;
         path_ = path;
         SafeTensors st(path);
-        if (st.find("bn.running_mean") != nullptr && st.find("decoder.conv_in.weight") != nullptr) {
+        if ((st.find("bn.running_mean") != nullptr && st.find("decoder.conv_in.weight") != nullptr) ||
+            st.find("decoder.up_blocks.2.upsamplers.0.upscale_conv.weight") != nullptr) {   // Flux2's, SeedVR2's
             open_flux2(st);
             if (!dry_ && !gemm_.init(s_, 16, err)) return false;
             return true;
@@ -891,9 +929,24 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
     for (void* p : tmp) gpu::free(p);
 }
 
-void MfVae::encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z) {
+void MfVae::encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z, uint64_t limit) {
     if (f2_) {
-        f2_encode(rgb, h, w, z);
+        if (f2_bytes(f2_enc_walk(h, w)) <= limit) {
+            f2_encode(rgb, h, w, z);
+            return;
+        }
+        // in tiles: the least work whose tiles' encode, their image and the blend fit the limit
+        const auto bytes = [&](int64_t th, int64_t tw) {
+            return f2_bytes(f2_enc_walk(th, tw)) + (uint64_t) (3 * th * tw * kPix + th * tw * 4 * f2_lc_) * 4 +
+                   (uint64_t) ((4 * f2_lc_ + 1) * h * w) * 4;
+        };
+        auto [th, tw] =
+            tile_sides(h, w, kF2Overlap, kF2TileMin, [&](int64_t a, int64_t b) { return bytes(a, b) <= limit; });
+        if (th == 0) {   // nothing fits: the least, which may still find the room
+            th = std::min(h, kF2TileMin);
+            tw = std::min(w, kF2TileMin);
+        }
+        f2_encode_tiled(rgb, h, w, z, th, tw);
         return;
     }
     const int64_t n = h * w, Z = e_out_.out / 2;
@@ -952,13 +1005,14 @@ void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t l
     if (!gpu::alloc_device(&rgb, (size_t) (3 * HW) * 4))
         throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
     tiled_ = f2_ && f2_scratch_bytes(h, w) > limit;
-    if (tiled_) {   // the Flux2 VAE where the whole does not fit: the deepest front and largest tiles that do
-        auto [k, t] = f2_tiling(h, w, limit);
-        if (k < 0) {   // nothing fits: the least, which may still find the room
-            k = 0;
-            t = std::min({h, w, kF2TileMin});
+    if (tiled_) {   // the Flux2 VAE where the whole does not fit: the deepest front and the tiles of least work that do
+        F2Tiling g = f2_tiling(h, w, limit);
+        if (g.k < 0) {   // nothing fits: the least, which may still find the room
+            g.k = 0;
+            g.th = std::min(h, kF2TileMin);
+            g.tw = std::min(w, kF2TileMin);
         }
-        f2_decode_tiled(z, h, w, rgb, k, t);
+        f2_decode_tiled(z, h, w, rgb, g.k, g.th, g.tw);
     } else {
         decode_raw(z, h, w, rgb);
     }
@@ -971,10 +1025,9 @@ void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t l
 
 void MfVae::open_flux2(SafeTensors& st) {
     f2_ = true;
-    const SafeTensor* bm = st.find("bn.running_mean");
-    if (bm->elements() != 128)
-        throw std::runtime_error("image engine (Flux2 VAE): the batch norm is not of 128 values");
-    {
+    if (const SafeTensor* bm = st.find("bn.running_mean")) {   // SeedVR2's VAE has none
+        if (bm->elements() != 128)
+            throw std::runtime_error("image engine (Flux2 VAE): the batch norm is not of 128 values");
         const auto m = st.f32("bn.running_mean"), v = st.f32("bn.running_var");
         std::vector<float> sd(v.size());
         for (size_t i = 0; i < v.size(); ++i) sd[i] = std::sqrt(v[i] + 1e-4f);   // ComfyUI's bn_eps
@@ -1018,10 +1071,12 @@ void MfVae::open_flux2(SafeTensors& st) {
         return k;
     };
     const std::string d = "decoder.";
-    f2_pq_ = conv_w(st, nm(d + "post_quant_conv"));
+    f2_pq_ = Conv();
+    if (st.find(nm(d + "post_quant_conv") + ".weight") != nullptr) f2_pq_ = conv_w(st, nm(d + "post_quant_conv"));
     cin_ = conv_w(st, nm(d + "conv_in"));
-    if (f2_pq_.in != 32 || cin_.in != 32)
-        throw std::runtime_error("image engine (Flux2 VAE): the latent is not 32 wide");
+    f2_lc_ = f2_pq_.out > 0 ? f2_pq_.in : cin_.in;
+    if ((f2_pq_.out > 0 && f2_pq_.out != cin_.in) || (f2_mean_ != nullptr && f2_lc_ != 32) || f2_lc_ % 8 != 0)
+        throw std::runtime_error("image engine (Flux2 VAE): the latent's width is not the batch norm's or conv_in's");
     auto res = [&](const std::string& p) {
         F2Res r;
         r.n1w = vec(st, nm(p + "norm1.weight"));
@@ -1048,6 +1103,16 @@ void MfVae::open_flux2(SafeTensors& st) {
         for (int j = 0; st.find(nm(p + "block." + std::to_string(j) + ".conv1.weight")) != nullptr; ++j)
             l.blocks.push_back(res(p + "block." + std::to_string(j) + "."));
         if (st.find(nm(p + "upsample.conv.weight")) != nullptr) l.up = conv_w(st, nm(p + "upsample.conv"));
+        if (const SafeTensor* u = st.find(nm(p + "upsample.upscale_conv.weight"))) {
+            // SeedVR2's: "(x y z c)" output channels, z the frames in time (2 where it doubles them); the first
+            // frame's (z = 0) 4 C kept
+            const int64_t C = u->shape[1], Z = u->shape[0] / (4 * C);
+            if (Z < 1 || u->shape[0] != 4 * Z * C) throw std::runtime_error("image engine (VAE): " + p + "upscale_conv");
+            std::vector<int64_t> rows;
+            for (int64_t xy = 0; xy < 4; ++xy)
+                for (int64_t c = 0; c < C; ++c) rows.push_back(xy * Z * C + c);
+            l.shuffle = conv_w(st, nm(p + "upsample.upscale_conv"), true, 0, -1, &rows);
+        }
         f2_levels_.push_back(std::move(l));
     }
     int ups = 0;
@@ -1077,7 +1142,7 @@ MfVae::F2Sizes MfVae::f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, 
     }
     if (front) {
         z.mid = pix;
-        z.most = std::max(pix * 32, pix * 3 * C_);
+        z.most = std::max(pix * f2_lc_, pix * 3 * C_);
         z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
     }
     z.most = std::max(z.most, pix * c);
@@ -1087,6 +1152,7 @@ MfVae::F2Sizes MfVae::f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, 
         if (!l.blocks.empty()) c = l.blocks.back().c2.out;
         if (l.up.out > 0) {
             pix *= 4;
+            z.most = std::max(z.most, pix * c);   // the upsampled input (SeedVR2's: its 1 x 1 convolution's 4 c)
             c = l.up.out;
             z.most = std::max(z.most, pix * c);
         }
@@ -1108,7 +1174,7 @@ uint64_t MfVae::f2_bytes(const F2Sizes& z) const {
     const int64_t col_rows = std::min<int64_t>(z.pix, 32768);
     return (uint64_t) z.most * (3 * 4 + 2) +                           // x, y, t; a16
            (uint64_t) col_rows * 9 * cmax * 2 +                        // the unfolded neighbourhoods, a band
-           (uint64_t) z.pix * kGroups * 2 * 4 + 4 * (uint64_t) cmax * 4 +   // the group norms' sums, stats
+           (uint64_t) qi_group_norm_ws_floats(z.pix) * 4 + 4 * (uint64_t) cmax * 4 +   // the group norms' sums, stats
            (uint64_t) z.mid * f2_ac_ * 3 * 2 +                         // q, k, v^T
            (uint64_t) z.rows * z.mid * (4 + 2);                        // a band's scores, probabilities
 }
@@ -1147,7 +1213,7 @@ void MfVae::f2_grow(const F2Sizes& z) {
     a16_ = alloc<uint16_t>(allocs_, n.most);
     col_cap_ = std::min<int64_t>(n.pix, 32768) * 9 * cmax;
     col16_ = alloc<uint16_t>(allocs_, col_cap_);
-    gn_part_ = alloc<float>(allocs_, n.pix * kGroups * 2);
+    gn_part_ = alloc<float>(allocs_, qi_group_norm_ws_floats(n.pix));
     vec_ = alloc<float>(allocs_, 4 * cmax);
     f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * f2_ac_ * 3);
     f2_q_ = alloc<float>(allocs_, n.rows * n.mid);
@@ -1205,9 +1271,11 @@ void MfVae::f2_attention(const Attn& a, float* x, int64_t H, int64_t W) {
 void MfVae::f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c) {
     H = 2 * h;
     W = 2 * w;
-    f2_unpatch16(z, f2_mean_, f2_std_, h, w, a16_, s_);
-    conv(f2_pq_, a16_, H, W, f2_t_);
-    kernels::f32_to_f16_bulk(f2_t_, a16_, H * W * f2_pq_.out, s_);
+    f2_unpatch16(z, f2_mean_, f2_std_, h, w, f2_lc_, a16_, s_);
+    if (f2_pq_.out > 0) {
+        conv(f2_pq_, a16_, H, W, f2_t_);
+        kernels::f32_to_f16_bulk(f2_t_, a16_, H * W * f2_pq_.out, s_);
+    }
     x = f2_x_;
     conv(cin_, a16_, H, W, x);
     f2_resblock(f2_mid_[0], x, H, W);
@@ -1224,11 +1292,17 @@ void MfVae::f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t
         for (const F2Res& r : l.blocks) f2_resblock(r, x, H, W);
         if (!l.blocks.empty()) c = l.blocks.back().c2.out;
         if (l.up.out > 0) {
-            qi_up2x16(x, H, W, c, a16_, s_);
+            float *y = nullptr, *t = nullptr;
+            f2_others(x, y, t);
+            if (l.shuffle.out > 0) {   // SeedVR2's: its 1 x 1 convolution's 4 c spread over 2 x 2 positions
+                kernels::f32_to_f16_bulk(x, a16_, H * W * c, s_);
+                conv(l.shuffle, a16_, H, W, t);
+                f2_shuffle16(t, H, W, c, a16_, s_);
+            } else {
+                qi_up2x16(x, H, W, c, a16_, s_);
+            }
             H *= 2;
             W *= 2;
-            float *y = nullptr, *unused = nullptr;
-            f2_others(x, y, unused);
             conv(l.up, a16_, H, W, y);
             x = y;
             c = l.up.out;
@@ -1255,41 +1329,45 @@ void MfVae::f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb) {
 }
 
 // A tiled decode: the stages up to level k on the whole latent (its statistics and the middle's attention over all of
-// it), their output kept, and the levels from k on in tiles of t x t tokens.  Its scratch: the buffers the two share,
-// the output kept, a tile's input and image, and the blend's planes
-uint64_t MfVae::f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t t) const {
+// it), their output kept, and the levels from k on in tiles of th x tw tokens.  Its scratch: the buffers the two
+// share, the output kept, a tile's input and image, and the blend's planes
+uint64_t MfVae::f2_tiled_bytes(int64_t h, int64_t w, int k, int64_t th, int64_t tw) const {
     const int n = (int) f2_levels_.size();
-    const int64_t th = std::min(h, t), tw = std::min(w, t);
+    th = std::min(h, th);
+    tw = std::min(w, tw);
     const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
     const F2Sizes bi = f2_walk(th, tw, k, k, false, false);   // a tile's input
     return f2_bytes(f2_max(f, b)) + (uint64_t) (f.pix * f.c) * 4 + (uint64_t) (bi.pix * bi.c) * 4 +
            (uint64_t) (3 * th * tw * kPix) * 4 + (uint64_t) (4 * h * w * kPix) * 4;
 }
 
-// the deepest front and the largest tiles within `limit` -> (k, t); (-1, 0) when nothing fits
-std::pair<int, int64_t> MfVae::f2_tiling(int64_t h, int64_t w, uint64_t limit) const {
+// the deepest front whose least tiles fit `limit`, and its tiles of the least work within it; k -1 when nothing fits
+MfVae::F2Tiling MfVae::f2_tiling(int64_t h, int64_t w, uint64_t limit) const {
     const int n = (int) f2_levels_.size();
-    const int64_t least = std::min({h, w, kF2TileMin});
+    const int64_t lh = std::min(h, kF2TileMin), lw = std::min(w, kF2TileMin);
     for (int k = n; k >= 0; --k) {
-        if (f2_tiled_bytes(h, w, k, least) > limit) continue;
-        int64_t t = std::max(h, w);
-        while (t > least && f2_tiled_bytes(h, w, k, t) > limit) --t;
-        return {k, t};
+        if (f2_tiled_bytes(h, w, k, lh, lw) > limit) continue;
+        const auto [th, tw] =
+            tile_sides(h, w, kF2Overlap, kF2TileMin,
+                       [&](int64_t a, int64_t b) { return f2_tiled_bytes(h, w, k, a, b) <= limit; });
+        if (th > 0) return {k, th, tw};
     }
-    return {-1, 0};
+    return {};
 }
 
 uint64_t MfVae::f2_least_bytes(int64_t h, int64_t w) const {
     const int n = (int) f2_levels_.size();
-    const int64_t least = std::min({h, w, kF2TileMin});
+    const int64_t lh = std::min(h, kF2TileMin), lw = std::min(w, kF2TileMin);
     uint64_t b = f2_scratch_bytes(h, w);
-    for (int k = 0; k <= n; ++k) b = std::min(b, f2_tiled_bytes(h, w, k, least));
+    for (int k = 0; k <= n; ++k) b = std::min(b, f2_tiled_bytes(h, w, k, lh, lw));
     return b;
 }
 
-void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t t) {
+void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t th, int64_t tw) {
     const int n = (int) f2_levels_.size();
-    const int64_t th = std::min(h, t), tw = std::min(w, t), H = h * kPatch, W = w * kPatch;
+    th = std::min(h, th);
+    tw = std::min(w, tw);
+    const int64_t H = h * kPatch, W = w * kPatch;
     const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
     f2_grow(f2_max(f, b));
     std::vector<void*> tmp;
@@ -1333,6 +1411,44 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
 
 // ---- the Flux2 VAE's encoder
 
+// The encoder in tiles of t x t tokens (a tile's image 16 t pixels a side, the last ones flush with the edges), each
+// encoded whole (its group norms and its middle's attention over the tile, as ComfyUI's tiled encode has them) and the
+// tiles' latents blended linearly across the kF2Overlap tokens two of them share
+void MfVae::f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, int64_t th, int64_t tw) {
+    th = std::min(h, th);
+    tw = std::min(w, tw);
+    const int64_t H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
+    std::vector<void*> tmp;
+    float* acc = alloc<float>(tmp, (V + 1) * h * w);
+    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
+    float* tz = alloc<float>(tmp, th * tw * V);
+    gpu::memset_async(acc, 0, (size_t) ((V + 1) * h * w) * 4, s_);
+    auto starts = [](int64_t n, int64_t side) {
+        std::vector<int64_t> v;
+        for (int64_t a = 0;; a += side - kF2Overlap) {
+            if (a + side >= n) {
+                v.push_back(n - side);
+                break;
+            }
+            v.push_back(a);
+        }
+        return v;
+    };
+    const auto ys = starts(h, th), xs = starts(w, tw);
+    for (const int64_t y0 : ys)
+        for (const int64_t x0 : xs) {
+            for (int64_t c = 0; c < 3; ++c)   // the tile's image, a plane at a time
+                tile_gather(rgb + c * H * W, W, 1, y0 * kPatch, x0 * kPatch, th * kPatch, tw * kPatch,
+                            trgb + c * th * tw * kPix, s_);
+            f2_encode(trgb, th, tw, tz);
+            tile_blend(tz, th, tw, y0, x0, h, w, kF2Overlap, y0 > 0, y0 + th < h, x0 > 0, x0 + tw < w, acc, s_, V,
+                       true);
+        }
+    tile_finish(acc, h * w, z, s_, V, true);
+    gpu::stream_sync(s_);
+    for (void* p : tmp) gpu::free(p);
+}
+
 void MfVae::open_flux2_encoder(SafeTensors& st) {
     // the LDM checkpoint's names, or diffusers' (FLUX.2-klein's vae/: down_blocks counted the same way, from the
     // largest; quant_conv outside the encoder)
@@ -1374,19 +1490,24 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
     {   // conv_in's 3 input channels widened to 8 (zero weights), as the products take them
         const std::string n = nm(e + "conv_in");
         const SafeTensor* t = st.find(n + ".weight");
-        if (t->shape.size() != 4 || t->shape[1] != 3 || t->shape[2] != 3 || t->shape[3] != 3)
+        const size_t r = t->shape.size();   // [out][3][3][3], or [out][3][kt][3][3] (SeedVR2's: its time taps summed)
+        if ((r != 4 && r != 5) || t->shape[1] != 3 || t->shape[r - 2] != 3 || t->shape[r - 1] != 3)
             throw std::runtime_error("image engine (Flux2 VAE): the encoder's conv_in is not 3 x 3 over RGB");
+        const int64_t kt = r == 5 ? t->shape[2] : 1;
         f2_ein_.out = t->shape[0];
         f2_ein_.in = 8;
         f2_ein_.k = 3;
         weight_bytes_ += (uint64_t) (f2_ein_.out * 9 * 8) * 2;
         if (!dry_) {
-            const auto w = st.f32(n + ".weight");   // [out][3][3][3]
+            const auto w = st.f32(n + ".weight");   // [out][3][kt][3][3]
             std::vector<uint16_t> h((size_t) (f2_ein_.out * 9 * 8), 0);
             for (int64_t o = 0; o < f2_ein_.out; ++o)
                 for (int64_t i = 0; i < 3; ++i)
-                    for (int64_t k = 0; k < 9; ++k)
-                        h[(size_t) ((o * 9 + k) * 8 + i)] = kernels::f16_from_f32(w[(size_t) ((o * 3 + i) * 9 + k)]);
+                    for (int64_t k = 0; k < 9; ++k) {
+                        float v = 0.f;
+                        for (int64_t z = 0; z < kt; ++z) v += w[(size_t) (((o * 3 + i) * kt + z) * 9 + k)];
+                        h[(size_t) ((o * 9 + k) * 8 + i)] = kernels::f16_from_f32(v);
+                    }
             uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
             gpu::copy(d, h.data(), h.size() * 2);
             f2_ein_.w = d;
@@ -1426,7 +1547,8 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
     f2_enw_ = vec(st, nm(e + "norm_out.weight"));
     f2_enb_ = vec(st, nm(e + "norm_out.bias"));
     f2_eout_ = conv_w(st, nm(e + "conv_out"));
-    if (f2_eout_.out != 64) throw std::runtime_error("image engine (Flux2 VAE): the encoder's moments are not 2 x 32");
+    if (f2_eout_.out != 2 * f2_lc_)
+        throw std::runtime_error("image engine (Flux2 VAE): the encoder's moments are not twice the latent's width");
     f2_qc_ = Conv();
     if (st.find(nm(e + "quant_conv.weight")) != nullptr) f2_qc_ = conv_w(st, nm(e + "quant_conv"));
     f2_down_ = std::move(levels);
@@ -1452,7 +1574,7 @@ MfVae::F2Sizes MfVae::f2_enc_walk(int64_t h, int64_t w) const {
         }
     }
     z.mid = pix;
-    z.most = std::max({z.most, pix * 3 * f2_eattn_.qkv.in, pix * 64});
+    z.most = std::max({z.most, pix * 3 * f2_eattn_.qkv.in, pix * 2 * f2_lc_});
     z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
     z.c = c;
     return z;
@@ -1492,7 +1614,7 @@ void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
         conv(f2_qc_, a16_, H, W, t);
         m = t;
     }
-    f2_patch(m, f2_mean_, f2_std_, h, w, z, s_);
+    f2_patch(m, f2_mean_, f2_std_, h, w, f2_lc_, z, s_);
     gpu::stream_sync(s_);
 }
 

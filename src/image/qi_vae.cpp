@@ -13,6 +13,7 @@
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
 
+#include "tile_sides.hpp"
 #if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
 #endif
@@ -55,6 +56,10 @@ const float kWanStd[16] = {2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f,
                            3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f};
 const bool kTemporalUp[5] = {true, true, true, false, false};   // the up blocks whose shortcut also spans time
 constexpr int64_t kColBytes = 256ll << 20;                      // the unfolded neighbourhoods a product at most
+constexpr int64_t kScoreValues = 16ll << 20;                     // the attention's scores a band of query rows at most
+
+// the attention's band of query rows over hw keys: its scores within kScoreValues
+int64_t attn_rows(int64_t hw) { return std::max<int64_t>(1, std::min(hw, kScoreValues / std::max<int64_t>(1, hw))); }
 
 sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
@@ -496,11 +501,16 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g,
     conv(qkv_w, a16_, H, W, qkv);
     uint16_t *q16 = a16_, *k16 = a16_ + HW * C, *vt16 = a16_ + 2 * HW * C;
     split_qkv16(qkv, HW, C, q16, k16, vt16, s_);
+    // a band of query rows at a time (their scores in t2_, probabilities in col16_), O into qkv's rows, which the
+    // split has copied: the whole [hw][hw] scores took a 1248 x 1872 image's decode 5 GB a buffer, and tiles
     float* sc = t2_;
-    gemm_.f16(q16, k16, sc, HW, HW, C);
     uint16_t* p16 = col16_;
-    qi_softmax16(sc, HW, HW, 1.0f / std::sqrt((float) C), p16, s_);
-    gemm_.f16(p16, vt16, qkv, HW, C, HW);   // O = P . V (V^T's rows are V's columns)
+    for (int64_t r0 = 0, rows = attn_rows(HW); r0 < HW; r0 += rows) {
+        const int64_t n = std::min(rows, HW - r0);
+        gemm_.f16(q16 + r0 * C, k16, sc, n, HW, C);
+        qi_softmax16(sc, n, HW, 1.0f / std::sqrt((float) C), p16, s_);
+        gemm_.f16(p16, vt16, qkv + r0 * C, n, C, HW);   // O = P . V (V^T's rows are V's columns)
+    }
     kernels::f32_to_f16_bulk(qkv, a16_, HW * C, s_);
     conv(proj, a16_, H, W, x, true);
 }
@@ -508,7 +518,7 @@ void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g,
 QiVae::Need QiVae::need(int64_t h, int64_t w) const {
     // the largest activation: each stage's pixels times its widest channel count; the attention's scores [hw][hw]
     Need n;
-    n.big32 = h * w * std::max<int64_t>(3 * cin_.out, h * w);
+    n.big32 = h * w * std::max<int64_t>(3 * cin_.out, attn_rows(h * w));
     n.big16 = 3 * h * w * cin_.out;
     int64_t H = h, W = w, c = cin_.out, unfold = 0;   // the largest stage's unfolded neighbourhoods
     for (const Up& u : up_) {
@@ -528,8 +538,8 @@ QiVae::Need QiVae::need(int64_t h, int64_t w) const {
         }
         c = co;
     }
-    // the convolutions unfold a band of rows at a time into at most kColBytes; the attention's probabilities [hw][hw]
-    n.col = std::max(h * w * h * w, std::min(unfold, kColBytes / 2));
+    // the convolutions unfold a band of rows at a time into at most kColBytes; the attention's probabilities, a band
+    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, kColBytes / 2));
     return n;
 }
 
@@ -551,13 +561,19 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
         decode_piece(z, h, w, rgba);
         return;
     }
-    // square tiles of t latent pixels, the largest whose decode fits, a quarter of a tile overlapping its neighbours
+    // tiles that overlap their neighbours by a quarter of the largest square whose decode fits, as even as that
+    // leaves and of the least work (tile_sides.hpp), each at least the two overlaps its blend ramps over
     int64_t t = std::min(h, w);
     while (t > 8 && scratch_bytes(t, t) > max_scratch) t -= 4;
     if (scratch_bytes(t, t) > max_scratch)
         throw std::runtime_error("image engine (VAE): not enough GPU memory for a tile of the image");
-    const int64_t S = scale_, ov = std::max<int64_t>(2, t / 4), step = t - ov, H = S * h, W = S * w, C = pq_.in;
-    const int64_t th = std::min(t, h), tw = std::min(t, w);
+    const int64_t S = scale_, ov = std::max<int64_t>(2, t / 4), H = S * h, W = S * w, C = pq_.in;
+    auto [th, tw] = tile_sides(h, w, ov, 2 * ov,
+                               [&](int64_t a, int64_t b) { return scratch_bytes(a, b) <= max_scratch; });
+    if (th == 0) {
+        th = std::min(t, h);
+        tw = std::min(t, w);
+    }
     float *sub = nullptr, *piece = nullptr, *wsum = nullptr;
     if (!gpu::alloc_device(&sub, (size_t) (C * th * tw) * 4) ||
         !gpu::alloc_device(&piece, (size_t) (4 * S * S * th * tw) * 4) ||
@@ -565,9 +581,9 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
         throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
     gpu::memset_async(rgba, 0, (size_t) (4 * H * W) * 4, s_);
     gpu::memset_async(wsum, 0, (size_t) (H * W) * 4, s_);
-    for (int64_t y0 = 0;; y0 += step) {
+    for (int64_t y0 = 0;; y0 += th - ov) {
         const int64_t yy = std::min(y0, h - th);   // the last row of tiles ends at the edge
-        for (int64_t x0 = 0;; x0 += step) {
+        for (int64_t x0 = 0;; x0 += tw - ov) {
             const int64_t xx = std::min(x0, w - tw);
             crop_latent(z, C, h, w, yy, xx, th, tw, sub, s_);
             decode_piece(sub, th, tw, piece);
@@ -648,11 +664,11 @@ QiVae::Need QiVae::encode_need(int64_t H, int64_t W) const {
         }
         c = co;
     }
-    // the middle's attention: q, k, v [hw][c] and the scores [hw][hw]
-    n.big32 = std::max(n.big32, h * w * std::max(3 * c, h * w));
+    // the middle's attention: q, k, v [hw][c] and a band's scores
+    n.big32 = std::max(n.big32, h * w * std::max(3 * c, attn_rows(h * w)));
     n.big16 = std::max(n.big16, 3 * h * w * c);
     n.big32 = std::max(n.big32, h * w * std::max(eout_.out, quant_.out));
-    n.col = std::max(h * w * h * w, std::min(unfold, kColBytes / 2));
+    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, kColBytes / 2));
     return n;
 }
 

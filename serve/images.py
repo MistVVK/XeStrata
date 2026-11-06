@@ -197,15 +197,22 @@ UPSCALE_TILE = 1024
 UPSCALE_PAD = 128
 UPSCALE_BLUR = 32
 # an upscale's first pass, by the engine's upscalers (src/upscale: UPS:, the UPS line): "auto" is RealESRGAN where the
-# picture is drawn again after it (its finer edges for the drawing to start from) and where it is not too, until SeedVR2
-# (which draws no second pass) is here; each method's weights (image_aux's), none for Lanczos
-UPSCALE_METHODS = ("auto", "lanczos", "realesrgan")
+# picture is drawn again after it (its finer edges for the drawing to start from) and SeedVR2 where it is not (its own
+# restoration in one step, whatever the picture's style: the user's decision of 2026-11-05), RealESRGAN where SeedVR2
+# does not fit the GPU; each method's weights are image_aux's, none for Lanczos
+UPSCALE_METHODS = ("auto", "lanczos", "realesrgan", "seedvr2")
 UPSCALE_WEIGHTS = {"realesrgan": "realesrgan"}
-# the color corrections after it (vLLM-Omni's SeedVR2 color_correction_method's names): none by default, as ComfyUI's
-# ImageUpscaleWithModel corrects nothing
+# SeedVR2's variants: 7B (photos, video, the default), 7B sharp (anime, blurred pictures, crisper detail), 3B (where the
+# 7B's 8 bits do not fit the VRAM and the RAM together); each in FP16 (where the GPU holds it) or int8_convrot
+SEEDVR2_VARIANTS = ("7b", "7b-sharp", "3b")
+SEEDVR2_WORK_MIB = 4096   # what a 7B run takes besides its weights at a couple of megapixels (the DiT's activations)
+# the color corrections after it (vLLM-Omni's SeedVR2 color_correction_method's names); none given, the upscaler's
+# own: none for RealESRGAN (as ComfyUI's ImageUpscaleWithModel), lab for SeedVR2 (its pipeline's)
 UPSCALE_COLORS = ("none", "lab", "adain", "wavelet")
-# /v1/images/upscale's models (its `model`, and /v1/models' entries) -> the method
-UPSCALE_MODELS = {"realesrgan-x4plus": "realesrgan", "lanczos": "lanczos"}
+# /v1/images/upscale's models (its `model`, and /v1/models' entries) -> the method and SeedVR2's variant
+UPSCALE_MODELS = {"realesrgan-x4plus": ("realesrgan", None), "lanczos": ("lanczos", None),
+                  "seedvr2-7b": ("seedvr2", "7b"), "seedvr2-7b-sharp": ("seedvr2", "7b-sharp"),
+                  "seedvr2-3b": ("seedvr2", "3b")}
 # the Detailer (fix_image, the edits' `fix`): Impact Pack's FaceDetailer's steps and defaults (bbox_threshold 0.5,
 # bbox_dilation 10, bbox_crop_factor 3, drop_size 10, denoise 0.5, noise_mask_feather 20), its guide_size 1024 for
 # the models that draw about 1 MP (ComfyUI's 512 is SD 1.5's) and its max_size the Crop and Stitch drawing's
@@ -1115,11 +1122,11 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     """An upscale (the edits' `upscale`, the chat's upscale_image, /v1/images/upscale), as ComfyUI's two-pass workflows
     make one: `image` made larger by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU by
     `method` (UPSCALE_METHODS: Lanczos, or an upscaler model whose weights image_aux fetches; job["upscaler"]) with its
-    color correction (`color`, UPSCALE_COLORS), then with `redraw` (the default) drawn again from it at `strength`
-    (UPSCALE_STRENGTH), an img2img of the whole picture (job["init"], job["upscale"]); past the model's max_side, in
-    tiles as Ultimate SD Upscale draws them (job["tiles"]: UPSCALE_TILE pixels, UPSCALE_PAD of context around each,
-    UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most.  Without redraw, the first pass alone (job["ups_only"]:
-    no image model run, one image, the prompt not needed)."""
+    color correction (`color`, UPSCALE_COLORS), then with `redraw` (asked for: not the default, as ComfyUI's upscale
+    nodes draw nothing again) drawn again from it at `strength` (UPSCALE_STRENGTH), an img2img of the whole picture
+    (job["init"], job["upscale"]); past the model's max_side, in tiles as Ultimate SD Upscale draws them (job["tiles"]:
+    UPSCALE_TILE pixels, UPSCALE_PAD of context around each, UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most.
+    Without redraw, the first pass alone (job["ups_only"]: no image model run, one image, the prompt not needed)."""
     v = req["upscale"]
     if isinstance(v, str):   # a form's field
         try:
@@ -1128,9 +1135,9 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
             v = None
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         v = {"scale": v}
-    if not isinstance(v, dict) or not set(v) <= {"scale", "strength", "method", "redraw", "color"}:
+    if not isinstance(v, dict) or not set(v) <= {"scale", "strength", "method", "redraw", "color", "variant"}:
         raise ImageRequestError('upscale: {"scale": 1.5 or 2, "method": "auto", "redraw": true, "strength": 0.35, '
-                                '"color": "none"} (or the scale alone)')
+                                '"color": "lab", "variant": "7b"} (or the scale alone)')
     try:
         scale = float(v.get("scale", 2))
     except (TypeError, ValueError):
@@ -1140,21 +1147,28 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     method = v.get("method") or "auto"
     if method not in UPSCALE_METHODS:
         raise ImageRequestError(f"upscale.method: one of {', '.join(UPSCALE_METHODS)}, not {method!r}")
-    color = v.get("color") or "none"
-    if color not in UPSCALE_COLORS:
+    color = v.get("color") or None
+    if color is not None and color not in UPSCALE_COLORS:
         raise ImageRequestError(f"upscale.color: one of {', '.join(UPSCALE_COLORS)}, not {color!r}")
-    redraw = v.get("redraw", True)
+    variant = v.get("variant") or None
+    if variant is not None and variant not in SEEDVR2_VARIANTS:
+        raise ImageRequestError(f"upscale.variant: SeedVR2's {', '.join(SEEDVR2_VARIANTS)}, not {variant!r}")
+    redraw = v.get("redraw", False)
     if isinstance(redraw, str):   # a form's field
         redraw = redraw.strip().lower() not in ("false", "0", "no", "off", "")
     if not isinstance(redraw, bool):
         raise ImageRequestError("upscale.redraw: true or false")
     if not redraw and v.get("strength") is not None:
-        raise ImageRequestError("upscale.strength: only with redraw")
+        raise ImageRequestError("upscale.strength: only with \"redraw\": true")
     w0, h0 = image_dims(image)
     w, h = (max(SIZE_STEP, round(x * scale / SIZE_STEP) * SIZE_STEP) for x in (w0, h0))
     if max(w, h) > UPSCALE_MAX_SIDE:
         raise ImageRequestError(f"upscale: {w}x{h} passes {UPSCALE_MAX_SIDE} pixels a side")
-    upscaler = {"method": "realesrgan" if method == "auto" else method, "asked": method, "color": color}
+    resolved = method if method != "auto" else "realesrgan" if redraw else "seedvr2"
+    if variant is not None and resolved != "seedvr2":
+        raise ImageRequestError("upscale.variant: SeedVR2's alone")
+    upscaler = {"method": resolved, "asked": method, "color": color,
+                **({"variant": variant or "7b"} if resolved == "seedvr2" else {})}
     side = int(cfg.get("max_side") or 2048)
     if not redraw:
         job = parse_request({**req, "prompt": str(req.get("prompt") or "").strip() or "upscale", "n": 1,
@@ -1197,11 +1211,11 @@ def upscale_request(fields: dict) -> tuple[dict, str | None]:
     if not isinstance(extra, dict):
         raise ImageRequestError("extra_params: a JSON object")
     model = fields.get("model") or "auto"
-    method = UPSCALE_MODELS.get(model, model)
+    method, variant = UPSCALE_MODELS.get(model, (model, None))
     if method not in UPSCALE_METHODS:
         raise ImageRequestError(f"model: an upscaler, one of {', '.join(['auto', *UPSCALE_MODELS])}, not {model!r}")
     up: dict = {"method": method, "scale": fields.get("scale") or (4 if method == "realesrgan" else 2),
-                "redraw": extra.get("redraw", False)}
+                "redraw": extra.get("redraw", False), **({"variant": variant} if variant else {})}
     if extra.get("color_correction_method") is not None:
         up["color"] = extra["color_correction_method"]
     if extra.get("redraw_strength") is not None:
@@ -2793,10 +2807,9 @@ class ImageGen:
         """An upscale's first pass on IMG and NEED: UPS:<spec> and its color correction (UPSCOLOR:), none for Lanczos
         alone (the engine's own resize); NEED's the base image's size too (UPSIN:)."""
         u = job.get("upscaler") or {}
-        if not u or u["method"] == "lanczos" and u.get("color", "none") == "none":
+        if not u or u["method"] == "lanczos" and u.get("color") in (None, "none"):
             return ""
-        words = f" UPS:{ImageGen._ups_spec(job)}" + (f" UPSCOLOR:{u['color']}" if u.get("color", "none") != "none"
-                                                     else "")
+        words = f" UPS:{ImageGen._ups_spec(job)}" + (f" UPSCOLOR:{u['color']}" if u.get("color") else "")
         if need:   # an upscale in tiles: the whole size too (NEED's is a tile's)
             words += " UPSIN:{},{}".format(*image_dims(job["init"])) + (
                 f",{job['width']},{job['height']}" if job.get("tiles") else "")
@@ -2812,8 +2825,8 @@ class ImageGen:
             u = job["upscaler"]
             with self.lock:
                 self._ready()
-                return self.engine.ask(f"UPSNEED {job['width']} {job['height']} {w0} {h0} {self._ups_spec(job)} "
-                                       f"COLOR:{u['color']}", "NEED", 600)
+                return self.engine.ask(f"UPSNEED {job['width']} {job['height']} {w0} {h0} {self._ups_spec(job)}"
+                                       + (f" COLOR:{u['color']}" if u.get("color") else ""), "NEED", 600)
         with self.lock:
             self._ready()
             w, h = made_size(job)
@@ -2898,8 +2911,9 @@ class ImageGen:
                 pic.write_bytes(job["init"])
                 self._live(stage="upscale", sampling_at=None)
                 try:
-                    got = self.engine.ask(f"UPS {job['width']} {job['height']} {pic} {out} {self._ups_spec(job)} "
-                                          f"COLOR:{u['color']} SEED:{job['seed']}", "UPSCALED", timeout, cancel)
+                    got = self.engine.ask(f"UPS {job['width']} {job['height']} {pic} {out} {self._ups_spec(job)}"
+                                          + (f" COLOR:{u['color']}" if u.get("color") else "")
+                                          + f" SEED:{job['seed']}", "UPSCALED", timeout, cancel)
                 except ImageJobFailed as e:
                     self.totals["failed"] += 1
                     why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
@@ -2950,6 +2964,12 @@ class ImageGen:
         with self.lock:
             self._ready()
             return int(self.engine.ask("FREE", "FREE", 60)["free_mib"])
+
+    def total_mib(self) -> int:
+        """The image GPU's memory, as the engine sees it."""
+        with self.lock:
+            self._ready()
+            return int(self.engine.ask("FREE", "FREE", 60).get("total_mib") or 0)
 
     def fit(self) -> int:
         """The engine's budget set to what it holds and what is free now, less the reserve -> the budget (MiB)."""
@@ -3369,14 +3389,15 @@ TOOLS: list[dict[str, Any]] = [
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "upscale_image",
-     "description": "Make an image larger by an upscaler and, by default, draw it again finer (the same picture).",
+     "description": "Make an image larger by an upscaler, and with redraw draw it again finer (the same picture).",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what the image shows (needed with redraw)"},
          "image": {"type": "string",
                    "description": "a /v1/images/files/... link; default the conversation's last image"},
          "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
          "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
-         "redraw": {"type": "boolean", "description": "draw it again after the upscaler (default true)"},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
+         "redraw": {"type": "boolean", "description": "draw it again after the upscaler (default false)"},
          "strength": {"type": "number", "description": "with redraw: how much may change (default 0.35)"},
          "seed": {"type": "integer"}}}},
     {"name": "fix_image",
@@ -3890,7 +3911,7 @@ class ImageTools:
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
             if name == "upscale_image":
-                req["upscale"] = {k: args[k] for k in ("scale", "method", "redraw", "strength")
+                req["upscale"] = {k: args[k] for k in ("scale", "method", "redraw", "strength", "variant")
                                   if args.get(k) not in (None, "")}
             if name == "fix_image":
                 req["fix"] = {"parts": args.get("parts") or ["face"],
@@ -3964,7 +3985,9 @@ class ImageTools:
             if job.get("upscaler"):   # how it was made larger
                 u = job["upscaler"]
                 text += (f" upscale_image made it larger by {u['method']}"
-                         + (" (auto's choice)" if u["asked"] == "auto" else "")
+                         + (f" {u['variant']}" if u.get("variant") else "")
+                         + (f" (auto's choice; {u['fallback']})" if u.get("fallback") else
+                            " (auto's choice)" if u["asked"] == "auto" else "")
                          + (f", then drew it again at strength {job['strength']:g}." if not job.get("ups_only")
                             else ", not drawn again."))
             seen = self._seen(gen, images[0])
@@ -4216,6 +4239,7 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
         return fix_images(svc, gen, job, cancel)
     if job.get("upscaler"):
         upscaler_weights(gen, job)
+        seedvr2_or_realesrgan(gen, job)
     if job.get("ups_only"):
         return upscale_images(svc, gen, job, cancel)
     if job.get("enhance") and not job.get("enhanced"):
@@ -4248,17 +4272,68 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     return images, figures, used
 
 
+def seedvr2_file(gen: ImageGen, variant: str) -> str:
+    """The AUX name of SeedVR2's DiT a request takes: the variant's FP16 file where the GPU's memory holds it beside its
+    work, else its int8_convrot (the blocks the VRAM does not hold read from the RAM); the 3B where the 7B's int8 fits
+    neither the VRAM nor the RAM.  A file already here is taken before one to fetch, where it fits."""
+    q = image_aux._qimage()
+    root = image_aux.aux_dir(gen.cfg)
+    try:   # the GPU's whole memory, not what is free now: the choice the same from request to request
+        vram = gen.total_mib()
+    except ImageJobFailed:
+        vram = 0
+    ram = ram_available_mib() or 0
+
+    def mib(name: str) -> int:
+        return q.FILES[name][2] >> 20
+    if variant != "3b":
+        fp16, int8 = f"seedvr2-{variant}-fp16", f"seedvr2-{variant}-int8"
+        if vram >= mib(fp16) + SEEDVR2_WORK_MIB and (image_aux.ready(fp16, root) or not image_aux.ready(int8, root)):
+            return fp16
+        if vram + ram >= mib(int8) + SEEDVR2_WORK_MIB:
+            return int8
+        gen._say(f"image job: SeedVR2 {variant}'s 8 bits fit neither the VRAM ({vram} MiB) nor the RAM ({ram} MiB): "
+                 "its 3B")
+    return "seedvr2-3b-fp16" if vram >= mib("seedvr2-3b-fp16") + SEEDVR2_WORK_MIB else "seedvr2-3b-int8"
+
+
 def upscaler_weights(gen: ImageGen, job: dict) -> None:
-    """An upscale's upscaler weights (image_aux's, UPSCALE_WEIGHTS): their path into job["upscaler"], or AuxPending
-    while they download (the upscale is not made with another method meanwhile)."""
+    """An upscale's upscaler weights (image_aux's, UPSCALE_WEIGHTS; SeedVR2's DiT by seedvr2_file and its VAE beside
+    it): their path into job["upscaler"], or AuxPending while they download (the upscale is not made with another
+    method meanwhile)."""
     u = job["upscaler"]
-    name = UPSCALE_WEIGHTS.get(u["method"])
-    if name is None:
+    names = [seedvr2_file(gen, u.get("variant") or "7b"), "seedvr2-vae"] if u["method"] == "seedvr2" else \
+        [UPSCALE_WEIGHTS[u["method"]]] if u["method"] in UPSCALE_WEIGHTS else []
+    if not names:
         return
-    got = image_aux.ensure(name, image_aux.aux_dir(gen.cfg), gen._say)
-    if got["status"] != "ready":
-        raise AuxPending([got])
-    u["path"] = got["path"]
+    root = image_aux.aux_dir(gen.cfg)
+    got = [image_aux.ensure(name, root, gen._say) for name in names]
+    pending = [g for g in got if g["status"] != "ready"]
+    if pending:
+        raise AuxPending(pending)
+    u["path"] = got[0]["path"]
+    if u["method"] == "seedvr2":
+        u["file"] = names[0]
+
+
+def seedvr2_or_realesrgan(gen: ImageGen, job: dict) -> None:
+    """auto's SeedVR2 where the engine says it does not fit the GPU (UPSNEED's least past its cap): RealESRGAN instead,
+    said in the result (job["upscaler"]["fallback"])."""
+    u = job["upscaler"]
+    if u["asked"] != "auto" or u["method"] != "seedvr2":
+        return
+    try:
+        need = gen.need(job) if job.get("ups_only") else None
+    except ImageJobFailed:
+        need = None
+    if need is not None and int(need.get("least_mib", 0)) <= int(need.get("cap_mib", 0)):   # UPSNEED's cap: the GPU's
+        return
+    gen._say("image job: SeedVR2 does not fit the GPU: RealESRGAN instead")
+    u.update(method="realesrgan", fallback="SeedVR2 does not fit the GPU's memory")
+    u.pop("variant", None)
+    u.pop("path", None)
+    u.pop("file", None)
+    upscaler_weights(gen, job)
 
 
 def upscale_images(svc, gen: ImageGen, job: dict,
@@ -4273,6 +4348,7 @@ def upscale_images(svc, gen: ImageGen, job: dict,
                "size": f"{job['width']}x{job['height']}", "text_encode_ms": 0.0, "sampling_s": 0.0,
                "vae_decode_s": 0.0,
                "upscale": {"method": u["method"], "asked": u["asked"], "color": got.get("color", "none"),
+                           **{k: u[k] for k in ("variant", "file", "fallback") if u.get(k)},
                            **{k: float(got[k]) for k in ("upscale_s", "model_s", "resize_s", "color_s") if k in got},
                            **{k: int(got[k]) for k in ("tile", "tiles") if k in got}}}
     gen.last = figures

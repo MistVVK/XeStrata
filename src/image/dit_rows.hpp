@@ -11,6 +11,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/gelu.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -141,12 +142,15 @@ inline void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
     });
 }
 
-// q, k and v [T][heads hd] -> FP16 [T][heads][hd]: q and k RMS-normed over the head (wq, wk; eps 1e-6) and rotated in
-// pairs by cos[t][j], sin[t][j] (tables [T][hd / 2]; null: not rotated), (j, j + hd / 2) with `neox` (Qwen-Image's
-// heirs: MOSS-Image, Anima) or (2j, 2j + 1) (Mage-Flow); v divided by its head's scale hs (qk_norm_rope.hpp)
+// q, k and v [T][heads hd] -> FP16 [T][heads][hd]: q and k RMS-normed over the head (wq, wk; eps, 1e-6 by default)
+// and rotated in pairs by cos[t][j], sin[t][j] (tables [T][hd / 2]; null: not rotated), (j, j + n_rot / 2) with `neox`
+// (Qwen-Image's heirs: MOSS-Image, Anima) or (2j, 2j + 1) (Mage-Flow, SeedVR2), the first n_rot channels of a head (0:
+// all of them; SeedVR2 7B's 60), the rest normed only; v divided by its head's scale hs (null: as it is)
+// (qk_norm_rope.hpp)
 inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk,
                       const float* cos, const float* sin, const float* hs, int64_t T, int64_t heads, int64_t hd,
-                      bool neox, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s) {
+                      bool neox, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s, float eps = 1e-6f,
+                      int64_t n_rot = 0) {
     if (T <= 0) return;
     struct Heads {
         MfOut q, k, v;
@@ -154,7 +158,7 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
         int64_t hd;
         auto head(int which, int64_t t, int64_t h) const {
             const auto r = (which == 0 ? q : which == 1 ? k : v).row(t, h * hd);
-            const bool vs = which == 2;
+            const bool vs = which == 2 && hs != nullptr;
             const float inv = vs ? 1.f / hs[h] : 1.f;
             return [=](int64_t d) { return vs ? r(d) * inv : r(d); };
         }
@@ -163,6 +167,8 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
     sh.wq = wq;
     sh.wk = wk;
     sh.neox = neox;
+    sh.eps = eps;
+    sh.n_rot = n_rot;
     const Heads in{q, k, v, hs, hd};
     const kernels::qk::Rows16 out{q16, k16, v16, heads, heads, hd};
     if (cos != nullptr) kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::Tables{cos, sin, hd / 2}, out);
@@ -232,6 +238,100 @@ struct LnMod {
     }
 };
 
+// RMSNorm(x[t]) over the channels (eps), times w where it is given, then times scale and plus shift where given
+// (SeedVR2's modulation: the time's and the layer's scale summed), or with one_plus times (1 + scale) and plus shift
+// where scale is given (MOSS-Image's), rows16's Op
+struct RmsAffine {
+    const float *x, *w, *scale, *shift;
+    int64_t C;
+    float eps;
+    bool one_plus = false;
+    template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
+        const float* r = x + t * C;
+        float s = 0.f;
+        for (int64_t c = lane; c < C; c += step) s += r[c] * r[c];
+        return {0.f, 1.f / sycl::sqrt(reduce(s) / (float) C + eps)};
+    }
+    float value(int64_t t, int64_t c, const Stats& st) const {
+        if (one_plus) {   // (its weight given)
+            const float y = x[t * C + c] * st.inv * w[c];
+            return scale != nullptr ? y * (1.f + scale[c]) + shift[c] : y;
+        }
+        float y = x[t * C + c] * st.inv;
+        if (w != nullptr) y *= w[c];
+        if (scale != nullptr) y *= scale[c];
+        return shift != nullptr ? y + shift[c] : y;
+    }
+};
+
+// RowsI8Of's ops over the same rows: RmsAffine's (no weight), GeluTanh's, FP16 rows and FP32 rows as they are; R the
+// regular rotation (kRegular: int8_convrot's weights)
+template<bool R> struct RmsAffineI8 {
+    static constexpr bool kRms = true, kKeep = false, kRegular = R;
+    const float *x, *scale, *shift;
+    int64_t C;
+    float eps;
+    float raw(int64_t t, int64_t c) const { return x[t * C + c]; }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float ss) const { return 1.f / sycl::sqrt(ss / (float) C + eps); }
+    float out(int64_t, int64_t c, float v, float inv) const { return v * inv * scale[c] + shift[c]; }
+};
+template<bool R> struct GeluTanhI8 {
+    static constexpr bool kRms = false, kKeep = false, kRegular = R;
+    MfOut x;
+    float raw(int64_t t, int64_t c) const { return gelu_tanh(x.at(t, c)); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+};
+template<bool R> struct HalfI8 {
+    static constexpr bool kRms = false, kKeep = false, kRegular = R;
+    const uint16_t* h;
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return f32_from_f16(h[t * C + c]); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+};
+template<bool R> struct FloatI8 {
+    static constexpr bool kRms = false, kKeep = false, kRegular = R;
+    const float* x;
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return x[t * C + c]; }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+};
+
+template<bool R> struct SwiGluI8 {
+    static constexpr bool kRms = false, kKeep = false, kRegular = R;
+    MfOut g;
+    int64_t F;
+    float raw(int64_t t, int64_t c) const {
+        const float a = g.at(t, c);
+        return a / (1.f + sycl::exp(-a)) * g.at(t, c + F);
+    }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+};
+
+// SwiGLU of a fused product's output g [T][2F]: SiLU of the first F (the gate) times the second F, rows16's Op
+struct SwiGlu {
+    MfOut g;
+    int64_t F;
+    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
+    float value(int64_t t, int64_t c, const Stats&) const {
+        const float a = g.at(t, c);
+        return a / (1.f + sycl::exp(-a)) * g.at(t, c + F);
+    }
+};
+
+// GELU (tanh form) of a product's output, rows16's Op
+struct GeluTanh {
+    MfOut x;
+    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
+    float value(int64_t t, int64_t c, const Stats&) const { return gelu_tanh(x.at(t, c)); }
+    // |GELU(v)| <= v for v >= 0 and below 0.17 for v < 0: the row's scale without a tanh more a value
+    float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }
+};
+
 // A W8A8 product's int8 input (qi_kernels.hpp: qi_rows_i8's rows) straight from a row-wise op: kQiRotate values at a
 // time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a row (q8_act.hpp's Mul rule), without
 // FP16 rows and a second pass between: on the RX 9060 XT those two passes were a fifth of MOSS-Image's step
@@ -241,7 +341,14 @@ struct LnMod {
 // is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic (keep(t, c, v) writes it back
 // where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the value given it (none: v).  Or
 // W values at once: raw_w, keep_w, out_w; or with the sub-group, load_sg (a lane's 8 values of a GGUF block, W 8).
-// row_scale(t), where the op has it: the row's own factor on its scale.
+// row_scale(t), where the op has it: the row's own factor on its scale.  An op with kRegular rotates by the regular
+// Hadamard matrix instead (kron(H4, H4, H4, H4) / 16, H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2: the
+// basis ComfyUI's int8_convrot weights are saved in, hunyuanimage3_file.hpp), which is Sylvester's, a sign that flips
+// for each of the position's base-4 digits that is 3, and Sylvester's again: H4 = S D S with D = diag(1, 1, 1, -1).
+template<class Op> constexpr bool regular_rotation() {
+    if constexpr (requires { Op::kRegular; }) return Op::kRegular;
+    else return false;
+}
 template<class Op, int W, int G = 4> struct RowsI8Of {
     static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = G;
     static_assert(W == 1 || W == 4 || W == V);
@@ -257,6 +364,7 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
     static constexpr bool kVecOut = W > 1 && requires(const Op& o, float* p) {
         o.template out_w<W>(int64_t{}, int64_t{}, p, 1.f);
     };
+    static constexpr bool kRegular = regular_rotation<Op>();
     Op op;
     int64_t K, gpr, nsg;
     int8_t* q;
@@ -314,25 +422,42 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
 #pragma unroll
                 for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
             }
+            // Sylvester's butterflies: within the lane over j's bits, across the lanes over lane's
+            auto sylvester = [&] {
 #pragma unroll
-            for (int m = 1; m < V; m <<= 1)
+                for (int m = 1; m < V; m <<= 1)
 #pragma unroll
-                for (int j = 0; j < V; ++j)
-                    if ((j & m) == 0) {
-                        const float a = v[c][j], b = v[c][j + m];
-                        v[c][j] = a + b;
-                        v[c][j + m] = a - b;
+                    for (int j = 0; j < V; ++j)
+                        if ((j & m) == 0) {
+                            const float a = v[c][j], b = v[c][j + m];
+                            v[c][j] = a + b;
+                            v[c][j + m] = a - b;
+                        }
+#pragma unroll
+                for (int l = 1; l < SG; l <<= 1)
+#pragma unroll
+                    for (int j = 0; j < V; ++j) {
+                        const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
+                        v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
                     }
-#pragma unroll
-            for (int l = 1; l < SG; l <<= 1)
+            };
+            sylvester();
+            float norm = 1.f / 16.f;
+            if constexpr (kRegular) {   // D between two of Sylvester's: the value at position p of the group
 #pragma unroll
                 for (int j = 0; j < V; ++j) {
-                    const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
-                    v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
+                    const int p = (int) off(j) + lane * W;
+                    int threes = 0;
+#pragma unroll
+                    for (int d = 0; d < 8; d += 2) threes += ((p >> d) & 3) == 3;
+                    if (threes & 1) v[c][j] = -v[c][j];
                 }
+                sylvester();
+                norm = 1.f / 256.f;
+            }
 #pragma unroll
             for (int j = 0; j < V; ++j) {
-                v[c][j] *= 1.f / 16.f;
+                v[c][j] *= norm;
                 amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
             }
         }
