@@ -366,9 +366,12 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
             ms[kPickFp16] = timed([&](int64_t n) {
                 return prompt_attn(qv, pools.k_pool, pools.v_pool, pools.page_table, pos0 + T - n, n, s, out, stream);
             });
-        // the decode kernel over a slice of the queries its scratch fits in (it takes each query alike)
+        // the decode kernel over a slice of the queries its scratch fits in (it takes each query alike), 32 MiB: the
+        // timing's buffers are freed after it, and a GPU's driver may keep them from the free memory the engine plans
+        // with (the B70's kept 256 MiB of it at 256, 2026-11-07)
         const uint64_t per_q = qsa_decode_attn_scratch_floats(cells, s) * 4;
-        const int64_t nq = std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((256ull << 20) / std::max<uint64_t>(per_q, 1))));
+        const int64_t nq =
+            std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) ((32ull << 20) / std::max<uint64_t>(per_q, 1))));
         std::vector<int32_t> hs((size_t) (nq * kStepCount));
         for (int64_t t = 0; t < nq; ++t) qsa_step_fill(hs.data() + t * kStepCount, pos0 + T - nq + t, s);
         auto* steps = static_cast<int32_t*>(dev(hs.size() * 4));

@@ -159,8 +159,25 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         w.type = k::kNativeQ8Rows;
     }
     w.data = d;
-    // the shape's decode layout on this GPU, before any graph captures it (native_mmvq_tune)
-    if (k::native_mmvq_supported(w.type)) k::native_mmvq_tune(w.type, d, w.n_in, w.n_out, cs_);
+    weight_at_.push_back(d);
+    weight_bytes_.push_back(bytes);
+    if (k::native_mmvq_supported(w.type)) tune_wait_.push_back(&w);
+    return true;
+}
+
+// each shape's decode layout on this GPU, before any graph captures it, its launches reading the weights uploaded so
+// far: a span of their own (256 MiB at least) allocated and freed for each shape was kept by the B70's driver (its
+// free memory 256 MiB short after the load, and a prompt's chunks short of room with it, 2026-11-07)
+bool PlainModel::tune_uploaded(std::string& err) {
+    try {
+        for (const W* w : tune_wait_)
+            k::native_mmvq_tune(w->type, w->data, w->n_in, w->n_out, cs_, (int) weight_at_.size(), weight_at_.data(),
+                                weight_bytes_.data());
+    } catch (const std::exception& e) {
+        err = std::string("plain model: timing the decode products: ") + e.what();
+        return false;
+    }
+    tune_wait_.clear();
     return true;
 }
 
@@ -664,6 +681,7 @@ bool PlainModel::load_qwen(std::string& err) {
               std::to_string((long long) s.key_length) + " wide";
         return false;
     }
+    if (!tune_uploaded(err)) return false;
     // the BF16 projections' two GEMV forms timed for each shape a window takes, before any graph is recorded; the
     // head is left to the default form (its timing would allocate a second copy of it)
     try {

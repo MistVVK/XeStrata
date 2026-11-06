@@ -228,6 +228,7 @@ bool PlainModel::load_glm5(std::string& err) {
         }
     }
 
+    if (!tune_uploaded(err)) return false;
     // per-sequence state: per KDA block its recurrence and its three convolutions' last 3 inputs; per DSA block the
     // indexer's key | gate rows, its pooled keys and the MLA latent (FP16), one row a cell
     const int64_t H = s.n_head, S = s.kda_head_dim, C = H * S, KVR = s.kv_lora_rank, ID = s.idx_key_length;

@@ -452,10 +452,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (!status) { err = std::string("native dense scratch: ") + strata::gpu::last_error(); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
+        // the timing's launches read the weights uploaded here, as the decode reads a matrix after the others (not a
+        // span allocated for it, which a GPU's driver may keep from the free memory after it is freed)
+        std::vector<const void*> at;
+        std::vector<uint64_t> at_bytes;
+        for (const auto& item : pending) {
+            at.push_back(item.data.get());
+            at_bytes.push_back(item.bytes);
+        }
         for (auto& item : pending) {
             // each shape's decode layout on this GPU, before any graph captures it (native_mmvq_tune)
             strata::kernels::native_mmvq_tune(item.type, item.data.get(), (int) item.ref->ne0, (int) item.ref->ne1,
-                                              &compute);
+                                              &compute, (int) at.size(), at.data(), at_bytes.data());
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();

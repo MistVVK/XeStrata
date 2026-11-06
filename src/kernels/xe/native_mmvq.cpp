@@ -677,8 +677,15 @@ const char* format_name(const std::type_index& t);
 
 // the faster layout of the shape on the queue's GPU (y is written; the caller's weights only where no span fits);
 // true: the sub-group's
+struct Regions {
+    int n = 0;
+    const void* const* ptrs = nullptr;
+    const uint64_t* bytes = nullptr;
+};
+
 template<typename F>
-bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
+bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out,
+                 const Regions& regions = {}) {
     const bool rule = steps_rule(n_in / F::DIV, WARP / F::T);
     uint8_t* span = nullptr;
     try {
@@ -689,12 +696,25 @@ bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float*
         uint64_t want = std::max<uint64_t>(kTuneSpanCaches * dev.get_info<sycl::info::device::global_mem_cache_size>(),
                                            kTuneSpanMin);
         want = std::min<uint64_t>(std::max(want, 2 * stride), dev.get_info<sycl::info::device::max_mem_alloc_size>());
+        // the places: in the regions given (each a matrix's bytes at a 256-byte boundary within one), until they
+        // cover the span; else a span allocated for them
+        std::vector<const uint8_t*> at;
+        uint64_t covered = 0;
+        for (int r = 0; r < regions.n && covered < want; ++r) {
+            const auto* base = static_cast<const uint8_t*>(regions.ptrs[r]);
+            const uint64_t lead = (256 - reinterpret_cast<uintptr_t>(base) % 256) % 256;
+            for (uint64_t o = lead; o + bytes <= regions.bytes[r] && covered < want; o += stride) {
+                at.push_back(base + o);
+                covered += stride;
+            }
+        }
+        if (covered < want) at.clear();
         uint64_t got = 0;
-        for (uint64_t w = want; w >= 2 * stride && span == nullptr; w /= 2) {
+        for (uint64_t w = want; at.empty() && w >= 2 * stride && span == nullptr; w /= 2) {
             span = sycl::malloc_device<uint8_t>(w, q);
             got = w;
         }
-        const uint64_t places = span != nullptr ? got / stride : 1;
+        const uint64_t places = !at.empty() ? at.size() : span != nullptr ? got / stride : 1;
         if (span != nullptr) {
             auto* w32 = reinterpret_cast<uint32_t*>(span);
             q.parallel_for(sycl::range<1>((size_t) (places * stride / 4)), [=](sycl::id<1> i) {
@@ -706,7 +726,9 @@ bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float*
         }
         uint64_t next = 0;
         auto run = [&](int l) {
-            const void* w = span != nullptr ? (const void*) (span + (next++ % places) * stride) : weights;
+            const void* w = !at.empty()       ? (const void*) at[next++ % places]
+                            : span != nullptr ? (const void*) (span + (next++ % places) * stride)
+                                              : weights;
             if (l == 1) launch_row<F, 1, 8>(q, w, x_q8_1, y, n_in, n_out);
             else launch_group<F, 1>(q, w, x_q8_1, y, n_in, n_out);
         };
@@ -820,7 +842,7 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
 
 // native_mmvq_tune: the layout timed over a zero activation and an output of the shape's own
 template<typename F>
-void mmvq_tune(const void* weights, int n_in, int n_out, void* stream) {
+void mmvq_tune(const void* weights, int n_in, int n_out, void* stream, const Regions& regions) {
     validate_shape(n_in, 1, F::DIV);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -835,7 +857,7 @@ void mmvq_tune(const void* weights, int n_in, int n_out, void* stream) {
             return steps_rule(n_in / F::DIV, WARP / F::T);
         }
         q.memset(x, 0, native_q8_1_bytes(n_in, 1)).wait_and_throw();
-        const bool row = time_layout<F>(q, weights, x, y, n_in, n_out);
+        const bool row = time_layout<F>(q, weights, x, y, n_in, n_out, regions);
         sycl::free(x, q);
         sycl::free(y, q);
         return row;
@@ -1159,25 +1181,27 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-void native_mmvq_tune(int ggml_type, const void* weights, int n_in, int n_out, void* stream) {
+void native_mmvq_tune(int ggml_type, const void* weights, int n_in, int n_out, void* stream, int regions,
+                      const void* const* region_ptrs, const uint64_t* region_bytes) {
+    const Regions r{regions, region_ptrs, region_bytes};
     switch (ggml_type) {
-    case 2: mmvq_tune<Q40Traits>(weights, n_in, n_out, stream); break;
-    case 6: mmvq_tune<Q50Traits>(weights, n_in, n_out, stream); break;
-    case 8: mmvq_tune<Q80Traits>(weights, n_in, n_out, stream); break;
-    case 20: mmvq_tune<IQ4NLTraits>(weights, n_in, n_out, stream); break;
-    case 10: mmvq_tune<Q2KTraits>(weights, n_in, n_out, stream); break;
-    case 11: mmvq_tune<Q3KTraits>(weights, n_in, n_out, stream); break;
-    case 12: mmvq_tune<Q4KTraits>(weights, n_in, n_out, stream); break;
-    case 13: mmvq_tune<Q5KTraits>(weights, n_in, n_out, stream); break;
-    case 14: mmvq_tune<Q6KTraits>(weights, n_in, n_out, stream); break;
+    case 2: mmvq_tune<Q40Traits>(weights, n_in, n_out, stream, r); break;
+    case 6: mmvq_tune<Q50Traits>(weights, n_in, n_out, stream, r); break;
+    case 8: mmvq_tune<Q80Traits>(weights, n_in, n_out, stream, r); break;
+    case 20: mmvq_tune<IQ4NLTraits>(weights, n_in, n_out, stream, r); break;
+    case 10: mmvq_tune<Q2KTraits>(weights, n_in, n_out, stream, r); break;
+    case 11: mmvq_tune<Q3KTraits>(weights, n_in, n_out, stream, r); break;
+    case 12: mmvq_tune<Q4KTraits>(weights, n_in, n_out, stream, r); break;
+    case 13: mmvq_tune<Q5KTraits>(weights, n_in, n_out, stream, r); break;
+    case 14: mmvq_tune<Q6KTraits>(weights, n_in, n_out, stream, r); break;
     case kNativeQ6KRows:
-        if (native_q6_k_rows_ok(n_in)) mmvq_tune<Q6KRowTraits>(weights, n_in, n_out, stream);
+        if (native_q6_k_rows_ok(n_in)) mmvq_tune<Q6KRowTraits>(weights, n_in, n_out, stream, r);
         break;
     case kNativeQ8Rows:
-        if (native_q8_0_rows_ok(n_in)) mmvq_tune<Q80RowTraits>(weights, n_in, n_out, stream);
+        if (native_q8_0_rows_ok(n_in)) mmvq_tune<Q80RowTraits>(weights, n_in, n_out, stream, r);
         break;
-    case 23: mmvq_tune<IQ4XSTraits>(weights, n_in, n_out, stream); break;
-    case 42: mmvq_tune<Q20Traits>(weights, n_in, n_out, stream); break;
+    case 23: mmvq_tune<IQ4XSTraits>(weights, n_in, n_out, stream, r); break;
+    case 42: mmvq_tune<Q20Traits>(weights, n_in, n_out, stream, r); break;
     default: break;   // the i-quants' own kernels (iq_mmvq), BF16: one layout
     }
 }

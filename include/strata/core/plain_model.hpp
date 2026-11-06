@@ -564,6 +564,9 @@ private:
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is
     /// (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
     bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
+    /// The decode layouts of the matrices upload put on the GPU since the last call (native_mmvq_tune), timed over
+    /// all of them: the model's weights, read as the decode reads them, rather than a span allocated for the timing.
+    bool tune_uploaded(std::string& err);
     /// Block `l`'s weights (blk.<l>.*): its mixer, norms, router and shared expert.
     bool load_block(const GgufModel& m, int64_t l, Block& b, std::string& err);
     /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
@@ -900,6 +903,9 @@ private:
     const float *mtp_enorm_ = nullptr, *mtp_hnorm_ = nullptr, *mtp_head_norm_ = nullptr;
     int64_t n_moe_ = 0;   ///< MoE layers of the tiers: the trunk's, then the MTP layer's
     std::vector<void*> allocs_;      ///< every device allocation, freed in the destructor
+    std::vector<const W*> tune_wait_;              ///< upload's matrices not yet timed (tune_uploaded)
+    std::vector<const void*> weight_at_;           ///< upload's matrices on the GPU, and their bytes
+    std::vector<uint64_t> weight_bytes_;
 
     // the expert tiers (src_ and pool_ the root's, shared by every stage)
     std::unique_ptr<ExpertSource> src_own_;
