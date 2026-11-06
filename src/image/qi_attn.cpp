@@ -54,6 +54,7 @@ const char* qi_attention_path() {
 
 namespace {
 thread_local bool g_no_i8 = false;   // the 16-bit path's run while the int8 one is timed against it
+thread_local bool g_no_sdpa = false;   // the engine's own kernel's run while the maker's is timed against it
 
 // qi_attention's choices of the int8 kernel, a GPU's: (image rows, keys) / 1024 -> int8
 struct Choices {
@@ -61,6 +62,10 @@ struct Choices {
     std::map<std::pair<int64_t, int64_t>, bool> of;
 };
 Choices& choices_of(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<Choices>> of;
+    return *of.get(q.get_device(), [] { return std::make_shared<Choices>(); });
+}
+Choices& sdpa_choices_of(sycl::queue& q) {   // the maker's kernel (true) or the engine's own, as choices_of
     static core::PerDevice<std::shared_ptr<Choices>> of;
     return *of.get(q.get_device(), [] { return std::make_shared<Choices>(); });
 }
@@ -196,9 +201,53 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         }
         if (use == 1 && !g_no_i8) i8_done = run_i8();
     }
+    // the maker's 16-bit kernel (qi_sdpa) or the engine's own, once a GPU and a shape (as the int8 kernel's choice) on
+    // the first attention of 2048 image rows or more, timed both ways: the maker's unless the engine's own is clearly
+    // the faster (5%: a near tie taken one way or the other from start to start would change the image with it)
+    auto maker = [&] {
+        if (g_no_sdpa) return false;
+        if (T - r0 < 2048) return true;
+        sycl::queue& qq = core::Runtime::get().stream(stream);
+        Choices& ch = sdpa_choices_of(qq);
+        const auto key = std::make_pair((T - r0 + 1023) / 1024, (T + 1023) / 1024);
+        {
+            std::lock_guard<std::mutex> lock(ch.mu);
+            const auto it = ch.of.find(key);
+            if (it != ch.of.end()) return it->second;
+        }
+        auto timed = [&](const std::function<bool()>& f) {
+            if (!f()) return -1.0;
+            qq.wait();
+            const auto t0 = std::chrono::steady_clock::now();
+            f();
+            qq.wait();
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        const double mk = timed([&] {
+            return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim, stream);
+        });
+        double own = -1.0;
+        if (mk >= 0.0) {
+            g_no_sdpa = true;
+            own = timed([&] {
+                qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
+                return true;
+            });
+            g_no_sdpa = false;
+        }
+        const bool use = mk >= 0.0 && !(own >= 0.0 && own < mk * 0.95);
+        std::lock_guard<std::mutex> lock(ch.mu);
+        ch.of[key] = use;
+        if (mk >= 0.0)
+            std::fprintf(stderr,
+                         "strata-image: the attention's image rows by %s at %lld rows of %lld keys (the maker's %.2f "
+                         "ms, the engine's own %.2f ms)\n",
+                         use ? "the maker's kernel" : "the engine's own", (long long) (T - r0), (long long) T, mk, own);
+        return use;
+    };
     // the image rows went through the int8 kernel or else the maker's 16-bit one; the text rows are left
-    if (i8_done || (T - r0 >= 256 && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
-                                             out16 + (r0 - first) * heads * head_dim, stream))) {
+    if (i8_done || (T - r0 >= 256 && maker() && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+                                                        out16 + (r0 - first) * heads * head_dim, stream))) {
         if (first >= n_text) {
             if (!stream) core::Runtime::get().stream(stream).wait();
             return;

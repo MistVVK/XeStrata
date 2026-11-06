@@ -22,7 +22,8 @@
 // home whatever the source, which takes the layer back as prepare left it: the later passes copy it as it is and skip
 // the rewrite, a pass over the layer on the compute stream that the copy engine cannot hide.
 // A home is taken only while the RAM has room for it beside the headroom (take_home), on a thread of its own from the
-// first streamed layer's use on; a layer without one goes as before.
+// first streamed layer's use on; a layer without one goes as before.  The homes stay when the budget makes their
+// layers resident (configure), and a resident layer is loaded from its home where it has one (drop_homes frees them).
 // A pass through the relay reads the RAM three times (the memcpy's read and write, the DMA's read), and RAM bandwidth
 // is what bounds it: on the development machine (DDR4-3200, B70) the relay passed 10-11 GB/s where a DMA from
 // page-locked memory runs at 27 GB/s, and the B70's copies from the file's pages ran at 4.7 GB/s; the RX 9060 XT's ran

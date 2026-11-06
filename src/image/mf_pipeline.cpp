@@ -312,6 +312,12 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
     return nd;
 }
 
+void MfPipeline::te_layers() {
+    if (te_want_ == 0 || te_set_ == te_want_) return;   // (no plan yet: the encoder as it was opened)
+    te_->set_layer_budget(te_want_);
+    te_set_ = te_want_;
+}
+
 void MfPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
     if (held() == 0 || active() == nullptr) return;
@@ -386,7 +392,10 @@ QiPlan MfPipeline::plan(int64_t hw, int n, int64_t max_text, int64_t n_ids) {
         d.set_block_budget(p.blocks);
         dit_set_ = p.blocks;
     }
-    if (p.layers != te_set_) {
+    // the encoder's layers: fewer at once (their room is the DiT's now), more only when it encodes (te_layers), as
+    // QiPipeline's: a prompt whose states are kept does not run it
+    te_want_ = p.layers;
+    if (p.layers < te_set_) {
         te_->set_layer_budget(p.layers);
         te_set_ = p.layers;
     }
@@ -542,9 +551,11 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     }
     // the states: an edit's afresh (its images are not in the ids), a generation's kept for the same prompt
     if (editing) {
+        te_layers();
         last_states_ = te_->encode(ids, e.te);
         last_ids_.clear();
     } else if (r.ids != last_ids_) {
+        te_layers();
         last_states_ = te_->encode(r.ids);
         last_ids_ = r.ids;
     } else {
@@ -554,9 +565,11 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     d.set_context(0, last_states_.data() + r.drop * C, n_ctx);
     if (guided) {
         if (editing) {
+            te_layers();
             last_neg_states_ = te_->encode(neg_ids, e.neg_te);
             last_neg_ids_.clear();
         } else if (r.neg_ids != last_neg_ids_) {
+            te_layers();
             last_neg_states_ = te_->encode(r.neg_ids);
             last_neg_ids_ = r.neg_ids;
         }

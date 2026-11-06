@@ -141,7 +141,8 @@ Maxwell and older (compute capability below 6.0) do not run it: the SYCL runtime
 On Volta (sm_70), `STRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
 One is the routed experts' "mode 8": gate/up, SwiGLU and the q8_1 quantization in one pass, with the codebook grid and the activations in the work-group's local memory (`src/kernels/xe/iq_kernels.cpp`, upstream f6330507: 227 -> 159 µs on a V100).
 The other is the hyper-connection read's norm and up projection, with the weights loaded ahead to hide the latency (`src/kernels/xe/fused_gr.cpp`, upstream aaa323fe: 50.9 -> 46.7 µs a read on a V100).
-Both give the default kernels' output bit for bit, and `STRATA_GR_FAST=1` takes the second on any GPU.
+Both give the default kernels' output bit for bit.
+The read's norm and up are the default on every GPU (Qwen3.8-Flash-Next's decode on the RTX 4070 23.75 -> 24.8 tok/s, the B70 and the RX 9060 XT equal). `STRATA_GR_FAST=0` keeps the former kernels.
 Mode 8 is the default on every GPU whose local memory holds it (B70 decode +0.8-1.1% at 1K and 32K, RTX 4070 equal; the idea of upstream f7eaf2de's STRATA_EXPDEC). `STRATA_EXP_MODE=0` keeps the former kernels.
 Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests with and without them, and the experts' and the read's outputs were the default's bit for bit (on an RX 9060 XT as well).
 

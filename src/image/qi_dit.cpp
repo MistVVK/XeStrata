@@ -5,6 +5,8 @@
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_gguf.hpp"
 
+#include "dit_rows.hpp"
+
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -245,8 +247,21 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         // weight dequantized to FP16 in the products' scratch and rotated and quantized again a row at a time, in
         // place, each time a block is copied to the GPU (int8 values and a scale a row take less room than any
         // block format of 8 bits a value or more); else Q8_0's on NVIDIA's int8 tensor cores where the GPU has them
+        // W8A8 unless it is clearly the slower here: its MLP's product at a 1024 x 1024 image's 4096 rows timed both
+        // ways once a GPU (dit_rows::time_w8_f16, as MOSS-Image, Mage-Flow and Anima choose their forms), FP16 taken
+        // only where W8A8 is 5% slower or more (a near tie stays put)
+        auto w8_not_slower = [this] {
+            static core::PerDevice<int> of;
+            return of.get(core::Runtime::get().stream(s_).get_device(), [this] {
+                const auto [f16, w8] = dit_rows::time_w8_f16(4096, C_, 2 * inter_, "Qwen-Image's DiT", s_);
+                const int ok = f16 <= 0.0 || w8 <= 0.0 || w8 < f16 * 1.05 ? 1 : 0;
+                std::fprintf(stderr, "image engine: Qwen-Image's DiT in %s (its MLP's product at 4096 rows: %.2f ms in "
+                                     "FP16, %.2f in W8A8)\n", ok ? "8 bits" : "16 bits", 1e3 * f16, 1e3 * w8);
+                return ok;
+            }) == 1;
+        };
         uint64_t w8t_bytes = 0;
-        if (std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(s_)) {
+        if (std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(s_) && w8_not_slower()) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
                     w->w8 = w->k % kQiRotate == 0 &&

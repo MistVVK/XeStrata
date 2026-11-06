@@ -198,8 +198,11 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
         l.d = nullptr;
         l.loaded = false;
     }
-    // a layer resident now has no use for its home, nor any once nothing streams; the rest keep theirs
-    free_homes(0, streaming ? R : (int) layers_.size());
+    // the homes stay where the layers become resident: a budget that grows and shrinks between uses (an encoder beside
+    // a DiT, all its layers resident for a prompt's plan and then streamed again) loads them from their homes, DMA
+    // alone and the prepared bytes as they are, not from the file's pages again (MOSS-Image's text encoder on the RX
+    // 9060 XT: its pages pushed out of the page cache between prompts, read from the disk at about 90 ms a layer,
+    // 3 to 4 s of a 30-token prompt's encode, 2026-11-07); drop_homes gives their RAM back
     if (!streaming) {
         for (Slot& s : slots_) {
             if (s.d != nullptr) gpu::free(s.d);
@@ -358,6 +361,21 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
     if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+    uint8_t* home;
+    bool prepped;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        home = l.home;
+        prepped = l.prepped || (l.homed && !prepare_);
+    }
+    if (home != nullptr && prepped) {   // a home a streamed pass left: the layer as it is used
+        std::lock_guard<std::mutex> lk(relay_mu_[0]);
+        check(gpu::copy_async(l.d, home, l.bytes, copy_), "a layer's copy");
+        check(gpu::event_record(relay_free_[0], copy_), "an event");
+        check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
+        l.loaded = true;
+        return;
+    }
     // straight from the file's pages where the streamed layers' measured choice is so (or STRATA_IMAGE_STREAM_SOURCE
     // says file): through the relay, each layer's memcpy waited for the last one's DMA, and the GPU idled through it
     // (MOSS-Image's text encoder's blocks made resident again for an edit on the RTX 4070: 1.2 of its 3.3 s,

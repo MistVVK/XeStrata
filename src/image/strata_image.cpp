@@ -144,6 +144,7 @@
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
 #include "strata/image/yolo_detect.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
 
 #include <atomic>
@@ -1245,6 +1246,9 @@ int main(int argc, char** argv) {
                          argv[0]);
             return 2;
         }
+        // the products' library loaded on a thread of its own while the model opens (as the text engines start), not
+        // at the first image's first product
+        strata::prefill::Gemm::prepare();
         std::unique_ptr<si::ImagePipeline> pipe;
         std::string err;
         if (hunyuanimage3) {

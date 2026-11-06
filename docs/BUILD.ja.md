@@ -143,7 +143,8 @@ Maxwell 以前（compute capability 6.0 未満）では動きません。NVIDIA 
 Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
 もうひとつはハイパーコネクションの読み出しの norm と up の積で、重みを先に読んで遅延を隠します（`src/kernels/xe/fused_gr.cpp`、upstream の aaa323fe: V100 で 1 回 50.9 → 46.7 µs）。
-どちらも出力は既定のカーネルとビット単位で同じで、`STRATA_GR_FAST=1` でほかの GPU でも使えます。
+どちらも出力は既定のカーネルとビット単位で同じです。
+読み出しの norm と up は、すべての GPU で既定です（Qwen3.8-Flash-Next の decode が RTX 4070 で 23.75 → 24.8 tok/s、B70 と RX 9060 XT は同等）。`STRATA_GR_FAST=0` で従来のカーネルです。
 モード 8 は、ローカルメモリに入るすべての GPU で既定です（B70 の decode が 1K・32K で +0.8〜1.1%、RTX 4070 は同等。upstream の f7eaf2de の STRATA_EXPDEC と同じ考え）。`STRATA_EXP_MODE=0` で従来のカーネルです。
 sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両方を使っても CTest 71 件が通り、エキスパートと読み出しの出力は既定とビット単位で同じでした（RX 9060 XT でも同じ）。
 

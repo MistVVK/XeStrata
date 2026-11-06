@@ -13,7 +13,6 @@
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
 #include "strata/kernels/q8_act.hpp"
-#include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -66,14 +65,15 @@ inline float warp_sum(const sycl::sub_group& sg, float v) {
 inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 
 // Upstream's latency-hidden norm and up kernels (aaa323fe: gfx906's, which upstream runs on sm_70 too; V100-SXM2: 50.9
-// -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise): STRATA_GR_FAST=1 or 0 on any GPU, else
-// Volta with STRATA_SM70_TABLE=1 (sm70_table.hpp).
-bool gr_fast(sycl::queue& q) {
-    static const int env = [] {
+// -> 46.7 us a read at T 1, hc-read0's up 1.08 -> 0.96 ms a window, bitwise), on every GPU: Qwen3.8-Flash-Next's
+// decode on the RTX 4070 23.75 -> 24.8 tok/s, on the B70 and the RX 9060 XT the same (2026-11-07), the same tokens.
+// STRATA_GR_FAST=0 the former kernels.
+bool gr_fast(sycl::queue&) {
+    static const bool on = [] {
         const char* v = std::getenv("STRATA_GR_FAST");
-        return v != nullptr ? (std::strtol(v, nullptr, 10) != 0 ? 1 : 0) : -1;
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    return env >= 0 ? env != 0 : xe::sm70_table(q);
+    return on;
 }
 
 // 8 bf16 packed in a uint4 against 8 floats.

@@ -646,10 +646,11 @@ bool Gemm::half_ok(void* stream) {
 #endif
 }
 
-void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
-                       int64_t K, int64_t ldy) {
+void Gemm::native_half([[maybe_unused]] const uint16_t* X, int ggml_type, const void* W_blocks,
+                       [[maybe_unused]] uint16_t* Y16, [[maybe_unused]] int64_t T, int64_t N, int64_t K, int64_t ldy) {
     if (ldy <= 0) ldy = N;
-    with_f16(ggml_type, W_blocks, N, K, [&](const uint16_t* w, int64_t r0, int64_t n) {
+    with_f16(ggml_type, W_blocks, N, K,
+             [&]([[maybe_unused]] const uint16_t* w, [[maybe_unused]] int64_t r0, [[maybe_unused]] int64_t n) {
 #if STRATA_ONEMATH
         if (half_out(X, w, Y16 + r0, T, n, K, ldy, stream_)) return;
 #endif
