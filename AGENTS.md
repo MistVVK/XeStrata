@@ -15,6 +15,19 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 - **Keep it current in the same turn:** a fact learned or found changed (a new container, a moved folder, something a machine lacks) goes into `LOCAL.md` before the work moves on. A fact that is missing there is looked up, and asked of the user only when it cannot be found, then written down.
 - It is written in Japanese, by machine, facts only, as it is now.
 
+## One computing engine for every model (the most important rule)
+
+Every model XeStrata runs computes through one set of shared parts: the image engine's DiTs, VAEs, text encoders and upscalers, and the LLMs (Qwen3.8's engine and `PlainModel`) alike.
+The shared parts are the attention (`flash_attn`), the products (`prefill::Gemm`, `iq_mmq`), the row operations (`dit_rows.hpp`, `rms_norm_rows`), the QK norm and RoPE (`qk_norm_rope.hpp`), the KV appends, the activations' quantization, the tiles, the VRAM budget and the warm-up.
+They were made one so that a speed-up reaches every model at once.
+
+- A speed-up goes into the shared part, and it is on by default on every device that has what it needs: not an opt-in flag, and not one model's private copy.
+- Whether a path is taken is chosen from what the device reports (its matrix combinations, sub-group sizes, memory and the rest, as the first rule below says), never from the model's name or family. Which capabilities a path pays off on is settled by measuring on the three makers' GPUs while it is written, not by timing it on the user's machine at run time.
+- A model does not keep its own kernel for a role a shared part already has. A new model is built on the shared parts; a role they lack is added to them, so the other models can use it too.
+- Keep a separate implementation only when the shared one was measured slower for it, and say so with the numbers in a comment.
+- An opt-in (an environment variable, off by default) is only for a path that changes the answers beyond the models' checks, or one measured not faster on the three makers' GPUs; its comment says which.
+- Check a change to a shared part on every model that uses it: the images by byte match or by eye, the LLMs by KL, and the speed on the three makers' GPUs.
+
 ## Hardware independence (the first rule)
 
 XeStrata runs on any Intel Arc GPU and any x86-64 CPU with AVX2, not on the development machine's B70 and i7-14700.
