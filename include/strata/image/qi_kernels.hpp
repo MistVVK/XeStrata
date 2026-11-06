@@ -12,6 +12,10 @@
 #include <utility>
 #include <vector>
 
+namespace strata::kernels {
+struct FlashAttnI8Stats;
+}
+
 namespace strata::image {
 
 /// y16[t] = LayerNorm(x[t]) * (1 + mod[t < n_text][...]) (+ shift: the VAEs' modulation; no affine, eps 1e-6), FP16:
@@ -43,14 +47,16 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 /// image sees all of itself), an image token every token.  On the GPU's matrix engines where it has them
 /// (src/image/qi_attn.cpp, flash_attn.hpp), FP16 out16 [T - first][heads * head_dim]: the query rows from `first` on
 /// (the rows before it, a cached prefix's, are not asked); else the same kernel's FMA form.  `int8`: the rows that see every key
-/// may take the int8 kernel where it is the faster (qi_attention_i8: a model whose images it keeps, Qwen-Image's; not
-/// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).  `spans`: prefix rows [a, b) that see
+/// may take flash_attn's int8 path where it is the faster on this GPU (qi_attention_i8; every image model passes it:
+/// on the RTX 4070 Anima's, Mage-Flow Turbo's and Qwen-Image's images stay as good, 2026-11-06).  `spans`: prefix rows [a, b) that see
 /// keys 0 .. b - 1 and no others (an edit's references, as key_lim says on the GPU): they take the image rows' kernels,
-/// as rows past a context of b keys.
+/// as rows past a context of b keys.  `i8_stats`: the keys' and values' statistics the int8 path takes instead of its
+/// own pass over them (kernels::FlashAttnI8Stats).
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, void* stream,
                   const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false,
-                  const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr);
+                  const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr,
+                  const kernels::FlashAttnI8Stats* i8_stats = nullptr);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();

@@ -668,6 +668,39 @@ inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int
                    HeadMax{a, b, na, nb, heads, hd, part});
 }
 
+// The column form of head_max and head_scale: part[s][c] = the largest |x| of column c over slice s of the rows, a's
+// na then b's nb (kColSlices slices; the rows read side by side, a column a work-item), then col_scale: hs[h] = head h's power of
+// two as head_scale makes it (the same: a head's largest is its columns'), and sv[c] = column c's largest at it, over
+// 127 (1 for a column of zeros) - the V scales the int8 attention takes (kernels::FlashAttnI8Stats), so that it need
+// not read the attention's FP16 v again for them
+constexpr int64_t kColSlices = 32;
+
+inline void col_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int64_t C, float* part, void* s) {
+    const int64_t n = na + nb;
+    if (n <= 0) return;
+    q_of(s).parallel_for(sycl::range<2>((size_t) kColSlices, (size_t) C), [=](sycl::id<2> id) {
+        const auto sl = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        const int64_t t0 = n * sl / kColSlices, t1 = n * (sl + 1) / kColSlices;
+        float m = 0.f;
+        for (int64_t t = t0; t < t1; ++t) m = sycl::fmax(m, sycl::fabs(t < na ? a.at(t, c) : b.at(t - na, c)));
+        part[sl * C + c] = m;
+    });
+}
+
+inline void col_scale(const float* part, int64_t C, int64_t heads, int64_t hd, float* hs, float* sv, void* s) {
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (heads * hd)), sycl::range<1>((size_t) hd)),
+                         [=](sycl::nd_item<1> it) {
+        const auto h = static_cast<int64_t>(it.get_group_linear_id());
+        const int64_t c = h * hd + static_cast<int64_t>(it.get_local_linear_id());
+        float cm = 0.f;
+        for (int64_t sl = 0; sl < kColSlices; ++sl) cm = sycl::fmax(cm, part[sl * C + c]);
+        const float m = sycl::reduce_over_group(it.get_group(), cm, sycl::maximum<float>());
+        const float hsv = pow2_scale(m);
+        if (it.get_local_linear_id() == 0) hs[h] = hsv;
+        sv[c] = cm > 0.f ? cm / hsv / 127.f : 1.f;
+    });
+}
+
 // hs[h] = the scale of head h over the rows' part: a work-group a head, its items striding the rows
 inline void head_scale(const float* part, int64_t rows, int64_t heads, float* hs, void* s) {
     constexpr size_t kWG = 256;

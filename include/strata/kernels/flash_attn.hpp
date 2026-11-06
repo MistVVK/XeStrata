@@ -70,6 +70,37 @@ int flash_attn_nsg_most(const void* sycl_device, int64_t head_dim);
 /// 4, 8 and 10 or 12 query heads a KV head).
 bool flash_attn(const FlashAttnArgs& a, void* stream, int nsg = 0);
 
+// The int8 path (flash_attn_i8.cpp, SageAttention's scheme): rows that see every key, head_dim 128, Q, K and V FP16
+// [rows][heads * 128] (the rows past T up to a multiple of flash_attn_i8_chunk zero).  Q . K^T and P . V on the int8
+// matrix instructions: RDNA3's and RDNA4's WMMA, NVIDIA's mma.sync from sm_80 on.
+
+/// The int8 kernel `stream`'s GPU takes: 1 the WMMA one, 2 the mma.sync one, 0 none (the caller takes flash_attn).
+int flash_attn_i8_kind(void* stream);
+/// The keys of the int8 path's chunks: P in int8 at 127 steps of a row's largest in each chunk (from key 0).
+int flash_attn_i8_chunk();
+/// The statistics of the keys and values a caller may give the int8 path instead of their pass over K and V: V's
+/// scales [heads * 128] (a column's largest |v| / 127, never 0), and K's mean over the keys [heads * 128], read where
+/// kmean_ready and else made into it (any mean leaves the softmax as it is - the scores of a row all move by q . mean
+/// - so one made at an earlier step serves: only the keys' int8 rounding asks it be near).
+struct FlashAttnI8Stats {
+    const float* sv = nullptr;
+    float* kmean = nullptr;
+    bool kmean_ready = false;
+};
+/// Query rows r0 .. T - 1 of T keys into out16 (its row 0 query row `first`); false where the GPU has no int8 kernel
+/// or its buffers do not fit (nothing written).  A null stream waits.
+bool flash_attn_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
+                   int64_t r0, int64_t first, uint16_t* out16, void* stream, const FlashAttnI8Stats* st = nullptr);
+/// A prefix of P keys made once (flash_attn_i8_prefix_bytes of device memory, from their k16 and v16) that
+/// flash_attn_i8_prefixed's T rows attend to after their own keys, its values at their scales times v_from / v_to (a
+/// head's).
+uint64_t flash_attn_i8_prefix_bytes(int64_t P, int64_t heads);
+bool flash_attn_i8_prefix(const uint16_t* k16, const uint16_t* v16, int64_t P, int64_t heads, void* prefix,
+                          void* stream);
+bool flash_attn_i8_prefixed(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
+                            const void* prefix, int64_t P, const float* v_from, const float* v_to, uint16_t* out16,
+                            void* stream);
+
 // The selection form (formerly qsa_prompt_attn.hpp, perf-review D-1: the prompt path's QSA attention on the matrix
 // engines):
 //

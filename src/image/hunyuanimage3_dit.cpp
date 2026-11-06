@@ -179,7 +179,7 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         // the rows T .. qi_attn_rows(T) of q, k and v are the attention's padding: hunyuanimage3_scratch_alloc zeroed them,
         // and a sequence changes T only by going through a new scratch
         qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, stream,
-                     key_lim);
+                     key_lim, 0, true);
         hunyuanimage3_rotate16(sc.a16, T, d.hidden, d.rotate, sc.ar16, stream);
         gemm.f16(sc.ar16, w.o, sc.o32, T, w.o_n, w.o_k);
         if (out != x) up(out, x, (size_t) T * d.hidden * sizeof(float));

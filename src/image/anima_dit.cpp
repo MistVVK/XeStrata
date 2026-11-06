@@ -13,6 +13,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/gelu.hpp"
+#include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -652,6 +653,8 @@ uint64_t AnimaDit::activation_bytes(int64_t hw, int n, int64_t mlp_rows) const {
            (uint64_t) TP * C_ * 2 * 4 +                         // the self-attention's q, k, v, output
            (uint64_t) R * C_ * 2 * 2 +                          // the attention's FP16 output, the heads' q
            (uint64_t) hw * hd_ * 4 +                            // the rotary tables
+           (uint64_t) (blocks_.size() * 2 + 1) * C_ * 4 +        // the int8 attention's K means and V scales
+           (uint64_t) kColSlices * C_ * 4 +                     // col_max's parts (vpart_ at least)
            (uint64_t) hw * L * 6 +                              // a head's scores and their probabilities
            (uint64_t) TP * C_ * 4 +                             // the plain attention's scratch
            (uint64_t) n * blocks_.size() * L * C_ * 2 * 2 +     // the contexts' kept keys and values
@@ -679,7 +682,12 @@ void AnimaDit::ensure(int64_t hw, int n) {
     rs2_ = alloc<float>(allocs_, std::max(Rk, mlp_rows_));
     rs_o_ = alloc<float>(allocs_, Rk);
     hs_ = alloc<float>(allocs_, heads_);
-    vpart_ = alloc<float>(allocs_, hw * heads_);
+    vpart_ = alloc<float>(allocs_, std::max(hw * heads_, kColSlices * C_));   // head_max's, col_max's
+    // the int8 attention's statistics: a context's V scales, K's mean a block and context (zero until a step makes it)
+    vsv_ = alloc<float>(allocs_, C_);
+    kmean_ = alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_);
+    gpu::memset_async(kmean_, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
+    kready_.assign(blocks_.size() * 2, 0);
     if (w8_) {
         xq8_rows_ = std::max(Rk, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
@@ -706,11 +714,13 @@ void AnimaDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) o32_, (void*) g_, (void*) h16_,
                     (void*) rs_, (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_,
+                    (void*) vsv_, (void*) kmean_,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) qh16_,
                     (void*) sc_, (void*) p16_, (void*) cos_, (void*) sin_, (void*) lora_f32_,
                     (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = nullptr;
+    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = vsv_ = kmean_ = nullptr;
+    kready_.clear();
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = qh16_ = p16_ = nullptr;
     xq8_ = nullptr;
     lora_f32_ = nullptr;
@@ -1040,6 +1050,8 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     product(h16_, nullptr, xemb_, nullptr, x_, HW, nullptr);
     for (int i = 1; i < n; ++i) gpu::copy_async(x_ + i * HW * C, x_, (size_t) (HW * C) * 4, s_);
     time_embedding(sigma);
+    if (sigma > last_sigma_) std::fill(kready_.begin(), kready_.end(), 0);   // a new image: K's means made again
+    last_sigma_ = sigma;
     if (cross_sdpa_ < 0) cross_sdpa_ = fused_attention_ok() ? 1 : 0;
     const bool fused = cross_sdpa_ == 1;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
@@ -1058,11 +1070,15 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
                 for (uint16_t* jb : {jq16_, jk16_, jv16_})
                     gpu::memset_async(jb + HW * C, 0, (size_t) ((dirty_[0] - HW) * C) * 2, s_);
             dirty_[0] = HW;
-            head_max(v.from(r0), HW, MfOut{}, 0, heads_, hd_, vpart_, s_);
-            head_scale(vpart_, HW, heads_, hs_, s_);
+            // v's heads' scales by column, the int8 attention's V scales with them and K's mean kept from the last step
+            col_max(v.from(r0), HW, MfOut{}, 0, C, vpart_, s_);
+            col_scale(vpart_, C, heads_, hd_, hs_, vsv_, s_);
             qk_rope16(q.from(r0), k.from(r0), v.from(r0), f(b.sqn), f(b.skn), cos_, sin_, hs_, HW, heads_, hd_, true,
                       jq16_, jk16_, jv16_, s_);
-            qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, false);
+            const size_t ki = (size_t) bi * 2 + (size_t) i;   // (two contexts at most kept: a third makes its own)
+            kernels::FlashAttnI8Stats st{vsv_, i < 2 ? kmean_ + (int64_t) ki * C : nullptr, i < 2 && kready_[ki] != 0};
+            qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, true, nullptr, &st);
+            if (i < 2) kready_[ki] = 1;
             rows16(Heads{jo16_, hs_, C, hd_}, HW, C, o16_ + r0 * C, rs_o_ + r0, s_);
         }
         gate_add(x_, product(o16_, rs_o_, b.so, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);

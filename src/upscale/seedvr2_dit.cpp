@@ -739,7 +739,7 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
         for (int64_t k = 0; k < l.windows; ++k) {
             const int64_t a = l.at[(size_t) k];
             image::qi_attention(jq_ + a * C, jk_ + a * C, jv_ + a * C, l.len[(size_t) k], heads_, hd_, 0,
-                                jo_ + a * C, s_);
+                                jo_ + a * C, s_, nullptr, 0, true);
         }
         joint_scatter(l.src, l.jrows, C, jo_, o16_, s_);
         stream_out(b.v, base, o16_, x_, N);
