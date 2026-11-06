@@ -72,7 +72,8 @@ bool flash_attn(const FlashAttnArgs& a, void* stream, int nsg = 0);
 
 // The int8 path (flash_attn_i8.cpp, SageAttention's scheme): rows that see every key, head_dim 128, Q, K and V FP16
 // [rows][heads * 128] (the rows past T up to a multiple of flash_attn_i8_chunk zero).  Q . K^T and P . V on the int8
-// matrix instructions: RDNA3's and RDNA4's WMMA, NVIDIA's mma.sync from sm_80 on.
+// matrix instructions: RDNA3's and RDNA4's WMMA (comfy-kitchen's kernels where the build carries them, with their own
+// statistics), NVIDIA's mma.sync from sm_80 on.
 
 /// The int8 kernel `stream`'s GPU takes: 1 the WMMA one, 2 the mma.sync one, 0 none (the caller takes flash_attn).
 int flash_attn_i8_kind(void* stream);

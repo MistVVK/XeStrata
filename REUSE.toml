@@ -80,6 +80,11 @@ SPDX-FileCopyrightText = "NVIDIA CORPORATION & AFFILIATES"
 SPDX-License-Identifier = "BSD-3-Clause"
 
 [[annotations]]
+path = ["third_party/main/comfy-kitchen/LICENSE", "third_party/main/comfy-kitchen/NOTICE"]
+SPDX-FileCopyrightText = "2025 Comfy Org"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = ["third_party/main/aotriton/LICENSE"]
 SPDX-FileCopyrightText = "Advanced Micro Devices, Inc."
 SPDX-License-Identifier = "MIT"

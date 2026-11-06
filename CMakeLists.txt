@@ -901,6 +901,10 @@ if(STRATA_ENABLE_XE)
     add_dependencies(strata_image strata_onednn)
     target_sources(strata_image PRIVATE src/image/qi_sdpa_onednn.cpp src/image/qi_conv_onednn.cpp)
     target_link_libraries(strata_image PRIVATE strata_dnnl)
+    # and the int8 products with scaled BF16 out on Intel GPUs (kernels::i8_gemm_bf16)
+    add_dependencies(strata_kernels strata_onednn)
+    target_link_libraries(strata_kernels PRIVATE strata_dnnl)
+    set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
     set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
                  src/upscale/esrgan.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
@@ -1033,6 +1037,94 @@ if(STRATA_ENABLE_XE)
       set(_strata_aotriton_lib ${_strata_aot_dir}/lib)   # for the packages
     endif()
   endif()
+  # AMD GPUs with WMMA (RDNA3 and RDNA4), in both modes: i8_gemm's product and flash_attn_i8's attention through
+  # comfy-kitchen's HIP kernels
+  # (Apache-2.0, the tag pinned here; third_party/main/comfy-kitchen), in a module of their own
+  # (src/kernels/hip/kitchen_module.cpp) that i8_gemm.cpp opens on an AMD GPU only, as the image attention's aotriton:
+  # they need AMD's HIP runtime.  The SYCL compiler builds them as HIP, with XeStrata's patch (the bf16 WMMA builtins'
+  # operands as it declares them) and the ROCm device library functions HIP's headers call that it no longer declares
+  # (src/kernels/hip/ocml_f16_declares.hpp).  Linux only for now.  After oneMath: hip's package found before it gave
+  # hip::host this compiler's compiler-rt, which intel/llvm's install lacks, and oneMath's rocBLAS backend failed to
+  # link.
+  set(_strata_kitchen_archs "")
+  foreach(arch IN LISTS _strata_hip_archs)
+    if(arch MATCHES "^gfx1[12][0-9][0-9]$")
+      list(APPEND _strata_kitchen_archs ${arch})
+    endif()
+  endforeach()
+  if(_strata_kitchen_archs AND NOT WIN32)
+    strata_hip_prefixes(_strata_kitchen_prefixes)
+    find_package(hip QUIET PATHS ${_strata_kitchen_prefixes})
+  endif()
+  if(_strata_kitchen_archs AND NOT WIN32 AND TARGET hip::amdhip64)
+    include(FetchContent)
+    # the patch by git apply (a build container may lack patch), kept from the build folder's own repository (a build
+    # inside a checkout), in which git apply would skip the paths outside its folder without a word
+    find_package(Git REQUIRED)
+    FetchContent_Populate(strata_kitchen QUIET
+      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.40.tar.gz
+      URL_HASH SHA256=9f983556cc1a7bb7f5814f86a78d4eb4557e2a7c60554c50c95a2b6fd2ea2683
+      PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
+                    ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0001-wmma-bf16-operands.patch
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-subbuild)
+    set(_strata_kitchen_hip ${strata_kitchen_SOURCE_DIR}/comfy_kitchen/backends/hip)
+    set(_strata_kitchen_dir ${CMAKE_BINARY_DIR}/kitchen)
+    # its architecture_config.h, as its CMake makes it: the WMMA generation by the device compile's target
+    set(_strata_kitchen_gfx11 "")
+    set(_strata_kitchen_gfx12 "")
+    foreach(arch IN LISTS _strata_kitchen_archs)
+      if(arch MATCHES "^gfx12")
+        list(APPEND _strata_kitchen_gfx12 "defined(__${arch}__)")
+      else()
+        list(APPEND _strata_kitchen_gfx11 "defined(__${arch}__)")
+      endif()
+    endforeach()
+    list(JOIN _strata_kitchen_gfx11 " || " COMFY_HIP_GFX11_CONDITION)
+    list(JOIN _strata_kitchen_gfx12 " || " COMFY_HIP_GFX12_CONDITION)
+    if(NOT COMFY_HIP_GFX11_CONDITION)
+      set(COMFY_HIP_GFX11_CONDITION 0)
+    endif()
+    if(NOT COMFY_HIP_GFX12_CONDITION)
+      set(COMFY_HIP_GFX12_CONDITION 0)
+    endif()
+    configure_file(${_strata_kitchen_hip}/architecture_config.h.in ${_strata_kitchen_dir}/architecture_config.h @ONLY)
+    list(GET _strata_kitchen_archs 0 _strata_kitchen_first)
+    strata_hip_device_libs(${_strata_kitchen_first} _strata_kitchen_libs)
+    # HIP's headers: hip's package's, a system folder (Fedora's /usr/include) left to the compiler's own search
+    get_target_property(_strata_kitchen_inc hip::amdhip64 INTERFACE_INCLUDE_DIRECTORIES)
+    list(REMOVE_ITEM _strata_kitchen_inc ${CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES} /usr/include)
+    get_filename_component(_strata_kitchen_rocm "${hip_DIR}/../../.." ABSOLUTE)
+    set(_strata_kitchen_flags -x hip -std=c++20 -O3 -fPIC -DNDEBUG -w --rocm-path=${_strata_kitchen_rocm}
+        --rocm-device-lib-path=${_strata_kitchen_libs}
+        -include ${CMAKE_SOURCE_DIR}/src/kernels/hip/ocml_f16_declares.hpp -I${_strata_kitchen_dir})
+    foreach(dir IN LISTS _strata_kitchen_inc)
+      list(APPEND _strata_kitchen_flags -isystem ${dir})
+    endforeach()
+    foreach(arch IN LISTS _strata_kitchen_archs)
+      list(APPEND _strata_kitchen_flags --offload-arch=${arch})
+    endforeach()
+    set(_strata_kitchen_objs "")
+    foreach(src ops/gemm_int8 sage_attention/quant_qk_int8 sage_attention/quant_v_int8 sage_attention/int8_attn)
+      string(REPLACE "/" "_" _name ${src})
+      set(_obj ${_strata_kitchen_dir}/${_name}${CMAKE_CXX_OUTPUT_EXTENSION})
+      add_custom_command(OUTPUT ${_obj}
+        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_kitchen_flags} -c ${_strata_kitchen_hip}/${src}.hip -o ${_obj}
+        DEPENDS ${_strata_kitchen_hip}/${src}.hip ${CMAKE_SOURCE_DIR}/src/kernels/hip/ocml_f16_declares.hpp
+        COMMENT "comfy-kitchen's ${src} for AMD ${_strata_kitchen_archs}" VERBATIM)
+      list(APPEND _strata_kitchen_objs ${_obj})
+    endforeach()
+    add_library(strata_hip_kitchen SHARED src/kernels/hip/kitchen_module.cpp ${_strata_kitchen_objs})
+    set_source_files_properties(${_strata_kitchen_objs} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
+    target_include_directories(strata_hip_kitchen PRIVATE ${_strata_kitchen_inc})
+    target_compile_definitions(strata_hip_kitchen PRIVATE __HIP_PLATFORM_AMD__)
+    target_link_libraries(strata_hip_kitchen PRIVATE hip::amdhip64 strata_warnings)
+    add_dependencies(strata_kernels strata_hip_kitchen)
+    set_property(SOURCE src/kernels/xe/i8_gemm.cpp src/kernels/xe/flash_attn_i8.cpp APPEND PROPERTY
+                 COMPILE_DEFINITIONS STRATA_HIP_KITCHEN=1)
+    target_link_libraries(strata_kernels PRIVATE ${CMAKE_DL_LIBS})
+    set(_strata_kitchen ON)   # its license text goes with the packages
+  endif()
   # NVIDIA GPUs (contrib-llvm): cuDNN's SDPA and the VAEs' convolutions through cudnn-frontend (Apache-2.0,
   # header-only, the tag pinned here), which opens cuDNN at run time (libcudnn.so.9, cudnn64_9.dll: the user's
   # installation, not free software; without it the engine's own kernel).  cuDNN's headers (cudnn.h, the same for
@@ -1094,8 +1186,8 @@ if(STRATA_ENABLE_XE)
   add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
   target_link_libraries(qi_attn_parity PRIVATE strata_image)
   add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
-  # kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs) against the library's int8 product, every value of the
-  # image models' product shapes (skipped where the GPU takes no such kernel)
+  # kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs, comfy-kitchen's on AMD ones) against the library's int8
+  # product, every value of the image models' product shapes (skipped where the GPU takes no such kernel)
   add_executable(i8_gemm_parity src/kernels/xe/i8_gemm_parity.cpp)
   target_link_libraries(i8_gemm_parity PRIVATE strata_image)
   add_test(NAME i8_gemm_parity COMMAND i8_gemm_parity)

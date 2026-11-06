@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/kernels/xe/i8_gemm_parity.cpp - kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs) against the library's
-// int8 product (prefill::Gemm::i8, int32 sums) scaled on the host (GPU, synthetic, no model).
+// src/kernels/xe/i8_gemm_parity.cpp - kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs, comfy-kitchen's on AMD
+// GPUs with WMMA) against the library's int8 product (prefill::Gemm::i8, int32 sums) scaled on the host (GPU,
+// synthetic, no model).
 //
 //   The products the image models make (MOSS-Image's 3072 and 16384, Mage-Flow's 12288, Anima's 2048 and 8192,
 //   SeedVR2's 2560 and 10240) at rows that take each kernel and its edges (1024, 2047, 2048, a tile's part over:

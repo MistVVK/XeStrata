@@ -171,6 +171,13 @@ if(_strata_cudnn_frontend)   # compiled into the image engine
   install(FILES third_party/main/cudnn-frontend/LICENSE.txt
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cudnn-frontend)
 endif()
+if(_strata_kitchen)   # the module beside the engine
+  install(TARGETS strata_hip_kitchen LIBRARY DESTINATION ${_pkg_engine}/lib)   # where i8_gemm.cpp looks for it
+  install(FILES third_party/main/comfy-kitchen/LICENSE
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.comfy-kitchen)
+  install(FILES third_party/main/comfy-kitchen/NOTICE
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME NOTICE.comfy-kitchen)
+endif()
 if(_strata_cutlass)   # compiled into the engine
   install(FILES third_party/main/cutlass/LICENSE.txt
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cutlass)

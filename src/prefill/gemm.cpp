@@ -7,6 +7,7 @@
 // for.
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
@@ -35,6 +36,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 
@@ -461,7 +463,8 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
 }
 
-bool Gemm::i8_usable(void* stream) {
+// Whether oneMath's backend for `stream`'s GPU has int8 products (asked of it once, by a trial).
+static bool onemath_i8(void* stream) {
 #if STRATA_ONEMATH
     sycl::queue& q = core::Runtime::get().stream(stream);
     const Backend b = backend(q.get_device());
@@ -503,10 +506,17 @@ bool Gemm::i8_usable(void* stream) {
 #endif
 }
 
+bool Gemm::i8_usable(void* stream) { return onemath_i8(stream) || strata::kernels::i8_gemm_s32_ok(stream); }
+
 void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
               void* stream) {
-#if STRATA_ONEMATH
     if (T <= 0 || N <= 0) return;
+    if (!onemath_i8(stream)) {   // oneDNN's (Intel's GPUs in the free mode)
+        if (!strata::kernels::i8_gemm_s32(X, W, Y, T, N, K, ldy, stream))
+            throw std::runtime_error("an int8 product on a GPU no library takes it on");
+        return;
+    }
+#if STRATA_ONEMATH
     namespace om = oneapi::math;
     if (ldy <= 0) ldy = N;
     // one product of a batch (gemm_batch: oneMath's int8 product), the strides those of a whole matrix (oneMKL checks
@@ -514,8 +524,6 @@ void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N
     om::blas::column_major::gemm_batch(core::Runtime::get().stream(stream), om::transpose::trans,
                                        om::transpose::nontrans, N, T, K, 1.0f, W, K, N * K, X, K, T * K, 0.0f, Y, ldy,
                                        ldy * T, 1);
-#else
-    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) stream;
 #endif
 }
 

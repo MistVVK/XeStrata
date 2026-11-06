@@ -402,7 +402,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat）の `debian/rules` から写しました。
    - 画像のエンジンの注意の計算: [oneDNN](https://github.com/uxlfoundation/oneDNN)（Apache-2.0、Intel の GPU）、[AOTriton](https://github.com/ROCm/aotriton)（MIT、AMD の GPU）、
      [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、NVIDIA の GPU）。NVIDIA の GPU の int8 の積に
-     [CUTLASS](https://github.com/NVIDIA/cutlass)（BSD-3-Clause）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
+     [CUTLASS](https://github.com/NVIDIA/cutlass)（BSD-3-Clause）、AMD の GPU の int8 の積に [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen)（Apache-2.0）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
    - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。

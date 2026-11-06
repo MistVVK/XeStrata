@@ -22,4 +22,12 @@ bool i8_gemm_ok(void* stream);
 bool i8_gemm_bf16(const int8_t* X, const float* sx, const int8_t* W, const float* sw, const float* bias, uint16_t* Y,
                  int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream);
 
+/// Y [T][N] (int32 sums, row stride ldy, 0: N) = X [T][K] . W [N][K]^T through oneDNN, where its GPU engine takes
+/// `stream`'s GPU (Intel's): the int8 product prefill::Gemm::i8 takes where oneMath has none (the free mode); false
+/// (nothing written) where oneDNN does not take it.
+bool i8_gemm_s32(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                 void* stream);
+/// Whether i8_gemm_s32 takes `stream`'s GPU.
+bool i8_gemm_s32_ok(void* stream);
+
 }  // namespace strata::kernels

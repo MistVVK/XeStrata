@@ -1,0 +1,67 @@
+SPDX-FileCopyrightText: 2025 Comfy Org
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0
+
+wmma-bf16-operands: a change to comfy-kitchen v0.2.40 for intel/llvm's clang, applied by CMakeLists.txt.
+
+intel/llvm's clang declares the bf16 WMMA builtins with short vectors as their operands, where ROCm's clang takes
+__bf16 vectors: the fragments go to them bit-cast, the same bits.
+---
+diff --git a/comfy_kitchen/backends/hip/mma.h b/comfy_kitchen/backends/hip/mma.h
+index 3822e35..e4cacb1 100644
+--- a/comfy_kitchen/backends/hip/mma.h
++++ b/comfy_kitchen/backends/hip/mma.h
+@@ -1,5 +1,6 @@
+ // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
+ // SPDX-License-Identifier: Apache-2.0
++// Modified 2026 by MistVVK and the XeStrata contributors: the bf16 WMMA builtins' operands bit-cast to short vectors.
+ //
+ // WMMA policies for RDNA3 (gfx11) and RDNA4 (gfx12), wave32.
+ //
+@@ -46,6 +47,10 @@ typedef __bf16 v8bf __attribute__((ext_vector_type(8)));
+ typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
+ typedef _Float16 v8h __attribute__((ext_vector_type(8)));
+ typedef _Float16 v16h __attribute__((ext_vector_type(16)));
++// The bf16 WMMA builtins' operands as intel/llvm's clang declares them (short vectors; ROCm's clang takes __bf16
++// vectors): the same bits
++typedef short v8s __attribute__((ext_vector_type(8)));
++typedef short v16s __attribute__((ext_vector_type(16)));
+ 
+ constexpr int kWave = 32;
+ 
+@@ -249,7 +254,7 @@ struct MmaBf16 {
+     static __forceinline__ __device__ int frag_base(int lane) { return 8 * (lane / 16); }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+-        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
++        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(__builtin_bit_cast(v8s, a), __builtin_bit_cast(v8s, b), c);
+     }
+     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+ };
+@@ -287,7 +292,7 @@ struct MmaFp8 {
+     }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+-        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
++        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(v16s, a), __builtin_bit_cast(v16s, b), c);
+     }
+     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+ };
+@@ -302,7 +307,7 @@ struct MmaBf8 {
+     }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+-        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
++        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(v16s, a), __builtin_bit_cast(v16s, b), c);
+     }
+     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+ };
+@@ -360,7 +365,7 @@ struct MmaBf16 {
+     static __forceinline__ __device__ int frag_base(int) { return 0; }
+     static __forceinline__ __device__ Acc zero() { return Acc{0, 0, 0, 0, 0, 0, 0, 0}; }
+     static __forceinline__ __device__ Acc mma(Frag a, Frag b, Acc c) {
+-        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
++        return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(__builtin_bit_cast(v16s, a), __builtin_bit_cast(v16s, b), c);
+     }
+     static __forceinline__ __device__ float get(Acc c, int e) { return c[e]; }
+ };

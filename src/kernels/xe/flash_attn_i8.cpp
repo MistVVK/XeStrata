@@ -17,6 +17,9 @@
 #include "nv_mma.hpp"
 #include "device_target.hpp"
 
+#if STRATA_HIP_KITCHEN
+#include "hip_kitchen.hpp"
+#endif
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/dot_product.hpp>
 
@@ -1310,6 +1313,13 @@ bool flash_attn_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16
                    int64_t r0, int64_t first, uint16_t* out16, void* stream, const FlashAttnI8Stats* st) {
     if (T <= r0) return true;
     sycl::queue& q = core::Runtime::get().stream(stream);
+#if STRATA_HIP_KITCHEN
+    // comfy-kitchen's (AMD GPUs with WMMA): its own statistics (K smoothed by an anchor key, V's columns' scales)
+    if (hip_kitchen::attn(q, q16, k16, v16, T, heads, D, r0, first, out16)) {
+        if (!stream) q.wait();
+        return true;
+    }
+#endif
     if (!i8::run(q, q16, k16, v16, T, heads, r0, first, T, out16, st)) return false;
     if (!stream) q.wait();
     return true;
