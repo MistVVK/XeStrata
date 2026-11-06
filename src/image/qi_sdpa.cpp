@@ -14,6 +14,7 @@
 
 #include "qi_sdpa.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/matrix_report.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -89,6 +90,7 @@ AotFn aotriton_module() {
 #endif
 
 bool qi_sdpa_causal([[maybe_unused]] void* stream) {
+    if (kernels::no_xmx()) return false;   // as qi_sdpa
 #if STRATA_AOTRITON
     return core::Runtime::get().stream(stream).get_device().get_backend() == sycl::backend::ext_oneapi_hip &&
            aotriton_module() != nullptr;
@@ -100,6 +102,9 @@ bool qi_sdpa_causal([[maybe_unused]] void* stream) {
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
              int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal) {
     if (q1 <= q0) return true;
+    // every maker's kernel here runs on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with
+    // them) leaves the attention to the engine's own kernels, which take their paths without them
+    if (kernels::no_xmx()) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
     [[maybe_unused]] const sycl::backend be = q.get_device().get_backend();
 #if STRATA_AOTRITON

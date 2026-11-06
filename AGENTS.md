@@ -22,7 +22,7 @@ The shared parts are the attention (`flash_attn`), the products (`prefill::Gemm`
 They were made one so that a speed-up reaches every model at once.
 
 - A speed-up goes into the shared part, and it is on by default on every device that has what it needs: not an opt-in flag, and not one model's private copy.
-- Whether a path is taken is chosen from what the device reports (its matrix combinations, sub-group sizes, memory and the rest, as the first rule below says), never from the model's name or family. Which capabilities a path pays off on is settled by measuring on the three makers' GPUs while it is written, not by timing it on the user's machine at run time.
+- Each device takes its fastest path automatically, chosen from its capabilities (what it reports: its matrix combinations, sub-group sizes, memory and the rest, as the first rule below says), never from the model's name or family.
 - A model does not keep its own kernel for a role a shared part already has. A new model is built on the shared parts; a role they lack is added to them, so the other models can use it too.
 - Keep a separate implementation only when the shared one was measured slower for it, and say so with the numbers in a comment.
 - An opt-in (an environment variable, off by default) is only for a path that changes the answers beyond the models' checks, or one measured not faster on the three makers' GPUs; its comment says which.

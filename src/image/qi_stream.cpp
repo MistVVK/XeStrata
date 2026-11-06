@@ -358,10 +358,24 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
     if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
+    // straight from the file's pages where the streamed layers' measured choice is so (or STRATA_IMAGE_STREAM_SOURCE
+    // says file): through the relay, each layer's memcpy waited for the last one's DMA, and the GPU idled through it
+    // (MOSS-Image's text encoder's blocks made resident again for an edit on the RTX 4070: 1.2 of its 3.3 s,
+    // 2026-11-06)
+    bool from_file = source_ == Source::file;
+    if (!from_file) {
+        std::lock_guard<std::mutex> g(g_from_file_mu);
+        from_file = g_from_file == 1;
+    }
     std::lock_guard<std::mutex> lk(relay_mu_[0]);
-    gpu::event_sync(relay_free_[0]);
-    copy_spans(relay_[0], l.spans, l.bytes);
-    check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+    if (from_file) {
+        for (const Span& sp : l.spans)
+            check(gpu::copy_async(l.d + sp.offset, sp.host, sp.bytes, copy_), "a layer's copy");
+    } else {
+        gpu::event_sync(relay_free_[0]);
+        copy_spans(relay_[0], l.spans, l.bytes);
+        check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+    }
     check(gpu::event_record(relay_free_[0], copy_), "an event");
     // the compute stream waits for the copy where it uses the layer
     check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
