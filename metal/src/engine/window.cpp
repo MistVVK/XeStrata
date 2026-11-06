@@ -921,14 +921,23 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         }
     }
     ple_on_ = ss.ple.ready() && f_.find("blk.1.ple_key.weight") != nullptr;
-    if (ple_on_ && T("blk.1.ple_conv1d.weight").type == ref::F32) {
+    // ple_conv_add reads F16.  F32 (Unsloth's UD-IQ3_XXS and up, Q8_0) and BF16 (Unsloth's UD-IQ1_S / IQ1_M / Q2_0 /
+    // IQ2_XS / Q2_K_XL and their BF16 file) are narrowed here, as tools/iq_pack.py does for the host's pack; a BF16 tensor
+    // read as F16 gave garbage from the first token on Metal only (the CUDA / HIP / SYCL engines read the pack's copy)
+    if (ple_on_ && (T("blk.1.ple_conv1d.weight").type == ref::F32 || T("blk.1.ple_conv1d.weight").type == ref::BF16)) {
         const gguf::Tensor& k = T("blk.1.ple_conv1d.weight");
-        const size_t ne = k.bytes / 4;
+        const bool bf = k.type == ref::BF16;
+        const size_t ne = k.bytes / (bf ? 2 : 4);
         plekw_ = cx_->alloc((ne * 2 + 4095) / 4096 * 4096);
-        const float* src = (const float*) ((const uint8_t*) W_.ptr + k.offset);
+        const uint8_t* src = (const uint8_t*) W_.ptr + k.offset;
         uint16_t* dst = plekw_.as<uint16_t>();
-        for (size_t i = 0; i < ne; ++i) dst[i] = ref::f32_to_f16(src[i]);
+        for (size_t i = 0; i < ne; ++i)
+            dst[i] = ref::f32_to_f16(bf ? ref::bf16_to_f32(((const uint16_t*) src)[i]) : ((const float*) src)[i]);
         plekw_own_ = true;
+    } else if (ple_on_ && T("blk.1.ple_conv1d.weight").type != ref::F16) {
+        err = "metal window: blk.1.ple_conv1d.weight is type " + std::to_string(T("blk.1.ple_conv1d.weight").type) +
+              ": the Metal PLE conv reads F16 (F32 and BF16 are converted at load)";
+        return false;
     }
     ple_hist_.assign((size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM, 0.0f);
     last_norm_.assign((size_t) MAXT * strata::kernels::NG_HC_DIM, 0.0f);
