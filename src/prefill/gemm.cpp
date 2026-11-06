@@ -183,8 +183,25 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
 // chunk sizes (qkv 10240 x 2560 at 7.6 TFLOPS up to T 7040, 4.3 from T 7041); its SGEMM runs at 8.4-9.8 from T 512,
 // and for the engine's shapes upstream measured the same bits as the FP16 call.  That is the cuBLAS build's property,
 // so opt-in.  The copies are kept per queue and grown to the largest product (a few hundred MiB for the big ones).
-// f16's half_sums: the product with FP16 sums (oneMath's half GEMM; cuBLAS's HGEMM on NVIDIA GPUs, where GeForce cards
-// run it at twice the FP32 sums' rate) into a half buffer kept per queue and grown to the largest, then widened into Y.
+// The product with FP16 sums into FP16 rows Y16 (row stride ldy): oneMath's half GEMM (cuBLAS's HGEMM on NVIDIA GPUs,
+// where GeForce cards run it at twice the FP32 sums' rate); false where oneMath has none for the GPU, or it failed.
+bool half_out(const uint16_t* X, const uint16_t* W, uint16_t* Y16, int64_t T, int64_t N, int64_t K, int64_t ldy,
+              void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (!backend(q.get_device()).blas) return false;
+    try {
+        namespace om = oneapi::math;
+        om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K, sycl::half(1.0f),
+                                     reinterpret_cast<const sycl::half*>(W), K, reinterpret_cast<const sycl::half*>(X),
+                                     K, sycl::half(0.0f), reinterpret_cast<sycl::half*>(Y16), ldy);
+    } catch (const oneapi::math::exception& e) {
+        std::fprintf(stderr, "strata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
+        return false;
+    }
+    return true;
+}
+
+// f16's half_sums: half_out into a half buffer kept per queue and grown to the largest, then widened into Y.
 bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream) {
     sycl::queue& q = core::Runtime::get().stream(stream);
@@ -206,16 +223,7 @@ bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         }
         yh = c.p;
     }
-    if (yh == nullptr) return false;
-    try {
-        namespace om = oneapi::math;
-        om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K, sycl::half(1.0f),
-                                     reinterpret_cast<const sycl::half*>(W), K, reinterpret_cast<const sycl::half*>(X),
-                                     K, sycl::half(0.0f), yh, N);
-    } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "strata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
-        return false;
-    }
+    if (yh == nullptr || !half_out(X, W, reinterpret_cast<uint16_t*>(yh), T, N, K, N, stream)) return false;
     strata::kernels::for_rows_cols(q, T, N, [=](int64_t t, int64_t n) { Y[t * ldy + n] = (float) yh[t * N + n]; });
     return true;
 }
@@ -511,7 +519,10 @@ bool Gemm::i8_usable(void* stream) { return onemath_i8(stream) || strata::kernel
 void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
               void* stream) {
     if (T <= 0 || N <= 0) return;
-    if (!onemath_i8(stream)) {   // oneDNN's (Intel's GPUs in the free mode)
+    // oneDNN's where it takes the GPU (Intel's), in both modes: as fast as oneMKL's through oneMath or faster, the same
+    // sums (the B70, the image DiTs' shapes from 256 x 3072 x 3072 to 8230 x 16384 x 3072: 0.80 to 1.00 of its time,
+    // 2026-11-06), and the int8 products' one library there (its BF16 ones, kernels::i8_gemm_bf16, are oneDNN's)
+    if (strata::kernels::i8_gemm_s32_ok(stream) || !onemath_i8(stream)) {
         if (!strata::kernels::i8_gemm_s32(X, W, Y, T, N, K, ldy, stream))
             throw std::runtime_error("an int8 product on a GPU no library takes it on");
         return;
@@ -578,21 +589,21 @@ bool Gemm::native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, f
     return true;
 }
 
-void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy, bool half_sums) {
+// W's FP16 rows for prod(w16, r0, n) (rows r0 .. r0 + n - 1 of W): as they are for F16 rows, else dequantized into the
+// scratch, at once or in row slices, on the side stream with STRATA_DEQUANT_SIDE
+template<class F> void Gemm::with_f16(int ggml_type, const void* W_blocks, int64_t N, int64_t K, F prod) {
     if (ggml_type == 1) {   // F16 rows (an F16 GGUF's, Anima's Qwen3-0.6B-Base): the product takes them as they are
-        f16(X, static_cast<const uint16_t*>(W_blocks), Y, T, N, K, ldy, half_sums);
+        prod(static_cast<const uint16_t*>(W_blocks), 0, N);
         return;
     }
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices (of 16 rows, so every slice's Y stays 64-byte aligned).
         const int64_t rows = scratch_elems_ / K / 16 * 16;
         if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
-        if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy, half_sums);
+            prod(scratch_, r0, n);
         }
         // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
         if (side_scratch_) strata::gpu::event_record(side_free_[0], stream_);
@@ -609,13 +620,41 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
         strata::gpu::event_record(side_ready_[side_cur_], side_stream_);
         strata::gpu::stream_wait_event(stream_, side_ready_[side_cur_]);
-        f16(X, s, Y, T, N, K, ldy, half_sums);
+        prod(s, 0, N);
         strata::gpu::event_record(side_free_[side_cur_], stream_);
         side_cur_ ^= 1;
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy, half_sums);
+    prod(scratch_, 0, N);
+}
+
+void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
+                  int64_t ldy, bool half_sums) {
+    if (ldy <= 0) ldy = N;
+    with_f16(ggml_type, W_blocks, N, K, [&](const uint16_t* w, int64_t r0, int64_t n) {
+        f16(X, w, Y + r0, T, n, K, ldy, half_sums);
+    });
+}
+
+bool Gemm::half_ok(void* stream) {
+#if STRATA_ONEMATH
+    return backend(core::Runtime::get().stream(stream).get_device()).blas;
+#else
+    (void) stream;
+    return false;
+#endif
+}
+
+void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
+                       int64_t K, int64_t ldy) {
+    if (ldy <= 0) ldy = N;
+    with_f16(ggml_type, W_blocks, N, K, [&](const uint16_t* w, int64_t r0, int64_t n) {
+#if STRATA_ONEMATH
+        if (half_out(X, w, Y16 + r0, T, n, K, ldy, stream_)) return;
+#endif
+        throw std::runtime_error("prefill gemm: an FP16 product into FP16 rows on a GPU oneMath has none for");
+    });
 }
 
 }  // namespace strata::prefill

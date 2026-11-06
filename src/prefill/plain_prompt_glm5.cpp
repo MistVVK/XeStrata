@@ -124,6 +124,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
             float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * kHC * N : nullptr;
+            if (first()) embed_ahead(tokens + c0, T);
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
                 if (tok < 0 || tok >= n_vocab_ ||

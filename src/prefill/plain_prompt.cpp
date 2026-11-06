@@ -1035,6 +1035,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * N : nullptr;
             // the chunk's inputs: embedding rows (a later stage: the rows handed on), per-token step counts and rotary
             // positions
+            if (first()) embed_ahead(tokens + c0, T);
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
                 if (tok < 0 || tok >= n_vocab_ || (first() && !embed(tok, p0 + t, P.emb + t * N))) {
@@ -1066,6 +1067,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // its sums in FP16 where that was measured faster (a norm's rows keep them in FP16's range)
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
                 if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy, dense_half_sums_);
+            };
+            // the products whose sums are read once, by the residual's add or the SwiGLU, in FP16 as they come where
+            // their FP16 sums are taken (not widened into FP32 first: a pass over every sum, the RTX 4070's Qwen3.5-9B
+            // prompt 75 ms of 1.0 s at 4K, 2026-11-07); y16 in the FP32 buffer's room
+            const bool half_rows = dense_half_sums_ && !hooked && T >= dense_native_rows_ && gm.half_ok(cs);
+            auto proj_h = [&](const W& w, void* y) {
+                gm.native_half(P.x16, w.type, w.data, static_cast<uint16_t*>(y), T, w.n_out, w.n_in);
             };
             // the last token's logits, by the decode's head (an encoder's chunks write their rows instead, below)
             auto last_logits = [&] {
@@ -1156,9 +1164,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     part(8);
                     // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8; normed,
                     // its sums in FP16 as proj_hn's)
-                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
-                              dense_half_sums_);
-                    hook(ProductHook::kSsmOut, b.ssm_out, P.y16, P.mix);
+                    if (half_rows) {
+                        gm.native_half(P.y16, b.ssm_out.type, b.ssm_out.data, reinterpret_cast<uint16_t*>(P.mix), T,
+                                       b.ssm_out.n_out, b.ssm_out.n_in);
+                    } else {
+                        gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
+                                  dense_half_sums_);
+                        hook(ProductHook::kSsmOut, b.ssm_out, P.y16, P.mix);
+                    }
                     part(9);
                 } else {
                     const int64_t a = b.attn;
@@ -1207,18 +1220,34 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         k::native_qsa_gate_apply(P.attn, P.qfull, P.attn32, (int) (T * NH), (int) HD, cs);
                         ao = P.attn32;
                     }
-                    if (!dense(b.o, ao, NH * HD, P.mix, T)) {
+                    if (half_rows) {
+                        f16(ao, T, NH * HD);
+                        proj_h(b.o, P.mix);
+                    } else if (!dense(b.o, ao, NH * HD, P.mix, T)) {
                         f16(ao, T, NH * HD);
                         proj(b.o, P.mix, T, 0, dense_half_sums_);   // averages of V's rows: in FP16's range as well
                         hook(ProductHook::kO, b.o, P.x16, P.mix);
                     }
                 }
-                k::add_inplace(P.x, P.mix, T * N, cs);
+                if (half_rows) prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.mix), T * N, cs);
+                else k::add_inplace(P.x, P.mix, T * N, cs);
                 mark(b.recurrent ? 0 : 4, t_mark);
 
                 if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
                     k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
                     f16(P.hn, T, N);
+                    if (half_rows) {   // gate, up, the SwiGLU and down's sums for the residual all in FP16
+                        proj_h(b.sh_gate, P.sh_gate);
+                        proj_h(b.sh_up, P.sh_up);
+                        prefill::swiglu_pair_h(reinterpret_cast<const uint16_t*>(P.sh_gate),
+                                               reinterpret_cast<const uint16_t*>(P.sh_up), P.x16, T, cs, FS);
+                        proj_h(b.sh_down, P.moe_out);
+                        prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.moe_out), T * N, cs);
+                        steer(b, T, P.x, cs);
+                        mark(3, t_mark);
+                        if (!is_mtp) unbind_block(l);
+                        continue;
+                    }
                     proj_hn(b.sh_gate, P.sh_gate);
                     proj_hn(b.sh_up, P.sh_up);
                     hook(ProductHook::kGate, b.sh_gate, P.x16, P.sh_gate);

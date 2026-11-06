@@ -999,6 +999,17 @@ void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void*
         h16[r * width + c] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[at]);
     });
 }
+void swiglu_pair_h(const uint16_t* g16, const uint16_t* u16, uint16_t* h16, int64_t n, void* stream, int64_t width) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
+        const float a = kernels::f32_from_f16(g16[i]);
+        h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * kernels::f32_from_f16(u16[i]));
+    });
+}
+void add_h(float* x, const uint16_t* y16, int64_t n, void* stream) {
+    if (n <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { x[i] += kernels::f32_from_f16(y16[i]); });
+}
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream) {
     if (n <= 0) return;
     const int64_t per = width / 8;   // 16-byte units, 8 values each

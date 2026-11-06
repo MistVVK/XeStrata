@@ -74,6 +74,10 @@ void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream)
 /// h16's width apart
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width = 640,
                  int64_t ld = 0);
+/// swiglu_pair from FP16 g and u (Gemm::native_half's sums), n rows of `width` each, h16's too.
+void swiglu_pair_h(const uint16_t* g16, const uint16_t* u16, uint16_t* h16, int64_t n, void* stream, int64_t width);
+/// x[i] += y16[i] for n values, y16 FP16 sums (Gemm::native_half's): the residual's add without widening them first.
+void add_h(float* x, const uint16_t* y16, int64_t n, void* stream);
 /// Gather rows: dst16[i, :] = x16[src[i], :] (n rows of `width` BF16).
 void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int64_t n, int64_t width, void* stream);
 /// Gather rows: dst[i, :] = x[src[i], :] (n rows of `width` floats).

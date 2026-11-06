@@ -58,6 +58,12 @@ public:
     /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
+    /// native with FP16 sums into FP16 rows Y16 (row stride ldy), not widened into FP32: the reader takes them as they
+    /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Only where half_ok says yes.
+    void native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
+                     int64_t K, int64_t ldy = 0);
+    /// Whether `stream`'s GPU takes native_half (oneMath's half GEMM).
+    static bool half_ok(void* stream);
     /// The products' warm-up, shared by the models: native() once a shape (type, N x K, ldy) a GPU in the process -
     /// a library's first product of a shape loads its kernels for it (rocBLAS on the RX 9060 XT: 0.5 s for the
     /// first product, 0.9 s more for the first of 32 rows) - on X's rows of zeros into a buffer the caller
@@ -91,6 +97,7 @@ public:
     void* stream() const { return stream_; }
 
 private:
+    template<class F> void with_f16(int ggml_type, const void* W_blocks, int64_t N, int64_t K, F prod);
     bool bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 
     void* stream_ = nullptr;

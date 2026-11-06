@@ -2134,6 +2134,17 @@ bool PlainModel::embed(int32_t tok, int64_t pos, float* dst) const {
     return k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, dst, spec_.n_embd);
 }
 
+// The rows' pages read ahead (platform::advise_willneed: the system's read-ahead, every row's asked at once, read in
+// parallel): a prompt's rows that are not in the page cache otherwise come from the disk one fault at a time as embed
+// reads them (the B70, whose weights' upload left the mapping's pages uncached: 2694 major faults, 452 ms of a 4K
+// prompt's 1.30 s, Qwen3.5-9B; the RTX 4070's 12 ms, 2026-11-07)
+void PlainModel::embed_ahead(const int32_t* tokens, int64_t n) const {
+    if (emb_ == nullptr || emb_row_ == 0) return;
+    for (int64_t t = 0; t < n; ++t)
+        if (tokens[t] >= 0 && tokens[t] < n_vocab_)
+            strata::platform::advise_willneed(emb_ + (size_t) tokens[t] * emb_row_, emb_row_);
+}
+
 void PlainModel::set_sampler(const strata::kernels::SamplerParams& sp) {
     sampler_ = sp;
     for (auto& st : next_) st->sampler_ = sp;

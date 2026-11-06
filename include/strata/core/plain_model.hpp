@@ -883,6 +883,8 @@ private:
     /// The embedding of token `tok` at position `pos` into `dst` (n_embd floats): a picture's row there, else the
     /// token's; false for a token outside the vocabulary or a row the host cannot dequantize
     bool embed(int32_t tok, int64_t pos, float* dst) const;
+    /// The embedding rows of `n` tokens asked of the system ahead, all at once, before embed reads them one at a time
+    void embed_ahead(const int32_t* tokens, int64_t n) const;
     /// token_embd.weight's place in the mapping and its row format, for `embed` (every model's load)
     bool load_embedding(std::string& err);
     int32_t* mrope_ = nullptr;       ///< --vision: the cells' (t, h, w), device [max_cells][3]
