@@ -90,8 +90,10 @@ carries (NCSA, Copyright (c) 2014-2016 Advanced Micro Devices, Inc.), stb_image'
 Barrett), which the image engine is compiled with, oneDNN's library for Intel GPUs (Apache-2.0, Copyright Intel
 Corporation, with the third-party programs its THIRD-PARTY-PROGRAMS lists), AOTriton's library and kernels' images for
 AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
-(Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes and cuDNN
-Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with.
+(Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes, cuDNN
+Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with,
+and CUTLASS (BSD-3-Clause, Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES), which the engine's int8
+products for NVIDIA GPUs are compiled with.
 The engine in the contrib-llvm packages is compiled with NVIDIA's CUDA Toolkit, and its code for NVIDIA GPUs can contain
 parts of NVIDIA's libdevice; those parts are NVIDIA's, distributed under the NVIDIA CUDA Toolkit End User License
 Agreement.

@@ -171,6 +171,10 @@ if(_strata_cudnn_frontend)   # compiled into the image engine
   install(FILES third_party/main/cudnn-frontend/LICENSE.txt
           DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cudnn-frontend)
 endif()
+if(_strata_cutlass)   # compiled into the engine
+  install(FILES third_party/main/cutlass/LICENSE.txt
+          DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.cutlass)
+endif()
 install(FILES NOTICE COPYING COPYING.LESSER DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME})
 
 # ---- the program

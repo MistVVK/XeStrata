@@ -42,6 +42,7 @@
 #include "strata/image/guidance.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
@@ -78,13 +79,16 @@ struct AltRows {
 
 /// A product's output [T][C] as its readers take it: FP32 sums (f) times the rows' scales (rs, null: 1), or a W8A8
 /// product's int32 sums (i) times the activations' scales (sx, a row) and the weights' (sw, a column); plus the bias
-/// (b, null: none).
+/// (b, null: none).  Or a W8A8 product's values as they are (bf, BF16: kernels::i8_gemm_bf16 scaled them and added
+/// the bias), half the bytes of the sums.
 struct MfOut {
     const float* f = nullptr;
     const int32_t* i = nullptr;
     const float *rs = nullptr, *sx = nullptr, *sw = nullptr, *b = nullptr;
     int64_t C = 0;
+    const uint16_t* bf = nullptr;
     float at(int64_t t, int64_t c) const {
+        if (bf != nullptr) return kernels::f32_from_bf16(bf[t * C + c]);
         const float v = i != nullptr ? (float) i[t * C + c] * sx[t] * sw[c]
                                      : (rs != nullptr ? f[t * C + c] * rs[t] : f[t * C + c]);
         return b != nullptr ? v + b[c] : v;
@@ -92,6 +96,7 @@ struct MfOut {
     /// at(t, c0 + d) as r(d), the row's offsets taken once (the per-head kernels' reads: qk_norm_rope.hpp)
     auto row(int64_t t, int64_t c0) const {
         const int64_t o = t * C + c0;
+        const uint16_t* bp16 = bf != nullptr ? bf + o : nullptr;
         const int32_t* ip = i != nullptr ? i + o : nullptr;
         const float* fp = f != nullptr ? f + o : nullptr;
         const float sxt = i != nullptr ? sx[t] : 0.f, rst = rs != nullptr ? rs[t] : 1.f;
@@ -99,12 +104,18 @@ struct MfOut {
         const float* bp = b != nullptr ? b + c0 : nullptr;
         const bool scaled = rs != nullptr;
         return [=](int64_t d) {
+            if (bp16 != nullptr) return kernels::f32_from_bf16(bp16[d]);
             const float v = ip != nullptr ? (float) ip[d] * sxt * swp[d] : (scaled ? fp[d] * rst : fp[d]);
             return bp != nullptr ? v + bp[d] : v;
         };
     }
     /// at(t, c + p) for p below W, read W side by side (c and C multiples of W)
     template<int W> void at_w(int64_t t, int64_t c, float* o) const {
+        if (bf != nullptr) {
+            const Packed<uint16_t, W> hv = *reinterpret_cast<const Packed<uint16_t, W>*>(bf + t * C + c);
+            for (int p = 0; p < W; ++p) o[p] = kernels::f32_from_bf16(hv.v[p]);
+            return;
+        }
         if (i != nullptr) {
             const Packed<int32_t, W> iv = *reinterpret_cast<const Packed<int32_t, W>*>(i + t * C + c);
             const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(sw + c);
@@ -125,6 +136,7 @@ struct MfOut {
         MfOut o = *this;
         if (f != nullptr) o.f += r * C;
         if (i != nullptr) o.i += r * C;
+        if (bf != nullptr) o.bf += r * C;
         if (rs != nullptr) o.rs += r;
         if (sx != nullptr) o.sx += r;
         return o;

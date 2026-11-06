@@ -539,7 +539,9 @@ struct Kernel {
 // multiple), and P's bytes are packed with prmt.  A step that ends before the segment's last key takes no masks.
 // A warp 16 queries and a work-group 8 warps: 3.7 ms on the RTX 4070 for 4400 rows of 32 heads (3.9 before the FMA
 // and the packing) against 4.4 with 32 queries and 4 warps (both at 255 registers; bounded to 128 for two work-groups
-// an SM, they spilled: 4.9 ms)
+// an SM, they spilled: 4.9 ms).  P at a fixed scale (127 exp(s - m), m the maximum so far, as SageAttention's) with
+// the sums kept in int32 across steps took only 3% off (2.55 to 2.48 ms, 4115 rows of 32 heads, 2026-11-06), and long
+// rows' many small probabilities lost too much in int8 (3 times qi_attn_parity's bound at 8192 keys)
 constexpr int NQ = 1;             // query tiles of 16 a warp
 constexpr int NNW = 8;            // warps a work-group
 constexpr int SC = 1;             // the layout's chunks a step

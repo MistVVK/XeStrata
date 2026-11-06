@@ -115,6 +115,8 @@ COMPONENTS = [
      ["app/engine/dnnl.dll"]),
     ("cuDNN Frontend (compiled into strata-image.exe)", "1.31.0", "Apache-2.0 (parts MIT)",
      "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
+    ("CUTLASS (compiled into the engine)", "4.2.1", "BSD-3-Clause", "https://github.com/NVIDIA/cutlass",
+     ["src:third_party/main/cutlass/LICENSE.txt"], []),
     ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
     ("libjxl's cjxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, libwebp and "

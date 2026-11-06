@@ -11,6 +11,7 @@
 #include "strata/image/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -625,12 +626,20 @@ void Seedvr2Dit::ensure(int64_t h, int64_t w) {
 }
 
 MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
-                              int64_t T, const float* bias) {
+                              int64_t T, const float* bias, bool bf16) {
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {   // input's int8 rows (xq8_ and their scales xs_in_) against the file's
+        // a reader's values as BF16 where the GPU takes such a product (kernels::i8_gemm_bf16): half the bytes it reads
+        const auto* sw = reinterpret_cast<const float*>(base + w.sw);
+        if (bf16 && kernels::i8_gemm_bf16(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias,
+                                        reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+            MfOut o;
+            o.C = w.n;
+            o.bf = reinterpret_cast<const uint16_t*>(y);
+            return o;
+        }
         prefill::Gemm::i8(xq8_, reinterpret_cast<const int8_t*>(d), reinterpret_cast<int32_t*>(y), T, w.n, w.k, w.n, s_);
-        return MfOut{nullptr, reinterpret_cast<const int32_t*>(y), nullptr, xs_in_,
-                     reinterpret_cast<const float*>(base + w.sw), bias, w.n};
+        return MfOut{nullptr, reinterpret_cast<const int32_t*>(y), nullptr, xs_in_, sw, bias, w.n};
     }
     if (w.type == kTypeQ8_0) gemm_.native(x16, kTypeQ8_0, d, y, T, w.n, w.k);
     else gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
@@ -639,7 +648,7 @@ MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, 
 
 void Seedvr2Dit::product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                          const float* bias) {
-    const MfOut o = product_out(x16, rs, w, base, y, T, bias);
+    const MfOut o = product_out(x16, rs, w, base, y, T, bias, false);
     if (o.i != nullptr) image::qi_i8_scale(y, T, w.n, w.n, o.sx, o.sw, bias, nullptr, s_);
     else if (rs != nullptr || bias != nullptr) rows::rows_back(y, rs, bias, T, w.n, s_);
 }
@@ -721,6 +730,7 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
             MfOut p = o;
             if (p.f != nullptr) p.f += k * C;
             if (p.i != nullptr) p.i += k * C;
+            if (p.bf != nullptr) p.bf += k * C;
             if (p.sw != nullptr) p.sw += k * C;
             if (p.b != nullptr) p.b += k * C;
             return p;

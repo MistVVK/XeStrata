@@ -12,6 +12,7 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -548,9 +549,16 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
         if (!same_input) xs_next_ ^= 1;
         float* sx = scales + xs_next_ * xq8_rows_;
         if (!same_input) qi_rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
+        const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
+        // a reader's values as BF16 where the GPU takes such a product (kernels::i8_gemm_bf16): half the bytes it reads
+        if (defer && kernels::i8_gemm_bf16(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias,
+                                              reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+            out.f = nullptr;
+            out.bf = reinterpret_cast<const uint16_t*>(y);
+            return out;
+        }
         prefill::Gemm::i8(xq8_, reinterpret_cast<const int8_t*>(d), reinterpret_cast<int32_t*>(y), T, w.n, w.k, w.n,
                           s_);
-        const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
         if (defer) {
             out.f = nullptr;
             out.i = reinterpret_cast<const int32_t*>(y);
@@ -1335,10 +1343,12 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
                 gate_add_rows(x + m0 * C, d, gate_f, rr.from(m0), mr, C, s_);
                 continue;
             }
-            // left to the next block's first kernel, the weights' scales copied out of the block's region (the
-            // stream may refill it before then)
-            gpu::copy_async(pend_sw_, d.sw, (size_t) C * 4, s_);
-            d.sw = pend_sw_;
+            // left to the next block's first kernel, int32 sums' weights' scales copied out of the block's region (the
+            // stream may refill it before then; BF16 values carry none)
+            if (d.sw != nullptr) {
+                gpu::copy_async(pend_sw_, d.sw, (size_t) C * 4, s_);
+                d.sw = pend_sw_;
+            }
             pend_ = {d, gate_f, x, R, rr};
             continue;
         }

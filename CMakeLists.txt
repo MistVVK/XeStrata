@@ -407,6 +407,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/flash_attn.cpp src/kernels/xe/flash_attn_i8.cpp
+                                    src/kernels/xe/i8_gemm.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
                                     src/kernels/xe/draft_head.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
@@ -414,6 +415,110 @@ if(STRATA_ENABLE_XE)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
   # Packed embeddings require separate multiply/add rounding; parity also checks signed zero.
   target_compile_options(strata_kernels PRIVATE -fno-fast-math -ffp-contract=off)
+  # NVIDIA GPUs from sm_80 on (contrib-llvm): i8_gemm's product (int8 sums scaled into BF16) through CUTLASS
+  # (BSD-3-Clause, header-only, the tag pinned here; third_party/main/cutlass), src/kernels/cuda/i8_gemm_cutlass.cu.
+  # The SYCL compiler builds it as CUDA, never nvcc: the device side alone into each architecture's code, embedded in
+  # the program (i8_gemm_cutlass_images.cpp) and loaded through NVIDIA's driver; the host side alone into the
+  # kernel's parameters, with no CUDA runtime to link.  The CUDA headers are the toolkit's (on Windows the cross
+  # build's) ahead of a distribution's in /usr/include, and CUTLASS reads their version from the macros nvcc defines, as
+  # its own CMake gives clang (without them its tensor-op instructions compile to nothing).
+  if(_strata_cuda_archs AND STRATA_LICENSE STREQUAL "contrib")
+    set(_strata_cutlass_sm "")
+    foreach(arch IN LISTS _strata_cuda_archs)
+      if(arch MATCHES "^sm_([0-9]+)" AND CMAKE_MATCH_1 GREATER_EQUAL 80)
+        list(APPEND _strata_cutlass_sm ${CMAKE_MATCH_1})
+      endif()
+    endforeach()
+    set(_strata_cutlass_inc "${_strata_cuda_root}/include")
+    if(WIN32 AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/include/cuda.h")
+      set(_strata_cutlass_inc "${STRATA_CUDA_WINDOWS_LIBS}/include")
+    endif()
+    set(_strata_cutlass_ver "")
+    if(EXISTS "${_strata_cutlass_inc}/cuda.h")
+      file(STRINGS "${_strata_cutlass_inc}/cuda.h" _strata_cutlass_ver REGEX "^#define CUDA_VERSION [0-9]+")
+    endif()
+    if(_strata_cutlass_sm AND _strata_cutlass_ver MATCHES "([0-9]+)$")
+      math(EXPR _strata_cutlass_major "${CMAKE_MATCH_1} / 1000")
+      math(EXPR _strata_cutlass_minor "(${CMAKE_MATCH_1} % 1000) / 10")
+      include(FetchContent)
+      FetchContent_Populate(strata_cutlass QUIET
+        URL https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.2.1.tar.gz
+        URL_HASH SHA256=a4513ba33ae82fd754843c6d8437bee1ac71a6ef1c74df886de2338e3917d4df
+        DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cutlass-src
+        SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cutlass-subbuild)
+      list(SORT _strata_cutlass_sm COMPARE NATURAL)
+      list(GET _strata_cutlass_sm 0 _strata_cutlass_oldest)
+      separate_arguments(_strata_cutlass_flags NATIVE_COMMAND "${CMAKE_CXX_FLAGS}")   # a cross build's roots
+      if(CMAKE_CXX_COMPILER_TARGET)
+        list(APPEND _strata_cutlass_flags --target=${CMAKE_CXX_COMPILER_TARGET})
+      endif()
+      if(WIN32)
+        # MSVC's ABI: CUTLASS's 128-bit integers as clang's own, not MSVC's intrinsics (clang lacks _udiv128); and
+        # libcu++ told the objects are COFF's in the device compile too, whose nvptx target says ELF (else it asks
+        # alignments COFF does not take)
+        list(APPEND _strata_cutlass_flags -DCUTLASS_UINT128_NATIVE -D_LIBCUDACXX_OBJECT_FORMAT_COFF=1)
+      else()
+        list(APPEND _strata_cutlass_flags -fPIC)
+      endif()
+      list(APPEND _strata_cutlass_flags -x cuda ${_strata_cuda_base_opts} -std=c++17 -O3 -w -DNDEBUG
+           -D__CUDACC_VER_MAJOR__=${_strata_cutlass_major} -D__CUDACC_VER_MINOR__=${_strata_cutlass_minor}
+           -isystem ${_strata_cutlass_inc}/cccl)
+      # a distribution's toolkit has its headers in the compiler's own /usr/include: named again with -isystem it moves
+      # ahead of libstdc++'s, whose <cmath> then finds no <math.h> with #include_next (Ubuntu's CUDA 12.4)
+      if(NOT _strata_cutlass_inc IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES)
+        list(APPEND _strata_cutlass_flags -isystem ${_strata_cutlass_inc})
+      endif()
+      list(APPEND _strata_cutlass_flags -I${strata_cutlass_SOURCE_DIR}/include -I${CMAKE_SOURCE_DIR}/src/kernels/cuda)
+      set(_strata_cutlass_src ${CMAKE_SOURCE_DIR}/src/kernels/cuda/i8_gemm_cutlass.cu)
+      set(_strata_cutlass_hdr ${CMAKE_SOURCE_DIR}/src/kernels/cuda/i8_gemm_cutlass.hpp)
+      set(_strata_cutlass_dir ${CMAKE_BINARY_DIR}/cutlass)
+      file(MAKE_DIRECTORY ${_strata_cutlass_dir})
+      # each architecture's code, and the oldest one's PTX for newer GPUs (their driver compiles it), written into
+      # i8_gemm_cutlass_images.cpp by cmake/StrataEmbed.cmake
+      set(_strata_cutlass_images "")
+      set(_strata_cutlass_sms "")
+      set(_strata_cutlass_ptx "")
+      foreach(sm IN LISTS _strata_cutlass_sm ITEMS ptx)
+        if(sm STREQUAL "ptx")
+          set(_out ${_strata_cutlass_dir}/i8_gemm_sm_${_strata_cutlass_oldest}.ptx)
+          set(_mode -S --cuda-gpu-arch=sm_${_strata_cutlass_oldest})
+          list(APPEND _strata_cutlass_sms ${_strata_cutlass_oldest})
+          list(APPEND _strata_cutlass_ptx true)
+        else()
+          set(_out ${_strata_cutlass_dir}/i8_gemm_sm_${sm}.cubin)
+          set(_mode -c --cuda-gpu-arch=sm_${sm})
+          list(APPEND _strata_cutlass_sms ${sm})
+          list(APPEND _strata_cutlass_ptx false)
+        endif()
+        add_custom_command(OUTPUT ${_out}
+          COMMAND ${CMAKE_CXX_COMPILER} ${_strata_cutlass_flags} --cuda-device-only ${_mode} ${_strata_cutlass_src}
+                  -o ${_out}
+          DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr}
+          COMMENT "CUTLASS's int8 product for NVIDIA ${sm}" VERBATIM)
+        list(APPEND _strata_cutlass_images ${_out})
+      endforeach()
+      list(JOIN _strata_cutlass_images "," _strata_cutlass_list)
+      list(JOIN _strata_cutlass_sms "," _strata_cutlass_sms)
+      list(JOIN _strata_cutlass_ptx "," _strata_cutlass_ptx)
+      add_custom_command(OUTPUT ${_strata_cutlass_dir}/i8_gemm_cutlass_images.cpp
+        COMMAND ${CMAKE_COMMAND} -DOUT=${_strata_cutlass_dir}/i8_gemm_cutlass_images.cpp
+                -DIMAGES=${_strata_cutlass_list} -DSMS=${_strata_cutlass_sms} -DPTXS=${_strata_cutlass_ptx}
+                -P ${CMAKE_SOURCE_DIR}/cmake/StrataEmbed.cmake
+        DEPENDS ${_strata_cutlass_images} ${CMAKE_SOURCE_DIR}/cmake/StrataEmbed.cmake
+        COMMENT "CUTLASS's int8 product: its code into the program" VERBATIM)
+      set(_strata_cutlass_host ${_strata_cutlass_dir}/i8_gemm_cutlass_host${CMAKE_CXX_OUTPUT_EXTENSION})
+      add_custom_command(OUTPUT ${_strata_cutlass_host}
+        COMMAND ${CMAKE_CXX_COMPILER} ${_strata_cutlass_flags} --cuda-host-only
+                --cuda-gpu-arch=sm_${_strata_cutlass_oldest} -c ${_strata_cutlass_src} -o ${_strata_cutlass_host}
+        DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr}
+        COMMENT "CUTLASS's int8 product: its parameters" VERBATIM)
+      target_sources(strata_kernels PRIVATE ${_strata_cutlass_dir}/i8_gemm_cutlass_images.cpp ${_strata_cutlass_host})
+      set_source_files_properties(${_strata_cutlass_host} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
+      target_include_directories(strata_kernels PRIVATE src/kernels/cuda)
+      set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUTLASS=1)
+      set(_strata_cutlass ON)   # its license text goes with the packages
+    endif()
+  endif()
 
   # ---- strata_engine (P2.S5): the composed layer, the session loop, the expert sources and caches, the
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
@@ -989,6 +1094,12 @@ if(STRATA_ENABLE_XE)
   add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
   target_link_libraries(qi_attn_parity PRIVATE strata_image)
   add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
+  # kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs) against the library's int8 product, every value of the
+  # image models' product shapes (skipped where the GPU takes no such kernel)
+  add_executable(i8_gemm_parity src/kernels/xe/i8_gemm_parity.cpp)
+  target_link_libraries(i8_gemm_parity PRIVATE strata_image)
+  add_test(NAME i8_gemm_parity COMMAND i8_gemm_parity)
+  set_tests_properties(i8_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-seedvr2-probe src/upscale/seedvr2_probe.cpp)

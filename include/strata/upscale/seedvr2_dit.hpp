@@ -106,9 +106,9 @@ private:
     void product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                  const float* bias);
     // the same product as its reader takes it, the rows' scales and the bias not applied (y FP32, or W8A8's int32 sums
-    // with their input's scales xs_in_ and the weights')
+    // with their input's scales xs_in_ and the weights'; with bf16 W8A8's values as BF16 where the GPU makes them)
     image::MfOut product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
-                             int64_t T, const float* bias);
+                             int64_t T, const float* bias, bool bf16 = true);
     float* next_xs();   // W8A8: the other of xs_ and xs2_, made xs_in_ (the next int8 rows' scales)
     // a product's input rows by the weights' form: FP16 rows (op16, into y16 with their scales rs), W8A8's int8 rows
     // (opi8), or the FP16 rows rotated for Q8_0 -> the FP16 rows' pointer (null for W8A8)

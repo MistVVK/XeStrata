@@ -421,7 +421,8 @@ permission under GPL section 7, what goes in, and how to report).
      their build is given are transcribed from the `debian/rules` of Debian's
      [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat);
    - the image engine's attention: [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs)
-     and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
+     and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs); the int8 products on NVIDIA GPUs,
+     [CUTLASS](https://github.com/NVIDIA/cutlass) (BSD-3-Clause); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
    - [quantscope](https://github.com/1872183316/quantscope) (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with;
    - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1);
    - [KaTeX](https://katex.org/) (MIT), which draws the math in the chat.
