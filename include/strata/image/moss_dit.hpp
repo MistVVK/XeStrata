@@ -149,11 +149,11 @@ public:
     }
     void drop_activations();
 
-    /// The rows of context 0 after block 0 and the text embedder's rows of context 0 (device FP32 [h w + rows][C],
-    /// [rows][C]), for the probe (kept when keep_block0(true)).
+    /// The rows of context 0 after block 0 and the text embedder's rows of context 0 (device BF16 [h w + rows][C],
+    /// [rows][C]: the residual stream's form), for the probe (kept when keep_block0(true)).
     void keep_block0(bool on) { keep0_ = on; }
-    const float* block0() const { return b0_; }
-    const float* text_rows(int i) const { return ctx_[i].txt0; }
+    const uint16_t* block0() const { return b0_; }
+    const uint16_t* text_rows(int i) const { return ctx_[i].txt0; }
 
     /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
     /// of the entry they are (the text embedder's fused qkv is three weights on the GPU: q takes the entry's rows
@@ -211,7 +211,7 @@ private:
     };
     struct Ctx {
         int64_t rows = 0;
-        float* txt0 = nullptr;   // [rows][C]: the text embedder's output
+        uint16_t* txt0 = nullptr;   // [rows][C]: the text embedder's output (BF16)
         std::vector<int> skip;
         // the RoPE's tables of the context's rows, [h w + rows][64] (for the size they were made for)
         float *cos = nullptr, *sin = nullptr;
@@ -239,7 +239,7 @@ private:
     // a block over x's rows, its segments' (a context each, its attention among its own rows) one after the other:
     // w q, k, v, o, up_gate, down; bias (null: none) theirs; mod null (the text embedder's blocks): no time
     void run_block(const W* const* w, const float* const* bias, const float* n1, const float* n2, const float* nq,
-                   const float* nk, const uint8_t* base, const float* mod, float* x, const std::vector<int64_t>& seg,
+                   const float* nk, const uint8_t* base, const float* mod, uint16_t* x, const std::vector<int64_t>& seg,
                    const std::vector<const float*>& cos, const std::vector<const float*>& sin);
 
     struct Shards;
@@ -294,7 +294,10 @@ private:
     };
     Rows rows_for(int64_t hw, int n, int64_t max_text, int64_t ref_rows, bool ref_i8) const;
     int64_t dirty_[2] = {0, 0};   // the rows of each attention slot (jq16_ ...) that may not be zero
-    float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *gu_ = nullptr,
+    // x_: the residual stream, BF16 as ComfyUI keeps it (the RMS norms read and write it: 8 bytes a value in FP32, 4
+    // in BF16; the RTX 4070's step 634 -> 620 ms, 2026-11-06)
+    uint16_t* x_ = nullptr;
+    float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *gu_ = nullptr,
           *temb_ = nullptr, *mod_ = nullptr, *head_ = nullptr;
     // the FP16 inputs' row scales (rs_ the current product's, rs2_ the MLP's second's while rs_ is still read, rs_o_
     // the attention's output's), the v heads' scales (hs_, a context's heads) and their rows' maxima
@@ -321,13 +324,13 @@ private:
     struct Pending {
         MfOut add;
         const float* gate = nullptr;
-        float* x = nullptr;
+        uint16_t* x = nullptr;
         int64_t R = 0;
         AltRows rr;
     } pend_;
     float* pend_sw_ = nullptr;
     void flush_pending();
-    float* b0_ = nullptr;
+    uint16_t* b0_ = nullptr;
     // an edit's references (set_refs): every block's keys and values of their rows and its v heads' scales; capture_
     // while set_refs runs the blocks over them; cur_block_ the block run_block runs
     uint16_t *ref_k16_ = nullptr, *ref_v16_ = nullptr;
@@ -342,7 +345,7 @@ private:
     bool refs_in_i8(int64_t rows) const;
     // the references in the stream (TimestepZero, Index): their rows through the input projection [R][C], and the
     // modulation's six rows at timestep 0 after mod_'s (TimestepZero's)
-    float* ref_x_ = nullptr;
+    uint16_t* ref_x_ = nullptr;
     int64_t stream_rows_ = 0;
     std::vector<std::pair<int64_t, int64_t>> ref_shapes_;   // the references' latent rows and columns
     void ref_coord(int64_t r, float* p) const;

@@ -36,6 +36,7 @@
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -1037,6 +1038,15 @@ int step(const std::string& dit_path, const std::string& out_path, const std::st
 
 namespace {
 
+// n BF16 values on the device (MossDit's rows) as floats
+std::vector<float> bf16_rows(const uint16_t* d, size_t n) {
+    std::vector<uint16_t> b(n);
+    strata::gpu::copy(b.data(), d, n * 2);
+    std::vector<float> h(n);
+    for (size_t i = 0; i < n; ++i) h[i] = strata::kernels::f32_from_bf16(b[i]);
+    return h;
+}
+
 // MOSS-Image's table of the weights adapters may take (one line a name: its entry's rows and columns), and where each
 // entry of `lora` lands on it (a line a mapped weight, MISSING a key the DiT does not take, SHAPE a weight whose rows
 // and columns are not the entry's).
@@ -1132,12 +1142,10 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
         // the text embedder's weights go (the pipeline gives them up for the blocks' room) and come back: a weight an
         // adapter is bound to keeps its layer across the load, and the velocity is the same again
         const uint64_t before = dit.lora_bytes();
-        std::vector<float> rows_before((size_t) (n_text * dit.hidden()));
-        gpu::copy(rows_before.data(), dit.text_rows(0), rows_before.size() * 4);
+        std::vector<float> rows_before = bf16_rows(dit.text_rows(0), (size_t) (n_text * dit.hidden()));
         if (std::strcmp(drop, "1") == 0) dit.drop_text();
         dit.set_context(0, ctx.data(), n_text);
-        std::vector<float> rows_after((size_t) (n_text * dit.hidden()));
-        gpu::copy(rows_after.data(), dit.text_rows(0), rows_after.size() * 4);
+        std::vector<float> rows_after = bf16_rows(dit.text_rows(0), (size_t) (n_text * dit.hidden()));
         double rd = 0, ra = 0, rb = 0;
         for (size_t i = 0; i < rows_after.size(); ++i) {
             rd += (double) rows_before[i] * rows_after[i];

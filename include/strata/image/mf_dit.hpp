@@ -93,21 +93,48 @@ struct MfOut {
                                      : (rs != nullptr ? f[t * C + c] * rs[t] : f[t * C + c]);
         return b != nullptr ? v + b[c] : v;
     }
-    /// at(t, c0 + d) as r(d), the row's offsets taken once (the per-head kernels' reads: qk_norm_rope.hpp)
-    auto row(int64_t t, int64_t c0) const {
-        const int64_t o = t * C + c0;
-        const uint16_t* bp16 = bf != nullptr ? bf + o : nullptr;
-        const int32_t* ip = i != nullptr ? i + o : nullptr;
-        const float* fp = f != nullptr ? f + o : nullptr;
-        const float sxt = i != nullptr ? sx[t] : 0.f, rst = rs != nullptr ? rs[t] : 1.f;
-        const float* swp = sw != nullptr ? sw + c0 : nullptr;
-        const float* bp = b != nullptr ? b + c0 : nullptr;
-        const bool scaled = rs != nullptr;
-        return [=](int64_t d) {
+    /// at(t, c0 + d) as r(d), the row's offsets taken once (the per-head kernels' reads: qk_norm_rope.hpp); r.r2(d, a,
+    /// b) reads d and d + 1 in one access (d even, c0 and C too)
+    struct Row {
+        const uint16_t* bp16;
+        const int32_t* ip;
+        const float *fp, *swp, *bp;
+        float sxt, rst;
+        bool scaled;
+        float operator()(int64_t d) const {
             if (bp16 != nullptr) return kernels::f32_from_bf16(bp16[d]);
             const float v = ip != nullptr ? (float) ip[d] * sxt * swp[d] : (scaled ? fp[d] * rst : fp[d]);
             return bp != nullptr ? v + bp[d] : v;
-        };
+        }
+        void r2(int64_t d, float& v0, float& v1) const {
+            if (bp16 != nullptr) {
+                const Packed<uint16_t, 2> h = *reinterpret_cast<const Packed<uint16_t, 2>*>(bp16 + d);
+                v0 = kernels::f32_from_bf16(h.v[0]);
+                v1 = kernels::f32_from_bf16(h.v[1]);
+                return;
+            }
+            if (ip != nullptr) {
+                const Packed<int32_t, 2> iv = *reinterpret_cast<const Packed<int32_t, 2>*>(ip + d);
+                const Packed<float, 2> wv = *reinterpret_cast<const Packed<float, 2>*>(swp + d);
+                v0 = (float) iv.v[0] * sxt * wv.v[0];
+                v1 = (float) iv.v[1] * sxt * wv.v[1];
+            } else {
+                const Packed<float, 2> fv = *reinterpret_cast<const Packed<float, 2>*>(fp + d);
+                v0 = scaled ? fv.v[0] * rst : fv.v[0];
+                v1 = scaled ? fv.v[1] * rst : fv.v[1];
+            }
+            if (bp != nullptr) {
+                const Packed<float, 2> bv = *reinterpret_cast<const Packed<float, 2>*>(bp + d);
+                v0 += bv.v[0];
+                v1 += bv.v[1];
+            }
+        }
+    };
+    Row row(int64_t t, int64_t c0) const {
+        const int64_t o = t * C + c0;
+        return Row{bf != nullptr ? bf + o : nullptr, i != nullptr ? i + o : nullptr, f != nullptr ? f + o : nullptr,
+                   sw != nullptr ? sw + c0 : nullptr, b != nullptr ? b + c0 : nullptr, i != nullptr ? sx[t] : 0.f,
+                   rs != nullptr ? rs[t] : 1.f, rs != nullptr};
     }
     /// at(t, c + p) for p below W, read W side by side (c and C multiples of W)
     template<int W> void at_w(int64_t t, int64_t c, float* o) const {

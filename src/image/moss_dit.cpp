@@ -17,6 +17,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/flash_attn.hpp"
+#include "strata/prefill/kernels.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -79,9 +80,9 @@ std::string name_list(const std::vector<std::string>& names) {
 
 // RMSNorm(x[t]) * w (eps 1e-6), then * (1 + scale) + shift where the time gives them (null: not), alt's rows taking
 // another set's: dit_rows' RmsAffine
-RmsAffine rms_mod(const float* x, const float* w, const float* shift, const float* scale, int64_t C,
-                  const AltRows& alt = {}) {
-    return RmsAffine{x, w, scale, shift, C, kEps, true, alt};
+RmsAffineOf<uint16_t> rms_mod(const uint16_t* x, const float* w, const float* shift, const float* scale, int64_t C,
+                              const AltRows& alt = {}) {
+    return RmsAffineOf<uint16_t>{x, w, scale, shift, C, kEps, true, alt};
 }
 
 // x as it is (the text encoder's states, for their FP16 rows' scales)
@@ -110,17 +111,20 @@ struct Situ {
 // deferred product (gate_add, its sums written back to x); Situ's; the attention's output times its heads' scales
 struct RmsI8 {
     static constexpr bool kRms = true, kKeep = true;
-    float* x;
+    uint16_t* x;   // BF16 (MossDit's x_)
     MfOut add;
     const float *gate, *w, *shift, *scale;
     int64_t C;
     AltRows rr{};   // rms_mod's, the gate's too
     float raw(int64_t t, int64_t c) const {
-        const float v = x[t * C + c];
+        const float v = resid(x[t * C + c]);
         return add.C > 0 ? v + gate[c + rr.at(t)] * add.at(t, c) : v;
     }
-    void keep(int64_t t, int64_t c, float v) const {
-        if (add.C > 0) x[t * C + c] = v;
+    // the sum as x keeps it: the norm takes the rounded value, as the next block reads it
+    void keep(int64_t t, int64_t c, float& v) const {
+        if (add.C == 0) return;
+        x[t * C + c] = bf16_bits(v);
+        v = resid(x[t * C + c]);
     }
     float inv(float ss) const { return 1.f / sycl::sqrt(ss / (float) C + kEps); }
     float out(int64_t t, int64_t c, float v, float inv) const {
@@ -130,21 +134,24 @@ struct RmsI8 {
     }
     // the same W values side by side (RowsI8Of's vector form)
     template<int W> void raw_w(int64_t t, int64_t c, float* v) const {
-        const Packed<float, W> xv = *reinterpret_cast<const Packed<float, W>*>(x + t * C + c);
+        const Packed<uint16_t, W> xv = *reinterpret_cast<const Packed<uint16_t, W>*>(x + t * C + c);
         if (add.C > 0) {
             float a[W];
             add.at_w<W>(t, c, a);
             const Packed<float, W> gv = *reinterpret_cast<const Packed<float, W>*>(gate + c);
-            for (int p = 0; p < W; ++p) v[p] = xv.v[p] + gv.v[p] * a[p];
+            for (int p = 0; p < W; ++p) v[p] = resid(xv.v[p]) + gv.v[p] * a[p];
         } else {
-            for (int p = 0; p < W; ++p) v[p] = xv.v[p];
+            for (int p = 0; p < W; ++p) v[p] = resid(xv.v[p]);
         }
     }
-    template<int W> void keep_w(int64_t t, int64_t c, const float* v) const {
+    template<int W> void keep_w(int64_t t, int64_t c, float* v) const {
         if (add.C == 0) return;
-        Packed<float, W> o;
-        for (int p = 0; p < W; ++p) o.v[p] = v[p];
-        *reinterpret_cast<Packed<float, W>*>(x + t * C + c) = o;
+        Packed<uint16_t, W> o;
+        for (int p = 0; p < W; ++p) {
+            o.v[p] = bf16_bits(v[p]);
+            v[p] = resid(o.v[p]);
+        }
+        *reinterpret_cast<Packed<uint16_t, W>*>(x + t * C + c) = o;
     }
     template<int W> void out_w(int64_t, int64_t c, float* v, float inv) const {
         const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(w + c);
@@ -159,7 +166,7 @@ struct RmsI8 {
 };
 
 // gate_add, rr's rows taking their gate alt floats on: the shared kernel over each run of rows of one gate
-void gate_add_rows(float* x, const MfOut& h, const float* gate, const AltRows& rr, int64_t T, int64_t C, void* s) {
+void gate_add_rows(uint16_t* x, const MfOut& h, const float* gate, const AltRows& rr, int64_t T, int64_t C, void* s) {
     if (rr.alt == 0 || gate == nullptr) {
         gate_add(x, h, gate, T, C, s);
         return;
@@ -661,7 +668,7 @@ uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t 
     const Rows rw = rows_for(hw, n, max_text, ref_rows, refs_in_i8(ref_rows));
     const int64_t R = rw.R;
     const int64_t band = mlp_rows > 0 ? std::min(R, mlp_rows) : R;
-    return (uint64_t) R * C_ * 4 * 5 +                          // x, q, k, v, a
+    return (uint64_t) R * C_ * 4 * 4 + (uint64_t) R * C_ * 2 +  // q, k, v, a; x (BF16)
            (uint64_t) band * 2 * F_ * 4 +                       // the MLP's up_gate sums
            (uint64_t) std::max(R * C_, band * F_) * 2 +         // the products' FP16 input
            (uint64_t) rw.J * C_ * 2 * 3 + (uint64_t) rw.O * C_ * 2 +   // q, k, v of each context, the output
@@ -687,7 +694,7 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     const Rows rw = rows_for(hw, n, max_text, ref_rows_, ref_i8_on_);
     const int64_t R = rw.R, TP = rw.TP;
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
-    x_ = alloc<float>(allocs_, R * C_);
+    x_ = alloc<uint16_t>(allocs_, R * C_);
     q_ = alloc<float>(allocs_, R * C_);
     k_ = alloc<float>(allocs_, R * C_);
     v_ = alloc<float>(allocs_, R * C_);
@@ -717,7 +724,7 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     jv16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
     jo16_ = alloc<uint16_t>(allocs_, rw.O * C_);
     o16_ = alloc<uint16_t>(allocs_, R * C_);
-    if (keep0_) b0_ = alloc<float>(allocs_, (hw + max_text) * C_);
+    if (keep0_) b0_ = alloc<uint16_t>(allocs_, (hw + max_text) * C_);
     cap_hw_ = hw;
     cap_n_ = n;
     cap_text_ = max_text;
@@ -735,7 +742,8 @@ void MossDit::drop_activations() {
                     (void*) b0_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_,
                     (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = b0_ = pend_sw_ = vsv_ = kmean_ = nullptr;
+    q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = pend_sw_ = vsv_ = kmean_ = nullptr;
+    x_ = b0_ = nullptr;
     kready_.clear();
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
     xq8_ = nullptr;
@@ -1221,7 +1229,7 @@ void MossDit::time_embedding(float timestep) {
 }
 
 void MossDit::run_block(const W* const* w, const float* const* bias, const float* n1, const float* n2,
-                        const float* nq, const float* nk, const uint8_t* base, const float* mod, float* x,
+                        const float* nq, const float* nk, const uint8_t* base, const float* mod, uint16_t* x,
                         const std::vector<int64_t>& seg, const std::vector<const float*>& cos,
                         const std::vector<const float*>& sin) {
     const int64_t C = C_;
@@ -1380,8 +1388,10 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
     uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_);
     gpu::copy(xs, states, (size_t) (rows * txt_dim_) * 4);
     rows16(Plain{xs, txt_dim_}, rows, txt_dim_, x16, rs_, s_);
-    c.txt0 = alloc<float>(allocs_, rows * C_);
-    product(x16, rs_, tproj_, nullptr, c.txt0, rows, b_tproj_);
+    float* t32 = alloc<float>(allocs_, rows * C_);
+    c.txt0 = alloc<uint16_t>(allocs_, rows * C_);
+    product(x16, rs_, tproj_, nullptr, t32, rows, b_tproj_);
+    prefill::to_bf16(t32, c.txt0, rows * C_, s_);
     std::vector<float> cv, sv;
     rope_rows(rows, hd_, rope_base_, [](int64_t r, float* p) {
         p[0] = p[2] = p[3] = 0.f;
@@ -1397,7 +1407,7 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
         run_block(w, bias, tb.n1, tb.n2, tb.nq, tb.nk, nullptr, nullptr, c.txt0, {rows}, {dc}, {ds});
     }
     gpu::stream_sync(s_);
-    for (void* p : {(void*) xs, (void*) x16, (void*) dc, (void*) ds}) release(allocs_, p);
+    for (void* p : {(void*) xs, (void*) x16, (void*) t32, (void*) dc, (void*) ds}) release(allocs_, p);
 }
 
 void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int n, float* out) {
@@ -1413,12 +1423,13 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
     // each context's rows: the image's input projection (the same rows in each), then its text embedder's rows,
     // then the references' in the stream
     kernels::f32_to_f16_bulk(x, h16_, HW * in_ch_, s_);
-    product(h16_, nullptr, vin_, nullptr, x_, HW, b_vin_);
+    product(h16_, nullptr, vin_, nullptr, a_, HW, b_vin_);
+    prefill::to_bf16(a_, x_, HW * C, s_);
     for (int i = 0; i < n; ++i) {
-        if (i > 0) gpu::copy_async(x_ + off[(size_t) i] * C, x_, (size_t) (HW * C) * 4, s_);
-        gpu::copy_async(x_ + (off[(size_t) i] + HW) * C, ctx_[i].txt0, (size_t) (ctx_[i].rows * C) * 4, s_);
+        if (i > 0) gpu::copy_async(x_ + off[(size_t) i] * C, x_, (size_t) (HW * C) * 2, s_);
+        gpu::copy_async(x_ + (off[(size_t) i] + HW) * C, ctx_[i].txt0, (size_t) (ctx_[i].rows * C) * 2, s_);
         if (J > 0)
-            gpu::copy_async(x_ + (off[(size_t) i] + HW + ctx_[i].rows) * C, ref_x_, (size_t) (J * C) * 4, s_);
+            gpu::copy_async(x_ + (off[(size_t) i] + HW + ctx_[i].rows) * C, ref_x_, (size_t) (J * C) * 2, s_);
     }
     time_embedding(timestep);
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
@@ -1448,7 +1459,7 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
         }
         if (bi == 0 && keep0_) flush_pending();
         blocks_stream_.end(bi);
-        if (bi == 0 && keep0_) gpu::copy_async(b0_, x_, (size_t) ((HW + ctx_[0].rows) * C) * 4, s_);
+        if (bi == 0 && keep0_) gpu::copy_async(b0_, x_, (size_t) ((HW + ctx_[0].rows) * C) * 2, s_);
     }
     flush_pending();
     // the head: each context's image rows normed, scaled and shifted by the time, projected to the latent's channels
@@ -1478,7 +1489,8 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_, (void*) ref_i8_, (void*) ref_x_})
         release(allocs_, p);
     ref_k16_ = ref_v16_ = nullptr;
-    ref_hs_ = ref_x_ = nullptr;
+    ref_hs_ = nullptr;
+    ref_x_ = nullptr;
     ref_i8_ = nullptr;
     ref_i8_on_ = false;
     ref_rows_ = stream_rows_ = 0;
@@ -1498,8 +1510,10 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
             kernels::f32_to_f16_bulk(f.tokens, x16 + o * in_ch_, f.h * f.w * in_ch_, s_);
             o += f.h * f.w;
         }
-        ref_x_ = alloc<float>(allocs_, R * C_);
-        product(x16, nullptr, vin_, nullptr, ref_x_, R, b_vin_);
+        float* rx = alloc<float>(allocs_, R * C_);
+        ref_x_ = alloc<uint16_t>(allocs_, R * C_);
+        product(x16, nullptr, vin_, nullptr, rx, R, b_vin_);
+        prefill::to_bf16(rx, ref_x_, R * C_, s_);
         if (layout == QiRefLayout::TimestepZero) {
             time_embedding(0.f);
             gpu::copy_async(mod_ + 6 * C_, mod_, (size_t) (6 * C_) * 4, s_);
@@ -1507,6 +1521,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         }
         gpu::stream_sync(s_);
         release(allocs_, x16);
+        release(allocs_, rx);
         stream_rows_ = R;
         return;
     }
@@ -1534,7 +1549,8 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         kernels::f32_to_f16_bulk(f.tokens, h16_ + o * in_ch_, f.h * f.w * in_ch_, s_);
         o += f.h * f.w;
     }
-    product(h16_, nullptr, vin_, nullptr, x_, R, b_vin_);
+    product(h16_, nullptr, vin_, nullptr, a_, R, b_vin_);
+    prefill::to_bf16(a_, x_, R * C_, s_);
     time_embedding(0.f);
     capture_ = true;
     try {

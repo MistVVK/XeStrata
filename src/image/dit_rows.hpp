@@ -31,9 +31,9 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <thread>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -156,11 +156,19 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
         MfOut q, k, v;
         const float* hs;
         int64_t hd;
-        auto head(int which, int64_t t, int64_t h) const {
-            const auto r = (which == 0 ? q : which == 1 ? k : v).row(t, h * hd);
-            const bool vs = which == 2 && hs != nullptr;
-            const float inv = vs ? 1.f / hs[h] : 1.f;
-            return [=](int64_t d) { return vs ? r(d) * inv : r(d); };
+        struct Head {
+            MfOut::Row r;
+            float inv;   // v's 1 / hs, else 1
+            float operator()(int64_t d) const { return r(d) * inv; }
+            void r2(int64_t d, float& a, float& b) const {
+                r.r2(d, a, b);
+                a *= inv;
+                b *= inv;
+            }
+        };
+        Head head(int which, int64_t t, int64_t h) const {
+            return {(which == 0 ? q : which == 1 ? k : v).row(t, h * hd),
+                    which == 2 && hs != nullptr ? 1.f / hs[h] : 1.f};
         }
     };
     kernels::qk::Shape sh{T, heads, heads, hd};
@@ -238,33 +246,56 @@ struct LnMod {
     }
 };
 
+// A DiT's residual stream: FP32, or BF16 (uint16_t, ComfyUI's form: MOSS-Image's), rounded to the nearest.  NVIDIA's
+// GPUs take the conversion instruction (kernels::bf16_from_f32's integer rounding doubled MOSS-Image's RMS norm's
+// instructions on the RTX 4070, 2026-11-06); elsewhere the integer rounding: a kernel with
+// sycl::ext::oneapi::bfloat16's conversion crashes intel/llvm v7.2.0's SYCL runtime (libsycl 9) on Intel's GPUs where
+// its on-disk cache is on, as the runtime sets it (getItemFromDisc, getSortedImages; the B70, the same day).  The #if
+// goes once the intel/llvm the build takes runs the data folder's records/2026-11-06-libsycl-bf16-cache/repro with
+// SYCL_CACHE_PERSISTENT=1
+inline float resid(float v) { return v; }
+inline float resid(uint16_t v) { return kernels::f32_from_bf16(v); }
+inline uint16_t bf16_bits(float v) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+    return sycl::bit_cast<uint16_t>(sycl::ext::oneapi::bfloat16(v));
+#else
+    return kernels::bf16_from_f32(v);
+#endif
+}
+template<class X> inline X resid_of(float v) {
+    if constexpr (std::is_same_v<X, uint16_t>) return bf16_bits(v);
+    else return v;
+}
+
 // RMSNorm(x[t]) over the channels (eps), times w where it is given, then times scale and plus shift where given
 // (SeedVR2's modulation: the time's and the layer's scale summed), or with one_plus times (1 + scale) and plus shift
-// where scale is given (MOSS-Image's), rows16's Op
-struct RmsAffine {
-    const float *x, *w, *scale, *shift;
+// where scale is given (MOSS-Image's), rows16's Op (X the residual's type)
+template<class X> struct RmsAffineOf {
+    const X *x;
+    const float *w, *scale, *shift;
     int64_t C;
     float eps;
     bool one_plus = false;
     AltRows alt{};   // rows whose scale and shift are another set's
     template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
-        const float* r = x + t * C;
+        const X* r = x + t * C;
         float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += r[c] * r[c];
+        for (int64_t c = lane; c < C; c += step) s += resid(r[c]) * resid(r[c]);
         return {0.f, 1.f / sycl::sqrt(reduce(s) / (float) C + eps)};
     }
     float value(int64_t t, int64_t c, const Stats& st) const {
         const int64_t m = c + alt.at(t);
         if (one_plus) {   // (its weight given)
-            const float y = x[t * C + c] * st.inv * w[c];
+            const float y = resid(x[t * C + c]) * st.inv * w[c];
             return scale != nullptr ? y * (1.f + scale[m]) + shift[m] : y;
         }
-        float y = x[t * C + c] * st.inv;
+        float y = resid(x[t * C + c]) * st.inv;
         if (w != nullptr) y *= w[c];
         if (scale != nullptr) y *= scale[m];
         return shift != nullptr ? y + shift[m] : y;
     }
 };
+using RmsAffine = RmsAffineOf<float>;
 
 // RowsI8Of's ops over the same rows: RmsAffine's (no weight), GeluTanh's, FP16 rows and FP32 rows as they are; R the
 // regular rotation (kRegular: int8_convrot's weights)
@@ -673,18 +704,30 @@ inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int
 // two as head_scale makes it (the same: a head's largest is its columns'), and sv[c] = column c's largest at it, over
 // 127 (1 for a column of zeros) - the V scales the int8 attention takes (kernels::FlashAttnI8Stats), so that it need
 // not read the attention's FP16 v again for them
-constexpr int64_t kColSlices = 32;
+// A work-item 4 columns side by side (where C is a multiple of 4) of a slice: MOSS-Image's v on the RTX 4070 (4115 rows
+// of 3072, 2026-11-06) took 0.12 ms read a column a work-item over 32 slices, at 40% of the memory's bandwidth
+constexpr int64_t kColSlices = 128;
 
 inline void col_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int64_t C, float* part, void* s) {
     const int64_t n = na + nb;
     if (n <= 0) return;
-    q_of(s).parallel_for(sycl::range<2>((size_t) kColSlices, (size_t) C), [=](sycl::id<2> id) {
-        const auto sl = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
-        const int64_t t0 = n * sl / kColSlices, t1 = n * (sl + 1) / kColSlices;
-        float m = 0.f;
-        for (int64_t t = t0; t < t1; ++t) m = sycl::fmax(m, sycl::fabs(t < na ? a.at(t, c) : b.at(t - na, c)));
-        part[sl * C + c] = m;
-    });
+    auto run = [&]<int W>() {
+        q_of(s).parallel_for(sycl::range<2>((size_t) kColSlices, (size_t) (C / W)), [=](sycl::id<2> id) {
+            const auto sl = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]) * W;
+            const int64_t t0 = n * sl / kColSlices, t1 = n * (sl + 1) / kColSlices;
+            float m[W] = {};
+            for (int64_t t = t0; t < t1; ++t) {
+                float v[W];
+                if constexpr (W == 1) v[0] = t < na ? a.at(t, c) : b.at(t - na, c);
+                else if (t < na) a.at_w<W>(t, c, v);
+                else b.at_w<W>(t - na, c, v);
+                for (int p = 0; p < W; ++p) m[p] = sycl::fmax(m[p], sycl::fabs(v[p]));
+            }
+            for (int p = 0; p < W; ++p) part[sl * C + c + p] = m[p];
+        });
+    };
+    if (C % 4 == 0) run.template operator()<4>();
+    else run.template operator()<1>();
 }
 
 inline void col_scale(const float* part, int64_t C, int64_t heads, int64_t hd, float* hs, float* sv, void* s) {
@@ -735,13 +778,15 @@ inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int6
 inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) { qi_bias_add(y, b, T, N, s); }
 
 // The DiTs' gated residual: x[t][c] += g(t, c) h[t][c]
-template<class G> sycl::event gate_add_by(float* x, const MfOut& h, G g, int64_t T, int64_t C, void* s) {
+template<class X, class G> sycl::event gate_add_by(X* x, const MfOut& h, G g, int64_t T, int64_t C, void* s) {
     if (T <= 0) return {};
-    return kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) { x[t * C + c] += g(t, c) * h.at(t, c); });
+    return kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
+        x[t * C + c] = resid_of<X>(resid(x[t * C + c]) + g(t, c) * h.at(t, c));
+    });
 }
 
 // x[t] += gate * h[t] (per channel; gate null: 1)
-inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
+template<class X> inline void gate_add(X* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     (void) gate_add_by(x, h, [=](int64_t, int64_t c) { return gate != nullptr ? gate[c] : 1.f; }, T, C, s);
 }
 

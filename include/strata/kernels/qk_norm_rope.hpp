@@ -157,6 +157,10 @@ struct Rows16 {
             }
             for (int64_t r = 0; r < rep; ++r) p[r * head_dim + d] = h;
         }
+        void w2(int64_t d, float a, float b) const {   // d and d + 1 (d even)
+            const uint32_t h = (uint32_t) f16_gpu::f16_from_f32(a) | (uint32_t) f16_gpu::f16_from_f32(b) << 16;
+            for (int64_t r = 0; r < rep; ++r) *reinterpret_cast<uint32_t*>(p + r * head_dim + d) = h;
+        }
     };
     Put out_head(int which, int64_t t, int64_t h) const {
         if (which == 0) return {q16 + (t * q_heads + h) * head_dim, 1, head_dim};
@@ -230,7 +234,101 @@ inline void qk_head(const sycl::sub_group& sg, const In& in, const Ang& ang, con
     }
 }
 
-template <bool NEOX, bool ROPE_FIRST, bool NORM, class In, class Ang, class Out>
+/// Columns d and d + 1 (d even) in one access where the head's reader or writer has it (r2, w2), else one at a time
+template <class X> inline void read2(const X& x, int d, float& a, float& b) {
+    if constexpr (requires { x.r2(int64_t{}, a, b); }) {
+        x.r2(d, a, b);
+    } else {
+        a = x(d);
+        b = x(d + 1);
+    }
+}
+template <class Y> inline void write2(const Y& y, int d, float a, float b) {
+    if constexpr (requires { y.w2(int64_t{}, a, b); }) {
+        y.w2(d, a, b);
+    } else {
+        y(d, a);
+        y(d + 1, b);
+    }
+}
+
+/// The kernel for a head of up to 128 rotated columns and 64 more not, each an even count (kernel's HELD): a lane holds
+/// two adjacent pairs and two adjacent columns past n_rot, read once into registers and two at a time, q's, k's and v's
+/// reads issued before the first is used.  Read where used, twice and one at a time, MOSS-Image's QK on the RTX 4070
+/// (8221 rows of 24 heads of 128, 2026-11-06) waited on them at 40% of the memory's bandwidth, 0.70 ms
+struct Held {
+    float a[2], b[2], e[2];   // pairs 2 lane and + 1 (j and j + half, or 2j and 2j + 1); columns n_rot + 2 lane, + 1
+};
+
+template <int WHICH, bool NEOX, class In>
+inline Held qk_load(int lane, const In& in, int64_t t, int64_t head, int hd, int n_rot, bool rest) {
+    const int half = n_rot / 2, p = 2 * lane, d = n_rot + 2 * lane;
+    const auto x = in.head(WHICH, t, head);
+    Held v{};
+    if (p < half) {
+        if (NEOX) {
+            read2(x, p, v.a[0], v.a[1]);
+            read2(x, p + half, v.b[0], v.b[1]);
+        } else {
+            read2(x, 2 * p, v.a[0], v.b[0]);
+            read2(x, 2 * p + 2, v.a[1], v.b[1]);
+        }
+    }
+    if (rest && d < hd) read2(x, d, v.e[0], v.e[1]);
+    return v;
+}
+
+template <int WHICH, bool NEOX, bool ROPE_FIRST, bool NORM, class Ang, class Out>
+inline void qk_store(const sycl::sub_group& sg, const Held& v, const Ang& ang, const Out& out, const float* w,
+                     float eps, int64_t t, int64_t head, int hd, int n_rot, bool tail) {
+    const int lane = (int) sg.get_local_linear_id(), half = n_rot / 2, p = 2 * lane, d = n_rot + 2 * lane;
+    const auto y = out.out_head(WHICH, t, head);
+    float r = 1.f;
+    if (NORM) {
+        float ss = 0.f;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) ss += v.a[i] * v.a[i] + v.b[i] * v.b[i] + v.e[i] * v.e[i];
+        r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + eps);
+    }
+    if (p < half) {
+        const auto rot = ang.row(t);
+        float a[2], b[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int i0 = NEOX ? p + i : 2 * (p + i), i1 = NEOX ? p + i + half : 2 * (p + i) + 1;
+            float c, s;
+            rot(p + i, c, s);
+            a[i] = v.a[i];
+            b[i] = v.b[i];
+            if (ROPE_FIRST) {
+                const float a2 = a[i] * c - b[i] * s, b2 = a[i] * s + b[i] * c;
+                a[i] = NORM ? a2 * r * w[i0] : a2;
+                b[i] = NORM ? b2 * r * w[i1] : b2;
+            } else {
+                if (NORM) {
+                    a[i] = a[i] * r * w[i0];
+                    b[i] = b[i] * r * w[i1];
+                }
+                if (Ang::on) {
+                    const float a2 = a[i] * c - b[i] * s;
+                    b[i] = a[i] * s + b[i] * c;
+                    a[i] = a2;
+                }
+            }
+        }
+        if (NEOX) {
+            write2(y, p, a[0], a[1]);
+            write2(y, p + half, b[0], b[1]);
+        } else {
+            write2(y, 2 * p, a[0], b[0]);
+            write2(y, 2 * p + 2, a[1], b[1]);
+        }
+    }
+    if (tail && d < hd)
+        write2(y, d, NORM ? v.e[0] * r * w[d] : v.e[0], NORM ? v.e[1] * r * w[d + 1] : v.e[1]);
+}
+
+template <bool NEOX, bool ROPE_FIRST, bool NORM, bool HELD, class In, class Ang, class Out>
 sycl::event qk_norm_rope_t(sycl::queue& q, const Shape& sh, const In in, const Ang ang, const Out out) {
     const int64_t hd = sh.head_dim, n_rot = sh.n_rot > 0 ? sh.n_rot : hd;
     const int64_t qh = sh.q_heads, kvh = sh.kv_heads, nh = std::max(qh, kvh), n = sh.T * nh;
@@ -246,6 +344,22 @@ sycl::event qk_norm_rope_t(sycl::queue& q, const Shape& sh, const In in, const A
             const int64_t job = (int64_t) it.get_group_linear_id() * kJobs + (int64_t) sg.get_group_linear_id();
             if (job >= n) return;   // the whole sub-group
             const int64_t t = job / nh, h = job - t * nh;
+            if constexpr (HELD) {
+                const int lane = (int) sg.get_local_linear_id(), hdi = (int) hd, nr = (int) n_rot;
+                Held vq{}, vk{}, vv{};
+                if (h < qh) vq = qk_load<0, NEOX>(lane, in, t, h, hdi, nr, tail);
+                if (h < kvh) {
+                    vk = qk_load<1, NEOX>(lane, in, t, h, hdi, nr, tail);
+                    if (values) vv = qk_load<2, true>(lane, in, t, h, hdi, nr, true);
+                }
+                if (h < qh) qk_store<0, NEOX, ROPE_FIRST, NORM>(sg, vq, ang, out, wq, eps, t, h, hdi, nr, tail);
+                if (h < kvh) {
+                    qk_store<1, NEOX, ROPE_FIRST, NORM>(sg, vk, ang, out, wk, eps, t, h, hdi, nr, tail);
+                    if (values)
+                        qk_store<2, true, false, false>(sg, vv, NoRope{}, out, nullptr, eps, t, h, hdi, nr, true);
+                }
+                return;
+            }
             if (h < qh) qk_head<0, NEOX, ROPE_FIRST, NORM>(sg, in, ang, out, wq, eps, t, h, hd, n_rot, tail);
             if (h < kvh) {
                 qk_head<1, NEOX, ROPE_FIRST, NORM>(sg, in, ang, out, wk, eps, t, h, hd, n_rot, tail);
@@ -258,22 +372,26 @@ sycl::event qk_norm_rope_t(sycl::queue& q, const Shape& sh, const In in, const A
         });
 }
 
-/// The kernel's forms: the pairs' layout, the order of the rotation and the norm, and whether there is a norm, as
-/// constants (the per-head kernels this replaced had them so; as run-time flags in the loops they cost MOSS-Image's
-/// QK on the B70 a quarter more)
+/// The kernel's forms: the pairs' layout, the order of the rotation and the norm, whether there is a norm and whether
+/// the head fits Held, as constants (the per-head kernels this replaced had them so; as run-time flags in the loops
+/// they cost MOSS-Image's QK on the B70 a quarter more)
 template <class In, class Ang, class Out>
 sycl::event qk_norm_rope(sycl::queue& q, const Shape& sh, const In in, const Ang ang, const Out out) {
     const bool norm = sh.wq != nullptr || sh.wk != nullptr;
+    const int64_t n_rot = sh.n_rot > 0 ? sh.n_rot : sh.head_dim, rest = sh.head_dim - n_rot;
+    const bool held = n_rot % 4 == 0 && n_rot <= 4 * kLanes && rest % 2 == 0 && rest <= 2 * kLanes;
+    auto go = [&]<bool NEOX, bool ROPE_FIRST, bool NORM>() {
+        return held ? qk_norm_rope_t<NEOX, ROPE_FIRST, NORM, true>(q, sh, in, ang, out)
+                    : qk_norm_rope_t<NEOX, ROPE_FIRST, NORM, false>(q, sh, in, ang, out);
+    };
     if (sh.neox) {
-        if (sh.rope_first) return norm ? qk_norm_rope_t<true, true, true>(q, sh, in, ang, out)
-                                       : qk_norm_rope_t<true, true, false>(q, sh, in, ang, out);
-        return norm ? qk_norm_rope_t<true, false, true>(q, sh, in, ang, out)
-                    : qk_norm_rope_t<true, false, false>(q, sh, in, ang, out);
+        if (sh.rope_first) return norm ? go.template operator()<true, true, true>()
+                                       : go.template operator()<true, true, false>();
+        return norm ? go.template operator()<true, false, true>() : go.template operator()<true, false, false>();
     }
-    if (sh.rope_first) return norm ? qk_norm_rope_t<false, true, true>(q, sh, in, ang, out)
-                                   : qk_norm_rope_t<false, true, false>(q, sh, in, ang, out);
-    return norm ? qk_norm_rope_t<false, false, true>(q, sh, in, ang, out)
-                : qk_norm_rope_t<false, false, false>(q, sh, in, ang, out);
+    if (sh.rope_first) return norm ? go.template operator()<false, true, true>()
+                                   : go.template operator()<false, true, false>();
+    return norm ? go.template operator()<false, false, true>() : go.template operator()<false, false, false>();
 }
 
 }  // namespace strata::kernels::qk
