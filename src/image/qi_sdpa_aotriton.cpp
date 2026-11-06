@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa_aotriton.cpp - see qi_sdpa.hpp: aotriton's flash attention on AMD GPUs (MIT; its library and its
-// kernels' images beside the engine), on the queue's HIP stream.  A module of its own (libstrata_sdpa_aotriton.so,
-// strata_sdpa_aotriton.dll), which the image engine opens on an AMD GPU only: aotriton needs AMD's HIP runtime, which
-// a machine with other makers' GPUs need not have, and the engine must start there.
+// src/image/qi_sdpa_aotriton.cpp - see include/strata/kernels/sdpa_aotriton.hpp: aotriton's flash attention on AMD
+// GPUs (MIT; its library and its kernels' images beside the engine), on the queue's HIP stream.  A module of its own
+// (libstrata_sdpa_aotriton.so, strata_sdpa_aotriton.dll), which the kernels open on an AMD GPU only
+// (kernels::aotriton_sdpa): aotriton needs AMD's HIP runtime, which a machine with other makers' GPUs need not have,
+// and the engine must start there.
 
 #include <aotriton/flash.h>
 #include <sycl/ext/oneapi/backend/hip.hpp>
 
-#include "qi_sdpa.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -35,24 +35,26 @@ std::unordered_map<sycl::device, Aot> g_aot;
 
 }  // namespace
 
-bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-              int64_t T, int64_t heads, int64_t hd, uint16_t* out16, bool causal) {
+// `rows` query rows over `keys` keys, the keys' kv_heads heads each read by heads / kv_heads of the queries' (GQA);
+// causal: row t sees the keys up to keys - rows + t
+bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
+              int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, bool causal) {
     namespace ao = aotriton;
     std::lock_guard<std::mutex> lock(g_mu);
     Aot& d = g_aot[q.get_device()];
     if (d.failed) return false;
     if (d.counter == nullptr) d.counter = sycl::malloc_device<int32_t>(1, q);
-    const uint64_t row = (uint64_t) (heads * hd);
-    auto view = [&](const uint16_t* p, int64_t rows) {
+    auto view = [&](const uint16_t* p, int64_t n, int64_t h) {
+        const uint64_t row = (uint64_t) (h * hd);
         return ao::TensorView<4>(reinterpret_cast<intptr_t>(p),
-                                 std::array<uint64_t, 4>{1, (uint64_t) heads, (uint64_t) rows, (uint64_t) hd},
-                                 std::array<uint64_t, 4>{(uint64_t) rows * row, (uint64_t) hd, row, 1}, ao::kFloat16);
+                                 std::array<uint64_t, 4>{1, (uint64_t) h, (uint64_t) n, (uint64_t) hd},
+                                 std::array<uint64_t, 4>{(uint64_t) n * row, (uint64_t) hd, row, 1}, ao::kFloat16);
     };
     ao::v3::flash::attn_fwd_params p;
-    p.Q = view(q16 + q0 * (int64_t) row, q1 - q0);
-    p.K = view(k16, T);
-    p.V = view(v16, T);
-    p.Out = view(out16, q1 - q0);
+    p.Q = view(q16, rows, heads);
+    p.K = view(k16, keys, kv_heads);
+    p.V = view(v16, keys, kv_heads);
+    p.Out = view(out16, rows, heads);
     p.B = ao::TensorView<4>::get_null_tensor(ao::kFloat16);
     p.A = ao::TensorView<2>::get_null_tensor(ao::kFloat16);
     p.L = ao::TensorView<2>::get_null_tensor(ao::kFloat32);
@@ -65,12 +67,14 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
     p.philox_offset_output = ao::TensorView<0>::get_null_tensor(ao::kUInt64);
     p.encoded_softmax = ao::TensorView<4>::get_null_tensor(ao::kFloat16);
     p.persistent_atomic_counter = ao::TensorView<0>(reinterpret_cast<intptr_t>(d.counter), ao::kInt32);
-    // causal: the windowed form, both edges the top-left aligned diagonal (the binary kernels have no other causal)
+    // causal: the windowed form (the binary kernels have no other causal), both edges the top-left aligned diagonal
+    // where the rows are the keys, else a window of every key before and keys - rows after, the bottom-right diagonal
     p.causal_type = causal ? ao::v3::flash::CausalType::WindowedAttention : ao::v3::flash::CausalType::None;
-    p.window_left = causal ? ao::v3::flash::WindowValue::TopLeftAligned : 0;
-    p.window_right = causal ? ao::v3::flash::WindowValue::TopLeftAligned : 0;
-    p.Max_seqlen_q = (int32_t) (q1 - q0);
-    p.Max_seqlen_k = (int32_t) T;
+    const bool square = rows == keys;
+    p.window_left = !causal ? 0 : square ? ao::v3::flash::WindowValue::TopLeftAligned : (int32_t) keys;
+    p.window_right = !causal ? 0 : square ? ao::v3::flash::WindowValue::TopLeftAligned : (int32_t) (keys - rows);
+    p.Max_seqlen_q = (int32_t) rows;
+    p.Max_seqlen_k = (int32_t) keys;
     q.memset(d.counter, 0, sizeof(int32_t));
     const hipStream_t hs = sycl::get_native<sycl::backend::ext_oneapi_hip>(q);
     const hipError_t e = ao::v3::flash::attn_fwd(p, ao::v3::flash::attn_fwd_params::kVersion, ao::Stream(hs));
@@ -92,8 +96,8 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
 #define STRATA_SDPA_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
 STRATA_SDPA_EXPORT bool strata_sdpa_aotriton(void* q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
-                                             int64_t q0, int64_t q1, int64_t T, int64_t heads, int64_t hd,
+                                             int64_t rows, int64_t keys, int64_t heads, int64_t kv_heads, int64_t hd,
                                              uint16_t* out16, bool causal) {
-    return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, q0, q1, T, heads, hd, out16,
-                                         causal);
+    return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, rows, keys, heads, kv_heads, hd,
+                                         out16, causal);
 }

@@ -11,6 +11,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/sdpa_aotriton.hpp"
 #include "strata/kernels/sdpa_onednn.hpp"
 #include "strata/core/gpu.hpp"
 
@@ -213,7 +214,8 @@ bool run_i8(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int64
     return true;
 }
 
-// The maker's kernel (onednn_sdpa: oneDNN's fused SDPA on Intel GPUs) over the pools gathered into dense FP16 rows
+// The maker's kernel (onednn_sdpa: oneDNN's fused SDPA on Intel GPUs; aotriton_sdpa: aotriton's flash attention on AMD
+// ones) over the pools gathered into dense FP16 rows
 // (INT8 and Q4_0 decoded), the queries made FP16, its output widened into attn; false where it does not take it.  Its
 // shapes are the chunk's own, not padded: oneDNN's fused kernel takes the causal mask's offset from the shapes, not
 // from the lengths given with them (padded, the rows saw the padding's keys: the B70, oneDNN 3.12, 2026-11-07), and a
@@ -251,7 +253,10 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
 
 bool run_maker(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T,
                const QsaShapes& s, float* attn, void* stream) {
-#if STRATA_ONEDNN
+    const bool aot = aotriton_sdpa_ready(stream);
+#if !STRATA_ONEDNN
+    if (!aot) return false;
+#endif
     const int64_t hd = s.head_dim, KH = s.n_head_kv, NH = s.n_head, Tk = pos0 + T;
     if (pools.page_table == nullptr || pool_format(pools) < 0 || (hd != 128 && hd != 256)) return false;
     const int64_t CK = KH * hd, CQ = NH * hd;
@@ -261,14 +266,14 @@ bool run_maker(sycl::queue& queue, const float* q, const QsaAttnPools& pools, in
     if (hd == 128) gather16<128>(queue, pools, s.page_size, KH, Tk, k16, v16);
     else gather16<256>(queue, pools, s.page_size, KH, Tk, k16, v16);
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)), [=](sycl::id<1> i) { q16[i] = f16_gpu::f16_from_f32(q[i]); });
-    if (!onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true)) return false;
+    bool ok = aot && aotriton_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true);
+#if STRATA_ONEDNN
+    ok = ok || (!aot && onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true));
+#endif
+    if (!ok) return false;
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)),
                        [=](sycl::id<1> i) { attn[i] = f16_gpu::f32_from_f16(o16[i]); });
     return true;
-#else
-    (void) queue, (void) q, (void) pools, (void) pos0, (void) T, (void) s, (void) attn, (void) stream;
-    return false;
-#endif
 }
 
 // The buffers of run_i8 and run_maker are taken before the timing at the size of its longer shape (or of the shorter,
@@ -280,11 +285,16 @@ void prepare_buffers(sycl::queue& queue, const QsaShapes& s, int64_t a, int64_t 
     const int64_t T = std::min<int64_t>(2048, std::max<int64_t>(1, a / 2));   // time_pick's rows
     for (const int64_t cells : {b, a})
         if (flash_attn_i8_causal_prepare(T, cells, s.n_head, s.n_head_kv, s.head_dim, stream)) break;
+    // a maker's kernel here: aotriton (an AMD GPU with its module) or oneDNN (an Intel GPU's Level Zero or OpenCL)
+    const sycl::backend be = queue.get_device().get_backend();
+    bool maker = aotriton_sdpa_ready(stream);
 #if STRATA_ONEDNN
-    if (flash_attn_i8_kind(stream) == 0)   // an Intel GPU (no int8 kernel there for now)
+    maker = maker || be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl;
+#endif
+    (void) be;
+    if (maker)
         for (const int64_t cells : {b, a})
             if (scratch(queue, 1, maker_scratch(s, std::min<int64_t>(2048, cells / 2), cells)) != nullptr) break;
-#endif
 }
 void release_unpicked(sycl::queue& queue, void* stream, const Picks& p) {
     if (p.short_pick != kPickI8 && p.long_pick != kPickI8) {

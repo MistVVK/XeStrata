@@ -407,7 +407,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/flash_attn.cpp src/kernels/xe/flash_attn_i8.cpp
-                                    src/kernels/xe/i8_gemm.cpp
+                                    src/kernels/xe/i8_gemm.cpp src/kernels/xe/sdpa_aotriton.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
                                     src/kernels/xe/draft_head.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
@@ -1033,9 +1033,9 @@ if(STRATA_ENABLE_XE)
       if(TARGET strata_aotriton_win)
         add_dependencies(strata_sdpa_aotriton strata_aotriton_win)
       endif()
-      add_dependencies(strata_image strata_sdpa_aotriton)
-      set_property(SOURCE src/image/qi_sdpa.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_AOTRITON=1)
-      target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
+      add_dependencies(strata_kernels strata_sdpa_aotriton)
+      set_property(SOURCE src/kernels/xe/sdpa_aotriton.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_AOTRITON=1)
+      target_link_libraries(strata_kernels PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_aotriton_lib ${_strata_aot_dir}/lib)   # for the packages
     endif()
   endif()
