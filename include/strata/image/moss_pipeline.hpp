@@ -77,6 +77,8 @@ public:
     /// need() for a request with the text encoder's pictures of these sizes (the server's PIC:): the vision encoder
     /// counted
     void set_pictures_given(std::vector<std::pair<int64_t, int64_t>> sizes) { pictures_ = std::move(sizes); }
+    /// need() for a request whose references are in this layout (the server's EDITFMT:)
+    void set_ref_layout(QiRefLayout layout) { ref_layout_ = layout; }
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
                                   const std::function<bool(int, int)>& step = {},
                                   const std::function<void(const char*)>& stage = {}) override;
@@ -107,6 +109,7 @@ private:
     mutable int64_t w8_rows_ = 0;
     bool base_encoder_ = false, states_given_ = false;
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
+    QiRefLayout ref_layout_ = QiRefLayout::TextStart;   // and their layout (in the stream: as text rows)
     std::string vision_path_;
     int32_t image_pad_ = -1;   // the text encoder's <|image_pad|> (its GGUF's vocabulary)
     std::unique_ptr<QiVision> vision_size_;

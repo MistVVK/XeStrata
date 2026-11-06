@@ -12,6 +12,9 @@
 // the time of a step (both contexts, then the prompt's alone).  MOSS_BLOCK_BUDGET_MIB: the blocks' VRAM (the rest
 // streamed); without it, what the GPU has free beside the working buffers and 512 MiB.  MOSS_PROBE_RUNS: the timed
 // steps (3).  MOSS_MLP_ROWS: the MLP's rows a band (MossDit::set_mlp_rows; without it, all).
+// An edit's references: MOSS_PROBE_REFS, .npy latents [1][128][h][w] (commas between them), in the layout
+// MOSS_PROBE_LAYOUT (moss, aitk, aitk-nokv or index: MossDit::set_refs); MOSS_PROBE_DUMP, a folder the two velocities
+// go to (cond.npy and uncond.npy, [1][128][h][w]) beside the comparison.
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -96,6 +99,22 @@ std::vector<float> fetch(const float* d, size_t n) {
     return h;
 }
 
+// v as a .npy file of float32, C order, of these dims
+void save_npy(const std::string& path, const std::vector<float>& v, const std::vector<int64_t>& dims) {
+    std::string header = "{'descr': '<f4', 'fortran_order': False, 'shape': (";
+    for (const int64_t d : dims) header += std::to_string(d) + ", ";
+    header += "), }";
+    while ((10 + header.size() + 1) % 64 != 0) header += ' ';
+    header += '\n';
+    std::ofstream f(path, std::ios::binary);
+    const uint16_t hl = (uint16_t) header.size();
+    f.write("\x93NUMPY\x01\x00", 8);
+    f.write(reinterpret_cast<const char*>(&hl), 2);
+    f.write(header.data(), (std::streamsize) header.size());
+    f.write(reinterpret_cast<const char*>(v.data()), (std::streamsize) (v.size() * 4));
+    if (!f) throw std::runtime_error("cannot write " + path);
+}
+
 float* put(const std::vector<float>& h) {
     float* d = nullptr;
     if (!strata::gpu::alloc_device(&d, h.size() * 4)) throw std::runtime_error("GPU memory");
@@ -166,6 +185,32 @@ int run(const std::string& path, const std::string& dir, bool q8) {
                     (double) budget / 1073741824.0);
     }
     if (const char* e = std::getenv("MOSS_MLP_ROWS")) d.set_mlp_rows(std::strtoll(e, nullptr, 10));
+    std::vector<float*> refs;
+    if (const char* e = std::getenv("MOSS_PROBE_REFS")) {
+        const std::string list = e, lay = std::getenv("MOSS_PROBE_LAYOUT") ? std::getenv("MOSS_PROBE_LAYOUT") : "";
+        using L = strata::image::QiRefLayout;
+        const L layout = lay == "aitk" ? L::Isolated : lay == "aitk-nokv" ? L::TimestepZero : lay == "index" ? L::Index
+                                                                                                             : L::TextStart;
+        std::vector<strata::image::MossDit::RefLatent> lat;
+        for (size_t i = 0; i < list.size();) {
+            const size_t j = std::min(list.find(',', i), list.size());
+            std::vector<int64_t> rs;
+            const auto z = npy(list.substr(i, j - i), &rs);
+            if (rs.size() != 4 || rs[1] != Cl) throw std::runtime_error(list.substr(i, j - i) + ": not [1][128][h][w]");
+            const int64_t rhw = rs[2] * rs[3];
+            std::vector<float> zt((size_t) (rhw * Cl));
+            for (int64_t c = 0; c < Cl; ++c)
+                for (int64_t p = 0; p < rhw; ++p) zt[(size_t) (p * Cl + c)] = z[(size_t) (c * rhw + p)];
+            refs.push_back(put(zt));
+            lat.push_back({refs.back(), rs[2], rs[3]});
+            i = j + 1;
+        }
+        t0 = std::chrono::steady_clock::now();
+        d.set_refs(lat, layout);
+        strata::gpu::stream_sync(s);
+        std::printf("references (%s, %zu): %.1f ms\n", lay.empty() ? "moss" : lay.c_str(), lat.size(),
+                    1e3 * seconds_since(t0));
+    }
     std::vector<float> xt((size_t) (HW * Cl));   // the noise as tokens [h w][128]
     for (int64_t c = 0; c < Cl; ++c)
         for (int64_t p = 0; p < HW; ++p) xt[(size_t) (p * Cl + c)] = noise[(size_t) (c * HW + p)];
@@ -181,6 +226,8 @@ int run(const std::string& path, const std::string& dir, bool q8) {
         std::vector<float> v((size_t) (HW * Cl));
         for (int64_t p = 0; p < HW; ++p)
             for (int64_t c = 0; c < Cl; ++c) v[(size_t) (c * HW + p)] = o[(size_t) ((i * HW + p) * Cl + c)];
+        if (const char* e = std::getenv("MOSS_PROBE_DUMP"))
+            save_npy(std::string(e) + (i == 0 ? "/cond.npy" : "/uncond.npy"), v, {1, Cl, h, w});
         compare(i == 0 ? "cond" : "uncond", v, npy(dir + (i == 0 ? "/step0-cond.npy" : "/step0-uncond-skip22.npy")));
     }
     const char* re = std::getenv("MOSS_PROBE_RUNS");
@@ -202,6 +249,7 @@ int run(const std::string& path, const std::string& dir, bool q8) {
     std::printf("time_forms(%lld rows): FP16 %.2f ms, W8A8 %.2f ms\n", (long long) HW, 1e3 * f16, 1e3 * w8);
     strata::gpu::free(out);
     strata::gpu::free(x);
+    for (float* r : refs) strata::gpu::free(r);
     return 0;
 }
 

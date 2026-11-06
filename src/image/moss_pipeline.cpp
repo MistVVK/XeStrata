@@ -38,6 +38,9 @@ constexpr uint64_t kTextWork = 1280 * kMiB;
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
+// an edit's references in the stream at every step (MossDit::set_refs), rather than kept as keys and values
+bool in_stream(QiRefLayout l) { return l == QiRefLayout::TimestepZero || l == QiRefLayout::Index; }
+
 // The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
 // (their code, their workspaces), other programs', and what the allocations take past their sizes.  The HIP runtime
 // takes a block of 1 to 2 MiB as 2 MiB and a larger one in steps of 2 MiB (the RX 9060 XT, ROCm 7.1 and 10.1,
@@ -285,7 +288,7 @@ uint64_t MossPipeline::held() const {
     if (vae_) b += vae_->weight_bytes() + vae_->scratch_held() + (vae_->has_encoder() ? vae_->encoder_bytes() : 0);
     if (dit_) {
         b += dit_->weight_bytes() + dit_->lora_bytes() + dit_->scratch_bytes() + dit_->blocks_vram() +
-             dit_->activations_held() + dit_->ref_bytes(dit_->ref_rows());
+             dit_->activations_held() + dit_->ref_bytes(dit_->ref_rows()) + dit_->stream_bytes(dit_->stream_rows());
         if (dit_->text_loaded()) b += dit_->text_bytes();
     }
     if (te_) b += text_fixed() + te_->layers_vram();
@@ -308,13 +311,19 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
         ref_enc = std::max(ref_enc, vae.encode_scratch_bytes(rh / 16, rw / 16) + (uint64_t) (3 * rw * rh) * 4 +
                                         (uint64_t) ((rw / 16) * (rh / 16) * dit.latent_channels()) * 4);
     }
-    const int64_t hw = std::max(h * w, R);   // the activations' rows: the image's, or the references' at their pass
-    const int64_t max_text = std::max(n_text, n_neg);
+    // the references in the stream (ai-toolkit's with its kv_cache off; MossDit::set_refs) are rows after each
+    // context's text: no pass of their own, no keys and values kept
+    const bool stream = in_stream(ref_layout_);
+    const int64_t hw = stream ? h * w : std::max(h * w, R);   // the activations' rows: the image's, or the
+                                                              // references' at their pass
+    const int64_t max_text = std::max(n_text, n_neg) + (stream ? R : 0);
+    const int64_t kept = stream ? 0 : R;
     const int n = n_neg > 0 ? 2 : 1;
     // the adapters: their A and B (in VRAM for the request, the blocks streamed or not), and the products' scratch of a
     // step's rows; nothing bound yet, so the DiT's activations here hold none of it
     const uint64_t lora = lora_gpu_bytes(loras, n * (hw + max_text));
-    uint64_t base = ref_enc, fixed = vae.weight_bytes() + dit.text_bytes() + lora + dit.ref_bytes(R);
+    uint64_t base = ref_enc,
+             fixed = vae.weight_bytes() + dit.text_bytes() + lora + (stream ? dit.stream_bytes(R) : dit.ref_bytes(R));
     if (R > 0 && base_encoder_) fixed += vae.encoder_bytes();
     if (mask && base_encoder_) {   // a base image: its encode, and its latent (and a mask's) kept
         fixed += (R > 0 ? 0 : vae.encoder_bytes()) + LatentStart::bytes(dit.latent_channels() * h * w, h * w, true);
@@ -328,11 +337,11 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
     const uint64_t te = (states_given_ ? 0 : text_fixed() + 2 * te_layer_max_) + vis;
     QiNeed nd;
     nd.least = fixed + dit.weight_bytes() + dit.scratch_bytes() +
-               std::max({dit.activation_bytes(hw, n, max_text, 512, R) + dit.block_min(), te,
+               std::max({dit.activation_bytes(hw, n, max_text, 512, kept) + dit.block_min(), te,
                          vae.least_scratch_bytes(h, w), base});
     nd.full = fixed + full.weight_bytes() + full.scratch_bytes() + full.block_bytes() +
               (states_given_ ? 0 : text_fixed() + te_layers_) + vis +
-              std::max({full.activation_bytes(hw, n, max_text, 0, R), vae.scratch_bytes(h, w), base});
+              std::max({full.activation_bytes(hw, n, max_text, 0, kept), vae.scratch_bytes(h, w), base});
     vram_into(nd);
     return nd;
 }
@@ -380,16 +389,21 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
     MossDit& d = *dit_;
     p.fixed = d.weight_bytes() + d.lora_bytes() + d.scratch_bytes() +
               (text || d.text_loaded() ? d.text_bytes() : 0) + vae_->weight_bytes() +
-              (vae_->has_encoder() ? vae_->encoder_bytes() : 0) + d.ref_bytes(ref_rows_);
+              (vae_->has_encoder() ? vae_->encoder_bytes() : 0) +
+              (in_stream(ref_layout_) ? d.stream_bytes(ref_rows_) : d.ref_bytes(ref_rows_));
     p.lora = d.lora_bytes();
     p.lora_n = d.lora_count();
     if (p.budget <= p.fixed)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay");
     const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
-    // an edit's references: their pass over the blocks takes the activations' rows too (set_refs; activation_bytes)
+    // an edit's references: their pass over the blocks takes the activations' rows too (set_refs; activation_bytes);
+    // in the stream, they are rows after each context's text instead
+    const bool stream = in_stream(ref_layout_);
+    const int64_t kept = stream ? 0 : ref_rows_;
+    if (stream && hw > 0) max_text += ref_rows_;
     const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
-                                  [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows, ref_rows_); });
+                                  [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows, kept); });
     if (avail < p.activations + dit_min)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is too small for this image");
@@ -608,6 +622,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             throw std::invalid_argument("image engine: a reference image's sides must be multiples of 16");
         ref_rows_ += (f.width / 16) * (f.height / 16);
     }
+    ref_layout_ = r.refs_layout;
     // an ai-toolkit edit's pictures: each <|image_pad|> of the prompt (and of the negative prompt) widened to the
     // picture's tokens, one per 32 x 32 pixels
     for (const QiRef& f : r.pictures)
@@ -679,7 +694,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     const bool own = !te_part.empty();
     const int64_t rows0 = r.te_rows > 0 && !own ? r.te_rows : (int64_t) ids0.size();
     const int64_t rows1 = guided ? (r.neg_te_rows > 0 && !own ? r.neg_te_rows : (int64_t) ids1.size()) : 0;
-    ensure_open(want_q8(h * w, n, std::max(rows0, rows1)));
+    ensure_open(want_q8(h * w, n, std::max(rows0, rows1) + (in_stream(ref_layout_) ? ref_rows_ : 0)));
     MossDit& d = *dit_;
     if (d.ref_rows() > 0) d.set_refs({});   // the last edit's references: this request makes its own (or has none)
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
@@ -772,13 +787,13 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             // allocating it again at the decode cost a 1 MP edit's decode a fifth (B70, 2026-11-04), but a card that
             // streams the blocks (the RTX 4070's 12 GB) needs the room for their layers
             if (d.resident_blocks() < d.blocks() || vae_->scratch_held() > p.vae - p.activations) vae_->drop_scratch();
-            d.set_refs(lat, !r.refs_aitk);
+            d.set_refs(lat, r.refs_layout);
         } catch (...) {
             for (float* p0 : z) gpu::free(p0);
             throw;
         }
         for (float* p0 : z) gpu::free(p0);
-    } else if (d.ref_rows() > 0) {
+    } else if (d.ref_rows() > 0 || d.stream_rows() > 0) {
         d.set_refs({});
     }
     const auto t1 = clock::now();

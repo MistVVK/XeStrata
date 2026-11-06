@@ -30,6 +30,7 @@
 
 #include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
+#include "strata/image/pipeline.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -72,15 +73,22 @@ public:
     /// and attending to each other alone, and each block's keys and values of them are kept (their v heads' scales
     /// with them); at every step the rows of each context attend to them as well, their keys before the context's
     /// own.  Called after the adapters are bound (the blocks they go through are the adapted ones); empty: none, the
-    /// kept keys and values freed.  `text_start` false: an ai-toolkit adapter's layout (ComfyUI's
+    /// kept keys and values freed.  `layout` Isolated: an ai-toolkit adapter's (ComfyUI's
     /// "index_timestep_zero_isolated"), each context's image and text rows on f moved back by the context's rows (the
-    /// references keep f = 0; Moss-Image-Edit's, true, leave them where a picture without references has them).
+    /// references keep f = 0; Moss-Image-Edit's, TextStart, leave them where a picture without references has them).
+    /// TimestepZero and Index, the references in the stream (ai-toolkit's with its kv_cache off; ComfyUI's
+    /// "index_timestep_zero" and "index"): f as Isolated's, but their rows go after each context's text at every step,
+    /// attending to all of its rows and they to them, modulated at timestep 0 (TimestepZero) or at the step's (Index);
+    /// only their input projection is kept (stream_rows of them a context).
     struct RefLatent {
         const float* tokens;
         int64_t h, w;
     };
-    void set_refs(const std::vector<RefLatent>& refs, bool text_start = true);
+    void set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout = QiRefLayout::TextStart);
     int64_t ref_rows() const { return ref_rows_; }
+    int64_t stream_rows() const { return stream_rows_; }
+    /// The VRAM the input projection of `rows` references in the stream takes.
+    uint64_t stream_bytes(int64_t rows) const { return (uint64_t) rows * C_ * 4; }
     /// The VRAM the kept keys and values of `rows` reference rows take.
     uint64_t ref_bytes(int64_t rows) const;
 
@@ -207,7 +215,7 @@ private:
         std::vector<int> skip;
         // the RoPE's tables of the context's rows, [h w + rows][64] (for the size they were made for)
         float *cos = nullptr, *sin = nullptr;
-        int64_t rope_h = -1, rope_w = -1, rope_rows = -1, rope_off = 0;
+        int64_t rope_h = -1, rope_w = -1, rope_rows = -1, rope_off = 0, rope_refs = 0;
     };
     W dense(const std::vector<std::string>& names, bool biased, const float** bias, std::vector<void*>& owned,
             uint64_t& bytes);
@@ -310,6 +318,7 @@ private:
         const float* gate = nullptr;
         float* x = nullptr;
         int64_t R = 0;
+        AltRows rr;
     } pend_;
     float* pend_sw_ = nullptr;
     void flush_pending();
@@ -326,6 +335,13 @@ private:
     uint64_t ref_i8_stride_ = 0;
     bool ref_i8_on_ = false;
     bool refs_in_i8(int64_t rows) const;
+    // the references in the stream (TimestepZero, Index): their rows through the input projection [R][C], and the
+    // modulation's six rows at timestep 0 after mod_'s (TimestepZero's)
+    float* ref_x_ = nullptr;
+    int64_t stream_rows_ = 0;
+    std::vector<std::pair<int64_t, int64_t>> ref_shapes_;   // the references' latent rows and columns
+    void ref_coord(int64_t r, float* p) const;
+    bool stream_t0_ = false;
     bool ref_text_start_ = true, capture_ = false;
     int cur_block_ = 0;
 };

@@ -27,6 +27,12 @@ struct QiRef {
     int64_t width = 0, height = 0;
 };
 
+// MOSS-Image's edits: where an edit adapter's references sit beside the image, as ComfyUI's ref_latents_method names
+// it (MossDit::set_refs).  TextStart: Moss-Image-Edit's ("index_timestep_zero_text_start"); Isolated: ai-toolkit's
+// with its kv_cache on ("index_timestep_zero_isolated"); TimestepZero: ai-toolkit's with it off
+// ("index_timestep_zero"); Index: the references at the image's timestep ("index")
+enum class QiRefLayout { TextStart, Isolated, TimestepZero, Index };
+
 struct QiRequest {
     std::vector<int32_t> ids;   // the prompt in the model's chat form, tokenized; an edit's one <|image_pad|> per ref
     int64_t drop = 0;           // the leading ids whose states the DiT does not take (the system turn)
@@ -36,10 +42,10 @@ struct QiRequest {
     int64_t steps = 0;          // with no sigmas: the sampler's steps (0: the model's own).  HunyuanImage 3.0's
                                 // schedule is the shift of its own sampler; a fixed-schedule model leaves this.
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
-    // MOSS-Image's edits with an ai-toolkit adapter (its layout: MossDit::set_refs's text_start false): the pictures
-    // the text encoder sees, each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens:
-    // its sides, multiples of 32, over 32 each), their tokens' rows from the vision encoder
-    bool refs_aitk = false;
+    // MOSS-Image's edits: the references' layout (an ai-toolkit adapter's also has pictures: the text encoder sees
+    // each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens: its sides, multiples of
+    // 32, over 32 each), their tokens' rows from the vision encoder)
+    QiRefLayout refs_layout = QiRefLayout::TextStart;
     // Crop and Stitch's color match of the drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
     // around the paint (the default's: the drawing's drift only), 2 the whole cut (ComfyUI's ColorTransfer)
     int crop_color = 0;

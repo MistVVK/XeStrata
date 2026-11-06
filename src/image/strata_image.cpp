@@ -58,9 +58,11 @@
 //                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
 //                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
-//                            MOSS-Image's edits: EDITFMT:aitk an ai-toolkit adapter's layout (EDITFMT:moss, the
-//                            default, Moss-Image-Edit's; MossDit::set_refs), PIC:<path> a picture the text encoder sees
-//                            (at the ids' next <|image_pad|>; its sides multiples of 32; --vision, Qwen3.5-9B's mmproj);
+//                            MOSS-Image's edits: EDITFMT:aitk an ai-toolkit adapter's layout, EDITFMT:aitk-nokv one
+//                            trained with its kv_cache off, EDITFMT:index the references at the image's timestep
+//                            (EDITFMT:moss, the default, Moss-Image-Edit's; QiRefLayout), PIC:<path> a picture the text
+//                            encoder sees (at the ids' next <|image_pad|>; its sides multiples of 32; --vision,
+//                            Qwen3.5-9B's mmproj);
 //                            CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height> Crop and Stitch (img_crop.hpp): the mask's
 //                            box of the base image drawn at <width> <height> and put back, the image at the base
 //                            image's own size (its partial images too), the IMAGE line's crop_s the steps' time;
@@ -267,6 +269,16 @@ std::string decoded_path(const std::string& s) {
     return out;
 }
 
+// EDITFMT:<moss|aitk|aitk-nokv|index>: MOSS-Image's edit adapter's layout (QiRefLayout)
+si::QiRefLayout ref_layout(const std::string& word) {
+    const std::string f = word.substr(8);
+    if (f == "moss") return si::QiRefLayout::TextStart;
+    if (f == "aitk") return si::QiRefLayout::Isolated;
+    if (f == "aitk-nokv") return si::QiRefLayout::TimestepZero;
+    if (f == "index") return si::QiRefLayout::Index;
+    throw std::invalid_argument("EDITFMT:<moss|aitk|aitk-nokv|index>: " + word);
+}
+
 void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
     const std::string rest = word.substr(5);
     const size_t colon = rest.find(':');
@@ -293,8 +305,7 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
         else if (word.rfind("CROP:", 0) == 0 && crop != nullptr) *crop = si::parse_crop(word);
         else if (word.rfind("PIC:", 0) == 0) r.pictures.push_back(read_image(word.substr(4)));
-        else if (word == "EDITFMT:aitk") r.refs_aitk = true;
-        else if (word == "EDITFMT:moss") r.refs_aitk = false;
+        else if (word.rfind("EDITFMT:", 0) == 0) r.refs_layout = ref_layout(word);
         else if (word == "UPSCALE") r.upscale = true;
         else if (word.rfind("UPS:", 0) == 0) r.upscaler = word.substr(4);
         else if (word.rfind("UPSCOLOR:", 0) == 0) r.upscaler_color = word.substr(9);
@@ -398,9 +409,11 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
             crop = si::parse_crop(word);
             continue;
         }
-        if (word.rfind("EDITFMT:", 0) == 0 || word.rfind("COLOR:", 0) == 0 || word == "UPSCALE" ||
-            word.rfind("TILES:", 0) == 0)
+        if (word.rfind("EDITFMT:", 0) == 0) {
+            r.refs_layout = ref_layout(word);
             continue;
+        }
+        if (word.rfind("COLOR:", 0) == 0 || word == "UPSCALE" || word.rfind("TILES:", 0) == 0) continue;
         if (word.rfind("UPS:", 0) == 0) {
             r.upscaler = word.substr(4);
             continue;
@@ -962,11 +975,13 @@ int serve(si::ImagePipeline& p) {
                 if (moss != nullptr) {
                     moss->set_states_given(states);
                     moss->set_pictures_given(pictures);
+                    moss->set_ref_layout(lr.refs_layout);
                 }
                 si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
                 if (moss != nullptr) {
                     moss->set_states_given(false);
                     moss->set_pictures_given({});
+                    moss->set_ref_layout(si::QiRefLayout::TextStart);
                 }
                 if (!lr.upscaler.empty()) {   // the upscaler runs before the drawing, the image model's cache given back
                     su::UpscaleModel& m = ups.get(lr.upscaler);

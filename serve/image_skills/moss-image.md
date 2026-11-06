@@ -4,7 +4,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 -->
 # MOSS-Image
 
-When: a MOSS-Image image: a layout of boxes (posters, signs, panels) or an edit with a painted part.
+When: a MOSS-Image image: boxes (posters, signs, panels), an edit with a painted part or a named edit LoRA.
 
 - Give generate_image a `layout` only when the user says where things or words go: a poster, a sign, several panels.
 - With a layout, the prompt is a short description of the whole image.
@@ -16,3 +16,5 @@ When: a MOSS-Image image: a layout of boxes (posters, signs, panels) or an edit 
 - edit_image with a painted part and more images than the one edited: first without `refine`. Only when the painted
   part comes out poor (blurred, broken, or without what the other images were to give it), edit the same image again
   (`image` the one edited before, not the result) with `refine` true.
+- An edit LoRA the user names ("use armv6", "with the X LoRA"): edit_image's `edit_adapter`, the name as it is listed
+  there. Never give one the user did not name. When the result says it cannot be used, tell the user why.

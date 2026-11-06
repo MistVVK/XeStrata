@@ -869,10 +869,11 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "vae": str(local_path(models_dir, "moss-vae")),
                 "edit_lora": str(local_path(models_dir, "moss-edit-lora")), "edit_adapter": "chinoll",
                 "edit_adapters": {"chinoll": {"lora": str(local_path(models_dir, "moss-edit-lora")),
-                                              "format": "moss-image-edit"},
+                                              "format": "moss-image-edit", "about": "chinoll's Moss-Image-Edit"},
                                   **{v: {"lora": str(local_path(models_dir, f"moss-edit-{v}")), "format": "ai-toolkit",
-                                         "vision": str(local_path(models_dir, "moss-mmproj"))}
-                                     for v in ("armv5", "armv6")}},
+                                         "vision": str(local_path(models_dir, "moss-mmproj")), "about": about}
+                                     for v, about in (("armv5", "akhaliq's MOSS-Image-Edit-HQ armV5"),
+                                                      ("armv6", "akhaliq's MOSS-Image-Edit-HQ armV6"))}},
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):

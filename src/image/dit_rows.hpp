@@ -246,6 +246,7 @@ struct RmsAffine {
     int64_t C;
     float eps;
     bool one_plus = false;
+    AltRows alt{};   // rows whose scale and shift are another set's
     template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
         const float* r = x + t * C;
         float s = 0.f;
@@ -253,14 +254,15 @@ struct RmsAffine {
         return {0.f, 1.f / sycl::sqrt(reduce(s) / (float) C + eps)};
     }
     float value(int64_t t, int64_t c, const Stats& st) const {
+        const int64_t m = c + alt.at(t);
         if (one_plus) {   // (its weight given)
             const float y = x[t * C + c] * st.inv * w[c];
-            return scale != nullptr ? y * (1.f + scale[c]) + shift[c] : y;
+            return scale != nullptr ? y * (1.f + scale[m]) + shift[m] : y;
         }
         float y = x[t * C + c] * st.inv;
         if (w != nullptr) y *= w[c];
-        if (scale != nullptr) y *= scale[c];
-        return shift != nullptr ? y + shift[c] : y;
+        if (scale != nullptr) y *= scale[m];
+        return shift != nullptr ? y + shift[m] : y;
     }
 };
 

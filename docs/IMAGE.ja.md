@@ -147,7 +147,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
-| `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6`、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
+| `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6` か `edit_adapters` に足した名前、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
 | `image_tools` | すべて | チャットのモデルが使ってよい画像の道具の一覧（`generate_image`・`edit_image`）。ここにない道具は、チャットにも Images API にも出しません |
 | `crop_stitch` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
 | `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
@@ -296,6 +296,8 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
    - `color_match` に `auto` を付けると、描いた部分を貼り戻す前に、塗った部分のすぐ外（元のまま残る所）で元の画像と描いた画像の色（Lab の平均と標準偏差）をそろえ、モデルの色のずれだけを直します。塗った部分の中で頼んだ色の変更は打ち消しません。`full` は ComfyUI の Transfer Color（reinhard_lab）と同じく、切り出した全体の色を元の画像に寄せます（頼んだ色の変更も薄まります）。既定は `off`（設定の `images` の `color_match` で変えられます）で、試したモデル（Qwen-Image-2.1-Turbo、MOSS-Image）では描いた後の色のずれが小さかったためです。
    - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です（ComfyUI の Text Encode MOSS-Image Edit の ai-toolkit と同じ）。
+   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（ComfyUI の Edit Model Reference Method の `index`。thearkorbit の moss-image-edit-lora-poc）は `index` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
+   - LoRA の置き場（`lora_dir`）に置いた MOSS-Image の編集の LoRA も、形がファイルから分かれば選べます。分かるのは、隣の `<名前>.json` の `"edit_format"`、Moss-Image-Edit の形のメタデータ（`adapter_config` の `moss-edit-lora`）、ai-toolkit が出力に書く学習の設定（隣の `<名前>.yaml` か、ジョブの名前が同じ `config.yaml`）の `model_kwargs` の `edit` と `kv_cache` です。チャットで「armv6 の LoRA で」のように名指しすると、チャットのモデルが `edit_image` の `edit_adapter` でその LoRA を選び、Images API の編集でも `edit_adapter` に名前を書けます。使えない名前（形の分からない LoRA など）は、既定の LoRA で描かずに理由を返します。
    - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです（ComfyUI の Inpaint Crop and Stitch でも同じでした）。
      `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
    - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。

@@ -60,6 +60,22 @@ template<class T, int W> struct alignas(sizeof(T) * W) Packed {
     T v[W];
 };
 
+/// The rows of a block's run that take their modulation from another set, alt floats past the step's (0 for every row:
+/// none): [r0, e0) and [r1, ...) of the run, read t0 rows on (MossDit's references in the stream: the last rows of
+/// each context's, at timestep 0).
+struct AltRows {
+    int64_t r0 = INT64_MAX, e0 = 0, r1 = INT64_MAX, t0 = 0, alt = 0;
+    int64_t at(int64_t t) const {
+        t += t0;
+        return (t >= r0 && t < e0) || t >= r1 ? alt : 0;
+    }
+    AltRows from(int64_t rows) const {
+        AltRows r = *this;
+        r.t0 += rows;
+        return r;
+    }
+};
+
 /// A product's output [T][C] as its readers take it: FP32 sums (f) times the rows' scales (rs, null: 1), or a W8A8
 /// product's int32 sums (i) times the activations' scales (sx, a row) and the weights' (sw, a column); plus the bias
 /// (b, null: none).

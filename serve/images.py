@@ -290,9 +290,13 @@ MOSS_MAX_REFS = 4
 # the layouts edit adapters are trained in, as ComfyUI's TextEncodeMOSSImageEdit has them (moss_edit_format): chinoll's
 # Moss-Image-Edit; ai-toolkit's (ostris), whose text encoder sees the references too (each as "Picture N:" before the
 # prompt, at most MOSS_PICTURE_PIXELS, the node's 384 x 384), their latents at most MOSS_AITK_REF_PIXELS (its
-# control_image_max_pixels, akhaliq's armV5's) and its steps and guidance MOSS-Image's own; and ai-toolkit's with its
-# kv_cache off (the references in the sequence at every step)
-MOSS_EDIT_FORMATS = ("moss-image-edit", "ai-toolkit", "ai-toolkit-no-kv")
+# control_image_max_pixels, akhaliq's armV5's) and its steps and guidance MOSS-Image's own; ai-toolkit's with its
+# kv_cache off (the references in the sequence at every step, at timestep 0); and "index", ComfyUI's method of that
+# name (the references in the sequence at the image's timestep, no picture to the text encoder; thearkorbit's
+# moss-image-edit-lora-poc), its references and steps as ai-toolkit's.  The engine's EDITFMT: word of each but the
+# first (QiRefLayout)
+MOSS_EDIT_FORMATS = ("moss-image-edit", "ai-toolkit", "ai-toolkit-no-kv", "index")
+MOSS_EDITFMT_WORDS = {"ai-toolkit": "aitk", "ai-toolkit-no-kv": "aitk-nokv", "index": "index"}
 # the edit adapter setup's config names by default among its "edit_adapters" (tools/image/qimage.py says why); the
 # config's "edit_adapter" chooses another, and XESTRATA_MOSS_EDIT over it (moss_edit_adapter)
 MOSS_EDIT_DEFAULT = "chinoll"
@@ -1312,13 +1316,19 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     # Mage-Flow's edit model has its own steps; MOSS-Image's edits their steps and guidance (MOSS_EDIT_STEPS)
     if mage and edits:
         job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")})
-    elif moss and edits:   # Moss-Image-Edit's steps and guidance; an ai-toolkit adapter's are MOSS-Image's own
+    elif moss and edits:   # Moss-Image-Edit's steps and guidance; the other layouts' are MOSS-Image's own
+        if req.get("edit_adapter") not in (None, ""):   # the edit adapter the request names (moss_pick_adapter)
+            a = moss_pick_adapter(cfg, str(req["edit_adapter"]))
+            cfg = {**cfg, "edit_adapter": str(req["edit_adapter"]), "edit_lora": a["lora"], "edit_format": a["format"]}
         dflt = model_defaults(cfg)
         fmt = moss_edit_format(cfg)
         job = parse_request(req, {**cfg, "steps": dflt["edit_steps"], "cfg_scale": dflt["edit_guidance"]}
                             if fmt == "moss-image-edit" else cfg)
         job["edit_format"] = fmt
     else:
+        if req.get("edit_adapter") not in (None, ""):
+            raise ImageRequestError("edit_adapter: MOSS-Image's edits' alone"
+                                    + ("" if moss else f" ({cfg.get('model_name') or 'this model'} is not MOSS-Image)"))
         job = parse_request(req, cfg)
     if edits:
         job["refs"] = list(images)
@@ -2034,9 +2044,10 @@ def moss_edit_adapter(cfg: dict) -> dict:
 def moss_edit_format(cfg: dict) -> str:
     """The layout of the config's MOSS-Image edit adapter (MOSS_EDIT_FORMATS): the config's "edit_format", else the
     file's: Moss-Image-Edit's where its metadata's adapter_config says "moss-edit-lora", else ai-toolkit's (an
-    ai-toolkit file says only that it is ai-toolkit's, not how its references were laid out: its kv_cache on, the
-    default; SimpleTuner's edit adapters, its metadata's modelspec.architecture "moss_image-sft-edit/lora", are trained
-    in that layout as well)."""
+    ai-toolkit file says only that it is ai-toolkit's, not whether its kv_cache was on: on, as the published edit
+    adapters have it (akhaliq's armA to armV7s1, 7err4's and pleiades7's CharRef), though ai-toolkit's own default is
+    off - an adapter trained with it off is "ai-toolkit-no-kv" in the config; SimpleTuner's edit adapters, its
+    metadata's modelspec.architecture "moss_image-sft-edit/lora", are trained in the kv_cache-on layout as well)."""
     fmt = cfg.get("edit_format")
     if fmt:   # setup's edit_adapters say it; a config of its own may
         if fmt not in MOSS_EDIT_FORMATS:
@@ -2047,14 +2058,111 @@ def moss_edit_format(cfg: dict) -> str:
 
 @functools.lru_cache(maxsize=8)
 def _adapter_format(path: str) -> str:
+    return "moss-image-edit" if _moss_edit_meta(path) else "ai-toolkit"
+
+
+def _moss_edit_meta(path: str) -> bool:
+    """A safetensors file whose metadata's adapter_config says it is Moss-Image-Edit's ("moss-edit-lora")."""
     try:
         with open(path, "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             meta = json.loads(f.read(n)).get("__metadata__") or {}
         conf = json.loads(meta.get("adapter_config") or "{}")
     except (OSError, ValueError, struct.error):
-        return "ai-toolkit"
-    return "moss-image-edit" if isinstance(conf, dict) and conf.get("format") == "moss-edit-lora" else "ai-toolkit"
+        return False
+    return isinstance(conf, dict) and conf.get("format") == "moss-edit-lora"
+
+
+def _aitk_edit(config: Path, stem: str | None) -> bool | None:
+    """An ai-toolkit job's config.yaml: its model_kwargs' kv_cache (True or False) where its edit is true, else None;
+    `stem` (a shared config.yaml): only where the job's name is the file's ("armV5", or "armV5_000000750" a step's).
+    Read by its lines, as ai-toolkit writes it (config: name, process: ... model: model_kwargs: edit, kv_cache)."""
+    try:
+        lines = config.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    name, kw, edit, kv, indent = None, False, False, False, -1
+    for line in lines:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        key, _, value = text.partition(":")
+        depth = len(line) - len(line.lstrip())
+        value = value.strip().strip("'\"")
+        if key == "name" and name is None and depth <= 2:
+            name = value
+        if kw and depth <= indent:
+            kw = False
+        if key == "model_kwargs":
+            kw, indent = True, depth
+        elif kw and key == "edit":
+            edit = value.lower() == "true"
+        elif kw and key == "kv_cache":
+            kv = value.lower() == "true"
+    if stem is not None and not (name and (stem == name or re.fullmatch(re.escape(name) + r"_\d+", stem))):
+        return None
+    return kv if edit else None
+
+
+def moss_edit_layout(path: Path) -> str | None:
+    """The layout (MOSS_EDIT_FORMATS) a file in the LoRA folder is a MOSS-Image edit adapter in, from the files, else
+    None (not one, or not one that says so): <name>.json beside it with an "edit_format"; Moss-Image-Edit's metadata;
+    an ai-toolkit job's config (<name>.yaml, or the config.yaml ai-toolkit writes beside its output, of the same job
+    name) with edit true - kv_cache on "ai-toolkit", off "ai-toolkit-no-kv".  An ai-toolkit file's own metadata says
+    neither that it edits nor its kv_cache, and "index" has no trainer's config to say it."""
+    try:
+        fmt = json.loads(path.with_suffix(".json").read_text()).get("edit_format")
+        if fmt in MOSS_EDIT_FORMATS:
+            return fmt
+    except (OSError, ValueError, AttributeError):
+        pass
+    if _moss_edit_meta(str(path)):
+        return "moss-image-edit"
+    for config, stem in ((path.with_suffix(".yaml"), None), (path.parent / "config.yaml", path.stem)):
+        kv = _aitk_edit(config, stem)
+        if kv is not None:
+            return "ai-toolkit" if kv else "ai-toolkit-no-kv"
+    return None
+
+
+def moss_edit_adapters(cfg: dict) -> dict[str, dict]:
+    """The MOSS-Image edit adapters a request may name (edit_adapter): the config's "edit_adapters" (setup's chinoll,
+    armv5 and armv6: {"lora", "format", "vision", "about"}), then the LoRA folder's files moss_edit_layout knows, by
+    their listing's names - ai-toolkit's with the config's vision encoder (Qwen3.5-9B's mmproj; without it, not
+    offered)."""
+    out = {k: dict(v) for k, v in (cfg.get("edit_adapters") or {}).items()}
+    vision = cfg.get("vision") or next((a.get("vision") for a in out.values() if a.get("vision")), None)
+    folder = lora_api.folder(cfg)
+    have = {os.path.realpath(a["lora"]) for a in out.values() if a.get("lora")}
+    for e in folder.listing():
+        if e["name"] in out or os.path.realpath(folder.dir / e["path"]) in have:
+            continue
+        fmt = moss_edit_layout(folder.dir / e["path"])
+        if fmt is None or (fmt.startswith("ai-toolkit") and not vision):
+            continue
+        out[e["name"]] = {"lora": str(folder.dir / e["path"]), "format": fmt,
+                          "vision": vision if fmt.startswith("ai-toolkit") else None, "about": f"LoRA folder, {fmt}"}
+    return out
+
+
+def moss_pick_adapter(cfg: dict, name: str) -> dict:
+    """The edit adapter `name` of moss_edit_adapters, or ImageRequestError saying why it cannot be used (not there,
+    or a LoRA of the folder that does not say it is an edit adapter, or one that needs the vision encoder)."""
+    adapters = moss_edit_adapters(cfg)
+    if name in adapters:
+        return adapters[name]
+    folder = lora_api.folder(cfg)
+    known = {e["name"]: e for e in folder.listing()}
+    if name in known:
+        fmt = moss_edit_layout(folder.dir / known[name]["path"])
+        why = (f"{name} is an ai-toolkit edit adapter, and Qwen3.5-9B's vision encoder (mmproj) it needs is not set up "
+               "(run setup with --images)" if fmt else
+               f"{name} is a LoRA of the folder that does not say it is a MOSS-Image edit adapter: put {name}.json "
+               'beside it with {"edit_format": ...} (' + ", ".join(MOSS_EDIT_FORMATS) + ") or its ai-toolkit "
+               "config.yaml")
+    else:
+        why = f"no MOSS-Image edit adapter {name}"
+    raise ImageRequestError(f"edit_adapter: {why}; the edit adapters here: {', '.join(adapters) or 'none'}")
 
 
 def moss_picture(data: bytes, box: list | None = None) -> bytes:
@@ -2446,6 +2554,11 @@ class ImageGen:
         self.family = self.cfg.get("family") or "qwen-image"
         if self.family == "moss-image":   # its edit adapter, as the config or the environment chooses
             self.cfg.update(moss_edit_adapter(self.cfg))
+            # the engine opens the vision encoder where any adapter a request may name needs it (moss_pick_adapter;
+            # it reads it only for a request with pictures)
+            if not self.cfg.get("vision"):
+                self.cfg["vision"] = next((a["vision"] for a in (self.cfg.get("edit_adapters") or {}).values()
+                                           if a.get("vision")), None)
         for k in self._file_keys():
             if not isinstance(self.cfg.get(k), str) or not self.cfg[k]:
                 raise ValueError(f'the config\'s "images" section needs "{k}" (run setup with --images again)')
@@ -2761,9 +2874,9 @@ class ImageGen:
 
     @staticmethod
     def _crop_ref(job: dict) -> tuple[int, int] | None:
-        """An ai-toolkit MOSS-Image edit's first reference beside a Crop and Stitch drawing: the cut at the references'
-        size (MOSS_AITK_REF_PIXELS), as the other references are, where it is smaller than the drawing."""
-        if not (job.get("edit_format", "").startswith("ai-toolkit") and job.get("refs")):
+        """An ai-toolkit (or "index") MOSS-Image edit's first reference beside a Crop and Stitch drawing: the cut at the
+        references' size (MOSS_AITK_REF_PIXELS), as the other references are, where it is smaller than the drawing."""
+        if not (job.get("edit_format") in MOSS_EDITFMT_WORDS and job.get("refs")):
             return None
         gw, gh = job["crop"]["gen"]
         ref = moss_ref_size(gw, gh, MOSS_AITK_REF_PIXELS, grow=False)
@@ -2783,7 +2896,8 @@ class ImageGen:
                  + (" UPSCALE" + ImageGen._ups_words(job, need) if job.get("upscale") else "")
                  + ("" if not job.get("tiles") else
                     f" TILES:{job['tiles']['tile']},{job['tiles']['pad']},{job['tiles']['blur']}")
-                 + (" EDITFMT:aitk" if job.get("edit_format", "").startswith("ai-toolkit") else "")
+                 + (f" EDITFMT:{MOSS_EDITFMT_WORDS[job['edit_format']]}" if job.get("edit_format") in MOSS_EDITFMT_WORDS
+                    else "")
                  + "".join(f" PIC:{p}" for p in job.get("pic_paths") or ())
                  + (f" INIT:{job['init_path']}" if job.get("init_path") else "")
                  + (f" TE:{job['te_path']}" if job.get("te_path") else "")
@@ -3671,6 +3785,18 @@ class ImageTools:
                 params = dict(t["parameters"])   # refine is MOSS-Image's edits' alone
                 params["properties"] = {k: v for k, v in params["properties"].items() if k != "refine"}
                 t["parameters"] = params
+            adapters = {name: a for g in gens if g.family == "moss-image" and can_edit(g.cfg)
+                        for name, a in moss_edit_adapters(g.cfg).items()}
+            if t["name"] == "edit_image" and len(adapters) > 1:   # MOSS-Image's edit adapters, named by the user
+                default = next((g.cfg.get("edit_adapter") for g in gens if g.family == "moss-image"), None)
+                params = dict(t["parameters"])
+                params["properties"] = {**params["properties"], "edit_adapter": {
+                    "type": "string",
+                    "description": "MOSS-Image's edit LoRA, only when the user names one (their words for it): "
+                                   + "; ".join(f"{name}" + (f" ({a['about']})" if a.get("about") else "")
+                                               for name, a in adapters.items())
+                                   + (f"; default {default}" if default else "")}}
+                t["parameters"] = params
             if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "layout": {
@@ -3906,6 +4032,8 @@ class ImageTools:
                 req["layout"] = tidy_layout(layout, w, h)
             if name == "edit_image" and args.get("strength") not in (None, ""):
                 req["strength"] = args["strength"]
+            if name == "edit_image" and args.get("edit_adapter") not in (None, ""):
+                req["edit_adapter"] = args["edit_adapter"]
             if name == "edit_image" and args.get("refine") not in (None, ""):
                 req["refine"] = args["refine"]
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
