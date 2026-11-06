@@ -71,6 +71,19 @@ inline void mma_s8(int* d, const uint32_t* a, uint32_t b0, uint32_t b1, int c0) 
         : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c0));
 }
+/// c + the sum of a's four bytes as unsigned (dp4a against ones)
+inline uint32_t sum_u8x4(uint32_t a, uint32_t c) {
+    uint32_t d;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(0x01010101u), "r"(c));
+    return d;
+}
+/// d += A (16 x 32 uint8) . B (32 x 8 int8), int32 sums
+inline void mma_u8s8(int* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
 /// d += A (16 x 16) . B (16 x 8), FP16 or (BF) BF16 values, FP32 sums
 template<bool BF>
 inline void mma_f16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
