@@ -446,6 +446,38 @@ def cjxl() -> str | None:
     return _CJXL[0]
 
 
+_DJXL: list[str | None] = []
+
+
+def djxl() -> str | None:
+    """libjxl's decoder, djxl, found as cjxl is (the same packages and the Windows 7z carry both); None: a JPEG XL
+    input cannot be read."""
+    if not _DJXL:
+        beside = Path(__file__).resolve().parents[1] / "engine" / ("djxl.exe" if sys.platform == "win32" else "djxl")
+        _DJXL.append(shutil.which("djxl") or (str(beside) if beside.is_file() else None))
+    return _DJXL[0]
+
+
+def is_jxl(data: bytes) -> bool:
+    """A JPEG XL file: its bare codestream, or the ISO BMFF container."""
+    return data[:2] == b"\xff\x0a" or data[:12] == b"\x00\x00\x00\x0cJXL \r\n\x87\n"
+
+
+def decode_jxl(data: bytes) -> bytes:
+    """A JPEG XL input (one of this server's jxl outputs sent back, for one) as PNG by djxl: neither Pillow nor the
+    engines' decoders read it.  ValueError (the request's 400) without djxl or where it fails."""
+    exe = djxl()
+    if exe is None:
+        raise ValueError("a JPEG XL image needs libjxl's djxl on this computer (Ubuntu's libjxl-tools, Fedora's "
+                         "libjxl-utils); send PNG, JPEG or WebP instead")
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    r = subprocess.run([exe, "-", "-", "--output_format", "png", "--quiet"], input=data, capture_output=True,
+                       timeout=300, creationflags=no_window)
+    if r.returncode != 0 or not r.stdout:
+        raise ValueError(f"the JPEG XL image could not be read: {r.stderr.decode(errors='replace').strip()[-300:]}")
+    return r.stdout
+
+
 def output_formats() -> list[str]:
     """The output_formats this server writes: png, jpeg and webp, and jxl where there is a cjxl."""
     return ["png", "jpeg", "webp"] + (["jxl"] if cjxl() else [])

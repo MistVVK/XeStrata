@@ -39,6 +39,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" aria-label="Images" title="Images" data-i18n-label="tab.images" data-i18n-title="tab.images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-tools" aria-controls="view-tools" aria-selected="false" data-tab="tools" hidden>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-tool"/></svg><span data-i18n="tab.tools">Tools</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor" aria-label="Monitor" title="Monitor" data-i18n-label="tab.monitor" data-i18n-title="tab.monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about" aria-label="About" title="About" data-i18n-label="tab.about" data-i18n-title="tab.about">
@@ -130,36 +132,31 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
   <!-- ============================ Images ============================ -->
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
-    <div class="about">
-      <form class="st-card img-form" id="img-form">
-        <span class="card-title" id="img-title" data-i18n="img.title">Make an image</span>
+    <!-- the prompts and Generate on top, the settings on the left and the pictures on the right; one column on a phone,
+         the prompts, the pictures, the settings, with Generate held at the bottom of the screen -->
+    <form class="img-page" id="img-form">
+      <div class="st-card img-prompts">
+        <label class="st-field img-model" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
+          <select class="st-input" id="img-model"></select></label>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"
                   data-i18n-placeholder="img.prompt" data-i18n-label="img.promptLabel"></textarea>
-        <label class="st-field" id="img-neg-f"><span data-i18n="img.negative">Negative prompt (optional)</span>
-          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" data-i18n-placeholder="img.negativeHint"></textarea></label>
+        <details class="img-neg" id="img-neg-f" open><summary data-i18n="img.negative">Negative prompt (optional)</summary>
+          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" aria-label="Negative prompt (optional)"
+                    data-i18n-placeholder="img.negativeHint" data-i18n-label="img.negative"></textarea></details>
         <span class="composer-hint" id="img-neg-hint" hidden></span>
-        <div class="img-lora" id="img-lora" hidden>
-          <div class="img-row">
-            <label class="st-field" id="img-lora-add-f"><span data-i18n="img.lora">LoRA</span>
-              <select class="st-input" id="img-lora-add"></select></label>
-            <span class="composer-hint" id="img-lora-hint" hidden></span>
-          </div>
-          <div class="img-lora-chips" id="img-lora-chips"></div>
-          <!-- adapters added to the server's LoRA folder: a file (or one dropped here), or a Hugging Face file -->
-          <div class="img-lora-new">
-            <button class="st-btn st-btn--secondary" id="img-lora-upload" type="button" data-i18n="img.loraUpload">Upload a LoRA…</button>
-            <input type="file" id="img-lora-file" accept=".safetensors,.gguf" hidden>
-            <input class="st-input" id="img-lora-url" type="url" autocomplete="off" placeholder="Hugging Face link to a .safetensors file"
-                   aria-label="Hugging Face link" data-i18n-placeholder="img.loraUrl" data-i18n-label="img.loraUrlLabel">
-            <button class="st-btn st-btn--secondary" id="img-lora-fetch" type="button" data-i18n="img.loraFetch">Fetch</button>
-          </div>
-          <span class="composer-hint" id="img-lora-status" role="status" hidden></span>
-          <details class="img-lora-files" id="img-lora-files" hidden><summary id="img-lora-files-sum"></summary>
-            <div class="img-lora-file-list" id="img-lora-file-list"></div></details>
-        </div>
-        <div class="img-row">
-          <label class="st-field" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
-            <select class="st-input" id="img-model"></select></label>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="img-go"><span class="img-go__run" data-i18n="img.generate">Generate</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="img-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <label class="st-field" id="img-sampler-f" hidden><span data-i18n="img.sampler">Sampler</span>
+          <select class="st-input" id="img-sampler"></select></label>
+        <label class="st-field img-sl" id="img-steps-f"><span class="img-sl__head"><span data-i18n="img.steps">Steps</span>
+          <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></span>
+          <input class="img-sl__range" type="range" data-for="img-steps" tabindex="-1" aria-hidden="true"></label>
+        <div class="img-size">
           <label class="st-field"><span data-i18n="img.size">Size</span>
             <select class="st-input" id="img-size">
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
@@ -167,60 +164,76 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <option>1920x1080</option><option>1080x1920</option>
               <option value="auto" data-i18n="img.sizeAuto">auto (the reference's shape)</option>
               <option value="custom" data-i18n="img.sizeCustom">Custom&hellip;</option></select></label>
-          <label class="st-field" id="img-custom" hidden><span data-i18n="img.widthHeight">Width &times; height</span>
-            <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width" data-i18n-label="img.width">
-            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height" data-i18n-label="img.height"></span></label>
-          <label class="st-field" id="img-ref-f"><span id="img-ref-l">Edit an image (optional)</span>
-            <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
-          <label class="st-field" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span data-i18n="img.strength">Strength</span>
-            <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></label>
-          <label class="st-field" id="img-up-f" hidden title="Make the image larger (an upscaler; with the check below, drawn again at strength 0.35, in tiles past the largest side)" data-i18n-title="img.upscaleTitle"><span data-i18n="img.upscale">Upscale</span>
-            <select class="st-input" id="img-up"><option value="" data-i18n="img.upNone">None</option><option value="1.5">1.5&times;</option><option value="2">2&times;</option></select></label>
-          <label class="st-field" id="img-up-m-f" hidden title="How the image is made larger: Auto (RealESRGAN when it is drawn again, SeedVR2 when not), Lanczos (a plain resize), RealESRGAN (sharper) or SeedVR2 (restores detail in one step; sharp: for anime and blurred pictures). The weights are downloaded the first time" data-i18n-title="img.upMethodTitle"><span data-i18n="img.upMethod">Upscaler</span>
-            <select class="st-input" id="img-up-m"><option value="auto" data-i18n="img.upAuto">Auto</option><option value="lanczos">Lanczos</option><option value="realesrgan">RealESRGAN</option><option value="seedvr2">SeedVR2</option><option value="seedvr2:7b-sharp" data-i18n="img.upSharp">SeedVR2 (sharp)</option></select></label>
-          <label class="img-check" id="img-up-r-f" hidden title="Draw the larger image again, adding detail (strength 0.35, or the Strength field); off keeps the picture as it is, only larger" data-i18n-title="img.upRedrawTitle"><input type="checkbox" id="img-up-r"> <span data-i18n="img.upRedraw">Draw it again after the upscale</span></label>
-          <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-i18n="img.extend">Extend to</span>
-            <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
-          <label class="st-field" id="img-fix-f" hidden title="Find faces, hands or people and draw each again, finer (a Detailer; strength 0.5, or the Strength field)" data-i18n-title="img.fixTitle"><span data-i18n="img.fix">Fix parts</span>
-            <select class="st-input" id="img-fix"><option value="" data-i18n="img.upNone">None</option><option value="face" data-i18n="img.fixFace">Faces</option><option value="face,hands" data-i18n="img.fixFaceHands">Faces and hands</option><option value="person" data-i18n="img.fixPerson">People</option></select></label>
-          <label class="st-field" id="img-steps-f"><span data-i18n="img.steps">Steps</span>
-            <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
-          <label class="st-field" id="img-cfg-f"><span id="img-cfg-l">Guidance (CFG)</span>
-            <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></label>
-          <label class="st-field" id="img-sampler-f" hidden><span data-i18n="img.sampler">Sampler</span>
-            <select class="st-input" id="img-sampler"></select></label>
-          <label class="st-field"><span data-i18n="img.seed">Seed</span>
-            <input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
-          <label class="st-field" id="img-n-f"><span data-i18n="img.count">Images</span>
-            <span class="img-n"><select class="st-input" id="img-n"><option>1</option></select>
-            <span class="img-n-est" id="img-n-est"></span></span></label>
-          <label class="st-field"><span data-i18n="img.format">Format</span>
-            <select class="st-input" id="img-fmt"></select></label>
-          <label class="st-field" id="img-q-f" hidden><span data-i18n="img.quality">Quality</span>
-            <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
-          <label class="st-field img-check" id="img-bg-f" hidden>
-            <input type="checkbox" id="img-bg"> <span data-i18n="img.transparent">Transparent background</span></label>
-          <label class="st-field img-check" id="img-partial-f">
-            <input type="checkbox" id="img-partial"> <span data-i18n="img.partial">Show partial images</span></label>
-          <button type="submit" class="st-btn st-btn--primary" id="img-go" data-i18n="img.generate">Generate</button>
+          <button type="button" class="st-btn st-btn--icon" id="img-swap" title="Swap the width and the height" aria-label="Swap the width and the height"
+                  data-i18n-title="img.swap" data-i18n-label="img.swap">
+            <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 4V20M7 20L3.5 16.5M7 20L10.5 16.5M17 20V4M17 4L13.5 7.5M17 4L20.5 7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         </div>
-        <div class="img-mask" id="img-mask" hidden>
-          <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
-          <div class="img-mask-tools">
-            <label class="img-check"><span data-i18n="img.brush">Brush</span> <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size" data-i18n-label="img.brushSize"></label>
-            <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
-            <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
-            <span class="img-check" title="Find the part the words name in the first image (SAM 3, or Florence-2) and paint it into the mask; the brush changes it after" data-i18n-title="img.regionTitle"><input class="st-input" id="img-region" type="text" placeholder="Words: hair, sky" aria-label="Words of the part" data-i18n-placeholder="img.region" data-i18n-label="img.regionLabel"> <button type="button" class="st-btn" id="img-region-go" data-i18n="img.regionGo">Make mask</button></span>
-            <button type="button" class="st-btn" id="img-rembg" title="Cut the first image's subject out (BiRefNet): a transparent PNG among the results" data-i18n="img.rembg" data-i18n-title="img.rembgTitle">Remove background</button>
-            <a href="#" id="img-sam-license" hidden data-i18n="img.samLicense">SAM 3's license&hellip;</a>
-            <label class="img-check" title="Crop and Stitch: the part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropStitchTitle"><input type="checkbox" id="img-crop" checked> <span data-i18n="img.cropStitch">Cut out the painted part and draw it larger</span></label>
-            <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
-            <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
+        <div class="img-wh" id="img-custom">
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="img.width">Width</span>
+            <input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024"></span>
+            <input class="img-sl__range" type="range" data-step="16" data-for="img-w" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="img.height">Height</span>
+            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024"></span>
+            <input class="img-sl__range" type="range" data-step="16" data-for="img-h" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <label class="st-field img-sl" id="img-cfg-f"><span class="img-sl__head"><span id="img-cfg-l">Guidance (CFG)</span>
+          <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></span>
+          <input class="img-sl__range" type="range" data-for="img-cfg" tabindex="-1" aria-hidden="true"></label>
+        <label class="st-field img-sl" id="img-n-f"><span class="img-sl__head"><span data-i18n="img.count">Images</span>
+          <span class="img-n"><span class="img-n-est" id="img-n-est"></span><select class="st-input" id="img-n"><option>1</option></select></span></span>
+          <input class="img-sl__range" type="range" data-for="img-n" tabindex="-1" aria-hidden="true"></label>
+        <div class="st-field"><label for="img-seed" data-i18n="img.seed">Seed</label>
+          <span class="img-seed"><input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom">
+            <button type="button" class="st-btn st-btn--icon" id="img-seed-random" title="A random seed" aria-label="A random seed" data-i18n-title="img.seedDice" data-i18n-label="img.seedDice">
+              <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3.5" stroke="currentColor" stroke-width="1.5"/><circle cx="8.75" cy="8.75" r="1.25" fill="currentColor"/><circle cx="12" cy="12" r="1.25" fill="currentColor"/><circle cx="15.25" cy="15.25" r="1.25" fill="currentColor"/></svg></button>
+            <button type="button" class="st-btn st-btn--icon" id="img-seed-reuse" title="The last image's seed" aria-label="The last image's seed" data-i18n-title="img.seedReuse" data-i18n-label="img.seedReuse" disabled>
+              <svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button></span></div>
+
+        <details class="st-collapse img-sec" id="img-sec-ref"><summary><span id="img-ref-l">Edit an image (optional)</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field" id="img-ref-f"><input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl" multiple
+                   aria-labelledby="img-ref-l"></label>
+            <label class="st-field img-sl" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span class="img-sl__head"><span data-i18n="img.strength">Strength</span>
+              <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></span>
+              <input class="img-sl__range" type="range" data-for="img-strength" tabindex="-1" aria-hidden="true"></label>
+            <label class="st-field" id="img-ext-f" hidden title="Draw past the image's edges to this shape (outpaint)" data-i18n-title="img.extendTitle"><span data-i18n="img.extend">Extend to</span>
+              <select class="st-input" id="img-ext"><option value="" data-i18n="img.upNone">None</option><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="3:4">3:4</option><option value="16:9">16:9</option><option value="9:16">9:16</option></select></label>
+            <div class="img-mask" id="img-mask" hidden>
+              <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
+              <div class="img-mask-tools">
+                <label class="img-check"><span data-i18n="img.brush">Brush</span> <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size" data-i18n-label="img.brushSize"></label>
+                <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
+                <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
+                <span class="img-check img-region" title="Find the part the words name in the first image (SAM 3, or Florence-2) and paint it into the mask; the brush changes it after" data-i18n-title="img.regionTitle"><input class="st-input" id="img-region" type="text" placeholder="Words: hair, sky" aria-label="Words of the part" data-i18n-placeholder="img.region" data-i18n-label="img.regionLabel"> <button type="button" class="st-btn" id="img-region-go" data-i18n="img.regionGo">Make mask</button></span>
+                <a href="#" id="img-sam-license" hidden data-i18n="img.samLicense">SAM 3's license&hellip;</a>
+                <label class="img-check" title="Crop and Stitch: the part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size" data-i18n-title="img.cropStitchTitle"><input type="checkbox" id="img-crop" checked> <span data-i18n="img.cropStitch">Cut out the painted part and draw it larger</span></label>
+                <label class="img-check" title="Match the drawn part's colors to the image's: auto by the part kept around the paint, full by the whole cut" data-i18n-title="img.colorTitle"><span data-i18n="img.color">Color match</span> <select class="st-input" id="img-color"><option value="off" data-i18n="img.colorOff">Off</option><option value="auto" data-i18n="img.colorAuto">Auto</option><option value="full" data-i18n="img.colorWhole">Whole part</option></select></label>
+                <label class="img-check" id="img-refine-f" hidden title="MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again" data-i18n-title="img.refineTitle"><input type="checkbox" id="img-refine"> <span data-i18n="img.refine">Draw the painted part again, finer (about 1.6 times the time)</span></label>
+              </div>
+              <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
+            </div>
           </div>
-          <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
-        </div>
-        <details class="st-collapse" id="img-guide" hidden><summary><span data-i18n="img.guide">Sampling guidance</span></summary>
-          <div class="st-collapse__body img-row">
+        </details>
+        <details class="st-collapse img-sec img-lora" id="img-lora" hidden><summary><span data-i18n="img.lora">LoRA</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field" id="img-lora-add-f"><select class="st-input" id="img-lora-add" aria-label="LoRA" data-i18n-label="img.lora"></select></label>
+            <span class="composer-hint" id="img-lora-hint" hidden></span>
+            <div class="img-lora-chips" id="img-lora-chips"></div>
+            <!-- adapters added to the server's LoRA folder: a file (or one dropped here), or a Hugging Face file -->
+            <div class="img-lora-new">
+              <button class="st-btn st-btn--secondary" id="img-lora-upload" type="button" data-i18n="img.loraUpload">Upload a LoRA…</button>
+              <input type="file" id="img-lora-file" accept=".safetensors,.gguf" hidden>
+              <input class="st-input" id="img-lora-url" type="url" autocomplete="off" placeholder="Hugging Face link to a .safetensors file"
+                     aria-label="Hugging Face link" data-i18n-placeholder="img.loraUrl" data-i18n-label="img.loraUrlLabel">
+              <button class="st-btn st-btn--secondary" id="img-lora-fetch" type="button" data-i18n="img.loraFetch">Fetch</button>
+            </div>
+            <span class="composer-hint" id="img-lora-status" role="status" hidden></span>
+            <details class="img-lora-files" id="img-lora-files" hidden><summary id="img-lora-files-sum"></summary>
+              <div class="img-lora-file-list" id="img-lora-file-list"></div></details>
+          </div>
+        </details>
+        <details class="st-collapse img-sec" id="img-guide" hidden><summary><span data-i18n="img.guide">Sampling guidance</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
             <label class="img-check" id="img-g-detail_daemon-f" title="Detail Daemon: the model asked at a slightly lower noise level, for finer detail" data-i18n-title="img.gDetailTitle"><input type="checkbox" id="img-g-detail_daemon"> <span data-i18n="img.gDetail">Detail Daemon</span>
               <input class="st-input" id="img-g-detail_daemon-v" type="number" min="-5" max="5" step="0.05" placeholder="0.1" aria-label="Detail amount" data-i18n-label="img.gDetailAmount"></label>
             <label class="img-check" id="img-g-skip_layer_guidance-f" title="Skip Layer Guidance: another pass of the prompt with blocks 7, 8 and 9 skipped, early in the steps" data-i18n-title="img.gSlgTitle"><input type="checkbox" id="img-g-skip_layer_guidance"> <span data-i18n="img.gSlg">Skip Layer Guidance</span>
@@ -232,8 +245,20 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <label class="img-check" id="img-g-cfg_zero_star-f" title="CFG-Zero*: the negative prompt's prediction scaled to the prompt's before guidance; needs CFG" data-i18n-title="img.gZeroTitle"><input type="checkbox" id="img-g-cfg_zero_star"> <span>CFG-Zero*</span></label>
           </div>
         </details>
-        <div class="img-moss" id="img-moss" hidden>
-          <div class="img-row">
+        <details class="st-collapse img-sec" id="img-sec-out"><summary><span data-i18n="img.output">Output</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field"><span data-i18n="img.format">Format</span>
+              <select class="st-input" id="img-fmt"></select></label>
+            <label class="st-field" id="img-q-f" hidden><span data-i18n="img.quality">Quality</span>
+              <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
+            <label class="st-field img-check" id="img-bg-f" hidden>
+              <input type="checkbox" id="img-bg"> <span data-i18n="img.transparent">Transparent background</span></label>
+            <label class="st-field img-check" id="img-partial-f">
+              <input type="checkbox" id="img-partial"> <span data-i18n="img.partial">Show partial images</span></label>
+          </div>
+        </details>
+        <details class="st-collapse img-sec img-moss" id="img-moss" hidden><summary><span>MOSS-Image</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
             <label class="st-field" id="img-enhance-f"><span data-i18n="img.enhance">Write the prompt out</span>
               <select class="st-input" id="img-enhance" title="The chat's model writes the short prompt out before the image is made" data-i18n-title="img.enhanceTitle">
                 <option value="" data-i18n="img.enhanceOff">Off</option>
@@ -241,45 +266,227 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
                 <option value="layout" data-i18n="img.enhanceLayout">As a layout of boxes</option></select></label>
             <label class="st-field img-check" id="img-layout-on-f">
               <input type="checkbox" id="img-layout-on"> <span data-i18n="img.layoutOn">Place things with boxes</span></label>
-          </div>
-          <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span></summary>
-            <div class="st-collapse__body img-row">
-              <label class="st-field"><span data-i18n="img.shift">Shift</span>
-                <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="0.5"></label>
-              <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
-                <input class="st-input" id="img-uskip" type="text"></label>
-              <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
-                <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
-              <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
-                <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
-              <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
-                <span class="img-wh"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
-                <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+            <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+              <div class="st-collapse__body img-sec__body">
+                <label class="st-field"><span data-i18n="img.shift">Shift</span>
+                  <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="0.5"></label>
+                <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
+                  <input class="st-input" id="img-uskip" type="text"></label>
+                <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
+                  <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
+                <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
+                  <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
+                <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
+                  <span class="img-pair"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
+                  <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+              </div>
+            </details>
+            <div class="img-layout" id="img-layout" hidden>
+              <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
+              <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
+              <div class="img-layout-item" id="img-layout-item" hidden>
+                <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
+                  <select class="st-input" id="img-box-label">
+                    <option value="object" data-i18n="img.boxObject">Object</option>
+                    <option value="character" data-i18n="img.boxCharacter">Character</option>
+                    <option value="text" data-i18n="img.boxText">Text</option></select></label>
+                <label class="st-field"><span data-i18n="img.boxCaption">What it looks like</span>
+                  <input class="st-input" id="img-box-caption" type="text"></label>
+                <label class="st-field" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
+                  <input class="st-input" id="img-box-text" type="text"></label>
+                <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
+              </div>
+              <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
             </div>
-          </details>
-          <div class="img-layout" id="img-layout" hidden>
-            <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
-            <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
-            <div class="img-row" id="img-layout-item" hidden>
-              <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
-                <select class="st-input" id="img-box-label">
-                  <option value="object" data-i18n="img.boxObject">Object</option>
-                  <option value="character" data-i18n="img.boxCharacter">Character</option>
-                  <option value="text" data-i18n="img.boxText">Text</option></select></label>
-              <label class="st-field img-box-wide"><span data-i18n="img.boxCaption">What it looks like</span>
-                <input class="st-input" id="img-box-caption" type="text"></label>
-              <label class="st-field img-box-wide" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
-                <input class="st-input" id="img-box-text" type="text"></label>
-              <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
-            </div>
-            <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
           </div>
+        </details>
+      </div>
+
+      <div class="st-card img-output">
+        <div class="img-view" id="img-view">
+          <img id="img-main" src="data:," alt="" hidden>
+          <span class="img-view__empty" id="img-empty"><svg class="st-icon img-view__icon"><use href="web/sprite.svg#i-image"/></svg>
+            <span data-i18n="img.empty">The images you make show here.</span></span>
+          <span class="img-view__cap" id="img-view-cap" hidden></span>
         </div>
+        <div class="img-results" id="img-results" role="list" aria-label="The images made" data-i18n-label="img.made" hidden></div>
+        <div class="img-actions" id="img-actions" hidden>
+          <a class="st-btn st-btn--icon" id="img-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save">
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--secondary" id="img-to-ref" title="Start the next image from this one" data-i18n-title="img.toRefTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="img.toRef">To img2img</span></button>
+          <button type="button" class="st-btn st-btn--icon" id="img-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest">
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="img-use-seed" title="Use this image's seed" aria-label="Use this image's seed"
+                  data-i18n-title="img.useSeed" data-i18n-label="img.useSeed">
+            <svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button>
+        </div>
+        <div class="img-actions" id="img-send" hidden>
+          <span class="img-send" role="group" aria-label="Open in Tools" data-i18n-label="img.sendTools">
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="upscale" data-i18n="tool.upscale">Upscale</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="fix" data-i18n="tool.fix">Fix parts</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="segment" data-i18n="tool.segment">Find parts</button>
+            <button type="button" class="st-btn st-btn--secondary" data-send-tool="rembg" data-i18n="tool.rembg">Remove background</button></span>
+        </div>
+        <details class="img-info" id="img-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="img-info"></div></details>
         <span class="composer-hint" id="img-hint" data-i18n="img.hint">One image at a time; a chat request waits for it (and the other way round).</span>
         <span class="composer-hint" id="img-note" hidden></span>
-      </form>
-      <div class="img-results" id="img-results"></div>
-    </div>
+      </div>
+    </form>
+    <dialog class="img-full" id="img-full" aria-label="The image" data-i18n-label="img.full">
+      <img id="img-full-img" src="data:," alt="">
+      <button type="button" class="st-btn st-btn--icon img-full__close" id="img-full-close" aria-label="Close" data-i18n-label="close">
+        <svg class="st-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 6L18 18M18 6L6 18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+    </dialog>
+  </section>
+
+  <!-- ============================ Tools ============================ -->
+  <!-- the image tools that make no new picture, each on its own on an image of yours or one made here, as their own
+       requests are: /v1/images/upscale, the edits' fix (the Detailer), /v1/images/segmentations and
+       /v1/images/remove-background -->
+  <section class="view view--images" id="view-tools" role="tabpanel" aria-labelledby="tab-btn-tools" hidden>
+    <form class="img-page" id="tool-form">
+      <div class="st-card img-prompts">
+        <div class="seg" id="tool-kind" role="radiogroup" aria-label="Tool" data-i18n-label="tool.kind">
+          <button type="button" role="radio" data-tool="upscale" aria-checked="true" data-i18n="tool.upscale">Upscale</button>
+          <button type="button" role="radio" data-tool="fix" aria-checked="false" data-i18n="tool.fix">Fix parts</button>
+          <button type="button" role="radio" data-tool="segment" aria-checked="false" data-i18n="tool.segment">Find parts</button>
+          <button type="button" role="radio" data-tool="rembg" aria-checked="false" data-i18n="tool.rembg">Remove background</button>
+        </div>
+        <span class="composer-hint" id="tool-about"></span>
+        <label class="st-field" id="tool-file-f"><span data-i18n="tool.image">Image (or drop one here)</span>
+          <input class="st-input" id="tool-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp,image/jxl,.jxl"></label>
+        <label class="st-field" id="tool-prompt-f"><span id="tool-prompt-l">Prompt</span>
+          <textarea class="st-input img-prompt" id="tool-prompt" rows="2"></textarea></label>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="tool-go"><span class="img-go__run" id="tool-go-l">Upscale</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="tool-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <!-- the upscale: /v1/images/upscale's model, scale and extra_params -->
+        <div class="tool-fields" data-tool="upscale">
+          <label class="st-field"><span data-i18n="tool.upModel">Upscaler (model)</span>
+            <select class="st-input" id="tool-up-model">
+              <option value="auto" data-i18n="tool.upAuto">Auto</option>
+              <option value="lanczos">Lanczos</option>
+              <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
+              <option value="seedvr2-7b">SeedVR2 7B</option>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
+              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+          <span class="composer-hint" id="tool-up-about"></span>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
+            <input class="st-input" id="tool-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
+            <input class="img-sl__range" type="range" data-for="tool-up-scale" tabindex="-1" aria-hidden="true"></label>
+          <span class="composer-hint" id="tool-up-size"></span>
+          <label class="st-field"><span data-i18n="tool.upColor">Color correction</span>
+            <select class="st-input" id="tool-up-color">
+              <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
+              <option value="none" data-i18n="tool.upColorNone">None</option>
+              <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-up-redraw"> <span data-i18n="tool.upRedraw">Draw it again with the image model, adding detail</span></label>
+          <label class="st-field img-sl" id="tool-up-strength-f" hidden><span class="img-sl__head"><span data-i18n="tool.upStrength">How much is drawn again</span>
+            <input class="st-input" id="tool-up-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.35"></span>
+            <input class="img-sl__range" type="range" data-for="tool-up-strength" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the Detailer: the edits' fix {parts, strength} -->
+        <div class="tool-fields" data-tool="fix" hidden>
+          <fieldset class="tool-parts"><legend data-i18n="tool.fixParts">The parts to find and draw again</legend>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="face" checked> <span data-i18n="img.fixFace">Faces</span></label>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="hands"> <span data-i18n="tool.fixHands">Hands</span></label>
+            <label class="img-check"><input type="checkbox" name="tool-part" value="person"> <span data-i18n="img.fixPerson">People</span></label></fieldset>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upStrength">How much is drawn again</span>
+            <input class="st-input" id="tool-fix-strength" type="number" min="0.01" max="1" step="0.01" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-fix-strength" tabindex="-1" aria-hidden="true"></label>
+        </div>
+        <!-- the model that draws (the upscale's redraw_model, the Detailer's model) and its seed -->
+        <div class="tool-fields" data-tool="upscale fix">
+          <label class="st-field" id="tool-model-f" hidden><span data-i18n="tool.drawModel">Image model that draws</span>
+            <select class="st-input" id="tool-model"></select></label>
+          <label class="st-field" id="tool-seed-f"><span data-i18n="img.seed">Seed</span>
+            <input class="st-input" id="tool-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
+        </div>
+        <!-- /v1/images/segmentations: task, model, score_threshold, mask_threshold -->
+        <div class="tool-fields" data-tool="segment" hidden>
+          <label class="st-field"><span data-i18n="tool.segTask">What to find</span>
+            <select class="st-input" id="tool-seg-task">
+              <option value="mask" data-i18n="tool.segMask">Masks of the parts the words name</option>
+              <option value="box" data-i18n="tool.segBox">Boxes around them</option>
+              <option value="grounding" data-i18n="tool.segGrounding">Every thing the words name, with its name (Florence-2)</option></select></label>
+          <label class="st-field"><span data-i18n="tool.segModel">Model</span>
+            <select class="st-input" id="tool-seg-model">
+              <option value="" data-i18n="tool.segAuto">Auto (SAM 3 where its license is agreed to, else Florence-2)</option>
+              <option value="sam3.1">SAM 3.1</option>
+              <option value="florence-2-large">Florence-2 large</option>
+              <option value="florence-2-base">Florence-2 base</option></select></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.segScore">Least score kept</span>
+            <input class="st-input" id="tool-seg-score" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-seg-score" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.segMaskT">Mask threshold</span>
+            <input class="st-input" id="tool-seg-mask" type="number" min="0" max="1" step="0.05" placeholder="0.5"></span>
+            <input class="img-sl__range" type="range" data-for="tool-seg-mask" tabindex="-1" aria-hidden="true"></label>
+          <a href="#" id="tool-sam-license" data-i18n="img.samLicense">SAM 3's license&hellip;</a>
+        </div>
+        <!-- /v1/images/remove-background: model (BiRefNet's version), operating_resolution, refine_foreground,
+             mask_only, background_color, mask_grow, mask_blur, output_format -->
+        <div class="tool-fields" data-tool="rembg" hidden>
+          <label class="st-field"><span data-i18n="tool.bgModel">BiRefNet version</span>
+            <select class="st-input" id="tool-bg-model">
+              <option value="general" data-i18n="tool.bgGeneral">general (the default)</option>
+              <option value="lite">lite</option><option value="lite-2k">lite-2k</option><option value="portrait">portrait</option>
+              <option value="matting">matting</option><option value="hr">hr</option><option value="dynamic">dynamic</option></select></label>
+          <label class="st-field"><span data-i18n="tool.bgRes">Resolution it reads at (width x height, multiples of 32)</span>
+            <input class="st-input" id="tool-bg-res" type="text" placeholder="the version's own" data-i18n-placeholder="tool.bgResOwn"></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-refine" checked> <span data-i18n="tool.bgRefine">Clean the edge's colors (refine_foreground)</span></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-mask"> <span data-i18n="tool.bgMaskOnly">The mask only (white where the subject is)</span></label>
+          <label class="st-field img-check"><input type="checkbox" id="tool-bg-color-on"> <span data-i18n="tool.bgColorOn">Fill the background with a color</span>
+            <input type="color" id="tool-bg-color" value="#ffffff" aria-label="Background color" data-i18n-label="tool.bgColor"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.bgGrow">Grow the edge (pixels; below 0 shrinks)</span>
+            <input class="st-input" id="tool-bg-grow" type="number" min="-64" max="64" step="1" placeholder="0"></span>
+            <input class="img-sl__range" type="range" data-for="tool-bg-grow" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.bgBlur">Soften the edge (pixels)</span>
+            <input class="st-input" id="tool-bg-blur" type="number" min="0" max="32" step="0.5" placeholder="0"></span>
+            <input class="img-sl__range" type="range" data-for="tool-bg-blur" tabindex="-1" aria-hidden="true"></label>
+          <label class="st-field"><span data-i18n="img.format">Format</span>
+            <select class="st-input" id="tool-bg-fmt"><option>png</option><option>webp</option></select></label>
+        </div>
+      </div>
+
+      <div class="st-card img-output">
+        <!-- the result over the image it came from: a divider to compare them, or the parts found drawn over it -->
+        <div class="img-view tool-view" id="tool-view">
+          <span class="img-view__empty" id="tool-empty"><svg class="st-icon img-view__icon"><use href="web/sprite.svg#i-image"/></svg>
+            <span data-i18n="tool.empty">Choose an image, or send one here from the Images tab.</span></span>
+          <div class="tool-stage" id="tool-stage" hidden>
+            <img id="tool-before" src="data:," alt="">
+            <img id="tool-after" src="data:," alt="" hidden>
+            <canvas id="tool-overlay" hidden></canvas>
+            <span class="tool-divider" id="tool-divider" hidden></span>
+          </div>
+          <span class="img-view__cap" id="tool-cap" hidden></span>
+        </div>
+        <input class="tool-split" id="tool-split" type="range" min="0" max="100" value="50" aria-label="Before and after" data-i18n-label="tool.split" hidden>
+        <div class="st-progress" id="tool-progress" hidden><div class="st-progress__bar" id="tool-bar"></div></div>
+        <div class="tool-found" id="tool-found" hidden></div>
+        <div class="img-actions" id="tool-actions" hidden>
+          <a class="st-btn st-btn--icon" id="tool-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save">
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--secondary" id="tool-to-ref" title="Start the next image from this one" data-i18n-title="img.toRefTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="img.toRef">To img2img</span></button>
+          <button type="button" class="st-btn st-btn--secondary" id="tool-to-mask" hidden title="The image to img2img with the parts found as its mask" data-i18n-title="tool.toMaskTitle">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-edit"/></svg><span data-i18n="tool.toMask">Edit these parts</span></button>
+          <button type="button" class="st-btn st-btn--icon" id="tool-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest">
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+        </div>
+        <details class="img-info" id="tool-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="tool-info"></div></details>
+        <span class="composer-hint" id="tool-hint"></span>
+      </div>
+    </form>
   </section>
 
   <!-- ============================ Monitor ============================ -->

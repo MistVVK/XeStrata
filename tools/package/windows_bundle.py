@@ -10,7 +10,7 @@ The folder (XeStrata-<version>-windows-x64/):
 
     xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
-    app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and BUILD.json
+    app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and djxl.exe, and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
     NOTICE, COPYING, COPYING.LESSER, THIRD-PARTY-NOTICES.md, licenses/
 
@@ -119,9 +119,10 @@ COMPONENTS = [
      ["src:third_party/main/cutlass/LICENSE.txt"], []),
     ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
-    ("libjxl's cjxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, libwebp and "
-     "sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, MIT, zlib, IJG, "
-     "libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"], ["app/engine/cjxl.exe"]),
+    ("libjxl's cjxl and djxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, "
+     "libwebp and sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, "
+     "MIT, zlib, IJG, libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"],
+     ["app/engine/cjxl.exe", "app/engine/djxl.exe"]),
     ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
      ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
 ]
@@ -224,7 +225,8 @@ def main() -> None:
         shutil.copy2(a.engine / "bin" / d, eng / d)
     for d in ONEDNN_DLLS:
         shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
-    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
+    for x in ("cjxl.exe", "djxl.exe"):   # the images' JPEG XL out and in (serve/images.py cjxl, djxl)
+        shutil.copy2(a.jxl / "bin" / x, eng / x)
     aot = a.engine / "_deps" / "aotriton" / "aotriton"
     shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
     shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])

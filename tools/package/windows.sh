@@ -19,7 +19,7 @@ archs="sm_60;sm_61;sm_70;sm_75;sm_80;sm_86;sm_89;sm_90"
 hip_archs="gfx1030;gfx1031;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201"
 xwin_ver=0.10.0
 python_ver=3.14.8
-# libjxl's Windows tools (the release's static build), for cjxl.exe: the images' JPEG XL
+# libjxl's Windows tools (the release's static build), for cjxl.exe and djxl.exe: the images' JPEG XL
 jxl_ver=v0.12.0
 jxl_sha256=3025d7e308390796d20492322e606bc92decaee7b6bc99d3f7547870ae5db7de
 # oneMKL's Windows headers, import libraries and CMake package (Intel's PyPI wheels; not free software: linked against,

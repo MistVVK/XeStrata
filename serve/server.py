@@ -2977,9 +2977,12 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes, keep_alpha: bool = False) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
+        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG (JPEG
+        XL by libjxl's djxl, the rest by Pillow).
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `keep_alpha` (an image
         edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white."""
+        if images_api.is_jxl(data):                       # JPEG XL (this server's jxl output sent back): djxl's PNG
+            data = images_api.decode_jxl(data)
         jpeg = data[:3] == b"\xff\xd8\xff"
         if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
                 data[:6] in (b"GIF87a", b"GIF89a"):

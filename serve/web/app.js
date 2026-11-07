@@ -90,10 +90,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 let tab = "chat";
 let noteShown = false;
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "tools", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   fitHeader();                                       // on a phone the open tab shows its name: the row's room changes
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "tools", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") {
     $("img-prompt").focus();
     if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
@@ -152,7 +152,7 @@ async function loadHealth() {
     $("img-note").textContent = health.image_note || "";
     imgModels();
     thinkingButtons();
-    if (location.hash === "#images" && health.image_generation) showTab("images");
+    if (["#images", "#tools"].includes(location.hash) && health.image_generation) showTab(location.hash.slice(1));
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -2965,7 +2965,51 @@ function readAsDataURL(f) {
     r.readAsDataURL(f);
   });
 }
-$("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
+// the size: a preset puts its sides into the width and the height, and moving those chooses the preset they match (else
+// Custom); "auto" hides them
+function imgSizeShow() {
+  const v = $("img-size").value;
+  if (/^\d+x\d+$/.test(v)) [$("img-w").value, $("img-h").value] = v.split("x");
+  $("img-custom").hidden = v === "auto";
+  $("img-swap").disabled = v === "auto";
+  imgSliders();
+}
+function imgSizeFromWH() {
+  const sel = $("img-size"), v = `${$("img-w").value}x${$("img-h").value}`;
+  sel.value = [...sel.options].some(o => o.value === v) ? v : "custom";
+}
+$("img-size").onchange = imgSizeShow;
+for (const id of ["img-w", "img-h"]) $(id).addEventListener("input", imgSizeFromWH);
+$("img-swap").onclick = () => {
+  [$("img-w").value, $("img-h").value] = [$("img-h").value, $("img-w").value];
+  imgSizeFromWH();
+  imgCount();
+  imgLayoutDraw();
+};
+// the sliders beside the numbers (data-for): the number, or the count's select, is what a request reads, and the slider
+// moves it; an empty number is the model's default (its placeholder), which the slider shows
+const imgRanges = [...document.querySelectorAll(".img-page .img-sl__range")];
+function imgSliders() {
+  for (const r of imgRanges) {
+    const f = $(r.dataset.for);
+    if (f.tagName === "SELECT") {
+      Object.assign(r, {min: "1", max: String(Math.max(1, f.options.length)), step: "1", disabled: f.options.length < 2});
+      r.value = f.value;
+      continue;
+    }
+    Object.assign(r, {min: f.min, max: f.max, step: r.dataset.step || f.step || "1"});
+    const v = parseFloat(f.value !== "" ? f.value : f.placeholder);
+    r.value = String(Number.isFinite(v) ? v : f.min);
+  }
+  for (const r of imgRanges) r.style.setProperty("--fill", `${r.max > r.min ? (r.value - r.min) / (r.max - r.min) * 100 : 0}%`);
+}
+for (const r of imgRanges) r.addEventListener("input", () => {
+  const f = $(r.dataset.for);
+  f.value = r.value;
+  f.dispatchEvent(new Event("input", {bubbles: true}));
+  if (f.tagName === "SELECT") f.dispatchEvent(new Event("change", {bubbles: true}));
+});
+for (const f of ["img-form", "tool-form"]) $(f).addEventListener("input", (e) => { if (!imgRanges.includes(e.target)) imgSliders(); });
 // the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
 // fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
 // the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
@@ -3016,6 +3060,7 @@ function imgModels() {
   if (ms.some(m => m.id === was)) sel.value = was;
   $("img-model-f").hidden = ms.length < 2;
   imgDefaults();
+  toolsSetup();
 }
 $("img-model").onchange = () => {
   if (!imgModel().edits && ($("img-ref").files || []).length > 1) $("img-ref").value = "";
@@ -3036,9 +3081,8 @@ function imgDefaults() {
   $("img-ref").multiple = !!edits;
   const refs = ($("img-ref").files || []).length > 0;
   $("img-strength-f").hidden = !refs;
-  const one = ($("img-ref").files || []).length === 1;   // upscale and extend take the one image they grow
-  $("img-up-f").hidden = $("img-ext-f").hidden = $("img-fix-f").hidden = !one;
-  $("img-up-m-f").hidden = $("img-up-r-f").hidden = !one || !$("img-up").value;
+  const one = ($("img-ref").files || []).length === 1;   // extend takes the one image it grows
+  $("img-ext-f").hidden = !one;
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
@@ -3328,6 +3372,7 @@ function imgCount() {
     : tr("img.aboutMin", "about {n} min", {n: (est / 60).toFixed(est < 600 ? 1 : 0)});
   $("img-n-f").title = one == null ? tr("img.countFirst", "Up to 4 until the server has made an image and measured its speed")
     : tr("img.countMost", "Up to {n}: the images one request makes in {min} min at most (budget_s)", {n: most, min: Math.round(budget / 60)});
+  imgSliders();
 }
 for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n", "img-strength"])
   $(id).addEventListener("input", imgCount);
@@ -3420,29 +3465,6 @@ async function imgRegionMask() {
 }
 $("img-region-go").onclick = imgRegionMask;
 $("img-region").onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); imgRegionMask(); } };
-// the first image's subject cut out (POST /v1/images/remove-background: BiRefNet general), among the results
-$("img-rembg").onclick = async () => {
-  const f = ($("img-ref").files || [])[0];
-  if (!f) return;
-  $("img-rembg").disabled = true;
-  const t0 = performance.now();
-  try {
-    const r = await fetch("v1/images/remove-background", {method: "POST", headers: headers(true),
-      body: JSON.stringify({image: await readAsDataURL(f)})});
-    const j = await r.json();
-    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
-    const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
-    img.src = `data:image/${j.output_format};base64,` + j.data[0].b64_json;
-    img.alt = cap.textContent = tr("img.rembgDone", "Background removed ({model}, {s} s)",
-      {model: j.model, s: ((performance.now() - t0) / 1000).toFixed(1)});
-    fig.append(img, cap);
-    $("img-results").prepend(fig);
-  } catch (e) {
-    toast("error", tr("img.rembg", "Remove background"), String(e.message || e), 8000);
-  } finally {
-    $("img-rembg").disabled = false;
-  }
-};
 // SAM 3's license (Meta's SAM License, fetched to show): agreed here, the server fetches its weights and finds parts
 // with it; until then Florence-2 (MIT) does
 $("img-sam-license").onclick = async (ev) => {
@@ -3652,7 +3674,7 @@ function imgLayoutLoad(layout, size, prompt) {
   const sel = $("img-size");
   if ([...sel.options].some(o => o.value === `${w}x${h}`)) sel.value = `${w}x${h}`;
   else { sel.value = "custom"; $("img-w").value = String(w); $("img-h").value = String(h); }
-  $("img-custom").hidden = sel.value !== "custom";
+  imgSizeShow();
   imgLayout.boxes = layout.items.filter(it => Array.isArray(it.bbox) && it.bbox.length === 4).map(it => {
     const [x0, y0, x1, y1] = it.bbox.map(Number);
     return {x0: clamp01(Math.min(x0, x1) / w), y0: clamp01(Math.min(y0, y1) / h), x1: clamp01(Math.max(x0, x1) / w), y1: clamp01(Math.max(y0, y1) / h),
@@ -3763,12 +3785,9 @@ $("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q")
 $("img-bg").onchange = imgFormat;
 $("img-partial").checked = store.get("img_partial", false);
 $("img-partial").onchange = () => store.set("img_partial", $("img-partial").checked);
-// a streamed job (the "show partial images" setting): one figure shows the engine's partial images as they come, and
-// the completed events become the body the plain request answers with
-async function imgStream(r, prompt) {
-  const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
-  img.alt = prompt;
-  fig.append(img, cap);
+// a streamed job (the "show partial images" setting): the large picture shows the engine's partial images as they come,
+// and the completed events become the body the plain request answers with
+async function imgStream(r) {
   const j = {data: []};
   const reader = r.body.getReader(), dec = new TextDecoder();
   let buf = "";
@@ -3786,9 +3805,8 @@ async function imgStream(r, prompt) {
         try { e = JSON.parse(line.slice(5).trim()); } catch (err) { continue; }
         if (e.type === "error") throw new Error((e.error && e.error.message) || tr("img.none", "No image"));
         if (e.type.endsWith(".partial_image")) {
-          img.src = `data:image/${e.output_format || "png"};base64,` + e.b64_json;
-          cap.textContent = tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1});
-          if (!fig.isConnected) $("img-results").prepend(fig);
+          imgPartial(`data:image/${e.output_format || "png"};base64,` + e.b64_json,
+                     tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1}));
         } else if (e.type.endsWith(".completed")) {
           Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, strata: e.strata});
           j.data.push({b64_json: e.b64_json, seed: e.seed});
@@ -3796,15 +3814,118 @@ async function imgStream(r, prompt) {
       }
     }
   } finally {
-    fig.remove();
+    imgPartial(null);
   }
   if (!j.data.length) throw new Error(tr("img.none", "No image"));
   return j;
 }
+// the pictures made on this page, newest first: the one chosen large with its save, its generation info (A1111's lines,
+// for a reader who knows them) and the buttons that use it; the others as a row of thumbnails below it
+const imgShots = [];   // [{url, name, seed, info, note}]
+let imgSel = -1;
+function imgShow(i) {
+  imgSel = i;
+  const s = imgShots[i], main = $("img-main");
+  main.hidden = !s;
+  $("img-empty").hidden = !!s;
+  $("img-actions").hidden = $("img-send").hidden = $("img-info-box").hidden = !s;
+  $("img-results").hidden = imgShots.length < 2;
+  for (const [k, t] of [...$("img-results").children].entries()) t.setAttribute("aria-current", String(k === i));
+  if (!s) { main.removeAttribute("src"); return; }
+  main.src = s.url;
+  main.alt = s.prompt;
+  Object.assign($("img-save"), {href: s.url, download: s.name});
+  $("img-use-seed").disabled = s.seed == null;
+  $("img-info").replaceChildren(s.info, ...(s.note ? [s.note] : []));
+}
+// a partial image in the large picture while the job runs; null puts back the one chosen
+function imgPartial(url, caption) {
+  const cap = $("img-view-cap");
+  cap.hidden = !url;
+  if (!url) { imgShow(imgSel); return; }
+  cap.textContent = caption;
+  $("img-main").src = url;
+  $("img-main").hidden = false;
+  $("img-empty").hidden = true;
+}
+function imgAdd(shot) {
+  imgShots.unshift(shot);
+  const b = document.createElement("button"), im = document.createElement("img");
+  b.type = "button";
+  b.className = "img-thumb";
+  b.setAttribute("role", "listitem");
+  im.className = "img-thumb__img";
+  im.src = shot.url;
+  im.alt = shot.prompt;
+  b.append(im);
+  b.onclick = () => imgShow([...$("img-results").children].indexOf(b));
+  $("img-results").prepend(b);
+}
+// an image's info in the API's names: the request that made it (its seed the image's, n one: sent again, it makes this
+// image again) and what the answer says of it; the copy button copies that request as JSON
+function imgInfo(url, body, j, d, seconds) {
+  const req = {...body, seed: d.seed};
+  for (const k of ["n", "stream", "partial_images"]) delete req[k];
+  const made = j.strata && j.strata.crop && !j.strata.crop.whole && j.strata.made_size ? tr("img.madeCrop", "(drawn at {size} around the painted part)", {size: j.strata.made_size})
+    : j.strata && j.strata.crop ? ""
+    : j.strata && j.strata.made_size ? tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})
+    : j.strata && j.strata.requested_size ? tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size}) : "";
+  return {req, info: imgInfoText(url, req, [`model: ${j.model}`, `size: ${j.size} ${made}`.trim(), `seconds: ${seconds}`])};
+}
+// "POST <endpoint>", the request's fields as key: value (an image as its kind, not its data), then the answer's lines
+function imgInfoText(url, req, answer) {
+  const val = (k, v) => typeof v === "string" && v.startsWith("data:") ? `(${v.slice(5, v.indexOf(";"))})`
+    : k === "images" ? `(${v.length})` : k === "mask" ? "(image/png)" : typeof v === "string" ? v : JSON.stringify(v);
+  return [`POST /${url}`, ...Object.entries(req).filter(([k]) => k !== "response_format").map(([k, v]) => `${k}: ${val(k, v)}`),
+          "", ...answer].join("\n");
+}
+$("img-main").onclick = () => {
+  if (!$("img-view-cap").hidden) return;   // a partial image
+  $("img-full-img").src = $("img-main").src;
+  $("img-full").showModal();
+};
+$("img-full-close").onclick = () => $("img-full").close();
+$("img-full").addEventListener("click", (e) => { if (e.target !== $("img-full-close")) $("img-full").close(); });
+$("img-copy").onclick = () => copyText(JSON.stringify(imgShots[imgSel].req, null, 2), $("img-copy"));
+let imgLastSeed = null;
+$("img-use-seed").onclick = () => { $("img-seed").value = String(imgShots[imgSel].seed); imgSliders(); };
+$("img-seed-reuse").onclick = () => { if (imgLastSeed != null) $("img-seed").value = String(imgLastSeed); };
+$("img-seed-random").onclick = () => { $("img-seed").value = ""; };
+// the picture chosen as the next job's image to start from (an edit's reference, or img2img's)
+async function imgUseAsRef(url, name) {
+  const blob = await (await fetch(url)).blob();
+  const dt = new DataTransfer();
+  dt.items.add(new File([blob], name, {type: blob.type}));
+  $("img-ref").files = dt.files;
+  $("img-ref").dispatchEvent(new Event("change"));
+  $("img-sec-ref").open = true;
+  showTab("images");
+  $("img-sec-ref").scrollIntoView({block: "nearest", behavior: "smooth"});
+}
+$("img-to-ref").onclick = () => imgUseAsRef(imgShots[imgSel].url, imgShots[imgSel].name);
+// the picture into the Tools tab, with the tool chosen there
+for (const b of document.querySelectorAll("[data-send-tool]"))
+  b.onclick = () => { const s = imgShots[imgSel]; toolOpen(b.dataset.sendTool, s.url, s.name, s.req && s.req.prompt); };
+// the sections' open or closed, kept here; on a phone the negative prompt (while empty) and the info start closed
+const imgPhone = matchMedia("(max-width: 640px)");
+for (const id of ["img-neg-f", "img-sec-ref", "img-lora", "img-guide", "img-sec-out", "img-moss", "img-info-box"]) {
+  const d = $(id), was = store.get("img_open_" + id, null);
+  d.open = was != null ? was : !(imgPhone.matches && id === "img-info-box") && !(imgPhone.matches && id === "img-neg-f");
+  d.addEventListener("toggle", () => store.set("img_open_" + id, d.open));
+}
+// a phone's software keyboard over a text field of this tab: Generate, held at the bottom, steps out of its way
+if (window.visualViewport) {
+  const typing = () => {
+    const a = document.activeElement;
+    const field = a && $("img-form").contains(a) && (a.tagName === "TEXTAREA" || (a.tagName === "INPUT" && !["range", "checkbox", "file"].includes(a.type)));
+    $("img-form").classList.toggle("is-typing", !!field && visualViewport.height < window.innerHeight * 0.8);
+  };
+  visualViewport.addEventListener("resize", typing);
+  $("img-form").addEventListener("focusout", () => setTimeout(typing, 100));
+}
 $("img-neg").oninput = () => { imgNegHint(); imgCount(); };
 $("img-cfg").addEventListener("input", imgNegHint);
 $("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
-$("img-up").onchange = () => imgDefaults();   // the upscaler's fields with a scale
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
@@ -3833,9 +3954,10 @@ $("img-form").onsubmit = async (ev) => {
   const partial = $("img-partial").checked;
   if (partial) Object.assign(body, {stream: true, partial_images: 2});
   imageBusy = true;
-  $("img-go").disabled = true;
-  paintLive();
+  imgAbort = new AbortController();
   const t0 = performance.now();
+  imgGoBusy(t0);
+  paintLive();
   $("img-hint").textContent = tr("img.generatingHint", "Generating… (a minute or more on a small GPU)");
   try {
     // with an image: an edit (or a model without edits, img2img), in JSON with data: URLs (without an API key the
@@ -3848,54 +3970,363 @@ $("img-form").onsubmit = async (ev) => {
       if ($("img-color").value !== "off") body.color_match = $("img-color").value;
       if (!$("img-refine-f").hidden && $("img-refine").checked) body.refine = true;
     }
-    if (!mask && refs.length === 1 && $("img-fix").value) {   // the Detailer: the parts found and drawn again
-      body.fix = {parts: $("img-fix").value.split(",")};
-      if (body.strength !== undefined) body.fix.strength = body.strength;
-      delete body.size;
-    } else if (!mask && refs.length === 1 && $("img-up").value) {   // the upscaler, then the drawing (or not)
-      const [method, variant] = $("img-up-m").value.split(":");   // SeedVR2's variant after the colon
-      body.upscale = {scale: Number($("img-up").value), method, redraw: $("img-up-r").checked};
-      if (variant) body.upscale.variant = variant;
-      if ($("img-up-r").checked && body.strength !== undefined) body.upscale.strength = body.strength;
-      delete body.strength;
+    if (!mask && refs.length === 1 && $("img-ext").value) {
+      body.extend = {aspect: $("img-ext").value};
+      delete body.size;   // the size is the grown image's
     }
-    else if (!mask && refs.length === 1 && $("img-ext").value) body.extend = {aspect: $("img-ext").value};
-    if (body.upscale || body.extend) delete body.size;   // the size is the grown image's
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
-    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
-    const j = partial && r.ok ? await imgStream(r, prompt) : await r.json();
+    // Interrupt aborts the request; the server cancels a job whose client left, after the step it is on
+    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: imgAbort.signal});
+    const j = partial && r.ok ? await imgStream(r) : await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
-    for (const d of j.data) {
-      const fig = document.createElement("figure");
-      const img = document.createElement("img");
-      img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
-      img.alt = prompt;
-      const cap = document.createElement("figcaption");
-      const made = j.strata && j.strata.crop && !j.strata.crop.whole && j.strata.made_size ? ` ${tr("img.madeCrop", "(drawn at {size} around the painted part)", {size: j.strata.made_size})}`
-        : j.strata && j.strata.crop ? ""
-        : j.strata && j.strata.made_size ? ` ${tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})}`
-        : j.strata && j.strata.requested_size ? ` ${tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size})}` : "";
-      const by = $("img-model-f").hidden ? "" : `${j.model}, `;
-      cap.textContent = `${by}${j.size}${made}, ${tr("img.capSeed", "seed {seed}", {seed: d.seed})}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
-      fig.append(img, cap);
-      const note = imgEnhanced(j, d);
-      if (note) fig.append(note);
-      $("img-results").prepend(fig);
+    const seconds = Math.round((performance.now() - t0) / 1000);
+    for (const d of [...j.data].reverse()) {
+      const fmt = j.output_format || "png";
+      imgAdd({url: `data:image/${fmt};base64,` + d.b64_json, name: `xestrata-${d.seed}.${fmt === "jpeg" ? "jpg" : fmt}`, seed: d.seed,
+              prompt, ...imgInfo(url, body, j, d, seconds), note: imgEnhanced(j, d)});
     }
-    $("img-hint").textContent = tr("img.done", "Done. Right-click an image to save it.");
+    imgLastSeed = j.data[0].seed;
+    $("img-seed-reuse").disabled = false;
+    imgShow(0);
+    $("img-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    if (imgPhone.matches) $("img-view").scrollIntoView({block: "start", behavior: "smooth"});
     if (j.strata && j.strata.made_size && !j.strata.crop)
       toast("info", tr("img.madeAt", "Made at {size}", {size: j.strata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
     else if (j.strata && j.strata.requested_size)
       toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.strata.requested_size}), 8000);
   } catch (e) {
-    $("img-hint").textContent = "";
-    toast("error", tr("img.none", "No image"), String(e.message || e), 8000);
+    if (imgAbort.signal.aborted) $("img-hint").textContent = tr("img.interrupted", "Interrupted.");
+    else {
+      $("img-hint").textContent = "";
+      toast("error", tr("img.none", "No image"), String(e.message || e), 8000);
+    }
   } finally {
     imageBusy = false;
-    $("img-go").disabled = false;
+    imgAbort = null;
+    imgGoBusy(null);
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
     paintLive();
     await loadHealth();        // the speed the job measured (the count's limit and estimate)
     imgMaskSetup();
+  }
+};
+// Generate, and while a job of this page runs, Interrupt in its place with the seconds so far
+let imgAbort = null, imgTimer = 0;
+function imgGoBusy(t0) {
+  clearInterval(imgTimer);
+  $("img-go").classList.toggle("is-busy", t0 != null);
+  $("img-go-time").textContent = "";
+  if (t0 != null)
+    imgTimer = setInterval(() => { $("img-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round((performance.now() - t0) / 1000)}); }, 1000);
+}
+// Enter in a field while a job runs (the form's implicit submission, a click of no pointer on the button) does not stop it
+$("img-go").onclick = (ev) => {
+  if (!imgAbort) return;
+  ev.preventDefault();
+  if (ev.detail > 0 || document.activeElement === $("img-go")) imgAbort.abort();
+};
+
+// ------------------------------------------------------------------ the Tools tab: the image tools on their own
+// Each tool is its API's request: the upscale /v1/images/upscale (model, scale, extra_params: color_correction_method,
+// redraw, redraw_strength, redraw_model), the Detailer the edits' fix ({parts, strength}), the parts found
+// /v1/images/segmentations (prompt, task, model, score_threshold, mask_threshold), the background removed
+// /v1/images/remove-background (model, operating_resolution, refine_foreground, mask_only, background_color, mask_grow,
+// mask_blur, output_format).  The image is one of this browser's files or one the Images tab sends (toolOpen).
+const TOOL_NAMES = {upscale: "upscale_image", fix: "fix_image", segment: "find_region", rembg: "remove_background"};
+let toolKind = store.get("tool_kind", "upscale"), toolSrc = null, toolAbort = null, toolTimer = 0, toolLast = null;
+// the tools some image model offers (/health's defaults.tools): the tab, and each tool's button
+function toolsSetup() {
+  const ms = health.image_models || [];
+  const has = (k) => ms.some(m => ((m.defaults || {}).tools || []).includes(TOOL_NAMES[k]));
+  const any = Object.keys(TOOL_NAMES).filter(has);
+  $("tab-btn-tools").hidden = !health.image_generation || !any.length;
+  for (const b of $("tool-kind").children) b.hidden = !has(b.dataset.tool);
+  for (const b of document.querySelectorAll("[data-send-tool]")) b.hidden = !has(b.dataset.sendTool);
+  if (any.length && !any.includes(toolKind)) toolKind = any[0];
+  // the image model that draws (an upscale's redraw, the Detailer): one that offers the tool, a choice of several
+  const sel = $("tool-model"), was = sel.value;
+  const draw = ms.filter(m => ((m.defaults || {}).tools || []).includes(TOOL_NAMES[toolKind === "fix" ? "fix" : "upscale"]));
+  sel.replaceChildren(...draw.map(m => new Option(m.id, m.id)));
+  if (draw.some(m => m.id === was)) sel.value = was;
+  toolShow();
+}
+// the tool's name (its button) and what it does
+const toolRunText = (k) => k === "fix" ? tr("tool.fix", "Fix parts") : k === "segment" ? tr("tool.segment", "Find parts")
+  : k === "rembg" ? tr("tool.rembg", "Remove background") : tr("tool.upscale", "Upscale");
+const toolAboutText = (k) => k === "fix" ? tr("tool.aboutFix", "Finds faces, hands or people and draws each again, finer (a Detailer). The image keeps its size.")
+  : k === "segment" ? tr("tool.aboutSegment", "Finds the parts the words name. A mask found here can be the mask of an edit in the Images tab.")
+  : k === "rembg" ? tr("tool.aboutRembg", "Cuts the subject out (BiRefNet): a PNG with a transparent background, or its mask.")
+  : tr("tool.aboutUpscale", "Makes the image larger on the GPU; with the redraw, the image model draws the larger picture again for detail.");
+// the fields of the tool chosen, the prompt's label (or none), and the button's words
+function toolShow() {
+  const k = toolKind;
+  for (const b of $("tool-kind").children) b.setAttribute("aria-checked", String(b.dataset.tool === k));
+  for (const f of document.querySelectorAll("#tool-form .tool-fields")) f.hidden = !f.dataset.tool.split(" ").includes(k);
+  $("tool-go-l").textContent = toolRunText(k);
+  $("tool-about").textContent = toolAboutText(k);
+  const redraw = $("tool-up-redraw").checked;
+  $("tool-up-strength-f").hidden = !redraw;
+  $("tool-prompt-f").hidden = k === "rembg" || (k === "upscale" && !redraw);
+  $("tool-prompt-l").textContent = k === "segment" ? tr("tool.promptParts", "The parts to find (a few words: hair, the sky)")
+    : k === "fix" ? tr("tool.promptFix", "Prompt (optional: each part's own words otherwise)")
+    : tr("tool.promptRedraw", "What the picture shows (the redraw's prompt)");
+  $("tool-model-f").hidden = $("tool-model").options.length < 2 || (k === "upscale" && !redraw);
+  $("tool-seed-f").hidden = k === "upscale" && !redraw;
+  $("tool-up-about").textContent = tr("img.upMethodTitle", "How the image is made larger: Auto (RealESRGAN when it is drawn again, SeedVR2 when not), Lanczos (a plain resize), RealESRGAN (sharper) or SeedVR2 (restores detail in one step; sharp: for anime and blurred pictures). The weights are downloaded the first time");
+  toolUpSize();
+}
+for (const b of $("tool-kind").children)
+  b.onclick = () => { toolKind = b.dataset.tool; store.set("tool_kind", toolKind); toolResult(null); toolsSetup(); };
+$("tool-up-redraw").onchange = toolShow;
+// the upscale's size: the sides times the scale, multiples of 16, at most 4096 (the server's UPSCALE_MAX_SIDE)
+function toolUpSize() {
+  const el = $("tool-up-size");
+  if (!toolSrc || toolKind !== "upscale") { el.textContent = ""; return; }
+  const sc = +$("tool-up-scale").value || 2, [w, h] = [toolSrc.w, toolSrc.h].map(x => Math.max(16, Math.round(x * sc / 16) * 16));
+  el.textContent = tr("tool.upSize", "{w} × {h} → {W} × {H}", {w: toolSrc.w, h: toolSrc.h, W: w, H: h}) +
+    (Math.max(w, h) > 4096 ? " " + tr("tool.upTooLarge", "(past 4096 a side: a smaller scale)") : "");
+}
+$("tool-up-scale").addEventListener("input", toolUpSize);
+// the image the tool reads: a file of this browser's, one dropped on the tab, or one the Images tab sends
+async function toolSetSource(url, name) {
+  const im = new Image();
+  await new Promise((ok, no) => { im.onload = ok; im.onerror = () => no(new Error(tr("tool.unreadable", "The browser cannot read this image"))); im.src = url; });
+  toolSrc = {url, name: name || "image.png", w: im.naturalWidth, h: im.naturalHeight};
+  toolLast = null;
+  $("tool-before").src = url;
+  $("tool-stage").hidden = false;
+  $("tool-empty").hidden = true;
+  toolResult(null);
+  toolUpSize();
+}
+async function toolFile(f) {
+  if (!f) return;
+  try { await toolSetSource(await readAsDataURL(f), f.name); } catch (e) { toast("error", tr("tab.tools", "Tools"), String(e.message || e), 6000); }
+}
+$("tool-file").onchange = () => toolFile($("tool-file").files[0]);
+for (const ev of ["dragenter", "dragover"]) $("tool-form").addEventListener(ev, (e) => {
+  if ([...(e.dataTransfer.items || [])].some((i) => i.kind === "file")) e.preventDefault();
+});
+$("tool-form").addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f && f.type.startsWith("image/")) { e.preventDefault(); toolFile(f); }
+});
+async function toolOpen(kind, url, name, prompt) {
+  toolKind = kind;
+  store.set("tool_kind", kind);
+  $("tool-file").value = "";
+  if (prompt && kind !== "segment") $("tool-prompt").value = prompt;
+  showTab("tools");
+  toolsSetup();
+  await toolSetSource(url, name);
+}
+// the request of the tool chosen, on the image: [the endpoint, the body]
+function toolRequest() {
+  const k = toolKind, num = (id) => $(id).value === "" ? undefined : Number($(id).value);
+  const prompt = $("tool-prompt").value.trim(), seed = num("tool-seed"), model = $("tool-model-f").hidden ? undefined : $("tool-model").value;
+  const body = {image: toolSrc.url};
+  if (k === "upscale") {
+    Object.assign(body, {model: $("tool-up-model").value, scale: num("tool-up-scale") ?? 2});
+    const extra = {};
+    if ($("tool-up-color").value) extra.color_correction_method = $("tool-up-color").value;
+    if ($("tool-up-redraw").checked) {
+      Object.assign(extra, {redraw: true, ...(num("tool-up-strength") != null && {redraw_strength: num("tool-up-strength")}), ...(model && {redraw_model: model})});
+      Object.assign(body, {prompt, ...(seed != null && {seed})});
+    }
+    if (Object.keys(extra).length) body.extra_params = extra;
+    return ["v1/images/upscale", {...body, response_format: "b64_json"}];
+  }
+  if (k === "fix") {
+    const parts = [...document.querySelectorAll("[name=tool-part]:checked")].map(x => x.value);
+    const req = {images: [{image_url: toolSrc.url}], fix: {parts, ...(num("tool-fix-strength") != null && {strength: num("tool-fix-strength")})}};
+    return ["v1/images/edits", {...req, ...(prompt && {prompt}), ...(model && {model}), ...(seed != null && {seed}), response_format: "b64_json"}];
+  }
+  if (k === "segment") {
+    const m = $("tool-seg-model").value;
+    return ["v1/images/segmentations", {...body, prompt, task: $("tool-seg-task").value, ...(m && {model: m}),
+            ...(num("tool-seg-score") != null && {score_threshold: num("tool-seg-score")}),
+            ...(num("tool-seg-mask") != null && {mask_threshold: num("tool-seg-mask")})}];
+  }
+  return ["v1/images/remove-background", {...body, model: $("tool-bg-model").value,
+          ...($("tool-bg-res").value.trim() && {operating_resolution: $("tool-bg-res").value.trim()}),
+          refine_foreground: $("tool-bg-refine").checked, mask_only: $("tool-bg-mask").checked,
+          ...($("tool-bg-color-on").checked && {background_color: $("tool-bg-color").value}),
+          ...(num("tool-bg-grow") != null && {mask_grow: num("tool-bg-grow")}), ...(num("tool-bg-blur") != null && {mask_blur: num("tool-bg-blur")}),
+          output_format: $("tool-bg-fmt").value, response_format: "b64_json"}];
+}
+// the result: the new picture over the image (a divider to compare them), or the parts found drawn over it
+function toolResult(r) {
+  toolLast = r;
+  const after = $("tool-after"), ov = $("tool-overlay");
+  after.hidden = ov.hidden = $("tool-split").hidden = $("tool-divider").hidden = true;
+  $("tool-found").hidden = $("tool-to-mask").hidden = true;
+  $("tool-actions").hidden = $("tool-info-box").hidden = !r;
+  if (!r) return;
+  $("tool-info").textContent = r.info;
+  if (r.url) {
+    after.src = r.url;
+    after.hidden = $("tool-split").hidden = $("tool-divider").hidden = false;
+    toolSplit();
+    Object.assign($("tool-save"), {href: r.url, download: r.name});
+    $("tool-save").hidden = $("tool-to-ref").hidden = false;
+    return;
+  }
+  $("tool-save").hidden = $("tool-to-ref").hidden = true;
+  toolFound(r.found);
+}
+function toolSplit() {
+  $("tool-stage").style.setProperty("--split", `${$("tool-split").value}%`);
+  $("tool-split").style.setProperty("--fill", `${$("tool-split").value}%`);
+}
+$("tool-split").addEventListener("input", toolSplit);
+// the parts found: each drawn in its color over the image (its mask, or its box), and listed with its score; the ones
+// ticked make the mask "Edit these parts" sends to the Images tab
+const TOOL_COLORS = ["#e11d48", "#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b2"];
+async function toolFound(found) {
+  const list = $("tool-found");
+  list.hidden = false;
+  list.replaceChildren(...(found.items.length ? found.items.map((it, i) => {
+    const row = document.createElement("label"), cb = document.createElement("input"), sw = document.createElement("span"), t = document.createElement("span");
+    row.className = "tool-found__row img-check";
+    cb.type = "checkbox"; cb.checked = true; cb.onchange = () => toolDrawFound(found);
+    sw.className = "tool-found__swatch"; sw.style.background = TOOL_COLORS[i % TOOL_COLORS.length];
+    t.textContent = `${it.label || found.prompt} · ${it.score.toFixed(2)}`;
+    row.append(cb, sw, t);
+    it.check = cb;
+    return row;
+  }) : [Object.assign(document.createElement("span"), {className: "composer-hint", textContent: tr("img.regionNone", "Not found: try other words")})]));
+  for (const it of found.items) {
+    if (!it.mask) continue;
+    it.img = new Image();
+    await new Promise((ok, no) => { it.img.onload = ok; it.img.onerror = no; it.img.src = "data:image/png;base64," + it.mask; });
+  }
+  $("tool-to-mask").hidden = !found.items.length || !toolMaskable();
+  toolDrawFound(found);
+}
+const toolMaskable = () => !!(imgModel().defaults || {}).mask;
+// the ticked parts as one mask at the image's size: white where they are (their masks, or their boxes)
+function toolMaskCanvas(found, color) {
+  const c = document.createElement("canvas");
+  c.width = found.width; c.height = found.height;
+  const g = c.getContext("2d");
+  found.items.forEach((it, i) => {
+    if (!it.check.checked) return;
+    const col = color || TOOL_COLORS[i % TOOL_COLORS.length];
+    if (it.img) {
+      const t = document.createElement("canvas");
+      t.width = c.width; t.height = c.height;
+      const tg = t.getContext("2d");
+      tg.drawImage(it.img, 0, 0, c.width, c.height);
+      tg.globalCompositeOperation = "source-in";   // the mask PNG is white on black: keep its white as the color
+      const d = tg.getImageData(0, 0, c.width, c.height);
+      for (let p = 0; p < d.data.length; p += 4) d.data[p + 3] = d.data[p] > 127 ? 255 : 0;
+      tg.putImageData(d, 0, 0);
+      tg.fillStyle = col;
+      tg.fillRect(0, 0, c.width, c.height);
+      g.drawImage(t, 0, 0);
+    } else if (it.box) {
+      g.fillStyle = col;
+      g.fillRect(it.box[0], it.box[1], it.box[2] - it.box[0], it.box[3] - it.box[1]);
+    }
+  });
+  return c;
+}
+function toolDrawFound(found) {
+  const ov = $("tool-overlay");
+  ov.width = found.width; ov.height = found.height;
+  const g = ov.getContext("2d");
+  g.clearRect(0, 0, ov.width, ov.height);
+  g.globalAlpha = 0.45;
+  g.drawImage(toolMaskCanvas(found), 0, 0);
+  g.globalAlpha = 1;
+  g.lineWidth = Math.max(2, ov.width / 300);
+  found.items.forEach((it, i) => {
+    if (!it.check.checked || !it.box) return;
+    g.strokeStyle = TOOL_COLORS[i % TOOL_COLORS.length];
+    g.strokeRect(it.box[0], it.box[1], it.box[2] - it.box[0], it.box[3] - it.box[1]);
+  });
+  ov.hidden = false;
+}
+// "Edit these parts": the image to the Images tab as its reference, the parts ticked painted into its mask
+$("tool-to-mask").onclick = async () => {
+  const found = toolLast && toolLast.found, src = toolSrc;
+  if (!found) return;
+  const m = toolMaskCanvas(found, "#e11d48");
+  await imgUseAsRef(src.url, src.name);
+  const c = $("img-mask-paint"), img = $("img-mask-img");
+  const paint = () => { c.getContext("2d").drawImage(m, 0, 0, c.width, c.height); };
+  if (img.complete && img.naturalWidth && c.width) paint(); else img.addEventListener("load", () => setTimeout(paint, 0), {once: true});
+};
+$("tool-to-ref").onclick = () => toolLast && imgUseAsRef(toolLast.url, toolLast.name);
+$("tool-copy").onclick = () => toolLast && copyText(JSON.stringify(toolLast.req, null, 2), $("tool-copy"));
+$("tool-sam-license").onclick = (ev) => $("img-sam-license").onclick(ev);
+// running: the button is Interrupt with the seconds so far; an image job's progress (the metrics' live.image) beside
+function toolBusy(t0) {
+  clearInterval(toolTimer);
+  $("tool-go").classList.toggle("is-busy", t0 != null);
+  $("tool-go-time").textContent = "";
+  $("tool-progress").hidden = true;
+  $("tool-cap").hidden = true;
+  if (t0 == null) return;
+  toolTimer = setInterval(() => {
+    const s = (performance.now() - t0) / 1000, live = lastMetrics && lastMetrics.live && lastMetrics.live.image;
+    $("tool-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round(s)});
+    if (!live) return;
+    const p = live.progress || 0;
+    $("tool-progress").hidden = false;
+    $("tool-bar").style.width = `${Math.round(100 * p)}%`;
+    $("tool-cap").hidden = false;
+    $("tool-cap").textContent = imageState(live)[0] + (p > 0.05 ? " · " + tr("tool.left", "about {n} s left", {n: Math.round(s * (1 - p) / p)}) : "");
+  }, 500);
+}
+$("tool-go").onclick = (ev) => {
+  if (!toolAbort) return;
+  ev.preventDefault();
+  if (ev.detail > 0 || document.activeElement === $("tool-go")) toolAbort.abort();
+};
+$("tool-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (toolAbort) return;
+  if (!toolSrc) { toast("warn", tr("tab.tools", "Tools"), tr("tool.noImage", "Choose an image first."), 5000); return; }
+  const [url, body] = toolRequest();
+  if (!$("tool-prompt-f").hidden && toolKind !== "fix" && !body.prompt) { $("tool-prompt").focus(); return; }
+  if (toolKind === "fix" && !body.fix.parts.length) { toast("warn", tr("tool.fix", "Fix parts"), tr("tool.noParts", "Tick a part to find."), 5000); return; }
+  toolAbort = new AbortController();
+  imageBusy = true;
+  paintLive();
+  const t0 = performance.now();
+  toolBusy(t0);
+  $("tool-hint").textContent = "";
+  try {
+    const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body), signal: toolAbort.signal});
+    const j = await r.json();
+    if (!r.ok) {
+      const e = j.error || {};
+      if (e.code === "weights_downloading") throw new Error(tr("tool.downloading", "The tool's weights are downloading: run it again in a minute. ({msg})", {msg: e.message || ""}));
+      throw new Error(e.message || r.statusText);
+    }
+    const seconds = Math.round((performance.now() - t0) / 1000);
+    if (url.endsWith("segmentations")) {
+      const items = j.data.map(d => ({score: d.score, box: d.box, mask: d.mask, label: d.label}));
+      toolResult({req: body, info: imgInfoText(url, body, [`model: ${j.model}`, `task: ${j.task}`, `found: ${items.length}`, `seconds: ${seconds}`]),
+                  found: {items, width: j.width, height: j.height, prompt: body.prompt}});
+      $("tool-sam-license").hidden = !(j.strata && /license/.test(j.strata.fallback || ""));
+    } else {
+      const fmt = j.output_format || "png", d = j.data[0];
+      const fix = j.strata && j.strata.fix;   // the Detailer's regions found and drawn again
+      const answer = [`model: ${j.model}`, j.size ? `size: ${j.size}` : j.width ? `size: ${j.width}x${j.height}` : "", d.seed != null ? `seed: ${d.seed}` : "",
+                      fix ? `regions: ${(fix.regions || []).map(x => `${x.part} ${x.score.toFixed(2)}`).join(", ") || 0}` : "", `seconds: ${seconds}`].filter(Boolean);
+      const req = d.seed != null && body.seed == null && (body.prompt || body.fix) ? {...body, seed: d.seed} : body;
+      toolResult({url: `data:image/${fmt};base64,` + d.b64_json, name: `xestrata-${toolKind}.${fmt === "jpeg" ? "jpg" : fmt}`, req, info: imgInfoText(url, req, answer)});
+    }
+    $("tool-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+  } catch (e) {
+    if (toolAbort.signal.aborted) $("tool-hint").textContent = tr("img.interrupted", "Interrupted.");
+    else toast("error", toolRunText(toolKind), String(e.message || e), 10000);
+  } finally {
+    toolAbort = null;
+    imageBusy = false;
+    toolBusy(null);
+    paintLive();
   }
 };
