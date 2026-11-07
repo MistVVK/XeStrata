@@ -546,6 +546,10 @@ AuxMapNet::Map AuxMapNet::run(const MConv& c, const Map& x, AuxAct a, const Map*
     float* y = scratch(kSumSlot, (size_t) (P * c.outp) * 4);
     if (plain) {
         gemm_.f16(x.p, c.w, y, P, c.outp, c.inp);
+    } else if (c.outp <= kConvFewOut && c.dil == 1) {
+        // few outputs (an image's last layer): straight, the unfolded patches' traffic past the product's.  Line
+        // art's 7 x 7 of 64 channels to one at 768 x 512 took the RTX 4070 24 ms unfolded (2026-11-08)
+        aux_conv_few16(x.p, x.h, x.w, c.inp, c.w, c.outp, c.out, c.k, c.s, c.pad, OH, OW, y, s_);
     } else {   // unfolded a slice of rows at a time
         const int64_t K = (int64_t) c.k * c.k * c.inp;
         const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(P, kColBytes / (K * 2)));

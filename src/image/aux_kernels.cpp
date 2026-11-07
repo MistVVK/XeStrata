@@ -73,6 +73,53 @@ void aux_im2col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, i
     finish(stream, e, "aux_im2col16");
 }
 
+void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, int64_t O,
+                    int64_t real, int k, int stride, int pad, int64_t OH, int64_t OW, float* y, void* stream) {
+    if (OH <= 0 || OW <= 0 || O <= 0) return;
+    if (O > kConvFewOut || real > O) throw std::invalid_argument("aux_conv_few16: more than kConvFewOut outputs");
+    // a pixel's channels shared by kLanes work-items (each read of a tap's channels one run of memory), their sums
+    // added in local memory
+    constexpr int64_t kLanes = 16, kPixels = 16;
+    const int64_t K = (int64_t) k * k * C, P = OH * OW, groups = (P + kPixels - 1) / kPixels;
+    const auto e = queue_for(stream).submit([&](sycl::handler& hd) {
+        sycl::local_accessor<float, 1> part(sycl::range<1>((size_t) (kLanes * kPixels * kConvFewOut)), hd);
+        hd.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (groups * kLanes * kPixels)),
+                                          sycl::range<1>((size_t) (kLanes * kPixels))),
+                        [=](sycl::nd_item<1> it) {
+            const auto l = static_cast<int64_t>(it.get_local_id(0));
+            const int64_t lane = l % kLanes, slot = l / kLanes;
+            const int64_t p = static_cast<int64_t>(it.get_group(0)) * kPixels + slot;
+            float acc[kConvFewOut] = {};
+            if (p < P) {
+                const int64_t oy = p / OW, ox = p - oy * OW;
+                for (int ty = 0; ty < k; ++ty) {
+                    const int64_t yy = oy * stride - pad + ty;
+                    if (yy < 0 || yy >= H) continue;
+                    for (int tx = 0; tx < k; ++tx) {
+                        const int64_t xx = ox * stride - pad + tx;
+                        if (xx < 0 || xx >= W) continue;
+                        const uint16_t* px = x16 + (yy * W + xx) * C;
+                        const int64_t t0 = ((int64_t) ty * k + tx) * C;
+                        for (int64_t c = lane; c < C; c += kLanes) {
+                            const float v = f32_from_f16(px[c]);
+                            for (int64_t o = 0; o < real; ++o) acc[o] += v * f32_from_f16(w16[o * K + t0 + c]);
+                        }
+                    }
+                }
+            }
+            for (int64_t o = 0; o < kConvFewOut; ++o) part[(size_t) (l * kConvFewOut + o)] = acc[o];
+            sycl::group_barrier(it.get_group());
+            if (lane < O && p < P) {   // lane o sums output o over the pixel's lanes
+                float s = 0.f;
+                if (lane < real)
+                    for (int64_t j = 0; j < kLanes; ++j) s += part[(size_t) ((slot * kLanes + j) * kConvFewOut + lane)];
+                y[p * O + lane] = s;
+            }
+        });
+    });
+    finish(stream, e, "aux_conv_few16");
+}
+
 void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* y,
                      void* stream) {
     const int64_t n = H * W * C;

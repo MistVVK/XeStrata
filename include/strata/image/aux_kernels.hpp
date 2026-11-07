@@ -19,6 +19,13 @@ void aux_rgb_norm16(const uint8_t* rgba, int64_t W, int64_t H, const float* mean
 void aux_im2col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int64_t OW,
                   int64_t p0, int64_t n, uint16_t* col16, void* stream);
 
+/// y [OH][OW][O] (FP32, no bias) = the k x k convolution (stride `stride`, zero padding `pad`) of x16 [H][W][C] by
+/// w16 [O][k][k][C], each output pixel's sums at once (O <= kConvFewOut; the outputs past `real` 0, the padding's): a
+/// convolution with few outputs, whose unfolded patches would be read for a product of O columns only.
+constexpr int64_t kConvFewOut = 8;
+void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, int64_t O,
+                    int64_t real, int k, int stride, int pad, int64_t OH, int64_t OW, float* y, void* stream);
+
 /// y = x + the depthwise 3 x 3 convolution of x (zero padding 1, w [C][9], bias b [C]): DaViT's position encoding
 /// with its residual.  x and y [H][W][C], not the same buffer.
 void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* y,
