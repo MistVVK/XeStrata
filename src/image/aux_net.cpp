@@ -204,25 +204,36 @@ AuxNet::Conv AuxNet::conv(const std::string& name, int stride, int pad) {
     const SafeTensor* t = st_->find(name + ".weight");
     if (t == nullptr || t->shape.size() != 4 || t->shape[2] != t->shape[3])
         throw std::runtime_error(path_ + ": no convolution " + name);
-    Conv c;
-    c.o = t->shape[0];
-    c.c = t->shape[1];
-    c.k = (int) t->shape[2];
-    c.stride = stride;
-    c.pad = pad;
-    const auto w = st_->f32(name + ".weight");   // [o][c][k][k] -> [o][k][k][c]
-    std::vector<uint16_t> h(w.size());
-    const int64_t kk = (int64_t) c.k * c.k;
-    for (int64_t o = 0; o < c.o; ++o)
-        for (int64_t ci = 0; ci < c.c; ++ci)
+    const auto b = st_->find(name + ".bias") != nullptr ? st_->f32(name + ".bias") : std::vector<float>();
+    return conv_host(st_->f32(name + ".weight"), b, t->shape[0], t->shape[1], (int) t->shape[2], stride, pad);
+}
+
+AuxNet::Conv AuxNet::conv_host(const std::vector<float>& w, const std::vector<float>& b, int64_t o, int64_t c, int k,
+                               int stride, int pad) {
+    Conv cv;
+    cv.o = o;
+    cv.c = c;
+    cv.k = k;
+    cv.stride = stride;
+    cv.pad = pad;
+    const int64_t kk = (int64_t) k * k;
+    if ((int64_t) w.size() != o * c * kk) throw std::runtime_error(path_ + ": a convolution's weight size");
+    std::vector<uint16_t> h(w.size());   // [o][c][k][k] -> [o][k][k][c]
+    for (int64_t oi = 0; oi < o; ++oi)
+        for (int64_t ci = 0; ci < c; ++ci)
             for (int64_t t2 = 0; t2 < kk; ++t2)
-                h[(size_t) ((o * kk + t2) * c.c + ci)] = kernels::f16_from_f32(w[(size_t) ((o * c.c + ci) * kk + t2)]);
+                h[(size_t) ((oi * kk + t2) * c + ci)] = kernels::f16_from_f32(w[(size_t) ((oi * c + ci) * kk + t2)]);
     auto* dw = static_cast<uint16_t*>(alloc(h.size() * 2));
     gpu::copy(dw, h.data(), h.size() * 2);
-    c.w = dw;
+    cv.w = dw;
     weight_bytes_ += h.size() * 2;
-    if (st_->find(name + ".bias") != nullptr) c.b = f32(name + ".bias");
-    return c;
+    if (!b.empty()) {
+        auto* db = static_cast<float*>(alloc(b.size() * 4));
+        gpu::copy(db, b.data(), b.size() * 4);
+        cv.b = db;
+        weight_bytes_ += b.size() * 4;
+    }
+    return cv;
 }
 
 AuxNet::Lin AuxNet::deconv2(const std::string& name) {

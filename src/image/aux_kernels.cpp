@@ -106,30 +106,30 @@ void aux_layer_norm(const float* x, const float* r, const float* w, const float*
     finish(stream, e, "aux_layer_norm");
 }
 
-void aux_window16(const uint16_t* src16, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, uint16_t* dst16,
-                  void* stream) {
-    const int64_t n = H * W * C;
+void aux_window16(const uint16_t* src16, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, int64_t Hp,
+                  int64_t Wp, uint16_t* dst16, void* stream) {
+    const int64_t n = Hp * Wp * C;
     if (n <= 0) return;
-    const int64_t nwx = W / ws;
+    const int64_t nwx = Wp / ws;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i % C, t = i / C, win = t / (ws * ws), r = t - win * ws * ws;
-        const int64_t y = ((win / nwx) * ws + r / ws + shift) % H, x = ((win % nwx) * ws + r % ws + shift) % W;
-        dst16[i] = src16[(y * W + x) * C + c];
+        const int64_t y = ((win / nwx) * ws + r / ws + shift) % Hp, x = ((win % nwx) * ws + r % ws + shift) % Wp;
+        dst16[i] = y < H && x < W ? src16[(y * W + x) * C + c] : (uint16_t) 0;
     });
     finish(stream, e, "aux_window16");
 }
 
-void aux_unwindow_add(float* x, const float* y, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift,
-                      void* stream) {
-    const int64_t n = H * W * C;
+void aux_unwindow_add(float* x, const float* y, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, int64_t Hp,
+                      int64_t Wp, void* stream) {
+    const int64_t n = Hp * Wp * C;
     if (n <= 0) return;
-    const int64_t nwx = W / ws;
+    const int64_t nwx = Wp / ws;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i % C, t = i / C, win = t / (ws * ws), r = t - win * ws * ws;
-        const int64_t py = ((win / nwx) * ws + r / ws + shift) % H, px = ((win % nwx) * ws + r % ws + shift) % W;
-        x[(py * W + px) * C + c] += y[i];
+        const int64_t py = ((win / nwx) * ws + r / ws + shift) % Hp, px = ((win % nwx) * ws + r % ws + shift) % Wp;
+        if (py < H && px < W) x[(py * W + px) * C + c] += y[i];
     });
     finish(stream, e, "aux_unwindow_add");
 }
@@ -450,6 +450,173 @@ void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const flo
         bias[i] = tmp[(qq * R + py) * heads + h] + tmp[(qq * R + H + px) * heads + h];
     });
     finish(stream, e, "aux_box_bias");
+}
+
+void aux_merge2(const float* x, int64_t H, int64_t W, int64_t C, float* y, void* stream) {
+    const int64_t h = H / 2, w = W / 2, n = h * w * 4 * C;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c4 = i % (4 * C), p = i / (4 * C), part = c4 / C, c = c4 - part * C;
+        const int64_t py = p / w, px = p - py * w;
+        const int64_t sy = 2 * py + part % 2, sx = 2 * px + part / 2;   // x0 (0, 0), x1 (1, 0), x2 (0, 1), x3 (1, 1)
+        y[i] = x[(sy * W + sx) * C + c];
+    });
+    finish(stream, e, "aux_merge2");
+}
+
+void aux_resize_into(const float* src, int64_t h, int64_t w, int64_t C, float* dst, int64_t H, int64_t W, int64_t ld,
+                     int64_t c0, bool align_corners, bool add, void* stream) {
+    const int64_t n = H * W * C;
+    if (n <= 0) return;
+    const bool same = h == H && w == W;
+    // the source coordinate of a destination pixel: align_corners maps the corners' centers onto each other
+    const float ry = align_corners ? (H > 1 ? (float) (h - 1) / (float) (H - 1) : 0.f) : (float) h / (float) H;
+    const float rx = align_corners ? (W > 1 ? (float) (w - 1) / (float) (W - 1) : 0.f) : (float) w / (float) W;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, p = i / C, py = p / W, px = p - py * W;
+        float v;
+        if (same) {
+            v = src[i];
+        } else {
+            const float fy = align_corners ? (float) py * ry : sycl::fmax(((float) py + 0.5f) * ry - 0.5f, 0.f);
+            const float fx = align_corners ? (float) px * rx : sycl::fmax(((float) px + 0.5f) * rx - 0.5f, 0.f);
+            const int64_t y0 = sycl::min((int64_t) fy, h - 1), x0 = sycl::min((int64_t) fx, w - 1);
+            const int64_t y1 = sycl::min(y0 + 1, h - 1), x1 = sycl::min(x0 + 1, w - 1);
+            const float ay = fy - (float) y0, ax = fx - (float) x0;
+            v = (1.f - ay) * ((1.f - ax) * src[(y0 * w + x0) * C + c] + ax * src[(y0 * w + x1) * C + c]) +
+                ay * ((1.f - ax) * src[(y1 * w + x0) * C + c] + ax * src[(y1 * w + x1) * C + c]);
+        }
+        float& d = dst[p * ld + c0 + c];
+        d = add ? d + v : v;
+    });
+    finish(stream, e, "aux_resize_into");
+}
+
+void aux_deform_col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int pad, const float* om,
+                      int64_t p0, int64_t n, uint16_t* col16, void* stream) {
+    const int64_t k2 = (int64_t) k * k, K = k2 * C;
+    if (n <= 0 || K <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * K)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / K, q = i - r * K, tap = q / C, c = q - tap * C;
+        const int64_t p = p0 + r, oy = p / W, ox = p - oy * W;
+        const float* o = om + p * 3 * k2;
+        const int64_t ty = tap / k, tx = tap - ty * k;   // the tap's row and column in the kernel
+        const float y = (float) (oy - pad + ty) + o[2 * tap], x = (float) (ox - pad + tx) + o[2 * tap + 1];
+        const float m = 2.f / (1.f + sycl::exp(-o[2 * k2 + tap]));
+        float v = 0.f;
+        // torchvision's bilinear_interpolate: nothing outside (-1, H) x (-1, W), the corners outside it zero
+        if (y > -1.f && y < (float) H && x > -1.f && x < (float) W) {
+            const float fy = sycl::floor(y), fx = sycl::floor(x);
+            const int64_t yl = (int64_t) fy, xl = (int64_t) fx, yh = yl + 1, xh = xl + 1;
+            const float ly = y - fy, lx = x - fx, hy = 1.f - ly, hx = 1.f - lx;
+            auto at = [&](int64_t yy, int64_t xx) {
+                return yy >= 0 && yy < H && xx >= 0 && xx < W ? f32_from_f16(x16[(yy * W + xx) * C + c]) : 0.f;
+            };
+            v = hy * hx * at(yl, xl) + hy * lx * at(yl, xh) + ly * hx * at(yh, xl) + ly * lx * at(yh, xh);
+        }
+        col16[i] = f16_from_f32(v * m);
+    });
+    finish(stream, e, "aux_deform_col16");
+}
+
+void aux_bias_act(float* y, int64_t rows, int64_t n, int64_t ld, const float* bias, bool relu, void* stream) {
+    if (rows <= 0 || n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (rows * n)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / n, c = i - r * n;
+        float& v = y[r * ld + c];
+        float t = v + (bias != nullptr ? bias[c] : 0.f);
+        if (relu) t = sycl::fmax(t, 0.f);
+        v = t;
+    });
+    finish(stream, e, "aux_bias_act");
+}
+
+void aux_col_mean(const float* x, int64_t P, int64_t C, float* mean, void* stream) {
+    if (P <= 0 || C <= 0) return;
+    constexpr size_t L = 256;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) C * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto c = static_cast<int64_t>(it.get_group_linear_id());
+            const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            float s = 0.f;
+            for (int64_t p = l; p < P; p += (int64_t) L) s += x[p * C + c];
+            s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+            if (l == 0) mean[c] = s / (float) P;
+        });
+    finish(stream, e, "aux_col_mean");
+}
+
+void aux_scale_by_sigmoid(float* x, int64_t P, int64_t C, const float* logit, void* stream) {
+    if (P <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x[i] *= 1.f / (1.f + sycl::exp(-logit[i / C]));
+    });
+    finish(stream, e, "aux_scale_by_sigmoid");
+}
+
+void aux_image_patches16(const float* img, int64_t S, int64_t g, uint16_t* y16, void* stream) {
+    const int64_t s = S / g, ch = 3 * g * g, n = s * s * ch;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t q = i % ch, p = i / ch, py = p / s, px = p - py * s;
+        const int64_t c = q / (g * g), gy = (q / g) % g, gx = q % g;
+        y16[i] = f16_from_f32(img[((gy * s + py) * S + gx * s + px) * 3 + c]);
+    });
+    finish(stream, e, "aux_image_patches16");
+}
+
+void aux_rgb_norm(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, const float* std, float* y,
+                  void* stream) {
+    const int64_t n = W * H;
+    if (n <= 0) return;
+    const float m0 = mean[0], m1 = mean[1], m2 = mean[2], s0 = 1.f / std[0], s1 = 1.f / std[1], s2 = 1.f / std[2];
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[3 * i] = ((float) rgba[4 * i] / 255.f - m0) * s0;
+        y[3 * i + 1] = ((float) rgba[4 * i + 1] / 255.f - m1) * s1;
+        y[3 * i + 2] = ((float) rgba[4 * i + 2] / 255.f - m2) * s2;
+    });
+    finish(stream, e, "aux_rgb_norm");
+}
+
+void aux_alpha_bicubic(const float* logits, int64_t h, int64_t w, int64_t W, int64_t H, uint8_t* alpha, void* stream) {
+    const int64_t n = W * H;
+    if (n <= 0) return;
+    const float sy = (float) h / (float) H, sx = (float) w / (float) W;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t py = i / W, px = i - py * W;
+        // torch's upsample_bicubic2d: the source coordinate unclamped, the four taps' indices clamped to the edge
+        const float fy = ((float) py + 0.5f) * sy - 0.5f, fx = ((float) px + 0.5f) * sx - 0.5f;
+        const float by = sycl::floor(fy), bx = sycl::floor(fx), ty = fy - by, tx = fx - bx;
+        auto cubic = [](float t, float* wt) {
+            constexpr float A = -0.75f;
+            auto c1 = [](float x) { return ((A + 2.f) * x - (A + 3.f)) * x * x + 1.f; };
+            auto c2 = [](float x) { return ((A * x - 5.f * A) * x + 8.f * A) * x - 4.f * A; };
+            wt[0] = c2(t + 1.f), wt[1] = c1(t), wt[2] = c1(1.f - t), wt[3] = c2(2.f - t);
+        };
+        float wy[4], wx[4];
+        cubic(ty, wy);
+        cubic(tx, wx);
+        float v = 0.f;
+        for (int a = 0; a < 4; ++a) {
+            const int64_t yy = sycl::clamp((int64_t) by - 1 + a, (int64_t) 0, h - 1);
+            float r = 0.f;
+            for (int b = 0; b < 4; ++b) {
+                const int64_t xx = sycl::clamp((int64_t) bx - 1 + b, (int64_t) 0, w - 1);
+                r += wx[b] * logits[yy * w + xx];
+            }
+            v += wy[a] * r;
+        }
+        alpha[i] = (uint8_t) sycl::round(255.f / (1.f + sycl::exp(-v)));
+    });
+    finish(stream, e, "aux_alpha_bicubic");
 }
 
 }  // namespace strata::image

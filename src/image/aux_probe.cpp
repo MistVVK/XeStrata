@@ -11,13 +11,18 @@
 //       SAM 3 on the picture and the words' ids: its parts as raw FP32 files in outdir (embed, vit<i>, fpn<i>, text,
 //       encoder, queries, scores, boxes, mask_logits), each instance's mask as mask<i>.u8 (raw, 255 inside), the
 //       boxes, scores and times (a cold run, then a warm one) on stdout.
+//   strata-image-aux-probe birefnet <weights.safetensors> <image> <outdir> [size]
+//       BiRefNet on the picture at size x size (1024): its parts as raw FP32 files in outdir (x1 .. x4, squeeze,
+//       p4 .. p1, logits), the alpha as alpha.u8 (raw, the picture's size), the times (a cold run, then warm ones).
+
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/birefnet.hpp"
+#include "strata/image/sam3.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
-#include "strata/image/sam3.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cmath>
@@ -214,7 +219,33 @@ int main(int argc, char** argv) {
             }
             return 0;
         }
-        std::fprintf(stderr, "usage: %s sdpa | sam3 <weights> <image> <ids> <outdir> [score] [mask]\n", argv[0]);
+        if (mode == "birefnet" && argc >= 5) {
+            si::Birefnet m(argv[2]);
+            si::QiRef img;
+            std::string err;
+            img.rgba = si::load_rgba8(argv[3], img.width, img.height, err);
+            if (img.rgba.empty()) throw std::runtime_error(err);
+            const std::string out = argv[4];
+            const int64_t size = argc > 5 ? std::stoll(argv[5]) : 1024;
+            m.dump = [&out](const char* name, const std::vector<float>& v) {
+                write_raw(out + "/" + name + ".f32", v.data(), v.size() * 4);
+            };
+            si::Birefnet::Times t;
+            auto alpha = m.run(img, size, &t);
+            m.dump = nullptr;
+            write_raw(out + "/alpha.u8", alpha.data(), alpha.size());
+            std::printf("cold backbone_s=%.4f decoder_s=%.4f mask_s=%.4f\n", t.backbone, t.decoder, t.mask);
+            const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+            const int reps = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
+            for (int r = 0; r < reps; ++r) {
+                si::Birefnet::Times t2;
+                alpha = m.run(img, size, &t2);
+                std::printf("warm backbone_s=%.4f decoder_s=%.4f mask_s=%.4f held_mib=%llu\n", t2.backbone,
+                            t2.decoder, t2.mask, (unsigned long long) (m.held() >> 20));
+            }
+            return 0;
+        }
+        std::fprintf(stderr, "usage: %s sdpa | sam3 <weights> <image> <ids> <outdir> [score] [mask] | birefnet <weights> <image> <outdir> [size]\n", argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-aux-probe: %s\n", e.what());

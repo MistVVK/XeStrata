@@ -79,6 +79,9 @@ protected:
     void lin3(const std::string& w_name, const std::string& b_name, Lin& q, Lin& k, Lin& v);
     Norm norm(const std::string& name, const char* w = ".weight", const char* b = ".bias");
     Conv conv(const std::string& name, int stride, int pad);
+    /// A convolution from host weights w [o][c][k][k] and bias b ([o], or empty: none).
+    Conv conv_host(const std::vector<float>& w, const std::vector<float>& b, int64_t o, int64_t c, int k, int stride,
+                   int pad);
     /// A transposed 2 x 2 convolution of stride 2 (weight [c][o][2][2]) as the product to [(dy, dx, o)][c] and its bias.
     Lin deconv2(const std::string& name);
     const float* f32(const std::string& name);

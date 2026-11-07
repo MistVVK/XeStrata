@@ -341,7 +341,7 @@ void Sam3::vision(const QiRef& image) {
         aux_layer_norm(x, nullptr, l.n1.w, l.n1.b, N, C, kVitEps, nullptr, h16, s_);
         const uint16_t* in16 = h16;
         if (!l.global) {
-            aux_window16(h16, G, G, C, ws, 0, w16, s_);
+            aux_window16(h16, G, G, C, ws, 0, G, G, w16, s_);
             in16 = w16;
         }
         product(in16, l.qkv, big, N);
@@ -352,7 +352,7 @@ void Sam3::vision(const QiRef& image) {
         else attention(q16, k16, v16, ws * ws, ws * ws, vit_heads_, hd, C, C, C, a16, nwin);
         product(a16, l.o, y, N);
         if (l.global) qi_axpy(x, y, 1.f, N * C, s_);
-        else aux_unwindow_add(x, y, G, G, C, ws, 0, s_);
+        else aux_unwindow_add(x, y, G, G, C, ws, 0, G, G, s_);
         aux_layer_norm(x, nullptr, l.n2.w, l.n2.b, N, C, kVitEps, nullptr, h16, s_);
         product(h16, l.fc1, big, N);
         qi_gelu_erf16(big, N * l.fc1.n, g16, s_);

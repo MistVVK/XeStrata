@@ -29,13 +29,14 @@ void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, 
 void aux_layer_norm(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
                     float* y, uint16_t* y16, void* stream);
 
-/// Windows of ws x ws (H and W multiples of ws), cyclically shifted by `shift` (Swin's shifted windows; 0: none):
-/// dst16 [windows][ws * ws][C] (row-major windows, row-major in each) from src16 [H][W][C].
-void aux_window16(const uint16_t* src16, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, uint16_t* dst16,
-                  void* stream);
-/// x [H][W][C] += y back from aux_window16's order (the same windows and shift).
-void aux_unwindow_add(float* x, const float* y, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift,
-                      void* stream);
+/// Windows of ws x ws over the grid padded to Hp x Wp (multiples of ws; the padding zero), cyclically shifted by
+/// `shift` (Swin's shifted windows; 0: none): dst16 [windows][ws * ws][C] (row-major windows, row-major in each) from
+/// src16 [H][W][C].
+void aux_window16(const uint16_t* src16, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, int64_t Hp,
+                  int64_t Wp, uint16_t* dst16, void* stream);
+/// x [H][W][C] += y back from aux_window16's order (the same windows, shift and padding; the padding's rows dropped).
+void aux_unwindow_add(float* x, const float* y, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, int64_t Hp,
+                      int64_t Wp, void* stream);
 
 /// DaViT's channel attention's operands from qkv [N][3C] (q, k, v, each G groups of C / G): qT16 and kT16
 /// [G][C / G][N] (q times `scale`), v16 [G][N][C / G].
@@ -106,5 +107,42 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
 /// heads floats.
 void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const float* mlp, int64_t hidden, int64_t heads,
                   float* tmp, float* bias, void* stream);
+
+/// x [H][W][C] -> y [(H / 2) (W / 2)][4C]: Swin's patch merging's gather, each 2 x 2 of the grid in the order (0, 0),
+/// (1, 0), (0, 1), (1, 1) (row offset first); H and W even.
+void aux_merge2(const float* x, int64_t H, int64_t W, int64_t C, float* y, void* stream);
+
+/// dst [H][W] at channels c0 .. c0 + C of rows ld wide = src [h][w][C] resized bilinearly (torch's interpolate,
+/// align_corners as given; the same size: a copy), added to what is there with `add`.
+void aux_resize_into(const float* src, int64_t h, int64_t w, int64_t C, float* dst, int64_t H, int64_t W, int64_t ld,
+                     int64_t c0, bool align_corners, bool add, void* stream);
+
+/// The sampled patches of a modulated deformable k x k convolution (stride 1, zero padding `pad`, torchvision's
+/// deform_conv2d) of x16 [H][W][C] for the output pixels p0 .. p0 + n - 1: col16 [n][k][k][C] = 2 sigmoid(m) times
+/// x at the tap's position moved by its offset (bilinear, zero outside), om [H W][3 k^2]: the taps' (dy, dx) pairs,
+/// then their modulators' logits m.
+void aux_deform_col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int pad, const float* om,
+                      int64_t p0, int64_t n, uint16_t* col16, void* stream);
+
+/// y [rows][n] (row stride ld) += bias (null: none), then ReLU with `relu`.
+void aux_bias_act(float* y, int64_t rows, int64_t n, int64_t ld, const float* bias, bool relu, void* stream);
+
+/// mean [C] = the average of x [P][C] over its P rows.
+void aux_col_mean(const float* x, int64_t P, int64_t C, float* mean, void* stream);
+
+/// x [P][C] *= sigmoid(logit[p]), each pixel's channels by its own gate.
+void aux_scale_by_sigmoid(float* x, int64_t P, int64_t C, const float* logit, void* stream);
+
+/// y [S / g][S / g][3 g g] FP16 = img [S][S][3] rearranged as BiRefNet's image2patches ('b c (hg h) (wg w) -> b (c hg
+/// wg) h w'): channel (c, gy, gx) of pixel (y, x) the picture's (gy (S / g) + y, gx (S / g) + x).
+void aux_image_patches16(const float* img, int64_t S, int64_t g, uint16_t* y16, void* stream);
+
+/// y [H][W][3] (FP32) = (rgba[...] / 255 - mean[c]) / std[c] of an RGBA8 picture's RGB.
+void aux_rgb_norm(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, const float* std, float* y,
+                  void* stream);
+
+/// alpha [H][W] = 255 sigmoid of logits [h][w] resized bicubically (torch's interpolate, align_corners=False, A
+/// -0.75, the border replicated), rounded.
+void aux_alpha_bicubic(const float* logits, int64_t h, int64_t w, int64_t W, int64_t H, uint8_t* alpha, void* stream);
 
 }  // namespace strata::image

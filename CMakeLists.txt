@@ -843,7 +843,7 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
                            src/image/hunyuanimage3_vision.cpp
                            src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_net.cpp
-                           src/image/sam3.cpp)
+                           src/image/sam3.cpp src/image/birefnet.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
@@ -1188,7 +1188,7 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-dit-probe PRIVATE strata_image)
   add_executable(strata-image-vae-probe src/image/qi_vae_probe.cpp)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
-  # SAM 3's parts against a reference's dumps (tools' scripts in the records), and qi_sdpa_ex's shapes
+  # SAM 3's and BiRefNet's parts against a reference's dumps (tools' scripts in the records), and qi_sdpa_ex's shapes
   # against FP64
   add_executable(strata-image-aux-probe src/image/aux_probe.cpp)
   target_link_libraries(strata-image-aux-probe PRIVATE strata_image)
