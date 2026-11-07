@@ -44,7 +44,8 @@ struct Buffers {
 };
 
 // Pillow's resampling weights (precompute_coeffs) from `in` samples to `out`: each output's first input `lo` and its
-// `k` weights, the filter's support widened by the scale when it shrinks; Lanczos (a = 3) or the triangle (bilinear)
+// `k` weights, the filter's support widened by the scale when it shrinks; Lanczos (a = 3), the triangle (bilinear) or
+// the cubic (bicubic, a = -0.5)
 struct Taps {
     std::vector<int32_t> lo;
     std::vector<float> w;
@@ -57,9 +58,18 @@ double sinc(double x) {
     return std::sin(x) / x;
 }
 
-Taps taps(int64_t in, int64_t out, bool lanczos) {
+// Pillow's bicubic_filter
+double cubic(double x) {
+    constexpr double a = -0.5;
+    x = std::abs(x);
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
+Taps taps(int64_t in, int64_t out, Filter f) {
     const double scale = (double) in / (double) out, fs = std::max(scale, 1.0);
-    const double support = (lanczos ? 3.0 : 1.0) * fs;
+    const double support = (f == Filter::lanczos ? 3.0 : f == Filter::bicubic ? 2.0 : 1.0) * fs;
     Taps t;
     t.k = (int) std::ceil(support) * 2 + 1;
     t.lo.resize((size_t) out);
@@ -73,8 +83,9 @@ Taps taps(int64_t in, int64_t out, bool lanczos) {
         double sum = 0.0;
         for (int64_t j = 0; j < hi - lo; ++j) {
             const double u = ((double) (j + lo) - center + 0.5) / fs;
-            const double v = lanczos ? (u > -3.0 && u < 3.0 ? sinc(u) * sinc(u / 3.0) : 0.0)
-                                     : std::max(0.0, 1.0 - std::abs(u));
+            const double v = f == Filter::lanczos ? (u > -3.0 && u < 3.0 ? sinc(u) * sinc(u / 3.0) : 0.0)
+                             : f == Filter::bicubic ? cubic(u)
+                                                    : std::max(0.0, 1.0 - std::abs(u));
             ww[(size_t) j] = v;
             sum += v;
         }
@@ -290,7 +301,8 @@ struct Resize {
     int32_t *lox = nullptr, *loy = nullptr;
     float *wx = nullptr, *wy = nullptr;
     Resize(Buffers& b, int64_t iw, int64_t ih, int64_t ow, int64_t oh, bool lanczos)
-        : tx(taps(iw, ow, lanczos)), ty(taps(ih, oh, lanczos)) {
+        : Resize(b, iw, ih, ow, oh, lanczos ? Filter::lanczos : Filter::triangle) {}
+    Resize(Buffers& b, int64_t iw, int64_t ih, int64_t ow, int64_t oh, Filter f) : tx(taps(iw, ow, f)), ty(taps(ih, oh, f)) {
         lox = b.put(tx.lo);
         wx = b.put(tx.w);
         loy = b.put(ty.lo);
@@ -302,14 +314,17 @@ uint8_t* rgba8_device(Buffers& b, const std::vector<uint8_t>& v) { return b.put(
 
 }  // namespace
 
-void lanczos_resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h) {
+namespace {
+
+// src (RGBA8, device) at w x h by Pillow's filter into dst (device)
+void resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h, Filter filter) {
     if (sw <= 0 || sh <= 0 || w <= 0 || h <= 0)
         throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
     Buffers b;
     const int64_t n = w * h;
     float* planes = b.get<float>((size_t) (4 * n));
     {
-        Resize rz(b, sw, sh, w, h, true);
+        Resize rz(b, sw, sh, w, h, filter);
         float* mid = b.get<float>((size_t) (4 * sh * w));
         rows_rgba8(src, sw, sh, 0, 0, sh, rz.tx, rz.lox, rz.wx, mid);
         columns(mid, 4, sh, w, rz.ty, rz.loy, rz.wy, planes, 0.0f, 255.0f);
@@ -318,6 +333,12 @@ void lanczos_resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* 
         const int64_t i = (int64_t) id[0];
         for (int c = 0; c < 4; ++c) dst[i * 4 + c] = (uint8_t) sycl::round(planes[c * n + i]);
     }), "resize: outputs");
+}
+
+}  // namespace
+
+void lanczos_resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h) {
+    resize_device(src, sw, sh, dst, w, h, Filter::lanczos);
 }
 
 uint64_t lanczos_resize_bytes(int64_t sw, int64_t sh, int64_t w, int64_t h) {
@@ -329,14 +350,16 @@ uint64_t lanczos_resize_bytes(int64_t sw, int64_t sh, int64_t w, int64_t h) {
     return (uint64_t) (4 * w * h) * 4 + (uint64_t) (4 * sh * w) * 4 + taps(sw, w) + taps(sh, h);
 }
 
-QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) {
+QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) { return pillow_resize(src, w, h, Filter::lanczos); }
+
+QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter) {
     if (src.width <= 0 || src.height <= 0 || src.rgba.size() != (size_t) (src.width * src.height * 4) || w <= 0 ||
         h <= 0)
         throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
     Buffers b;
     const uint8_t* pic = rgba8_device(b, src.rgba);
     uint8_t* out = b.get<uint8_t>((size_t) (4 * w * h));
-    lanczos_resize_device(pic, src.width, src.height, out, w, h);
+    resize_device(pic, src.width, src.height, out, w, h, filter);
     QiRef r;
     r.width = w;
     r.height = h;

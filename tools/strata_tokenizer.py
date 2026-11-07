@@ -476,6 +476,79 @@ class Tokenizer:
         return b"".join(self.token_bytes(i) for i in ids).decode("utf-8", errors=errors)
 
 
+# ------------------------------------------------------------------ CLIP's BPE (SAM 3's words)
+class ClipTokenizer:
+    """CLIP's tokenizer as its Hugging Face `tokenizer.json` describes it (openai/clip-vit-large-patch14's; SAM 3's
+    text tower reads the same vocabulary): the text NFC-normalized, its whitespace runs one space, lowercased; split
+    by CLIP's regex (contractions, letter runs, single digits, other runs), each piece through the byte layer and a
+    BPE whose words end in `</w>`, a piece the merges cannot spell the unknown token; <|startoftext|> first and
+    <|endoftext|> last, the content cut so the whole fits `max_len`."""
+
+    PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+"
+    GPT2 = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+
+    def __init__(self, vocab: dict[str, int], merges: list[str], bos: int, eos: int, unk: int):
+        self.vocab = vocab
+        self.ranks = {tuple(m.split(" ")): i for i, m in enumerate(merges) if m and not m.startswith("#version")}
+        self.bos, self.eos, self.unk = bos, eos, unk
+        self.byte = bytes_to_unicode()
+        self.pat = regex.compile(self.PATTERN)
+        self.gpt2 = regex.compile(self.GPT2)
+        self.cache: dict[str, list[int]] = {}
+
+    @classmethod
+    def from_hf(cls, path) -> "ClipTokenizer":
+        f = pathlib.Path(path)
+        if f.is_dir():
+            f = f / "tokenizer.json"
+        j = json.loads(f.read_text(encoding="utf-8"))
+        model = j.get("model") or {}
+        if model.get("type") != "BPE" or model.get("end_of_word_suffix") != "</w>":
+            raise ValueError("%s: not CLIP's BPE (end_of_word_suffix </w>)" % f)
+        added = {a["content"]: int(a["id"]) for a in j.get("added_tokens") or []}
+        vocab = {t: int(i) for t, i in model["vocab"].items()}
+        merges = [m if isinstance(m, str) else " ".join(m) for m in model.get("merges") or []]
+        unk = vocab.get(model.get("unk_token") or "<|endoftext|>", added.get("<|endoftext|>", 0))
+        return cls(vocab, merges, added["<|startoftext|>"], added["<|endoftext|>"], unk)
+
+    def _bpe(self, piece: str) -> list[int]:
+        hit = self.cache.get(piece)
+        if hit is not None:
+            return hit
+        word = list(piece[:-1]) + [piece[-1] + "</w>"]
+        while len(word) > 1:
+            best, at = None, -1
+            for i in range(len(word) - 1):
+                r = self.ranks.get((word[i], word[i + 1]))
+                if r is not None and (best is None or r < best):
+                    best, at = r, i
+            if best is None:
+                break
+            a, b = word[at], word[at + 1]
+            out, i = [], 0
+            while i < len(word):
+                if i < len(word) - 1 and word[i] == a and word[i + 1] == b:
+                    out.append(a + b)
+                    i += 2
+                else:
+                    out.append(word[i])
+                    i += 1
+            word = out
+        ids = [self.vocab.get(w, self.unk) for w in word]
+        if len(self.cache) < 4096:
+            self.cache[piece] = ids
+        return ids
+
+    def encode(self, text: str, max_len: int = 32) -> list[int]:
+        import unicodedata
+        t = regex.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).lower()
+        ids: list[int] = []
+        for piece in self.pat.findall(t):
+            for sub in self.gpt2.findall(piece):
+                ids.extend(self._bpe("".join(self.byte[b] for b in sub.encode("utf-8"))))
+        return [self.bos] + ids[:max(0, max_len - 2)] + [self.eos]
+
+
 # ------------------------------------------------------------------ incremental prompts (#567)
 def common_prefix_len(a: str, b: str) -> int:
     """Length of the longest common prefix, by slices (C speed) rather than a loop over characters."""

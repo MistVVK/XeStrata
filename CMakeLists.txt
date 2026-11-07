@@ -841,7 +841,9 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_gpu.cpp src/image/hunyuanimage3_dit.cpp
                            src/image/hunyuanimage3_vae.cpp src/image/hunyuanimage3_entry_exit.cpp
                            src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
-                           src/image/hunyuanimage3_vision.cpp)
+                           src/image/hunyuanimage3_vision.cpp
+                           src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_net.cpp
+                           src/image/sam3.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
@@ -908,7 +910,8 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(strata_kernels PRIVATE strata_dnnl)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
     set_property(SOURCE src/image/qi_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
-                 src/image/yolo_detect.cpp src/upscale/esrgan.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
+                 src/image/yolo_detect.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp
+                 APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
   # build's ROCm (hip's version) and its kernels' images for the build's AMD architectures, fetched (their SHA-256
@@ -1158,6 +1161,7 @@ if(STRATA_ENABLE_XE)
       # (not the detector's: the engine's own convolutions beat cuDNN's there, 8.3 against 9.0 ms a face on the
       # RTX 4070, 2026-11-05)
       set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/upscale/esrgan.cpp
+                   src/image/aux_net.cpp
                    APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
       target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_cudnn_frontend ON)   # its license text goes with the packages
@@ -1182,6 +1186,10 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-dit-probe PRIVATE strata_image)
   add_executable(strata-image-vae-probe src/image/qi_vae_probe.cpp)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
+  # SAM 3's parts against a reference's dumps (tools' scripts in the records), and qi_sdpa_ex's shapes
+  # against FP64
+  add_executable(strata-image-aux-probe src/image/aux_probe.cpp)
+  target_link_libraries(strata-image-aux-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)
   target_link_libraries(strata-image-text-probe PRIVATE strata_image)
   # the image attention (its 16-bit path and the int8 kernel) against FP64 (synthetic; --bench: a benchmark too)

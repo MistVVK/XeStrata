@@ -11,8 +11,9 @@ same content as upstream's is unchanged, any other is mixed:
 
   unchanged  upstream's copyright holders only, upstream's license (MIT, or the SPDX identifier upstream's file has)
   mixed      those holders and XeStrata's, LGPL-3.0-or-later AND MIT
-  own        a file that is not upstream's: XeStrata's copyright, LGPL-3.0-or-later; AND MIT when it also names
-             another permissive project's copyright (code transcribed from ggml, for example)
+  own        a file that is not upstream's: XeStrata's copyright, LGPL-3.0-or-later; AND that project's license when
+             it also names another permissive project's copyright (code transcribed from ggml: MIT; from vLLM-Omni:
+             Apache-2.0)
 
 A file without a header of its own is checked against the last REUSE.toml annotation that covers it.  --fix rewrites
 the headers that differ (only the holder and identifier lines); REUSE.toml and a file without a header are reported
@@ -34,6 +35,8 @@ STRATA = "2026 Niko1221 and the Strata contributors"
 # all of them MIT (Expat)
 PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging",
               "Peasant Smith and the Project Maya contributors")
+# the same for the projects under another permissive license: a copyright holder's words -> its license
+PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0"}
 OWN = "LGPL-3.0-or-later"
 MIXED = "LGPL-3.0-or-later AND MIT"
 # the files the classes do not cover: other projects' folders, license texts, the notices
@@ -142,7 +145,9 @@ def expected(path: str, data: bytes, hs: list[str], up: Upstream) -> tuple[str, 
         base = None  # written anew at upstream's path (AGENTS.md)
     if base is None:
         perm = [h for h in hs if h != XE and any(k in h for k in PERMISSIVE)]
-        return ("own", hs if XE in hs else hs + [XE], MIXED if perm else OWN)
+        other = sorted({lic for h in hs for k, lic in PERMISSIVE_OTHER.items() if k in h})
+        ident = " AND ".join([OWN] + (["MIT"] if perm else []) + other)
+        return ("own", hs if XE in hs else hs + [XE], ident)
     bhs, bid = holders_and_id(base)
     others = [h for h in hs if h != XE] or bhs or [STRATA]
     if base and strip(data) == strip(base):
