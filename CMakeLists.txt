@@ -839,6 +839,8 @@ if(STRATA_ENABLE_XE)
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
                            src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
                            src/upscale/seedvr2.cpp src/image/yolo_detect.cpp
+                           src/image/cnet_prep.cpp src/image/qi_control.cpp src/image/cnet_depth.cpp
+                           src/image/cnet_edges.cpp src/image/cnet_pose.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp

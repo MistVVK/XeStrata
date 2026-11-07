@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/cnet_prep.hpp"
 #include "strata/image/img_start.hpp"
 #include "strata/image/qi_kernels.hpp"
 
@@ -132,8 +133,9 @@ void QiPipeline::ensure_open() {
 
 uint64_t QiPipeline::held() const {
     if (!(dit_ && vae_ && te_)) return 0;
+    const uint64_t ctl = control_ ? control_->weight_bytes() + control_->blocks_vram() + control_->activations_held() : 0;
     return dit_->weight_bytes() + dit_->lora_bytes() + vae_->weight_bytes() + kScratch + dit_->blocks_vram() +
-           te_->layers_vram() + dit_->activations_held() + vae_->scratch_held();
+           te_->layers_vram() + dit_->activations_held() + vae_->scratch_held() + ctl;
 }
 
 QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
@@ -194,6 +196,9 @@ void QiPipeline::set_budget(uint64_t bytes) {
 void QiPipeline::release(bool all) {
     if (!(dit_ && vae_ && te_)) return;
     if (all) {   // every buffer the parts hold goes with them; the next request opens them again
+        if (dit_) dit_->set_control(nullptr);
+        control_.reset();
+        control_set_ = 0;
         drop_kept();
         dit_->drop_loras();   // the adapters' A and B too (they go back on the next request's, from its files)
         te_.reset();
@@ -207,6 +212,13 @@ void QiPipeline::release(bool all) {
     te_->drop_layer_homes();
     dit_->drop_activations();
     vae_->drop_scratch();
+    if (control_) {
+        control_->drop_blocks();
+        control_->drop_block_homes();
+        control_->drop_activations();
+        control_->clear();
+        control_set_ = 0;
+    }
     dit_set_ = te_set_ = 0;
     mlp_set_ = -1;
 }
@@ -241,14 +253,20 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     p.lora_n = dit_->lora_count();
     p.fixed = dit_->weight_bytes() + p.lora + vae_->weight_bytes() + kScratch + dit_->prefix_row_bytes(n_pre) +
               dit_->prefix_row_bytes(n_neg_pre);
+    // the ControlNet branch: its weights outside the blocks and its mapped conditioning stay; its stream is among the
+    // activations; its blocks share the DiT's room
+    QiControl* ctl = control_on_ && control_ ? control_.get() : nullptr;
+    if (ctl != nullptr) p.fixed += ctl->weight_bytes() + (uint64_t) (h * w * dit_->hidden()) * 4;
     // the activations: guidance's both sequences side by side after the first step (forward_pair)
     if (T > 0 && n_neg_pre > 0) T = qi_attn_rows(T) + qi_attn_rows(n_neg_pre + h * w);
     if (p.budget <= p.fixed) throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                                       " MiB) is below the weights that always stay");
-    const uint64_t avail = p.budget - p.fixed, dit_min = dit_->block_min(), te_min = te_->layer_min();
+    const uint64_t avail = p.budget - p.fixed, te_min = te_->layer_min(),
+                   dit_min = dit_->block_min() + (ctl != nullptr ? ctl->block_min() : 0);
     // the DiT's activations, the MLP in bands of rows when the whole takes more than a third of what is there
+    const uint64_t stream = ctl != nullptr ? (uint64_t) (T * dit_->hidden()) * 4 : 0;
     const int64_t mlp = mlp_bands(avail, T > 0, p.activations,
-                                  [&](int64_t rows) { return dit_->activation_bytes(T, rows); });
+                                  [&](int64_t rows) { return dit_->activation_bytes(T, rows) + stream; });
     // the room after the layers: the DiT's activations, and later the VAE's least (they take it in turn)
     // the encoder's buffers too: they come and go before the DiT's (generate frees them after the encode)
     const uint64_t work = std::max({p.activations, vae_->scratch_min(), te_->activation_bytes(n_ids)});
@@ -262,12 +280,24 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     p.resident_kv = kv > 0 ? (int) std::min<uint64_t>(spare / kv, (uint64_t) dit_->blocks()) : dit_->blocks();
     p.prefix_kv = (uint64_t) p.resident_kv * kv;
     dit_->set_prefix_vram_blocks(p.resident_kv);
-    p.blocks = clampu(avail - work - te_min - p.prefix_kv, dit_min, dit_->block_bytes());
+    const uint64_t ctl_bytes = ctl != nullptr ? ctl->block_bytes() : 0;
+    p.blocks = clampu(avail - work - te_min - p.prefix_kv, dit_min, dit_->block_bytes() + ctl_bytes);
     p.layers = clampu(avail - work - p.blocks - p.prefix_kv, te_min, te_->layer_bytes());
     p.mlp_rows = mlp;
-    if (p.blocks != dit_set_) {
-        dit_->set_block_budget(p.blocks);
-        dit_set_ = p.blocks;
+    uint64_t dit_blocks = p.blocks;
+    if (ctl != nullptr) {   // the blocks' room shared by their bytes, each at least its two slots
+        const uint64_t cb = clampu((uint64_t) ((double) p.blocks * (double) ctl_bytes /
+                                               (double) (dit_->block_bytes() + ctl_bytes)),
+                                   ctl->block_min(), ctl_bytes);
+        dit_blocks = std::max(p.blocks - std::min(p.blocks, cb), dit_->block_min());
+        if (cb != control_set_) {
+            ctl->set_block_budget(cb);
+            control_set_ = cb;
+        }
+    }
+    if (dit_blocks != dit_set_) {
+        dit_->set_block_budget(dit_blocks);
+        dit_set_ = dit_blocks;
     }
     // the encoder's layers: fewer at once (their room is the DiT's now), more only when it encodes (te_layers): the
     // decode gives them to the VAE, and a prompt whose states are kept does not run it (RX 9060 XT: 163 ms an image
@@ -464,6 +494,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         if (stage && r.refs.empty()) stage("refs");
         encode_base(r, *base, ls);
     }
+    use_control(r);
     if (stage) stage("text");
     const std::vector<int32_t>& all_ids = r.refs.empty() ? r.ids : ids;
     const int64_t n_ctx = (int64_t) all_ids.size() - r.drop;
@@ -544,6 +575,10 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         };
         dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide);
         dit_->drop_host_prefix();
+        if (control_) {   // the conditioning and the stream are this request's
+            control_->clear();
+            control_->drop_activations();
+        }
         const auto t2 = clock::now();
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it
@@ -633,6 +668,98 @@ void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart&
         gpu::copy_async(kept_.base_z, z0, (size_t) n * 4, s_);
         kept_.base = key;
     }
+}
+
+void QiPipeline::encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z) {
+    const int64_t HW = w * h;
+    std::vector<float> rgba((size_t) (4 * HW));
+    for (int64_t q = 0; q < HW; ++q)
+        for (int c = 0; c < 4; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 4 + c)] / 255.f;
+    float* d = nullptr;
+    if (!gpu::alloc_device(&d, rgba.size() * 4))
+        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+    gpu::copy(d, rgba.data(), rgba.size() * 4);
+    const bool ok = vae_->encode(d, h, w, z);
+    gpu::free(d);
+    vae_->drop_scratch();
+    if (!ok) throw std::runtime_error("image engine: the VAE's encoder failed on a ControlNet image");
+}
+
+void QiPipeline::use_control(const QiRequest& r) {
+    control_on_ = !r.control_net.empty();
+    if (!control_on_) {
+        if (control_) control_->clear();
+        dit_->set_control(nullptr);
+        return;
+    }
+    const bool mask = !r.mask.rgba.empty() && r.control_inpaint;
+    if (r.control.rgba.empty() && !mask)
+        throw std::invalid_argument("image engine: ControlNet needs a control image, or a mask to draw through it");
+    if (!vae_->has_encoder()) throw std::invalid_argument("image engine: the VAE file has no encoder for ControlNet");
+    if (!control_ || control_->path() != r.control_net) {
+        dit_->set_control(nullptr);
+        control_.reset();
+        control_set_ = 0;
+        auto c = std::make_unique<QiControl>();
+        std::string err;
+        if (!c->open(r.control_net, *dit_, err)) throw std::runtime_error("image engine (ControlNet): " + err);
+        c->set_block_budget(c->block_min());   // nothing resident until the plan
+        control_set_ = c->block_min();
+        control_ = std::move(c);
+    }
+    // control_img_in's 129 inputs (its weight's width) as VideoX-Fun's QwenImage21ControlPipeline (Apache-2.0) builds
+    // them: the VAE latent of the control picture at the image's size (64), one channel of 1 - the binarised mask taken
+    // to the latent grid by its nearest pixel (1 where the base stays), and the latent of the base picture whose pixels
+    // to be redrawn are 0 in -1 .. 1, that is mid grey (64); a part the request leaves out stays 0, as the pipeline
+    // feeds it
+    const int64_t h = r.height / 16, w = r.width / 16, hw = h * w, ch = dit_->channels();
+    std::vector<float> keep((size_t) hw, 0.f);
+    float* cond = nullptr;
+    if (!gpu::alloc_device(&cond, (size_t) ((2 * ch + 1) * hw) * 4))
+        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+    struct Free {
+        float* p;
+        void* s;
+        ~Free() {
+            gpu::stream_sync(s);
+            gpu::free(p);
+        }
+    } free_cond{cond, s_};
+    gpu::memset(cond, 0, (size_t) ((2 * ch + 1) * hw) * 4);
+    if (!r.control.rgba.empty()) encode_px(control_resize(r.control, r.width, r.height), r.width, r.height, cond);
+    if (mask) {
+        const QiRef* base = base_image(r);
+        if (base == nullptr) throw std::invalid_argument("image engine: a mask through ControlNet needs a base image");
+        // redrawn where the mask (its edit share, 1 - alpha) is at least a half, the pipeline's binarisation
+        const std::vector<uint8_t> m = resize_nearest(r.mask, r.width, r.height);
+        std::vector<uint8_t> px = resize_nearest(*base, r.width, r.height);
+        for (int64_t q = 0; q < r.width * r.height; ++q)
+            if (255 - (int) m[(size_t) (q * 4 + 3)] >= 128)
+                for (int c = 0; c < 3; ++c) px[(size_t) (q * 4 + c)] = 128;
+        for (int64_t y = 0; y < h; ++y)
+            for (int64_t x = 0; x < w; ++x) {   // nearest: the pixel at the latent cell's place
+                const int64_t py = std::min<int64_t>(r.height - 1, (y * r.height) / h),
+                              pxx = std::min<int64_t>(r.width - 1, (x * r.width) / w);
+                keep[(size_t) (y * w + x)] = 255 - (int) m[(size_t) ((py * r.width + pxx) * 4 + 3)] >= 128 ? 0.f : 1.f;
+            }
+        encode_px(px, r.width, r.height, cond + (ch + 1) * hw);
+    }
+    gpu::copy(cond + ch * hw, keep.data(), keep.size() * 4);
+    control_->set_input(cond, h, w, r.control_strength, r.control_sigma_lo, r.control_sigma_hi);
+    dit_->set_control(control_.get());
+}
+
+std::pair<uint64_t, uint64_t> QiPipeline::control_need(const std::string& path, int64_t width, int64_t height) {
+    if (!control_size_ || control_size_->path() != path) {
+        auto c = std::make_unique<QiControl>();
+        std::string err;
+        if (!c->open(path, *dit_size_, err, true)) throw std::runtime_error("image engine (ControlNet): " + err);
+        control_size_ = std::move(c);
+    }
+    const QiControl& c = *control_size_;
+    const int64_t hw = (width / 16) * (height / 16), T = hw + 512;   // the stream: the image and a prompt's rows
+    const uint64_t fixed = c.weight_bytes() + (uint64_t) (hw * dit_size_->hidden()) * 4 + c.activation_bytes(T, hw);
+    return {fixed + c.block_min(), fixed + c.block_bytes()};
 }
 
 void QiPipeline::drop_kept(bool base_too) {

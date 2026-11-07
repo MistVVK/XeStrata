@@ -62,6 +62,11 @@ public:
     std::vector<Segment> run(const QiRef& image, const std::vector<int32_t>& ids, float score_threshold,
                              float mask_threshold, Times* t = nullptr);
 
+    /// run() of each of several words on one picture: the trunk made once, each words' detector on it in turn (as a
+    /// clip's frame takes its prompts) -> the instances of each, in the words' order.
+    std::vector<std::vector<Segment>> run_many(const QiRef& image, const std::vector<std::vector<int32_t>>& ids,
+                                               float score_threshold, float mask_threshold);
+
     /// What a run needs on the GPU beyond what it holds now (the weights when not loaded, the scratch not grown).
     uint64_t need_bytes(int64_t width, int64_t height) const;
 
@@ -81,6 +86,8 @@ public:
     Detection detect(float score_threshold);
     void mask_prep();
     void mask_logits(const int64_t* qs, int64_t k, float* logits);
+    /// A detection's instances (their boxes and scores, and their masks at W x H: mask_prep and mask_logits).
+    std::vector<Segment> segments(const Detection& det, int64_t W, int64_t H, float mask_threshold);
 
     // ---------------------------------------------------------------------------------------------- the video
     // SAM 3.1's multiplex tracker (sam3_track.cpp): its parts, which a clip's run (sam3_video.cpp) puts together.  A

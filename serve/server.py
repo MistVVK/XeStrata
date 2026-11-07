@@ -89,6 +89,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
 from serve import image_aux  # noqa: E402
+from serve import image_controls as controls_api  # noqa: E402
 from serve import image_regions as regions_api  # noqa: E402
 from serve import videos as videos_api  # noqa: E402
 from serve import loras as lora_api  # noqa: E402
@@ -7019,7 +7020,8 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
     files in order); the numbers the JSON request takes as numbers (n, seed, steps, num_inference_steps,
     output_compression, partial_images whole; vLLM-Omni's guidance_scale and true_cfg_scale) as numbers, stream's true
-    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
+    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask" and the control's
+    picture's as "control_image"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -7035,6 +7037,8 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             files.append(data)
         elif name == "mask":
             fields["mask"] = data
+        elif name == "control_image":   # the control's picture (serve/image_controls.py)
+            fields["control_image"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
             whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images") \
@@ -7748,6 +7752,9 @@ def make_handler(svc: Service):
                             "/v2beta/stable-image/edit/remove-background"):   # forms or JSON (image_regions)
                     self._images_regions(path)
                     return
+                if path == "/v1/images/controls":   # a control image alone, to look at before sending (image_controls)
+                    self._images_controls()
+                    return
                 if path.startswith("/v1/images/licenses/"):   # agreeing to a tool's weights' license (SAM 3's)
                     if self._own_page("a license can be agreed to"):
                         self._image_license(path[len("/v1/images/licenses/"):], json.loads(self._body() or b"{}"))
@@ -7902,8 +7909,32 @@ def make_handler(svc: Service):
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             images_api.check_tool(gen.cfg, "generate_image")    # the config's image_tools, at every entry
+            req = controls_api.gather(req)
+            if req.get("control") is not None:                  # the composition from a picture (image_controls)
+                images_api.check_tool(gen.cfg, "control")
+                job = controls_api.parse_job(req, gen.cfg, picture=self._control_picture(req))
+                self._image_job(gen, job, req.get("stream") is True, edit=job.get("refs") is not None)
+                return
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
             self._image_job(gen, job, req.get("stream") is True)
+
+        def _control_picture(self, req: dict) -> bytes | None:
+            """The control's picture: the multipart control_image, else control.image given as an http(s) URL or a
+            path (as an edit's images are read; a data: URL or base64 parse_control reads itself)."""
+            picture = req.pop("control_image", None)
+            c = req.get("control")
+            src = c.get("image") if isinstance(c, dict) else None
+            if isinstance(src, dict):
+                src = src.get("image_url") or src.get("url")
+            if isinstance(src, dict):
+                src = src.get("url")
+            if picture is None and isinstance(src, str) and not src.startswith("data:") and \
+                    (src.startswith(("http://", "https://", "/", "file:")) or "." in src[-6:]):
+                self._no_local_sources([src])
+                picture = svc.download(src) if src.startswith(("http://", "https://")) else Vision.load(src)
+                if isinstance(c, dict):
+                    c.pop("image", None)
+            return Vision.normalize(picture) if picture else None
 
         def _images_edit(self):
             """POST /v1/images/edits (serve/images.py): reference images and a prompt in OpenAI's multipart form (image
@@ -7972,8 +8003,14 @@ def make_handler(svc: Service):
             for key, tool in (("fix", "fix_image"), ("upscale", "upscale_image"), ("extend", "extend_image")):
                 if req.get(key) is not None:
                     images_api.check_tool(gen.cfg, tool)
-            job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
-                                                mask)
+            req = controls_api.gather(req)
+            if req.get("control") is not None:   # the composition from a picture (image_controls)
+                images_api.check_tool(gen.cfg, "control")
+                job = controls_api.parse_job(req, gen.cfg, [Vision.normalize(d, keep_alpha=True) for d in files],
+                                             mask, self._control_picture(req), edit=True)
+            else:
+                job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files],
+                                                    gen.cfg, mask)
             self._image_job(gen, job, req.get("stream") is True, edit=True)
 
         def _images_upscale(self):
@@ -8309,6 +8346,30 @@ def make_handler(svc: Service):
                     self.send_header("seed", "0")
                     self.end_headers()
                     self.wfile.write(data)
+            except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                self._aux_failed(e)
+
+        def _images_controls(self) -> None:
+            """POST /v1/images/controls (image_controls.preview_*): the control image a request's control would give
+            the image model (canny, depth, pose...), synchronous, in the image jobs' GPU turn, on the image model the
+            GPU has now (none: the default)."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            fields, picture = self._one_image()
+            gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
+            images_api.check_tool(gen.cfg, "control")
+            req = controls_api.preview_request(fields, Vision.normalize(picture))
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            addr = cast(Any, self.server.server_address)
+            host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+            print(f"[strata] control image: {str(fields.get('type') or '')[:20]!r}", flush=True)
+            try:
+                self._json(200, controls_api.preview_response(svc, gen, req, f"{scheme}://{host}", cancel))
             except (images_api.AuxPending, images_api.ImageJobFailed) as e:
                 self._aux_failed(e)
 

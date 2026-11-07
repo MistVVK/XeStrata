@@ -29,7 +29,8 @@ Text and images take turns on one GPU and share its VRAM. What happens to the te
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 52 GB). Edits with up to 3 reference images (no transparent backgrounds) |
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50 (CFG) | OpenMOSS's 5B model. For text in images and a layout set with boxes (`layout`); the prompt can be expanded (`enhance`). Edits through chinoll's edit adapter (Moss-Image-Edit), up to 4 reference images (img2img and masks work too) |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50 (CFG) | The base model, before its tuning |
-| `moss-image-uncensored`, `moss-image-base-uncensored` | The two above | 50 (CFG) | With HauhauCS's Qwen3.5-9B, its refusals removed, as the text encoder |
+| `moss-image-4-step` | MOSS-Image with darask0's [4-step adapter](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) | 4 | MOSS-Image drawn in 4 steps (no CFG), about 10 times as fast as the usual MOSS-Image. No edits. A little short of the 50 steps' detail and variety |
+| `moss-image-uncensored`, `moss-image-base-uncensored`, `moss-image-4-step-uncensored` | The three above | As above | With HauhauCS's Qwen3.5-9B, its refusals removed, as the text encoder |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30 (CFG) | CircleStone Labs' 2B model. For anime-style illustrations drawn from Danbooru tags and sentences. No edits (img2img and masks work) |
 | `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30 (CFG) | Tuned to a consistent, polished style |
 | `anima-turbo` | [Anima-Turbo](https://huggingface.co/circlestone-labs/Anima) | 10 | Distilled for speed (no CFG) |
@@ -174,6 +175,7 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
 - With an image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`; the part around the paint is drawn enlarged, so the paint's close surroundings change a little as well). Unpainted, it is the whole image.
   Words (`hair` and so on) and "Make mask" find the place and paint it (the API's words to masks; the brush changes it after). "Remove background" puts the first image with its background taken away (a transparent PNG) among the results. Without SAM 3's license agreed to, Florence-2 finds the place, and "SAM 3's license…" shows its text to agree to.
 - With an image attached, the Strength field appears (the API's `strength`): the lower, the more of the image it keeps. Empty is the model's default: 1 for an edit (no start from the image's latent: the edits as before), 0.87 for img2img (lowered for a model of few steps, so that it skips one step at least).
+- "Composition from a picture (ControlNet)" draws after another picture's pose, outlines, depth and the like (the API's `control`). Choose what to take (pose, depth, outlines, line art, straight lines...) and the picture; "Preview the map" shows the control map first, and while "Send this map" is ticked the map shown is sent as it is (not made again). With Qwen-Image-2.1 the strength and the span can be changed, with MOSS-Image's color and depth the strength and the end. A model without ControlNet takes the map as one more reference image.
 - The LoRA row chooses among the files this model applies ([LoRA](#lora-adapters)); each choice is a chip whose strength (-2 to 2) can be changed, whose `trigger` words a "Trigger" button puts at the end of the prompt, and which × takes off. 4 at most, and the browser keeps each model's choice and strengths. As in the API, the name goes in the request's field (no tag is written).
 - Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
 - MOSS-Image has more:
@@ -275,6 +277,31 @@ With `layout`, a JSON of boxes that place things and text, the image is made fro
 With `enhance`, the chat's model (the text model loaded) first writes the prompt out into a detailed description or a layout for MOSS-Image, and the image is made from that. It writes it the way MOSS-Image's official prompt writer (skills/moss-image-prompt-enhancer) does.
 The answer's `revised_prompt` is the prompt the model read, and `strata.enhance` says what was made (`made`: `caption` or `layout`, with the prompt it wrote (`prompt`) or the layout's draft) and the seconds it took. When it fails (an answer that cannot be read, no chat model), the image is made from the prompt as it was, and `strata.enhance.error` says why.
 
+#### Composition from a picture (`control`)
+
+A map of another picture (`control.image`) - its pose, outlines, depth and the like - is made, and the image is drawn after it.  Generations and edits both take it.
+
+- `control` is `{"type": ..., "image": ...}`. `image` is a data: URL, base64 or an http(s) URL; an edit's multipart form can send it as the `control_image` file (the other fields then go in `control` as JSON, or as fields named with `control_` before them: `control_type`, `control_strength`...).
+- `type` is the map's kind.
+   - `pose`: people's poses (YOLOX-L finds the people, DWPose their body's, hands' and face's points, drawn as OpenPose's). `detect_body`, `detect_hands`, `detect_face` (all `true` by default).
+   - `depth`: depth (Depth Anything V2 Small; near white).
+   - `canny`: outlines (Canny). `low_threshold`, `high_threshold` (100 and 200 by default).
+   - `lineart`, `lineart_coarse`: line art (fine lines, rough lines).
+   - `hed`: soft outlines (HED; `safe` rounds them to steps, `true` by default). `scribble_hed`: a sketch made from them.
+   - `scribble`: the picture's own dark lines. `scribble_xdog`: a sketch by the extended difference of Gaussians (XDoG; `threshold`, 12 by default).
+   - `mlsd`: straight lines (M-LSD; rooms and buildings). `score_threshold`, `distance_threshold` (0.1 and 0.1 by default).
+   - `gray`: shading (grey).
+   - `color` (MOSS-Image alone): a color map of the objects (SAM 3 finds people, things, the sky, the floor and the like, each painted a color of its own, black elsewhere). It needs the SAM License agreed to.
+   - `none`: the picture is a control map already (the same as `preprocess: false`).
+- `resolution` is the picture's shorter side as the map is made (512 by default, 64 to 2048).
+- A generation without a size is made in `control.image`'s shape at about 1024x1024. The map is stretched to the size drawn.
+- Qwen-Image-2.1: drawn with alibaba-pai's Fun ControlNet Union. `strength` (1 by default, 0 to 2), the span `start` and `end` (shares of the steps; 0 and 1 by default; an `end` of 0.6 to 0.8 keeps the composition and frees the details); an edit with a mask gives ControlNet the painted part too (`inpaint: false` does not).
+- MOSS-Image's `color` and `depth` (`moss-image-4-step` too: there keep `end` short, 0.3, and where the mannequin's surface still shows use MOSS-Image's usual steps): drawn with darask0's color and depth adapter (MOSS-Image's input layer widened, and a LoRA). A `control` of a list of the two takes color and depth both. `strength` is the adapter's LoRA's (1 by default), `end` the share of the steps the map is used for (1 by default; 0.5 for maps made from a 3D mannequin and the like). `start` is not trained and is not taken. Use it to place people and things at their size, and describe each in the prompt.
+- Models without ControlNet (Mage-Flow's edits, HunyuanImage 3.0, MOSS-Image with edits for the other kinds): the map goes in as one more reference image, and the prompt ends with an ask to follow it ("the pose of the person in image 2" and the like). The pose works well; outlines and depth can carry the picture's own people over. `strength`, `start` and `end` are not taken.
+- Models without edits (MageTrail, Anima, MOSS-Image without edits for kinds other than color and depth) take no `control`.
+- The weights (the Fun ControlNet Union, the maps' networks, MOSS-Image's adapter) are fetched by the server the first time they are used (a 503 with the progress meanwhile).
+- The answer's `strata` holds the map's size and its seconds.
+
 ### Changing an image (`POST /v1/images/edits`)
 
 Makes an image from reference images: rewriting a reference image, or making a person or a thing in one the subject.
@@ -366,6 +393,10 @@ BiRefNet cuts the subject of one image out. A multipart form with `image`, or JS
 
 Words to masks and removing the background run in the image jobs' GPU turn and answer at once (not as jobs). Their weights stay for the next tool while a quarter of the GPU's memory is free, and are let go before the next image job.
 
+### A control map alone (`POST /v1/images/controls`)
+
+Makes and returns the map a `control` would give the model (the web page's "Preview the map"): a multipart form's `image`, `type` and the kind's fields, or JSON (`image` a data: URL or an http(s) URL). The answer is `created`, `type`, `width`, `height`, `data[]` (`b64_json` or `url`) and `strata` with the seconds. The map returned can go in a `control` with `preprocess: false` (MOSS-Image's color and depth) or `type: none`, and is not made again.
+
 ### The answer
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`; `lora` (each adapter's `name` and `scale`) when adapters were applied.
@@ -381,6 +412,7 @@ Words to masks and removing the background run in the image jobs' GPU turn and a
   `upscale_image` makes the conversation's last image larger, and with `redraw` draws it again finer (as "Upscaling" above: `scale`, 2 by default, `method`, `redraw`, not drawn again by default, and `strength`). When to draw it again ("just larger" no, "larger, with more detail" yes) is in the skill `tools/upscale_image`.
   `fix_image` finds faces, hands or people in the conversation's last image and draws them again (as "Fixing parts" above: `parts` and `strength`). While its weights download it says so, and the chat's model calls it again later.
   `edit_region` draws the place the words name (`region`) again as `prompt` says (as "A region in words" above), `find_region` shows the image with that place painted red (nothing drawn), and `remove_background` takes the background away or puts a plain color behind (`version` and `background_color`). When to use them is in the skills `tools/edit_region`, `tools/find_region` and `tools/remove_background`.
+  `control` makes a new image after the pose, outlines, depth and the like of the conversation's last image (one attached or one made in the conversation; as "Composition from a picture" above: `type`, `prompt`, `strength`, `end`). When to use it for "in this pose" and "with this composition" is in the skill `tools/control`.
   With Qwen-Image-2.1 and Mage-Flow, `generate_image` and `edit_image` take `guidance` too (a list of the names of "Sampling guidance" above); the three that need CFG are listed only where the model guides by default. When to use them is in `image_skill`'s `guidance`.
 - `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with every message while the "Image" switch left of the send button is on (it is a switch, not a send button). It does not go together with a `tool_choice`.
 - `strata_images` with `{"tools": [...]}` narrows the image tools of that request (a tool the config's `image_tools` leaves out cannot be asked for).
@@ -622,6 +654,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
   Read [Tencent's license](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE), its Acceptable Use Policy included, before you use the images.
   The quantized files are the ones PedroMarinhoDev publishes for ComfyUI.
 - MOSS-Image's weights (SFT and Base) are under Apache 2.0, published by OpenMOSS (MOSI. AI). Its VAE is the one in MOSS-Image's repository.
+  `moss-image-4-step`'s 4-step adapter (a LoRA, a time path, the sampler's table) is darask0's [MOSS-Image_4-step_adapter_lora](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora), under Apache 2.0.
   Its edit adapters are three, and setup takes them all: chinoll's [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit), the default (PedroMarinhoDev's [copy](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI) in ComfyUI's form, GPL-3.0), and akhaliq's [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) armV5 and armV6 (Apache 2.0). For these two it also takes Unsloth's Qwen3.5-9B vision encoder (mmproj, Apache 2.0).
 - Anima's weights (Base, Aesthetic, Turbo) are under CircleStone Labs' non-commercial license and NVIDIA's Open Model License of Cosmos-Predict2, which it is built on. The model may not be used commercially (the images it makes may). Read [Anima's page](https://huggingface.co/circlestone-labs/Anima) before using it.
   Anima-2.9B (Gazingstars123's) and the derivatives are under their publishers' licenses.
@@ -636,3 +669,10 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 - Words to masks' SAM 3.1 weights are under Meta's SAM License, which is not an open-source license (it binds whoever uses them, and forbids some uses). The server fetches them only once the user has agreed to it, Comfy-Org's [sam3.1](https://huggingface.co/Comfy-Org/sam3.1) FP16 file as it is. CLIP's `tokenizer.json` that reads the words (openai/clip-vit-large-patch14) is under MIT.
 - Florence-2's weights (large and base) and `tokenizer.json` are Microsoft's [Florence-2](https://huggingface.co/microsoft/Florence-2-large), under MIT.
 - The background remover's seven BiRefNet versions are Peng Zheng's [BiRefNet](https://github.com/ZhengPeng7/BiRefNet), under MIT.
+- The composition control's Fun ControlNet Union (for Qwen-Image-2.1) is alibaba-pai's [Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union), under the Qwen Research License as Qwen-Image-2.1 is. It is not a free software license: read it before you use the images commercially.
+- MOSS-Image's color and depth adapter is darask0's [MOSS-Image-color-depth-control](https://huggingface.co/darask0/MOSS-Image-color-depth-control), under Apache 2.0.
+- The weights of the networks that make the control maps:
+   - The depth's Depth Anything V2 Small (Lihe Yang et al.) is [Depth-Anything-V2-Small-hf](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf), under Apache 2.0 (the ones from Base up are non-commercial and not used).
+   - The pose's DWPose (Zhendong Yang et al.) is [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose), under Apache 2.0. YOLOX-L, which finds the people, is the same file as Megvii's [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) release ([kadirnar/yolox_l-v0.1.1](https://huggingface.co/kadirnar/yolox_l-v0.1.1)), under Apache 2.0.
+   - HED (ControlNet 1.1's annotator, Lvmin Zhang) is under Apache 2.0, line art (Caroline Chan's Informative Drawings) under MIT and M-LSD (NAVER) under Apache 2.0, all taken from [lllyasviel/Annotators](https://huggingface.co/lllyasviel/Annotators).
+   - The server turns these `.pth` files into safetensors with `tools/image/state_pt.py` before it uses them: a change of format that leaves the weights' values as they are, the original file's SHA-256 written into the converted one.

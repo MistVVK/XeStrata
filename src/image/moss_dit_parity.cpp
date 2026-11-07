@@ -9,6 +9,8 @@
 //   2. the block's output over the context's rows, the image's then the text's (the time's shared modulation, the
 //      four-axis RoPE, one attention over every row, the gates);
 //   3. the velocity (the head over the image's rows), and a second context's that skips the block;
+//   4. the velocity with the color and depth control's input projection (set_control: an adapter's video_embedder
+//      over the latent's, a color map's and a depth map's channels side by side);
 // each with the blocks in FP16 and in 8 bits (W8A8 where the GPU's library takes int8 products, else Q8_0).
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -355,6 +357,24 @@ int main() {
     }
     block(m, "layers.0.", x0, kHW + kRows, at, mod.data(), "proj.q", "proj.k", "proj.v", "proj.o", false);
     const Rows v0 = head_out(m, x0, head), v1 = head_out(m, context(ntxt), head);   // context 1 skips it
+    // the control's adapter: the input projection over three latents' channels, the color's and the depth's after
+    Model ctl;
+    ctl.linear("video_embedder", kC, 3 * kLat, true);
+    const auto ctl_path = std::filesystem::temp_directory_path() / "strata_moss_dit_parity_control.safetensors";
+    ctl.write(ctl_path);
+    const Rows col = rnd(kHW * kLat), dep = rnd(kHW * kLat);
+    Rows wide((size_t) (kHW * 3 * kLat));
+    for (int64_t t = 0; t < kHW; ++t)
+        for (int64_t c = 0; c < kLat; ++c) {
+            wide[(size_t) (t * 3 * kLat + c)] = lat[(size_t) (t * kLat + c)];
+            wide[(size_t) (t * 3 * kLat + kLat + c)] = col[(size_t) (t * kLat + c)];
+            wide[(size_t) (t * 3 * kLat + 2 * kLat + c)] = dep[(size_t) (t * kLat + c)];
+        }
+    Rows xc = lin(ctl, "video_embedder", wide, kHW);
+    xc.insert(xc.end(), txt.begin(), txt.end());
+    block(m, "layers.0.", xc, kHW + kRows, at, mod.data(), "proj.q", "proj.k", "proj.v", "proj.o", false);
+    const Rows vc = head_out(m, xc, head);
+    std::vector<float> fc(col.begin(), col.end()), fd(dep.begin(), dep.end());
 
     std::vector<float> fs(states.begin(), states.end()), fn(neg.begin(), neg.end()), fl(lat.begin(), lat.end());
     try {
@@ -389,6 +409,21 @@ int main() {
             check(e <= 5e-3, "3. the velocity", e, 5e-3);
             e = rel(std::vector<float>(o.begin() + kHW * kLat, o.end()), v1);
             check(e <= 3e-3, "3. a second context's, skipping the block", e, 3e-3);
+            float *dc = nullptr, *dd = nullptr;
+            if (!strata::gpu::alloc_device(&dc, fc.size() * 4) || !strata::gpu::alloc_device(&dd, fd.size() * 4))
+                throw std::runtime_error("GPU memory");
+            strata::gpu::copy(dc, fc.data(), fc.size() * 4);
+            strata::gpu::copy(dd, fd.data(), fd.size() * 4);
+            d.set_control(ctl_path.string());
+            d.set_control_input(dc, dd, 1.f, 1.f);
+            d.forward(x, kTime, kH, kW, 1, out);
+            strata::gpu::stream_sync(s);
+            e = rel(fetch(out, (size_t) (kHW * kLat)), vc);
+            check(e <= 5e-3, "4. the velocity with the color and depth control's input projection", e, 5e-3);
+            d.set_control_input(nullptr, nullptr, 1.f, 1.f);
+            d.set_control("");
+            strata::gpu::free(dc);
+            strata::gpu::free(dd);
             strata::gpu::free(x);
             strata::gpu::free(out);
         }
@@ -397,6 +432,7 @@ int main() {
         ++g_fail;
     }
     std::filesystem::remove(path);
+    std::filesystem::remove(ctl_path);
     std::printf("moss_dit_parity: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }

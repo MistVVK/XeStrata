@@ -28,6 +28,17 @@ inline float f32_from_f16(uint16_t b) { return static_cast<float>(sycl::bit_cast
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
+inline float act_of(AuxAct a, float v) {
+    switch (a) {
+    case AuxAct::relu: return sycl::fmax(v, 0.f);
+    case AuxAct::gelu: return 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
+    case AuxAct::silu: return v / (1.f + sycl::exp(-v));
+    case AuxAct::sigmoid: return 1.f / (1.f + sycl::exp(-v));
+    case AuxAct::relu6: return sycl::clamp(v, 0.f, 6.f);
+    default: return v;
+    }
+}
+
 void finish(void* stream, const sycl::event& e, const char* what) {
     if (!stream) core::Runtime::get().wait(e, what);
 }
@@ -728,12 +739,7 @@ void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, in
 void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
                     void* stream) {
     if (T <= 0 || n <= 0) return;
-    const auto f = [=](float v, float b) {
-        v += b;
-        if (act == AuxAct::relu) v = sycl::fmax(v, 0.f);
-        else if (act == AuxAct::gelu) v = 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
-        return v;
-    };
+    const auto f = [=](float v, float b) { return act_of(act, v + b); };
     if (n % 8 == 0) {   // a work-item 8 values: one 16-byte load and store (a row's 8 at a time are 16-byte aligned)
         using V = sycl::vec<sycl::half, 8>;
         const int64_t chunks = T * n / 8, per_row = n / 8;
@@ -1362,6 +1368,227 @@ void aux_mod_select16(const float* src, int64_t T, int64_t R, int64_t C, uint16_
         y16[i] = f16_from_f32(src[((r % T) * R) * C + i]);
     });
     finish(stream, e, "aux_mod_select16");
+}
+
+void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, AuxAct act, const uint16_t* res16,
+                     uint16_t* dst16, int64_t ld, int64_t off, void* stream) {
+    if (n <= 0 || O <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * O)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t q = i / O, o = i - q * O;
+        float v = act_of(act, y[i] + (bias != nullptr ? bias[o] : 0.f));
+        if (res16 != nullptr) v += f32_from_f16(res16[i]);
+        dst16[q * ld + off + o] = f16_from_f32(v);
+    });
+    finish(stream, e, "aux_map_store16");
+}
+
+void aux_dwconv16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, const float* bias, int k,
+                  int s, int p, int64_t OH, int64_t OW, AuxAct act, uint16_t* y16, void* stream) {
+    if (OH <= 0 || OW <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C, oy = q / OW, ox = q - oy * OW;
+        float acc = bias != nullptr ? bias[c] : 0.f;
+        for (int dy = 0; dy < k; ++dy) {
+            const int64_t yy = oy * s + dy - p;
+            if (yy < 0 || yy >= H) continue;
+            for (int dx = 0; dx < k; ++dx) {
+                const int64_t xx = ox * s + dx - p;
+                if (xx < 0 || xx >= W) continue;
+                acc += f32_from_f16(x16[(yy * W + xx) * C + c]) * f32_from_f16(w16[(c * k + dy) * k + dx]);
+            }
+        }
+        y16[i] = f16_from_f32(act_of(act, acc));
+    });
+    finish(stream, e, "aux_dwconv16");
+}
+
+void aux_maxpool16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int s, int p, int64_t OH, int64_t OW,
+                   uint16_t* y16, void* stream) {
+    if (OH <= 0 || OW <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C, oy = q / OW, ox = q - oy * OW;
+        float m = -INFINITY;
+        for (int dy = 0; dy < k; ++dy)
+            for (int dx = 0; dx < k; ++dx) {
+                const int64_t yy = oy * s + dy - p, xx = ox * s + dx - p;
+                if (yy >= 0 && yy < H && xx >= 0 && xx < W) m = sycl::fmax(m, f32_from_f16(x16[(yy * W + xx) * C + c]));
+            }
+        y16[i] = f16_from_f32(m);
+    });
+    finish(stream, e, "aux_maxpool16");
+}
+
+void aux_bilinear16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t OH, int64_t OW, bool align_corners,
+                    bool add, uint16_t* y16, void* stream) {
+    if (OH <= 0 || OW <= 0 || C <= 0) return;
+    const float sy = align_corners ? (OH > 1 ? (float) (H - 1) / (float) (OH - 1) : 0.f) : (float) H / (float) OH;
+    const float sx = align_corners ? (OW > 1 ? (float) (W - 1) / (float) (OW - 1) : 0.f) : (float) W / (float) OW;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C, oy = q / OW, ox = q - oy * OW;
+        float fy = align_corners ? (float) oy * sy : sycl::fmax(((float) oy + 0.5f) * sy - 0.5f, 0.f);
+        float fx = align_corners ? (float) ox * sx : sycl::fmax(((float) ox + 0.5f) * sx - 0.5f, 0.f);
+        const int64_t y0 = sycl::min((int64_t) fy, H - 1), x0 = sycl::min((int64_t) fx, W - 1);
+        const int64_t y1 = sycl::min(y0 + 1, H - 1), x1 = sycl::min(x0 + 1, W - 1);
+        fy -= (float) y0;
+        fx -= (float) x0;
+        const auto at = [&](int64_t yy, int64_t xx) { return f32_from_f16(x16[(yy * W + xx) * C + c]); };
+        const float top = at(y0, x0) + (at(y0, x1) - at(y0, x0)) * fx;
+        const float bot = at(y1, x0) + (at(y1, x1) - at(y1, x0)) * fx;
+        float v = top + (bot - top) * fy;
+        if (add) v += f32_from_f16(y16[i]);
+        y16[i] = f16_from_f32(v);
+    });
+    finish(stream, e, "aux_bilinear16");
+}
+
+void aux_deconv_scatter16(const float* y, int64_t H, int64_t W, int64_t k, int64_t O, const float* bias, AuxAct act,
+                          uint16_t* y16, void* stream) {
+    if (H <= 0 || W <= 0 || O <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (k * k * H * W * O)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t o = i % O, q = i / O, Y = q / (k * W), X = q - Y * (k * W);
+        const int64_t src = ((Y / k) * W + X / k) * k * k + (Y % k) * k + (X % k);
+        y16[i] = f16_from_f32(act_of(act, y[src * O + o] + (bias != nullptr ? bias[o] : 0.f)));
+    });
+    finish(stream, e, "aux_deconv_scatter16");
+}
+
+void aux_copy_channels16(const uint16_t* src16, int64_t n, int64_t C, uint16_t* dst16, int64_t ld, int64_t off,
+                         void* stream) {
+    if (n <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t q = i / C;
+        dst16[q * ld + off + (i - q * C)] = src16[i];
+    });
+    finish(stream, e, "aux_copy_channels16");
+}
+
+void aux_add16h(const uint16_t* a16, const uint16_t* b16, int64_t n, uint16_t* y16, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y16[i] = f16_from_f32(f32_from_f16(a16[i]) + f32_from_f16(b16[i]));
+    });
+    finish(stream, e, "aux_add16h");
+}
+
+void aux_pad_reflect16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t p, uint16_t* y16, void* stream) {
+    const int64_t OH = H + 2 * p, OW = W + 2 * p;
+    if (H <= 0 || W <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C;
+        int64_t y = q / OW - p, x = q % OW - p;
+        y = y < 0 ? -y : y >= H ? 2 * (H - 1) - y : y;
+        x = x < 0 ? -x : x >= W ? 2 * (W - 1) - x : x;
+        y16[i] = x16[(y * W + x) * C + c];
+    });
+    finish(stream, e, "aux_pad_reflect16");
+}
+
+void aux_zero_insert16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t s, int64_t lo, int64_t hi,
+                       uint16_t* y16, void* stream) {
+    const int64_t OH = (H - 1) * s + 1 + lo + hi, OW = (W - 1) * s + 1 + lo + hi;
+    if (H <= 0 || W <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C, y = q / OW - lo, x = q % OW - lo;
+        const bool on = y >= 0 && x >= 0 && y % s == 0 && x % s == 0 && y / s < H && x / s < W;
+        y16[i] = on ? x16[((y / s) * W + x / s) * C + c] : (uint16_t) 0;
+    });
+    finish(stream, e, "aux_zero_insert16");
+}
+
+namespace {
+// st [C][2] = each channel's mean and variance over x16 [n][C]: a work-group a channel
+void channel_stats16(const uint16_t* x16, int64_t n, int64_t C, float* st, void* stream) {
+    sycl::queue& q = queue_for(stream);
+    const size_t wg = std::min<size_t>(256, q.get_device().get_info<sycl::info::device::max_work_group_size>());
+    const auto e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) C * wg), sycl::range<1>(wg)),
+                                  [=](sycl::nd_item<1> it) {
+        const auto c = static_cast<int64_t>(it.get_group(0));
+        float s = 0.f, s2 = 0.f;
+        for (auto p = static_cast<int64_t>(it.get_local_id(0)); p < n; p += (int64_t) wg) {
+            const float v = f32_from_f16(x16[p * C + c]);
+            s += v;
+            s2 += v * v;
+        }
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
+        if (it.get_local_id(0) == 0) {
+            const float m = s / (float) n;
+            st[c * 2] = m;
+            st[c * 2 + 1] = sycl::fmax(s2 / (float) n - m * m, 0.f);
+        }
+    });
+    finish(stream, e, "aux_channel_stats16");
+}
+}  // namespace
+
+void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, AuxAct act, float* st, void* stream) {
+    if (n <= 0 || C <= 0) return;
+    channel_stats16(x16, n, C, st, stream);
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C;
+        x16[i] = f16_from_f32(act_of(act, (f32_from_f16(x16[i]) - st[c * 2]) * sycl::rsqrt(st[c * 2 + 1] + eps)));
+    });
+    finish(stream, e, "aux_instance_norm16");
+}
+
+void aux_scale_channels16(uint16_t* x16, int64_t n, int64_t C, const float* gate, void* stream) {
+    if (n <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x16[i] = f16_from_f32(f32_from_f16(x16[i]) * gate[i % C]);
+    });
+    finish(stream, e, "aux_scale_channels16");
+}
+
+void aux_col_mean16(const uint16_t* x16, int64_t n, int64_t C, float* mean, void* stream) {
+    if (n <= 0 || C <= 0) return;
+    sycl::queue& q = queue_for(stream);
+    const size_t wg = std::min<size_t>(256, q.get_device().get_info<sycl::info::device::max_work_group_size>());
+    const auto e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) C * wg), sycl::range<1>(wg)),
+                                  [=](sycl::nd_item<1> it) {
+        const auto c = static_cast<int64_t>(it.get_group(0));
+        float s = 0.f;
+        for (auto p = static_cast<int64_t>(it.get_local_id(0)); p < n; p += (int64_t) wg) s += f32_from_f16(x16[p * C + c]);
+        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
+        if (it.get_local_id(0) == 0) mean[c] = s / (float) n;
+    });
+    finish(stream, e, "aux_col_mean16");
+}
+
+void aux_pad16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t top, int64_t left, int64_t bottom,
+               int64_t right, uint16_t* y16, void* stream) {
+    const int64_t OH = H + top + bottom, OW = W + left + right;
+    if (OH <= 0 || OW <= 0 || C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, q = i / C, y = q / OW - top, x = q % OW - left;
+        y16[i] = y >= 0 && y < H && x >= 0 && x < W ? x16[(y * W + x) * C + c] : (uint16_t) 0;
+    });
+    finish(stream, e, "aux_pad16");
+}
+
+void aux_im2col16_dilated(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int dil,
+                          int64_t OW, int64_t p0, int64_t n, uint16_t* col16, void* stream) {
+    const int64_t K = (int64_t) k * k * C;
+    if (n <= 0 || K <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * K)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / K, q = i - r * K, tap = q / C, c = q - tap * C;
+        const int64_t p = p0 + r, oy = p / OW, ox = p - oy * OW;
+        const int64_t y = oy * stride - pad + (tap / k) * dil, x = ox * stride - pad + (tap % k) * dil;
+        col16[i] = y >= 0 && y < H && x >= 0 && x < W ? x16[(y * W + x) * C + c] : (uint16_t) 0;
+    });
+    finish(stream, e, "aux_im2col16_dilated");
 }
 
 }  // namespace strata::image

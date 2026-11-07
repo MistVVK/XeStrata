@@ -7,6 +7,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/cnet_prep.hpp"
 #include "strata/image/safetensors.hpp"
 
 #include <algorithm>
@@ -202,7 +203,9 @@ void MossPipeline::use_loras(const QiRequest& r) {
     const std::string before = dit_->lora_key();
     std::vector<LoraUse> dit;
     lora_split(r.loras, dit, te_loras_);
-    dit_->set_lora_bake(lora_bake_);
+    // a few-step adapter's LoRA is added to the products, not folded into the weights: its delta is below the 16-bit
+    // weights' rounding (its author's measure: 81% of it lost to bf16's)
+    dit_->set_lora_bake(lora_bake_ && r.dataspace.empty());
     if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
     if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
     if (lora_key_of(te_loras_) != te_lora_) {   // the states kept were the encoder's with the other adapters
@@ -680,6 +683,10 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     MossDit& d = *dit_;
     if (d.ref_rows() > 0) d.set_refs({});   // the last edit's references: this request makes its own (or has none)
     use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
+    dit_->set_time_path(r.time_path);
+    if (!r.dataspace.empty() && (r.strength < 1.0 || !r.mask.rgba.empty()))
+        throw std::invalid_argument("image engine: the few-step adapter (DATASPACE:) draws from noise only (no strength "
+                                    "below 1, no mask)");
     LatentStart ls;
     if (base != nullptr) {
         if (stage) stage("refs");
@@ -778,6 +785,35 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     } else if (d.ref_rows() > 0 || d.stream_rows() > 0) {
         d.set_refs({});
     }
+    // the color and depth control: the adapter's input projection, and each map through the VAE's encoder at the
+    // image's size (the posterior's mean, packed as the image's latent), alive through the sampling
+    struct ControlMaps {
+        MossDit& d;
+        float *color = nullptr, *depth = nullptr;
+        ~ControlMaps() {
+            d.set_control_input(nullptr, nullptr, 1.f, 1.f);
+            gpu::free(color);
+            gpu::free(depth);
+        }
+    } maps{d};
+    d.set_control(r.mctl);
+    if (!r.mctl.empty()) {
+        const auto encode_map = [&](const QiRef& m) -> float* {
+            if (m.rgba.empty()) return nullptr;
+            QiRef f;
+            f.width = r.width;
+            f.height = r.height;
+            f.rgba = control_resize(m, r.width, r.height);
+            return encode_ref(f);
+        };
+        if (r.mctl_color.rgba.empty() && r.mctl_depth.rgba.empty())
+            throw std::invalid_argument("image engine: MCTL: needs a color map (MCOLOR:) or a depth map (MDEPTH:)");
+        if (free_vram() < vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * HW) * 4) d.drop_activations();
+        maps.color = encode_map(r.mctl_color);
+        maps.depth = encode_map(r.mctl_depth);
+        if (d.resident_blocks() < d.blocks()) vae_->drop_scratch();
+        d.set_control_input(maps.color, maps.depth, r.mctl_color_end, r.mctl_depth_end);
+    }
     const auto t1 = clock::now();
     // the seed's noise as the reference's ([channels][h][w], PyTorch's CPU randn), as the latent's tokens [h w][channels]
     const int64_t Cl = d.latent_channels(), N = Cl * h * w;
@@ -820,7 +856,8 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek);
+        if (r.dataspace.empty()) d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek);
+        else few_steps(r, x, h, w, step, peek);
         gpu::free(x0);
         x0 = nullptr;
         const auto t2 = clock::now();
@@ -871,6 +908,68 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
     if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
     return img;
+}
+
+namespace moss_few_k {   // the kernels' names (an anonymous namespace mangles the same in every file)
+// y [n][C] = z + Q x0 (Q [C][C], a token's channels), C the latent's
+void mix(const float* z, const float* q, const float* x0, int64_t n, int64_t C, float* y, void* s) {
+    core::Runtime::get().stream(s).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / C, o = i - t * C;
+        const float* row = q + o * C;
+        const float* xt = x0 + t * C;
+        float acc = 0.f;
+        for (int64_t c = 0; c < C; ++c) acc += row[c] * xt[c];
+        y[i] = z[i] + acc;
+    });
+}
+// x0 = z - v
+void sub(const float* z, const float* v, int64_t n, float* x0, void* s) {
+    core::Runtime::get().stream(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        x0[id[0]] = z[id[0]] - v[id[0]];
+    });
+}
+}  // namespace moss_few_k
+
+void MossPipeline::few_steps(const QiRequest& r, float* x, int64_t h, int64_t w,
+                             const std::function<bool(int, int)>& step,
+                             const std::function<void(int, const std::function<void(float*)>&)>& peek) {
+    SafeTensors st(r.dataspace);
+    MossDit& d = *dit_;
+    const int64_t C = d.latent_channels(), n = h * w * C;
+    const SafeTensor* qt = st.find("latent_mix.Q");
+    const SafeTensor* ct = st.find("step_codes");
+    if (qt == nullptr || qt->shape != std::vector<int64_t>{C, C} || ct == nullptr || ct->shape.size() != 1)
+        throw std::runtime_error(r.dataspace + ": not a few-step adapter's data space (latent_mix.Q [" +
+                                 std::to_string(C) + "][" + std::to_string(C) + "], step_codes)");
+    const std::vector<float> q = st.f32("latent_mix.Q"), codes = st.f32("step_codes");
+    const int steps = (int) std::min<int64_t>(r.steps > 0 ? r.steps : (int64_t) codes.size(), (int64_t) codes.size());
+    float *z = nullptr, *qd = nullptr, *x0 = nullptr, *v = nullptr;
+    struct Free {
+        std::vector<float*> ps;
+        void* s;
+        ~Free() {
+            gpu::stream_sync(s);
+            for (float* p : ps) gpu::free(p);
+        }
+    } owned{{}, s_};
+    for (auto [p, m] : {std::pair<float**, int64_t>{&z, n}, {&qd, C * C}, {&x0, n}, {&v, n}}) {
+        if (!gpu::alloc_device(p, (size_t) m * 4))
+            throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+        owned.ps.push_back(*p);
+    }
+    gpu::copy(qd, q.data(), q.size() * 4);
+    gpu::copy_async(z, x, (size_t) n * 4, s_);
+    gpu::memset_async(x0, 0, (size_t) n * 4, s_);
+    for (int i = 0; i < steps; ++i) {
+        moss_few_k::mix(z, qd, x0, h * w, C, x, s_);
+        d.forward(x, codes[(size_t) i], h, w, 1, v);
+        moss_few_k::sub(z, v, n, x0, s_);
+        if (peek) peek(i + 1, [&](float* out) { gpu::copy_async(out, x0, (size_t) n * 4, s_); });
+        if (step && !step(i + 1, steps)) throw QiStopped();
+    }
+    gpu::copy_async(x, x0, (size_t) n * 4, s_);
+    gpu::stream_sync(s_);
 }
 
 }  // namespace strata::image

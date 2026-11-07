@@ -785,6 +785,54 @@ void Sam3::mask_logits(const int64_t* qs, int64_t k, float* logits) {
     }
 }
 
+std::vector<Segment> Sam3::segments(const Detection& det, int64_t W, int64_t H, float mask_threshold) {
+    std::vector<Segment> out;
+    const int64_t G = grid_, N = G * G;
+    for (int64_t q : det.keep) {
+        const float* b = det.box.data() + q * 4;
+        Segment sg;
+        sg.x0 = (b[0] - 0.5f * b[2]) * (float) W;
+        sg.y0 = (b[1] - 0.5f * b[3]) * (float) H;
+        sg.x1 = (b[0] + 0.5f * b[2]) * (float) W;
+        sg.y1 = (b[1] + 0.5f * b[3]) * (float) H;
+        sg.score = det.prob[(size_t) q];
+        out.push_back(std::move(sg));
+    }
+    if (det.keep.empty()) return out;
+    mask_prep();
+    // the kept queries' masks, a chunk at a time
+    float* logits = scratch(kMasks, (size_t) (16 * N * d_ * 4));   // free again: [chunk][16N]
+    auto* m8 = scratch_as<uint8_t>(kMasks8, (size_t) (kMaskChunk * W * H));
+    for (size_t k0 = 0; k0 < det.keep.size(); k0 += (size_t) kMaskChunk) {
+        const int64_t k = std::min<int64_t>(kMaskChunk, (int64_t) (det.keep.size() - k0));
+        mask_logits(det.keep.data() + k0, k, logits);
+        if (k0 == 0) host("mask_logits", logits, (size_t) (16 * N));
+        aux_mask_resize(logits, k, 4 * G, 4 * G, H, W, false, mask_threshold, m8, s_);
+        gpu::stream_sync(s_);
+        for (int64_t i = 0; i < k; ++i) {
+            auto& m = out[k0 + (size_t) i].mask;
+            m.resize((size_t) (W * H));
+            gpu::copy(m.data(), m8 + i * W * H, m.size());
+        }
+    }
+    return out;
+}
+
+std::vector<std::vector<Segment>> Sam3::run_many(const QiRef& image, const std::vector<std::vector<int32_t>>& ids,
+                                                 float score_threshold, float mask_threshold) {
+    load();
+    trunk(image);
+    std::vector<std::vector<Segment>> out;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        // the detector's encoder runs in place on the 1x level: kept from the first words for the next ones
+        if (i == 0) detect_neck(ids.size() > 1);
+        else detect_restore();
+        text(ids[i]);
+        out.push_back(segments(detect(score_threshold), image.width, image.height, mask_threshold));
+    }
+    return out;
+}
+
 std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& ids, float score_threshold,
                                float mask_threshold, Times* tm) {
     Times local;
@@ -802,36 +850,7 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
     const Detection det = detect(score_threshold);
     t.detect = since(t0);
     t0 = std::chrono::steady_clock::now();
-    std::vector<Segment> out;
-    const int64_t W = image.width, H = image.height, G = grid_, N = G * G;
-    for (int64_t q : det.keep) {
-        const float* b = det.box.data() + q * 4;
-        Segment sg;
-        sg.x0 = (b[0] - 0.5f * b[2]) * (float) W;
-        sg.y0 = (b[1] - 0.5f * b[3]) * (float) H;
-        sg.x1 = (b[0] + 0.5f * b[2]) * (float) W;
-        sg.y1 = (b[1] + 0.5f * b[3]) * (float) H;
-        sg.score = det.prob[(size_t) q];
-        out.push_back(std::move(sg));
-    }
-    if (!det.keep.empty()) {
-        mask_prep();
-        // the kept queries' masks, a chunk at a time
-        float* logits = scratch(kMasks, (size_t) (16 * N * d_ * 4));   // free again: [chunk][16N]
-        auto* m8 = scratch_as<uint8_t>(kMasks8, (size_t) (kMaskChunk * W * H));
-        for (size_t k0 = 0; k0 < det.keep.size(); k0 += (size_t) kMaskChunk) {
-            const int64_t k = std::min<int64_t>(kMaskChunk, (int64_t) (det.keep.size() - k0));
-            mask_logits(det.keep.data() + k0, k, logits);
-            if (k0 == 0) host("mask_logits", logits, (size_t) (16 * N));
-            aux_mask_resize(logits, k, 4 * G, 4 * G, H, W, false, mask_threshold, m8, s_);
-            gpu::stream_sync(s_);
-            for (int64_t i = 0; i < k; ++i) {
-                auto& m = out[k0 + (size_t) i].mask;
-                m.resize((size_t) (W * H));
-                gpu::copy(m.data(), m8 + i * W * H, m.size());
-            }
-        }
-    }
+    std::vector<Segment> out = segments(det, image.width, image.height, mask_threshold);
     t.masks = since(t0);
     return out;
 }

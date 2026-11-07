@@ -18,3 +18,7 @@ When: a MOSS-Image image: boxes (posters, signs, panels), an edit with a painted
   (`image` the one edited before, not the result) with `refine` true.
 - An edit LoRA the user names ("use armv6", "with the X LoRA"): edit_image's `edit_adapter`, the name as it is listed
   there. Never give one the user did not name. When the result says it cannot be used, tell the user why.
+- moss-image-4-step draws in 4 steps without guidance: no negative prompt, no edits; the prompt as for MOSS-Image.
+- control with `color` (where each thing is) or `depth` places people and things as the picture has them; describe
+  each in the prompt. A map from a 3D mannequin or a render: `end` 0.5 (else its surface shows through). With
+  moss-image-4-step keep `end` short (0.3); where the mannequin's surface still shows, use MOSS-Image's usual steps.

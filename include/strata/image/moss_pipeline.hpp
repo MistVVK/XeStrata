@@ -96,6 +96,11 @@ private:
     /// An edit's reference image through the VAE's encoder at its own size -> its latent [h w][128] (device FP32, the
     /// caller's to free).
     float* encode_ref(const QiRef& f);
+    /// The few-step adapter's sampler (r.dataspace's latent_mix.Q and step_codes): from the noise z (x, in place, the
+    /// finished latent after), x0 0 at first, each step x = z + Q x0 (Q over a token's channels) and x0 = z - v with v
+    /// the model's at that step's code; no guidance, the steps at most the codes.
+    void few_steps(const QiRequest& r, float* x, int64_t h, int64_t w, const std::function<bool(int, int)>& step,
+                   const std::function<void(int, const std::function<void(float*)>&)>& peek);
     /// The pictures' rows through the vision encoder (opened for them and closed after), one block each.
     std::vector<QiVisionOut> encode_pictures(const std::vector<QiRef>& pictures);
 

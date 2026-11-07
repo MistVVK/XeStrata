@@ -15,6 +15,7 @@
 
 #include "strata/image/img_start.hpp"
 #include "strata/image/pipeline.hpp"
+#include "strata/image/qi_control.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_text.hpp"
 #include "strata/image/qi_vae.hpp"
@@ -68,6 +69,10 @@ public:
                                   const std::function<bool(int, int)>& step = {},
                                   const std::function<void(const char*)>& stage = {}) override;
 
+    /// What the ControlNet branch at `path` adds to need's least and full for an image of width x height (read for its
+    /// sizes; nothing on the GPU).
+    std::pair<uint64_t, uint64_t> control_need(const std::string& path, int64_t width, int64_t height);
+
 private:
     QiPlan plan(int64_t T, int64_t h, int64_t w, int64_t n_ids = 0, int64_t n_neg_pre = 0);
 
@@ -84,6 +89,11 @@ private:
                    std::vector<QiDit::Ref>& neg_refs, bool vision = true);
     /// The base image (img_start.hpp) at the image's size through the VAE's encoder into `ls`'s base latent.
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
+    /// The request's ControlNet branch opened (or let go, without one) and its conditioning given to it: the control
+    /// image's latent, the kept mask and the masked base image's latent (zeros where the request has none).
+    void use_control(const QiRequest& r);
+    /// RGBA [4][h][w] FP32 of an RGBA8 picture at w x h through the VAE's encoder into z [64][h / 16][w / 16].
+    void encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, vision_path_;
@@ -96,6 +106,9 @@ private:
     std::unique_ptr<QiText> te_size_;
     std::unique_ptr<QiDit> dit_size_;
     std::unique_ptr<QiVae> vae_size_;
+    std::unique_ptr<QiControl> control_, control_size_;   // the ControlNet branch, and one read for its sizes
+    bool control_on_ = false;                              // the request has the branch
+    uint64_t control_set_ = 0;                             // its blocks' budget
     uint64_t dit_set_ = 0, te_set_ = 0;
     uint64_t te_want_ = 0;   // the encoder's layers the plan gives them: taken when it encodes (te_layers)
     int64_t mlp_set_ = -1;

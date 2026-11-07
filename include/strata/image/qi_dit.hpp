@@ -32,6 +32,8 @@ class GgufFile;
 
 namespace strata::image {
 
+class QiControl;
+
 /// Philox 4x32-10 normal values as PyTorch's CUDA randn gives them for `seed` (the generator stable-diffusion.cpp
 /// uses): value i from counter (offset, 0, i, 0) and key (seed low, seed high), Box-Muller's sine half.
 std::vector<float> philox_randn(uint64_t seed, uint64_t n, uint32_t offset = 0);
@@ -143,7 +145,14 @@ public:
     int lora_count() const { return (int) lora_files_.size(); }
     void drop_loras();
 
+    /// The ControlNet branch the sampling runs beside the blocks (qi_control.hpp; null: none): in a step it is on for,
+    /// every row is computed (the prefix cache neither read nor written) and the branch's skips are added.
+    void set_control(QiControl* control) { control_ = control; }
+
 private:
+    friend class QiControl;
+    QiControl* control_ = nullptr;
+    bool control_on(float t) const;   // the branch on for the step at time t (sigma x 1000)
     bool lora_bake_ = true, baked_any_ = false;
     float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
     uint16_t* bake_at16_ = nullptr;  // an adapter's A^T

@@ -277,6 +277,7 @@ MOSS_CFG = 3.0                     # block 22 skipped by the negative pass, no s
 MOSS_SHIFT = 5.0
 MOSS_NEG = ""
 MOSS_UNCOND_SKIP = [22]
+MOSS_FEW_STEPS = 4                 # the 4-step adapter's step codes (its card: 1 to 4, 4 recommended)
 MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
 MOSS_SHIFT_MAX = 20.0
 # MOSS-Image's edits: chinoll's Moss-Image-Edit adapter (the config's "edit_lora", at strength 1: below 1 the scene is
@@ -394,7 +395,8 @@ def model_defaults(cfg: dict) -> dict:
     edit = (int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else
             int(cfg.get("edit_steps") or MOSS_EDIT_STEPS) if moss and cfg.get("edit_lora") else steps)
     # "strength": an img2img's at most, lowered by the steps as img2img_strength (the web page's imgStrength)
-    out = {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
+    out = {"steps": steps, "edit_steps": edit, "steps_min": least,
+           "steps_max": MOSS_FEW_STEPS if cfg.get("few_step") else MAX_STEPS, "steps_fixed": fixed,
            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
            "formats": output_formats(),
            "guidance": (float(cfg.get("guidance") or HUNYUANIMAGE3_GUIDANCE) if hunyuan
@@ -412,6 +414,11 @@ def model_defaults(cfg: dict) -> dict:
            "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg)),
            # the image tools a chat may use with it (and the Images API's operations): the config's image_tools
            "tools": [t["name"] for t in TOOLS if cfg.get("image_tools") is None or t["name"] in cfg["image_tools"]],
+           # the control image (image_controls): how it reaches the model (controlnet, reference; null: none) and the
+           # kinds made
+           "control": ({"mode": _controls().capability(cfg), "types": _controls().kinds_for(cfg),
+                        "modes": {k: _controls().mode_of(cfg, k) for k in _controls().kinds_for(cfg)}}
+                       if _controls().capability(cfg) else None),
            # the sampling guidance it takes (guidance_request): each method's parameters as default, least and most,
            # and whether it needs classifier-free guidance
            "guidance_methods": {name: {"needs_cfg": name in GUIDANCE_NEEDS_CFG,
@@ -427,7 +434,10 @@ def model_defaults(cfg: dict) -> dict:
         out.update(samplers=list(MF_SAMPLERS), sampler=cfg.get("sampler") or MF_SAMPLERS[0])
     if moss and cfg.get("edit_lora"):   # its edits' guidance (MOSS_EDIT_CFG)
         out["edit_guidance"] = float(cfg.get("edit_cfg_scale") or MOSS_EDIT_CFG)
-    if moss:
+    if moss and cfg.get("few_step"):   # the 4-step adapter: its sampler (no shift, no skips), no guidance
+        out.update(shift=MOSS_SHIFT, uncond_skip_layers=[], slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0,
+                   blocks=MOSS_BLOCKS, layout=True, enhance=True, few_step=True, negative_prompt=None)
+    elif moss:
         out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
                    slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True,
                    enhance=True)
@@ -659,6 +669,15 @@ def moss_request(req: dict, cfg: dict) -> dict:
                            "slg_stop": _number(req, "slg_stop", 0.0, 1.0, 1.0)}
     if out["slg_start"] > out["slg_stop"]:
         raise ImageRequestError("slg_start: at most slg_stop")
+    few = cfg.get("few_step")
+    if few:   # the 4-step adapter (darask0's DMAD): its own sampler, no guidance, its skips and shift none
+        steps = req.get("steps", req.get("num_inference_steps"))
+        if steps not in (None, "") and not (isinstance(steps, int) and 1 <= steps <= MOSS_FEW_STEPS):
+            raise ImageRequestError(f"steps: 1 to {MOSS_FEW_STEPS} with this model's 4-step adapter")
+        for key in ("uncond_skip_layers", "slg_layers", "shift"):
+            if req.get(key) not in (None, [], ""):
+                raise ImageRequestError(f"{key}: not with this model's 4-step adapter (its own sampler)")
+        out.update(few_step=dict(few), uncond_skip=[], slg_layers=[], slg_scale=0.0)
     enhance = req.get("enhance")
     if isinstance(enhance, str):
         word = enhance.strip().lower()
@@ -2893,6 +2912,11 @@ class ImageGen:
     def _moss_words(job: dict) -> str:
         """MOSS-Image's words of IMG: its steps and shift (the engine makes its sigmas), the blocks the negative pass
         skips, and skip-layer guidance's (moss_request)."""
+        few = job.get("few_step")
+        if few:   # the 4-step adapter: its time path and data space (its LoRA among _lora_words')
+            return (f" STEPS:{min(int(job['steps']), MOSS_FEW_STEPS)} USKIP:none"
+                    f" TIMEPATH:{lora_api.encode_path(few['time_path'])}"
+                    f" DATASPACE:{lora_api.encode_path(few['dataspace'])}")
         words = (f" STEPS:{job['steps']} SHIFT:{job.get('shift', MOSS_SHIFT)!r}"
                  f" USKIP:{','.join(str(b) for b in job.get('uncond_skip', MOSS_UNCOND_SKIP)) or 'none'}")
         if job.get("slg_layers") and job.get("slg_scale"):
@@ -2907,6 +2931,8 @@ class ImageGen:
         first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the engine splits the
         line on whitespace - encode_path); a MOSS-Image edit's adapter (job["edit_lora"]) first, at 1."""
         edit = f" LORA:1.0:{lora_api.encode_path(job['edit_lora'])}" if job.get("edit_lora") else ""
+        if job.get("few_step"):   # the 4-step adapter's LoRA, at 1 (the engine adds it to the products)
+            edit = f" LORA:1.0:{lora_api.encode_path(job['few_step']['lora'])}" + edit
         return edit + "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
                               for use in job.get("loras") or ())
 
@@ -2953,10 +2979,20 @@ class ImageGen:
                     p = work / key
                     p.write_bytes(job[key])
                     job[f"{key}_path"] = str(p)
+        control = job.get("control") or {}
+        mctl = job.get("mctl") or {}   # ControlNet's map, MOSS-Image's color and depth maps (image_controls.img_words)
+        for key, data in (("control_path", control.get("map")), ("mctl_color_path", mctl.get("color")),
+                          ("mctl_depth_path", mctl.get("depth"))):
+            if data and not job.get(key):
+                fd, name = tempfile.mkstemp(prefix="control-", dir=self.dir)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data)
+                job[key] = name
 
     @staticmethod
     def unstage(job: dict) -> None:
-        files = ("init_path", "mask_path", "te_path", "neg_te_path")
+        files = ("init_path", "mask_path", "te_path", "neg_te_path", "control_path", "mctl_color_path",
+                 "mctl_depth_path")
         for p in ((job.pop("ref_paths", []) or []) + (job.pop("pic_paths", []) or [])
                   + [job.pop(k) for k in files if job.get(k)]):
             with contextlib.suppress(OSError):
@@ -3054,8 +3090,8 @@ class ImageGen:
             w, h = made_size(job)
             self.stage(job)
             n, neg = self._need_counts(job)
-            got = self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}",
-                                  "NEED", 600)
+            got = self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}"
+                                  f"{_controls().need_words(job)}", "NEED", 600)
             if job.get("refine"):   # the second pass's too: the larger of each
                 job2 = self._refine_job(job)
                 self.stage(job2)
@@ -3343,7 +3379,8 @@ class ImageGen:
                     try:
                         r = self.engine.ask(f"IMG {lw} {lh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
                                             f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}"
-                                            f"{self._lora_words(job)}", "IMAGE",
+                                            f"{self._lora_words(job)}"
+                                            f"{_controls().img_words(job, self.cfg, lw, lh)}", "IMAGE",
                                             timeout, cancel, step, stage, **({"preview": peek} if shows else {}))
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
@@ -3729,6 +3766,24 @@ TOOLS: list[dict[str, Any]] = [
          "image": {"type": "string",
                    "description": "a /v1/images/files/... link; default the conversation's last image"}},
          "required": ["region"]}},
+    {"name": "control",
+     "description": "Make a new image whose composition follows a picture: the pose of its people, its outlines, its "
+                    "depth or its straight lines (the picture's map made first). The new image is shown to the user.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "the new image's whole prompt (what it shows)"},
+         "type": {"type": "string", "enum": ["canny", "depth", "pose", "lineart", "lineart_coarse", "hed",
+                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "color"],
+                  "description": "what to take from the picture: pose (people's pose), canny or lineart (outlines), "
+                                 "depth (composition), mlsd (a room's or a building's straight lines), scribble (a "
+                                 "sketch), gray (its shading), color (MOSS-Image: where each object is)"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
+         "size": {"type": "string", "description": "WIDTHxHEIGHT; default the picture's shape at about 1024x1024"},
+         "strength": {"type": "number", "description": "with ControlNet: how strongly it follows, 0 to 2 (default 1)"},
+         "end": {"type": "number", "description": "with ControlNet: the share of the steps it follows, 0 to 1 "
+                                                  "(default 1; lower frees the details)"},
+         "seed": {"type": "integer"}},
+         "required": ["prompt", "type"]}},
     {"name": "remove_background",
      "description": "Take an image's background away (a transparent PNG), or put a plain color behind its subject.",
      "parameters": {"type": "object", "properties": {
@@ -3741,7 +3796,7 @@ TOOLS: list[dict[str, Any]] = [
 
 # the tools that start from an image
 EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image", "edit_region", "find_region",
-              "remove_background")
+              "remove_background", "control")
 SKILLS = Path(__file__).resolve().parent / "image_skills"
 # how a model's prompt is written, by its name without -uncensored, else its family: booru.md's Danbooru tags, else
 # natural.md's sentences
@@ -3952,6 +4007,8 @@ class ImageTools:
         out = []
         for t in TOOLS:
             gens = self._gens(t["name"] in EDIT_TOOLS)
+            if t["name"] == "control":   # the models that take a control image (image_controls.capability)
+                gens = [g for g in gens if _controls().capability(g.cfg)]
             if not gens or t["name"] in exclude or t["name"] not in self.allowed:
                 continue
             # the user's boxes alone make a new image by them, as ComfyUI's MOSS-Image Layout Prompt does (the picture
@@ -4404,6 +4461,8 @@ class ImageTools:
                                  {k: args[k] for k in ("left", "top", "right", "bottom")
                                   if args.get(k) not in (None, "")})
             gens = self._gens(name in EDIT_TOOLS)
+            if name == "control":
+                gens = [g for g in gens if _controls().capability(g.cfg)]
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
@@ -4448,6 +4507,12 @@ class ImageTools:
                 picture = self.normalize(data)
                 mask, found = image_regions.region_mask(self.svc, gen, picture, str(args["region"]), cancel=cancel)
                 job = parse_edit_request(req, [picture], gen.cfg, mask)
+            elif name == "control":   # a new image by a picture's composition (image_controls)
+                data = self._image(str(args.get("image") or ""))
+                if data is None:
+                    raise ImageRequestError("there is no picture in the conversation to take the composition from")
+                req["control"] = {k: args[k] for k in ("type", "strength", "end") if args.get(k) not in (None, "")}
+                job = _controls().parse_job(req, gen.cfg, picture=self.normalize(data))
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
             preview = None
@@ -4487,6 +4552,12 @@ class ImageTools:
                             " (auto's choice)" if u["asked"] == "auto" else "")
                          + (f", then drew it again at strength {job['strength']:g}." if not job.get("ups_only")
                             else ", not drawn again."))
+            if job.get("control"):   # how the composition was taken
+                cf = job["control"].get("figures") or {}
+                text += (f" control took the picture's {job['control']['type']} map ({cf.get('size', '?')}) "
+                         + ("through ControlNet." if cf.get("mode") == "controlnet" else
+                            "through MOSS-Image's color and depth adapter." if cf.get("mode") == "moss" else
+                            "as a reference image (this model has no ControlNet)."))
             seen = self._seen(gen, images[0])
             ok = True
         except AuxPending as e:   # the tool's weights are downloading: not an image, not an error to retry now
@@ -4724,6 +4795,12 @@ def enhance_prompt(svc, gen: ImageGen, job: dict, cancel: threading.Event | None
     job.pop("neg_ids", None)
 
 
+def _controls():
+    """serve/image_controls.py (it imports this module)."""
+    from serve import image_controls
+    return image_controls
+
+
 def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None,
                 preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
@@ -4732,6 +4809,8 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     of its own (separate: the chat does not wait for it).  Too many
     images for budget_s are refused first (ImageGen.check_n).  MOSS-Image's prompt enhancer (enhance_prompt) runs
     first, in the chat model's turn."""
+    if job.get("control"):   # the control map first (its own GPU turn), then the model's way of taking it
+        _controls().prepare(svc, gen, job, cancel)
     if job.get("fix"):
         return fix_images(svc, gen, job, cancel)
     if job.get("upscaler"):

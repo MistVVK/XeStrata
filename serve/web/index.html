@@ -218,6 +218,49 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             </div>
           </div>
         </details>
+        <details class="st-collapse img-sec" id="img-ctrl" hidden><summary><span id="img-ctrl-l" data-i18n="img.ctrl">Composition from a picture (ControlNet)</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
+          <div class="st-collapse__body img-sec__body">
+            <label class="st-field"><span data-i18n="img.ctrlType">Take from the picture</span>
+              <select class="st-input" id="img-ctrl-type">
+                <option value="" data-i18n="img.ctrlOff">Off</option>
+                <option value="pose" data-i18n="img.ctrlPose">Pose (people)</option>
+                <option value="depth" data-i18n="img.ctrlDepth">Depth (composition)</option>
+                <option value="canny" data-i18n="img.ctrlCanny">Outlines (Canny)</option>
+                <option value="lineart" data-i18n="img.ctrlLineart">Line art</option>
+                <option value="lineart_coarse" data-i18n="img.ctrlLineartCoarse">Line art, rough</option>
+                <option value="hed" data-i18n="img.ctrlHed">Soft outlines (HED)</option>
+                <option value="scribble_hed" data-i18n="img.ctrlScribbleHed">Sketch from the outlines</option>
+                <option value="scribble" data-i18n="img.ctrlScribble">A sketch's own lines</option>
+                <option value="scribble_xdog" data-i18n="img.ctrlXdog">Sketch (XDoG)</option>
+                <option value="mlsd" data-i18n="img.ctrlMlsd">Straight lines (M-LSD)</option>
+                <option value="gray" data-i18n="img.ctrlGray">Shading (gray)</option>
+                <option value="color" data-i18n="img.ctrlColor">Where each object is (color map)</option>
+                <option value="none" data-i18n="img.ctrlNone">The picture is a map already</option>
+              </select></label>
+            <div id="img-ctrl-body" hidden>
+              <label class="st-field"><input class="st-input" id="img-ctrl-file" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" aria-label="The picture" data-i18n-label="img.ctrlPicture"></label>
+              <span class="composer-hint" id="img-ctrl-hint" hidden></span>
+              <label class="st-field img-sl" id="img-ctrl-strength-f" title="How strongly the image follows the map (ControlNet's strength)" data-i18n-title="img.ctrlStrengthTitle"><span class="img-sl__head"><span data-i18n="img.strength">Strength</span>
+                <input class="st-input" id="img-ctrl-strength" type="number" min="0" max="2" step="0.05" placeholder="1"></span>
+                <input class="img-sl__range" type="range" data-for="img-ctrl-strength" tabindex="-1" aria-hidden="true"></label>
+              <label class="st-field" id="img-ctrl-span-f" title="The share of the steps the map is followed from and to: an end below 1 keeps the composition and frees the details" data-i18n-title="img.ctrlSpanTitle"><span data-i18n="img.ctrlSpan">From and to (share of the steps)</span>
+                <span class="img-pair"><input class="st-input" id="img-ctrl-start" type="number" min="0" max="1" step="0.05" placeholder="0" aria-label="Start" data-i18n-label="img.ctrlStart">
+                <input class="st-input" id="img-ctrl-end" type="number" min="0" max="1" step="0.05" placeholder="1" aria-label="End" data-i18n-label="img.ctrlEnd"></span></label>
+              <label class="st-field" id="img-ctrl-canny-f" hidden><span data-i18n="img.ctrlThresholds">Low and high thresholds</span>
+                <span class="img-pair"><input class="st-input" id="img-ctrl-low" type="number" min="0" max="255" step="1" placeholder="100" aria-label="Low threshold" data-i18n-label="img.ctrlLow">
+                <input class="st-input" id="img-ctrl-high" type="number" min="0" max="255" step="1" placeholder="200" aria-label="High threshold" data-i18n-label="img.ctrlHigh"></span></label>
+              <span class="img-check" id="img-ctrl-pose-f" hidden>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-body-on" checked> <span data-i18n="img.ctrlBody">Body</span></label>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-hands" checked> <span data-i18n="img.ctrlHands">Hands</span></label>
+                <label class="img-check"><input type="checkbox" id="img-ctrl-face" checked> <span data-i18n="img.ctrlFace">Face</span></label></span>
+              <label class="st-field" title="The picture's shorter side as the map is made" data-i18n-title="img.ctrlResTitle"><span data-i18n="img.ctrlRes">Map resolution</span>
+                <input class="st-input" id="img-ctrl-res" type="number" min="64" max="2048" step="64" placeholder="512"></label>
+              <div class="img-mask-tools"><button type="button" class="st-btn" id="img-ctrl-preview" data-i18n="img.ctrlPreview">Preview the map</button>
+                <label class="img-check" title="Send the map shown, as it is (not made again)" data-i18n-title="img.ctrlUseTitle"><input type="checkbox" id="img-ctrl-use" disabled> <span data-i18n="img.ctrlUse">Send this map</span></label></div>
+              <div class="img-ctrl-stage"><img id="img-ctrl-map" src="data:," alt="The control map" data-i18n-alt="img.ctrlMap" hidden></div>
+            </div>
+          </div>
+        </details>
         <details class="st-collapse img-sec img-lora" id="img-lora" hidden><summary><span data-i18n="img.lora">LoRA</span><svg class="st-icon st-icon--sm st-chev"><use href="web/sprite.svg#i-chevron"/></svg></summary>
           <div class="st-collapse__body img-sec__body">
             <label class="st-field" id="img-lora-add-f"><select class="st-input" id="img-lora-add" aria-label="LoRA" data-i18n-label="img.lora"></select></label>

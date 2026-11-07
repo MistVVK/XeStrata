@@ -142,4 +142,68 @@ private:
     std::map<int, Stage> stages_;
 };
 
+/// The control images' networks (cnet_*.cpp: HED, line art, M-LSD, Depth Anything V2's head, YOLOX, DWPose): feature
+/// maps [h][w][c] in FP16 (c a multiple of 8, the channels past a layer's own zero), convolutions with their batch norms
+/// folded in through the engine's convolutions (oneDNN's and cuDNN's where they take the shape, the bias and a ReLU in
+/// their pass; else 1 x 1 ones as products and the others unfolded, through prefill::Gemm), depthwise ones and the
+/// rest through the aux_ kernels.  A run's maps take scratch slots in turn from begin_run(), kept between runs.
+class AuxMapNet : public AuxNet {
+public:
+    using AuxNet::AuxNet;
+
+    struct Map {
+        uint16_t* p = nullptr;
+        int64_t h = 0, w = 0, c = 0;
+    };
+    /// w [outp][k][k][inp] FP16 (its padding zero; depthwise: [outp][k][k]), b [outp] FP32.
+    struct MConv {
+        int64_t in = 0, inp = 0, out = 0, outp = 0;
+        int k = 1, s = 1, pad = 0, dil = 1;   // dil: the taps' spacing (a dilated convolution)
+        bool depthwise = false;
+        const uint16_t* w = nullptr;
+        const float* b = nullptr;
+    };
+
+    static int64_t up8(int64_t n) { return (n + 7) / 8 * 8; }
+
+protected:
+    void begin_run() { next_ = 0; }
+    /// A run's next scratch buffer of n values of T.
+    template <class T> T* buf(size_t n) { return scratch_as<T>(kFirstSlot + next_++, std::max<size_t>(n, 1)); }
+    Map map(int64_t h, int64_t w, int64_t c) { return {buf<uint16_t>((size_t) (h * w * c)), h, w, c}; }
+
+    /// A convolution (or a linear layer [out][in]) `w_name` with bias `b_name` ("": none) and the batch norm `bn`
+    /// ("": none; its weight, bias, running_mean and running_var, eps) folded in, its inputs padded to `in_pad`
+    /// channels (0: up8 of its own); depthwise: weight [C][1][k][k].
+    MConv mconv(const std::string& w_name, const std::string& b_name, int stride, int pad, const std::string& bn = "",
+                float eps = 1e-5f, int64_t in_pad = 0, bool depthwise = false);
+    /// The same from host weights w [out][in][k][k] (depthwise [out][k][k]) and bias b ([out], or empty).
+    MConv mconv_host(const std::vector<float>& w, std::vector<float> b, int64_t out, int64_t in, int k, int stride,
+                     int pad, int64_t in_pad = 0, bool depthwise = false);
+    /// A transposed convolution (torch's weight [in][out][k][k]): `general` false, its kernel its stride (a product
+    /// scattered); true, any stride and padding (run_deconv_general: the flipped kernel over zeros put in).
+    MConv mdeconv(const std::string& w_name, const std::string& b_name, bool general);
+
+    /// The convolution of x, its bias and act, plus `res` (a map of the output's shape) after them: a new map.
+    Map run(const MConv& c, const Map& x, AuxAct a = AuxAct::none, const Map* res = nullptr);
+    Map run_deconv(const MConv& c, const Map& x, AuxAct a = AuxAct::none);
+    Map run_deconv_general(const MConv& c, const Map& x, int64_t s, int64_t p, int64_t op, AuxAct a = AuxAct::none);
+    Map act(const Map& x, AuxAct a);
+    Map add(const Map& a, const Map& b);
+    Map reflect(const Map& x, int64_t p);
+    Map resize(const Map& x, int64_t oh, int64_t ow, bool align_corners);
+    Map maxpool(const Map& x, int k, int s, int p);
+    /// x with zero rows and columns around it.
+    Map pad(const Map& x, int64_t top, int64_t left, int64_t bottom, int64_t right);
+    /// The maps side by side along the channels (each of the same h and w).
+    Map concat(const std::vector<Map>& parts);
+    void instance_norm(Map& x, float eps, AuxAct a);
+    /// The map's first channel as FP32 on the host (h w values).
+    std::vector<float> host_channel0(const Map& x);
+
+private:
+    static constexpr int kFirstSlot = 256, kSumSlot = 254, kColSlot = 253;
+    int next_ = 0;
+};
+
 }  // namespace strata::image

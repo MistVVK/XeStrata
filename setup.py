@@ -38,7 +38,8 @@ magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, 
 encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
 request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8 steps, its own tokenizer and
 system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
-encoder Qwen3.5-9B; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
+encoder Qwen3.5-9B; moss-image-4-step[-uncensored]: MOSS-Image with darask0's 4-step adapter, 4 steps;
+--image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
 auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
 --image-gpu-policy auto|keep|shrink|unload, --image-gpu auto|same|PCI).
 
@@ -7393,7 +7394,8 @@ def describe() -> dict:
         images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
                        "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.default_text_quant(dit), dit), 1),
-                       "edits": dit in QI.MF_EDIT or QI.is_moss(dit) or not QI.engine_quantized(dit),
+                       "edits": dit in QI.MF_EDIT or (QI.is_moss(dit) and dit not in QI.MOSS_FEW_STEP)
+                       or not QI.engine_quantized(dit),
                        "license": QI.license_note(dit), "tools": list(QI.IMAGE_TOOLS),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
                        # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
@@ -7477,7 +7479,8 @@ def main() -> int:
                          "writes. The web page and a request's own \"script_guard\" go over it. Without it setup asks "
                          "the first time, and with --setup")
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
-                    "mage-flow-base|magetrail|moss-image|moss-image-base[-uncensored]|hunyuan-image-3-distil|no",
+                    "mage-flow-base|magetrail|moss-image|moss-image-base|moss-image-4-step[-uncensored]|"
+                    "hunyuan-image-3-distil|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
                          "qwen-image-turbo (Qwen-Image-2.1-Turbo, 8 steps) or qwen-image-base (its base model "
                          "Qwen-Image-2.1, 40 steps by default, about 5 times as long an image); the text encoder "
@@ -7490,7 +7493,9 @@ def main() -> int:
                          "(HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, about 50 GB of RAM), which reads "
                          "its own prompt with the model's tokenizer and system prompt (no text encoder); moss-image "
                          "(MOSS-Image, 50 steps, guidance 3; text and a layout of boxes in the prompt) or "
-                         "moss-image-base (its base model), the text encoder Qwen3.5-9B (Unsloth's or, -uncensored, "
+                         "moss-image-base (its base model) or moss-image-4-step (MOSS-Image with darask0's 4-step "
+                         "adapter, 4 steps without guidance, no edits), the text encoder Qwen3.5-9B (Unsloth's or, "
+                         "-uncensored, "
                          "HauhauCS's; Q8_0, lowered first (Q6_K, Q4_K_M), or the chat model's own file when that is "
                          "Qwen3.5-9B of the same maker); several, "
                          "comma-separated (qwen-image-turbo,magetrail): the first the default, the others named by a "

@@ -284,6 +284,7 @@ MossDit::MossDit() = default;
 
 MossDit::~MossDit() {
     blocks_stream_.drop();
+    for (void* p : ctl_allocs_) gpu::free(p);
     for (void* p : allocs_) gpu::free(p);
     for (void* p : text_allocs_) gpu::free(p);
 }
@@ -1209,8 +1210,67 @@ void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
 // the time's embedding as the reference makes it: the sinusoid [cos, sin] of the timestep by freq / 2 frequencies
 // 10000^(-i / (freq / 2)) in FP64, rounded to bf16 (its first layer's type), through the two layers; then the shared
 // modulation's six rows (mod_) and the head's two (head_)
+void MossDit::set_time_path(const std::string& path) {
+    if (path == tp_path_) return;
+    gpu::stream_sync(s_);
+    for (float* p : {tp_smod_b_, tp_hmod_b_})
+        if (p != nullptr) release(allocs_, p);
+    tp_smod_b_ = tp_hmod_b_ = nullptr;
+    tp_w1_.clear(), tp_b1_.clear(), tp_w2_.clear(), tp_b2_.clear();
+    tp_path_.clear();
+    if (path.empty()) return;
+    SafeTensors st(path);
+    // the model's own layers' shapes: the file replaces them, or it is not a time path of this model
+    const auto take = [&](const std::string& name, int64_t rows, int64_t cols) {
+        const SafeTensor* t = st.find(name);
+        const std::vector<int64_t> want = cols > 0 ? std::vector<int64_t>{rows, cols} : std::vector<int64_t>{rows};
+        if (t == nullptr || t->shape != want)
+            throw std::runtime_error(path + ": not a MOSS-Image time path (" + name + " of the model's shape)");
+        return st.f32(name);
+    };
+    tp_w1_ = take("time_embedding.0.weight", t1_.n, t1_.k);
+    tp_b1_ = take("time_embedding.0.bias", t1_.n, 0);
+    tp_w2_ = take("time_embedding.2.weight", t2_.n, t2_.k);
+    tp_b2_ = take("time_embedding.2.bias", t2_.n, 0);
+    const std::vector<float> sb = take("shared_block_modulation.bias", smod_.n, 0);
+    const std::vector<float> hb = take("video_head_modulation.bias", hmod_.n, 0);
+    tp_smod_b_ = alloc<float>(allocs_, smod_.n);
+    tp_hmod_b_ = alloc<float>(allocs_, hmod_.n);
+    gpu::copy(tp_smod_b_, sb.data(), sb.size() * 4);
+    gpu::copy(tp_hmod_b_, hb.data(), hb.size() * 4);
+    tp_path_ = path;
+}
+
 void MossDit::time_embedding(float timestep) {
     const int64_t half = freq_ / 2;
+    if (!tp_path_.empty()) {   // the adapter's time path, in FP32 (its training's): the sinusoid, two layers, SiLU between
+        std::vector<float> e((size_t) freq_), h1((size_t) t1_.n), temb((size_t) t2_.n);
+        for (int64_t i = 0; i < half; ++i) {
+            const double ph = (double) timestep * std::pow(10000.0, -(double) i / (double) half);
+            e[(size_t) i] = (float) std::cos(ph);
+            e[(size_t) (half + i)] = (float) std::sin(ph);
+        }
+        const auto layer = [](const std::vector<float>& w, const std::vector<float>& b, const std::vector<float>& x,
+                              std::vector<float>& y) {
+            const size_t k = x.size();
+            for (size_t o = 0; o < y.size(); ++o) {
+                double s = b[o];
+                const float* row = w.data() + o * k;
+                for (size_t j = 0; j < k; ++j) s += (double) row[j] * x[j];
+                y[o] = (float) s;
+            }
+        };
+        layer(tp_w1_, tp_b1_, e, h1);
+        for (float& v : h1) v = v / (1.f + std::exp(-v));
+        layer(tp_w2_, tp_b2_, h1, temb);
+        gpu::stream_sync(s_);   // the last step's products may still read temb_
+        gpu::copy(temb_, temb.data(), temb.size() * 4);
+        uint16_t* h16 = t16_ + freq_;
+        kernels::f32_to_f16_bulk(temb_, h16 + C_, C_, s_);
+        product(h16 + C_, nullptr, smod_, nullptr, mod_, 1, tp_smod_b_);
+        product(h16 + C_, nullptr, hmod_, nullptr, head_, 1, tp_hmod_b_);
+        return;
+    }
     std::vector<uint16_t> e((size_t) freq_);
     for (int64_t i = 0; i < half; ++i) {
         const double ph = (double) timestep * std::pow(10000.0, -(double) i / (double) half);
@@ -1410,6 +1470,102 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
     for (void* p : {(void*) xs, (void*) x16, (void*) t32, (void*) dc, (void*) ds}) release(allocs_, p);
 }
 
+namespace moss_ctl_k {   // the kernels' names (an anonymous namespace mangles the same in every file)
+// y16 [rows][3 in] = x, color and depth side by side ([rows][in] each; null: zeros), FP16
+void tokens(const float* x, const float* color, const float* depth, int64_t rows, int64_t in, uint16_t* y16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 3 * in)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / (3 * in), c = i - r * 3 * in, part = c / in, j = c - part * in;
+        const float* src = part == 0 ? x : part == 1 ? color : depth;
+        y16[i] = f16_from_f32(src != nullptr ? src[r * in + j] : 0.f);
+    });
+}
+}  // namespace moss_ctl_k
+
+void MossDit::set_control(const std::string& path) {
+    if (path == ctl_path_) return;
+    gpu::stream_sync(s_);
+    for (void* p : ctl_allocs_) gpu::free(p);
+    ctl_allocs_.clear();
+    weight_bytes_ -= std::min<uint64_t>(weight_bytes_, ctl_bytes_);
+    ctl_bytes_ = 0;
+    ctl_path_.clear();
+    ctl_b_ = nullptr;
+    ctl_w_ = ctl_w0_ = W{};
+    if (path.empty()) return;
+    SafeTensors st(path);
+    const SafeTensor* t = st.find("video_embedder.weight");
+    if (t == nullptr || t->shape.size() != 2 || t->shape[0] != C_ || t->shape[1] != 3 * in_ch_ ||
+        st.find("video_embedder.bias") == nullptr)
+        throw std::runtime_error(path + ": not a MOSS-Image color and depth control adapter (its video_embedder [" +
+                                 std::to_string(C_) + "][" + std::to_string(3 * in_ch_) + "])");
+    const std::vector<float> w = st.f32("video_embedder.weight"), b = st.f32("video_embedder.bias");
+    const int64_t K = 3 * in_ch_;
+    std::vector<uint16_t> h((size_t) (C_ * K)), h0((size_t) (C_ * in_ch_));
+    for (int64_t o = 0; o < C_; ++o)
+        for (int64_t k = 0; k < K; ++k) {
+            const uint16_t v = f16_from_f32(w[(size_t) (o * K + k)]);
+            h[(size_t) (o * K + k)] = v;
+            if (k < in_ch_) h0[(size_t) (o * in_ch_ + k)] = v;
+        }
+    uint16_t* d = alloc<uint16_t>(ctl_allocs_, (int64_t) h.size());
+    uint16_t* d0 = alloc<uint16_t>(ctl_allocs_, (int64_t) h0.size());
+    float* db = alloc<float>(ctl_allocs_, C_);
+    gpu::copy(d, h.data(), h.size() * 2);
+    gpu::copy(d0, h0.data(), h0.size() * 2);
+    gpu::copy(db, b.data(), (size_t) C_ * 4);
+    ctl_w_.type = ctl_w0_.type = kTypeF16;
+    ctl_w_.n = ctl_w0_.n = C_;
+    ctl_w_.k = K;
+    ctl_w0_.k = in_ch_;
+    ctl_w_.row_bytes = (uint64_t) K * 2;
+    ctl_w0_.row_bytes = (uint64_t) in_ch_ * 2;
+    ctl_w_.d = d;
+    ctl_w0_.d = d0;
+    ctl_w0_.lora = vin_.lora;   // an adapter of the request on the input projection: the images' columns
+    ctl_b_ = db;
+    ctl_bytes_ = (uint64_t) (C_ * (K + in_ch_)) * 2 + (uint64_t) C_ * 4;
+    weight_bytes_ += ctl_bytes_;
+    ctl_path_ = path;
+}
+
+void MossDit::set_control_input(const float* color, const float* depth, float color_end, float depth_end) {
+    ctl_color_ = color;
+    ctl_depth_ = depth;
+    ctl_color_end_ = color_end;
+    ctl_depth_end_ = depth_end;
+    ctl_at_ = 0.0;
+    if (color == nullptr && depth == nullptr && ctl16_ != nullptr) {
+        gpu::stream_sync(s_);
+        release(allocs_, ctl16_);
+        ctl16_ = nullptr;
+        ctl16_rows_ = 0;
+    }
+}
+
+void MossDit::input_projection(const float* x, int64_t rows, float* y) {
+    if (ctl_path_.empty()) {
+        kernels::f32_to_f16_bulk(x, h16_, rows * in_ch_, s_);
+        product(h16_, nullptr, vin_, nullptr, y, rows, b_vin_);
+        return;
+    }
+    const float* color = ctl_color_ != nullptr && ctl_at_ < (double) ctl_color_end_ ? ctl_color_ : nullptr;
+    const float* depth = ctl_depth_ != nullptr && ctl_at_ < (double) ctl_depth_end_ ? ctl_depth_ : nullptr;
+    if (color == nullptr && depth == nullptr) {   // no map at this step: the zero columns add nothing
+        kernels::f32_to_f16_bulk(x, h16_, rows * in_ch_, s_);
+        product(h16_, nullptr, ctl_w0_, nullptr, y, rows, ctl_b_);
+        return;
+    }
+    if (rows > ctl16_rows_) {
+        gpu::stream_sync(s_);
+        if (ctl16_ != nullptr) release(allocs_, ctl16_);
+        ctl16_ = alloc<uint16_t>(allocs_, rows * 3 * in_ch_);
+        ctl16_rows_ = rows;
+    }
+    moss_ctl_k::tokens(x, color, depth, rows, in_ch_, ctl16_, s_);
+    product(ctl16_, nullptr, ctl_w_, nullptr, y, rows, ctl_b_);
+}
+
 void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int n, float* out) {
     const int64_t HW = h * w, C = C_, J = stream_rows_;
     int64_t maxL = 0;
@@ -1422,8 +1578,7 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
     for (int i = 0; i < n; ++i) rope_tables(ctx_[i], h, w);
     // each context's rows: the image's input projection (the same rows in each), then its text embedder's rows,
     // then the references' in the stream
-    kernels::f32_to_f16_bulk(x, h16_, HW * in_ch_, s_);
-    product(h16_, nullptr, vin_, nullptr, a_, HW, b_vin_);
+    input_projection(x, HW, a_);
     prefill::to_bf16(a_, x_, HW * C, s_);
     for (int i = 0; i < n; ++i) {
         if (i > 0) gpu::copy_async(x_ + off[(size_t) i] * C, x_, (size_t) (HW * C) * 2, s_);
@@ -1512,7 +1667,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         }
         float* rx = alloc<float>(allocs_, R * C_);
         ref_x_ = alloc<uint16_t>(allocs_, R * C_);
-        product(x16, nullptr, vin_, nullptr, rx, R, b_vin_);
+        product(x16, nullptr, ctl_path_.empty() ? vin_ : ctl_w0_, nullptr, rx, R, ctl_path_.empty() ? b_vin_ : ctl_b_);
         prefill::to_bf16(rx, ref_x_, R * C_, s_);
         if (layout == QiRefLayout::TimestepZero) {
             time_embedding(0.f);
@@ -1549,7 +1704,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         kernels::f32_to_f16_bulk(f.tokens, h16_ + o * in_ch_, f.h * f.w * in_ch_, s_);
         o += f.h * f.w;
     }
-    product(h16_, nullptr, vin_, nullptr, a_, R, b_vin_);
+    product(h16_, nullptr, ctl_path_.empty() ? vin_ : ctl_w0_, nullptr, a_, R, ctl_path_.empty() ? b_vin_ : ctl_b_);
     prefill::to_bf16(a_, x_, R * C_, s_);
     time_embedding(0.f);
     capture_ = true;
@@ -1621,6 +1776,7 @@ void MossDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& s
             // both skips act in the steps whose share of the whole schedule is in [start, stop)
             const double at = (double) (first + i) / (double) total;
             const bool active = g.start <= at && at < g.stop;
+            ctl_at_ = at;   // the control maps' ends (input_projection)
             ctx_[1].skip = active ? g.uncond_skip : std::vector<int>{};
             const float t = sigmas[(size_t) i] * 1000.f;
             forward(x, t, h, w, n, out);

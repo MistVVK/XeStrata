@@ -108,6 +108,12 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "microsoft/Florence-2-large": "21a599d414c4d928c9032694c424fb94458e3594",                      # 2026-11-07
     "microsoft/Florence-2-base": "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac",                       # 2026-11-07
     "ZhengPeng7/BiRefNet": "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",                             # 2026-11-07
+    "alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union": "8a4702014d4dabb5f896fcba917e2ee0a961465f",  # 2026-11-08
+    "depth-anything/Depth-Anything-V2-Small-hf": "5426e4f0f36572d16453bbda7a8389317b1bef99",     # 2026-11-08
+    "yzd-v/DWPose": "1a7144101628d69ee7a3768d1ee3a094070dc388",                                  # 2026-11-08
+    "kadirnar/yolox_l-v0.1.1": "f63e87ffbded0e30713d32dba22501f56fe5007e",                       # 2026-11-08
+    "darask0/MOSS-Image-color-depth-control": "357d7cc1eefd746de28ed74741c79464e3d82daa",        # 2026-11-08
+    "darask0/MOSS-Image_4-step_adapter_lora": "c88f33bcb3251eb39943d0635e74b650732977c8",        # 2026-11-08
     "ZhengPeng7/BiRefNet_lite": "aa62cd87eafb9cc43056d08ef3615a14628b831d",                        # 2026-11-07
     "ZhengPeng7/BiRefNet_lite-2K": "3f789d2ba403e2ee59ce08ee9250d4c1c590b418",                     # 2026-11-07
     "ZhengPeng7/BiRefNet-portrait": "b6561965a70070d9143fd9e558f6ca3c481510db",                    # 2026-11-07
@@ -145,6 +151,13 @@ _SAM = "Comfy-Org/sam3.1"   # SAM 3.1 (Meta's), as ComfyUI repackaged it: words 
 _CLIP = "openai/clip-vit-large-patch14"   # SAM 3's text encoder's tokenizer (CLIP's BPE)
 _FL = "microsoft/Florence-2-large"        # Florence-2: words to masks where SAM 3 is not taken, and boxes
 _FB = "microsoft/Florence-2-base"
+# ControlNet (the control tool): Qwen-Image-2.1's Fun ControlNet Union, and the control images' networks
+_CN = "alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union"
+_DA = "depth-anything/Depth-Anything-V2-Small-hf"   # the Small one: the larger ones are non-commercial
+_DW = "yzd-v/DWPose"
+_YX = "kadirnar/yolox_l-v0.1.1"   # Megvii's YOLOX-L release file (v0.1.1rc0's yolox_l.pth, the same bytes)
+_MC = "darask0/MOSS-Image-color-depth-control"   # MOSS-Image's color and depth control adapter
+_M4 = "darask0/MOSS-Image_4-step_adapter_lora"    # MOSS-Image's 4-step adapter (DMAD: a LoRA, a time path, a sampler's)
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -259,6 +272,14 @@ FILES = {
     "moss-vae": (_MS, "vae/diffusion_pytorch_model.safetensors", 249_521_372,
                  "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a"),
     # its edit adapter (trained on the SFT model, taken by the base model too)
+    # the 4-step adapter (moss-image-4-step): its LoRA, its time path (the time embedding and the modulations' biases)
+    # and its sampler's data space (latent_mix.Q, step_codes)
+    "moss-4-step-lora": (_M4, "lora.safetensors", 1_189_176_832,
+                         "4a4c8e2d6244a0fcdc2822b87b3435226ae57c289aef99fc2ac54edeab9e09bb"),
+    "moss-4-step-time-path": (_M4, "time_embedding.safetensors", 41_017_896,
+                              "2ebabc91e2a9e68c00e948dd80b05235a826e808817b5b2600b441457570d244"),
+    "moss-4-step-dataspace": (_M4, "dataspace.safetensors", 65_784,
+                              "d19f0e695bb26886cfce57441fd412f358e159d6eec8555ec1a71daaf30a7968"),
     "moss-edit-lora": (_ME, "moss_image_edit_lora_bf16.safetensors", 297_419_000,
                        "f4bf2905dd40ae490ffda37d6be717f3361a4a723225cf0bf1f3b941eb03315d"),
     "moss-edit-armv5": (_MEHQ, "weights/armV5/armV5.safetensors", 495_514_936,
@@ -347,6 +368,26 @@ FILES = {
                     "9d678bafec0b0019fbb073b7fd02f05ede25dc4b15254f23b2fb0be333200c0d"),
     "birefnet-dynamic": ("ZhengPeng7/BiRefNet_dynamic", "model.safetensors", 444_473_596,
                          "e3d2e4884e51ff30f0cd630edc6b1e41b06b7f23a0a2a5169f7b7cb33a711c2d"),
+    # ControlNet: the Fun ControlNet Union (the branch, BF16) and its control images' networks (the .pth ones converted
+    # by tools/image/state_pt.py)
+    "cnet-union": (_CN, "Qwen-Image-2.1-Fun-Controlnet-Union.safetensors", 7_550_979_904,
+                   "65d6b66d734da9e7ff5ef04e7db3a133553a52a3f29a7fcb3e9cce8fa21dcfcd"),
+    "cnet-depth": (_DA, "model.safetensors", 99_173_660,
+                   "3152477ce0d8d6978d76b995120de97cb5b928701fd0f817769f59e249a16b70"),
+    "cnet-hed": (_ANN, "ControlNetHED.pth", 29_444_406,
+                 "5ca93762ffd68a29fee1af9d495bf6aab80ae86f08905fb35472a083a4c7a8fa"),
+    "cnet-lineart": (_ANN, "sk_model.pth", 17_173_511,
+                     "c686ced2a666b4850b4bb6ccf0748031c3eda9f822de73a34b8979970d90f0c6"),
+    "cnet-lineart-coarse": (_ANN, "sk_model2.pth", 17_173_511,
+                            "30a534781061f34e83bb9406b4335da4ff2616c95d22a585c1245aa8363e74e0"),
+    "cnet-mlsd": (_ANN, "mlsd_large_512_fp32.pth", 6_341_481,
+                  "5696f168eb2c30d4374bbfd45436f7415bb4d88da29bea97eea0101520fba082"),
+    "cnet-dwpose": (_DW, "dw-ll_ucoco_384.pth", 406_878_486,
+                    "0d9408b13cd863c4e95a149dd31232f88f2a12aa6cf8964ed74d7d97748c7a07"),
+    "cnet-yolox": (_YX, "yolox_l.pth", 434_357_141,
+                   "1e6b7fa6240375370b2a8a8eab9066b3cdd43fd1d0bfa8d2027fd3a51def2917"),
+    "moss-control": (_MC, "moss-control.safetensors", 313_063_368,
+                     "e5c0c3efd05e4269207a39de6005798f14c90c6687c89c54eaffe4b76c43a763"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -402,6 +443,8 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "moss-image-uncensored": ("moss-image-uncensored", "moss-sft", "moss-uncensored"),
                 "moss-image-base": ("moss-image-base", "moss-base", "moss-stock"),
                 "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored"),
+                "moss-image-4-step": ("moss-image-4-step", "moss-sft-4-step", "moss-stock"),
+                "moss-image-4-step-uncensored": ("moss-image-4-step-uncensored", "moss-sft-4-step", "moss-uncensored"),
                 # Anima: the release's three and the 2.9B expansion, Qwen3-0.6B-Base as the text encoder
                 "anima-base": ("anima-base", "anima-base", "anima-stock"),
                 "anima-aesthetic": ("anima-aesthetic", "anima-aesthetic", "anima-stock"),
@@ -423,6 +466,8 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
                        "guidance; edits with up to four reference images (its edit adapter, fetched with it)",
          "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
+         "moss-image-4-step": "MOSS-Image with darask0's 4-step adapter: about ten times as fast, 4 steps without "
+                              "guidance; no edits",
          "anima-base": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the "
                        "model to train LoRAs on",
          "anima-aesthetic": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
@@ -445,6 +490,8 @@ DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
         # shift 5), the same for both
         "moss-sft": ("MOSS-Image", 50, "OpenMOSS-Team/MOSS-Image-SFT"),
         "moss-base": ("MOSS-Image-Base", 50, "OpenMOSS-Team/MOSS-Image-Base"),
+        # MOSS-Image (SFT) with darask0's 4-step adapter: its card's 4 steps, no guidance, its own sampler
+        "moss-sft-4-step": ("MOSS-Image 4-step", 4, "OpenMOSS-Team/MOSS-Image-SFT"),
         # Anima's: the model card's 30 steps with guidance 4 (Turbo 8 to 12 at guidance 1), on shift 3
         "anima-base": ("Anima", 30, "circlestone-labs/Anima"),
         "anima-aesthetic": ("Anima-Aesthetic", 30, "circlestone-labs/Anima"),
@@ -458,10 +505,13 @@ MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE (
 LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors",
                "moss-edit-armv5": "armV5-ai-toolkit.safetensors", "moss-edit-armv6": "armV6-ai-toolkit.safetensors",
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
+               "moss-4-step-lora": "moss-image-4-step-lora.safetensors",
+               "moss-4-step-time-path": "moss-image-4-step-time-path.safetensors",
+               "moss-4-step-dataspace": "moss-image-4-step-dataspace.safetensors",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
 IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "upscale_video", "segment_video",
-               "fix_image", "edit_region", "find_region", "remove_background")
+               "fix_image", "edit_region", "find_region", "control", "remove_background")
 # The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
 # with ("yolo": tools/image/yolo_pt.py, "esrgan": tools/image/esrgan.py, each a PyTorch checkpoint to safetensors; None:
 # used as it is), the file the engine reads, and the license shown when it is downloaded.  They live in AUX_DIR beside
@@ -480,6 +530,18 @@ _CLIP_LICENSE = f"MIT, OpenAI's CLIP (https://huggingface.co/{_CLIP})"
 _FLORENCE_LICENSE = f"MIT, Microsoft's Florence-2 (https://huggingface.co/{_FL})"
 _BIREFNET_LICENSE = "MIT, Peng Zheng's BiRefNet (https://github.com/ZhengPeng7/BiRefNet)"
 BIREFNET_VERSIONS = ("general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic")
+CNET_UNION_LICENSE = (f"the Qwen Research License (not a free software license: read it before you use the images "
+                      f"commercially), alibaba-pai's Qwen-Image-2.1 Fun ControlNet Union, https://huggingface.co/{_CN}")
+_DEPTH_LICENSE = f"Apache-2.0, Depth Anything V2 Small (Lihe Yang et al.), https://huggingface.co/{_DA}"
+_HED_LICENSE = ("Apache-2.0, ControlNet 1.1's HED annotator (Lvmin Zhang), "
+                "https://github.com/lllyasviel/ControlNet-v1-1-nightly")
+_LINEART_LICENSE = ("MIT, Caroline Chan's Informative Drawings line art models, "
+                    "https://github.com/carolineec/informative-drawings")
+_MLSD_LICENSE = "Apache-2.0, NAVER's M-LSD, https://github.com/navervision/mlsd"
+_DWPOSE_LICENSE = "Apache-2.0, DWPose (Zhendong Yang et al.), https://github.com/IDEA-Research/DWPose"
+_YOLOX_LICENSE = "Apache-2.0, Megvii's YOLOX, https://github.com/Megvii-BaseDetection/YOLOX"
+_MOSS_CONTROL_LICENSE = (f"Apache-2.0, darask0's MOSS-Image color and depth control adapter, "
+                         f"https://huggingface.co/{_MC}")
 AUX = {
     "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
     "yolo-hand": {"file": "yolo-hand", "convert": "yolo", "out": "hand_yolov8s.safetensors", "license": _YOLO_LICENSE},
@@ -507,7 +569,29 @@ AUX = {
                              "license": _FLORENCE_LICENSE},
     **{f"birefnet-{v}": {"file": f"birefnet-{v}", "convert": None, "out": f"birefnet-{v}.safetensors",
                          "license": _BIREFNET_LICENSE} for v in BIREFNET_VERSIONS},
+    # the control tool: Qwen-Image-2.1's branch, and each control image's network(s) (CNET_KINDS)
+    "cnet-union": {"file": "cnet-union", "convert": None, "out": "Qwen-Image-2.1-Fun-Controlnet-Union.safetensors",
+                   "license": CNET_UNION_LICENSE},
+    "cnet-depth": {"file": "cnet-depth", "convert": None, "out": "depth-anything-v2-small.safetensors",
+                   "license": _DEPTH_LICENSE},
+    "cnet-hed": {"file": "cnet-hed", "convert": "state", "out": "ControlNetHED.safetensors", "license": _HED_LICENSE},
+    "cnet-lineart": {"file": "cnet-lineart", "convert": "state", "out": "sk_model.safetensors",
+                     "license": _LINEART_LICENSE},
+    "cnet-lineart-coarse": {"file": "cnet-lineart-coarse", "convert": "state", "out": "sk_model2.safetensors",
+                            "license": _LINEART_LICENSE},
+    "cnet-mlsd": {"file": "cnet-mlsd", "convert": "state", "out": "mlsd_large_512_fp32.safetensors",
+                  "license": _MLSD_LICENSE},
+    "cnet-dwpose": {"file": "cnet-dwpose", "convert": "state", "out": "dw-ll_ucoco_384.safetensors",
+                    "license": _DWPOSE_LICENSE},
+    "cnet-yolox": {"file": "cnet-yolox", "convert": "state", "out": "yolox_l.safetensors", "license": _YOLOX_LICENSE},
+    # MOSS-Image's color and depth control (its LoRA and its widened input projection in one file)
+    "moss-control": {"file": "moss-control", "convert": None, "out": "moss-color-depth-control.safetensors",
+                     "license": _MOSS_CONTROL_LICENSE},
 }
+# the control images (strata-image's CONTROL kinds) and the AUX weights each needs, in the order the engine's W:, W2:
+CNET_KINDS = {"canny": (), "gray": (), "scribble": (), "scribble_xdog": (), "scribble_hed": ("cnet-hed",),
+              "hed": ("cnet-hed",), "lineart": ("cnet-lineart",), "lineart_coarse": ("cnet-lineart-coarse",),
+              "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose")}
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
 MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)
@@ -539,6 +623,14 @@ def is_hunyuanimage3(dit: str) -> bool:
 
 def is_moss(dit: str) -> bool:
     return dit.startswith("moss-")
+
+
+# a MOSS-Image DiT with a few-step adapter -> the DiT whose shards it takes
+MOSS_FEW_STEP = {"moss-sft-4-step": "moss-sft"}
+
+
+def moss_shards(dit: str) -> str:
+    return MOSS_FEW_STEP.get(dit, dit)
 
 
 def is_anima(dit: str) -> bool:
@@ -663,7 +755,11 @@ def aux_note() -> str:
             f"upscalers RealESRGAN x4plus, {_ESRGAN_LICENSE}, and SeedVR2 (7B, 7B sharp, 3B), {_SEEDVR2_LICENSE}; "
             f"find_region's and edit_region's SAM 3.1, under {SAM3_LICENSE}, fetched only after you agree to it "
             f"(Florence-2 large or base instead until then, {_FLORENCE_LICENSE}); remove_background's BiRefNet "
-            f"(general, lite, lite-2K, portrait, matting, HR, dynamic), {_BIREFNET_LICENSE}")
+            f"(general, lite, lite-2K, portrait, matting, HR, dynamic), {_BIREFNET_LICENSE}; control's Fun ControlNet "
+            f"Union for Qwen-Image-2.1, under {CNET_UNION_LICENSE}, and its control images' networks: Depth Anything "
+            f"V2 Small, {_DEPTH_LICENSE}; HED, {_HED_LICENSE}; line art, {_LINEART_LICENSE}; M-LSD, {_MLSD_LICENSE}; "
+            f"DWPose, {_DWPOSE_LICENSE}, with YOLOX-L, {_YOLOX_LICENSE}; MOSS-Image's color and depth control, "
+            f"{_MOSS_CONTROL_LICENSE}")
 
 
 def license_note(dit: str) -> str:
@@ -677,6 +773,10 @@ def license_note(dit: str) -> str:
         return (f"{name} is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is "
                 f"built on Cosmos-Predict2): https://huggingface.co/{repo} - the model may not be used commercially; "
                 "the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0")
+    if dit in MOSS_FEW_STEP:
+        return (f"{name} is MOSS-Image (SFT), under the Apache 2.0 license: https://huggingface.co/{repo}, with "
+                f"darask0's 4-step adapter, under Apache 2.0 too: https://huggingface.co/{_M4}; its text encoder, "
+                "Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)")
     if is_moss(dit):
         return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
                 "too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit "
@@ -706,6 +806,10 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     if is_hunyuanimage3(dit):
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
+    if dit in MOSS_FEW_STEP:   # the shards of its DiT, the VAE, the adapter's three files (no edit adapter)
+        sh = moss_shards(dit)
+        return (f"{sh}-1", f"{sh}-2", f"{sh}-3", f"{sh}-config", "moss-vae", "moss-4-step-lora",
+                "moss-4-step-time-path", "moss-4-step-dataspace", text_file(text_encoder, text_quant))
     if is_moss(dit):
         return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", "moss-edit-lora", "moss-edit-armv5",
                 "moss-edit-armv6", "moss-mmproj", text_file(text_encoder, text_quant))
@@ -924,6 +1028,17 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "sampler": "er_sde", "transparency": False, "vae": str(local_path(models_dir, "anima-vae")),
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))),
                 "t5_tokenizer": str(local_path(models_dir, "anima-t5-tokenizer")), "text_encoder": text_encoder,
+                "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
+    if dit in MOSS_FEW_STEP:   # the 4-step adapter: no guidance, its sampler's files (few_step), no edit adapter
+        q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
+        return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16", **loras,
+                "diffusion_model": str(local_path(models_dir, f"{moss_shards(dit)}-1").parent),
+                "steps": DITS[dit][1], "schedule": "moss", "cfg_scale": 1.0, "transparency": False,
+                "vae": str(local_path(models_dir, "moss-vae")),
+                "few_step": {"lora": str(local_path(models_dir, "moss-4-step-lora")),
+                             "time_path": str(local_path(models_dir, "moss-4-step-time-path")),
+                             "dataspace": str(local_path(models_dir, "moss-4-step-dataspace"))},
+                "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_moss(dit):
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}

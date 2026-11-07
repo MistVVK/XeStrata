@@ -3,6 +3,7 @@
 // src/image/qi_dit.cpp - see include/strata/image/qi_dit.hpp.
 
 #include "strata/image/qi_dit.hpp"
+#include "strata/image/qi_control.hpp"
 #include "strata/image/qi_gguf.hpp"
 
 #include "dit_rows.hpp"
@@ -681,8 +682,10 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         rope_text_ = n_text_;
     }
     step_modulation(t);
-    // a step after the first one of a context reads its prefix from the cache (set_loras drops it)
-    const bool prer = prefix && prefix_cache_;
+    // a step after the first one of a context reads its prefix from the cache (set_loras drops it); a step with the
+    // ControlNet branch on computes it again and leaves the cache as the steps without the branch made it
+    const bool ctl = control_on(t);
+    const bool prer = prefix && prefix_cache_ && !ctl;
     const int64_t r0 = prer ? n_text_ : 0, Tr = T - r0, ntr = n_text_ - r0;
     if (!prer) gpu::copy_async(x_, text_, (size_t) (n_text_ * C) * 4, s_);
     qi_latent_tokens16(x, in_ch_, HW, h16_, s_);
@@ -697,6 +700,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
     auto mod = [&](int i) { return mods_ + (int64_t) i * 2 * C; };
     float* xr = x_ + r0 * C;
     const size_t text_bytes = (size_t) (n_text_ * C) * 2;
+    if (ctl) control_->begin(T);
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         Block& b = blocks_[(size_t) bi];
         const uint8_t* base = blocks_stream_.begin(bi);   // the block's weights on the GPU (resident or a slot)
@@ -732,7 +736,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             if (prer) {
                 gpu::copy_async(k16_, b.pk, text_bytes, s_);
                 gpu::copy_async(v16_, b.pv, text_bytes, s_);
-            } else {
+            } else if (!ctl) {
                 gpu::copy_async(b.pk, k16_, text_bytes, s_);
                 gpu::copy_async(b.pv, v16_, text_bytes, s_);
             }
@@ -747,12 +751,15 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             qi_ln_mod16(xr + m0 * C, mod(2), mt, mr, C, h16_, s_);
             mlp(wgu, wdown, xr + m0 * C, mod(3), mt, mr);
         }
+        if (ctl) control_->after_block(bi, T);
         blocks_stream_.end(bi);
     }
     qi_ln_mod16(x_ + n_text_ * C, scale_, 0, HW, C, h16_, s_);   // the final norm: row 0 of scale_ for every token
     product(h16_, pout_, h_, HW);
     qi_tokens_latent(h_, in_ch_, HW, out, s_);
 }
+
+bool QiDit::control_on(float t) const { return control_ != nullptr && control_->active(t * 0.001f); }
 
 void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2) {
     const int64_t HW = H * W, C = C_, na = n_text_, nb = other_.n_text, Ta = na + HW, Tb = nb + HW;
@@ -1376,17 +1383,21 @@ void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sig
         }
     } free_vn{*this, vn};
     const int steps = (int) sigmas.size() - 1;
+    bool cached = false;   // the prefix caches made (by the first step without the ControlNet branch)
     for (int i = 0; i < steps; ++i) {
-        if (guided && i > 0) {   // both contexts' prefixes cached: one pass for the two (the weights read once)
-            forward_pair(x, sigmas[(size_t) i] * 1000.0f, H, W, v, vn);
+        const float t = sigmas[(size_t) i] * 1000.0f;
+        const bool ctl = control_on(t);
+        if (guided && cached && !ctl) {   // both contexts' prefixes cached: one pass for the two (the weights read once)
+            forward_pair(x, t, H, W, v, vn);
         } else {
-            forward(x, sigmas[(size_t) i] * 1000.0f, H, W, i > 0, v);
+            forward(x, t, H, W, cached, v);
         }
-        if (guided && i == 0) {   // the first step makes each context's prefix cache: one after the other
+        if (guided && (!cached || ctl)) {   // a step that makes each context's prefix cache: one after the other
             swap_context();
-            forward(x, sigmas[(size_t) i] * 1000.0f, H, W, false, vn);
+            forward(x, t, H, W, false, vn);
             swap_context();
         }
+        cached = cached || !ctl;
         if (guided) {   // v = vn + cfg (v - vn), as v -= vn, then vn += cfg v
             qi_axpy(v, vn, -1.0f, n, s_);
             qi_axpy(vn, v, cfg, n, s_);
@@ -1448,19 +1459,25 @@ void QiDit::sample_guided(float* x, int64_t H, int64_t W, const std::vector<floa
     float* vn = guided ? get() : nullptr;   // the negative prompt's velocity
     float* den = get();
     float* k = !spec.slg_layers.empty() ? get() : nullptr;   // the skipping pass's
+    if (control_ != nullptr && control_->set() && !spec.slg_layers.empty())
+        throw std::invalid_argument("image engine: skip layer guidance with ControlNet is not supported (its pass skips "
+                                    "blocks the branch adds to)");
     const int steps = (int) sigmas.size() - 1;
+    bool cached = false;   // the prefix caches made (by the first step without the ControlNet branch)
     for (int i = 0; i < steps; ++i) {
         const float s0 = sigmas[(size_t) i], s1 = sigmas[(size_t) i + 1], sm = g.model_sigma(s0);
-        if (guided && i > 0) {
+        const bool ctl = control_on(sm * 1000.0f);
+        if (guided && cached && !ctl) {
             forward_pair(x, sm * 1000.0f, H, W, v, vn);
         } else {
-            forward(x, sm * 1000.0f, H, W, i > 0, v);
+            forward(x, sm * 1000.0f, H, W, cached, v);
         }
-        if (guided && i == 0) {
+        if (guided && (!cached || ctl)) {
             swap_context();
             forward(x, sm * 1000.0f, H, W, false, vn);
             swap_context();
         }
+        cached = cached || !ctl;
         const bool skipping = k != nullptr && g.skip_pass(sm);
         if (skipping) {   // the prompt's context again, its prefix cached (by this step's pass if not before)
             skip_ = &g.skip_layers();

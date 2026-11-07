@@ -100,6 +100,26 @@ struct QiRequest {
     // the guidance ComfyUI's nodes add to the sampling (guidance.hpp: CFGNorm, CFGZero*, APG, skip layer guidance,
     // Detail Daemon; strata_image's GUIDE words): Qwen-Image-2.1's and Mage-Flow's; the other models leave it
     GuidanceSpec guide;
+    // Qwen-Image-2.1's ControlNet (qi_control.hpp; strata_image's CNET: and CTRL words): the branch's file (empty:
+    // none), the control image (a preprocessed map at any size, resized to the request's; empty: the branch's control
+    // channels zero, as an inpaint through the branch alone), the skips' strength and the sigmas the branch is on from
+    // and to (the server's of the start and end shares of the schedule); with a mask, the kept mask and the masked base
+    // image go to the branch too unless control_inpaint is false.  The other models refuse a request with one.
+    std::string control_net;
+    QiRef control;
+    float control_strength = 1.0f, control_sigma_hi = 1.0f, control_sigma_lo = 0.0f;
+    bool control_inpaint = true;
+    // MOSS-Image's color and depth control (darask0's adapter: moss_dit.hpp's set_control; strata_image's MCTL:,
+    // MCOLOR:, MDEPTH:, MCTLENDS: words): the adapter's file (its LoRA the request's LORA: applies), the color map and
+    // the depth map (each resized to the request's size; empty: that one off), and the share of the steps each is on
+    // for.  The other models refuse a request with one.
+    std::string mctl;
+    QiRef mctl_color, mctl_depth;
+    float mctl_color_end = 1.0f, mctl_depth_end = 1.0f;
+    // MOSS-Image's few-step adapter (darask0's 4-step DMAD; strata_image's TIMEPATH: and DATASPACE: words): its time
+    // path's file (moss_dit.hpp's set_time_path; its LoRA the request's LORA: applies, not baked) and its data-space
+    // file (latent_mix.Q and step_codes: the sampler's), the steps then at most its codes.
+    std::string time_path, dataspace;
     // the adapters the DiT's products add (image_lora.hpp), each file read once with the strength its delta is scaled
     // by, applied in this order: a set that changes starts the context again (the prefix's K and V were the other
     // set's).  A model that applies none refuses the request rather than make another image.

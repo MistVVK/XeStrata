@@ -3111,6 +3111,7 @@ function imgDefaults() {
   imgNegHint();
   imgMossSetup();
   imgGuideSetup();
+  imgCtrlSetup();
   imgLoras();
 }
 // the adapters this image model applies (/health's image_models[].defaults.loras, serve/loras.py's listing): the ones
@@ -3560,6 +3561,92 @@ function imgGuideBody(body) {
   }
   if (out.length) body.guidance = out;
 }
+// the composition from a picture (image_controls.py: the model's defaults' control, its mode and types): the kind,
+// the picture, ControlNet's strength and its share of the steps (a reference image's model has neither), the map
+// looked at before sending (POST /v1/images/controls) and sent as it is
+let imgCtrlMap = null;
+function imgCtrlSetup() {
+  const c = (imgModel().defaults || {}).control;
+  $("img-ctrl").hidden = !c;
+  if (!c) return;
+  for (const o of $("img-ctrl-type").options) o.hidden = !!o.value && o.value !== "none" && !c.types.includes(o.value);
+  if ($("img-ctrl-type").selectedOptions[0] && $("img-ctrl-type").selectedOptions[0].hidden) $("img-ctrl-type").value = "";
+  imgCtrlKind();
+}
+// the kind's way into the model (/health's control.modes): ControlNet's strength and span, MOSS-Image's adapter's
+// strength and end (no start: not trained), a reference image's neither
+function imgCtrlMode() {
+  const c = (imgModel().defaults || {}).control || {}, k = $("img-ctrl-type").value;
+  return (c.modes || {})[k === "none" ? "canny" : k] || c.mode;
+}
+function imgCtrlKind() {
+  const k = $("img-ctrl-type").value, mode = imgCtrlMode();
+  $("img-ctrl-strength-f").hidden = mode !== "controlnet" && mode !== "moss";
+  $("img-ctrl-span-f").hidden = mode !== "controlnet" && mode !== "moss";
+  $("img-ctrl-start").hidden = mode === "moss";
+  $("img-ctrl-hint").hidden = mode !== "reference";
+  $("img-ctrl-hint").textContent = mode === "reference" ? tr("img.ctrlRefHint", "This model has no ControlNet: the map goes in as one more reference image, and the prompt asks to follow it.") : "";
+  $("img-ctrl-body").hidden = !k;
+  $("img-ctrl-canny-f").hidden = k !== "canny";
+  $("img-ctrl-pose-f").hidden = k !== "pose";
+  $("img-ctrl-preview").hidden = k === "none";
+  imgCtrlReset();
+}
+function imgCtrlReset() {
+  imgCtrlMap = null;
+  $("img-ctrl-map").hidden = true;
+  $("img-ctrl-use").checked = false;
+  $("img-ctrl-use").disabled = true;
+}
+// the control's fields (the API's), the picture as a data: URL
+async function imgCtrlFields() {
+  const k = $("img-ctrl-type").value, f = ($("img-ctrl-file").files || [])[0];
+  if (!k || !f) return null;
+  const c = {type: k, image: await readAsDataURL(f)};
+  const num = (id, key) => { if ($(id).value !== "") c[key] = Number($(id).value); };
+  num("img-ctrl-res", "resolution");
+  if (k === "canny") { num("img-ctrl-low", "low_threshold"); num("img-ctrl-high", "high_threshold"); }
+  if (k === "pose") Object.assign(c, {detect_body: $("img-ctrl-body-on").checked, detect_hands: $("img-ctrl-hands").checked, detect_face: $("img-ctrl-face").checked});
+  return c;
+}
+async function imgCtrlBody(body) {
+  if ($("img-ctrl").hidden || !$("img-ctrl-type").value) return null;
+  const c = await imgCtrlFields();
+  if (!c) return tr("img.ctrlNoPicture", "Choose the picture to take the composition from (or turn the control off).");
+  // the map shown, as it is: MOSS-Image's color and depth keep their kind (preprocess false), the others are "none"
+  if (imgCtrlMap && $("img-ctrl-use").checked)
+    Object.assign(c, imgCtrlMode() === "moss" ? {preprocess: false, image: imgCtrlMap} : {type: "none", image: imgCtrlMap});
+  if (!$("img-ctrl-strength-f").hidden && $("img-ctrl-strength").value !== "") c.strength = Number($("img-ctrl-strength").value);
+  if (!$("img-ctrl-span-f").hidden) {
+    if ($("img-ctrl-start").value !== "" && !$("img-ctrl-start").hidden) c.start = Number($("img-ctrl-start").value);
+    if ($("img-ctrl-end").value !== "") c.end = Number($("img-ctrl-end").value);
+  }
+  body.control = c;
+  return null;
+}
+$("img-ctrl-type").onchange = imgCtrlKind;
+$("img-ctrl-file").onchange = imgCtrlReset;
+for (const id of ["img-ctrl-res", "img-ctrl-low", "img-ctrl-high", "img-ctrl-body-on", "img-ctrl-hands", "img-ctrl-face"]) $(id).addEventListener("change", imgCtrlReset);
+$("img-ctrl-preview").onclick = async () => {
+  const c = await imgCtrlFields();
+  if (!c) { toast("error", tr("img.ctrlMap", "The control map"), tr("img.ctrlNoPicture", "Choose the picture to take the composition from (or turn the control off)."), 6000); return; }
+  const b = $("img-ctrl-preview");
+  b.disabled = true;
+  try {
+    const r = await fetch("v1/images/controls", {method: "POST", headers: headers(true), body: JSON.stringify(c)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    imgCtrlMap = "data:image/png;base64," + j.data[0].b64_json;
+    $("img-ctrl-map").src = imgCtrlMap;
+    $("img-ctrl-map").hidden = false;
+    $("img-ctrl-use").disabled = false;
+    $("img-ctrl-use").checked = true;
+  } catch (e) {
+    toast("error", tr("img.ctrlMap", "The control map"), String(e.message || e), 8000);
+  } finally {
+    b.disabled = false;
+  }
+};
 function imgMossSetup() {
   const d = imgModel().defaults || {};
   $("img-moss").hidden = !d.layout;
@@ -3958,7 +4045,7 @@ $("img-form").onsubmit = async (ev) => {
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
   imgGuideBody(body);
-  const bad = imgMossBody(body);
+  const bad = imgMossBody(body) || await imgCtrlBody(body);
   if (bad) { toast("error", tr("img.none", "No image"), bad, 8000); return; }
   const partial = $("img-partial").checked;
   if (partial) Object.assign(body, {stream: true, partial_images: 2});

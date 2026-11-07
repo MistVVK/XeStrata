@@ -91,13 +91,23 @@
 //                            <sigma_end>,<rescaling_scale> (skip layer guidance, its window in the model's sigmas),
 //                            DD:<amount>,<start>,<end>,<bias>,<exponent>,<start_offset>,<end_offset>,<fade>,<smooth>,
 //                            <cfg_scale_override> (Detail Daemon)
+//                            Qwen-Image-2.1's ControlNet (qi_control.hpp): CNET:<path> the branch's file, CTRL:<path>
+//                            the control image (a map, resized to the line's size), CTRLS:<strength>,<from>,<to> (1, 1,
+//                            0: the sigmas it is on from and to), CTRLNOINPAINT the mask kept from the branch
+//                            MOSS-Image's color and depth control (moss_dit.hpp's set_control): MCTL:<path> the
+//                            adapter's file (its LoRA as a LORA: word beside it), MCOLOR:<path> the color map,
+//                            MDEPTH:<path> the depth map (near white), MCTLENDS:<color end>,<depth end> (1, 1: the
+//                            shares of the steps each is on for); its few-step adapter (darask0's 4-step DMAD):
+//                            TIMEPATH:<path> its time path (moss_dit.hpp's set_time_path; its LoRA as a LORA: word,
+//                            not baked), DATASPACE:<path> its sampler's latent mix and step codes (STEPS: at most them)
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
 //                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
 //                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
 //                            prompt of n ids; LORA: the request's adapters (their A and B are fixed); CROP: as IMG's
 //                            (the first reference counted at the line's size, the steps' buffers added); PIC: the text
 //                            encoder's pictures (the vision encoder counted; n counts their tokens); TE: the states
-//                            come from the chat's engine (MOSS-Image: no text encoder counted)
+//                            come from the chat's engine (MOSS-Image: no text encoder counted); CNET: the ControlNet
+//                            branch's (its weights, blocks and buffers counted)
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
 //                            UPS:<name>[:<path>] [UPSCOLOR:<m>] UPSIN:<width>,<height>[,<out width>,<out height>]: an
@@ -149,7 +159,20 @@
 //                            (RGB8) to <out>.fg too                                    -> MATTE matte_s=... ...
 //   AUXNEED <sam3|sam3video|florence|birefnet> <weights> <width> <height> [<buckets> | <beams> <max new> |
 //           <model width> <model height> <refine 0|1>]
+//   AUXNEED control <weights or -> <width> <height> <kind> <resolution> [<weights2>]
 //                            the VRAM that run needs beyond what the engine holds             -> NEED as NEED's
+//   COLORMAP <weights> <picture> <out> <ids;ids;...> [<score> <mask>]
+//                            MOSS-Image's color map: SAM 3's instances of each words (CLIP's ids, the words' sets
+//                            split by ;) on the picture, each painted a flat color of its own (the larger first), black
+//                            where none is; RGBA8 rows to <out>  -> COLORMAP width=... height=... objects=... colormap_s=...
+//   CONTROL <kind> <picture> <out> [RES:<n>] [LOW:<v>] [HIGH:<v>] [THR:<v>] [SAFE:0|1] [SCORE:<v>] [DIST:<v>]
+//           [BODY:0|1] [HANDS:0|1] [FACE:0|1] [W:<weights>] [W2:<weights>]
+//                            a control image (cnet_prep.hpp: canny, gray, scribble, scribble_xdog, hed, scribble_hed,
+//                            lineart, lineart_coarse, mlsd, depth, pose) of the picture at the shorter side RES (512),
+//                            its RGBA8 rows to <out>; LOW, HIGH canny's thresholds (100, 200), THR scribble_xdog's
+//                            (12), SAFE HED's steps (1), SCORE and DIST M-LSD's (0.1, 0.1), BODY, HANDS and FACE the
+//                            pose's parts (1); W the network's weights (%XX'd as LORA:'s), W2 the pose's DWPose's
+//                            beside YOLOX's                  -> CONTROL width=<w> height=<h> control_s=<seconds>
 // Each runs in the room the image model's budget leaves (its cache given back first, then its parts, where that is too
 // little; ERROR memory: ... when even that is), its scratch freed after it; its weights kept for the next while a
 // quarter of the GPU's memory stays free, and let go before the next image job (IMG, NEED, RATIO, UPS, UPSNEED).
@@ -179,6 +202,8 @@
 #include "strata/image/anima_pipeline.hpp"
 #include "strata/image/birefnet.hpp"
 #include "strata/image/florence2.hpp"
+#include "strata/image/cnet_models.hpp"
+#include "strata/image/cnet_prep.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
 #include "strata/image/img_crop.hpp"
@@ -200,6 +225,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -435,6 +461,29 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras
         else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
         else if (word.rfind("LORA:", 0) == 0) read_lora(word, r, loras);
         else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
+        else if (word.rfind("CNET:", 0) == 0) r.control_net = decoded_path(word.substr(5));
+        else if (word.rfind("CTRL:", 0) == 0) r.control = read_image(decoded_path(word.substr(5)));
+        else if (word.rfind("CTRLS:", 0) == 0) {
+            const auto v = parse_floats(word.substr(6));
+            if (v.size() != 3 || !(v[2] >= 0.0f && v[2] <= v[1] && v[1] <= 1.0f) || !std::isfinite(v[0]))
+                throw std::invalid_argument("CTRLS:<strength>,<sigma from>,<sigma to>: 0 <= to <= from <= 1: " + word);
+            r.control_strength = v[0];
+            r.control_sigma_hi = v[1];
+            r.control_sigma_lo = v[2];
+        }
+        else if (word == "CTRLNOINPAINT") r.control_inpaint = false;
+        else if (word.rfind("MCTL:", 0) == 0) r.mctl = decoded_path(word.substr(5));
+        else if (word.rfind("TIMEPATH:", 0) == 0) r.time_path = decoded_path(word.substr(9));
+        else if (word.rfind("DATASPACE:", 0) == 0) r.dataspace = decoded_path(word.substr(10));
+        else if (word.rfind("MCOLOR:", 0) == 0) r.mctl_color = read_image(decoded_path(word.substr(7)));
+        else if (word.rfind("MDEPTH:", 0) == 0) r.mctl_depth = read_image(decoded_path(word.substr(7)));
+        else if (word.rfind("MCTLENDS:", 0) == 0) {
+            const auto v = parse_floats(word.substr(9));
+            if (v.size() != 2 || !(v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f))
+                throw std::invalid_argument("MCTLENDS:<color end>,<depth end>: each 0 .. 1: " + word);
+            r.mctl_color_end = v[0];
+            r.mctl_depth_end = v[1];
+        }
         else throw std::invalid_argument("unknown word " + word);
     }
     return refs;
@@ -481,6 +530,14 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
                 r.width = v[2];
                 r.height = v[3];
             }
+            continue;
+        }
+        if (word.rfind("CTRL:", 0) == 0 || word.rfind("CTRLS:", 0) == 0 || word == "CTRLNOINPAINT" ||
+            word.rfind("MCTL:", 0) == 0 || word.rfind("MCOLOR:", 0) == 0 || word.rfind("MDEPTH:", 0) == 0 ||
+            word.rfind("MCTLENDS:", 0) == 0 || word.rfind("TIMEPATH:", 0) == 0 || word.rfind("DATASPACE:", 0) == 0)
+            continue;
+        if (word.rfind("CNET:", 0) == 0) {   // the ControlNet branch (QiPipeline::control_need)
+            r.control_net = decoded_path(word.substr(5));
             continue;
         }
         if (word.rfind("PIC:", 0) == 0) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
@@ -1034,6 +1091,154 @@ std::string detect_line(si::YoloDetector& d, const si::QiRef& img, float conf, c
     return line;
 }
 
+// The color map of MOSS-Image's color control: each instance found (SAM 3's, every words' together) painted in a
+// flat color of its own, the larger first so that a smaller one in front of it stays seen, black where none is: RGBA8
+// rows.  The colors are ids only (the adapter reads regions, not hues): hues a golden-ratio step apart, never black.
+std::vector<uint8_t> color_map(const std::vector<std::vector<si::Segment>>& found, int64_t W, int64_t H) {
+    struct One {
+        const si::Segment* s;
+        size_t area;
+    };
+    std::vector<One> all;
+    for (const auto& f : found)
+        for (const auto& s : f) {
+            size_t a = 0;
+            for (uint8_t v : s.mask) a += v != 0;
+            if (a > 0) all.push_back({&s, a});
+        }
+    std::stable_sort(all.begin(), all.end(), [](const One& a, const One& b) { return a.area > b.area; });
+    std::vector<uint8_t> out((size_t) (W * H * 4), 0);
+    for (size_t i = 3; i < out.size(); i += 4) out[i] = 255;
+    for (size_t k = 0; k < all.size(); ++k) {
+        const double h6 = std::fmod(0.11 + 0.6180339887 * (double) k, 1.0) * 6.0, f = h6 - std::floor(h6);
+        const double v = 0.92, s = 0.8, p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+        double rgb[3];
+        switch ((int) h6) {
+        case 0: rgb[0] = v, rgb[1] = t, rgb[2] = p; break;
+        case 1: rgb[0] = q, rgb[1] = v, rgb[2] = p; break;
+        case 2: rgb[0] = p, rgb[1] = v, rgb[2] = t; break;
+        case 3: rgb[0] = p, rgb[1] = q, rgb[2] = v; break;
+        case 4: rgb[0] = t, rgb[1] = p, rgb[2] = v; break;
+        default: rgb[0] = v, rgb[1] = p, rgb[2] = q; break;
+        }
+        const auto& m = all[k].s->mask;
+        for (size_t px = 0; px < m.size(); ++px)
+            if (m[px] != 0)
+                for (int c = 0; c < 3; ++c) out[px * 4 + (size_t) c] = (uint8_t) std::lround(rgb[c] * 255.0);
+    }
+    return out;
+}
+
+// A control image's networks (`kind`'s, opened once in `aux` from their weights: W:'s, and the pose's W2:, DWPose's
+// beside YOLOX's) into `nets` and `used`, and the VRAM a run on a picture of width x height takes beyond what the
+// engine holds: their weights where they are not loaded yet, their scratch and the preprocessing's
+uint64_t control_plan(AuxNets& aux, const std::string& kind, int64_t width, int64_t height, const si::ControlParams& cp,
+                      const std::string& weights, const std::string& weights2, si::ControlNets& nets,
+                      std::vector<si::AuxNet*>& used) {
+    const si::ControlKind* k = si::ControlPrep::find(kind);
+    if (k == nullptr) throw std::invalid_argument("CONTROL: no preprocessor " + kind);
+    const std::string net = k->net;
+    if (!net.empty() && (weights.empty() || (net == "pose" && weights2.empty())))
+        throw std::invalid_argument("CONTROL " + kind + ": its weights (W:" + std::string(net == "pose" ? ", W2:" : "") +
+                                    ")");
+    // the processed size: the shorter side cp.resolution, the sides padded to multiples of 64
+    const double side = (double) cp.resolution / (double) std::min(width, height);
+    const int64_t pw = (std::lround((double) width * side) + 63) / 64 * 64;
+    const int64_t ph = (std::lround((double) height * side) + 63) / 64 * 64;
+    uint64_t need = si::ControlPrep::work_bytes(width, height, cp);
+    const auto take = [&](auto& m, uint64_t run_bytes) {
+        need += (m.loaded() ? 0 : m.file_bytes()) + run_bytes;
+        used.push_back(&m);
+        return &m;
+    };
+    if (net == "depth") {
+        auto& m = aux.get<si::DepthAnything2>(weights);
+        nets.depth = take(m, m.need_bytes(width, height));
+    } else if (net == "hed") {
+        auto& m = aux.get<si::HedNet>(weights);
+        nets.hed = take(m, m.need_bytes(pw, ph));
+    } else if (net == "lineart" || net == "lineart_coarse") {
+        auto& m = aux.get<si::LineartNet>(weights);
+        nets.lineart = take(m, m.need_bytes(pw, ph));
+    } else if (net == "mlsd") {
+        auto& m = aux.get<si::MlsdNet>(weights);
+        nets.mlsd = take(m, m.need_bytes(pw, ph));
+    } else if (net == "pose") {
+        auto& y = aux.get<si::YoloxNet>(weights);
+        nets.yolox = take(y, y.need_bytes());
+        auto& d = aux.get<si::DwPoseNet>(weights2);
+        nets.dwpose = take(d, d.need_bytes());
+    }
+    return need;
+}
+
+// CONTROL's words after <kind> <picture> <out>: the map's parameters and its networks' weights (W:, and for the pose
+// W2:, DWPose's beside YOLOX's), each network opened once in `aux`; `p` the image model whose room a run takes (null:
+// the engine alone, --control)
+std::string control_line(si::ControlPrep& prep, AuxNets& aux, si::ImagePipeline* p, const std::string& kind,
+                         const si::QiRef& img, const std::string& out, std::istream& words, bool keep = false) {
+    si::ControlParams cp;
+    std::string weights, weights2;
+    const auto flag = [](const std::string& v) { return v != "0"; };
+    for (std::string w; words >> w;) {
+        if (w.rfind("RES:", 0) == 0) cp.resolution = std::stoi(w.substr(4));
+        else if (w.rfind("LOW:", 0) == 0) cp.low = std::stof(w.substr(4));
+        else if (w.rfind("HIGH:", 0) == 0) cp.high = std::stof(w.substr(5));
+        else if (w.rfind("THR:", 0) == 0) cp.threshold = std::stof(w.substr(4));
+        else if (w.rfind("SAFE:", 0) == 0) cp.safe = flag(w.substr(5));
+        else if (w.rfind("SCORE:", 0) == 0) cp.score = std::stof(w.substr(6));
+        else if (w.rfind("DIST:", 0) == 0) cp.distance = std::stof(w.substr(5));
+        else if (w.rfind("BODY:", 0) == 0) cp.body = flag(w.substr(5));
+        else if (w.rfind("HANDS:", 0) == 0) cp.hands = flag(w.substr(6));
+        else if (w.rfind("FACE:", 0) == 0) cp.face = flag(w.substr(5));
+        else if (w.rfind("W2:", 0) == 0) weights2 = decoded_path(w.substr(3));
+        else if (w.rfind("W:", 0) == 0) weights = decoded_path(w.substr(2));
+        else throw std::invalid_argument("CONTROL: an unknown word " + w);
+    }
+    si::ControlNets nets;
+    std::vector<si::AuxNet*> used;
+    const uint64_t need = control_plan(aux, kind, img.width, img.height, cp, weights, weights2, nets, used);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (p != nullptr) aux_room(*p, need, kind.c_str());
+    si::QiRef map;
+    try {
+        map = prep.run(kind, img, cp, nets);
+    } catch (...) {
+        prep.release();
+        for (si::AuxNet* m : used) m->drop_scratch();
+        throw;
+    }
+    if (!keep) {
+        prep.release();
+        for (si::AuxNet* m : used) {
+            if (p != nullptr) aux_done(*p, *m);
+            else m->drop_scratch();
+        }
+    }
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    write_file(out, map.rgba);
+    char b[160];
+    std::snprintf(b, sizeof b, "CONTROL width=%lld height=%lld control_s=%.4f", (long long) map.width,
+                  (long long) map.height, secs);
+    return b;
+}
+
+// Crop and Stitch's box (img_crop.hpp) of a control image that is the picture's: the image at the picture's size
+// (bicubic), the box cut out of it with its edges repeated where the box passes the picture
+si::QiRef control_box(const si::QiRef& control, const si::CropBox& b) {
+    const std::vector<uint8_t> whole = si::control_resize(control, b.width, b.height);
+    si::QiRef out;
+    out.width = b.w;
+    out.height = b.h;
+    out.rgba.resize((size_t) (b.w * b.h * 4));
+    for (int64_t y = 0; y < b.h; ++y)
+        for (int64_t x = 0; x < b.w; ++x) {
+            const int64_t sy = std::clamp<int64_t>(b.y + y, 0, b.height - 1), sx = std::clamp<int64_t>(b.x + x, 0, b.width - 1);
+            std::memcpy(&out.rgba[(size_t) ((y * b.w + x) * 4)], &whole[(size_t) ((sy * b.width + sx) * 4)], 4);
+        }
+    return out;
+}
+
 // the pipelines whose sampling takes guidance.hpp's guidance (GUIDE words)
 bool takes_guidance(si::ImagePipeline& p) {
     return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr;
@@ -1112,6 +1317,7 @@ int serve(si::ImagePipeline& p) {
     Detectors detectors;
     Upscalers ups;
     AuxNets aux;
+    si::ControlPrep control;
     {
         // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead.  A model whose
@@ -1155,6 +1361,12 @@ int serve(si::ImagePipeline& p) {
                 std::optional<si::CropBox> crop;
                 r.refs = read_refs(ls, r, loras, &crop);
                 if (!r.loras.empty() && !takes_loras(p)) no_loras(p);
+                if (!r.control_net.empty() && dynamic_cast<si::QiPipeline*>(&p) == nullptr)
+                    throw std::invalid_argument("image engine: CNET: is Qwen-Image-2.1's ControlNet; this model takes "
+                                                "a control image as a reference image instead");
+                if ((!r.mctl.empty() || !r.time_path.empty() || !r.dataspace.empty()) &&
+                    dynamic_cast<si::MossPipeline*>(&p) == nullptr)
+                    throw std::invalid_argument("image engine: MCTL:, TIMEPATH: and DATASPACE: are MOSS-Image's");
                 if (r.guide.any() && !takes_guidance(p))
                     throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
                                                 "DSLG: or DD: (Qwen-Image-2.1's and Mage-Flow's sampling do)");
@@ -1169,6 +1381,7 @@ int serve(si::ImagePipeline& p) {
                 };
                 if (r.tile > 0) {   // an upscale past the model's size: tile by tile (upscale_tiles)
                     if (crop) throw std::invalid_argument("TILES: not with CROP:");
+                    if (!r.control_net.empty()) throw std::invalid_argument("TILES: not with CNET: (a control per tile)");
                     si::QiTimes t;
                     si::QiPlan pl;
                     double cut_s = 0.0, ups_s = 0.0;
@@ -1200,6 +1413,8 @@ int serve(si::ImagePipeline& p) {
                     }
                     r.mask = cs->regen();
                     r.mask_share = cs->share();
+                    // the control image is the picture's: the same box of it (the edges repeated past the picture)
+                    if (!r.control.rgba.empty()) r.control = control_box(r.control, *crop);
                 }
                 const int color = r.crop_color;
                 r.on_preview = [&out, &cs, color](int index, int done, const std::vector<uint8_t>& rgba) {
@@ -1389,6 +1604,36 @@ int serve(si::ImagePipeline& p) {
                     write_file(masks + "." + std::to_string(i), s.mask);
                 }
                 std::printf("%s\n", line.c_str());
+            } else if (op == "COLORMAP") {   // COLORMAP <weights> <picture> <out> <ids;ids;...> [<score> <mask>]
+                std::string weights, pic, out, words;
+                ls >> weights >> pic >> out >> words;
+                if (!ls) throw std::invalid_argument("COLORMAP <weights> <picture> <out> <ids;ids;...> [<score> <mask>]");
+                float score = 0.5f, mask = 0.5f;
+                ls >> score >> mask;
+                std::vector<std::vector<int32_t>> ids;
+                for (size_t a = 0; a <= words.size();) {
+                    const size_t b = std::min(words.find(';', a), words.size());
+                    if (b > a) ids.push_back(parse_ids(words.substr(a, b - a)));
+                    a = b + 1;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                si::Sam3& m = aux.get<si::Sam3>(decoded_path(weights));
+                const si::QiRef img = read_image(pic);
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3");
+                std::vector<std::vector<si::Segment>> found;
+                try {
+                    found = m.run_many(img, ids, score, mask);
+                } catch (...) {
+                    aux_done(p, m);
+                    throw;
+                }
+                aux_done(p, m);
+                const std::vector<uint8_t> map = color_map(found, img.width, img.height);
+                write_file(out, map);
+                size_t n = 0;
+                for (const auto& f : found) n += f.size();
+                std::printf("COLORMAP width=%lld height=%lld objects=%zu colormap_s=%.4f\n", (long long) img.width,
+                            (long long) img.height, n, seconds_since(t0));
             } else if (op == "SEGV") {   // SEGV <weights> <video> <prompts> <out stem> [words]
                 std::string weights, src, prompts, stem;
                 ls >> weights >> src >> prompts >> stem;
@@ -1505,7 +1750,7 @@ int serve(si::ImagePipeline& p) {
                 std::string kind, weights;
                 int64_t w = 0, h = 0;
                 ls >> kind >> weights >> w >> h;
-                if (!ls) throw std::invalid_argument("AUXNEED <sam3|sam3video|florence|birefnet> <weights> <width> <height> ...");
+                if (!ls) throw std::invalid_argument("AUXNEED <sam3|sam3video|florence|birefnet|control> <weights> <width> <height> ...");
                 uint64_t need = 0, held = 0;
                 if (kind == "sam3") {
                     si::Sam3& m = aux.get<si::Sam3>(weights);
@@ -1526,8 +1771,20 @@ int serve(si::ImagePipeline& p) {
                     ls >> sw >> sh >> refine;
                     si::Birefnet& m = aux.get<si::Birefnet>(weights);
                     need = m.need_bytes(sw, sh, w, h, refine != 0), held = m.held();
+                } else if (kind == "control") {   // AUXNEED control <weights or -> <w> <h> <kind> <res> [<weights2>]
+                    std::string ck, w2;
+                    int res = 512;
+                    ls >> ck >> res;
+                    ls >> w2;
+                    si::ControlParams cp;
+                    cp.resolution = res;
+                    si::ControlNets nets;
+                    std::vector<si::AuxNet*> used;
+                    need = control_plan(aux, ck, w, h, cp, weights == "-" ? "" : decoded_path(weights),
+                                        w2.empty() ? "" : decoded_path(w2), nets, used);
+                    for (si::AuxNet* m : used) held += m->held();
                 } else {
-                    throw std::invalid_argument("AUXNEED: sam3, sam3video, florence or birefnet, not " + kind);
+                    throw std::invalid_argument("AUXNEED: sam3, sam3video, florence, birefnet or control, not " + kind);
                 }
                 size_t free = 0, total = 0;
                 strata::gpu::mem_info(&free, &total);
@@ -1536,6 +1793,11 @@ int serve(si::ImagePipeline& p) {
                             (unsigned long long) (all >> 20), (unsigned long long) (all >> 20),
                             (unsigned long long) ((p.held() + held) >> 20), (unsigned long long) (free >> 20),
                             (unsigned long long) (total >> 20));
+            } else if (op == "CONTROL") {   // CONTROL <kind> <picture> <out> [words]
+                std::string kind, pic, out;
+                ls >> kind >> pic >> out;
+                if (!ls) throw std::invalid_argument("CONTROL <kind> <picture> <out> [RES:<n>]...");
+                std::printf("%s\n", control_line(control, aux, &p, kind, read_image(pic), out, ls).c_str());
             } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
                 si::QiRequest r;
                 std::string ids;
@@ -1581,6 +1843,13 @@ int serve(si::ImagePipeline& p) {
                     nd.full = std::max(nd.full + m.weight_bytes(),
                                        nd.held + su::UpscaleRunner::full_bytes(m, iw, ih, ow, oh, c));
                 }
+                if (!lr.control_net.empty()) {
+                    auto* qi = dynamic_cast<si::QiPipeline*>(&p);
+                    if (qi == nullptr) throw std::invalid_argument("image engine: ControlNet is Qwen-Image-2.1's only");
+                    const auto [least, full] = qi->control_need(lr.control_net, w, h);
+                    nd.least += least;
+                    nd.full += full;
+                }
                 if (crop) {
                     const uint64_t cb = si::CropStitch::bytes(crop->width, crop->height, crop->w, crop->h, w, h,
                                                               crop->ref_w, crop->ref_h);
@@ -1613,6 +1882,7 @@ int serve(si::ImagePipeline& p) {
                 detectors.release(what == "ALL");
                 ups.release(what == "ALL");
                 aux.release(what == "ALL");
+                control.release();
                 std::printf("RELEASE ok\n");
             } else if (!op.empty()) {
                 throw std::invalid_argument("unknown request " + op);
@@ -1762,6 +2032,21 @@ int main(int argc, char** argv) {
             const int repeat = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             for (int i = 0; i < std::max(1, repeat); ++i)
                 std::printf("%s\n", detect_line(det, img, conf, argc >= 6 ? argv[5] : "", i + 1 < repeat).c_str());
+            return 0;
+        }
+        // --control <kind> <picture> <out> [words]: a control image alone, no image model (tools and checks)
+        if (argc >= 5 && std::string(argv[1]) == "--control") {
+            si::ControlPrep prep;
+            AuxNets nets;
+            const si::QiRef img = read_image(argv[3]);
+            std::string words;
+            for (int i = 5; i < argc; ++i) words.append(argv[i]).append(" ");
+            const char* rep = std::getenv("STRATA_CONTROL_REPEAT");   // a timing's repeats
+            const int repeat = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
+            for (int i = 0; i < std::max(1, repeat); ++i) {
+                std::istringstream ws(words);
+                std::printf("%s\n", control_line(prep, nets, nullptr, argv[2], img, argv[4], ws, i + 1 < repeat).c_str());
+            }
             return 0;
         }
         std::string dit, vae, text, vision, ratio_head, out, ids;

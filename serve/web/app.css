@@ -453,6 +453,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .img-mask{display:flex;flex-direction:column;gap:8px}
 .img-mask-tools{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
 .img-mask-stage{position:relative;align-self:flex-start;max-width:100%}
+.img-ctrl-stage img{display:block;max-width:100%;max-height:384px;border-radius:8px}
 .img-mask-stage img{display:block;max-width:100%;max-height:512px;border-radius:8px}
 .img-mask-stage canvas{position:absolute;inset:0;width:100%;height:100%;opacity:.5;touch-action:none;cursor:crosshair}
 .img-moss-more .st-collapse__body{padding:10px 14px}

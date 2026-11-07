@@ -29,7 +29,8 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 52 GB）。編集は参照画像 3 枚まで（透明な背景はない） |
 | `moss-image` | [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) | 50（CFG） | OpenMOSS の 5B のモデル。画像の中の文字と、枠で決めた配置（`layout`）に向く。プロンプトの書き広げ（`enhance`）も使える。編集は chinoll の編集の LoRA（Moss-Image-Edit）で、参照画像 4 枚まで（img2img とマスクも使える） |
 | `moss-image-base` | [MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base) | 50（CFG） | 調整の前の元のモデル |
-| `moss-image-uncensored`、`moss-image-base-uncensored` | 上の 2 つ | 50（CFG） | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
+| `moss-image-4-step` | MOSS-Image と darask0 の [4 ステップのアダプター](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) | 4 | MOSS-Image を 4 ステップ（CFG なし）で描く。通常の MOSS-Image の約 10 倍速い。編集はない。描き込みと多様さは 50 ステップに少し届かない |
+| `moss-image-uncensored`、`moss-image-base-uncensored`、`moss-image-4-step-uncensored` | 上の 3 つ | 上と同じ | 文の読み手を HauhauCS の拒否を外した Qwen3.5-9B にした組み合わせ |
 | `anima-base` | [Anima](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | CircleStone Labs の 2B のモデル。Danbooru のタグと文で描くアニメ調のイラスト向け。編集はできない（img2img とマスクは使える） |
 | `anima-aesthetic` | [Anima-Aesthetic](https://huggingface.co/circlestone-labs/Anima) | 30（CFG） | 決まった整った画風に調整した版 |
 | `anima-turbo` | [Anima-Turbo](https://huggingface.co/circlestone-labs/Anima) | 10 | 速さのために蒸留した版（CFG なし） |
@@ -174,6 +175,7 @@ HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guida
 - 画像を添付すると、1 枚目の画像の上で描き直す部分を塗れます（ブラシの大きさ、消しゴム、全部消す）。塗った部分だけを描き直し、残りは元の画素のまま残します（API の `mask`。塗った部分の周りを拡大して描き直すので、縁のすぐ外も少し変わります）。塗らなければ、画像全体です。
   言葉（`hair` など）を書いて「マスクを作る」を押すと、その場所を見つけて塗ります（API の言葉からマスク。後からブラシで直せます）。「背景を消す」は 1 枚目の画像の背景を消した透明の PNG を結果に並べます。SAM 3 のライセンスに同意していないと Florence-2 で見つけ、「SAM 3 のライセンス…」から文を読んで同意できます。
 - 画像を添付すると Strength の欄が出ます（API の `strength`）。小さいほど元の画像を多く残します。空欄はモデルの既定で、編集は 1（元の画像の潜在から始めない、今までの編集）、img2img は 0.87 です（ステップ数の少ないモデルでは、少なくとも 1 ステップ飛ばす値まで下げます）。
+- 「画像から構図を取る（ControlNet）」で、別の画像の姿勢・輪郭・深度などに沿って描けます（API の `control`）。取るもの（姿勢、深度、輪郭、線画、直線など）と画像を選び、「図を確かめる」で制御の図を先に見られます。「この図を送る」が付いている間は、見た図をそのまま送ります（作り直しません）。Qwen-Image-2.1 では強さと効かせる範囲も、MOSS-Image の色と深度では強さと終わりも変えられます。ControlNet のないモデルでは、図を参照の画像の 1 枚として渡します。
 - LoRA の行で、そのモデルが当てられるファイルを選べます（[LoRA](#loraアダプター)）。選んだものはチップになり、強さ（-2〜2）を変えられ、`trigger` のあるファイルは「トリガー」のボタンでその語をプロンプトの末尾に足せます。4 本までで、選んだものと強さはモデルごとにブラウザーが覚えます。API と同じく、名前は要求の欄で出します（タグは書きません）。
 - 画像は 1 枚ずつ作ります。何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にそちらを先に動かし、終わってから残りを作ります（文章のモデルを外す `unload` のときは、外したまま最後まで作ります）。
 - MOSS-Image では、さらに次のものが出ます。
@@ -275,6 +277,31 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 `enhance` を付けると、まずチャットのモデル（読み込んでいる文章のモデル）が、プロンプトを MOSS-Image 向けの詳しい説明か配置に書き広げ、それで画像を作ります。書き広げ方は、MOSS-Image の公式のプロンプトの書き手（skills/moss-image-prompt-enhancer）にならっています。
 応答の `revised_prompt` がモデルの読んだプロンプトで、`strata.enhance` に、作ったもの（`made`: `caption` か `layout`、書いたプロンプト（`prompt`）か配置の下書き）とかかった秒数が入ります。書き広げに失敗したとき（読めない答え、チャットのモデルがない）は、元のプロンプトのまま作り、`strata.enhance.error` に理由を書きます。
 
+#### 構図の制御（`control`）
+
+別の画像（`control.image`）から姿勢・輪郭・深度などの図を作り、それに沿って描きます。生成と編集のどちらでも受けます。
+
+- `control` は `{"type": ..., "image": ...}` の形です。`image` は data: URL か base64、http(s) の URL で、編集の multipart では `control_image` のファイルでも送れます（ほかの欄は `control` に JSON で書くか、`control_type`・`control_strength` のように `control_` を前に付けた欄で書きます）。
+- `type` は図の種類です。
+   - `pose`: 人物の姿勢（YOLOX-L で人を見つけ、DWPose で体・手・顔の点を取り、OpenPose の形に描く）。`detect_body`・`detect_hands`・`detect_face`（既定はすべて `true`）。
+   - `depth`: 深度（Depth Anything V2 Small。近いほど白）。
+   - `canny`: 輪郭（Canny）。`low_threshold`・`high_threshold`（既定 100・200）。
+   - `lineart`・`lineart_coarse`: 線画（細い線、粗い線）。
+   - `hed`: 柔らかい輪郭（HED。`safe` で段に丸める、既定 `true`）。`scribble_hed`: その輪郭から作る下描き。
+   - `scribble`: 画像そのものの暗い線。`scribble_xdog`: 拡張したガウスの差（XDoG）で作る下描き（`threshold`、既定 12）。
+   - `mlsd`: 直線（M-LSD。部屋や建物）。`score_threshold`・`distance_threshold`（既定 0.1・0.1）。
+   - `gray`: 陰影（グレー）。
+   - `color`（MOSS-Image だけ）: 物体ごとの色の地図（SAM 3 で人・物・空・床などを見つけ、1 つずつ別の色で塗り、ほかは黒）。SAM License に同意していないと使えません。
+   - `none`: 画像がすでに制御の図（`preprocess: false` と同じ）。
+- `resolution` は図を作るときの画像の短い辺です（既定 512、64〜2048）。
+- 大きさを付けない生成では、`control.image` の形で約 1024x1024 にします。図は描く大きさに合わせて引き伸ばします。
+- Qwen-Image-2.1: alibaba-pai の Fun ControlNet Union で描きます。`strength`（既定 1、0〜2）、効かせる範囲の `start`・`end`（ステップの割合。既定 0 と 1。`end` を 0.6〜0.8 にすると構図を保ったまま細部が自由になる）、マスクのある編集では塗った部分も ControlNet に渡します（`inpaint: false` で渡さない）。
+- MOSS-Image の `color` と `depth`（`moss-image-4-step` でも使える。4 ステップでは `end` を短め（0.3）にし、マネキンの質感が残るなら通常のステップ数の MOSS-Image で）: darask0 の色と深度のアダプター（MOSS-Image の入力の層を広げ、LoRA を足したもの）で描きます。`control` を 2 つの配列にすると色と深度を両方使えます。`strength` はアダプターの LoRA の強さ（既定 1）、`end` はその図を使うステップの割合（既定 1。3D のマネキンなどから作った図は 0.5 がよい）です。`start` は学習されていないので受けません。人や物の位置と大きさを決めたいときに使い、プロンプトには物ごとの説明を書きます。
+- ControlNet のないモデル（Mage-Flow の編集、HunyuanImage 3.0、編集のある MOSS-Image のほかの種類）: 図を参照の画像の 1 枚として渡し、プロンプトの最後に「その図の姿勢に沿う」などの頼みを足します。姿勢はよく効きますが、輪郭と深度では元の画像の人物まで写すことがあります。`strength`・`start`・`end` は受けません。
+- 編集のないモデル（MageTrail、Anima、編集のない MOSS-Image の色と深度以外）は `control` を受けません。
+- 重み（Fun ControlNet Union、前処理の網、MOSS-Image のアダプター）は、初めて使うときにサーバーが取ります（取っている間は 503 で、進み具合を返します）。
+- 応答の `strata` には、作った図の大きさと秒数が入ります。
+
 ### 画像を直す（`POST /v1/images/edits`）
 
 参照画像を元に画像を作ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。
@@ -366,6 +393,10 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 
 言葉からマスクと背景を消すは、画像の仕事と同じ GPU の順番で動き、終わるとその場で返します（ジョブにはしません）。重みは GPU のメモリの 4 分の 1 が空いている間は次の道具のために残し、次の画像の仕事の前に放します。
 
+### 制御の図だけ（`POST /v1/images/controls`）
+
+`control` に渡す図を作って返します（Web のページの「図を確かめる」）。multipart の `image` と `type` と種類ごとの欄、または JSON（`image` に data: URL か http(s) の URL）で送ります。応答は `created`・`type`・`width`・`height`・`data[]`（`b64_json` か `url`）と、秒数の `strata` です。返した図は、`control` に `preprocess: false`（MOSS-Image の色と深度）か `type: none` で送れば、作り直さずに使えます。
+
 ### 応答
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
@@ -381,6 +412,7 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
   `upscale_image` は、会話の最後の画像を大きくし、`redraw` で細かく描き直します（上の「拡大」と同じ。引数は `scale`（既定は 2）・`method`・`redraw`（既定は描き直さない）・`strength`）。「そのまま大きく」なら描き直さず、「大きく、細かく描き込んで」なら描き直す、という使い分けは、スキルの `tools/upscale_image` に書いてあります。
   `fix_image` は、会話の最後の画像の顔・手・人物を見つけて描き直します（上の「部分を直す」と同じ。引数は `parts` と `strength`）。重みを取っている間は、その旨を返し、チャットのモデルは後で呼び直します。
   `edit_region` は、言葉の場所（`region`）だけを `prompt` のとおりに描き直し（上の「言葉の場所」と同じ）、`find_region` は言葉の場所を赤で塗った画像を見せ（描き直さない）、`remove_background` は背景を消すか単色を敷きます（引数は `version` と `background_color`）。使いどころはスキルの `tools/edit_region`・`tools/find_region`・`tools/remove_background` に書いてあります。
+  `control` は、会話の最後の画像（添付したものか、会話で作ったもの）の姿勢・輪郭・深度などに沿って新しい画像を作ります（上の「構図の制御」と同じ。引数は `type`・`prompt`・`strength`・`end`）。「このポーズで」「この構図で」のときの使い分けは、スキルの `tools/control` に書いてあります。
   Qwen-Image-2.1 と Mage-Flow では、`generate_image` と `edit_image` に `guidance`（上の「サンプリングのガイダンス」の名前の配列）も渡します。CFG の要る 3 つは、モデルの既定で CFG が掛かるときだけ並べます。使いどころは `image_skill` の `guidance` に書いてあります。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
 - `strata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
@@ -622,6 +654,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
   量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
+  `moss-image-4-step` の 4 ステップのアダプター（LoRA、時刻の経路、サンプラーの表）は darask0 の [MOSS-Image_4-step_adapter_lora](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) で、Apache 2.0 です。
   編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が ComfyUI の形に直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
@@ -636,3 +669,10 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - 言葉からマスクの SAM 3.1 の重みは Meta の SAM License で、オープンソースのライセンスではありません（使う人を拘束し、禁じる使い方があります）。サーバーは利用者が同意するまで取りません。重みは Comfy-Org の [sam3.1](https://huggingface.co/Comfy-Org/sam3.1) の FP16 のものをそのまま使います。言葉を読む CLIP の `tokenizer.json`（openai/clip-vit-large-patch14）は MIT です。
 - Florence-2（large と base）の重みと `tokenizer.json` は Microsoft の [Florence-2](https://huggingface.co/microsoft/Florence-2-large) で、MIT です。
 - 背景を消す BiRefNet の 7 つの版の重みは、Peng Zheng の [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) で、MIT です。
+- 構図の制御の Fun ControlNet Union（Qwen-Image-2.1 用）は alibaba-pai の [Qwen-Image-2.1-Fun-Controlnet-Union](https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union) で、Qwen-Image-2.1 と同じく Qwen Research License です。自由なソフトウェアのライセンスではないので、商用に使う前にそのライセンスを読んでください。
+- MOSS-Image の色と深度のアダプターは darask0 の [MOSS-Image-color-depth-control](https://huggingface.co/darask0/MOSS-Image-color-depth-control) で、Apache 2.0 です。
+- 構図の制御の図を作る網の重み:
+   - 深度の Depth Anything V2 Small（Lihe Yang ほか）は [Depth-Anything-V2-Small-hf](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) で、Apache 2.0 です（Base より大きいものは非商用なので使いません）。
+   - 姿勢の DWPose（Zhendong Yang ほか）は [yzd-v/DWPose](https://huggingface.co/yzd-v/DWPose) で、Apache 2.0 です。人を見つける YOLOX-L は Megvii の [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) のリリースと同じファイル（[kadirnar/yolox_l-v0.1.1](https://huggingface.co/kadirnar/yolox_l-v0.1.1)）で、Apache 2.0 です。
+   - HED（ControlNet 1.1 の注釈器、Lvmin Zhang）は Apache 2.0、線画（Caroline Chan の Informative Drawings）は MIT、M-LSD（NAVER）は Apache 2.0 で、どれも [lllyasviel/Annotators](https://huggingface.co/lllyasviel/Annotators) から取ります。
+   - これらの `.pth` は、サーバーが `tools/image/state_pt.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換で、元のファイルの SHA-256 を変換後のファイルに書き残します。
