@@ -67,8 +67,37 @@ double cubic(double x) {
     return 0.0;
 }
 
+// OpenCV's cubic (a = -0.75)
+double cv_cubic(double x) {
+    constexpr double a = -0.75;
+    x = std::abs(x);
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
 Taps taps(int64_t in, int64_t out, Filter f) {
     const double scale = (double) in / (double) out, fs = std::max(scale, 1.0);
+    if (f == Filter::cv_cubic) {
+        // the 4 samples around (x + 0.5) scale - 0.5, an index past an edge taken as the edge's
+        Taps t;
+        t.k = 4;
+        t.lo.resize((size_t) out);
+        t.w.assign((size_t) (out * t.k), 0.0f);
+        for (int64_t x = 0; x < out; ++x) {
+            const double c = ((double) x + 0.5) * scale - 0.5;
+            const auto i0 = (int64_t) std::floor(c);
+            const double fr = c - (double) i0;
+            const int64_t lo = std::clamp<int64_t>(i0 - 1, 0, std::max<int64_t>(in - 4, 0));
+            t.lo[(size_t) x] = (int32_t) lo;
+            for (int64_t j = 0; j < 4; ++j) {
+                const int64_t at = std::clamp<int64_t>(i0 - 1 + j, 0, in - 1);
+                const int64_t slot = std::clamp<int64_t>(at - lo, 0, 3);
+                t.w[(size_t) (x * 4 + slot)] += (float) cv_cubic(fr + 1.0 - (double) j);
+            }
+        }
+        return t;
+    }
     const double support = (f == Filter::lanczos ? 3.0 : f == Filter::bicubic ? 2.0 : 1.0) * fs;
     Taps t;
     t.k = (int) std::ceil(support) * 2 + 1;

@@ -4348,9 +4348,16 @@ $("tool-form").onsubmit = async (ev) => {
 // running are the metrics' live.video.
 const VID_SYNC_S = 20;   // seconds: a video this short is upscaled in the answer, a longer one as a job
 let vidSrc = null, vidAbort = null, vidTimer = 0, vidLast = null, vidJobsTimer = 0, vidJob = null;
+// the segmentation: the tool chosen, the answer shown ({answer, fps, mine, hidden, gone, urls}), the clicks given (each
+// {time, target: "new<n>" or an object's id, x, y, label} or {time, target, box}), the click mode, the new objects
+let vidKind = store.get("vid_kind", "upscale"), vidSeg = null, vidClicks = [], vidMode = "", vidNewN = 1, vidDrag = null;
 function videoSetup() {
-  const ups = (health.image_models || []).some(m => ((m.defaults || {}).tools || []).includes("upscale_image"));
-  $("tab-btn-video").hidden = !health.image_generation || !health.video || !ups;
+  const has = (t) => (health.image_models || []).some(m => ((m.defaults || {}).tools || []).includes(t));
+  const ups = has("upscale_image"), seg = has("segment_video");
+  $("tab-btn-video").hidden = !health.image_generation || !health.video || !(ups || seg);
+  for (const b of $("vid-kind").children) b.hidden = !(b.dataset.vid === "upscale" ? ups : seg);
+  if (!(vidKind === "segment" ? seg : ups)) vidKind = ups ? "upscale" : "segment";
+  vidKindSet(vidKind);
   const off = health.video && !health.video.available;
   $("vid-go").disabled = !!off;
   if (off) $("vid-hint").textContent = tr("vid.noFfmpeg", "The video tools need ffmpeg on the server: xestrata --setup says how to install it.");
@@ -4386,6 +4393,8 @@ function vidSrcInfo(server) {
 }
 function vidSetSource(f) {
   if (!f) return;
+  vidClicks = [];
+  vidSegShow(null);
   if (vidSrc) URL.revokeObjectURL(vidSrc.url);
   vidSrc = {file: f, url: URL.createObjectURL(f), w: 0, h: 0, duration: 0, unplayable: false};
   const v = $("vid-src");
@@ -4420,6 +4429,7 @@ function vidShow(which) {
   $("vid-empty").hidden = have.source || have.result;
   $("vid-bar").hidden = !(have.source || have.result);
   if (which !== "both") $("vid-out").muted = false;
+  vidSegDraw();
 }
 for (const b of $("vid-show").children) b.onclick = () => vidShow(b.dataset.show);
 const vidBoth = () => $("vid-view").dataset.show === "both";
@@ -4460,10 +4470,10 @@ function vidRequest() {
   if (Object.keys(extra).length) req.extra_params = extra;
   return req;
 }
-function vidForm(req) {
+function vidForm(req, field = "input_references") {
   const fd = new FormData();
   for (const [k, v] of Object.entries(req)) fd.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
-  fd.append("input_references", vidSrc.file, vidSrc.file.name);
+  fd.append(field, vidSrc.file, vidSrc.file.name);
   return fd;
 }
 // a POST of the form with its upload's progress (fetch tells none): {status, headers(name), body: a Blob}
@@ -4522,14 +4532,19 @@ $("vid-go").onclick = (ev) => {
   if (ev.detail > 0 || document.activeElement === $("vid-go")) vidAbort.ctl.abort();
 };
 const vidInfo = (req, path, answer) => [`POST /${path}`, ...Object.entries(req).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`),
-                                        `input_references: (${vidSrc ? vidSrc.file.name : "?"})`, "", ...answer].join("\n");
+                                        `${path.includes("segment") ? "video" : "input_references"}: (${vidSrc ? vidSrc.file.name : "?"})`, "", ...answer].join("\n");
 $("vid-form").onsubmit = async (ev) => {
   ev.preventDefault();
   if (vidAbort) return;
   if (!vidSrc) { toast("warn", tr("tab.video", "Video"), tr("vid.noVideo", "Choose a video first."), 5000); return; }
-  const req = vidRequest(), v = health.video || {};
+  const seg = vidKind === "segment", req = seg ? vidSegRequest() : vidRequest(), v = health.video || {};
+  if (seg && !req.prompt && !(req.clicks || []).length) {
+    toast("warn", tr("vid.segment", "Find objects"), tr("vid.segNothing", "Give the words of what to find, or click on the video."), 6000);
+    return;
+  }
   const sync = vidSrc.duration > 0 && vidSrc.duration <= VID_SYNC_S && vidSrc.file.size <= (v.sync_max_mib || 512) * 1048576;
-  const path = sync ? "v1/videos/sync" : "v1/videos";
+  const path = seg ? "v1/videos/segmentations" : sync ? "v1/videos/sync" : "v1/videos";
+  if (seg && !sync) req.job = true;
   if (!sync && v.max_upload_mib && vidSrc.file.size > v.max_upload_mib * 1048576) {
     toast("error", tr("tool.upscale", "Upscale"), tr("vid.tooLarge", "The video is larger than the server takes ({n} MiB: video.max_upload_mib).", {n: v.max_upload_mib}), 10000);
     return;
@@ -4542,10 +4557,14 @@ $("vid-form").onsubmit = async (ev) => {
   $("vid-hint").textContent = "";
   vidResult(null);
   try {
-    const r = await vidPost(path, vidForm(req), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
+    const r = await vidPost(path, vidForm(req, seg ? "video" : "input_references"), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
     vidAbort.upload = 1;
     if (r.status !== 200) throw new Error(await vidError(r));
-    if (sync) {
+    if (seg && sync) {
+      const seconds = Math.round((performance.now() - t0) / 1000);
+      vidSegAnswer(JSON.parse(await r.body.text()), req, path, seconds);
+      $("vid-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    } else if (sync) {
       const seconds = Math.round((performance.now() - t0) / 1000), fps = Number(r.header("X-Video-Fps")) || 0;
       const answer = [`model: ${r.header("X-Model")}`, `frames: ${r.header("X-Video-Frames")}`, `fps: ${fmt(fps, 3)}`,
                       r.header("X-Video-Vfr") ? `vfr: ${r.header("X-Video-Vfr")}` : "", `seconds: ${seconds}`].filter(Boolean);
@@ -4561,7 +4580,7 @@ $("vid-form").onsubmit = async (ev) => {
     }
   } catch (e) {
     if (vidAbort.ctl.signal.aborted) $("vid-hint").textContent = tr("img.interrupted", "Interrupted.");
-    else toast("error", tr("tool.upscale", "Upscale"), String(e.message || e), 12000);
+    else toast("error", seg ? tr("vid.segment", "Find objects") : tr("tool.upscale", "Upscale"), String(e.message || e), 12000);
   } finally {
     vidAbort = null;
     vidJob = null;
@@ -4590,9 +4609,16 @@ async function vidFollow(t0) {
     if (rec.status === "failed") throw new Error((rec.error && rec.error.message) || rec.status);
   }
 }
-// a completed job's result in the player: its file from the server
-function vidOpenJob(rec, req, seconds) {
+// a completed job's result in the player: its file from the server (a segmentation's: its answer, and its overlay video)
+async function vidOpenJob(rec, req, seconds) {
   const res = rec.result || {}, up = res.upscale || {};
+  if (rec.kind === "segmentation") {
+    const r = await fetch(`v1/videos/${rec.id}/content`, {headers: headers()});
+    if (!r.ok) { toast("error", tr("vid.segment", "Find objects"), `HTTP ${r.status}`, 8000); return; }
+    vidSegAnswer(await r.json(), req, "v1/videos/segmentations", seconds != null ? seconds : res.seconds, rec);
+    if (seconds != null) $("vid-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    return;
+  }
   const answer = [`id: ${rec.id}`, `model: ${rec.model}`, `size: ${rec.size}`, res.frames != null ? `frames: ${res.frames}` : "",
                   res.fps ? `fps: ${fmt(res.fps, 3)}` : "", res.vfr ? "vfr: read at its average frame rate" : "",
                   up.method ? `upscaler: ${up.method}${up.variant ? " " + up.variant : ""}` : "", up.chunk ? `chunk: ${up.chunk}` : "",
@@ -4652,6 +4678,267 @@ function chatVideoNote(v) {
     ? tr("vid.chatRefused", "A video job has the GPU (the model made way for it): the chat answers again in about {n} s.", {n: v.left_s || "?"})
     : tr("vid.chatBetween", "A video job is running: the chat answers between its chunks, a little later than usual.");
 }
+
+// ------------------------------------------------------------------ Video: finding objects
+// The segmentation (/v1/videos/segmentations, SAM 3.1): words, and points and boxes clicked on the paused source (at
+// its time; the server takes the frame there), each making a new object or fixing one found before.  Its answer's masks
+// (vLLM-Omni's COCO RLE) are drawn over the source as it plays, each object shown or hidden; its videos (the overlay,
+// the masks) come as files.  A frame and its objects' mask go to the Images tab's edit.
+const VID_COLORS = [[31, 119, 180], [255, 127, 14], [44, 160, 44], [214, 39, 40], [148, 103, 189], [140, 86, 75],
+                    [227, 119, 194], [127, 127, 127], [188, 189, 34], [23, 190, 207]];   // the engine's overlay's, by id
+const vidColor = (id) => VID_COLORS[id % VID_COLORS.length];
+function vidKindSet(k) {
+  vidKind = k;
+  store.set("vid_kind", k);
+  for (const b of $("vid-kind").children) b.setAttribute("aria-checked", String(b.dataset.vid === k));
+  for (const el of $("vid-form").querySelectorAll("[data-vid]")) if (el.parentElement !== $("vid-kind")) el.hidden = el.dataset.vid !== k;
+  const key = k === "segment" ? "vid.segment" : "tool.upscale";
+  $("vid-go-label").dataset.i18n = key;
+  $("vid-go-label").textContent = k === "segment" ? tr("vid.segment", "Find objects") : tr("tool.upscale", "Upscale");
+  vidModeSet(k === "segment" ? vidMode : "");
+  vidSegDraw();
+}
+for (const b of $("vid-kind").children) b.onclick = () => vidKindSet(b.dataset.vid);
+function vidModeSet(m) {
+  vidMode = m;
+  for (const b of $("vid-seg-mode").children) b.setAttribute("aria-checked", String(b.dataset.mode === m));
+  $("vid-canvas").classList.toggle("is-clicking", vidKind === "segment" && m !== "");
+  vidSegDraw();
+}
+for (const b of $("vid-seg-mode").children) b.onclick = () => vidModeSet(b.dataset.mode);
+// the clicks' targets: the new objects so far, then the objects of the answer shown
+function vidTargets() {
+  const sel = $("vid-seg-target"), keep = sel.value;
+  const opts = [];
+  for (let n = 1; n <= vidNewN; n++) opts.push([`new${n}`, tr("vid.segNewN", "New object {n}", {n})]);
+  for (const o of (vidSeg && vidSeg.answer.objects) || []) opts.push([String(o.id), tr("vid.segObj", "Object {id}", {id: o.id}) + (o.prompt ? ` (${o.prompt})` : "")]);
+  sel.replaceChildren(...opts.map(([v, t]) => Object.assign(document.createElement("option"), {value: v, textContent: t})));
+  sel.value = opts.some(([v]) => v === keep) ? keep : opts[0][0];
+}
+$("vid-seg-new").onclick = () => { vidNewN += 1; vidTargets(); $("vid-seg-target").value = `new${vidNewN}`; };
+vidTargets();
+function vidClickList() {
+  const chips = vidClicks.map((c, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "st-btn st-btn--secondary";
+    const what = c.box ? tr("vid.segBox", "Box") : c.label ? tr("vid.segIn", "Point: in") : tr("vid.segOut", "Point: out");
+    const to = c.target.startsWith("new") ? tr("vid.segNewN", "New object {n}", {n: c.target.slice(3)}) : tr("vid.segObj", "Object {id}", {id: c.target});
+    b.textContent = `${fmt(c.time, 2)} s · ${what} → ${to} ×`;
+    b.title = tr("vid.segRemove", "Remove");
+    b.onclick = () => { vidClicks.splice(i, 1); vidClickList(); vidSegDraw(); };
+    return b;
+  });
+  $("vid-seg-clicks").replaceChildren(...chips);
+}
+// the request's fields: the words (the first as prompt, the rest as prompts), the clicks grouped by their time and
+// target (one object each), the videos asked for
+function vidSegRequest() {
+  const words = $("vid-seg-words").value.split(",").map(w => w.trim()).filter(Boolean);
+  const req = {model: "sam3.1"};
+  if (words.length) req.prompt = words[0];
+  if (words.length > 1) req.prompts = words.slice(1);
+  const groups = new Map();
+  for (const c of vidClicks) {
+    const key = `${c.time.toFixed(3)}|${c.target}`;
+    if (!groups.has(key)) groups.set(key, {time: Number(c.time.toFixed(3)), object: c.target.startsWith("new") ? null : Number(c.target), points: []});
+    const g = groups.get(key);
+    if (c.box) g.box = c.box.map(Math.round);
+    else g.points.push([Math.round(c.x), Math.round(c.y), c.label]);
+  }
+  if (groups.size) req.clicks = [...groups.values()].map((g) => { if (!g.points.length) delete g.points; return g; });
+  const outs = [];
+  if ($("vid-seg-overlay").checked) outs.push("overlay");
+  if ($("vid-seg-mask").checked) outs.push("mask");
+  if (outs.length) req.outputs = outs;
+  if ($("vid-seg-masks").checked) req.mask_video = true;
+  return req;
+}
+// the canvas over the source: placed on the picture the video shows (its letterbox left out), at its pixels
+function vidCanvasPlace() {
+  const v = $("vid-src"), c = $("vid-canvas");
+  if (!v.videoWidth || v.hidden) { c.hidden = true; return false; }
+  const ew = v.clientWidth, eh = v.clientHeight, k = Math.min(ew / v.videoWidth, eh / v.videoHeight);
+  const w = v.videoWidth * k, h = v.videoHeight * k;
+  if (c.width !== v.videoWidth || c.height !== v.videoHeight) { c.width = v.videoWidth; c.height = v.videoHeight; }
+  Object.assign(c.style, {left: `${v.offsetLeft + (ew - w) / 2}px`, top: `${v.offsetTop + (eh - h) / 2}px`, width: `${w}px`, height: `${h}px`});
+  c.hidden = false;
+  return true;
+}
+// the frame the source shows: its time at the answer's rate (the server's frame of a click at that time)
+const vidFrameAt = (t, fps) => Math.floor(t * fps + 1e-3);
+// an object's mask on a frame from its RLE (the runs down the columns, the first the background's) into `img`'s pixels
+function vidPaintRle(img, counts, W, H, rgb, a) {
+  let p = 0;
+  for (let i = 0; i < counts.length; i++) {
+    const n = counts[i];
+    if (i % 2) {
+      for (let q = p; q < p + n; q++) {
+        const o = ((q % H) * W + Math.floor(q / H)) * 4;
+        img.data[o] = rgb[0]; img.data[o + 1] = rgb[1]; img.data[o + 2] = rgb[2]; img.data[o + 3] = a;
+      }
+    }
+    p += n;
+  }
+}
+// the objects shown on the source's frame, then the clicks of this time
+function vidSegDraw() {
+  const c = $("vid-canvas"), v = $("vid-src");
+  const want = vidKind === "segment" && ((vidSeg && vidSeg.mine) || vidClicks.length || vidMode !== "");
+  if (!want || !vidCanvasPlace()) { c.hidden = true; return; }
+  const g = c.getContext("2d");
+  g.clearRect(0, 0, c.width, c.height);
+  if (vidSeg && vidSeg.mine) {
+    const A = vidSeg.answer, f = A.frames[Math.min(A.frames.length - 1, vidFrameAt(v.currentTime, vidSeg.fps))];
+    if (f && f.instances.length) {
+      const img = g.createImageData(A.width, A.height);
+      for (const it of f.instances)
+        if (!vidSeg.hidden.has(it.id) && !vidSeg.gone.has(it.id)) vidPaintRle(img, it.mask.counts, A.width, A.height, vidColor(it.id), 120);
+      g.putImageData(img, 0, 0);
+    }
+  }
+  const r = Math.max(4, c.width / 120);
+  g.lineWidth = Math.max(2, c.width / 400);
+  for (const k of [...vidClicks, ...(vidDrag ? [vidDrag] : [])]) {
+    if (Math.abs(k.time - v.currentTime) > 1e-3) continue;
+    g.strokeStyle = g.fillStyle = k.box ? "#facc15" : k.label ? "#22c55e" : "#ef4444";
+    if (k.box) { g.strokeRect(k.box[0], k.box[1], k.box[2] - k.box[0], k.box[3] - k.box[1]); continue; }
+    g.beginPath(); g.arc(k.x, k.y, r, 0, 2 * Math.PI); g.fill();
+  }
+}
+for (const ev of ["timeupdate", "seeked", "loadedmetadata", "pause"]) $("vid-src").addEventListener(ev, vidSegDraw);
+window.addEventListener("resize", vidSegDraw);
+// while it plays, each frame shown
+$("vid-src").addEventListener("play", () => {
+  const v = $("vid-src");
+  const tick = () => { if (v.paused || v.ended) return; vidSegDraw(); v.requestVideoFrameCallback ? v.requestVideoFrameCallback(tick) : requestAnimationFrame(tick); };
+  tick();
+});
+// a click (a point) or a drag (a box) on the paused source, at the video's pixels
+function vidCanvasXY(e) {
+  const c = $("vid-canvas"), b = c.getBoundingClientRect();
+  return [(e.clientX - b.left) * c.width / b.width, (e.clientY - b.top) * c.height / b.height];
+}
+$("vid-canvas").addEventListener("pointerdown", (e) => {
+  if (vidKind !== "segment" || !vidMode) return;
+  const v = $("vid-src");
+  if (!v.paused) { v.pause(); toast("info", tr("vid.segment", "Find objects"), tr("vid.segPaused", "Paused: click on this frame."), 3000); return; }
+  e.preventDefault();
+  const [x, y] = vidCanvasXY(e), target = $("vid-seg-target").value || "new1", time = v.currentTime;
+  if (vidMode !== "box") {
+    vidClicks.push({time, target, x, y, label: Number(vidMode)});
+    vidClickList(); vidSegDraw();
+    return;
+  }
+  vidDrag = {time, target, box: [x, y, x, y], x0: x, y0: y};
+  $("vid-canvas").setPointerCapture(e.pointerId);
+});
+$("vid-canvas").addEventListener("pointermove", (e) => {
+  if (!vidDrag) return;
+  const [x, y] = vidCanvasXY(e);
+  vidDrag.box = [Math.min(vidDrag.x0, x), Math.min(vidDrag.y0, y), Math.max(vidDrag.x0, x), Math.max(vidDrag.y0, y)];
+  vidSegDraw();
+});
+$("vid-canvas").addEventListener("pointerup", () => {
+  if (!vidDrag) return;
+  const {time, target, box} = vidDrag;
+  vidDrag = null;
+  if (box[2] - box[0] >= 4 && box[3] - box[1] >= 4) {
+    for (let i = vidClicks.length - 1; i >= 0; i--)   // one box an object on a frame: a new one takes its place
+      if (vidClicks[i].box && vidClicks[i].target === target && Math.abs(vidClicks[i].time - time) < 1e-3) vidClicks.splice(i, 1);
+    vidClicks.push({time, target, box});
+  }
+  vidClickList(); vidSegDraw();
+});
+// an answer shown: its objects listed, its masks over the source (when it is this page's video), its videos as files
+function vidSegShow(seg) {
+  if (vidSeg) for (const u of vidSeg.urls) URL.revokeObjectURL(u);
+  vidSeg = seg;
+  $("vid-objects").hidden = $("vid-seg-bar").hidden = !seg;
+  vidTargets();
+  if (!seg) { $("vid-objects").replaceChildren(); $("vid-seg-files").replaceChildren(); vidSegDraw(); return; }
+  const rows = seg.answer.objects.map((o) => {
+    const row = document.createElement("label"), sw = document.createElement("span"), box = document.createElement("input"), del = document.createElement("button");
+    row.className = "vid-obj";
+    sw.className = "vid-obj__swatch";
+    sw.style.background = `rgb(${vidColor(o.id).join(",")})`;
+    box.type = "checkbox";
+    box.checked = true;
+    box.title = tr("vid.segShowObj", "Show");
+    box.onchange = () => { if (box.checked) seg.hidden.delete(o.id); else seg.hidden.add(o.id); vidSegDraw(); };
+    del.type = "button";
+    del.className = "st-btn st-btn--icon";
+    del.textContent = "×";
+    del.title = tr("vid.segRemove", "Remove");
+    del.onclick = (ev) => {
+      ev.preventDefault();
+      if (seg.gone.has(o.id)) seg.gone.delete(o.id); else seg.gone.add(o.id);
+      row.classList.toggle("is-gone", seg.gone.has(o.id));
+      vidSegDraw();
+    };
+    const what = o.prompt || tr("vid.segClicked", "clicked");
+    row.append(box, sw, document.createTextNode(`#${o.id} ${what}`), del);
+    row.ondblclick = () => { $("vid-seg-target").value = String(o.id); };
+    return row;
+  });
+  $("vid-objects").replaceChildren(...(rows.length ? rows : [Object.assign(document.createElement("span"), {className: "composer-hint", textContent: tr("vid.segNone", "Nothing found: try other words, or click on it.")})]));
+  $("vid-seg-files").replaceChildren(...seg.files.map(([label, href, name]) => Object.assign(document.createElement("a"),
+    {className: "st-btn st-btn--secondary", href, download: name, textContent: label})));
+  const editable = toolMaskable() && seg.mine;
+  $("vid-seg-edit").hidden = $("vid-seg-edit-bg").hidden = !editable;
+  vidSegDraw();
+}
+// a segmentation's answer (the synchronous one, or a job's content with its record) shown
+function vidSegAnswer(answer, req, path, seconds, rec) {
+  const urls = [], files = [];
+  const blobOf = (b64, type) => { const u = URL.createObjectURL(new Blob([Uint8Array.from(atob(b64), ch => ch.charCodeAt(0))], {type})); urls.push(u); return u; };
+  let overlay = null;
+  if (rec) {
+    files.push([tr("vid.segFileJson", "Masks (JSON)"), `v1/videos/${rec.id}/content`, `${rec.id}.json`]);
+    const fl = rec.files || {};
+    if (fl.overlay) overlay = `v1/videos/${rec.id}/content?variant=overlay`;
+    if (fl.mask) files.push([tr("vid.segFileMask", "Mask video"), `v1/videos/${rec.id}/content?variant=mask`, fl.mask]);
+    for (const o of answer.objects) if (fl[`object_${o.id}`]) files.push([tr("vid.segFileObj", "Object {id}'s mask", {id: o.id}), `v1/videos/${rec.id}/content?variant=object_${o.id}`, fl[`object_${o.id}`]]);
+  } else {
+    if (answer.overlay_video) overlay = blobOf(answer.overlay_video, "video/mp4");
+    if (answer.mask_union_video) files.push([tr("vid.segFileMask", "Mask video"), blobOf(answer.mask_union_video, "video/mp4"), "xestrata-masks.mp4"]);
+    for (const o of answer.objects) if (o.mask_video) files.push([tr("vid.segFileObj", "Object {id}'s mask", {id: o.id}), blobOf(o.mask_video, "video/mp4"), `xestrata-object-${o.id}.mp4`]);
+    delete answer.overlay_video; delete answer.mask_union_video;
+    for (const o of answer.objects) delete o.mask_video;
+    files.unshift([tr("vid.segFileJson", "Masks (JSON)"), (() => { const u = URL.createObjectURL(new Blob([JSON.stringify(answer)], {type: "application/json"})); urls.push(u); return u; })(), "xestrata-segmentation.json"]);
+  }
+  const mine = !!req && !!vidSrc;
+  const info = [`objects: ${answer.objects.map(o => `#${o.id} ${o.prompt || "click " + o.click}`).join(", ") || "none"}`,
+                `frames: ${answer.num_frames}`, `fps: ${fmt(answer.fps, 3)}`, answer.vfr ? `vfr: ${answer.vfr}` : "",
+                seconds != null ? `seconds: ${seconds}` : ""].filter(Boolean);
+  if (overlay) vidResult({url: overlay, name: rec ? `${rec.id}-overlay.mp4` : "xestrata-overlay.mp4", fps: answer.fps, req: req || {model: "sam3.1"}, mine,
+                          info: req ? vidInfo(req, path, info) : info.join("\n")});
+  else { vidResult(null); $("vid-info-box").hidden = false; $("vid-info").textContent = req ? vidInfo(req, path, info) : info.join("\n"); }
+  vidSegShow({answer, fps: answer.fps, mine, hidden: new Set(), gone: new Set(), urls, files});
+  if (mine) vidShow("source");
+}
+// the source's frame shown, with the objects kept (or all but them) as the mask, to the Images tab's edit
+async function vidSegEdit(background) {
+  const v = $("vid-src"), A = vidSeg && vidSeg.answer;
+  if (!A || !v.videoWidth) return;
+  v.pause();
+  const pic = document.createElement("canvas");
+  pic.width = v.videoWidth; pic.height = v.videoHeight;
+  pic.getContext("2d").drawImage(v, 0, 0);
+  const m = document.createElement("canvas");
+  m.width = A.width; m.height = A.height;
+  const g = m.getContext("2d"), img = g.createImageData(A.width, A.height);
+  const f = A.frames[Math.min(A.frames.length - 1, vidFrameAt(v.currentTime, vidSeg.fps))];
+  for (const it of (f && f.instances) || []) if (!vidSeg.gone.has(it.id) && !vidSeg.hidden.has(it.id)) vidPaintRle(img, it.mask.counts, A.width, A.height, [225, 29, 72], 255);
+  if (background) for (let p = 3; p < img.data.length; p += 4) { const on = img.data[p] === 0; img.data[p - 3] = 225; img.data[p - 2] = 29; img.data[p - 1] = 72; img.data[p] = on ? 255 : 0; }
+  g.putImageData(img, 0, 0);
+  await imgUseAsRef(pic.toDataURL("image/png"), `frame-${vidFrameAt(v.currentTime, vidSeg.fps)}.png`);
+  const c = $("img-mask-paint"), el = $("img-mask-img");
+  const paint = () => { c.getContext("2d").drawImage(m, 0, 0, c.width, c.height); };
+  if (el.complete && el.naturalWidth && c.width) paint(); else el.addEventListener("load", () => setTimeout(paint, 0), {once: true});
+}
+$("vid-seg-edit").onclick = () => vidSegEdit(false);
+$("vid-seg-edit-bg").onclick = () => vidSegEdit(true);
 
 // a video attached in the chat: sent to the server first (POST /v1/videos/files: the chat's tools take it from there,
 // upscale_video), then attached as a text of its link and what the server read of it, which the model sees

@@ -38,6 +38,8 @@ public:
     bool loaded() const { return loaded_; }
     /// Frees the scratch (the weights stay).
     void drop_scratch();
+    /// Waits for the work queued on its stream (what a caller reads of its results is there after).
+    void sync();
     /// Frees everything on the GPU (the next run loads the weights again).
     void release();
 
@@ -89,6 +91,10 @@ protected:
     /// A transposed 2 x 2 convolution of stride 2 (weight [c][o][2][2]) as the product to [(dy, dx, o)][c] and its bias.
     Lin deconv2(const std::string& name);
     const float* f32(const std::string& name);
+    /// Host values on the GPU (FP32), counted with the weights.
+    const float* upload(const std::vector<float>& v);
+    /// A linear layer from host weights w [n][k] and bias b ([n], or empty: none).
+    Lin lin_host(const std::vector<float>& w, const std::vector<float>& b, int64_t n, int64_t k);
     const uint16_t* f16(const std::string& name);
     std::vector<float> host_f32(const std::string& name);
 

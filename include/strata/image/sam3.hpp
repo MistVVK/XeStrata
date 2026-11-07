@@ -28,9 +28,12 @@
 #pragma once
 
 #include "strata/image/aux_net.hpp"
+#include "strata/image/img_crop.hpp"
 #include "strata/image/pipeline.hpp"
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,7 +45,11 @@ struct Segment {
     std::vector<uint8_t> mask;              // width x height, 255 inside
 };
 
+class Sam3Video;
+
 class Sam3 : public AuxNet {
+    friend class Sam3Video;   // a clip's run: the tracker's parts and the frame's features in its scratch
+
 public:
     explicit Sam3(const std::string& path);
 
@@ -58,10 +65,95 @@ public:
     /// What a run needs on the GPU beyond what it holds now (the weights when not loaded, the scratch not grown).
     uint64_t need_bytes(int64_t width, int64_t height) const;
 
+    /// run()'s parts, for a clip's run (sam3_video.cpp): the words' states (text; kept while the words are the same),
+    /// the detector on the trunk's frame (detect_neck, then detect: every query's probability, its box cx, cy, w, h
+    /// on [0, 1], the queries past `score_threshold` best first), then the masks' features (mask_prep) and the
+    /// queries' mask logits at the 4x level (mask_logits: logits [k][16 grid^2], FP32 on the GPU).
+    struct Detection {
+        std::vector<int64_t> keep;
+        std::vector<float> prob, box;
+    };
+    void text(const std::vector<int32_t>& ids);
+    /// keep: the 1x level kept, for detect_restore to put back before the next words' detect (which runs its
+    /// encoder in place there).
+    void detect_neck(bool keep = false);
+    void detect_restore();
+    Detection detect(float score_threshold);
+    void mask_prep();
+    void mask_logits(const int64_t* qs, int64_t k, float* logits);
+
+    // ---------------------------------------------------------------------------------------------- the video
+    // SAM 3.1's multiplex tracker (sam3_track.cpp): its parts, which a clip's run (sam3_video.cpp) puts together.  A
+    // frame's trunk is the detector's; the tracker reads it through necks of its own.  Up to M objects share a
+    // bucket (their masks, scores and pointers decoded at once); a clip of more has more buckets, B of them.
+    static constexpr int64_t kMux = 16;   // M: the objects a bucket holds (the checkpoint's multiplex count)
+
+    /// The tracker's weights onto the GPU (the detector's with them).
+    void track_load();
+    /// What a clip's run needs on the GPU beyond what it holds now: need_bytes' and the tracker's, `buckets` buckets.
+    uint64_t video_need_bytes(int64_t width, int64_t height, int64_t buckets) const;
+    /// A frame's trunk (the ViT's patches, kept for its necks) from a picture, resized and normalized as run()'s; or
+    /// from pixels already [3][1008][1008] on the host, taken as they are (the probe's).
+    void trunk(const QiRef& image, Filter filter = Filter::triangle);
+    void trunk_pixels(const float* chw);
+    /// The trunk's propagation features (the neck's 4x, 2x and 1x levels, d channels, [H][W][d]), kept for the frame;
+    /// their device pointers by level.
+    void track_features();
+    const float* track_level(int i) const;
+    /// The memory attention of B buckets: x [P][d] (the frame's 1x level) + 0.1 pos [P][d], attending to mem16
+    /// [B][N][2d] (a row: the frame's image features | its memory; an object pointer's: zeros | the pointer), its
+    /// first nsp rows the frames' (P a frame) at sine [P][d] + tpos [frame][d] (tpos null: sine is [nsp][d]), the
+    /// rest pointers at ptr_pos [(r - nsp) / per][d] -> out [B][P][d].
+    void mem_attention(const float* x, const float* pos, const uint16_t* mem16, int64_t B, int64_t N, int64_t nsp,
+                       const float* sine, const float* tpos, const float* ptr_pos, int64_t per, float* out);
+    /// The multiplex decoder over B buckets: img [B][P][d] (the frame's features after the memory attention), the
+    /// 4x and 2x levels hr0, hr1, each slot's validity valid [B M] -> masks [B][M T][P0] (logits at 4x), iou
+    /// [B][M][T], scores [B][M], the mask tokens [B][M][T][d] (device scratch, valid until the next call).
+    struct MuxOut {
+        float *masks = nullptr, *iou = nullptr, *score = nullptr, *tokens = nullptr;
+        int64_t T = 0, P0 = 0;
+    };
+    MuxOut mux_decode(const float* img, const float* hr0, const float* hr1, const std::vector<uint8_t>& valid,
+                      int64_t B);
+    /// The object pointers of tokens [n][d] (the propagation's projection, or the interactive one's), each taken to
+    /// the no-object pointer where its score [n] (host) is not above 0 -> ptr [n][d].
+    void pointers(const float* tokens, int64_t n, bool interactive, const std::vector<float>& score, float* ptr);
+    /// The memory encoder of B buckets: pix [P][d] (the frame's 1x level), masks [N][h][w] (logits; sigmoid_first:
+    /// the cond frame's own masks, resized after their sigmoid, else before), cond [N] (1: a clean mask), is_obj [N]
+    /// (host) -> mem [B][P][d] (FP32) and the same as FP16 into mem16 rows (its stride ld, at column `col`).
+    void mem_encode(const float* pix, const float* masks, int64_t N, int64_t h, int64_t w, bool sigmoid_first,
+                    const std::vector<float>& cond, const std::vector<float>& is_obj, int64_t B, float* mem,
+                    uint16_t* mem16, int64_t ld, int64_t col, const std::vector<float>* valid = nullptr);
+    /// The object pointers' time positions: the pointer projection of the 1D sine of t / (max_abs - 1), each t ->
+    /// out [n][d].
+    void ptr_positions(const std::vector<int64_t>& t, int64_t max_abs, float* out);
+    /// The memories' time positions [mem_frames()][d] (the device's), the memory frames a frame attends to at most.
+    const float* mem_tpos() const { return mem_tpos_; }
+    int64_t mem_frames() const { return mem_frames_; }
+    /// The sine positions of the 1x level [grid^2][d] (the device's), the memories' and the frame's.
+    const float* sine_positions() const { return sine_pos_; }
+    /// The memory encoder of a bucket from its input already made: mux16 [1152][1152][2M] (the masks' 2 sigmoid - 1,
+    /// then the cond channels), each slot's being an object [M] (the probe's) -> mem [P][d].
+    void mem_encode_muxed(const float* pix, const uint16_t* mux16, const std::vector<float>& slot_is_obj, float* mem);
+    /// The interactive decoder on masks [n][S][S] (0 or 1, S the image size): the frame's interactive neck's 1x level
+    /// with the no-memory embedding, each mask through the mask downsample and the prompt encoder -> their tokens [n]
+    /// [d] (the first mask token's) and scores [n] (host).
+    void interactive(const float* masks, int64_t n, float* tokens, std::vector<float>& score);
+    /// The interactive decoder on clicks: pts [n] (x, y on the 1008 picture's [0, 1]; label 0 out, 1 in, 2 and 3 a
+    /// box's top left and bottom right), on the frame's interactive features (no memory) with the object's mask
+    /// before (prev: its logits [4G][4G] on the GPU) or none -> its mask logits [16 grid^2] (host; none where its
+    /// score is not above 0), its token [d] (the GPU's; token null: none) and score (the logit).
+    float point_prompt(const std::vector<std::array<float, 3>>& pts, const float* prev, std::vector<float>& low,
+                       float* token);
+
 private:
     void load_weights() override;
     void vision(const QiRef& image);
-    void text(const std::vector<int32_t>& ids);
+    void trunk_from(const uint16_t* pix16);
+    std::vector<int32_t> text_ids_;   // the words whose states text() holds
+    // the states of the words text() made (FP32 then FP16 [T][d], the host's): a clip's several words each frame
+    static constexpr size_t kTextCache = 32;
+    std::map<std::vector<int32_t>, std::vector<uint8_t>> text_cache_;
     void attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, int64_t lq, int64_t lk, int64_t heads,
                    int64_t hd, int64_t q_row, int64_t k_row, int64_t v_row, uint16_t* out, int64_t batch = 1,
                    const float* bias = nullptr, bool causal = false);
@@ -94,6 +186,74 @@ private:
         Conv c1, c3;
     };
     Attn attn(const std::string& name);
+    /// The neck `set` on the trunk into out[3] (4x, 2x, 1x; [H][W][d] FP32).
+    void neck(const std::vector<Fpn>& set, float* const out[3]);
+    std::vector<Fpn> neck_of(const std::string& prefix);
+
+    // the tracker's parts
+    struct Mlp {   // ReLU between its layers
+        std::vector<Lin> l;
+    };
+    struct TwoWayLayer {
+        Lin sq, sk, sv, so, tq, tk, tv, to, iq, ik, iv, io, fc1, fc2;
+        Norm n1, n2, n3, n4;
+    };
+    struct MaskDecoder {
+        std::vector<TwoWayLayer> layers;
+        Lin fq, fk, fv, fo;
+        Norm nf;
+        std::vector<float> obj, iou, mask;   // the tokens (host), rows of d
+        Lin up1, up2, s0, s1;
+        Norm ln1;
+        std::vector<Mlp> hyper;
+        Mlp iou_head, score_head;
+        int64_t M = 1, T = 4;   // the objects at once, the masks an object
+    };
+    struct MemLayer {
+        Lin qkv, so, cq_img, cq, ck, cv, co, fc1, fc2;
+        Norm n1, n2, n3;
+    };
+    struct CxBlock {
+        const float *dw = nullptr, *dwb = nullptr, *gamma = nullptr;
+        Norm n;
+        Lin pw1, pw2;
+    };
+    MaskDecoder decoder(const std::string& p, int64_t M, int64_t T);
+    Mlp mlp(const std::string& p);
+    void mlp_run(const Mlp& m, const uint16_t* x16, int64_t rows, float* y);
+    /// The two-way transformer of a decoder over B batches: queries q [B][Nt][d] (tokens qpe [B][Nt][d] their
+    /// positions), keys k [B][P][d] at kpe [P][d]; both updated in place.
+    void two_way(const MaskDecoder& m, int64_t B, int64_t Nt, float* q, const float* qpe, float* k, const float* kpe);
+    /// A decoder's heads on one batch (sam3_track.cpp), and the prompt encoder's dense embedding of a mask's logits.
+    void mask_heads(const MaskDecoder& m, const float* qb, int64_t Nt, const float* kb, const float* s0,
+                    const float* s1, float* masks, float* iou, float* score);
+    void mask_dense(const float* low, float* out);
+    float* track_scratch(int slot, size_t bytes);
+    void encode_bucket(const float* pix, const uint16_t* mux16, const std::vector<float>& slot_is_obj, float* mem,
+                       uint16_t* mem16, int64_t ld, int64_t col);
+    int64_t P_() const { return grid_ * grid_; }
+
+    std::vector<Fpn> prop_, inter_;
+    MaskDecoder mdec_, idec_;
+    std::vector<MemLayer> mem_;
+    Norm mem_norm_;
+    std::vector<Conv> mds_;
+    std::vector<Norm> mds_ln_;
+    Lin mds_out_, pix_proj_;
+    std::vector<CxBlock> fuser_;
+    Mlp ptr_proj_, iptr_proj_;
+    Lin no_obj_ptr_, tpos_proj_;
+    const float* mem_tpos_ = nullptr;
+    int64_t mem_frames_ = 7;
+    Conv imds_, pe_c0_, pe_c1_;
+    Norm pe_ln0_, pe_ln1_;
+    Lin pe_c2_;
+    std::vector<float> no_mask_, prompt_gauss_;
+    std::array<std::vector<float>, 4> point_emb_;   // the clicks' labels: out, in, a box's two corners
+    std::vector<float> not_point_, no_mem_, valid_emb_, invalid_emb_, no_obj_spatial_;
+    const float* dense_pe_ = nullptr;    // the multiplex decoder's image positions [P][d]
+    const float* prompt_pe_ = nullptr;   // the prompt encoder's [P][d]
+    bool track_loaded_ = false;
 
     // the ViT
     Conv patch_conv_;

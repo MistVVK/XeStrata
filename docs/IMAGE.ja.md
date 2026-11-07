@@ -391,6 +391,76 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
   どちらの道具も LoRA の欄を持たず、会話から作る画像にはアダプターを当てません。
 
+## 動画
+
+画像を設定したサーバーでは、動画を大きくすること（SeedVR2 ほか）と、動画の中の物体を探して追うこと（SAM 3.1）もできます。Web のページの Video のタブ、チャット、API（vLLM-Omni 互換）から使えます。
+
+- 動画の読み書きには ffmpeg と ffprobe を使います（サーバーの PATH にあるもの。`STRATA_FFMPEG`・`STRATA_FFPROBE` でも指定できます）。XeStrata には入っていません。無いときは動画の道具だけが使えず、`xestrata --setup` が入れ方を案内します。
+- 読む動画: ffmpeg が読めるもの（MP4、WebM、MOV、MKV など）です。
+   - 回転の情報があれば、その向きに直して読みます。
+   - フレームの間隔が一定でない動画（VFR）は、平均の fps で読み直し（フレームを間引くか繰り返す）、応答にそう書きます。
+   - 10 ビットの SDR は 8 ビットで読みます。HDR（PQ・HLG）は、SDR に直すと見た目が変わるので断り、理由を返します。
+- 書く動画: H.264 の MP4 です（ffmpeg に H.264 のエンコーダーが無いときは VP9 の WebM）。可逆の FFV1 の MKV も選べます。元の動画の音声は入れます（その容器に入らない形式は AAC か Opus に直します）。
+- 上限は 2 段です。
+   - その場で答える API（`/v1/videos/sync` と `/v1/videos/segmentations`）は、vLLM-Omni と同じく 2048 フレーム、アップロード 512 MiB までです。超えると 400 を返します（ジョブにすれば通ります）。
+   - ジョブ（`/v1/videos` と、`job` を付けた切り出し）は結果をディスクに書くので、フレーム数は問いません。アップロードの上限は設定の `video.max_upload_mib` で、既定はディスクの空きから 2 GiB を引いた大きさです。
+   - RAM と VRAM は数フレームずつ流して使うので、フレーム数に比例しません。
+- ジョブは 1 つずつ、画像の仕事と同じ GPU の順番で動きます。記録とファイルは、既定の画像のモデルのフォルダーの `video-jobs/<id>/` に、消すまで残ります。
+- 動画のジョブの間も、チャットは割り込んで答えます（拡大は塊の切れ目で、切り出しは 1 秒ごと。いつもより少し遅れます）。文章のモデルが場所を空けて動いているときは、終わるまで待たせ、残りのおよその秒数を返します。
+
+### Video のタブとチャット
+
+**Video のタブ**: 動画を選ぶか、タブにドロップします。
+
+- **Upscale**: 拡大の手段、倍率、色の補正、種、SeedVR2 の塊（フレーム数と重なり）を選びます。20 秒以下の動画はその場で答え、長いものはジョブにします。
+- **Find objects**: 探すものを短い英語の言葉で書きます（`person, red car` のようにカンマで区切って複数）。
+   - 点と箱: 動画を止めて、「Point: in」（含める）・「Point: out」（除く）・「Box」（箱）を選び、動画の上をクリックかドラッグします。指示は時刻つきで並び、押すと消えます。
+   - 「They make or fix」で、指示が新しい物体を作るか、前の結果の物体を直すかを選びます。「New object」で新しい物体を足します。新しい物体の指示は、1 つのフレームにまとめて置きます。
+   - 作る動画: 物体に色を重ねた動画、全物体のマスクの動画 1 本、物体ごとのマスクの動画を選べます。フレームごとのマスクは、いつも JSON で届きます。
+   - 結果: 物体の一覧（色・ID・言葉）で、物体ごとに表示・非表示と外すを切り替えられ、マスクは元の動画の上に重ねて再生されます。重ねの動画は Result で再生でき、JSON とマスクの動画を保存できます。
+   - 「このフレームのこの物体を編集」「このフレームの背景を編集」で、止めたフレームと、物体（または背景）のマスクを Images のタブの編集に送ります。
+- 元と結果を切り替えるか並べ、1 フレームずつ送れます。下のジョブの一覧に、このページと API のジョブの状態、進み具合、残り時間が出て、開く・保存・取り消し・削除ができます。
+
+**チャット**: 入力欄に動画を添付すると、サーバーに送り（`POST /v1/videos/files`。1 週間残します）、そのリンクを会話に入れます。会話に動画があるときは、モデルに次の道具を渡します。
+
+- `upscale_video`: 動画を大きくするジョブを始めます（引数は `scale`・`method`・`variant`・`seed`）。
+- `segment_video`: 物体を探して追うジョブを始めます（引数は探すものの `prompts` と、物体ごとのマスクの動画を作る `masks`）。重ねの動画・マスクの動画・JSON の場所を答えます。
+
+どちらもジョブの ID と結果の場所を答え、ジョブはチャットと関係なく進みます。設定の `image_tools` での名前は `upscale_video` と `segment_video` です（`segment_video` を外すと `/v1/videos/segmentations` も止まります）。
+
+### 動画の拡大（`POST /v1/videos`、`POST /v1/videos/sync`）
+
+vLLM-Omni の動画の形です。multipart で次を送ります。
+
+- `input_references`（または `video`）: 動画のファイル。
+- `model`: 画像の拡大と同じ名前（`seedvr2-7b`・`seedvr2-7b-sharp`・`seedvr2-3b`・`realesrgan-x4plus`・`lanczos`・`auto`）。既定の `auto` は SeedVR2 で、GPU のメモリに入らないときは RealESRGAN です。
+- `size`（`幅x高さ`）か `scale`（既定 2）、`seed`。
+- `extra_params`: 色の補正 `color_correction_method`（`none`・`lab`・`adain`・`wavelet`）と、XeStrata の拡張の `chunk_frames`（SeedVR2 の塊のフレーム数。4n + 1。既定は GPU に入るだけ）・`temporal_overlap`（塊の重なり。潜在のフレームで、1 つが 4 フレーム）・`video_codec`（`h264`・`vp9`・`ffv1`）。
+
+SeedVR2 は動画を時間の塊で通し、塊の重なりは潜在で混ぜます（ComfyUI の SeedVR2TemporalMerge と同じ）。VAE は時間の端を次の塊に持ち越して切れ目なく通し、大きなフレームはタイルに分けます。RealESRGAN と Lanczos はフレームごとです。色の補正は、フレームごとにその元のフレームに合わせます。
+
+- `/v1/videos/sync` は動画そのものを返します。ヘッダーの `X-Video-Frames`・`X-Video-Fps`、平均の fps で読み直したときは `X-Video-Vfr` が付きます。
+- `/v1/videos` はジョブで、OpenAI の Videos API の形の記録（`id`、`status` が `queued`・`in_progress`・`completed`・`failed`、`progress`）をすぐ返します。
+   - `GET /v1/videos/{id}` で記録を、`GET /v1/videos/{id}/content` で結果のファイルを取ります（`Range` で一部も取れます）。
+   - `GET /v1/videos`（`limit`・`after`・`order`）で一覧を、`DELETE /v1/videos/{id}` で消します（動いているジョブは止めます）。
+   - 終わった記録の `result` に、かかった秒数とその内訳が入ります。
+
+### 動画の物体を探す（`POST /v1/videos/segmentations`）
+
+vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画のファイル）・`prompt`（探すものの言葉）・`prompts`（ほかの言葉の JSON の配列。16 個まで）・`mask_video`（`true` で物体ごとのマスクの動画も返す）・`model`（`sam3.1`）を送ります。SAM 3.1 の SAM License への同意が要ります（画像の言葉からマスクと同じ）。
+
+- 応答は `created`・`model`・`width`・`height`・`num_frames`・`fps`・`objects`・`frames` です。
+   - `objects[]`: 物体の `id` と、見つけた言葉の `prompt`。`mask_video` を付けたときは、その物体のマスクの動画（白が中。H.264 の MP4）の base64。
+   - `frames[]`: フレームの番号 `frame_index` と、そのフレームの物体 `instances[]`（`id`、見つけたときの `score`、`box`（画素の x0・y0・x1・y1。x1・y1 は最後の画素）、`mask`（COCO の圧縮しない RLE: `size` と、列の順の連続の長さ。背景から始まる））。
+- 言葉はそれぞれ別に探し、同じ言葉で見つけた物体どうしだけを照らし合わせます。物体は合わせて 16 個までです。
+- 拡張の欄（XeStrata）:
+   - `prompts` の要素を `{"prompt": "...", "frame": n}` にすると、その言葉は n フレーム目から探します。
+   - `clicks`: 点と箱の指示の JSON の配列です。要素は `frame`（または秒の `time`）、`object`（直す物体の ID。付けないと新しい物体）、`points`（`[[x, y, 1 か 0], ...]`。1 は含める、0 は除く）、`box`（`[x0, y0, x1, y1]`）で、座標は動画の画素です。指示の物体はそのフレームから追い、すぐに出し、検出と合わなくても消しません。応答の `objects[]` では `prompt` が空で、`click` に指示の番号が入ります。
+   - `outputs`: `["overlay"]`（物体に色を重ねた動画。音声つき）と `["mask"]`（全物体のマスクの動画 1 本）を頼めます。応答の `overlay_video`・`mask_union_video` に base64 で入ります。
+   - `job`: `true` でジョブにします（記録をすぐ返します）。答えの JSON は `GET /v1/videos/{id}/content`、動画は `?variant=overlay`・`mask`・`object_<id>` で取ります。
+   - `video_url`: チャットに添付した動画（`/v1/videos/files/...`）を、アップロードの代わりに使います。
+- SAM 3.1 は Meta の既定どおりに動かします（multiplex の追跡器、検出の点数 0.4、確かめが 3 フレーム続いた物体だけを出す、16 フレームごとの付け直し）。
+
 ## LoRA（アダプター）
 
 画像のモデルに、ComfyUI などが配っている LoRA を、画像を作るたびに当てられます。

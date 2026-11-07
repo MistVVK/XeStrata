@@ -30,7 +30,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 - **Everything in one install:** `xestrata --setup` (on Windows, `xestrata.exe`'s install screen) asks for the text model, whether it should read pictures and which models should make images, and downloads them together.
   For the image models, Enter installs three: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image.
   Whatever is installed is used at one address, `http://127.0.0.1:8095`:
-  the browser app (Chat, Images, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image API (vLLM-Omni-compatible); asked in the chat, it makes images as well.
+  the browser app (Chat, Images, Tools, Video, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image and video API (vLLM-Omni-compatible); asked in the chat, it makes images as well, and makes a video larger or finds the objects in it.
 - The image models are Qwen-Image-2.1, Mage-Flow, MageTrail, HunyuanImage 3.0, MOSS-Image and Anima, and each goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models).
 
 ## About XeStrata

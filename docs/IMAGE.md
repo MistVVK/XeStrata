@@ -391,6 +391,76 @@ Words to masks and removing the background run in the image jobs' GPU turn and a
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
   Neither tool has a LoRA field: an image made from the chat applies no adapter.
 
+## Video
+
+A server with images set up can also make a video larger (SeedVR2 and the others) and find and follow the objects in a video (SAM 3.1). Both are in the web page's Video tab, in the chat and in the API (vLLM-Omni-compatible).
+
+- Videos are read and written with ffmpeg and ffprobe (the ones on the server's PATH, or those `STRATA_FFMPEG` and `STRATA_FFPROBE` name). XeStrata does not include them. Without them only the video tools are unavailable, and `xestrata --setup` says how to install them.
+- The videos read: whatever ffmpeg reads (MP4, WebM, MOV, MKV and the like).
+   - A rotation in the file is applied as it is read.
+   - A video whose frame rate varies (VFR) is read again at its average rate (frames dropped or repeated), and the answer says so.
+   - 10-bit SDR is read as 8 bits. HDR (PQ, HLG) is refused with the reason: mapping it to SDR changes how it looks.
+- The videos written: H.264 in MP4 (VP9 in WebM where ffmpeg has no H.264 encoder), or lossless FFV1 in MKV when asked. The source's sound is kept (made AAC or Opus where the container takes no other).
+- The limits come in two tiers.
+   - The APIs that answer at once (`/v1/videos/sync` and `/v1/videos/segmentations`) take what vLLM-Omni's do: 2048 frames and an upload of 512 MiB. Past them they answer 400 (a job takes it).
+   - A job (`/v1/videos`, and a segmentation with `job`) writes its result to the disk, so its frames are not counted. Its upload's limit is the setting `video.max_upload_mib`, by default the disk's free space less 2 GiB.
+   - RAM and VRAM are used a few frames at a time, so they do not grow with the frames.
+- Jobs run one at a time, in the image jobs' turn on the GPU. Their records and files stay in the default image model's folder, `video-jobs/<id>/`, until deleted.
+- While a video job runs, the chat still answers between its steps (an upscale's chunks, a segmentation's every second), a little later than usual. Where the text model made way for the job, the chat waits until it ends and is told about how many seconds are left.
+
+### The Video tab and the chat
+
+**The Video tab**: choose a video, or drop one on the tab.
+
+- **Upscale**: the upscaler, the scale, the color correction, the seed and SeedVR2's chunks (their frames and overlap). A video of 20 seconds or less is answered at once, a longer one becomes a job.
+- **Find objects**: the things to find, as short English words (several separated by commas: `person, red car`).
+   - Points and boxes: pause the video, choose "Point: in", "Point: out" or "Box", and click or drag on the video. The clicks are listed with their times; clicking one removes it.
+   - "They make or fix" chooses whether the clicks make a new object or fix one of the last result's objects; "New object" adds another new object. A new object's clicks go on one frame.
+   - The videos to make: the video with the objects colored over it, one mask video of every object, a mask video of each object. The frames' masks always come as JSON.
+   - The result: the objects listed (color, ID, words), each shown, hidden or left out, their masks drawn over the source as it plays. The overlay video plays as the Result; the JSON and the mask videos can be saved.
+   - "Edit these objects in this frame" and "Edit the background in this frame" send the paused frame and the objects' (or the background's) mask to the Images tab's edit.
+- The source and the result can be switched or shown side by side, and stepped a frame at a time. The jobs below (this page's and the API's) show their state, progress and time left, and can be opened, saved, cancelled or deleted.
+
+**The chat**: a video attached in the input box is sent to the server (`POST /v1/videos/files`, kept a week) and its link goes into the conversation. While the conversation has a video, the model gets these tools:
+
+- `upscale_video`: starts a job that makes the video larger (its arguments `scale`, `method`, `variant` and `seed`).
+- `segment_video`: starts a job that finds and follows the objects (its arguments `prompts`, what to find, and `masks`, a mask video of each object too). It answers where the overlay video, the mask videos and the JSON will be.
+
+Both answer the job's ID and where its result will be; the job goes on whatever the chat does. In the setting `image_tools` they are `upscale_video` and `segment_video` (leaving `segment_video` out turns `/v1/videos/segmentations` off too).
+
+### Upscaling a video (`POST /v1/videos`, `POST /v1/videos/sync`)
+
+vLLM-Omni's video form, multipart:
+
+- `input_references` (or `video`): the video file.
+- `model`: the image upscale's names (`seedvr2-7b`, `seedvr2-7b-sharp`, `seedvr2-3b`, `realesrgan-x4plus`, `lanczos`, `auto`). The default `auto` is SeedVR2, or RealESRGAN where SeedVR2 does not fit the GPU's memory.
+- `size` (`WIDTHxHEIGHT`) or `scale` (2 by default), and `seed`.
+- `extra_params`: the color correction `color_correction_method` (`none`, `lab`, `adain`, `wavelet`) and XeStrata's `chunk_frames` (SeedVR2's frames a chunk, 4n + 1; by default as many as the GPU holds), `temporal_overlap` (the chunks' overlap in latent frames of 4 frames) and `video_codec` (`h264`, `vp9`, `ffv1`).
+
+SeedVR2 takes the video in chunks of time, their overlaps blended in the latents (as ComfyUI's SeedVR2TemporalMerge does). Its VAE carries the edge in time over to the next chunk, so there is no seam, and takes large frames in tiles. RealESRGAN and Lanczos go frame by frame. The color correction matches each frame to its source frame.
+
+- `/v1/videos/sync` answers the video itself, with the headers `X-Video-Frames`, `X-Video-Fps` and, for a video read at its average rate, `X-Video-Vfr`.
+- `/v1/videos` makes a job and answers its record at once, in the shape of OpenAI's Videos API (`id`, `status`: `queued`, `in_progress`, `completed` or `failed`, `progress`).
+   - `GET /v1/videos/{id}` gives the record, `GET /v1/videos/{id}/content` the result's file (a part of it with `Range`).
+   - `GET /v1/videos` (`limit`, `after`, `order`) lists the jobs, `DELETE /v1/videos/{id}` deletes one (stopping it if it runs).
+   - A completed record's `result` has the seconds it took and their parts.
+
+### Finding the objects in a video (`POST /v1/videos/segmentations`)
+
+vLLM-Omni's video segmentation: multipart `video` (the file), `prompt` (the words of what to find), `prompts` (other words, a JSON array; 16 at most), `mask_video` (`true`: each object's mask video too) and `model` (`sam3.1`). It needs SAM 3.1's SAM License agreed to, as the image's words to masks does.
+
+- The answer has `created`, `model`, `width`, `height`, `num_frames`, `fps`, `objects` and `frames`.
+   - `objects[]`: each object's `id` and the words that found it (`prompt`); with `mask_video`, its mask video (white inside, H.264 in MP4) in base64.
+   - `frames[]`: each frame's `frame_index` and its objects, `instances[]`: `id`, `score` (when it was found), `box` (pixels x0, y0, x1, y1, x1 and y1 the last pixels) and `mask` (COCO's uncompressed RLE: `size`, and the runs down the columns, the first the background's).
+- Each of the words is looked for on its own, and an object is matched only with the objects its own words found. There are 16 objects at most in all.
+- XeStrata's fields:
+   - A `prompts` entry `{"prompt": "...", "frame": n}` looks for those words from frame n on.
+   - `clicks`: points and boxes, a JSON array of `frame` (or `time`, in seconds), `object` (the ID of an object to fix; without it, a new object), `points` (`[[x, y, 1 or 0], ...]`: 1 in, 0 out) and `box` (`[x0, y0, x1, y1]`), on the video's pixels. A clicked object is followed from that frame on, shown at once, and kept whatever the detector finds. In `objects[]` its `prompt` is empty and its `click` is the entry's index.
+   - `outputs`: `["overlay"]` (the video with the objects colored over it, its sound kept) and `["mask"]` (one mask video of every object), in base64 in the answer's `overlay_video` and `mask_union_video`.
+   - `job`: `true` makes it a job (its record answered at once). The answer's JSON is at `GET /v1/videos/{id}/content`, the videos at `?variant=overlay`, `mask` and `object_<id>`.
+   - `video_url`: a video attached in the chat (`/v1/videos/files/...`), instead of an upload.
+- SAM 3.1 runs with Meta's defaults: the multiplex tracker, a detection score of 0.4, only objects confirmed in 3 frames in a row shown, conditioning again every 16 frames.
+
 ## LoRA (adapters)
 
 An image model can apply a LoRA that ComfyUI and the like distribute, each time it makes an image.

@@ -133,8 +133,10 @@ void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float
                     bool relu, float* y, uint16_t* y16, float* part, void* stream);
 
 /// masks [K][H][W] = 255 where the sigmoid of logits [K][h][w], resized to H x W bilinearly (torch's
-/// align_corners=False, the probabilities resized), passes `threshold`, else 0.
-void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64_t H, int64_t W, float threshold,
+/// align_corners=False; the probabilities resized, or with `as_logits` the logits themselves, as SAM 3's video
+/// outputs are), passes `threshold` (with `as_logits`, a logit), else 0.
+void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64_t H, int64_t W, bool as_logits,
+                     float threshold,
                      uint8_t* masks, void* stream);
 
 /// SAM 3's box relative position bias: for each of Q boxes (xyxy in [0, 1]), the rows' and the columns' distances
@@ -204,5 +206,36 @@ void aux_box_mean(const float* x, int64_t H, int64_t W, int64_t C, int64_t k, fl
 /// RGB8 into rgb (255 F truncated, as torch's to(uint8)) when given.
 void aux_fg_combine(const uint8_t* rgba, const uint8_t* alpha, const float* y, int64_t n, float* fb, uint8_t* rgb,
                     void* stream);
+
+// SAM 3.1's video tracker (sam3_track.cpp)
+
+/// y [H][W][C] = the depthwise k x k convolution of x [H][W][C] (zero padding k / 2), w [C][k][k], b [C].
+void aux_dwconv(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, int k, float* y,
+                void* stream);
+/// x [n][C] += g [C] * y [n][C] (a block's scaled residual).
+void aux_scale_add(float* x, const float* y, const float* g, int64_t n, int64_t C, void* stream);
+/// x [n] = v.
+void aux_fill(float* x, int64_t n, float v, void* stream);
+/// y16 [N][heads hd] = y (+ add [P][C] at row r % P, where not null) turned by the 2D axial RoPE of
+/// aux_rope2d_split16 at the position r % (grid grid): a query's rows, a bucket of P after another.
+void aux_rope2d16(const float* y, const float* add, int64_t P, int64_t N, int64_t heads, int64_t hd, int64_t grid,
+                  float theta, uint16_t* y16, void* stream);
+/// The memory attention's keys of B buckets of N rows each: a bucket's first nsp rows the frames' memories (P rows
+/// a frame) + sine [P][C] + tpos [frame][C], turned by aux_rope2d16's RoPE at r % P; the rest its object pointers +
+/// ptr_pos [(r - nsp) / per][C], not turned.  y [B][N][C] -> k16.  tpos null: sine is the spatial rows' whole
+/// positions [nsp][C] (the probe's).
+void aux_mem_key16(const float* y, int64_t B, int64_t N, int64_t nsp, int64_t P, const float* sine, const float* tpos,
+                   const float* ptr_pos, int64_t per, int64_t heads, int64_t hd, int64_t grid, float theta,
+                   uint16_t* k16, void* stream);
+/// The memory encoder's input of B buckets of M slots: y16 [B][H][W][2M], channel s the mask of object b M + s
+/// (masks [N][h][w] logits resized bilinearly to H x W, align_corners false; its sigmoid taken before the resize
+/// with `sigmoid_first`, else after) as 2 sigmoid - 1, channel M + s its cond [N] value; a slot past N, or whose
+/// valid [N] is 0 (a removed object's; valid null: all valid), zeros.
+void aux_mux_masks16(const float* masks, int64_t N, int64_t h, int64_t w, int64_t H, int64_t W, bool sigmoid_first,
+                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream);
+/// y [n] = 1 where x > 0, else 0.
+void aux_binarize(const float* x, int64_t n, float* y, void* stream);
+/// y16 [R][C] = src [T][R][C]'s rows r of block r % T (each row its own hypernetwork's output).
+void aux_mod_select16(const float* src, int64_t T, int64_t R, int64_t C, uint16_t* y16, void* stream);
 
 }  // namespace strata::image

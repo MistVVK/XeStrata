@@ -3174,6 +3174,28 @@ class ImageGen:
                 self._say(f"video job failed: {why}")
                 raise ImageJobFailed(why) from e
 
+    def segment_video(self, weights: Path, source: Path, prompts: Path, stem: Path, seg: dict,
+                      cancel: threading.Event | None = None, progress=None) -> dict:
+        """A video's segmentation (serve/videos.py): the engine's SEGV of SAM 3.1 (`weights`) on the file `source`
+        with the prompts file, its JSON lines and videos at `stem` + .jsonl and the rest, `progress` told each frame
+        -> the engine's figures (json, objects, masks, mask, overlay, frames, fps, vfr and the parts' seconds)."""
+        timeout = float(self.cfg.get("video_timeout_s") or 7 * 86400)
+        words = (" MASKS:1" if seg.get("mask_video") else "") + \
+            (" MASK:1" if "mask" in seg.get("outputs", ()) else "") + \
+            (" OVERLAY:1" if "overlay" in seg.get("outputs", ()) else "") + \
+            (" YIELD:1" if self.yield_turn is not None else "")   # the chat's requests run between frames
+        with self.lock:
+            self._ready()
+            self._live(stage="segment-video", sampling_at=None)
+            try:
+                return self.engine.ask(f"SEGV {weights} {source} {prompts} {stem}" + words, "SEGVIDEO", timeout,
+                                       cancel, progress, pause=self.yield_turn)
+            except ImageJobFailed as e:
+                self.totals["failed"] += 1
+                why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
+                self._say(f"video job failed: {why}")
+                raise ImageJobFailed(why) from e
+
     def aux_ask(self, line: str, want: str, timeout: float = 600) -> dict:
         """One request of the image tools' auxiliary models (image_regions: SEGMENT, FLORENCE, POLYMASK, MATTE) -> its
         answer's fields."""
@@ -3437,7 +3459,8 @@ class ImageGen:
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
                     "refs": "Reading the reference images",
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)",
-                    "upscale": "Upscaling", "upscale-video": "Upscaling a video", "segment": "Finding the region",
+                    "upscale": "Upscaling", "upscale-video": "Upscaling a video",
+                    "segment-video": "Finding objects in a video", "segment": "Finding the region",
                     "matte": "Removing the background"}
 
     def begin(self, job: dict) -> None:
@@ -3665,6 +3688,17 @@ TOOLS: list[dict[str, Any]] = [
          "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
          "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
          "seed": {"type": "integer"}}}},
+    {"name": "segment_video",
+     "description": "Find and follow objects through a video the user attached (SAM 3.1): each named thing, every "
+                    "instance of it, on every frame; makes a video with them colored over it, and their masks. It "
+                    "runs as a job on the server: the answer says where the user follows it; do not wait for it.",
+     "parameters": {"type": "object", "properties": {
+         "prompts": {"type": "array", "items": {"type": "string"},
+                     "description": 'short English noun phrases of what to find, e.g. ["person", "red car"]'},
+         "video": {"type": "string",
+                   "description": "a /v1/videos/files/... link; default the conversation's last video"},
+         "masks": {"type": "boolean", "description": "also a black-and-white mask video of each object"}},
+         "required": ["prompts"]}},
     {"name": "fix_image",
      "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer); the rest of "
                     "the image kept.",
@@ -3924,8 +3958,8 @@ class ImageTools:
             # they were drawn on is the canvas' background only); with a mask too, the painted part is redrawn by them
             if t["name"] == "edit_image" and self.user.get("layout") is not None and self.user.get("mask") is None:
                 continue
-            if t["name"] == "upscale_video" and self._video("") is None:   # offered for a video in the conversation
-                continue
+            if t["name"] in ("upscale_video", "segment_video") and self._video("") is None:
+                continue   # offered for a video in the conversation
             t = dict(t)
             if self.skills == "inline":
                 styles, rules = self._skill_groups(gens)
@@ -4222,6 +4256,38 @@ class ImageTools:
         return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
                 "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "upscale_video", "images": []}
 
+    def _segment_video_tool(self, args: dict, t0: float) -> dict:
+        """segment_video: a segmentation job on the video (videos.start_from_file), the overlay and the answer's links
+        the call's result at once; the job runs on the server past this answer."""
+        from serve import videos
+        text, ok = "", False
+        try:
+            f = self._video(str(args.get("video") or ""))
+            if f is None:
+                raise ImageRequestError("there is no video in the conversation (or it is no longer kept: attach it "
+                                        "again)")
+            prompts = args.get("prompts") or []
+            if isinstance(prompts, str):
+                prompts = [prompts]
+            fields = {"prompts": json.dumps([str(p) for p in prompts]), "outputs": json.dumps(["overlay", "mask"]),
+                      "mask_video": "true" if args.get("masks") else "false"}
+            check_tool(self.gen.cfg, "segment_video")
+            rec = videos.start_from_file(self.svc, videos.jobs_of(self.svc), f, fields, self.gen.cfg, "segment")
+            src = rec["source"]
+            base = f"/v1/videos/{rec['id']}/content"
+            text = (f"The segmentation runs on the server as job {rec['id']}: {src['frames']} frames, finding "
+                    f"{', '.join(map(str, prompts))}. The user follows it in the Video tab; once done the video with "
+                    f"the objects colored over it will be at {base}?variant=overlay, one mask video of them all at "
+                    f"{base}?variant=mask" + (f", each object's at {base}?variant=object_<id>" if args.get("masks")
+                                              else "") +
+                    f", and every frame's objects (vLLM-Omni's JSON) at {base}. Tell the user so; the job goes on "
+                    "whatever this chat does.")
+            ok = True
+        except (ValueError, ImageJobFailed, videos.VideoRequestError) as e:
+            text = f"error: {e}"
+        return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "segment_video", "images": []}
+
     def _aux_tool(self, name: str, args: dict, t0: float, cancel: threading.Event | None) -> dict:
         """find_region (the region marked on the image: image_regions.segment) and remove_background (BiRefNet's
         cut-out, image_regions.matte): an image shown to the user, nothing drawn by the image model."""
@@ -4296,6 +4362,8 @@ class ImageTools:
             return self._aux_tool(name, args, t0, cancel)
         if name == "upscale_video":
             return self._video_tool(args, t0)
+        if name == "segment_video":
+            return self._segment_video_tool(args, t0)
         urls: list[str] = []
         found: dict | None = None
         try:

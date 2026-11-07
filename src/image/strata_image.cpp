@@ -130,6 +130,16 @@
 //   SEGMENT <weights> <picture> <ids> <score threshold> <mask threshold> <masks>
 //                            SAM 3: the instances of the words (CLIP's ids), highest score first, each mask written to
 //                            <masks>.<i> (width x height bytes, 255 inside)  -> SEGMENT n=... segment_s=... boxes=...
+//   SEGV <weights> <video> <prompts> <out stem> [MASKS:1] [MASK:1] [OVERLAY:1] [CODEC:<h264|vp9|ffv1>] [YIELD:1]
+//                            SAM 3.1's video segmentation (sam3_video.hpp) of the prompts file's words ("W <from frame>
+//                            <ids>") and clicks ("C <frame> <object or -1> <x,y,label,...>"), each frame's instances a
+//                            JSON line of <out stem>.jsonl (vLLM-Omni's frames: id, score, box, COCO RLE); MASKS:1 a
+//                            mask video an object (<out stem>.obj<id>), MASK:1 one of them all, OVERLAY:1 the clip with
+//                            them over it (its audio kept).  YIELD:1: YIELD between frames each second, on at RESUME
+//                            -> STAGE segment-video, STEP <frames> <frames>, then SEGVIDEO json=... objects=<id>:w<i>|
+//                            c<i>,... [masks=<id>:<path>,...] [mask=... mime=...] [overlay=...] frames=... width=...
+//                            height=... fps=... vfr=... segment_s=... read_s=... trunk_s=... detect_s=... track_s=...
+//                            rules_s=... output_s=... write_s=...
 //   FLORENCE <weights> <picture> <ids> <beams> <max new>
 //                            Florence-2: the tokens it answers the task's ids (BART's) with  -> FLORENCE ids=... ...
 //   POLYMASK <width> <height> <out> <x,y,x,y,...>...
@@ -137,8 +147,9 @@
 //   MATTE <weights> <picture> <model width> <model height> <out> [REFINE]
 //                            BiRefNet: the alpha (width x height bytes) to <out>; REFINE, the foreground's colors
 //                            (RGB8) to <out>.fg too                                    -> MATTE matte_s=... ...
-//   AUXNEED <sam3|florence|birefnet> <weights> <width> <height> [<beams> <max new> | <model width> <model height>
-//           <refine 0|1>]    the VRAM that run needs beyond what the engine holds             -> NEED as NEED's
+//   AUXNEED <sam3|sam3video|florence|birefnet> <weights> <width> <height> [<buckets> | <beams> <max new> |
+//           <model width> <model height> <refine 0|1>]
+//                            the VRAM that run needs beyond what the engine holds             -> NEED as NEED's
 // Each runs in the room the image model's budget leaves (its cache given back first, then its parts, where that is too
 // little; ERROR memory: ... when even that is), its scratch freed after it; its weights kept for the next while a
 // quarter of the GPU's memory stays free, and let go before the next image job (IMG, NEED, RATIO, UPS, UPSNEED).
@@ -176,10 +187,12 @@
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
 #include "strata/image/sam3.hpp"
+#include "strata/image/sam3_video.hpp"
 #include "strata/image/yolo_detect.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -189,6 +202,7 @@
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -788,6 +802,211 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// SEGV's prompts file: a line a prompt, "W <from frame> <ids>" (words: CLIP's tokens, commas) or "C <frame> <object>
+// <x,y,label,...>" (clicks on the clip's pixels: label 1 in, 0 out, 2 and 3 a box's corners; object -1 a new one)
+void read_video_prompts(const std::string& path, std::vector<si::Sam3VideoWords>& words,
+                        std::vector<si::Sam3VideoClick>& clicks) {
+    std::ifstream f(path);
+    if (!f) throw std::invalid_argument("SEGV: cannot read " + path);
+    for (std::string line; std::getline(f, line);) {
+        std::istringstream ls(line);
+        std::string kind, list;
+        if (!(ls >> kind)) continue;
+        if (kind == "W") {
+            si::Sam3VideoWords w;
+            ls >> w.from >> list;
+            w.ids = parse_ids(list);
+            if (!ls || w.from < 0 || w.ids.size() < 2) throw std::invalid_argument("SEGV: W <from> <ids>");
+            words.push_back(std::move(w));
+        } else if (kind == "C") {
+            si::Sam3VideoClick c;
+            ls >> c.frame >> c.object >> list;
+            const std::vector<float> v = parse_floats(list);
+            if (!ls || c.frame < 0 || v.empty() || v.size() % 3 != 0)
+                throw std::invalid_argument("SEGV: C <frame> <object> <x,y,label,...>");
+            for (size_t i = 0; i < v.size(); i += 3) c.points.push_back({v[i], v[i + 1], v[i + 2]});
+            clicks.push_back(std::move(c));
+        } else {
+            throw std::invalid_argument("SEGV: a prompt line is W or C");
+        }
+    }
+    if (words.empty() && clicks.empty()) throw std::invalid_argument("SEGV: no words and no clicks");
+}
+
+// A mask (width x height, 255 inside) as COCO's uncompressed RLE: the runs down the columns, the first counting the
+// background (vLLM-Omni's rle_counts)
+void rle_json(const std::vector<uint8_t>& m, int64_t w, int64_t h, std::string& out) {
+    bool cur = false;
+    int64_t run = 0;
+    bool first = true;
+    const auto put = [&](int64_t v) {
+        if (!first) out += ',';
+        first = false;
+        out += std::to_string(v);
+    };
+    for (int64_t x = 0; x < w; ++x)
+        for (int64_t y = 0; y < h; ++y) {
+            const bool v = m[(size_t) (y * w + x)] != 0;
+            if (v != cur) {
+                put(run);
+                run = 0;
+                cur = v;
+            }
+            ++run;
+        }
+    put(run);
+}
+
+struct SegvOptions {
+    bool masks = false, mask = false, overlay = false;   // a video an object, one of them all, the clip overlaid
+    strata::video::Codec codec = strata::video::Codec::automatic;
+    std::function<void()> pause;                         // between frames, every kSegvYieldS seconds
+    std::function<bool(int64_t, int64_t)> step;          // the frames done, of about how many; false: stop
+};
+
+constexpr double kSegvYieldS = 1.0;   // the chat's wait at most, a yield to it
+
+// SEGV: the clip `in` through SAM 3.1's video segmentation (sam3_video.hpp) a frame at a time, each frame's instances
+// as a JSON line in <stem>.jsonl ({"frame_index", "instances": [{"id", "score", "box" [x0, y0, x1, y1] (the last
+// pixels), "mask": {"size": [h, w], "counts"}}]}: vLLM-Omni's frames), and the videos asked for -> SEGVIDEO's line
+std::string segment_video(si::Sam3& m, const std::string& in, const std::string& prompts, const std::string& stem,
+                          const SegvOptions& o) {
+    namespace sv = strata::video;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<si::Sam3VideoWords> words;
+    std::vector<si::Sam3VideoClick> clicks;
+    read_video_prompts(prompts, words, clicks);
+    const sv::Info info = sv::probe(in);
+    const int64_t W = info.width, H = info.height, WH = W * H;
+    si::Sam3Video vs(m, W, H, info.frames, words, clicks);
+    sv::Reader rd(in, info);
+    const std::string json = stem + ".jsonl";
+    std::ofstream js(json, std::ios::binary);
+    if (!js) throw std::runtime_error("cannot write " + json);
+    sv::WriteOptions gray;
+    gray.codec = o.codec;
+    gray.gray = true;
+    std::map<int64_t, std::unique_ptr<sv::Writer>> per;   // by object
+    std::unique_ptr<sv::Writer> all, over;
+    if (o.mask) all = std::make_unique<sv::Writer>(stem + ".mask", W, H, info.fps, gray);
+    if (o.overlay) {
+        sv::WriteOptions wo;
+        wo.codec = o.codec;
+        wo.audio_from = in;
+        over = std::make_unique<sv::Writer>(stem + ".overlay", W, H, info.fps, wo);
+    }
+    // the overlay's colors by id (Tableau's ten), half over the picture
+    static const uint8_t kColors[10][3] = {{31, 119, 180}, {255, 127, 14}, {44, 160, 44}, {214, 39, 40},
+                                           {148, 103, 189}, {140, 86, 75}, {227, 119, 194}, {127, 127, 127},
+                                           {188, 189, 34}, {23, 190, 207}};
+    std::deque<std::vector<uint8_t>> held;   // the frames read, until their results come out (the overlay's)
+    std::vector<uint8_t> rgb((size_t) (WH * 3)), black((size_t) WH, 0), one((size_t) WH);
+    std::map<int64_t, std::pair<int64_t, int64_t>> objects;   // id -> its words' or its click's (-1 the other)
+    int64_t read = 0, shown = 0;
+    double read_s = 0, write_s = 0;
+    const auto emit = [&](const std::vector<si::Sam3Video::Frame>& fs) {
+        for (const auto& f : fs) {
+            const auto w0 = std::chrono::steady_clock::now();
+            std::string line = "{\"frame_index\":" + std::to_string(f.index) + ",\"instances\":[";
+            char b[160];
+            std::fill(one.begin(), one.end(), 0);
+            for (size_t i = 0; i < f.objects.size(); ++i) {
+                const auto& ob = f.objects[i];
+                objects.emplace(ob.id, std::make_pair(ob.words, ob.click));
+                std::snprintf(b, sizeof b, "%s{\"id\":%lld,\"score\":%.4f,\"box\":[%lld,%lld,%lld,%lld],\"mask\":"
+                              "{\"size\":[%lld,%lld],\"counts\":[", i ? "," : "", (long long) ob.id, ob.score,
+                              (long long) ob.x0, (long long) ob.y0, (long long) (ob.x1 - 1), (long long) (ob.y1 - 1),
+                              (long long) H, (long long) W);
+                line += b;
+                rle_json(ob.mask, W, H, line);
+                line += "]}}";
+                for (int64_t px = 0; px < WH; ++px) one[(size_t) px] |= ob.mask[(size_t) px];
+            }
+            line += "]}\n";
+            js << line;
+            if (o.masks) {
+                for (const auto& ob : f.objects) {
+                    auto& wr = per[ob.id];
+                    if (!wr) {   // an object first seen here: black for the frames before
+                        wr = std::make_unique<sv::Writer>(stem + ".obj" + std::to_string(ob.id), W, H, info.fps, gray);
+                        for (int64_t k = 0; k < f.index; ++k) wr->write(black.data(), 1);
+                    }
+                }
+                for (auto& [id, wr] : per) {
+                    const auto it = std::find_if(f.objects.begin(), f.objects.end(),
+                                                 [id = id](const auto& ob) { return ob.id == id; });
+                    wr->write(it == f.objects.end() ? black.data() : it->mask.data(), 1);
+                }
+            }
+            if (all) all->write(one.data(), 1);
+            if (over) {
+                std::vector<uint8_t>& pic = held.front();
+                for (const auto& ob : f.objects) {
+                    const uint8_t* c = kColors[ob.id % 10];
+                    for (int64_t px = 0; px < WH; ++px)
+                        if (ob.mask[(size_t) px])
+                            for (int k = 0; k < 3; ++k)
+                                pic[(size_t) (px * 3 + k)] = (uint8_t) ((pic[(size_t) (px * 3 + k)] + c[k] + 1) / 2);
+                }
+                over->write(pic.data(), 1);
+            }
+            if (!held.empty()) held.pop_front();
+            write_s += seconds_since(w0);
+            ++shown;
+        }
+    };
+    auto last_yield = std::chrono::steady_clock::now();
+    for (;;) {
+        const auto r0 = std::chrono::steady_clock::now();
+        const int64_t n = rd.read(rgb.data(), 1);
+        read_s += seconds_since(r0);
+        if (n <= 0) break;
+        si::QiRef pic;
+        pic.width = W;
+        pic.height = H;
+        pic.rgba.resize((size_t) (WH * 4));
+        for (int64_t px = 0; px < WH; ++px) {
+            for (int c = 0; c < 3; ++c) pic.rgba[(size_t) (px * 4 + c)] = rgb[(size_t) (px * 3 + c)];
+            pic.rgba[(size_t) (px * 4 + 3)] = 255;
+        }
+        if (over) held.push_back(rgb);
+        emit(vs.push(pic));
+        ++read;
+        if (o.step && !o.step(read, std::max(info.frames, read))) throw std::runtime_error("SEGV: the video was stopped");
+        if (o.pause && seconds_since(last_yield) >= kSegvYieldS) {
+            o.pause();
+            last_yield = std::chrono::steady_clock::now();
+        }
+    }
+    emit(vs.finish());
+    js.close();
+    if (!js) throw std::runtime_error("cannot write " + json);
+    const auto w0 = std::chrono::steady_clock::now();
+    std::string paths;
+    for (auto& [id, wr] : per) {
+        wr->finish();
+        paths += (paths.empty() ? "" : ",") + std::to_string(id) + ":" + wr->path();
+    }
+    if (all) all->finish();
+    if (over) over->finish();
+    write_s += seconds_since(w0);
+    std::string objs;
+    for (const auto& [id, src] : objects)
+        objs += (objs.empty() ? "" : ",") + std::to_string(id) +
+                (src.first >= 0 ? ":w" + std::to_string(src.first) : ":c" + std::to_string(src.second));
+    const auto& t = vs.times();
+    char b[512];
+    std::snprintf(b, sizeof b, " frames=%lld width=%lld height=%lld fps=%.6f vfr=%d segment_s=%.3f read_s=%.3f "
+                  "trunk_s=%.3f detect_s=%.3f track_s=%.3f rules_s=%.3f output_s=%.3f write_s=%.3f", (long long) shown,
+                  (long long) W, (long long) H, info.fps, (int) info.vfr, seconds_since(t0), read_s, t.trunk, t.detect,
+                  t.track, t.rules, t.output, write_s);
+    std::string line = "SEGVIDEO json=" + json + " objects=" + (objs.empty() ? "-" : objs);
+    if (!paths.empty()) line += " masks=" + paths;
+    if (all) line += " mask=" + all->path() + " mime=" + all->mime();
+    if (over) line += " overlay=" + over->path();
+    return line + b;
+}
+
 // DETECT's answer: "DETECT n=<count> detect_s=<seconds> boxes=<x0>,<y0>,<x1>,<y1>,<score>,<class>;..." (the boxes on
 // the picture, highest score first), each mask (a segmentation head's, with `masks` given) written to <masks>.<i> as
 // width x height bytes, 255 inside.  The detection's buffers are freed after it (`keep`: kept for the next, a timing's
@@ -1170,6 +1389,50 @@ int serve(si::ImagePipeline& p) {
                     write_file(masks + "." + std::to_string(i), s.mask);
                 }
                 std::printf("%s\n", line.c_str());
+            } else if (op == "SEGV") {   // SEGV <weights> <video> <prompts> <out stem> [words]
+                std::string weights, src, prompts, stem;
+                ls >> weights >> src >> prompts >> stem;
+                if (!ls) throw std::invalid_argument("SEGV <weights> <video> <prompts> <out stem> [MASKS:1] ...");
+                SegvOptions o;
+                for (std::string word; ls >> word;) {
+                    if (word == "MASKS:1") o.masks = true;
+                    else if (word == "MASK:1") o.mask = true;
+                    else if (word == "OVERLAY:1") o.overlay = true;
+                    else if (word == "YIELD:1") {
+                        o.pause = [&in] {
+                            std::printf("YIELD\n");
+                            std::fflush(stdout);
+                            in.resume();
+                        };
+                    } else if (word.rfind("CODEC:", 0) == 0) {
+                        const std::string c = word.substr(6);
+                        o.codec = c == "h264" ? strata::video::Codec::h264 : c == "vp9" ? strata::video::Codec::vp9
+                                  : c == "ffv1" ? strata::video::Codec::ffv1
+                                                : throw std::invalid_argument("SEGV: CODEC: h264, vp9 or ffv1");
+                    } else {
+                        throw std::invalid_argument("SEGV: unknown word " + word);
+                    }
+                }
+                si::Sam3& m = aux.get<si::Sam3>(weights);
+                const strata::video::Info info = strata::video::probe(src);
+                aux_room(p, m.video_need_bytes(info.width, info.height, 1), "SAM 3.1's video segmentation");
+                std::printf("STAGE segment-video\n");
+                std::fflush(stdout);
+                in.stop = false;
+                o.step = [&in](int64_t d, int64_t n) {
+                    std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
+                    std::fflush(stdout);
+                    return !in.stop.load();
+                };
+                std::string line;
+                try {
+                    line = segment_video(m, src, prompts, stem, o);
+                } catch (...) {
+                    aux_done(p, m);
+                    throw;
+                }
+                aux_done(p, m);
+                std::printf("%s\n", line.c_str());
             } else if (op == "FLORENCE") {   // FLORENCE <weights> <picture> <ids> <beams> <max new>
                 std::string weights, pic, ids;
                 int beams = 3, max_new = 1024;
@@ -1242,11 +1505,16 @@ int serve(si::ImagePipeline& p) {
                 std::string kind, weights;
                 int64_t w = 0, h = 0;
                 ls >> kind >> weights >> w >> h;
-                if (!ls) throw std::invalid_argument("AUXNEED <sam3|florence|birefnet> <weights> <width> <height> ...");
+                if (!ls) throw std::invalid_argument("AUXNEED <sam3|sam3video|florence|birefnet> <weights> <width> <height> ...");
                 uint64_t need = 0, held = 0;
                 if (kind == "sam3") {
                     si::Sam3& m = aux.get<si::Sam3>(weights);
                     need = m.need_bytes(w, h), held = m.held();
+                } else if (kind == "sam3video") {
+                    int64_t buckets = 1;
+                    ls >> buckets;
+                    si::Sam3& m = aux.get<si::Sam3>(weights);
+                    need = m.video_need_bytes(w, h, buckets), held = m.held();
                 } else if (kind == "florence") {
                     int beams = 3, max_new = 1024;
                     ls >> beams >> max_new;
@@ -1259,7 +1527,7 @@ int serve(si::ImagePipeline& p) {
                     si::Birefnet& m = aux.get<si::Birefnet>(weights);
                     need = m.need_bytes(sw, sh, w, h, refine != 0), held = m.held();
                 } else {
-                    throw std::invalid_argument("AUXNEED: sam3, florence or birefnet, not " + kind);
+                    throw std::invalid_argument("AUXNEED: sam3, sam3video, florence or birefnet, not " + kind);
                 }
                 size_t free = 0, total = 0;
                 strata::gpu::mem_info(&free, &total);

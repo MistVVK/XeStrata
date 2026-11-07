@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/videos.py - the video tools' requests and jobs: a video upscaled by the image engine's upscalers (SeedVR2 in
-time, RealESRGAN and Lanczos frame by frame: src/upscale's run_video, the engine's UPSV), read and written by ffmpeg.
+time, RealESRGAN and Lanczos frame by frame: src/upscale's run_video, the engine's UPSV), and its objects found and
+followed by SAM 3.1 (src/image/sam3_video.cpp, the engine's SEGV), read and written by ffmpeg.
 
 The entry points are vLLM-Omni's: POST /v1/videos (a job, OpenAI's Videos API's shape: queued, in_progress, completed
 or failed, its progress, GET /v1/videos/{id}, its file at /v1/videos/{id}/content, GET /v1/videos, DELETE) and POST
@@ -11,6 +12,16 @@ WIDTHxHEIGHT; without it, scale (2 by default); extra_params: vLLM-Omni's color_
 chunk_frames and temporal_overlap (SeedVR2's chunks: ComfyUI's SeedVR2TemporalChunk's) and video_codec (h264, vp9,
 ffv1).
 
+The segmentation's entry point is vLLM-Omni's POST /v1/videos/segmentations: its form (video, prompt, prompts as a
+JSON list, mask_video, model) and its answer (width, height, num_frames, fps, objects [{id, prompt, mask_video: a base64
+mask video}], frames [{frame_index, instances [{id, score, box [x0, y0, x1, y1], mask: COCO's RLE}]}]).  XeStrata adds:
+a prompts entry may be {"prompt", "frame"} (words looked for from that frame on); clicks, a JSON list of {"frame" (or
+"time", seconds), "object" (an id to redo, or none: a new one), "points" [[x, y, 1 in or 0 out]...], "box" [x0, y0, x1,
+y1]} on the clip's pixels (an object's prompt is then "" and its "click" the entry's index); outputs, a JSON list of
+"mask" (one mask video of every object) and "overlay" (the clip with the objects over it, its sound kept), answered as
+mask_union_video and overlay_video; and job true, which makes it a job (its record answered at once, the answer at
+/v1/videos/{id}/content, the videos at its ?variant=overlay, mask or object_<id>).
+
 Limits, in two tiers: the synchronous answer takes what vLLM-Omni's does (2048 frames, an upload of 512 MiB; past them
 400); a job writes its result to the disk, so its frames are not counted against anything and its upload's limit is
 the server's video.max_upload_mib (by default the disk's free space less a margin).  A job's record and files live in
@@ -19,6 +30,7 @@ read at its average rate (the record says so), an HDR one refused (its reason).
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import os
@@ -31,6 +43,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
+from serve import image_aux
 from serve import images as img
 
 SYNC_MAX_FRAMES = 2048                 # vLLM-Omni's /v1/videos/segmentations and /v1/videos/sync limits
@@ -38,6 +51,8 @@ SYNC_MAX_BYTES = 512 << 20
 JOB_DISK_MARGIN = 2 << 30              # what a job's upload leaves free on the disk (the result is written there too)
 FILE_FIELDS = ("input_references", "input_reference", "video", "file")
 CODECS = ("h264", "vp9", "ffv1")
+SEG_MAX_PROMPTS = 16                   # vLLM-Omni's MAX_VIDEO_PROMPTS
+SEG_OUTPUTS = ("mask", "overlay")
 CHUNK = 1 << 20                        # an upload's read
 
 
@@ -278,12 +293,191 @@ def upscale_request(fields: dict, info: dict, cfg: dict, sync: bool) -> dict:
     return job
 
 
+def _json_field(fields: dict, name: str):
+    v = fields.get(name)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            raise VideoRequestError(f"{name}: JSON") from None
+    return v
+
+
+def _truth(v) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+def segment_request(fields: dict, info: dict, sync: bool) -> dict:
+    """A segmentation's form fields and its source's probe -> the job: its words (prompt, then prompts: strings or
+    {"prompt", "frame"}; repeats dropped, at most SEG_MAX_PROMPTS), its clicks, mask_video and outputs.  The words'
+    tokens are the engine's call (segment's), the files' too."""
+    words: list[dict] = []
+    seen = set()
+    extra = _json_field(fields, "prompts") or []
+    if not isinstance(extra, list):
+        raise VideoRequestError("prompts: a JSON list of strings (or of {\"prompt\", \"frame\"})")
+    for e in [fields.get("prompt") or "", *extra]:
+        text, frame = (e.get("prompt"), e.get("frame", 0)) if isinstance(e, dict) else (e, 0)
+        if not isinstance(text, str):
+            raise VideoRequestError("prompts: strings, or {\"prompt\": a string, \"frame\": a number}")
+        text = " ".join(text.split())
+        try:
+            frame = int(frame or 0)
+        except (TypeError, ValueError):
+            raise VideoRequestError("prompts' frame: a frame's number") from None
+        if text and (text, frame) not in seen:
+            seen.add((text, frame))
+            words.append({"prompt": text, "frame": max(0, frame)})
+    if len(words) > SEG_MAX_PROMPTS:
+        raise VideoRequestError(f"at most {SEG_MAX_PROMPTS} prompts")
+    clicks = []
+    for i, c in enumerate(_json_field(fields, "clicks") or []):
+        if not isinstance(c, dict):
+            raise VideoRequestError("clicks: a JSON list of {\"frame\", \"object\", \"points\", \"box\"}")
+        try:
+            pts = [[float(p[0]), float(p[1]), int(p[2]) if len(p) > 2 else 1] for p in c.get("points") or []]
+            box = [float(v) for v in c.get("box") or []]
+            # a page knows the time it shows, not the frame: the frame then that time's at the rate read
+            frame = int(float(c["time"]) * info["fps"] + 1e-3) if c.get("frame") is None and c.get("time") is not None \
+                else int(c.get("frame") or 0)
+            given = c.get("object")
+            obj = -1 if given in (None, "", -1) else int(str(given))
+        except (TypeError, ValueError, IndexError):
+            raise VideoRequestError(f"clicks[{i}]: frame, object, points [[x, y, label]...], box [x0, y0, x1, y1]") \
+                from None
+        if box and len(box) != 4:
+            raise VideoRequestError(f"clicks[{i}].box: [x0, y0, x1, y1]")
+        if any(p[2] not in (0, 1) for p in pts):
+            raise VideoRequestError(f"clicks[{i}].points: labels 1 (in) or 0 (out)")
+        if not pts and not box:
+            raise VideoRequestError(f"clicks[{i}]: points or a box")
+        if not 0 <= frame < max(info["frames"], 1) + 1:
+            raise VideoRequestError(f"clicks[{i}].frame: from 0 to {info['frames'] - 1}")
+        corners = [[min(box[0], box[2]), min(box[1], box[3]), 2], [max(box[0], box[2]), max(box[1], box[3]), 3]] \
+            if box else []
+        clicks.append({"frame": frame, "object": obj, "points": corners + pts})
+    if not words and not clicks:
+        raise VideoRequestError("Provide a text 'prompt' (or clicks).")
+    outputs = _json_field(fields, "outputs") or []
+    if isinstance(outputs, str):
+        outputs = [outputs]
+    if not isinstance(outputs, list) or any(o not in SEG_OUTPUTS for o in outputs):
+        raise VideoRequestError(f"outputs: a JSON list of {', '.join(SEG_OUTPUTS)}")
+    if sync and info["frames"] > SYNC_MAX_FRAMES:
+        raise VideoRequestError(f"the synchronous answer takes at most {SYNC_MAX_FRAMES} frames (this video has about "
+                                f"{info['frames']}); job true makes a job of it")
+    return {"segment": {"words": words, "clicks": clicks, "mask_video": _truth(fields.get("mask_video", False)),
+                        "outputs": list(dict.fromkeys(outputs))},
+            "width": info["width"], "height": info["height"], "n": 1, "steps": 1, "seed": 0, "source": info}
+
+
+def segment_answer(got: dict, job: dict, model: str, out: Path) -> dict:
+    """The engine's SEGVIDEO fields and its files -> vLLM-Omni's answer written to `out` (the frames copied from the
+    engine's JSON lines as they are, never parsed: a long clip's are tens of MB) -> {"path", "files": {variant: its
+    file}, "objects"}."""
+    seg = job["segment"]
+    words = seg["words"]
+    objects, files = [], {}
+    masks = dict(e.split(":", 1) for e in str(got.get("masks") or "").split(",") if ":" in e)
+    for e in str(got.get("objects") or "").split(","):
+        if ":" not in e:
+            continue
+        oid, src = e.split(":", 1)
+        o: dict = {"id": int(oid)}
+        if src.startswith("w"):
+            w = words[int(src[1:])]
+            o["prompt"] = w["prompt"]
+            if w["frame"]:
+                o["frame"] = w["frame"]
+        else:
+            o["prompt"] = ""
+            o["click"] = int(src[1:])
+        if oid in masks:
+            files[f"object_{oid}"] = Path(masks[oid])
+        objects.append(o)
+    if got.get("mask"):
+        files["mask"] = Path(got["mask"])
+    if got.get("overlay"):
+        files["overlay"] = Path(got["overlay"])
+
+    def b64(f: Path) -> str:
+        return base64.b64encode(f.read_bytes()).decode("ascii")
+    for o in objects:
+        if seg["mask_video"] and f"object_{o['id']}" in files:
+            o["mask_video"] = b64(files[f"object_{o['id']}"])
+    head = {"created": int(time.time()), "model": model, "width": int(got["width"]), "height": int(got["height"]),
+            "num_frames": int(got["frames"]), "fps": float(got["fps"]), "objects": objects}
+    if int(got.get("vfr") or 0):
+        head["vfr"] = "read at its average frame rate"
+    if "mask" in seg["outputs"] and "mask" in files:
+        head["mask_union_video"] = b64(files["mask"])
+    if "overlay" in seg["outputs"] and "overlay" in files:
+        head["overlay_video"] = b64(files["overlay"])
+    lines = Path(str(got["json"]))
+    with open(out, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(head)[:-1] + ',"frames":[')
+        with open(lines, encoding="utf-8") as jl:
+            for i, line in enumerate(jl):
+                if line.strip():
+                    fh.write(("," if i else "") + line.strip())
+        fh.write("]}")
+    lines.unlink(missing_ok=True)
+    return {"path": out, "files": files, "objects": objects}
+
+
+def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress: Callable[[int, int], None] | None,
+            cancel: threading.Event | None) -> dict:
+    """A segmentation's run: SAM 3.1's weights and its license (image_regions'), the words' CLIP tokens, then the
+    engine's SEGV in the image jobs' GPU turn -> segment_answer's, with "figures"."""
+    from serve import image_regions as regions
+    img.refuse_during_long_job(svc)
+    if image_aux.needs_consent("sam3", regions.root_of(gen)):
+        raise img.ImageRequestError(regions.sam3_consent_words())
+    weights, tok = regions.weights(gen, regions.seg_files(regions.SAM3))
+    seg = job["segment"]
+    clip = regions._clip(tok)
+    lines = []
+    for w in seg["words"]:
+        ids = clip.encode(w["prompt"], regions.SAM3_MAX_IDS)
+        lines.append(f"W {w['frame']} {','.join(map(str, ids))}")
+    for c in seg["clicks"]:
+        lines.append(f"C {c['frame']} {c['object']} " + ",".join(f"{v!r}" for p in c["points"] for v in p))
+    prompts = stem.parent / "prompts.txt"
+    prompts.write_text("\n".join(lines) + "\n")
+    job = {**job, "aux": {"kind": "sam3video", "path": str(weights), "need_args": [1]}}
+    t0 = time.monotonic()
+    with img.gpu_turn(svc, gen, job, cancel) as policy:
+        state = {"started": time.monotonic(), "done": 0, "total": int(job["source"]["frames"]), "policy": policy,
+                 "thread": threading.get_ident()}
+
+        def told(done: int, total: int) -> None:
+            state.update(done=done, total=total)
+            if progress is not None:
+                progress(done, total)
+        svc.long_job = gen.long_job = state
+        try:
+            got = gen.segment_video(weights, source, prompts, stem, seg, cancel, told)
+        finally:
+            svc.long_job = gen.long_job = None
+    answer = segment_answer(got, job, model, stem.parent / "segmentation.json")
+    figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "strata-image", "model": regions.SAM3,
+               "frames": int(got.get("frames", 0)), "fps": float(got.get("fps", 0)),
+               "vfr": bool(int(got.get("vfr") or 0)), "objects": len(answer["objects"]),
+               "segment": {k: float(got[k]) for k in ("segment_s", "read_s", "trunk_s", "detect_s", "track_s",
+                                                      "rules_s", "output_s", "write_s") if k in got}}
+    gen.last = figures
+    gen.end(None)
+    return {**answer, "mime": "application/json", "figures": figures}
+
+
 # ------------------------------------------------------------------------------------------- the jobs
 class VideoJobs:
     """The jobs' records (record.json) and files under `root`/<id>/, one job run at a time by a thread of its own."""
 
     def __init__(self, root: Path,
-                 run: Callable[[dict, Callable[[int, int], None], threading.Event, Path, Path], dict]):
+                 run: Callable[[dict, Callable[[int, int], None], threading.Event, Path, Path, str], dict]):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.run = run
@@ -323,6 +517,7 @@ class VideoJobs:
     def create(self, vid: str, model: str, job: dict, source: Path) -> dict:
         """A job of the request `job` on the uploaded `source` (in the job's folder): queued, its record answered."""
         rec = {"id": vid, "object": "video", "model": model, "status": "queued", "progress": 0,
+               "kind": "segmentation" if job.get("segment") else "upscale",
                "created_at": int(time.time()), "completed_at": None, "size": f"{job['width']}x{job['height']}",
                "seconds": f"{job['source']['duration']:.3f}", "prompt": "", "quality": "default", "error": None,
                "media_type": "video/mp4", "file_name": None, "remixed_from_video_id": None, "expires_at": None,
@@ -369,9 +564,12 @@ class VideoJobs:
                 job = dict(rec["job"])
                 job["source"] = {**rec["source"], "duration": float(rec["seconds"])}
                 d = self.dir_of(vid)
-                out = self.run(job, progress, cancel, d / rec["input"], d / "out")
+                out = self.run(job, progress, cancel, d / rec["input"], d / "out", rec["model"])
                 rec.update(status="completed", progress=100, completed_at=int(time.time()),
-                           file_name=Path(out["path"]).name, media_type=out["mime"], result=out.get("figures"))
+                           file_name=Path(out["path"]).name, media_type=out["mime"], result=out.get("figures"),
+                           files={k: Path(f).name for k, f in (out.get("files") or {}).items()},
+                           objects=[{k: v for k, v in o.items() if k != "mask_video"}
+                                    for o in out.get("objects") or []] or None)
             except Exception as e:   # the job's failure, said in its record
                 rec.update(status="failed", completed_at=int(time.time()),
                            error={"code": getattr(e, "code", "video_failed"), "message": str(e)})
@@ -403,10 +601,17 @@ class VideoJobs:
                 "first_id": page[0]["id"] if page else None, "last_id": page[-1]["id"] if page else None,
                 "has_more": len(recs) > len(page)}
 
-    def content(self, vid: str) -> tuple[Path, str] | None:
+    def content(self, vid: str, variant: str = "") -> tuple[Path, str] | None:
+        """A completed job's file: its answer, or (variant) a segmentation's video (overlay, mask, object_<id>)."""
         rec = self.get(vid)
         if rec is None or rec.get("status") != "completed" or not rec.get("file_name"):
             return None
+        if variant and variant != "video":
+            name = (rec.get("files") or {}).get(variant)
+            if not name:
+                return None
+            f = self.dir_of(vid) / name
+            return f, file_mime(f)
         return self.dir_of(vid) / rec["file_name"], rec.get("media_type") or "video/mp4"
 
     def delete(self, vid: str) -> dict | None:
@@ -433,8 +638,11 @@ def jobs_of(svc) -> VideoJobs:
     first use, run by the default edit model's engine as /v1/images/upscale is."""
     with svc.status_lock:
         if svc.video_jobs is None:
-            def run(job, progress, cancel, source, stem):
-                return upscale(svc, svc.images.pick_edit(None, True), job, source, stem, progress, cancel)
+            def run(job, progress, cancel, source, stem, model):
+                gen = svc.images.pick_edit(None, True)
+                if job.get("segment"):
+                    return segment(svc, gen, job, source, stem, model, progress, cancel)
+                return upscale(svc, gen, job, source, stem, progress, cancel)
             svc.video_jobs = VideoJobs(Path(svc.images.default.dir) / "video-jobs", run)
         return svc.video_jobs
 
@@ -490,11 +698,11 @@ def file_mime(f: Path) -> str:
             ".avi": "video/x-msvideo"}.get(f.suffix.lower(), "video/mp4")
 
 
-def start_from_file(svc, jobs: VideoJobs, f: Path, fields: dict, cfg: dict) -> dict:
-    """A job (POST /v1/videos's) on a kept file `f`: the file linked (or copied) into the job's folder, the request's
-    `fields` as the form's -> the job's record."""
+def start_from_file(svc, jobs: VideoJobs, f: Path, fields: dict, cfg: dict, kind: str = "upscale") -> dict:
+    """A job (POST /v1/videos's, or a segmentation's) on a kept file `f`: the file linked (or copied) into the job's
+    folder, the request's `fields` as the form's -> the job's record."""
     info = probe(f)
-    job = upscale_request(fields, info, cfg, False)
+    job = segment_request(fields, info, False) if kind == "segment" else upscale_request(fields, info, cfg, False)
     vid, folder = jobs.new_dir()
     dest = folder / ("input" + f.suffix)
     try:
@@ -502,7 +710,7 @@ def start_from_file(svc, jobs: VideoJobs, f: Path, fields: dict, cfg: dict) -> d
             os.link(f, dest)
         except OSError:
             shutil.copyfile(f, dest)
-        return jobs.create(vid, str(fields.get("model") or "auto"), job, dest)
+        return jobs.create(vid, str(fields.get("model") or ("sam3.1" if kind == "segment" else "auto")), job, dest)
     except BaseException:
         shutil.rmtree(folder, ignore_errors=True)
         raise
@@ -557,11 +765,13 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
 
 def model_ids() -> list[str]:
     """/v1/models' entries of the video tools."""
-    return list(img.UPSCALE_MODELS)
+    return [*img.UPSCALE_MODELS, "sam3.1"]
 
 
 def explain(e: Exception) -> tuple[int, dict]:
     """A failed video request's status and error body."""
     if isinstance(e, VideoRequestError):
         return e.status, {"error": {"type": "invalid_request_error", "code": "invalid_video", "message": str(e)}}
+    if isinstance(e, img.ImageRequestError):
+        return 400, {"error": {"type": "invalid_request_error", "message": str(e)}}
     return 500, {"error": {"type": "server_error", "code": "video_failed", "message": str(e)}}

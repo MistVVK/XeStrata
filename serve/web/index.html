@@ -502,14 +502,16 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <div class="st-card img-prompts">
         <div class="seg" id="vid-kind" role="radiogroup" aria-label="Tool" data-i18n-label="tool.kind">
           <button type="button" role="radio" data-vid="upscale" aria-checked="true" data-i18n="tool.upscale">Upscale</button>
+          <button type="button" role="radio" data-vid="segment" aria-checked="false" data-i18n="vid.segment">Find objects</button>
         </div>
-        <span class="composer-hint" data-i18n="vid.aboutUpscale">Makes the video larger on the GPU a few frames at a time (SeedVR2 in chunks of frames, the others frame by frame), its sound kept.</span>
+        <span class="composer-hint" data-vid="upscale" data-i18n="vid.aboutUpscale">Makes the video larger on the GPU a few frames at a time (SeedVR2 in chunks of frames, the others frame by frame), its sound kept.</span>
+        <span class="composer-hint" data-vid="segment" data-i18n="vid.aboutSegment" hidden>Finds every instance of the words on every frame and follows it (SAM 3.1); points and boxes on any frame add an object or fix one.</span>
         <label class="st-field"><span data-i18n="vid.file">Video (or drop one here)</span>
           <input class="st-input" id="vid-file" type="file" accept="video/*,.mkv"></label>
         <span class="composer-hint" id="vid-src-info"></span>
       </div>
       <div class="img-go-bar">
-        <button type="submit" class="st-btn st-btn--primary img-go" id="vid-go"><span class="img-go__run" data-i18n="tool.upscale">Upscale</span>
+        <button type="submit" class="st-btn st-btn--primary img-go" id="vid-go"><span class="img-go__run" id="vid-go-label" data-i18n="tool.upscale">Upscale</span>
           <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="vid-go-time"></span></button>
       </div>
 
@@ -541,6 +543,25 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <label class="st-field"><span data-i18n="vid.overlap">Chunks' overlap (latent frames of 4 frames)</span>
               <input class="st-input" id="vid-overlap" type="number" min="0" placeholder="0"></label></details>
         </div>
+        <!-- the segmentation: /v1/videos/segmentations' prompt, prompts, clicks, mask_video and outputs -->
+        <div class="tool-fields" data-vid="segment" hidden>
+          <label class="st-field"><span data-i18n="vid.segWords">What to find (short English words, commas between)</span>
+            <input class="st-input" id="vid-seg-words" type="text" placeholder="person, red car" data-i18n-placeholder="vid.segWordsPh"></label>
+          <span class="st-field"><span data-i18n="vid.segClick">Points and boxes: pause the video, then click or drag on it</span>
+            <span class="seg" id="vid-seg-mode" role="radiogroup" aria-label="Click" data-i18n-label="vid.segClickMode">
+              <button type="button" role="radio" data-mode="" aria-checked="true" data-i18n="vid.segOff">Off</button>
+              <button type="button" role="radio" data-mode="1" aria-checked="false" data-i18n="vid.segIn">Point: in</button>
+              <button type="button" role="radio" data-mode="0" aria-checked="false" data-i18n="vid.segOut">Point: out</button>
+              <button type="button" role="radio" data-mode="box" aria-checked="false" data-i18n="vid.segBox">Box</button></span></span>
+          <label class="st-field"><span data-i18n="vid.segTarget">They make or fix</span>
+            <span class="vid-seg-target"><select class="st-input" id="vid-seg-target"></select>
+              <button type="button" class="st-btn st-btn--secondary" id="vid-seg-new" data-i18n="vid.segNew">New object</button></span></label>
+          <div class="vid-seg-clicks" id="vid-seg-clicks"></div>
+          <fieldset class="vid-seg-outs"><legend data-i18n="vid.segOutputs">Videos to make (the frames' masks always come as JSON)</legend>
+            <label><input type="checkbox" id="vid-seg-overlay" checked> <span data-i18n="vid.segOverlay">The video with the objects colored over it</span></label>
+            <label><input type="checkbox" id="vid-seg-mask"> <span data-i18n="vid.segMask">One mask video of every object</span></label>
+            <label><input type="checkbox" id="vid-seg-masks"> <span data-i18n="vid.segMasks">A mask video of each object</span></label></fieldset>
+        </div>
       </div>
 
       <div class="st-card img-output">
@@ -548,8 +569,16 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <div class="img-view vid-view" id="vid-view" data-show="source">
           <span class="img-view__empty" id="vid-empty"><svg class="st-icon img-view__icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
             <span data-i18n="vid.empty">Choose a video, or open a job's result below.</span></span>
-          <video id="vid-src" controls playsinline preload="metadata" hidden></video>
+          <div class="vid-wrap" id="vid-src-wrap"><video id="vid-src" controls playsinline preload="metadata" hidden></video>
+            <canvas class="vid-canvas" id="vid-canvas" hidden></canvas></div>
           <video id="vid-out" controls playsinline preload="metadata" hidden></video>
+        </div>
+        <!-- the objects found: each one's color, shown or hidden over the source, and the clicks' target -->
+        <div class="vid-objects" id="vid-objects" hidden></div>
+        <div class="img-actions" id="vid-seg-bar" hidden>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-seg-edit" data-i18n="vid.segEdit">Edit these objects in this frame</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-seg-edit-bg" data-i18n="vid.segEditBg">Edit the background in this frame</button>
+          <span class="vid-seg-files" id="vid-seg-files"></span>
         </div>
         <div class="img-actions" id="vid-bar" hidden>
           <div class="seg" id="vid-show" role="radiogroup" aria-label="Show" data-i18n-label="vid.show">

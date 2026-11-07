@@ -66,7 +66,7 @@ std::vector<uint16_t> f16_of(const float* v, size_t n) {
 enum Slot {
     kPix, kRgba, kX, kH16, kW16, kBig, kG16, kQ16, kK16, kV16, kA16, kY, kCol,
     kF0, kF1, kF2, kPos, kTxt, kTxt16, kEnc, kEnc16, kEncPos16, kDec, kDec16, kQp, kBias, kTmp, kPix0, kPix1,
-    kInst16, kMasks, kMasks8, kPart, kSmall, kSmall16, kTxtOut, kTmp2, kQo16, kNeck, kProj16, kRef,
+    kInst16, kMasks, kMasks8, kPart, kSmall, kSmall16, kTxtOut, kTmp2, kQo16, kNeck, kProj16, kRef, kTrunk16, kF2Keep,
 };
 
 }  // namespace
@@ -131,23 +131,10 @@ void Sam3::load_weights() {
         vit_.push_back(l);
     }
     if (vit_.size() != 32) throw std::runtime_error(path_ + ": the ViT has " + std::to_string(vit_.size()) + " layers");
-    for (int i = 0; i < 3; ++i) {
-        const std::string b = std::string(kV) + "convs." + std::to_string(i) + ".";
-        Fpn f;
-        if (st_->find(b + "dconv_2x2_0.weight") != nullptr) {
-            f.up1 = deconv2(b + "dconv_2x2_0");
-            f.up2 = deconv2(b + "dconv_2x2_1");
-            f.ups = 2;
-        } else if (st_->find(b + "dconv_2x2.weight") != nullptr) {
-            f.up1 = deconv2(b + "dconv_2x2");
-            f.ups = 1;
-        }
-        f.c1 = conv(b + "conv_1x1", 1, 0);
-        f.c3 = conv(b + "conv_3x3", 1, 1);
-        fpn_.push_back(f);
-    }
-    if (fpn_[0].ups != 2 || fpn_[1].ups != 1 || fpn_[2].ups != 0)
-        throw std::runtime_error(path_ + ": the neck is not 4x, 2x and 1x");
+    track_loaded_ = false;   // a load after a release: the tracker's weights went with the rest
+    text_ids_.clear();
+    text_cache_.clear();
+    fpn_ = neck_of(std::string(kV) + "convs.");
     // the words
     tok_ = f16(std::string(kT) + "encoder.token_embedding.weight");
     tpos_ = f16(std::string(kT) + "encoder.positional_embedding");
@@ -271,6 +258,28 @@ void Sam3::load_weights() {
     }
 }
 
+std::vector<Sam3::Fpn> Sam3::neck_of(const std::string& prefix) {
+    std::vector<Fpn> set;
+    for (int i = 0; i < 3; ++i) {
+        const std::string b = prefix + std::to_string(i) + ".";
+        Fpn f;
+        if (st_->find(b + "dconv_2x2_0.weight") != nullptr) {
+            f.up1 = deconv2(b + "dconv_2x2_0");
+            f.up2 = deconv2(b + "dconv_2x2_1");
+            f.ups = 2;
+        } else if (st_->find(b + "dconv_2x2.weight") != nullptr) {
+            f.up1 = deconv2(b + "dconv_2x2");
+            f.ups = 1;
+        }
+        f.c1 = conv(b + "conv_1x1", 1, 0);
+        f.c3 = conv(b + "conv_3x3", 1, 1);
+        set.push_back(f);
+    }
+    if (set[0].ups != 2 || set[1].ups != 1 || set[2].ups != 0)
+        throw std::runtime_error(path_ + ": the neck " + prefix + " is not 4x, 2x and 1x");
+    return set;
+}
+
 uint64_t Sam3::need_bytes(int64_t width, int64_t height) const {
     const int64_t N = grid_ * grid_, P0 = 16 * N, P1 = 4 * N;
     // the ViT's buffers (its MLP's hidden rows the largest), the neck's levels, the pixel decoder's, the masks'
@@ -311,14 +320,48 @@ void Sam3::attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, in
 }
 
 void Sam3::vision(const QiRef& image) {
-    const int64_t S = image_, G = grid_, N = G * G, C = wd_, hd = C / vit_heads_;
-    // the picture at S x S (torchvision's antialiased bilinear: Pillow's triangle filter), normalized to [-1, 1]
-    const QiRef r = pillow_resize(image, S, S, Filter::triangle);
+    trunk(image);
+    detect_neck();
+}
+
+void Sam3::detect_neck(bool keep) {
+    const size_t b2 = (size_t) (grid_ * grid_ * d_ * 4);
+    float* lv[3] = {scratch(kF0, (size_t) (16 * grid_ * grid_ * d_ * 4)),
+                    scratch(kF1, (size_t) (4 * grid_ * grid_ * d_ * 4)), scratch(kF2, b2)};
+    neck(fpn_, lv);
+    if (keep) gpu::copy_async(scratch(kF2Keep, b2), lv[2], b2, s_);
+}
+
+void Sam3::detect_restore() {
+    const size_t b2 = (size_t) (grid_ * grid_ * d_ * 4);
+    gpu::copy_async(scratch(kF2, b2), scratch(kF2Keep, b2), b2, s_);
+}
+
+void Sam3::trunk(const QiRef& image, Filter filter) {
+    const int64_t S = image_;
+    // the picture at S x S (a picture's: torchvision's antialiased bilinear, Pillow's triangle filter; a video's
+    // frames: OpenCV's cubic, as Meta's loader), normalized to [-1, 1]
+    const QiRef r = pillow_resize(image, S, S, filter);
     auto* rgba = scratch_as<uint8_t>(kRgba, r.rgba.size());
     gpu::copy(rgba, r.rgba.data(), r.rgba.size());
     auto* pix16 = scratch_as<uint16_t>(kPix, (size_t) (S * S * 3));
     static const float half[3] = {0.5f, 0.5f, 0.5f};
     aux_rgb_norm16(rgba, S, S, half, half, pix16, s_);
+    trunk_from(pix16);
+}
+
+void Sam3::trunk_pixels(const float* chw) {
+    const int64_t S = image_;
+    std::vector<uint16_t> hwc((size_t) (S * S * 3));
+    for (int64_t c = 0; c < 3; ++c)
+        for (int64_t p = 0; p < S * S; ++p) hwc[(size_t) (p * 3 + c)] = kernels::f16_from_f32(chw[c * S * S + p]);
+    auto* pix16 = scratch_as<uint16_t>(kPix, hwc.size());
+    gpu::copy(pix16, hwc.data(), hwc.size() * 2);
+    trunk_from(pix16);
+}
+
+void Sam3::trunk_from(const uint16_t* pix16) {
+    const int64_t S = image_, G = grid_, N = G * G, C = wd_, hd = C / vit_heads_;
     float* x = scratch(kX, (size_t) (N * C * 4));
     auto* h16 = scratch_as<uint16_t>(kH16, (size_t) (N * C));
     auto* w16 = scratch_as<uint16_t>(kW16, (size_t) (N * C));
@@ -361,12 +404,19 @@ void Sam3::vision(const QiRef& image) {
                             next ? win(*next) : 0, kVitEps, next && !next->global ? w16 : h16, s_);
         if (li == 0 || li == 7 || li + 1 == vit_.size()) host(("vit" + std::to_string(li)).c_str(), x, (size_t) (N * C));
     }
-    // the neck: 4x, 2x and 1x levels of d_ channels
-    kernels::f32_to_f16_bulk(x, h16, N * C, s_);
-    float* lv[3] = {scratch(kF0, (size_t) (16 * N * d_ * 4)), scratch(kF1, (size_t) (4 * N * d_ * 4)),
-                    scratch(kF2, (size_t) (N * d_ * 4))};
+    // the trunk as FP16, which every neck reads
+    auto* t16 = scratch_as<uint16_t>(kTrunk16, (size_t) (N * C));
+    kernels::f32_to_f16_bulk(x, t16, N * C, s_);
+}
+
+void Sam3::neck(const std::vector<Fpn>& set, float* const lv[3]) {
+    const int64_t G = grid_, N = G * G, C = wd_;
+    const auto* h16 = scratch_as<uint16_t>(kTrunk16, (size_t) (N * C));
+    float* big = scratch(kBig, (size_t) (N * C * 4 * 4));
+    auto* g16 = scratch_as<uint16_t>(kG16, (size_t) (4 * N * C / 2));
     for (int i = 0; i < 3; ++i) {
-        const Fpn& f = fpn_[(size_t) i];
+        if (lv[i] == nullptr) continue;
+        const Fpn& f = set[(size_t) i];
         const uint16_t* in16 = h16;
         int64_t side = G;
         if (f.ups >= 1) {
@@ -393,6 +443,16 @@ void Sam3::vision(const QiRef& image) {
 }
 
 void Sam3::text(const std::vector<int32_t>& ids) {
+    if (ids == text_ids_) return;   // the same words as the last call's: their states are still there (a clip's)
+    const auto hit = text_cache_.find(ids);
+    if (hit != text_cache_.end()) {   // a clip's other words: their states as they were made
+        T_ = (int64_t) ids.size();
+        gpu::copy(scratch(kTxtOut, (size_t) (T_ * d_ * 4)), hit->second.data(), (size_t) (T_ * d_) * 4);
+        gpu::copy(scratch_as<uint16_t>(kTxt16, (size_t) (T_ * d_)), hit->second.data() + T_ * d_ * 4,
+                  (size_t) (T_ * d_) * 2);
+        text_ids_ = ids;
+        return;
+    }
     const int64_t T = (int64_t) ids.size(), C = td_, hd = C / txt_heads_;
     if (T < 2 || T > 32) throw std::invalid_argument("image engine (SAM 3): the words are 2 to 32 tokens");
     for (int32_t id : ids)
@@ -429,22 +489,16 @@ void Sam3::text(const std::vector<int32_t>& ids) {
     auto* t16 = scratch_as<uint16_t>(kTxt16, (size_t) (T * d_));
     kernels::f32_to_f16_bulk(t, t16, T * d_, s_);
     host("text", t, (size_t) (T * d_));
+    text_ids_ = ids;
+    if (text_cache_.size() >= kTextCache) text_cache_.clear();
+    std::vector<uint8_t>& keep = text_cache_[ids];
+    keep.resize((size_t) (T * d_) * 6);
+    gpu::stream_sync(s_);
+    gpu::copy(keep.data(), t, (size_t) (T * d_) * 4);
+    gpu::copy(keep.data() + T * d_ * 4, t16, (size_t) (T * d_) * 2);
 }
 
-std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& ids, float score_threshold,
-                               float mask_threshold, Times* tm) {
-    Times local;
-    Times& t = tm != nullptr ? *tm : local;
-    load();
-    auto t0 = std::chrono::steady_clock::now();
-    vision(image);
-    gpu::stream_sync(s_);
-    t.vision = since(t0);
-    t0 = std::chrono::steady_clock::now();
-    text(ids);
-    gpu::stream_sync(s_);
-    t.text = since(t0);
-    t0 = std::chrono::steady_clock::now();
+Sam3::Detection Sam3::detect(float score_threshold) {
     const int64_t G = grid_, N = G * G, d = d_, T = T_, hd = d / heads_, Q = queries_, Q1 = Q + 1;
     const int64_t mlp = enc_[0].fc1.n;
     const auto* txt16 = scratch_as<uint16_t>(kTxt16, (size_t) (T * d));
@@ -626,68 +680,126 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
         std::vector<float> b(ref.begin(), ref.end());
         dump("boxes", b);
     }
+    Detection r;
+    r.keep = std::move(keep);
+    r.prob = std::move(prob);
+    r.box = std::move(ref);
+    return r;
+}
+
+void Sam3::mask_prep() {
+    const int64_t G = grid_, N = G * G, d = d_, T = T_, hd = d / heads_, Q1 = queries_ + 1;
+    const int64_t mlp = enc_[0].fc1.n;
+    const auto* txt16 = scratch_as<uint16_t>(kTxt16, (size_t) (T * d));
+    float* x = scratch(kF2, (size_t) (N * d * 4));   // the 1x level, the encoder's stream in place
+    float* h = scratch(kY, (size_t) (N * d * 4));
+    auto* h16 = scratch_as<uint16_t>(kH16, (size_t) (N * d));
+    auto* q16 = scratch_as<uint16_t>(kQ16, (size_t) (N * d));
+    auto* a16 = scratch_as<uint16_t>(kA16, (size_t) (N * d));
+    auto* kt16 = scratch_as<uint16_t>(kSmall16, (size_t) (2 * T * d));
+    auto* vt16 = kt16 + T * d;
+    float* small = scratch(kTmp2, (size_t) (std::max<int64_t>(Q1, T) * std::max<int64_t>(mlp, d) * 4));
+    // the words' keys and values of an attention, at T rows
+    const auto word_kv = [&](const Attn& a) {
+        product(txt16, a.k, small, T);
+        kernels::f32_to_f16_bulk(small, kt16, T * d, s_);
+        product(txt16, a.v, small, T);
+        kernels::f32_to_f16_bulk(small, vt16, T * d, s_);
+    };
+    const auto to16 = [&](const uint16_t* in16, const Lin& l, int64_t rows, uint16_t* out16) {
+        product16(in16, l, out16, rows, true);
+    };
+    // the encoder's patches after the words' cross-attention
+    aux_layer_norm(x, nullptr, m_norm_.w, m_norm_.b, N, d, kEps, nullptr, h16, s_);
+    to16(h16, m_cross_.q, N, q16);
+    word_kv(m_cross_);
+    attention(q16, kt16, vt16, N, T, heads_, hd, d, d, d, a16);
+    product(a16, m_cross_.o, h, N);
+    qi_axpy(x, h, 1.f, N * d, s_);
+    // the pixel decoder up to the 4x level
+    float* f1 = scratch(kF1, (size_t) (4 * N * d * 4));
+    float* f0 = scratch(kF0, (size_t) (16 * N * d * 4));
+    float* c1 = scratch(kPix0, (size_t) (4 * N * d * 4));
+    auto* t16 = scratch_as<uint16_t>(kInst16, (size_t) (16 * N * d));
+    float* part = scratch(kPart, (size_t) (3 * 8 * 64 * 4));
+    aux_up_add16(x, G, G, f1, 2 * G, 2 * G, d, t16, s_);
+    convolve(pix_conv_[0], t16, 2 * G, 2 * G, c1, kCol);
+    aux_group_norm(c1, 4 * N, d, 8, pix_gn_[0].w, pix_gn_[0].b, kEps, true, c1, nullptr, part, s_);
+    aux_up_add16(c1, 2 * G, 2 * G, f0, 4 * G, 4 * G, d, t16, s_);
+    float* c0 = scratch(kMasks, (size_t) (16 * N * d * 4));
+    convolve(pix_conv_[1], t16, 4 * G, 4 * G, c0, kCol);
+    aux_group_norm(c0, 16 * N, d, 8, pix_gn_[1].w, pix_gn_[1].b, kEps, true, nullptr, t16, part, s_);
+    // the instance projection (1 x 1), FP16 for the masks' product
+    auto* p16 = scratch_as<uint16_t>(kProj16, (size_t) (16 * N * d));
+    product16(t16, inst_, p16, 16 * N, true);
+}
+
+void Sam3::mask_logits(const int64_t* qs, int64_t k, float* logits) {
+    const int64_t G = grid_, N = G * G, d = d_, Q = queries_, mlp = enc_[0].fc1.n;
+    auto* a16 = scratch_as<uint16_t>(kA16, (size_t) (N * d));
+    float* small = scratch(kTmp2, (size_t) (std::max<int64_t>(Q + 1, T_) * std::max<int64_t>(mlp, d) * 4));
+    const float* qo = scratch(kPix1, (size_t) (Q * d * 4));
+    const auto* p16 = scratch_as<uint16_t>(kProj16, (size_t) (16 * N * d));
+    std::vector<float> qh((size_t) (Q * d));
+    gpu::stream_sync(s_);
+    gpu::copy(qh.data(), qo, qh.size() * 4);
+    for (int64_t k0 = 0; k0 < k; k0 += kMaskChunk) {
+        const int64_t n = std::min<int64_t>(kMaskChunk, k - k0);
+        std::vector<float> rows((size_t) (n * d));
+        for (int64_t i = 0; i < n; ++i)
+            std::copy(qh.begin() + qs[k0 + i] * d, qh.begin() + (qs[k0 + i] + 1) * d, rows.begin() + i * d);
+        const auto r16 = f16_of(rows.data(), rows.size());
+        gpu::stream_sync(s_);
+        gpu::copy(a16, r16.data(), r16.size() * 2);
+        product(a16, emb1_, small, n);
+        aux_relu(small, n * d, nullptr, a16, s_);
+        product(a16, emb2_, small, n);
+        aux_relu(small, n * d, nullptr, a16, s_);
+        product(a16, emb3_, small, n);
+        kernels::f32_to_f16_bulk(small, a16, n * d, s_);
+        gemm_.f16(a16, p16, logits + k0 * 16 * N, n, 16 * N, d);
+    }
+}
+
+std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& ids, float score_threshold,
+                               float mask_threshold, Times* tm) {
+    Times local;
+    Times& t = tm != nullptr ? *tm : local;
+    load();
+    auto t0 = std::chrono::steady_clock::now();
+    vision(image);
+    gpu::stream_sync(s_);
+    t.vision = since(t0);
+    t0 = std::chrono::steady_clock::now();
+    text(ids);
+    gpu::stream_sync(s_);
+    t.text = since(t0);
+    t0 = std::chrono::steady_clock::now();
+    const Detection det = detect(score_threshold);
     t.detect = since(t0);
     t0 = std::chrono::steady_clock::now();
     std::vector<Segment> out;
-    const int64_t W = image.width, H = image.height;
-    for (int64_t q : keep) {
-        const float* b = ref.data() + q * 4;
+    const int64_t W = image.width, H = image.height, G = grid_, N = G * G;
+    for (int64_t q : det.keep) {
+        const float* b = det.box.data() + q * 4;
         Segment sg;
         sg.x0 = (b[0] - 0.5f * b[2]) * (float) W;
         sg.y0 = (b[1] - 0.5f * b[3]) * (float) H;
         sg.x1 = (b[0] + 0.5f * b[2]) * (float) W;
         sg.y1 = (b[1] + 0.5f * b[3]) * (float) H;
-        sg.score = prob[(size_t) q];
+        sg.score = det.prob[(size_t) q];
         out.push_back(std::move(sg));
     }
-    if (!keep.empty()) {
-        // the encoder's patches after the words' cross-attention
-        aux_layer_norm(x, nullptr, m_norm_.w, m_norm_.b, N, d, kEps, nullptr, h16, s_);
-        to16(h16, m_cross_.q, N, q16);
-        word_kv(m_cross_);
-        attention(q16, kt16, vt16, N, T, heads_, hd, d, d, d, a16);
-        product(a16, m_cross_.o, h, N);
-        qi_axpy(x, h, 1.f, N * d, s_);
-        // the pixel decoder up to the 4x level
-        float* f1 = scratch(kF1, (size_t) (4 * N * d * 4));
-        float* f0 = scratch(kF0, (size_t) (16 * N * d * 4));
-        float* c1 = scratch(kPix0, (size_t) (4 * N * d * 4));
-        auto* t16 = scratch_as<uint16_t>(kInst16, (size_t) (16 * N * d));
-        float* part = scratch(kPart, (size_t) (3 * 8 * 64 * 4));
-        aux_up_add16(x, G, G, f1, 2 * G, 2 * G, d, t16, s_);
-        convolve(pix_conv_[0], t16, 2 * G, 2 * G, c1, kCol);
-        aux_group_norm(c1, 4 * N, d, 8, pix_gn_[0].w, pix_gn_[0].b, kEps, true, c1, nullptr, part, s_);
-        aux_up_add16(c1, 2 * G, 2 * G, f0, 4 * G, 4 * G, d, t16, s_);
-        float* c0 = scratch(kMasks, (size_t) (16 * N * d * 4));
-        convolve(pix_conv_[1], t16, 4 * G, 4 * G, c0, kCol);
-        aux_group_norm(c0, 16 * N, d, 8, pix_gn_[1].w, pix_gn_[1].b, kEps, true, nullptr, t16, part, s_);
-        // the instance projection (1 x 1), FP16 for the masks' product
-        auto* p16 = scratch_as<uint16_t>(kProj16, (size_t) (16 * N * d));
-        product16(t16, inst_, p16, 16 * N, true);
-        // the kept queries' mask embeddings by the projection, a chunk at a time
-        std::vector<float> qh((size_t) (Q * d));
-        gpu::stream_sync(s_);
-        gpu::copy(qh.data(), qo, qh.size() * 4);
-        float* logits = c0;   // free again: [chunk][16N]
+    if (!det.keep.empty()) {
+        mask_prep();
+        // the kept queries' masks, a chunk at a time
+        float* logits = scratch(kMasks, (size_t) (16 * N * d_ * 4));   // free again: [chunk][16N]
         auto* m8 = scratch_as<uint8_t>(kMasks8, (size_t) (kMaskChunk * W * H));
-        for (size_t k0 = 0; k0 < keep.size(); k0 += (size_t) kMaskChunk) {
-            const int64_t k = std::min<int64_t>(kMaskChunk, (int64_t) (keep.size() - k0));
-            std::vector<float> rows((size_t) (k * d));
-            for (int64_t i = 0; i < k; ++i)
-                std::copy(qh.begin() + keep[k0 + (size_t) i] * d, qh.begin() + (keep[k0 + (size_t) i] + 1) * d,
-                          rows.begin() + i * d);
-            const auto r16 = f16_of(rows.data(), rows.size());
-            gpu::stream_sync(s_);
-            gpu::copy(a16, r16.data(), r16.size() * 2);
-            product(a16, emb1_, small, k);
-            aux_relu(small, k * d, nullptr, a16, s_);
-            product(a16, emb2_, small, k);
-            aux_relu(small, k * d, nullptr, a16, s_);
-            product(a16, emb3_, small, k);
-            kernels::f32_to_f16_bulk(small, a16, k * d, s_);
-            gemm_.f16(a16, p16, logits, k, 16 * N, d);
+        for (size_t k0 = 0; k0 < det.keep.size(); k0 += (size_t) kMaskChunk) {
+            const int64_t k = std::min<int64_t>(kMaskChunk, (int64_t) (det.keep.size() - k0));
+            mask_logits(det.keep.data() + k0, k, logits);
             if (k0 == 0) host("mask_logits", logits, (size_t) (16 * N));
-            aux_mask_resize(logits, k, 4 * G, 4 * G, H, W, mask_threshold, m8, s_);
+            aux_mask_resize(logits, k, 4 * G, 4 * G, H, W, false, mask_threshold, m8, s_);
             gpu::stream_sync(s_);
             for (int64_t i = 0; i < k; ++i) {
                 auto& m = out[k0 + (size_t) i].mask;

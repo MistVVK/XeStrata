@@ -30,7 +30,7 @@ Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows に�
 - **1 回の入れ方で全部**: `xestrata --setup`（Windows では `xestrata.exe` の導入の画面）で、文章のモデル、画像を読むかどうか、画像を作るモデルを選び、まとめてダウンロードします。
   画像を作るモデルは、Enter を押せば Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つを入れます。
   入れたものは、どれも同じアドレス `http://127.0.0.1:8095` で使えます。
-  ブラウザの画面（Chat、Images、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作ります。
+  ブラウザの画面（Chat、Images、Tools、Video、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像と動画の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作り、動画を大きくしたり動画の中の物体を探したりもします。
 - 画像を作るモデルは Qwen-Image-2.1、Mage-Flow、MageTrail、HunyuanImage 3.0、MOSS-Image、Anima から選べ、Qwen3.8-Flash-Next のどの版とも組み合わせられます（BETA のモデルとはまだ組み合わせられません）。
 
 ## XeStrata とは

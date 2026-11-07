@@ -531,6 +531,20 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .vid-view video{display:block;min-width:0;max-width:100%;max-height:calc(100vh - 260px);background:#000;border-radius:var(--st-r-sm)}
 .vid-view[data-show=both] video{flex:1 1 0;width:0}
 .vid-view video[hidden]{display:none}
+.vid-wrap{position:relative;display:flex;justify-content:center;min-width:0}
+.vid-wrap:has(> video[hidden]){display:none}
+.vid-view[data-show=both] .vid-wrap{flex:1 1 0;width:0}
+.vid-view[data-show=both] .vid-wrap video{width:100%}
+.vid-canvas{position:absolute;pointer-events:none}
+.vid-canvas.is-clicking{pointer-events:auto;cursor:crosshair}
+.vid-seg-target{display:flex;gap:var(--st-s-2)}
+.vid-seg-clicks{display:flex;flex-wrap:wrap;gap:var(--st-s-1)}
+.vid-seg-outs{display:flex;flex-direction:column;gap:var(--st-s-1);margin:0;padding:var(--st-s-2);border:1px solid var(--st-line);border-radius:var(--st-r-sm)}
+.vid-objects{display:flex;flex-wrap:wrap;gap:var(--st-s-2)}
+.vid-obj{display:flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid var(--st-line);border-radius:var(--st-r-sm);font-size:var(--st-fs-sm)}
+.vid-obj__swatch{width:12px;height:12px;border-radius:3px}
+.vid-obj.is-gone{opacity:.45;text-decoration:line-through}
+.vid-seg-files{display:flex;flex-wrap:wrap;gap:var(--st-s-2)}
 .vid-jobs__title{margin:var(--st-s-2) 0 0;font-size:var(--st-fs-base);font-weight:var(--st-fw-medium)}
 .vid-jobs{display:flex;flex-direction:column;gap:var(--st-s-2)}
 .vid-job{display:flex;align-items:center;justify-content:space-between;gap:var(--st-s-2);flex-wrap:wrap;padding:6px 10px;
@@ -563,6 +577,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
   .vid-view video{max-height:50vh}
   .vid-view[data-show=both]{flex-direction:column}
   .vid-view[data-show=both] video{width:100%;flex:none}
+  .vid-view[data-show=both] .vid-wrap{width:100%;flex:none}
   .img-actions .st-btn--icon,.img-seed .st-btn--icon,#img-swap{width:44px;height:44px}
   .img-actions .st-btn--secondary{height:44px}
   .img-go-bar{position:sticky;bottom:0;z-index:5;margin:0 calc(-1 * var(--st-s-3));

@@ -7218,7 +7218,8 @@ def make_handler(svc: Service):
                 return True
             ctype = self.headers.get("Content-Type", "")
             if ctype.startswith("multipart/form-data") and self.headers.get("X-Strata-Upload") \
-                    and self.path.split("?")[0].rstrip("/") in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files"):
+                    and self.path.split("?")[0].rstrip("/") in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files",
+                                                                "/v1/videos/segmentations"):
                 return False   # the Video tab's upload: a header of its own, which a page elsewhere cannot send
                 #                without a CORS preflight (granted to cors_origins alone)
             if not ctype.startswith("application/json"):
@@ -7737,8 +7738,8 @@ def make_handler(svc: Service):
                 if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
                     self._images_upscale()
                     return
-                if path in ("/v1/videos", "/v1/videos/sync"):  # a video's upscale (vLLM-Omni's): its upload streamed
-                    self._videos_post(path)
+                if path in ("/v1/videos", "/v1/videos/sync", "/v1/videos/segmentations"):
+                    self._videos_post(path)   # a video's upscale or segmentation (vLLM-Omni's): its upload streamed
                     return
                 if path == "/v1/videos/files":                # a video the chat's page attaches (upscale_video's)
                     self._videos_file()
@@ -7997,11 +7998,14 @@ def make_handler(svc: Service):
         def _videos_post(self, path: str) -> None:
             """POST /v1/videos (a job: its record answered at once, queued) and /v1/videos/sync (the file in the
             answer): a video upscaled (serve/videos.py), its source a multipart form's file (input_references or
-            video), written to the job's folder as it arrives."""
+            video), written to the job's folder as it arrives.  POST /v1/videos/segmentations: its objects found
+            (vLLM-Omni's answer, or a job with job true); its source the form's file, or video_url, a chat's kept
+            video (/v1/videos/files/...)."""
             if svc.images is None:
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
                                            "message": images_api.not_set_up_message()}})
                 return
+            seg = path.endswith("/segmentations")
             sync = path.endswith("/sync")
             jobs = self._video_jobs()
             vid, folder = jobs.new_dir()
@@ -8021,10 +8025,53 @@ def make_handler(svc: Service):
                                                        + ("" if sync else " (video.max_upload_mib)"), 413)
                 fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
                 src = next((f for f in files if f["field"] in videos_api.FILE_FIELDS), files[0] if files else None)
+                if seg:
+                    sync = not videos_api._truth(fields.get("job", False))
+                    if sync and length > videos_api.SYNC_MAX_BYTES + (1 << 20):
+                        raise videos_api.VideoRequestError(
+                            f"the upload is past the limit of {videos_api.SYNC_MAX_BYTES >> 20} MiB", 413)
+                    m = videos_api.FILE_REF.search(str(fields.get("video_url") or ""))
+                    if src is None and m and (kept := videos_api.file_path(jobs, m.group(1))) is not None:
+                        if not sync:
+                            rec = videos_api.start_from_file(svc, jobs, kept, fields, svc.images.default.cfg,
+                                                             "segment")
+                            self._json(200, rec)
+                            return
+                        src = {"path": kept}
                 if src is None:
-                    raise videos_api.VideoRequestError("input_references: the video to upscale")
+                    raise videos_api.VideoRequestError("video: the video to find the objects of" if seg
+                                                       else "input_references: the video to upscale")
                 info = videos_api.probe(src["path"])
                 gen = svc.images.pick_edit(None, True)
+                if seg:
+                    images_api.check_tool(gen.cfg, "segment_video")
+                    job = videos_api.segment_request(fields, info, sync)
+                    model = str(fields.get("model") or "sam3.1")
+                    if model not in ("auto", *regions_api.SEG_ALIASES) or \
+                            regions_api.SEG_ALIASES.get(model, regions_api.SAM3) != regions_api.SAM3:
+                        raise videos_api.VideoRequestError(f"model: sam3.1, not {model!r}")
+                    svc.last_request_at = time.time()
+                    print(f"[strata] video segmentation: {[w['prompt'] for w in job['segment']['words']]!r} "
+                          f"{len(job['segment']['clicks'])} clicks, {info['frames']} frames", flush=True)
+                    if not sync:
+                        rec = jobs.create(vid, model, job, src["path"])
+                        keep = True
+                        self._json(200, rec)
+                        return
+                    cancel = threading.Event()
+                    self._watch_client(cancel)
+                    out = videos_api.segment(svc, gen, job, src["path"], folder / "out", model, None, cancel)
+                    f = Path(out["path"])
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(f.stat().st_size))
+                    self.send_header("X-Request-Id", vid)
+                    self._cors()
+                    self.end_headers()
+                    with open(f, "rb") as fh:
+                        while chunk := fh.read(1 << 20):
+                            self.wfile.write(chunk)
+                    return
                 images_api.check_tool(gen.cfg, "upscale_image")
                 job = videos_api.upscale_request(fields, info, gen.cfg, sync)
                 model = str(fields.get("model") or "auto")
@@ -8123,12 +8170,27 @@ def make_handler(svc: Service):
             if tail == "":
                 self._json(200, jobs.public(rec))
                 return
-            got = jobs.content(vid)
+            q = {k: v[-1] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            got = jobs.content(vid, q.get("variant") or "")
+            if got is None and q.get("variant") and rec.get("status") == "completed":
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": f"the job has no {q['variant']} (its files: "
+                                                      f"{', '.join(rec.get('files') or {}) or 'none'})"}})
+                return
             if got is None:
                 still = rec.get("status") in ("queued", "in_progress")
                 self._json(404 if still else 422, {"error": {
                     "type": "invalid_request_error", "code": "not_ready" if still else "video_failed",
                     "message": "the video is still being made" if still else "the job failed: see its record"}})
+                return
+            if got[1] == "application/json":
+                body = got[0].read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self._cors()
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self._send_video(*got)
 

@@ -114,6 +114,28 @@ const float* AuxNet::f32(const std::string& name) {
     return d;
 }
 
+const float* AuxNet::upload(const std::vector<float>& v) {
+    auto* d = static_cast<float*>(alloc(std::max<size_t>(v.size(), 1) * 4));
+    gpu::copy(d, v.data(), v.size() * 4);
+    weight_bytes_ += v.size() * 4;
+    return d;
+}
+
+AuxNet::Lin AuxNet::lin_host(const std::vector<float>& w, const std::vector<float>& b, int64_t n, int64_t k) {
+    if ((int64_t) w.size() != n * k || (!b.empty() && (int64_t) b.size() != n))
+        throw std::runtime_error(path_ + ": a linear layer's size");
+    Lin l;
+    l.n = n;
+    l.k = k;
+    const auto h = f16_of(w);
+    auto* dw = static_cast<uint16_t*>(alloc(h.size() * 2));
+    gpu::copy(dw, h.data(), h.size() * 2);
+    l.w = dw;
+    weight_bytes_ += h.size() * 2;
+    if (!b.empty()) l.b = upload(b);
+    return l;
+}
+
 const uint16_t* AuxNet::f16(const std::string& name) {
     const auto h = f16_of(host_f32(name));
     auto* d = static_cast<uint16_t*>(alloc(h.size() * 2));
@@ -354,6 +376,8 @@ void AuxNet::convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, 
     }
     if (c.b != nullptr) qi_bias_add(y, c.b, P, c.o, s_);
 }
+
+void AuxNet::sync() { gpu::stream_sync(s_); }
 
 void AuxNet::host(const char* name, const float* dev, size_t n) {
     if (!dump) return;

@@ -852,7 +852,7 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
                            src/image/hunyuanimage3_vision.cpp
                            src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_net.cpp
-                           src/image/sam3.cpp src/image/birefnet.cpp src/image/florence2.cpp)
+                           src/image/sam3.cpp src/image/sam3_track.cpp src/image/sam3_video.cpp src/image/birefnet.cpp src/image/florence2.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
@@ -1219,6 +1219,8 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-seedvr2-probe src/upscale/seedvr2_probe.cpp)
   target_link_libraries(strata-image-seedvr2-probe PRIVATE strata_image)
+  add_executable(strata-image-sam3-track-probe src/image/sam3_track_probe.cpp)
+  target_link_libraries(strata-image-sam3-track-probe PRIVATE strata_image)
   add_executable(strata-image-moss-text-probe src/image/moss_text_probe.cpp)
   target_link_libraries(strata-image-moss-text-probe PRIVATE strata_image)
   add_executable(strata-image-moss-dit-probe src/image/moss_dit_probe.cpp)

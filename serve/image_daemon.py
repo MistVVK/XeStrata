@@ -33,7 +33,8 @@ import time
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "FIT": ("BUDGET",), "BUDGET": ("BUDGET",),
            "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",), "UPS": ("UPSCALED",),
            "UPSNEED": ("NEED",), "SEGMENT": ("SEGMENT",), "FLORENCE": ("FLORENCE",), "POLYMASK": ("POLYMASK",),
-           "MATTE": ("MATTE",), "AUXNEED": ("NEED",), "UPSV": ("UPSVIDEO",), "UPSVNEED": ("NEED",)}
+           "MATTE": ("MATTE",), "AUXNEED": ("NEED",), "UPSV": ("UPSVIDEO",), "UPSVNEED": ("NEED",),
+           "SEGV": ("SEGVIDEO",)}
 START_TIMEOUT_S = 600
 
 

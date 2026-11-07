@@ -691,8 +691,8 @@ void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float
     finish(stream, e, "aux_group_norm");
 }
 
-void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64_t H, int64_t W, float threshold,
-                     uint8_t* masks, void* stream) {
+void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64_t H, int64_t W, bool as_logits,
+                     float threshold, uint8_t* masks, void* stream) {
     const int64_t n = K * H * W;
     if (n <= 0) return;
     const float sy = (float) h / (float) H, sx = (float) w / (float) W;
@@ -705,7 +705,7 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
         const int64_t y1 = sycl::min(y0 + 1, h - 1), x1 = sycl::min(x0 + 1, w - 1);
         const float ay = fy - (float) y0, ax = fx - (float) x0;
         const float* l = logits + k * h * w;
-        auto sg = [](float v) { return 1.f / (1.f + sycl::exp(-v)); };
+        auto sg = [as_logits](float v) { return as_logits ? v : 1.f / (1.f + sycl::exp(-v)); };
         const float v = (1.f - ay) * ((1.f - ax) * sg(l[y0 * w + x0]) + ax * sg(l[y0 * w + x1])) +
                         ay * ((1.f - ax) * sg(l[y1 * w + x0]) + ax * sg(l[y1 * w + x1]));
         masks[i] = v > threshold ? (uint8_t) 255 : (uint8_t) 0;
@@ -1032,6 +1032,157 @@ void aux_box_refine(float* boxes, const float* delta, int64_t n, void* stream) {
         boxes[i] = 1.f / (1.f + sycl::exp(-(delta[i] + inv)));
     });
     finish(stream, e, "aux_box_refine");
+}
+
+void aux_dwconv(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, int k, float* y,
+                void* stream) {
+    const int64_t n = H * W * C, r = k / 2;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, p = i / C, py = p / W, px = p - py * W;
+        float s = b != nullptr ? b[c] : 0.f;
+        for (int64_t dy = -r; dy <= r; ++dy) {
+            const int64_t yy = py + dy;
+            if (yy < 0 || yy >= H) continue;
+            for (int64_t dx = -r; dx <= r; ++dx) {
+                const int64_t xx = px + dx;
+                if (xx < 0 || xx >= W) continue;
+                s += w[(c * k + dy + r) * k + dx + r] * x[(yy * W + xx) * C + c];
+            }
+        }
+        y[i] = s;
+    });
+    finish(stream, e, "aux_dwconv");
+}
+
+void aux_scale_add(float* x, const float* y, const float* g, int64_t n, int64_t C, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x[i] += g[i % C] * y[i];
+    });
+    finish(stream, e, "aux_scale_add");
+}
+
+void aux_fill(float* x, int64_t n, float v, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) { x[id[0]] = v; });
+    finish(stream, e, "aux_fill");
+}
+
+namespace {
+// the 2D axial RoPE's turn of a pair (a, b) of channel 2 p of a head of hd at grid position li (aux_rope2d_split16's)
+inline void rope_pair(float& a, float& b, int64_t p, int64_t hd, int64_t li, int64_t grid, float lt) {
+    const int64_t quarter = hd / 4, f = p < quarter ? p : p - quarter;
+    const float pos = (float) (p < quarter ? li % grid : li / grid);
+    const float ang = pos * sycl::exp(-(float) (4 * f) / (float) hd * lt);
+    const float cs = sycl::cos(ang), sn = sycl::sin(ang), a0 = a;
+    a = a0 * cs - b * sn;
+    b = b * cs + a0 * sn;
+}
+}  // namespace
+
+void aux_rope2d16(const float* y, const float* add, int64_t P, int64_t N, int64_t heads, int64_t hd, int64_t grid,
+                  float theta, uint16_t* y16, void* stream) {
+    const int64_t C = heads * hd, half = hd / 2;
+    if (N <= 0) return;
+    const float lt = sycl::log(theta);
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (N * heads * half)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i % half, th = i / half, r = th / heads, h = th - r * heads, c = h * hd + 2 * p;
+        float a = y[r * C + c], b = y[r * C + c + 1];
+        if (add != nullptr) {
+            a += add[(r % P) * C + c];
+            b += add[(r % P) * C + c + 1];
+        }
+        rope_pair(a, b, p, hd, r % (grid * grid), grid, lt);
+        y16[r * C + c] = f16_from_f32(a);
+        y16[r * C + c + 1] = f16_from_f32(b);
+    });
+    finish(stream, e, "aux_rope2d16");
+}
+
+void aux_mem_key16(const float* y, int64_t B, int64_t N, int64_t nsp, int64_t P, const float* sine, const float* tpos,
+                   const float* ptr_pos, int64_t per, int64_t heads, int64_t hd, int64_t grid, float theta,
+                   uint16_t* k16, void* stream) {
+    const int64_t C = heads * hd, half = hd / 2;
+    if (B * N <= 0) return;
+    const float lt = sycl::log(theta);
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (B * N * heads * half)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i % half, th = i / half, row = th / heads, h = th - row * heads, c = h * hd + 2 * p;
+        const int64_t r = row % N;
+        float a = y[row * C + c], b = y[row * C + c + 1];
+        if (r < nsp) {
+            const int64_t li = r % P, f = r / P, sr = tpos != nullptr ? li : r;
+            a += sine[sr * C + c] + (tpos != nullptr ? tpos[f * C + c] : 0.f);
+            b += sine[sr * C + c + 1] + (tpos != nullptr ? tpos[f * C + c + 1] : 0.f);
+            rope_pair(a, b, p, hd, li % (grid * grid), grid, lt);
+        } else {
+            const int64_t j = (r - nsp) / per;
+            a += ptr_pos[j * C + c];
+            b += ptr_pos[j * C + c + 1];
+        }
+        k16[row * C + c] = f16_from_f32(a);
+        k16[row * C + c + 1] = f16_from_f32(b);
+    });
+    finish(stream, e, "aux_mem_key16");
+}
+
+void aux_mux_masks16(const float* masks, int64_t N, int64_t h, int64_t w, int64_t H, int64_t W, bool sigmoid_first,
+                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream) {
+    const int64_t n = B * H * W * 2 * M;
+    if (n <= 0) return;
+    const float sy = (float) h / (float) H, sx = (float) w / (float) W;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t ch = i % (2 * M), px = i / (2 * M), b = px / (H * W), q = px - b * H * W;
+        const int64_t s = ch % M, o = b * M + s;
+        float v = 0.f;
+        if (o < N && (valid == nullptr || valid[o] > 0.f)) {
+            if (ch >= M) {
+                v = cond[o];
+            } else {
+                const int64_t oy = q / W, ox = q - oy * W;
+                // torch's bilinear, align_corners false: the source position clamped at 0
+                const float fy = sycl::fmax(((float) oy + 0.5f) * sy - 0.5f, 0.f);
+                const float fx = sycl::fmax(((float) ox + 0.5f) * sx - 0.5f, 0.f);
+                const int64_t y0 = sycl::min((int64_t) fy, h - 1), x0 = sycl::min((int64_t) fx, w - 1);
+                const int64_t y1 = sycl::min(y0 + 1, h - 1), x1 = sycl::min(x0 + 1, w - 1);
+                const float wy = fy - (float) y0, wx = fx - (float) x0;
+                const float* m = masks + o * h * w;
+                const auto at = [&](int64_t yy, int64_t xx) {
+                    const float l = m[yy * w + xx];
+                    return sigmoid_first ? 1.f / (1.f + sycl::exp(-l)) : l;
+                };
+                float t = (1.f - wy) * ((1.f - wx) * at(y0, x0) + wx * at(y0, x1)) +
+                          wy * ((1.f - wx) * at(y1, x0) + wx * at(y1, x1));
+                if (!sigmoid_first) t = 1.f / (1.f + sycl::exp(-t));
+                v = 2.f * t - 1.f;
+            }
+        }
+        y16[i] = f16_from_f32(v);
+    });
+    finish(stream, e, "aux_mux_masks16");
+}
+
+void aux_binarize(const float* x, int64_t n, float* y, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        y[id[0]] = x[id[0]] > 0.f ? 1.f : 0.f;
+    });
+    finish(stream, e, "aux_binarize");
+}
+
+void aux_mod_select16(const float* src, int64_t T, int64_t R, int64_t C, uint16_t* y16, void* stream) {
+    if (R * C <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / C;
+        y16[i] = f16_from_f32(src[((r % T) * R) * C + i]);
+    });
+    finish(stream, e, "aux_mod_select16");
 }
 
 }  // namespace strata::image

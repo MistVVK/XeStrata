@@ -2196,7 +2196,8 @@ The model files are not part of it; their licenses apply to them (below).
      [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) `vllm_omni/diffusion/models/seedvr2/`. The
      one step (the noise, the condition latent times 0.9152, the velocity taken off) and the image's handling before
      and after follow ComfyUI's (GPL-3.0) SeedVR2 nodes, whose outputs it was checked against; int8_convrot's rotation
-     is ComfyUI's regular Hadamard. The code is written without copying theirs.
+     is ComfyUI's regular Hadamard. A video's chunks and their overlaps' blend follow ComfyUI's SeedVR2TemporalChunk
+     and SeedVR2TemporalMerge. The code is written without copying theirs.
    - The upscale's color corrections (`src/image/img_color.cpp`): their names (`lab`, `adain`, `wavelet`, `none`) and
      the steps of `wavelet` (five dilated blurs) and `lab` (`wavelet`'s, then each CIE Lab channel matched rank for
      rank, the lightness kept 0.8) follow [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) and
@@ -2208,6 +2209,17 @@ The model files are not part of it; their licenses apply to them (below).
      at 15bb15d (LGPL-3.0-or-later AND Apache-2.0, `NOTICE`), and checked against transformers' Sam3Model. Neither
      Meta's code (SAM License) nor ComfyUI's is used. CLIP's BPE that reads the words (`tools/strata_tokenizer.py`'s
      `ClipTokenizer`) is written from its `tokenizer.json`'s shape.
+   - SAM 3.1's tracker (`src/image/sam3_track.cpp`): written for the engine after reading Meta's
+     [sam3](https://github.com/facebookresearch/sam3) (SAM License, f1647e8) and ComfyUI's (GPL-3.0)
+     `comfy/ldm/sam3/tracker.py` for the network's shape and defaults; neither's code is copied. Where the two differ
+     (the input's normalization, the sine positions, which token gives the object pointer, the norms' eps), Meta's is
+     followed. Its parts are checked against ComfyUI's outputs and against Meta's SAM 3.1 run in a throwaway
+     environment.
+   - The video segmentation's rules (`src/image/sam3_video.cpp`, `include/strata/image/sam3_video.hpp`): after
+     [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) `vllm_omni/diffusion/models/sam3/sam3_video.py`
+     at 2b610b3 (its association, hot start, occlusion suppression, delayed outputs and several words; LGPL-3.0-or-later
+     AND Apache-2.0, `NOTICE`). What SAM 3.1 adds (matching by IoM, detections at the edges left out, confirmation,
+     reconditioning, buckets of 16) and the clicks are written after reading Meta's sam3, whose code is not copied.
    - Florence-2 (`src/image/florence2.cpp`, `serve/image_regions.py`): written from Microsoft's
      [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (MIT) `modeling_florence2.py` (DaViT, BART, the
      beam search) and `processing_florence2.py` (the task prompts, the added tokens, reading `<loc_*>` and the
