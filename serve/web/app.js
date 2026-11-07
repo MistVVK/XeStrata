@@ -6,6 +6,7 @@
 /* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
           clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen, chatId,
           chat, saveChatOf, resumeReplies, chatName, openChat, StrataSegments */
+/* exported pending */   // read by chats-ui.js (the history's buttons wait for it)
 // serve/web/i18n.js, math.js, preview.js, segments.js and chats-ui.js, loaded before this file
 "use strict";
 
@@ -90,10 +91,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 let tab = "chat";
 let noteShown = false;
 function showTab(name) {
-  tab = ["chat", "images", "tools", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "tools", "video", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   fitHeader();                                       // on a phone the open tab shows its name: the row's room changes
-  for (const v of ["chat", "images", "tools", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "tools", "video", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") {
     $("img-prompt").focus();
     if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
@@ -105,6 +106,7 @@ function showTab(name) {
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
   if (tab === "about") { loadConfig(); loadUpdate(); }
+  if (tab === "video") vidJobs();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-header .st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -340,7 +342,10 @@ function pillLanes(live, localLoad) {
     lanes.push(["chat", `${fmt(live.tok_s, 1)} tok/s`, tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)})]);
   }
   if (live.queued > 0) lanes.push(["clock", String(live.queued), tr("pill.queued", "{n} queued", {n: live.queued})]);
-  if (live.image) {
+  if (live.video) {   // a video job (it is the image engine's job too)
+    const v = live.video;
+    lanes.push(["image", `${v.done}/${v.total}`, tr("vid.pill", "Video · frame {i} of {n}", {i: v.done, n: v.total})]);
+  } else if (live.image) {
     const img = live.image;
     lanes.push(["image", img.stage === "sampling" ? `${img.step}/${img.steps}` : "…", tr("img.pill", "Image · {step}", {step: imageStep(img)})]);
   } else if (imageBusy) {
@@ -542,6 +547,7 @@ function render(m) {
   setPill(state, lanes.length ? lanes.map((l) => l[2]).join(" · ") : idle, false, lanes.map((l) => [l[0], l[1]]));
   pillLive = {lanes, idle};
   renderPillPop();
+  chatVideoNote(live.video);
   modelButton(live);
   // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
   const fail = m.engine_failure;
@@ -2106,7 +2112,8 @@ async function generateReply(opts = {}) {
         // dropped before it, a mask the model had not used yet was lost when it wrote its memory first)
         const imageRan = (m.tools || []).some((t) => ["edit_image", "generate_image"].includes(t.tool || t.name) && t.state !== "writing");
         if (round > 0 && imageRan && body.strata_images && typeof body.strata_images === "object") {
-          const {force, edit, layout, ...rest} = body.strata_images;
+          const rest = {...body.strata_images};
+          for (const k of ["force", "edit", "layout"]) delete rest[k];
           body.strata_images = Object.keys(rest).length ? rest : true;
         }
         // kept past its connection (a tab put to sleep, a network that dropped, the page closed): the rest is read again
@@ -2306,6 +2313,7 @@ function isTextFile(f) {
 }
 function addFiles(files) {
   for (const f of files) {
+    if (f.type.startsWith("video/") && health.video && health.video.available) { chatVideo(f); continue; }
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
       if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
@@ -3009,7 +3017,7 @@ for (const r of imgRanges) r.addEventListener("input", () => {
   f.dispatchEvent(new Event("input", {bubbles: true}));
   if (f.tagName === "SELECT") f.dispatchEvent(new Event("change", {bubbles: true}));
 });
-for (const f of ["img-form", "tool-form"]) $(f).addEventListener("input", (e) => { if (!imgRanges.includes(e.target)) imgSliders(); });
+for (const f of ["img-form", "tool-form", "vid-form"]) $(f).addEventListener("input", (e) => { if (!imgRanges.includes(e.target)) imgSliders(); });
 // the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
 // fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
 // the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
@@ -3061,6 +3069,7 @@ function imgModels() {
   $("img-model-f").hidden = ms.length < 2;
   imgDefaults();
   toolsSetup();
+  videoSetup();
 }
 $("img-model").onchange = () => {
   if (!imgModel().edits && ($("img-ref").files || []).length > 1) $("img-ref").value = "";
@@ -4330,3 +4339,340 @@ $("tool-form").onsubmit = async (ev) => {
     paintLive();
   }
 };
+
+// ------------------------------------------------------------------ Video
+// The video tools on a video of this browser's.  The upscale is /v1/videos/sync for a short video (the file in the
+// answer) and a /v1/videos job for a longer one: it runs on the server, the page may close, and the jobs list (GET
+// /v1/videos: this page's and the API's) shows it.  The source plays from the browser's file, a result from the server
+// (its job's id is the access, as an image file's link).  A job's progress is its record's; the frames of the one
+// running are the metrics' live.video.
+const VID_SYNC_S = 20;   // seconds: a video this short is upscaled in the answer, a longer one as a job
+let vidSrc = null, vidAbort = null, vidTimer = 0, vidLast = null, vidJobsTimer = 0, vidJob = null;
+function videoSetup() {
+  const ups = (health.image_models || []).some(m => ((m.defaults || {}).tools || []).includes("upscale_image"));
+  $("tab-btn-video").hidden = !health.image_generation || !health.video || !ups;
+  const off = health.video && !health.video.available;
+  $("vid-go").disabled = !!off;
+  if (off) $("vid-hint").textContent = tr("vid.noFfmpeg", "The video tools need ffmpeg on the server: xestrata --setup says how to install it.");
+}
+// a duration as m:ss (or h:mm:ss)
+function vidClock(s) {
+  s = Math.max(0, Math.round(s || 0));
+  const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, ss = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+// the size it will be: the sides times the scale, even, at most 4096 a side
+function vidUpSize() {
+  const el = $("vid-up-size");
+  if (!vidSrc || !vidSrc.w) { el.textContent = ""; return; }
+  const sc = +$("vid-up-scale").value || 2, [w, h] = [vidSrc.w, vidSrc.h].map(x => Math.round(x * sc / 2) * 2);
+  el.textContent = tr("tool.upSize", "{w} × {h} → {W} × {H}", {w: vidSrc.w, h: vidSrc.h, W: w, H: h}) +
+    (Math.max(w, h) > 4096 ? " " + tr("tool.upTooLarge", "(past 4096 a side: a smaller scale)") : "");
+}
+$("vid-up-scale").addEventListener("input", vidUpSize);
+// what is known of the source: the browser's (size, length, file size), then the server's (frame rate, frames, VFR)
+function vidSrcInfo(server) {
+  if (!vidSrc) { $("vid-src-info").textContent = ""; return; }
+  const parts = [];
+  if (vidSrc.w) parts.push(`${vidSrc.w} × ${vidSrc.h}`);
+  if (vidSrc.duration) parts.push(vidClock(vidSrc.duration));
+  parts.push(`${fmt(vidSrc.file.size / 1048576, 1)} MiB`);
+  if (server) {
+    parts.push(tr("vid.fps", "{n} fps", {n: fmt(server.fps, 2)}), tr("vid.frames", "{n} frames", {n: server.frames}));
+    if (server.vfr) parts.push(tr("vid.vfr", "a varying frame rate, read at its average"));
+  }
+  if (vidSrc.unplayable) parts.push(tr("vid.unplayable", "this browser cannot play it; the server still reads it"));
+  $("vid-src-info").textContent = parts.join(" · ");
+}
+function vidSetSource(f) {
+  if (!f) return;
+  if (vidSrc) URL.revokeObjectURL(vidSrc.url);
+  vidSrc = {file: f, url: URL.createObjectURL(f), w: 0, h: 0, duration: 0, unplayable: false};
+  const v = $("vid-src");
+  v.onloadedmetadata = () => { vidSrc.w = v.videoWidth; vidSrc.h = v.videoHeight; vidSrc.duration = v.duration; vidSrcInfo(); vidUpSize(); };
+  v.onerror = () => { vidSrc.unplayable = true; vidSrcInfo(); };
+  v.src = vidSrc.url;
+  vidResult(null);
+  vidShow("source");
+  vidSrcInfo();
+  vidUpSize();
+}
+$("vid-file").onchange = () => vidSetSource($("vid-file").files[0]);
+for (const ev of ["dragenter", "dragover"]) $("vid-form").addEventListener(ev, (e) => {
+  if ([...(e.dataTransfer.items || [])].some((i) => i.kind === "file")) e.preventDefault();
+});
+$("vid-form").addEventListener("drop", (e) => {
+  const f = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) { e.preventDefault(); vidSetSource(f); }
+});
+// the player: the source, the result, or both side by side; with both, the result follows the source
+function vidShow(which) {
+  const have = {source: !!vidSrc, result: !!(vidLast && vidLast.url)};
+  if (which === "both" && !(have.source && have.result)) which = have.result ? "result" : "source";
+  if (!have[which] && which !== "both") which = have.source ? "source" : "result";
+  $("vid-view").dataset.show = which;
+  for (const b of $("vid-show").children) {
+    b.setAttribute("aria-checked", String(b.dataset.show === which));
+    b.hidden = b.dataset.show === "both" ? !(have.source && have.result) : !have[b.dataset.show];
+  }
+  $("vid-src").hidden = !have.source || which === "result";
+  $("vid-out").hidden = !have.result || which === "source";
+  $("vid-empty").hidden = have.source || have.result;
+  $("vid-bar").hidden = !(have.source || have.result);
+  if (which !== "both") $("vid-out").muted = false;
+}
+for (const b of $("vid-show").children) b.onclick = () => vidShow(b.dataset.show);
+const vidBoth = () => $("vid-view").dataset.show === "both";
+$("vid-src").addEventListener("play", () => { if (vidBoth()) { $("vid-out").muted = true; $("vid-out").currentTime = $("vid-src").currentTime; $("vid-out").play(); } });
+$("vid-src").addEventListener("pause", () => { if (vidBoth()) $("vid-out").pause(); });
+$("vid-src").addEventListener("seeked", () => { if (vidBoth()) $("vid-out").currentTime = $("vid-src").currentTime; });
+// a frame back or on (the result's rate where there is one, else the source's as the server read it, else 30)
+function vidStep(n) {
+  const fps = (vidLast && vidLast.fps) || 30;
+  for (const v of [$("vid-src"), $("vid-out")]) {
+    if (v.hidden || !v.src) continue;
+    v.pause();
+    v.currentTime = Math.max(0, v.currentTime + n / fps);
+  }
+}
+$("vid-prev").onclick = () => vidStep(-1);
+$("vid-next").onclick = () => vidStep(1);
+// the result: its file to play and save, the request and the server's figures
+function vidResult(r) {
+  if (vidLast && vidLast.blob) URL.revokeObjectURL(vidLast.url);
+  vidLast = r;
+  $("vid-save").hidden = $("vid-copy").hidden = $("vid-info-box").hidden = !r;
+  if (!r) { $("vid-out").removeAttribute("src"); $("vid-out").load(); vidShow("source"); return; }
+  $("vid-out").src = r.url;
+  Object.assign($("vid-save"), {href: r.url, download: r.name});
+  $("vid-info").textContent = r.info;
+  vidShow(vidSrc && r.mine ? "both" : "result");
+}
+$("vid-copy").onclick = () => vidLast && copyText(JSON.stringify(vidLast.req, null, 2), $("vid-copy"));
+// the request's fields (/v1/videos' form): the model, the scale, the seed, extra_params
+function vidRequest() {
+  const num = (id) => $(id).value === "" ? undefined : Number($(id).value);
+  const req = {model: $("vid-up-model").value, scale: num("vid-up-scale") ?? 2}, extra = {};
+  if (num("vid-seed") != null) req.seed = num("vid-seed");
+  if ($("vid-up-color").value) extra.color_correction_method = $("vid-up-color").value;
+  if (num("vid-chunk") != null) extra.chunk_frames = num("vid-chunk");
+  if (num("vid-overlap") != null) extra.temporal_overlap = num("vid-overlap");
+  if (Object.keys(extra).length) req.extra_params = extra;
+  return req;
+}
+function vidForm(req) {
+  const fd = new FormData();
+  for (const [k, v] of Object.entries(req)) fd.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+  fd.append("input_references", vidSrc.file, vidSrc.file.name);
+  return fd;
+}
+// a POST of the form with its upload's progress (fetch tells none): {status, headers(name), body: a Blob}
+function vidPost(url, fd, signal, uploaded) {
+  return new Promise((ok, no) => {
+    const x = new XMLHttpRequest();
+    x.open("POST", url);
+    for (const [k, v] of Object.entries(headers(false))) x.setRequestHeader(k, v);
+    x.setRequestHeader("X-Strata-Upload", "1");   // the server's mark of its own page's form (_foreign_page)
+    x.responseType = "blob";
+    x.upload.onprogress = (e) => { if (e.lengthComputable) uploaded(e.loaded / e.total); };
+    x.onload = () => ok({status: x.status, header: (n) => x.getResponseHeader(n), body: x.response});
+    x.onerror = () => no(new Error(tr("vid.netError", "The connection to the server failed")));
+    x.onabort = () => no(new DOMException("aborted", "AbortError"));
+    signal.addEventListener("abort", () => x.abort());
+    x.send(fd);
+  });
+}
+async function vidError(r) {
+  let e = {};
+  try { e = JSON.parse(await r.body.text()).error || {}; } catch { /* not JSON */ }
+  const ra = r.header("Retry-After");
+  if (e.code === "weights_downloading") return tr("tool.downloading", "The tool's weights are downloading: run it again in a minute. ({msg})", {msg: e.message || ""});
+  return (e.message || `HTTP ${r.status}`) + (r.status === 503 && ra ? " " + tr("vid.retry", "(try again in about {n} s)", {n: ra}) : "");
+}
+// running: the button is Interrupt with the seconds so far; the upload's share, then the frames done
+function vidBusy(t0) {
+  clearInterval(vidTimer);
+  $("vid-go").classList.toggle("is-busy", t0 != null);
+  $("vid-go-time").textContent = "";
+  $("vid-progress").hidden = true;
+  $("vid-cap").textContent = "";
+  if (t0 == null) return;
+  vidTimer = setInterval(() => {
+    const s = (performance.now() - t0) / 1000, run = vidAbort;
+    $("vid-go-time").textContent = tr("img.elapsed", "{n} s", {n: Math.round(s)});
+    let p = null, cap = "";
+    if (run && run.upload < 1) {
+      p = run.upload;
+      cap = tr("vid.uploading", "Sending the video · {pct}%", {pct: Math.round(100 * p)});
+    } else {
+      const v = (lastMetrics && lastMetrics.live && lastMetrics.live.video) || (vidJob && vidJob.rec && {done: vidJob.rec.frames_done || 0, total: (vidJob.rec.source || {}).frames || 0});
+      if (v && v.total) {
+        p = Math.min(1, v.done / v.total);
+        cap = tr("vid.frameOf", "Frame {i} of {n}", {i: v.done, n: v.total}) + (v.left_s ? " · " + tr("tool.left", "about {n} s left", {n: v.left_s}) : "");
+      }
+    }
+    $("vid-progress").hidden = p == null;
+    if (p != null) $("vid-bar-fill").style.width = `${Math.round(100 * p)}%`;
+    $("vid-cap").textContent = cap;
+  }, 500);
+}
+$("vid-go").onclick = (ev) => {
+  if (!vidAbort) return;
+  ev.preventDefault();
+  if (ev.detail > 0 || document.activeElement === $("vid-go")) vidAbort.ctl.abort();
+};
+const vidInfo = (req, path, answer) => [`POST /${path}`, ...Object.entries(req).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`),
+                                        `input_references: (${vidSrc ? vidSrc.file.name : "?"})`, "", ...answer].join("\n");
+$("vid-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (vidAbort) return;
+  if (!vidSrc) { toast("warn", tr("tab.video", "Video"), tr("vid.noVideo", "Choose a video first."), 5000); return; }
+  const req = vidRequest(), v = health.video || {};
+  const sync = vidSrc.duration > 0 && vidSrc.duration <= VID_SYNC_S && vidSrc.file.size <= (v.sync_max_mib || 512) * 1048576;
+  const path = sync ? "v1/videos/sync" : "v1/videos";
+  if (!sync && v.max_upload_mib && vidSrc.file.size > v.max_upload_mib * 1048576) {
+    toast("error", tr("tool.upscale", "Upscale"), tr("vid.tooLarge", "The video is larger than the server takes ({n} MiB: video.max_upload_mib).", {n: v.max_upload_mib}), 10000);
+    return;
+  }
+  vidAbort = {ctl: new AbortController(), upload: 0};
+  imageBusy = true;
+  paintLive();
+  const t0 = performance.now();
+  vidBusy(t0);
+  $("vid-hint").textContent = "";
+  vidResult(null);
+  try {
+    const r = await vidPost(path, vidForm(req), vidAbort.ctl.signal, (p) => { vidAbort.upload = p; });
+    vidAbort.upload = 1;
+    if (r.status !== 200) throw new Error(await vidError(r));
+    if (sync) {
+      const seconds = Math.round((performance.now() - t0) / 1000), fps = Number(r.header("X-Video-Fps")) || 0;
+      const answer = [`model: ${r.header("X-Model")}`, `frames: ${r.header("X-Video-Frames")}`, `fps: ${fmt(fps, 3)}`,
+                      r.header("X-Video-Vfr") ? `vfr: ${r.header("X-Video-Vfr")}` : "", `seconds: ${seconds}`].filter(Boolean);
+      const ext = (r.body.type || "video/mp4").includes("webm") ? "webm" : (r.body.type || "").includes("matroska") ? "mkv" : "mp4";
+      vidResult({url: URL.createObjectURL(r.body), blob: true, name: `xestrata-upscale.${ext}`, fps, req, mine: true, info: vidInfo(req, path, answer)});
+      $("vid-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+    } else {
+      const rec = JSON.parse(await r.body.text());
+      vidSrcInfo(rec.source);
+      vidJob = {id: rec.id, rec, req};
+      vidJobs();
+      await vidFollow(t0);
+    }
+  } catch (e) {
+    if (vidAbort.ctl.signal.aborted) $("vid-hint").textContent = tr("img.interrupted", "Interrupted.");
+    else toast("error", tr("tool.upscale", "Upscale"), String(e.message || e), 12000);
+  } finally {
+    vidAbort = null;
+    vidJob = null;
+    imageBusy = false;
+    vidBusy(null);
+    paintLive();
+    vidJobs();
+  }
+};
+// this page's job, followed to its end: its record every 2 s; Interrupt deletes it on the server
+async function vidFollow(t0) {
+  const id = vidJob.id;
+  for (;;) {
+    if (vidAbort.ctl.signal.aborted) {
+      await fetch(`v1/videos/${id}`, {method: "DELETE", headers: headers()}).catch(() => {});
+      return;
+    }
+    await new Promise((ok) => setTimeout(ok, 2000));
+    const r = await fetch(`v1/videos/${id}`, {headers: headers()});
+    if (!r.ok) throw new Error(tr("vid.lost", "The job is gone from the server."));
+    const rec = vidJob.rec = await r.json();
+    if (rec.status === "completed") {
+      vidOpenJob(rec, vidJob.req, Math.round((performance.now() - t0) / 1000));
+      return;
+    }
+    if (rec.status === "failed") throw new Error((rec.error && rec.error.message) || rec.status);
+  }
+}
+// a completed job's result in the player: its file from the server
+function vidOpenJob(rec, req, seconds) {
+  const res = rec.result || {}, up = res.upscale || {};
+  const answer = [`id: ${rec.id}`, `model: ${rec.model}`, `size: ${rec.size}`, res.frames != null ? `frames: ${res.frames}` : "",
+                  res.fps ? `fps: ${fmt(res.fps, 3)}` : "", res.vfr ? "vfr: read at its average frame rate" : "",
+                  up.method ? `upscaler: ${up.method}${up.variant ? " " + up.variant : ""}` : "", up.chunk ? `chunk: ${up.chunk}` : "",
+                  res.seed != null ? `seed: ${res.seed}` : "", `seconds: ${seconds != null ? seconds : res.seconds}`].filter(Boolean);
+  vidResult({url: `v1/videos/${rec.id}/content`, name: rec.file_name || `${rec.id}.mp4`, fps: res.fps, req: req || {model: rec.model, size: rec.size},
+             mine: !!req, info: (req ? vidInfo(req, "v1/videos", answer) : answer.join("\n"))});
+  if (seconds != null) $("vid-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
+}
+// the jobs on the server, newest first: each one's state, progress and time left, and its result to open, save or
+// delete; asked again every 3 s while one runs and the tab is open
+async function vidJobs() {
+  clearTimeout(vidJobsTimer);
+  if (tab !== "video" || $("tab-btn-video").hidden) return;
+  let list;
+  try {
+    const r = await fetch("v1/videos?limit=20", {headers: headers()});
+    if (!r.ok) return;
+    list = (await r.json()).data || [];
+  } catch { return; }
+  const now = Date.now() / 1000;
+  const rows = list.map((rec) => {
+    const row = document.createElement("div"), what = document.createElement("span"), acts = document.createElement("span");
+    row.className = "vid-job";
+    acts.className = "vid-job__acts";
+    const state = {queued: tr("vid.queued", "Waiting"), in_progress: tr("vid.running", "Running"), completed: tr("vid.done", "Done"),
+                   failed: tr("vid.failed", "Failed")}[rec.status] || rec.status;
+    let detail = `${state} · ${rec.model} · ${rec.size}`;
+    if (rec.status === "in_progress" && rec.progress > 0 && rec.started_at)
+      detail += ` · ${rec.progress}% · ` + tr("tool.left", "about {n} s left", {n: Math.round((now - rec.started_at) * (100 - rec.progress) / rec.progress)});
+    if (rec.status === "failed" && rec.error) detail += ` · ${rec.error.message}`;
+    what.textContent = `${new Date(rec.created_at * 1000).toLocaleString()} · ${detail}`;
+    const btn = (label, run) => { const b = document.createElement("button"); b.type = "button"; b.className = "st-btn st-btn--secondary"; b.textContent = label; b.onclick = run; return b; };
+    if (rec.status === "completed") {
+      acts.append(btn(tr("vid.open", "Open"), () => vidOpenJob(rec, null, null)));
+      const a = Object.assign(document.createElement("a"), {className: "st-btn st-btn--secondary", href: `v1/videos/${rec.id}/content`,
+                                                             download: rec.file_name || "", textContent: tr("img.save", "Save")});
+      acts.append(a);
+    }
+    const live = rec.status === "queued" || rec.status === "in_progress";
+    acts.append(btn(live ? tr("vid.cancel", "Cancel") : tr("vid.delete", "Delete"), async () => {
+      await fetch(`v1/videos/${rec.id}`, {method: "DELETE", headers: headers()}).catch(() => {});
+      vidJobs();
+    }));
+    row.append(what, acts);
+    return row;
+  });
+  $("vid-jobs").replaceChildren(...(rows.length ? rows : [Object.assign(document.createElement("span"), {className: "composer-hint", textContent: tr("vid.noJobs", "No jobs yet.")})]));
+  if (list.some((r) => r.status === "queued" || r.status === "in_progress")) vidJobsTimer = setTimeout(vidJobs, 3000);
+}
+// the chat's note while a video job runs on the server (live.video): its requests answered between the job's chunks,
+// or not until it ends where the text model made way for it
+function chatVideoNote(v) {
+  const el = $("chat-video-note");
+  el.hidden = !v;
+  if (!v) return;
+  el.textContent = v.chat === "refused"
+    ? tr("vid.chatRefused", "A video job has the GPU (the model made way for it): the chat answers again in about {n} s.", {n: v.left_s || "?"})
+    : tr("vid.chatBetween", "A video job is running: the chat answers between its chunks, a little later than usual.");
+}
+
+// a video attached in the chat: sent to the server first (POST /v1/videos/files: the chat's tools take it from there,
+// upscale_video), then attached as a text of its link and what the server read of it, which the model sees
+async function chatVideo(f) {
+  const v = health.video || {};
+  if (v.max_upload_mib && f.size > v.max_upload_mib * 1048576) {
+    toast("error", tr("vid.attach", "Video"), tr("vid.tooLarge", "The video is larger than the server takes ({n} MiB: video.max_upload_mib).", {n: v.max_upload_mib}), 10000);
+    return;
+  }
+  const fd = new FormData();
+  fd.append("file", f, f.name);
+  toast("info", tr("vid.attach", "Video"), tr("vid.sending", "Sending {name} to the server…", {name: f.name}), 4000);
+  try {
+    const r = await vidPost("v1/videos/files", fd, new AbortController().signal, () => {});
+    if (r.status !== 200) throw new Error(await vidError(r));
+    const j = JSON.parse(await r.body.text());
+    const text = `Video: ${j.url} (${j.width}x${j.height}, ${fmt(j.fps, 2)} fps, ${j.frames} frames, ${fmt(j.duration, 1)} s` +
+      (j.vfr ? ", a varying frame rate" : "") + ")";
+    attachments.push({kind: "file", name: f.name, text});
+    renderAttachments();
+  } catch (e) {
+    toast("error", tr("vid.attach", "Video"), String(e.message || e), 10000);
+  }
+}

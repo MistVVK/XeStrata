@@ -138,6 +138,9 @@ struct VideoRequest {
     Request frame;
     int64_t chunk = 0, overlap = 0;
     video::Codec codec = video::Codec::automatic;
+    /// Called where the run can wait with nothing in flight (a temporal model's chunk out, a few frames of the
+    /// others'): the server lets other requests use the GPU there.
+    std::function<void()> pause;
 };
 
 /// What a video's run made: the file, its frames and their rate (the source's average: a VFR source was read at it),

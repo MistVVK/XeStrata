@@ -12,7 +12,8 @@ path, or on Windows a file the daemon writes its loopback port and a random toke
 first).  The lines are strata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
 and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO, DETECT, UPS, UPSNEED) waits for
 the engine and gets its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after
-its step; QUIT closes the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers
+its step; RESUME goes on with the client's running video after its YIELD (the engine waits there for it); QUIT closes
+the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers
 STOPPED once the engine is gone.  Without a client and a request for --idle seconds (default 1800)
 the daemon ends, and so it does when the engine ends.
 """
@@ -104,9 +105,12 @@ class Daemon:
                             write(f, got)
                         except OSError:
                             gone = True
-                            if op == "IMG":
+                            if op in ("IMG", "UPSV"):
                                 with contextlib.suppress(OSError, ValueError):
                                     self.send("STOP")
+                    if gone and got == "YIELD":   # no one to say RESUME: on to its STOP
+                        with contextlib.suppress(OSError, ValueError):
+                            self.send("RESUME")
                     if got.split(" ", 1)[0] in ends or got.startswith("ERROR"):
                         return
             finally:
@@ -121,14 +125,14 @@ class Daemon:
             write(f, self.ready)
             requests: queue.Queue = queue.Queue()
 
-            def read():   # the client's lines: STOP at once (it targets the running image), the rest in turn
+            def read():   # the client's lines: STOP and RESUME at once (for the running request), the rest in turn
                 try:
                     for raw in f:
                         line = raw.rstrip("\r\n")
-                        if line == "STOP":
+                        if line in ("STOP", "RESUME"):
                             if self.owner is conn:
                                 with contextlib.suppress(OSError, ValueError):
-                                    self.send("STOP")
+                                    self.send(line)
                             continue
                         requests.put(line)
                 finally:

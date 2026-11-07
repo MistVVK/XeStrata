@@ -117,11 +117,12 @@
 //                            in the VAE's smallest tiles (least) or of 21 frames with the frame whole (full, the
 //                            default chunk of ComfyUI's template) added                    -> NEED as NEED's
 //   UPSV <width> <height> <in> <out stem> <name>[:<path>] [COLOR:<m>] [SEED:<s>] [CHUNK:<frames>] [OVERLAP:<latents>]
-//        [CODEC:<h264|vp9|ffv1>]
+//        [CODEC:<h264|vp9|ffv1>] [YIELD:1]
 //                            the video <in> (a file ffmpeg reads) upscaled to width x height by the upscaler, written
 //                            to <out stem> + its container's extension with the source's audio (upscale.hpp's
 //                            run_video: SeedVR2 in time, in chunks of CHUNK frames overlapping by OVERLAP latents, 0
-//                            its own choice; the others frame by frame); the image model's room let go first
+//                            its own choice; the others frame by frame); the image model's room let go first.
+//                            YIELD:1: YIELD at each chunk's end (a few frames' of the others), on at RESUME
 //                            -> STAGE upscale-video, STEP <frames written> <frames>, then UPSVIDEO path=... mime=...
 //                            frames=... width=... height=... fps=... vfr=... upscale_s=... read_s=... model_s=...
 //                            resize_s=... color_s=... write_s=... color=...
@@ -557,7 +558,9 @@ struct Lines {
         for (std::string line; stdin_line(line, buf);) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line == "STOP") {
+                std::lock_guard<std::mutex> l(mu);   // a run waiting for RESUME (resume) wakes to it
                 stop = true;
+                cv.notify_all();
                 continue;
             }
             std::lock_guard<std::mutex> l(mu);
@@ -574,6 +577,16 @@ struct Lines {
         if (q.empty()) return false;
         line = q.front();
         q.pop_front();
+        return true;
+    }
+    /// After a YIELD: waits for the server's RESUME; false on STOP or the input's end (the run stops at its next step).
+    bool resume() {
+        std::unique_lock<std::mutex> l(mu);
+        cv.wait(l, [this] { return eof || stop.load() || !q.empty(); });
+        if (stop.load() || q.empty()) return false;
+        const std::string line = q.front();
+        q.pop_front();
+        if (line != "RESUME") throw std::runtime_error("image engine: " + line + " while a video waits for RESUME");
         return true;
     }
 };
@@ -1044,6 +1057,12 @@ int serve(si::ImagePipeline& p) {
                         vr.chunk = std::stoll(word.substr(6));
                     } else if (word.rfind("OVERLAP:", 0) == 0) {
                         vr.overlap = std::stoll(word.substr(8));
+                    } else if (word == "YIELD:1") {   // at its chunks' ends: YIELD, then on at RESUME
+                        vr.pause = [&in] {
+                            std::printf("YIELD\n");
+                            std::fflush(stdout);
+                            in.resume();
+                        };
                     } else if (word.rfind("CODEC:", 0) == 0) {
                         const std::string c = word.substr(6);
                         vr.codec = c == "h264" ? strata::video::Codec::h264 : c == "vp9" ? strata::video::Codec::vp9

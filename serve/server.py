@@ -90,6 +90,7 @@ from serve.responses import ResponsesError, error_body as responses_error_body  
 from serve import images as images_api  # noqa: E402
 from serve import image_aux  # noqa: E402
 from serve import image_regions as regions_api  # noqa: E402
+from serve import videos as videos_api  # noqa: E402
 from serve import loras as lora_api  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -3844,6 +3845,8 @@ class Service:
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
+        self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
+        self.long_job: Any = None                         # a video job's state while it holds the image engine
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
         self.stop_ids = stop_token_ids(tokenizer)
         if hasattr(engine, "eos_ids"):
@@ -4256,6 +4259,11 @@ class Service:
         """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
+        job = self.long_job
+        if job is not None and job.get("policy") == "unload":   # a video job's GPU, the engine unloaded for it
+            left = images_api.long_job_left(self)
+            raise GpuBusy(f"a video job has the GPU for about {left} s more (the model made way for it): ask again "
+                          "then", retry_after=left)
         if self.loaded() and not self._vision_down():
             return
         trace = getattr(self.request_trace, "record", None)
@@ -4574,6 +4582,11 @@ class Service:
         image = self.images.live() if self.images is not None else None
         if image is not None:                           # an image job in the GPU's turn: its stage and steps
             live["image"] = image
+        job = self.long_job
+        if job is not None:   # a video job (videos.py): its frames, the seconds left, and whether the chat's requests
+            # run at its chunks' ends or are refused (it has the GPU the text engine gave up)
+            live["video"] = {"done": job["done"], "total": job["total"], "left_s": images_api.long_job_left(self),
+                             "chat": "refused" if job.get("policy") == "unload" else "between_chunks"}
         # the image jobs that ended beside the chat's requests, newest first (the Monitor's Requests table); the
         # conversation cache counts the chat's only
         rows = sorted(hist + (self.images.recent() if self.images is not None else []), key=lambda r: r["time"])
@@ -7190,7 +7203,8 @@ def make_handler(svc: Service):
         def _foreign_page(self) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON.  No Origin (curl, the SDKs, other servers): any content type, as before."""
+            then the body must be JSON (the Video tab's upload: a form with X-Strata-Upload).  No Origin (curl, the
+            SDKs, other servers): any content type, as before."""
             origin = self.headers.get("Origin")
             if svc.api_key or not origin:
                 return False
@@ -7202,7 +7216,12 @@ def make_handler(svc: Service):
                        f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") in the config")
                 self._json(403, {"error": {"type": "forbidden", "message": msg}})
                 return True
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
+            ctype = self.headers.get("Content-Type", "")
+            if ctype.startswith("multipart/form-data") and self.headers.get("X-Strata-Upload") \
+                    and self.path.split("?")[0].rstrip("/") in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files"):
+                return False   # the Video tab's upload: a header of its own, which a page elsewhere cannot send
+                #                without a CORS preflight (granted to cors_origins alone)
+            if not ctype.startswith("application/json"):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return True
             return False
@@ -7276,6 +7295,13 @@ def make_handler(svc: Service):
             if path.startswith("/v1/responses/"):
                 self._json(404, responses_error_body("this server keeps no responses (stateless): there is nothing "
                                                      "to delete", code="not_found"))
+            elif path.startswith("/v1/videos/") and path.count("/") == 3:   # a video job and its files
+                got = self._video_jobs().delete(path[len("/v1/videos/"):]) if svc.images is not None else None
+                if got is None:
+                    self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                               "message": "no such video"}})
+                else:
+                    self._json(200, got)
             else:
                 self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})", "type": "invalid_request_error"}})
 
@@ -7485,6 +7511,9 @@ def make_handler(svc: Service):
                                  "image_note": svc.images.note() if svc.images is not None else None,
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
+                                 "video": videos_api.status(svc.images.default.cfg,
+                                                            Path(svc.images.default.dir) / "video-jobs")
+                                 if svc.images is not None else None,
                                  "thinking": getattr(svc.template, "thinking", None),
                                  # a streamed chat reply can be kept past its connection (strata_reply)
                                  "kept_replies": True,
@@ -7498,6 +7527,18 @@ def make_handler(svc: Service):
                 if not self._authorized():
                     return
                 self._json(200, svc.updates.check() if release_check.enabled() else svc.updates.info())
+            elif path.startswith("/v1/videos/files/"):   # a chat's video: its name (32 random hex digits) is the access
+                f = videos_api.file_path(self._video_jobs(), path[len("/v1/videos/files/"):]) \
+                    if svc.images is not None else None
+                if f is None:
+                    self._json(404, {"error": {"message": "not found (the server keeps a chat's videos a week)"}})
+                else:
+                    self._send_video(f, videos_api.file_mime(f))
+            elif path.startswith("/v1/videos/") and path.endswith("/content"):
+                self._videos_get(path)    # as an image file's link: the job's id (32 random hex digits) is the access
+            elif path == "/v1/videos" or path.startswith("/v1/videos/"):   # the video jobs (serve/videos.py)
+                if self._authorized():
+                    self._videos_get(path)
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -7695,6 +7736,12 @@ def make_handler(svc: Service):
                     return
                 if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
                     self._images_upscale()
+                    return
+                if path in ("/v1/videos", "/v1/videos/sync"):  # a video's upscale (vLLM-Omni's): its upload streamed
+                    self._videos_post(path)
+                    return
+                if path == "/v1/videos/files":                # a video the chat's page attaches (upscale_video's)
+                    self._videos_file()
                     return
                 if path in ("/v1/images/segmentations", "/v1/images/remove-background",
                             "/v2beta/stable-image/edit/remove-background"):   # forms or JSON (image_regions)
@@ -7944,6 +7991,181 @@ def make_handler(svc: Service):
             job = images_api.parse_edit_request(req, [Vision.normalize(picture, keep_alpha=True)], gen.cfg)
             self._image_job(gen, job, edit=True)
 
+        def _video_jobs(self) -> videos_api.VideoJobs:
+            return videos_api.jobs_of(svc)
+
+        def _videos_post(self, path: str) -> None:
+            """POST /v1/videos (a job: its record answered at once, queued) and /v1/videos/sync (the file in the
+            answer): a video upscaled (serve/videos.py), its source a multipart form's file (input_references or
+            video), written to the job's folder as it arrives."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            sync = path.endswith("/sync")
+            jobs = self._video_jobs()
+            vid, folder = jobs.new_dir()
+            keep = False
+            try:
+                ctype = self.headers.get("Content-Type", "") or ""
+                if not ctype.lower().startswith("multipart/form-data"):
+                    raise videos_api.VideoRequestError("send the video in a multipart/form-data form "
+                                                       "(input_references)")
+                length = int(self.headers.get("Content-Length") or -1)
+                if length < 0:
+                    raise videos_api.VideoRequestError("the form needs its Content-Length")
+                limit = (videos_api.SYNC_MAX_BYTES if sync
+                         else videos_api.upload_limit(svc.images.default.cfg, jobs.root))
+                if length > limit + (1 << 20):
+                    raise videos_api.VideoRequestError(f"the upload is past the limit of {limit >> 20} MiB"
+                                                       + ("" if sync else " (video.max_upload_mib)"), 413)
+                fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
+                src = next((f for f in files if f["field"] in videos_api.FILE_FIELDS), files[0] if files else None)
+                if src is None:
+                    raise videos_api.VideoRequestError("input_references: the video to upscale")
+                info = videos_api.probe(src["path"])
+                gen = svc.images.pick_edit(None, True)
+                images_api.check_tool(gen.cfg, "upscale_image")
+                job = videos_api.upscale_request(fields, info, gen.cfg, sync)
+                model = str(fields.get("model") or "auto")
+                svc.last_request_at = time.time()
+                if not sync:
+                    rec = jobs.create(vid, model, job, src["path"])
+                    keep = True
+                    self._json(200, rec)
+                    return
+                cancel = threading.Event()
+                self._watch_client(cancel)
+                t0 = time.monotonic()
+                out = videos_api.upscale(svc, gen, job, src["path"], folder / "out", None, cancel)
+                f = Path(out["path"])
+                self.send_response(200)
+                self.send_header("Content-Type", out["mime"])
+                self.send_header("Content-Length", str(f.stat().st_size))
+                self.send_header("X-Request-Id", vid)
+                self.send_header("X-Model", model)
+                self.send_header("X-Inference-Time-S", f"{time.monotonic() - t0:.3f}")
+                self.send_header("X-Video-Frames", str(out["figures"]["frames"]))
+                self.send_header("X-Video-Fps", f"{out['figures']['fps']:.6f}")
+                if out["figures"]["vfr"]:   # read at its average rate: the frames dropped or repeated to it
+                    self.send_header("X-Video-Vfr", "read at its average frame rate")
+                self._cors()
+                self.end_headers()
+                with open(f, "rb") as fh:
+                    while chunk := fh.read(1 << 20):
+                        self.wfile.write(chunk)
+            except images_api.AuxPending as e:
+                self._aux_failed(e)
+            except (videos_api.VideoRequestError, images_api.ImageRequestError) as e:
+                status, body = videos_api.explain(e) if isinstance(e, videos_api.VideoRequestError) else \
+                    (400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._json(status, body)
+            except images_api.LongJobBusy as e:
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
+            except images_api.ImageJobFailed as e:
+                self._json(500, {"error": {"type": "server_error", "code": "video_failed", "message": str(e)}})
+            finally:
+                if not keep:
+                    shutil.rmtree(folder, ignore_errors=True)
+
+        def _videos_file(self) -> None:
+            """POST /v1/videos/files: a video the chat's page attaches, a multipart form's file, kept a week
+            (videos.store_file) -> its link and what ffprobe says of it."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            jobs = self._video_jobs()
+            folder = videos_api.files_dir(jobs) / f"upload-{uuid.uuid4().hex}"
+            folder.mkdir()
+            try:
+                ctype = self.headers.get("Content-Type", "") or ""
+                length = int(self.headers.get("Content-Length") or -1)
+                if not ctype.lower().startswith("multipart/form-data") or length < 0:
+                    raise videos_api.VideoRequestError("send the video in a multipart/form-data form (file)")
+                limit = videos_api.upload_limit(svc.images.default.cfg, jobs.root)
+                if length > limit + (1 << 20):
+                    raise videos_api.VideoRequestError(f"the upload is past the limit of {limit >> 20} MiB "
+                                                       "(video.max_upload_mib)", 413)
+                _, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
+                if not files:
+                    raise videos_api.VideoRequestError("file: the video")
+                self._json(200, videos_api.store_file(jobs, Path(files[0]["path"]), files[0].get("filename") or ""))
+            except videos_api.VideoRequestError as e:
+                self._json(*videos_api.explain(e))
+            finally:
+                shutil.rmtree(folder, ignore_errors=True)
+
+        def _videos_get(self, path: str) -> None:
+            """GET /v1/videos (the jobs, newest first: limit, after, order), /v1/videos/{id} (its record) and
+            /v1/videos/{id}/content (its file once completed)."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            jobs = self._video_jobs()
+            if path == "/v1/videos":
+                q = {k: v[-1] for k, v in parse_qs(urlsplit(self.path).query).items()}
+                try:
+                    limit = int(q.get("limit") or 20)
+                except ValueError:
+                    limit = 20
+                self._json(200, jobs.list(limit, q.get("after"), q.get("order") or "desc"))
+                return
+            rest = path[len("/v1/videos/"):]
+            vid, _, tail = rest.partition("/")
+            rec = jobs.get(vid)
+            if rec is None or tail not in ("", "content"):
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "not_found",
+                                           "message": "no such video"}})
+                return
+            if tail == "":
+                self._json(200, jobs.public(rec))
+                return
+            got = jobs.content(vid)
+            if got is None:
+                still = rec.get("status") in ("queued", "in_progress")
+                self._json(404 if still else 422, {"error": {
+                    "type": "invalid_request_error", "code": "not_ready" if still else "video_failed",
+                    "message": "the video is still being made" if still else "the job failed: see its record"}})
+                return
+            self._send_video(*got)
+
+        def _send_video(self, f: Path, mime: str) -> None:
+            """A video file, or the part a Range asks for (a player's seek: 206)."""
+            size = f.stat().st_size
+            first, last = 0, size - 1
+            m = re.fullmatch(r"bytes=(\d*)-(\d*)", (self.headers.get("Range") or "").strip())
+            if m and (m.group(1) or m.group(2)):   # a player's seek: the part asked for (one range)
+                if m.group(1):
+                    first, last = int(m.group(1)), min(int(m.group(2) or last), last)
+                else:
+                    first = max(0, size - int(m.group(2)))
+                if first > last:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self._cors()
+                    self.end_headers()
+                    return
+            self.send_response(206 if m and (m.group(1) or m.group(2)) else 200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(last - first + 1))
+            if m and (m.group(1) or m.group(2)):
+                self.send_header("Content-Range", f"bytes {first}-{last}/{size}")
+            self.send_header("Content-Disposition", f'inline; filename="{f.name}"')
+            self.send_header("Cache-Control", "private, max-age=86400")
+            self._cors()
+            self.end_headers()
+            with open(f, "rb") as fh:
+                fh.seek(first)
+                left = last - first + 1
+                while left > 0 and (chunk := fh.read(min(1 << 20, left))):
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+
         def _one_image(self) -> tuple[dict, bytes]:
             """A request of one image: a multipart form (its image file and text fields) or JSON (image: a data: URL,
             an http(s) URL or a path, or {"image_url": ...}) -> (the fields, the image's bytes)."""
@@ -7978,6 +8200,10 @@ def make_handler(svc: Service):
                     "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
                                                      for d in e.downloads]}}
                 self._json(500 if failed else 503, body, headers=None if failed else {"Retry-After": image_aux.RETRY_S})
+                return
+            if isinstance(e, images_api.LongJobBusy):
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
                 return
             self._json(500, {"error": {"type": "server_error", "code": "image_tool_failed", "message": str(e)}})
 
@@ -8076,6 +8302,10 @@ def make_handler(svc: Service):
                     "type": "server_error", "code": "weights_download_failed" if failed else "weights_downloading",
                     "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
                                                      for d in e.downloads]}})
+                return
+            except images_api.LongJobBusy as e:
+                self._json(503, {"error": {"type": "server_error", "code": "busy", "message": str(e)}},
+                           headers={"Retry-After": e.retry_after})
                 return
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",

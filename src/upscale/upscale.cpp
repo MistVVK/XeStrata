@@ -393,6 +393,7 @@ VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, con
                 rep.write_s += since(t0);
                 tell(++rep.frames);
             }
+            if (r.pause) r.pause();
         }
     } else {
         // the model's frames: the frame at the size asked for, padded to the model's multiple by its edges
@@ -405,6 +406,7 @@ VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, con
         std::deque<std::vector<uint8_t>> waiting;   // the frames pushed whose output is not out yet (their colors')
         std::vector<uint8_t> host((size_t) (w * h * 4));
         const auto drain = [&] {
+            if (m.video_ready() <= 0) return;
             while (m.video_ready() > 0) {
                 auto t0 = std::chrono::steady_clock::now();
                 m.video_take(made.p, 1);
@@ -441,6 +443,7 @@ VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, con
                 rep.write_s += since(t0);
                 tell(++rep.frames);
             }
+            if (r.pause) r.pause();   // a chunk's frames out
         };
         for (;;) {
             auto t0 = std::chrono::steady_clock::now();

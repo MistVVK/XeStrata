@@ -460,8 +460,8 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
-IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "fix_image", "edit_region",
-               "find_region", "remove_background")
+IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "upscale_video", "fix_image",
+               "edit_region", "find_region", "remove_background")
 # The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
 # with ("yolo": tools/image/yolo_pt.py, "esrgan": tools/image/esrgan.py, each a PyTorch checkpoint to safetensors; None:
 # used as it is), the file the engine reads, and the license shown when it is downloaded.  They live in AUX_DIR beside

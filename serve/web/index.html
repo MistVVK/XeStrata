@@ -41,6 +41,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-tools" aria-controls="view-tools" aria-selected="false" data-tab="tools" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-tool"/></svg><span data-i18n="tab.tools">Tools</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-video" aria-controls="view-video" aria-selected="false" data-tab="video" hidden>
+      <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span data-i18n="tab.video">Video</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor" aria-label="Monitor" title="Monitor" data-i18n-label="tab.monitor" data-i18n-title="tab.monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about" aria-label="About" title="About" data-i18n-label="tab.about" data-i18n-title="tab.about">
@@ -82,6 +84,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         </div>
       </div>
       <div class="composer-wrap">
+        <!-- a video job on the server (the metrics' live.video): the chat answers between its chunks, or not until it ends -->
+        <div class="chat-video-note" id="chat-video-note" role="status" hidden></div>
         <form class="st-composer" id="composer">
           <div class="attachments" id="attachments" hidden></div>
           <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
@@ -485,6 +489,90 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <details class="img-info" id="tool-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
           <div class="img-info__text" id="tool-info"></div></details>
         <span class="composer-hint" id="tool-hint"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- ============================ Video ============================ -->
+  <!-- the video tools, each its API's request on a video of this browser's: the upscale /v1/videos/sync (a short one)
+       or a /v1/videos job (a longer one, run on the server: the page may close); the jobs, this page's and the API's,
+       under the player -->
+  <section class="view view--images" id="view-video" role="tabpanel" aria-labelledby="tab-btn-video" hidden>
+    <form class="img-page" id="vid-form">
+      <div class="st-card img-prompts">
+        <div class="seg" id="vid-kind" role="radiogroup" aria-label="Tool" data-i18n-label="tool.kind">
+          <button type="button" role="radio" data-vid="upscale" aria-checked="true" data-i18n="tool.upscale">Upscale</button>
+        </div>
+        <span class="composer-hint" data-i18n="vid.aboutUpscale">Makes the video larger on the GPU a few frames at a time (SeedVR2 in chunks of frames, the others frame by frame), its sound kept.</span>
+        <label class="st-field"><span data-i18n="vid.file">Video (or drop one here)</span>
+          <input class="st-input" id="vid-file" type="file" accept="video/*,.mkv"></label>
+        <span class="composer-hint" id="vid-src-info"></span>
+      </div>
+      <div class="img-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go" id="vid-go"><span class="img-go__run" data-i18n="tool.upscale">Upscale</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span><span class="img-go__time" id="vid-go-time"></span></button>
+      </div>
+
+      <div class="st-card img-settings">
+        <!-- the upscale: /v1/videos' model, scale, seed and extra_params -->
+        <div class="tool-fields" data-vid="upscale">
+          <label class="st-field"><span data-i18n="tool.upModel">Upscaler (model)</span>
+            <select class="st-input" id="vid-up-model">
+              <option value="auto" data-i18n="tool.upAuto">Auto</option>
+              <option value="lanczos">Lanczos</option>
+              <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
+              <option value="seedvr2-7b">SeedVR2 7B</option>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
+              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+          <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
+            <input class="st-input" id="vid-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
+            <input class="img-sl__range" type="range" data-for="vid-up-scale" tabindex="-1" aria-hidden="true"></label>
+          <span class="composer-hint" id="vid-up-size"></span>
+          <label class="st-field"><span data-i18n="tool.upColor">Color correction</span>
+            <select class="st-input" id="vid-up-color">
+              <option value="" data-i18n="tool.upColorOwn">The upscaler's own</option>
+              <option value="none" data-i18n="tool.upColorNone">None</option>
+              <option value="lab">LAB</option><option value="adain">AdaIN</option><option value="wavelet" data-i18n="tool.upColorWavelet">Wavelet</option></select></label>
+          <label class="st-field"><span data-i18n="img.seed">Seed</span>
+            <input class="st-input" id="vid-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
+          <details class="img-neg"><summary data-i18n="vid.more">SeedVR2's chunks</summary>
+            <label class="st-field"><span data-i18n="vid.chunk">Frames a chunk (1, 5, 9 &hellip; 4 n + 1; empty: as many as the GPU holds)</span>
+              <input class="st-input" id="vid-chunk" type="number" min="1" step="4" placeholder="auto" data-i18n-placeholder="vid.auto"></label>
+            <label class="st-field"><span data-i18n="vid.overlap">Chunks' overlap (latent frames of 4 frames)</span>
+              <input class="st-input" id="vid-overlap" type="number" min="0" placeholder="0"></label></details>
+        </div>
+      </div>
+
+      <div class="st-card img-output">
+        <!-- the video chosen and its result: one or the other, or side by side; stepped a frame at a time together -->
+        <div class="img-view vid-view" id="vid-view" data-show="source">
+          <span class="img-view__empty" id="vid-empty"><svg class="st-icon img-view__icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+            <span data-i18n="vid.empty">Choose a video, or open a job's result below.</span></span>
+          <video id="vid-src" controls playsinline preload="metadata" hidden></video>
+          <video id="vid-out" controls playsinline preload="metadata" hidden></video>
+        </div>
+        <div class="img-actions" id="vid-bar" hidden>
+          <div class="seg" id="vid-show" role="radiogroup" aria-label="Show" data-i18n-label="vid.show">
+            <button type="button" role="radio" data-show="source" aria-checked="true" data-i18n="vid.source">Source</button>
+            <button type="button" role="radio" data-show="result" aria-checked="false" data-i18n="vid.result">Result</button>
+            <button type="button" role="radio" data-show="both" aria-checked="false" data-i18n="vid.both">Side by side</button>
+          </div>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-prev" title="A frame back" data-i18n-title="vid.prev">&#9664;&#xFE0E;</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vid-next" title="A frame on" data-i18n-title="vid.next">&#9654;&#xFE0E;</button>
+          <a class="st-btn st-btn--icon" id="vid-save" title="Save" aria-label="Save" data-i18n-title="img.save" data-i18n-label="img.save" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></a>
+          <button type="button" class="st-btn st-btn--icon" id="vid-copy" title="Copy the request (JSON)" aria-label="Copy the request (JSON)"
+                  data-i18n-title="img.copyRequest" data-i18n-label="img.copyRequest" hidden>
+            <svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button>
+        </div>
+        <div class="st-progress" id="vid-progress" hidden><div class="st-progress__bar" id="vid-bar-fill"></div></div>
+        <span class="composer-hint" id="vid-cap"></span>
+        <details class="img-info" id="vid-info-box" hidden open><summary data-i18n="img.info">Generation info</summary>
+          <div class="img-info__text" id="vid-info"></div></details>
+        <span class="composer-hint" id="vid-hint"></span>
+        <!-- the jobs on the server, newest first (GET /v1/videos): this page's and the API's -->
+        <h3 class="vid-jobs__title" data-i18n="vid.jobs">Jobs</h3>
+        <div class="vid-jobs" id="vid-jobs"><span class="composer-hint" data-i18n="vid.noJobs">No jobs yet.</span></div>
       </div>
     </form>
   </section>

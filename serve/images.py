@@ -145,7 +145,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 from serve import image_aux
 from serve import loras as lora_api
@@ -1429,6 +1429,58 @@ class AuxPending(ImageJobFailed):
         super().__init__(aux_words(downloads))
 
 
+class LongJobBusy(ImageJobFailed):
+    """A request for the image engine while a long job (a video's, serve/videos.py) has it: refused at once rather
+    than queued for the job's length (a 503 with Retry-After).  `retry_after`: the job's seconds left, as far as its
+    frames tell."""
+
+    def __init__(self, message: str, retry_after: int):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def job_left(state: dict | None) -> int | None:
+    """The seconds a long job's state (videos.upscale's: its start, frames done and frames) says it has left; None
+    for none."""
+    if not state:
+        return None
+    done, total = state["done"], max(state["total"], state["done"])
+    left = (time.monotonic() - state["started"]) / done * (total - done) if done else 600
+    return int(min(max(left, 5), 86400))
+
+
+def long_job_left(svc) -> int | None:
+    """The seconds a long job (svc.long_job: a video's) still holds the image engine; None when none runs."""
+    return job_left(getattr(svc, "long_job", None))
+
+
+def refuse_during_long_job(svc) -> None:
+    """LongJobBusy while a long job holds the image engine (another image job would wait for all of it)."""
+    left = long_job_left(svc)
+    if left is not None:
+        raise LongJobBusy(f"a video job has the image engine for about {left} s more: ask again then", left)
+
+
+class EngineLock:
+    """ImageGen's lock (one request line at a time): one that a long job holds (gen.long_job) refuses at once
+    (LongJobBusy) rather than keeping the caller for the job's length."""
+
+    def __init__(self, gen: ImageGen):
+        self.gen = gen
+        self.lock = threading.Lock()
+
+    def __enter__(self) -> EngineLock:
+        while not self.lock.acquire(timeout=0.25):
+            state = self.gen.long_job
+            left = job_left(state) if state and state.get("thread") != threading.get_ident() else None
+            if left is not None:
+                raise LongJobBusy(f"a video job has the image engine for about {left} s more: ask again then", left)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.lock.release()
+
+
 def aux_words(downloads: list[dict]) -> str:
     """What a tool's result says of its weights' downloads."""
     out = []
@@ -2526,10 +2578,11 @@ class ImageEngine:
             raise ImageJobFailed(f"the image engine is gone ({e}); its log: {self.log_path}") from e
 
     def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None,
-            stage=None, preview=None) -> dict:
+            stage=None, preview=None, pause=None) -> dict:
         """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
         `step`, STAGE lines (refs, text, sampling, decode) to `stage`, PREVIEW lines (a partial image: its index, the
-        step, the file of its RGBA8 rows) to `preview`.  ImageJobFailed on ERROR."""
+        step, the file of its RGBA8 rows) to `preview`; at a YIELD (UPSV's YIELD:1) `pause` runs, then RESUME goes
+        back.  ImageJobFailed on ERROR."""
         self.send(line)
         t0 = time.monotonic()
         while True:
@@ -2545,6 +2598,12 @@ class ImageEngine:
                 if preview is not None:
                     index, done, path = got.split(maxsplit=3)[1:4]
                     preview(int(index), int(done), path)
+            elif got == "YIELD":
+                try:
+                    if pause is not None:
+                        pause()
+                finally:
+                    self.send("RESUME")
             elif got.startswith(want):
                 return _kv(got)
             elif got.startswith("ERROR"):
@@ -2609,7 +2668,8 @@ class ImageGen:
         self.keep_files = int(self.cfg.get("keep_files") or 64)
         self.reserve = int(self.cfg.get("reserve_mib") or 512)
         self.spare = int(self.cfg.get("spare_mib") or 1024)
-        self.lock = threading.Lock()              # one request line at a time even when the service's turn is not taken
+        self.lock = EngineLock(self)              # one request line at a time even when the service's turn is not taken
+        self.long_job: dict | None = None         # a long job's state while it runs (videos.upscale): EngineLock
         self.loras = lora_api.folder(self.cfg)    # the adapters its DiT takes (serve/loras.py)
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
                                   self._say)
@@ -2617,6 +2677,7 @@ class ImageGen:
         self.t5 = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
         self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
+        self.yield_turn: Callable[[], None] | None = None   # gpu_turn's, while a job has the turn
         self.last: dict | None = None              # the last job's figures (/v1/status)
         # the measured speed, an edit's apart (its reference images): for each size made (in megapixels), one step's
         # seconds (a guided step two) and the rest's an image (estimate_s)
@@ -2973,6 +3034,14 @@ class ImageGen:
                 self._ready()
                 return self.engine.ask(f"AUXNEED {a['kind']} {a['path']} {job['width']} {job['height']}"
                                        + "".join(f" {v}" for v in a.get("need_args") or ()), "NEED", 600)
+        if job.get("video"):   # a video's upscale (serve/videos.py): its upscaler's on the source's frames
+            src = job["source"]
+            u = job["upscaler"]
+            with self.lock:
+                self._ready()
+                return self.engine.ask(f"UPSVNEED {job['width']} {job['height']} {src['width']} {src['height']} "
+                                       f"{self._ups_spec(job)}" + (f" COLOR:{u['color']}" if u.get("color") else ""),
+                                       "NEED", 600)
         if job.get("ups_only"):
             w0, h0 = image_dims(job["init"])
             u = job["upscaler"]
@@ -3080,6 +3149,30 @@ class ImageGen:
                 with contextlib.suppress(OSError):
                     work.rmdir()
         return png, got
+
+    def upscale_video(self, job: dict, source: Path, stem: Path, cancel: threading.Event | None = None,
+                      progress=None) -> dict:
+        """A video's upscale (serve/videos.py): the engine's UPSV on the file `source` into `stem` + its container's
+        extension, `progress` told each frame written -> the engine's figures (path, mime, frames, fps, vfr and the
+        parts' seconds)."""
+        timeout = float(self.cfg.get("video_timeout_s") or 7 * 86400)
+        u = job["upscaler"]
+        words = (f" COLOR:{u['color']}" if u.get("color") else "") + f" SEED:{job['seed']}" + \
+            (f" CHUNK:{job['chunk']}" if job.get("chunk") else "") + \
+            (f" OVERLAP:{job['overlap']}" if job.get("overlap") else "") + \
+            (f" CODEC:{job['codec']}" if job.get("codec") else "") + \
+            (" YIELD:1" if self.yield_turn is not None else "")   # the chat's requests run at its chunks' ends
+        with self.lock:
+            self._ready()
+            self._live(stage="upscale-video", sampling_at=None)
+            try:
+                return self.engine.ask(f"UPSV {job['width']} {job['height']} {source} {stem} {self._ups_spec(job)}"
+                                       + words, "UPSVIDEO", timeout, cancel, progress, pause=self.yield_turn)
+            except ImageJobFailed as e:
+                self.totals["failed"] += 1
+                why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
+                self._say(f"video job failed: {why}")
+                raise ImageJobFailed(why) from e
 
     def aux_ask(self, line: str, want: str, timeout: float = 600) -> dict:
         """One request of the image tools' auxiliary models (image_regions: SEGMENT, FLORENCE, POLYMASK, MATTE) -> its
@@ -3344,7 +3437,8 @@ class ImageGen:
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
                     "refs": "Reading the reference images",
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)",
-                    "upscale": "Upscaling", "segment": "Finding the region", "matte": "Removing the background"}
+                    "upscale": "Upscaling", "upscale-video": "Upscaling a video", "segment": "Finding the region",
+                    "matte": "Removing the background"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -3559,6 +3653,17 @@ TOOLS: list[dict[str, Any]] = [
          "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
          "redraw": {"type": "boolean", "description": "draw it again after the upscaler (default false)"},
          "strength": {"type": "number", "description": "with redraw: how much may change (default 0.35)"},
+         "seed": {"type": "integer"}}}},
+    {"name": "upscale_video",
+     "description": "Make a video the user attached larger by an upscaler (SeedVR2 by default), its sound kept. It "
+                    "runs as a job on the server for minutes or more: the answer says where the user follows it and "
+                    "gets the video; do not wait for it.",
+     "parameters": {"type": "object", "properties": {
+         "video": {"type": "string",
+                   "description": "a /v1/videos/files/... link; default the conversation's last video"},
+         "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
+         "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
          "seed": {"type": "integer"}}}},
     {"name": "fix_image",
      "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer); the rest of "
@@ -3819,6 +3924,8 @@ class ImageTools:
             # they were drawn on is the canvas' background only); with a mask too, the painted part is redrawn by them
             if t["name"] == "edit_image" and self.user.get("layout") is not None and self.user.get("mask") is None:
                 continue
+            if t["name"] == "upscale_video" and self._video("") is None:   # offered for a video in the conversation
+                continue
             t = dict(t)
             if self.skills == "inline":
                 styles, rules = self._skill_groups(gens)
@@ -4069,6 +4176,52 @@ class ImageTools:
                     return data
         return None
 
+    def _video(self, which: str):
+        """The video upscale_video takes: a /v1/videos/files/ link, else the conversation's last (the chat's page
+        attaches a video as its link) -> its file, or None (none, or the server keeps no video tools)."""
+        from serve import videos
+        if getattr(self.svc, "images", None) is None or not videos.available():
+            return None
+        jobs = videos.jobs_of(self.svc)
+        m = videos.FILE_REF.search(which or "")
+        if m:
+            return videos.file_path(jobs, m.group(1))
+        for msg in reversed(self.messages):
+            content = msg.get("content")
+            for item in reversed(content if isinstance(content, list) else [content]):
+                text = item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+                for name in reversed(videos.FILE_REF.findall(text or "")):
+                    if (f := videos.file_path(jobs, name)) is not None:
+                        return f
+        return None
+
+    def _video_tool(self, args: dict, t0: float) -> dict:
+        """upscale_video: a /v1/videos job on the video (videos.start_from_file), its id and where its video will be
+        the call's result at once; the job runs on the server past this answer."""
+        from serve import videos
+        text, ok = "", False
+        try:
+            f = self._video(str(args.get("video") or ""))
+            if f is None:
+                raise ImageRequestError("there is no video in the conversation (or it is no longer kept: attach it "
+                                        "again)")
+            method, variant = str(args.get("method") or "auto"), args.get("variant")
+            model = f"seedvr2-{variant}" if method in ("seedvr2", "auto") and variant else method
+            if model not in UPSCALE_MODELS and model not in UPSCALE_METHODS:
+                model = method
+            fields = {"model": model, **{k: args[k] for k in ("scale", "seed") if args.get(k) not in (None, "")}}
+            rec = videos.start_from_file(self.svc, videos.jobs_of(self.svc), f, fields, self.gen.cfg)
+            src = rec["source"]
+            text = (f"The upscale runs on the server as job {rec['id']}: {src['frames']} frames, "
+                    f"{src['width']}x{src['height']} to {rec['size']}, with {model}. It takes minutes or more; the "
+                    f"user follows it in the Video tab, and the video will be at /v1/videos/{rec['id']}/content once "
+                    "done. Tell the user so; the job goes on whatever this chat does.")
+            ok = True
+        except (ValueError, ImageJobFailed, videos.VideoRequestError) as e:
+            text = f"error: {e}"
+        return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": "upscale_video", "images": []}
+
     def _aux_tool(self, name: str, args: dict, t0: float, cancel: threading.Event | None) -> dict:
         """find_region (the region marked on the image: image_regions.segment) and remove_background (BiRefNet's
         cut-out, image_regions.matte): an image shown to the user, nothing drawn by the image model."""
@@ -4141,6 +4294,8 @@ class ImageTools:
         args = arguments if isinstance(arguments, dict) else {}
         if name in ("find_region", "remove_background"):
             return self._aux_tool(name, args, t0, cancel)
+        if name == "upscale_video":
+            return self._video_tool(args, t0)
         urls: list[str] = []
         found: dict | None = None
         try:
@@ -4727,6 +4882,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
     card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""
+    refuse_during_long_job(svc)
     if isinstance(getattr(svc, "images", None), ImageModels) and svc.images.separate:
         with separate_turn(svc, gen, job, cancel) as policy:
             yield policy
@@ -4775,12 +4931,42 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
                                       first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
                 restore = _make_room(svc, gen, policy, need)
+
+                def yield_turn() -> None:
+                    """A long job's pause (a video's chunk out): the requests waiting for the service's turn run on
+                    the text engine, then the job goes on.  Under unload that engine is not loaded: they were
+                    refused (long_job_left), nothing waits."""
+                    if policy == "unload":
+                        return
+                    with svc.status_lock:
+                        if not svc.status["queued"] and not getattr(svc, "live_reqs", None):
+                            return
+                        svc.status.update(busy=False, phase=None)
+                    if ctl is not None:
+                        ctl.release()
+                    svc.fifo.release()
+                    try:
+                        for _ in range(240):   # the waiting take the turn (and leave the queue) in a moment
+                            with svc.status_lock:
+                                if not svc.status["queued"]:
+                                    break
+                            time.sleep(0.25)
+                    finally:
+                        svc.fifo.acquire()
+                        if ctl is not None:
+                            ctl.acquire()
+                            while getattr(svc, "live_reqs", None):
+                                time.sleep(0.25)
+                        with svc.status_lock:
+                            svc.status.update(busy=True, phase="generating an image", started=time.time())
                 try:
                     budget = gen.fit()
                     gen._say(f"image job: {policy}, the image engine's budget {budget} MiB (the DiT resident from "
                              f"{need['full_mib']} MiB, at least {need['least_mib']} MiB)")
+                    gen.yield_turn = yield_turn
                     yield policy
                 finally:
+                    gen.yield_turn = None
                     _give_back(svc, gen, policy, restore)
                     with svc.status_lock:
                         svc.status["busy"] = False
