@@ -77,7 +77,7 @@ std::vector<float> tokens_of(const std::vector<float>& l, int64_t h, int64_t w) 
     return z;
 }
 
-int vae(const std::string& path, const std::string& dir) {
+int vae(const std::string& path, const std::string& dir, const std::string& out_path = "") {
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::MfVae v;
     std::string err;
@@ -110,6 +110,10 @@ int vae(const std::string& path, const std::string& dir) {
     std::printf("decode %lld x %lld: %.1f ms\n", (long long) W, (long long) H, 1e3 * seconds_since(t0));
     const auto d = fetch(out, (size_t) (3 * H * W));
     compare("decode", d.data(), dec.data(), dec.size());
+    if (!out_path.empty()) {   // the decode, [3][H][W] FP32
+        std::ofstream o(out_path, std::ios::binary);
+        o.write(reinterpret_cast<const char*>(d.data()), (std::streamsize) (d.size() * 4));
+    }
     return 0;
 }
 
@@ -228,22 +232,28 @@ int video(const std::string& path, const std::string& clip, int64_t W, int64_t H
             room = std::min<uint64_t>(room, std::stoull(e) << 20);
         m.set_room(room);
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    m.video_begin(W, H, T, seed, chunk, overlap);
-    for (int64_t f = 0; f < T; ++f) {
-        for (int64_t p = 0; p < HW; ++p) {
-            for (int c = 0; c < 3; ++c) rgba[(size_t) (p * 4 + c)] = raw[(size_t) ((f * HW + p) * 3 + c)];
-            rgba[(size_t) (p * 4 + 3)] = 255;
+    // STRATA_PROBE_REPEAT: the clip run that many times, each one's time printed (the last warm), its frames the last's
+    const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+    const long repeat = rep != nullptr ? std::max(1L, std::strtol(rep, nullptr, 10)) : 1L;
+    for (long r = 0; r < repeat; ++r) {
+        res.clear();
+        const auto t0 = std::chrono::steady_clock::now();
+        m.video_begin(W, H, T, seed, chunk, overlap);
+        for (int64_t f = 0; f < T; ++f) {
+            for (int64_t p = 0; p < HW; ++p) {
+                for (int c = 0; c < 3; ++c) rgba[(size_t) (p * 4 + c)] = raw[(size_t) ((f * HW + p) * 3 + c)];
+                rgba[(size_t) (p * 4 + 3)] = 255;
+            }
+            strata::gpu::copy(in, rgba.data(), rgba.size());
+            m.video_push(in, 1);
+            take();
         }
-        strata::gpu::copy(in, rgba.data(), rgba.size());
-        m.video_push(in, 1);
+        m.video_end();
         take();
+        std::printf("video %lld frames of %lld x %lld, chunks of %lld overlapping by %lld: %.1f s (%s), %zu frames out\n",
+                    (long long) T, (long long) W, (long long) H, (long long) chunk, (long long) overlap,
+                    seconds_since(t0), m.parts().c_str(), res.size() / (size_t) (HW * 3));
     }
-    m.video_end();
-    take();
-    std::printf("video %lld frames of %lld x %lld, chunks of %lld overlapping by %lld: %.1f s (%s), %zu frames out\n",
-                (long long) T, (long long) W, (long long) H, (long long) chunk, (long long) overlap,
-                seconds_since(t0), m.parts().c_str(), res.size() / (size_t) (HW * 3));
     std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(res.data()), (std::streamsize) res.size());
     return 0;
 }
@@ -309,7 +319,7 @@ int dit(const std::string& path, const std::string& dir) {
 int main(int argc, char** argv) {
     try {
         const std::string what = argc > 1 ? argv[1] : "";
-        if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
+        if (what == "vae" && (argc == 4 || argc == 5)) return vae(argv[2], argv[3], argc == 5 ? argv[4] : "");
         if (what == "dit" && argc == 4) return dit(argv[2], argv[3]);
         if (what == "video" && argc == 11)
             return video(argv[2], argv[3], std::stoll(argv[4]), std::stoll(argv[5]), std::stoll(argv[6]), argv[7],
@@ -318,7 +328,8 @@ int main(int argc, char** argv) {
             return vae_video(argv[2], argv[3], std::stoll(argv[4]), std::stoll(argv[5]), std::stoll(argv[6]), argv[7],
                              argc > 8 ? std::stoll(argv[8]) : 0, argc > 9 ? std::stoll(argv[9]) : 0,
                              argc > 10 && std::string(argv[10]) == "host");
-        std::fprintf(stderr, "usage: %s vae VAE.safetensors GOLDEN_DIR | dit DIT.safetensors GOLDEN_DIR\n", argv[0]);
+        std::fprintf(stderr, "usage: %s vae VAE.safetensors GOLDEN_DIR [OUT.f32] | dit DIT.safetensors GOLDEN_DIR\n",
+                     argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "seedvr2-probe: %s\n", e.what());

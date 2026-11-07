@@ -46,6 +46,9 @@ void aux_add_norm(const float* x, const float* r, const float* rb, const float* 
 /// `at` [1] says (a recorded step's position).
 void aux_cache_put_kv(const uint16_t* src16, int64_t B, int64_t ld, int64_t koff, int64_t voff, int64_t C,
                       uint16_t* kc, uint16_t* vc, int64_t cap, const int32_t* at, void* stream);
+/// aux_layer_norm of x [T][C] (no residual) then GELU (erf's), into y16 (FP16).
+void aux_layer_norm_gelu16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps,
+                           uint16_t* y16, void* stream);
 /// aux_layer_norm of x [H][W][C] into y16 in aux_window16's order (no shift, H and W whole windows of ws): the norm
 /// and the windows in one pass.
 void aux_layer_norm_window16(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C,
@@ -73,6 +76,17 @@ void aux_channel_split(const float* qkv, int64_t N, int64_t C, int64_t G, float 
 
 /// p16 [rows][cols] = softmax of each row of s.
 void aux_softmax16(const float* s, int64_t rows, int64_t cols, uint16_t* p16, void* stream);
+/// An attention's heads apart: x [rows][ld] (head h's hd channels at h * hd) -> y [heads][rows][hd], or (transpose)
+/// [heads][hd][rows] (a product's keys' values); FP16.
+void aux_heads16(const uint16_t* x, int64_t rows, int64_t heads, int64_t hd, int64_t ld, bool transpose, uint16_t* y,
+                 void* stream);
+/// The heads' outputs together: o [heads][rows][hd] (FP32) -> y [rows][heads hd] (FP16).
+void aux_heads_merge16(const float* o, int64_t rows, int64_t heads, int64_t hd, uint16_t* y, void* stream);
+/// The softmax of scores s [heads][rows][G G] times `scale`, plus a bias over the grid of keys that is a row's term
+/// plus a column's (rows from `skip` on: grid [rows - skip][2 G][heads], key y G + x its y-th and its G + x-th) -> p16,
+/// FP16.
+void aux_softmax_grid16(const float* s, int64_t heads, int64_t rows, int64_t G, float scale, const float* grid,
+                        int64_t skip, uint16_t* p16, void* stream);
 
 /// y [n][C] = tok[ids[i]] * scale + pos[pos_ids[i]] (FP16 tables); tok null: y += pos[pos_ids[i]].
 void aux_embed(const int32_t* ids, const int32_t* pos_ids, const uint16_t* tok, const uint16_t* pos, int64_t n,
@@ -142,8 +156,8 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
 /// SAM 3's box relative position bias: for each of Q boxes (xyxy in [0, 1]), the rows' and the columns' distances
 /// to its edges (i / H - y0, i / H - y1; j / W - x0, j / W - x1), times 8, as sign * log2(|d| + 1) / 3, through two
 /// MLPs (2 -> hidden, ReLU, -> heads; `mlp`: the rows' w1 [hidden][2], b1, w2 [heads][hidden], b2, then the
-/// columns'), summed into bias [heads][Q + 1][H * W] (its row 0, the presence token's, zero).  tmp: Q * (H + W) *
-/// heads floats.
+/// columns'), into tmp [Q][H + W][heads] (the rows' terms, then the columns': aux_softmax_grid16's grid), and, where
+/// `bias` is given, summed into bias [heads][Q + 1][H * W] (its row 0, the presence token's, zero).
 void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const float* mlp, int64_t hidden, int64_t heads,
                   float* tmp, float* bias, void* stream);
 /// SAM 3's decoder's query positions from boxes [Q][4] (cx, cy, w, h): sin16 [Q][4F] the sine embeddings of y, x, w
@@ -230,9 +244,12 @@ void aux_mem_key16(const float* y, int64_t B, int64_t N, int64_t nsp, int64_t P,
 /// The memory encoder's input of B buckets of M slots: y16 [B][H][W][2M], channel s the mask of object b M + s
 /// (masks [N][h][w] logits resized bilinearly to H x W, align_corners false; its sigmoid taken before the resize
 /// with `sigmoid_first`, else after) as 2 sigmoid - 1, channel M + s its cond [N] value; a slot past N, or whose
-/// valid [N] is 0 (a removed object's; valid null: all valid), zeros.
+/// valid [N] is 0 (a removed object's; valid null: all valid), zeros.  With `live` (the GPU's), only those L slots
+/// of one bucket: y16 [H][W][2L], channel c the mask of slot live[c], L + c its cond (the zero channels of the empty
+/// slots left out, for a convolution whose weights leave them out too).
 void aux_mux_masks16(const float* masks, int64_t N, int64_t h, int64_t w, int64_t H, int64_t W, bool sigmoid_first,
-                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream);
+                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream,
+                     const int32_t* live = nullptr, int64_t L = 0);
 /// y [n] = 1 where x > 0, else 0.
 void aux_binarize(const float* x, int64_t n, float* y, void* stream);
 /// y16 [R][C] = src [T][R][C]'s rows r of block r % T (each row its own hypernetwork's output).

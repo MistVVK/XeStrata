@@ -139,7 +139,7 @@
 //                            -> STAGE segment-video, STEP <frames> <frames>, then SEGVIDEO json=... objects=<id>:w<i>|
 //                            c<i>,... [masks=<id>:<path>,...] [mask=... mime=...] [overlay=...] frames=... width=...
 //                            height=... fps=... vfr=... segment_s=... read_s=... trunk_s=... detect_s=... track_s=...
-//                            rules_s=... output_s=... write_s=...
+//                            memory_s=... rules_s=... output_s=... write_s=...
 //   FLORENCE <weights> <picture> <ids> <beams> <max new>
 //                            Florence-2: the tokens it answers the task's ids (BART's) with  -> FLORENCE ids=... ...
 //   POLYMASK <width> <height> <out> <x,y,x,y,...>...
@@ -997,9 +997,9 @@ std::string segment_video(si::Sam3& m, const std::string& in, const std::string&
     const auto& t = vs.times();
     char b[512];
     std::snprintf(b, sizeof b, " frames=%lld width=%lld height=%lld fps=%.6f vfr=%d segment_s=%.3f read_s=%.3f "
-                  "trunk_s=%.3f detect_s=%.3f track_s=%.3f rules_s=%.3f output_s=%.3f write_s=%.3f", (long long) shown,
-                  (long long) W, (long long) H, info.fps, (int) info.vfr, seconds_since(t0), read_s, t.trunk, t.detect,
-                  t.track, t.rules, t.output, write_s);
+                  "trunk_s=%.3f detect_s=%.3f track_s=%.3f memory_s=%.3f rules_s=%.3f output_s=%.3f write_s=%.3f",
+                  (long long) shown, (long long) W, (long long) H, info.fps, (int) info.vfr, seconds_since(t0), read_s,
+                  t.trunk, t.detect, t.track, t.memory, t.rules, t.output, write_s);
     std::string line = "SEGVIDEO json=" + json + " objects=" + (objs.empty() ? "-" : objs);
     if (!paths.empty()) line += " masks=" + paths;
     if (all) line += " mask=" + all->path() + " mime=" + all->mime();

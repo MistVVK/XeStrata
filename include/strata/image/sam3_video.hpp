@@ -94,9 +94,10 @@ public:
     /// The clip's end -> the frames still held.
     std::vector<Frame> finish();
 
-    /// Each part's seconds so far (the trunk, the detector, the tracker, the rules and the outputs).
+    /// Each part's seconds so far: the trunk, the detector, the tracker (the memory attention and the decoder), the
+    /// memory (the memory encoder and the masks given as clean ones), the rules and the outputs.
     struct Times {
-        double trunk = 0, detect = 0, track = 0, rules = 0, output = 0;
+        double trunk = 0, detect = 0, track = 0, memory = 0, rules = 0, output = 0;
     };
     const Times& times() const { return t_; }
 

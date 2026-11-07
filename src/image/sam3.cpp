@@ -65,7 +65,8 @@ std::vector<uint16_t> f16_of(const float* v, size_t n) {
 // scratch slots
 enum Slot {
     kPix, kRgba, kX, kH16, kW16, kBig, kG16, kQ16, kK16, kV16, kA16, kY, kCol,
-    kF0, kF1, kF2, kPos, kTxt, kTxt16, kEnc, kEnc16, kEncPos16, kDec, kDec16, kQp, kBias, kTmp, kPix0, kPix1,
+    kF0, kF1, kF2, kPos, kTxt, kTxt16, kEnc, kEnc16, kEncPos16, kDec, kDec16, kQp, kTmp, kGq, kGk, kGv, kGs, kGp, kGo,
+    kPix0, kPix1,
     kInst16, kMasks, kMasks8, kPart, kSmall, kSmall16, kTxtOut, kTmp2, kQo16, kNeck, kProj16, kRef, kTrunk16, kF2Keep,
 };
 
@@ -287,7 +288,9 @@ uint64_t Sam3::need_bytes(int64_t width, int64_t height) const {
     uint64_t want = (uint64_t) N * (wd_ * 4 * 3 + mlp * 6 + wd_ * 2 * 6);
     want += (uint64_t) (P0 + P1 + N) * d_ * 4 + (uint64_t) P0 * (wd_ / 4) * 6 + (uint64_t) P1 * (wd_ / 2) * 6;
     want += (uint64_t) P0 * d_ * (4 + 2 + 2) + (uint64_t) kMaskChunk * (P0 * 4 + width * height);
-    want += (uint64_t) heads_ * (queries_ + 1) * N * 4 + (uint64_t) image_ * image_ * 8 + (64ull << 20);
+    // the decoder's attention over the patches: the heads' keys and values apart, their scores and weights
+    want += (uint64_t) N * d_ * 4 + (uint64_t) heads_ * (queries_ + 1) * N * 6;
+    want += (uint64_t) image_ * image_ * 8 + (64ull << 20);
     const uint64_t have = held() - weight_bytes_;
     return (loaded_ ? 0 : file_bytes_ + file_bytes_ / 8) + (want > have ? want - have : 0);
 }
@@ -317,6 +320,28 @@ void Sam3::attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, in
     a.bias = bias;
     a.causal = causal;
     qi_sdpa_ex(a, s_);
+}
+
+// The decoder's queries over the patches with the box bias (a row's term and a column's of the grid, the presence
+// token's row none), by products: each head's scores through the Gemm, their softmax with the bias, by the values.  The
+// scores of 201 rows over 5,184 keys are few enough to hold, and the products take the GPU's matrix engines, which
+// qi_sdpa_ex's own kernels for a biased attention do not (the B70: 8 ms a frame in those, 2026-11-07)
+void Sam3::grid_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t lq, const float* grid,
+                          uint16_t* out) {
+    const int64_t G = grid_, N = G * G, d = d_, H = heads_, hd = d / H;
+    auto* qh = scratch_as<uint16_t>(kGq, (size_t) (lq * d));
+    auto* kh = scratch_as<uint16_t>(kGk, (size_t) (N * d));
+    auto* vt = scratch_as<uint16_t>(kGv, (size_t) (N * d));
+    float* sc = scratch(kGs, (size_t) (H * lq * N * 4));
+    auto* p16 = scratch_as<uint16_t>(kGp, (size_t) (H * lq * N));
+    float* o = scratch(kGo, (size_t) (lq * d * 4));
+    aux_heads16(q16, lq, H, hd, d, false, qh, s_);
+    aux_heads16(k16, N, H, hd, d, false, kh, s_);
+    aux_heads16(v16, N, H, hd, d, true, vt, s_);
+    gemm_.f16_batch(qh, kh, sc, lq, N, hd, H, lq * hd, N * hd, lq * N);
+    aux_softmax_grid16(sc, H, lq, G, 1.f / std::sqrt((float) hd), grid, 1, p16, s_);
+    gemm_.f16_batch(p16, vt, o, lq, hd, N, H, lq * N, hd * N, lq * hd);
+    aux_heads_merge16(o, lq, H, hd, out, s_);
 }
 
 void Sam3::vision(const QiRef& image) {
@@ -556,7 +581,6 @@ Sam3::Detection Sam3::detect(float score_threshold) {
     float* qp = scratch(kQp, (size_t) (Q1 * d * 4));
     float* qo = scratch(kPix1, (size_t) (Q * d * 4));   // the queries after the output norm
     auto* qo16 = scratch_as<uint16_t>(kQo16, (size_t) (Q * d));
-    float* bias = scratch(kBias, (size_t) (heads_ * Q1 * N * 4));
     float* tmp = scratch(kTmp, (size_t) (Q * 2 * G * heads_ * 4));
     auto* sin16 = scratch_as<uint16_t>(kSmall, (size_t) (Q * 2 * d + Q * 4 * 2));
     auto* boxes_dev = reinterpret_cast<float*>(sin16 + Q * 2 * d);
@@ -584,7 +608,7 @@ Sam3::Detection Sam3::detect(float score_threshold) {
             product(sin16, ref1_, small, Q);
             aux_relu(small, Q * d, nullptr, a16, s_);
             product(a16, ref2_, qp + d, Q);
-            aux_box_bias(boxes_dev, Q, G, G, rpb_, rpb_hidden_, heads_, tmp, bias, s_);
+            aux_box_bias(boxes_dev, Q, G, G, rpb_, rpb_hidden_, heads_, tmp, nullptr, s_);
         }
         // self-attention (q and k with the positions), post-norm
         kernels::f32_to_f16_bulk(hq, hq16, Q1 * d, s_);
@@ -607,7 +631,7 @@ Sam3::Detection Sam3::detect(float score_threshold) {
         to16(hp16, l.vis.q, Q1, q16);
         to16(encpos16, l.vis.k, N, k16);
         to16(enc16, l.vis.v, N, v16);
-        attention(q16, k16, v16, Q1, N, heads_, hd, d, d, d, a16, 1, bias);
+        grid_attention(q16, k16, v16, Q1, tmp, a16);
         product(a16, l.vis.o, small, Q1);
         aux_layer_norm(hq, small, l.n_vis.w, l.n_vis.b, Q1, d, kEps, hq, hq16, s_);
         // the MLP

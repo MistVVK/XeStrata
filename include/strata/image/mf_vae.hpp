@@ -116,11 +116,17 @@ public:
     bool video() const { return video_; }
     /// Forgets what the slices so far left (a new clip), and lets their frames' memory go.
     void video_reset();
-    /// The tiles' carried frames in host memory (pinned), each convolution's copied to the GPU for its turn and back,
-    /// so that the GPU holds one tile's: for a frame whose tiles' carried frames do not fit the GPU together.  Set
-    /// between clips (it forgets what the slices left).
+    /// The tiles' carried frames in host memory (pinned), each convolution's copied to the GPU when its tile's turn
+    /// comes and back when another tile's does, so that the GPU holds one tile's: for a frame whose tiles' carried
+    /// frames do not fit the GPU together.  Set between clips (it forgets what the slices left).
     void set_video_host_cache(bool on);
     bool video_host_cache() const { return vhost_; }
+    /// Whether the slices after this call read what it leaves (true until the clip's last call): false spares the
+    /// host cache's copies back of the tiles' carried frames, which no slice reads again.
+    void set_video_keep(bool keep) { vkeep_ = keep; }
+    /// The latents a tile's slice takes in encode_video_tiled and decode_video_tiled (the encoder's 1 + 4 (n - 1)
+    /// frames first, then 4 n): their work video_scratch_bytes(.., 4 n).  1 by default.
+    void set_video_slice(int64_t latents) { vslice_ = std::max<int64_t>(latents, 1); }
     /// A slice of frames rgb [T][3][16 h][16 w] (device FP32, -1 .. 1) through the encoder: the latents' tokens it
     /// gives, z [n][h w][64] (device FP32, the posterior's means), their number n the return.  `first`: the clip's
     /// first slice (T = 1 + 4 k, k + 1 latents), else T = 4 k (k latents) after the slice before.
@@ -131,14 +137,21 @@ public:
     int64_t decode_video(const float* z, int64_t n, int64_t h, int64_t w, bool first, float* rgb);
     /// The same in tiles of tt x tt tokens (the last ones flush with the edges, kF2Overlap tokens shared and blended
     /// linearly, the latents' on the encoder's side, the pixels' on the decoder's), each tile its own carried frames:
-    /// the layout must stay the same through a clip.  tt 0, or one the latent fits in: the whole.
+    /// the layout must stay the same through a clip.  tt 0, or one the latent fits in: the whole.  Each tile goes
+    /// through all the call's frames before the next, a latent's at a time (the work of one latent's, whatever the
+    /// call's length), so that a tile's carried frames move to and from host memory once a call.
     int64_t encode_video_tiled(const float* rgb, int64_t T, int64_t h, int64_t w, bool first, float* z, int64_t tt);
     int64_t decode_video_tiled(const float* z, int64_t n, int64_t h, int64_t w, bool first, float* rgb, int64_t tt);
     /// The GPU memory a slice of T frames (encode) or n latents (decode) of an h x w latent works in, besides the
     /// carried frames.
     uint64_t video_scratch_bytes(int64_t h, int64_t w, int64_t frames) const;
-    /// The frames a tile of h x w tokens carries through a clip (its causal convolutions').
-    uint64_t video_carried_bytes(int64_t h, int64_t w) const;
+    /// A video's tiles along a side of n tokens for tiles of at most tt (encode_video_tiled's and
+    /// decode_video_tiled's): their side, as small as the count that side takes covers n with, and that count.
+    static int64_t video_tile_side(int64_t n, int64_t tt);
+    static int64_t video_tiles(int64_t n, int64_t tt);
+    /// The frames a tile of h x w tokens carries through a clip (its causal convolutions'): the encoder's (side 0), the
+    /// decoder's (1) or both (-1).  The host cache holds one side's on the GPU at a time.
+    uint64_t video_carried_bytes(int64_t h, int64_t w, int side = -1) const;
 
     /// The CoD decoder's output [h w][384] and the 21 blocks' output [h w][384] of the last decode (device FP32), for
     /// the probe.
@@ -148,10 +161,10 @@ public:
 private:
     struct Conv {
         int64_t out = 0, in = 0, k = 1;
-        const uint16_t* w = nullptr;   // [out][k][k][in] FP16 (a video convolution's time taps summed)
+        const uint16_t* w = nullptr;   // [out][k][k][in] FP16 (the image form's: the time taps summed)
         const float* b = nullptr;      // null: no bias
         int64_t kt = 1;                // a video convolution's time taps
-        const uint16_t* taps = nullptr;   // the video form's: [kt][out][k][k][in] FP16 (null: kt 1, or not video)
+        const uint16_t* taps = nullptr;   // the video form's: [out][kt][k][k][in] FP16 (null: kt 1, or not video)
     };
     struct Res {
         const float *n1w = nullptr, *n1b = nullptr, *n2w = nullptr, *n2b = nullptr;
@@ -183,6 +196,10 @@ private:
     /// A 3 x 3 convolution of stride 2 (the input padded by one on the bottom and the right): out [H / 2][W / 2]
     /// (+= with `add`).
     void conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add = false);
+    /// conv's into FP16 out16 (+= with `add`) where a library writes FP16 (oneDNN, cuDNN): false where none takes it.
+    /// side: room for the convolution's own output where the sum is made in a pass of the engine's (cuDNN's).
+    bool conv16(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, uint16_t* out16, bool add,
+                uint16_t* side);
     void gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu, uint16_t* y16);
     void resblock(const Res& r, float*& x, int64_t H, int64_t W);
     void attention(const Attn& a, float* x, int64_t H, int64_t W);
@@ -209,15 +226,16 @@ private:
     };
     void open_flux2(class SafeTensors& st);
     void open_flux2_encoder(class SafeTensors& st);
-    void f2_others(const float* x, float*& a, float*& b) const;
-    void f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W);
-    void f2_attention(const Attn& a, float* x, int64_t H, int64_t W);
+    void f2_others(const uint16_t* x, uint16_t*& a, uint16_t*& b) const;
+    void f2_resblock(const F2Res& r, uint16_t*& x, int64_t H, int64_t W);
+    void f2_attention(const Attn& a, uint16_t* x, int64_t H, int64_t W);
+    const uint16_t* f2_in16(const uint16_t* x, int64_t n, uint16_t* room);
     F2Sizes f2_enc_walk(int64_t h, int64_t w) const;
     void f2_encode(const float* rgb, int64_t h, int64_t w, float* z);
     void f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, int64_t th, int64_t tw);
-    void f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c);
-    void f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t& c);
-    void f2_tail(const float* x, int64_t H, int64_t W, int64_t c, float* rgb);
+    void f2_front(const float* z, int64_t h, int64_t w, int k, uint16_t*& x, int64_t& H, int64_t& W, int64_t& c);
+    void f2_levels(int k0, int k1, uint16_t*& x, int64_t& H, int64_t& W, int64_t& c);
+    void f2_tail(const uint16_t* x, int64_t H, int64_t W, int64_t c, float* rgb);
     void f2_decode_raw(const float* z, int64_t h, int64_t w, float* rgb);
     void f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, int k, int64_t th, int64_t tw);
     F2Sizes f2_walk(int64_t h, int64_t w, int k0, int k1, bool front, bool tail) const;
@@ -235,13 +253,23 @@ private:
     struct VCache {
         uint16_t* buf = nullptr;   // the frames a causal convolution carries, [m][frame] FP16 (host memory: vhost_)
         int64_t frame = 0, m = 0, n = 0;   // values a frame, the frames it holds, the frames held now
+        int owner = -1;                    // vdev_'s: the tile whose frames it holds (newer than its host copy)
     };
-    void vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t ts, bool s2, float* out,
-               bool add, int64_t& To);
-    void v_resblock(const F2Res& r, float*& x, int64_t T, int64_t H, int64_t W);
-    void v_attention(const Attn& a, float* x, int64_t T, int64_t H, int64_t W);
-    void v_grow(int64_t values);
-    void v_others(const float* x, float*& a, float*& b) const;
+    // out: the activations' 16 bits (o16) or FP32; side: T output frames' room the residual's sum may use
+    void vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t ts, bool s2, void* out,
+               bool o16, bool add, int64_t& To, uint16_t* side = nullptr);
+    void v_frame(const Conv& k, const uint16_t* in16, int64_t H, int64_t W, bool s2, void* out, bool o16, bool add,
+                 uint16_t* side = nullptr);
+    const uint16_t* v_in16(const uint16_t* x, int64_t n);
+    void v_resblock(const F2Res& r, uint16_t*& x, int64_t T, int64_t H, int64_t W);
+    void v_attention(const Attn& a, uint16_t* x, int64_t T, int64_t H, int64_t W);
+    void v_grow(int64_t values, int64_t head, int64_t frame);
+    void v_others(const uint16_t* x, uint16_t*& a, uint16_t*& b) const;
+    void v_enter(int side);
+    bool finite(const float* x, int64_t n);
+    int64_t v_encode_tiled(const float* rgb, int64_t T, int64_t h, int64_t w, bool first, float* z, int64_t tt);
+    int64_t v_decode_tiled(const float* z, int64_t n, int64_t h, int64_t w, bool first, float* rgb, int64_t tt);
+    bool overflowed(const float* x, int64_t n);
     bool video_ = false;
     struct VKey {
         const Conv* c;
@@ -254,9 +282,22 @@ private:
     std::unordered_map<VKey, VCache, VKeyHash> vcache_[2];   // the encoder's, the decoder's, by tile
     std::unordered_map<const Conv*, VCache> vdev_[2];        // vhost_: a convolution's on the GPU, the tiles' in turn
     int vside_ = 0, vtile_ = 0;
-    bool vhost_ = false;
-    float *vx_ = nullptr, *vy_ = nullptr, *vt_ = nullptr;   // a slice's frames, the largest stage's
-    uint16_t* va16_ = nullptr;
+    bool vhost_ = false, vkeep_ = true;
+    bool vkept_[2] = {true, true};   // vkeep_ at each side's last call
+    // a slice's activations, the largest stage's frames: 16 bits, FP16 until an output has a value past FP16's range
+    // (then BF16 from that call on, the call again); the normalizations' statistics and the taps' sums in FP32
+    // (vtmp_, a frame's)
+    uint16_t *vx_ = nullptr, *vy_ = nullptr, *vt_ = nullptr;
+    bool vbf_ = false;
+    int* vbad_ = nullptr;
+    int64_t vslice_ = 1;
+    float* vtmp_ = nullptr;
+    int64_t vtmp_cap_ = 0;
+    uint16_t* vtapw_ = nullptr;   // a convolution's taps one after another, [kt][out][k][k][in], for the tap-wise path
+    int64_t vtapw_cap_ = 0;
+    uint16_t* va16_ = nullptr;   // after `vhead_` values of room for a convolution's carried frames before its input
+    uint16_t* va16_base_ = nullptr;
+    int64_t vhead_ = 0;
     int64_t vcap_ = 0;
 
     void* s_ = nullptr;
@@ -309,7 +350,9 @@ private:
     int64_t f2_ac_ = 0;        // the widest middle attention's channels (the decoder's, or the encoder's once loaded)
     int64_t f2_band_ = 0;      // the convolutions' unfolded band (values), by the decoder's widths
     uint64_t f2_held_ = 0;
-    float *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr, *f2_q_ = nullptr;
+    // the Flux2 VAE's activations, a frame's: 16 bits as the video form's (vbf_), the taps' sums in vtmp_
+    uint16_t *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr;
+    float* f2_q_ = nullptr;
     uint16_t *f2_qk16_ = nullptr, *f2_p16_ = nullptr;
 };
 

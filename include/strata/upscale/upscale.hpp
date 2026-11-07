@@ -93,7 +93,8 @@ public:
     virtual bool temporal() const { return false; }
     /// The temporal models' video, frames of w x h (the model's multiples) RGBA8 on the GPU: begun (about `frames`
     /// of them; chunks of `chunk` frames overlapping by `overlap` where it cuts the video so, 0 its own choice), the
-    /// frames pushed in order, those made taken as they are ready, then the end (the rest made ready).
+    /// frames pushed in order (read before video_push returns: the caller may write the next into the same place),
+    /// those made taken as they are ready, then the end (the rest made ready).
     virtual void video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, int64_t chunk, int64_t overlap) {
         (void) w, (void) h, (void) frames, (void) seed, (void) chunk, (void) overlap;
         throw std::logic_error("upscale: not a temporal model");

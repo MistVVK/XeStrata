@@ -503,8 +503,18 @@ constexpr int64_t kGnGroups = 32;      // every GroupNorm here: nn.GroupNorm(32,
 constexpr int64_t kGnChunk = 256;      // positions a chunk
 constexpr int64_t kGnMaxChunk = 256;   // chunks a reducer's work-group
 
-void group_part(const float* x, const float* mean, int64_t P, int64_t C, bool sq, float* part,
-                              void* stream) {
+// a GroupNorm's input: FP32, or 16-bit (FP16 or BF16 bits) activations
+struct GnIn {
+    const void* p;
+    int kind;   // 0 FP32, 1 FP16, 2 BF16
+    float operator[](int64_t i) const {
+        if (kind == 0) return static_cast<const float*>(p)[i];
+        const uint16_t h = static_cast<const uint16_t*>(p)[i];
+        return kind == 1 ? f32_from_f16(h) : kernels::f32_from_bf16(h);
+    }
+};
+
+void group_part(GnIn x, const float* mean, int64_t P, int64_t C, bool sq, float* part, void* stream) {
     if (P <= 0) return;
     const int64_t cg = C / kGnGroups, B = (P + kGnChunk - 1) / kGnChunk;
     const auto e = queue_for(stream).parallel_for(
@@ -516,9 +526,9 @@ void group_part(const float* x, const float* mean, int64_t P, int64_t C, bool sq
             const float m = sq ? mean[g] : 0.f;
             float a = 0.f, comp = 0.f;
             for (int64_t p = b * kGnChunk + lane; p < p1; p += 32) {
-                const float* r = x + p * C + g * cg;
+                const int64_t r = p * C + g * cg;
                 for (int64_t c = 0; c < cg; ++c) {
-                    const float d = r[c] - m;
+                    const float d = x[r + c] - m;
                     const float y = (sq ? d * d : d) - comp, t = a + y;
                     comp = (t - a) - y;
                     a = t;
@@ -578,7 +588,7 @@ void group_stats(const float* part, int64_t B, int64_t P, int64_t CG, float eps,
 int64_t gn_chunks(int64_t HW) { return (HW + kGnChunk - 1) / kGnChunk; }
 int64_t gn_rows(int64_t C) { return sycl::max<int64_t>(1, 256 / C); }
 
-void gn_partial(const float* x, int64_t HW, int64_t C, float* part, void* s) {
+void gn_partial(GnIn x, int64_t HW, int64_t C, float* part, void* s) {
     const int64_t cg = C / kGnGroups, nk = gn_chunks(HW), R = gn_rows(C), local = C * R;
     queue_for(s).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> ln(sycl::range<1>((size_t) local), h), lm(sycl::range<1>((size_t) local), h),
@@ -674,8 +684,10 @@ int64_t qi_group_norm_ws_floats(int64_t P) {
     return 2 * kGnGroups + std::max((B + G) * kGnGroups, B * kGnGroups * 3);   // the two passes' sums, or the one's
 }
 
-void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
-                     uint16_t* y16, float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16) {
+namespace {
+
+void group_norm16(GnIn x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu, uint16_t* y16,
+                  float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16) {
     if (P <= 0) return;
     if (C % kGnGroups != 0 || C % 8 != 0) throw std::invalid_argument("qi_group_norm16: C");
     float* mean = ws, *inv = ws + kGnGroups, *part = ws + 2 * kGnGroups;
@@ -700,7 +712,14 @@ void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const
     // 8 values a work-item, in one load and one store: a value each took 30 ms of MOSS-Image's decode on the B70
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C / 8)), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % C;
-        const sycl::vec<float, 8> xv = *reinterpret_cast<const sycl::vec<float, 8>*>(x + i);
+        sycl::vec<float, 8> xv;
+        if (x.kind == 0) {
+            xv = *reinterpret_cast<const sycl::vec<float, 8>*>(static_cast<const float*>(x.p) + i);
+        } else {
+            const sycl::vec<uint16_t, 8> hv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(
+                static_cast<const uint16_t*>(x.p) + i);
+            for (int j = 0; j < 8; ++j) xv[j] = x.kind == 1 ? f32_from_f16(hv[j]) : kernels::f32_from_bf16(hv[j]);
+        }
         sycl::vec<uint16_t, 8> o, lo;
         for (int j = 0; j < 8; ++j) {
             const int64_t c = c0 + j, g = c / CG;
@@ -714,6 +733,18 @@ void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const
         if (lo16 != nullptr) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(lo16 + i) = lo;
     });
     finish(stream, e, "qi_group_norm16");
+}
+
+}  // namespace
+
+void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
+                     uint16_t* y16, float* ws, void* stream, const float* scale, const float* shift, uint16_t* lo16) {
+    group_norm16(GnIn{x, 0}, P, C, w, b, eps, silu, y16, ws, stream, scale, shift, lo16);
+}
+
+void qi_group_norm16(const uint16_t* x16, bool bf16, int64_t P, int64_t C, const float* w, const float* b, float eps,
+                     bool silu, uint16_t* y16, float* ws, void* stream) {
+    group_norm16(GnIn{x16, bf16 ? 2 : 1}, P, C, w, b, eps, silu, y16, ws, stream, nullptr, nullptr, nullptr);
 }
 
 void qi_softmax16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* stream, int64_t ld) {

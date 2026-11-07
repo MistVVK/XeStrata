@@ -466,7 +466,7 @@ def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress:
                "frames": int(got.get("frames", 0)), "fps": float(got.get("fps", 0)),
                "vfr": bool(int(got.get("vfr") or 0)), "objects": len(answer["objects"]),
                "segment": {k: float(got[k]) for k in ("segment_s", "read_s", "trunk_s", "detect_s", "track_s",
-                                                      "rules_s", "output_s", "write_s") if k in got}}
+                                                      "memory_s", "rules_s", "output_s", "write_s") if k in got}}
     gen.last = figures
     gen.end(None)
     return {**answer, "mime": "application/json", "figures": figures}
@@ -757,7 +757,8 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
                            **{k: u[k] for k in ("variant", "file", "fallback") if u.get(k)},
                            **{k: float(got[k]) for k in ("upscale_s", "read_s", "model_s", "resize_s", "color_s",
                                                          "write_s", "encode_s", "dit_s", "decode_s") if k in got},
-                           **{k: int(got[k]) for k in ("chunk", "vae_tile", "vae_host") if k in got}}}
+                           **{k: int(got[k]) for k in ("chunk", "vae_tile", "vae_host", "vae_latents", "vae_slice")
+                              if k in got}}}
     gen.last = figures
     gen.end(None)
     return {"path": got["path"], "mime": got.get("mime", "video/mp4"), "figures": figures}

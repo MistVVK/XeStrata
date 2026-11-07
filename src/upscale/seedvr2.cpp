@@ -30,16 +30,20 @@ namespace seedvr2_detail {
 
 sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
-// A video's VAE in tiles of tt x tt tokens (0: the frame whole) over a th x tw latent of HW pixels: a slice's work,
-// every tile's carried frames (one tile's where they are kept in host memory: `host`), the slice's frames and a tile's
-uint64_t vae_video_need(const image::MfVae& vae, int64_t th, int64_t tw, int64_t HW, int64_t tt, bool host) {
+// A video's VAE in tiles of tt x tt tokens (0: the frame whole) over a th x tw latent of HW pixels, `lat` latents a
+// call: a slice's work (`slice` latents), every tile's carried frames (one tile's of one side where they are kept in
+// host memory: `host`), and the call's frames and latents (the encoder's input and its tiles', the decoder's sums,
+// tiles', output and RGBA8)
+uint64_t vae_video_need(const image::MfVae& vae, int64_t th, int64_t tw, int64_t HW, int64_t tt, bool host,
+                        int64_t lat, int64_t slice = 1) {
     if (tt <= 0) tt = std::max(th, tw);
-    const int64_t a = std::min(th, tt), b = std::min(tw, tt);
-    // the tiles along a side of n: tt apart less the 4 tokens they share, the last flush with the edge
-    const auto along = [](int64_t n, int64_t t) { return n <= t ? 1 : (n - 5) / (t - 4) + 1; };
-    const auto tiles = host ? 1 : (uint64_t) (along(th, a) * along(tw, b));
-    return vae.video_scratch_bytes(a, b, 5) + vae.video_carried_bytes(a, b) * tiles +
-           (uint64_t) HW * 15 * 4 * 2;
+    const int64_t a = image::MfVae::video_tile_side(th, tt), b = image::MfVae::video_tile_side(tw, tt);
+    const uint64_t carried =
+        host ? std::max(vae.video_carried_bytes(a, b, 0), vae.video_carried_bytes(a, b, 1))
+             : vae.video_carried_bytes(a, b) * (uint64_t) (image::MfVae::video_tiles(th, tt) *
+                                                           image::MfVae::video_tiles(tw, tt));
+    const uint64_t per = (uint64_t) HW * 176 + (uint64_t) (a * b * 256) * 96 + (uint64_t) (th * tw * 64) * 24;
+    return vae.video_scratch_bytes(a, b, 4 * slice) + carried + per * (uint64_t) lat;
 }
 
 // the tiles video_begin tries after the frame whole, largest first
@@ -89,6 +93,16 @@ void rgba8_of_raw(const float* rgb, int64_t T, int64_t HW, uint8_t* out, void* s
     });
 }
 
+// The share of the earlier chunk's latent at position j of the `shared` two chunks have (0 .. shared - 1, one alone
+// 0): all of it over the first third of the stretch, none over the last, falling as a half cosine between, in u =
+// j / (shared - 1)
+float kept_share(int64_t j, int64_t shared) {
+    const float u = shared > 1 ? (float) j / (float) (shared - 1) : 0.f;
+    if (u <= 1.f / 3.f) return 1.f;
+    if (u >= 2.f / 3.f) return 0.f;
+    return 0.5f * (1.f + std::cos(3.14159265358979f * (3.f * u - 1.f)));
+}
+
 // a = a w + b (1 - w)
 void blend(float* a, const float* b, int64_t n, float w, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -114,6 +128,8 @@ struct Seedvr2::Impl {
     bool video_vae = false;   // the VAE opened in its video form
     int64_t vae_tt = 0;       // a video's VAE tiles (tokens a side; 0: the frame whole)
     bool vae_host = false;    // their carried frames in host memory (MfVae::set_video_host_cache)
+    int64_t vae_lat = 1;      // the latents a VAE call takes at most (the encoder's: 1 + 4 (n - 1) frames, then 4 n)
+    int64_t vae_slice = 1;    // the latents a tile's slice takes within a call (MfVae::set_video_slice)
     int64_t last_chunk = 0;   // the last video's chunk (frames), for parts()
     // a video's state (video_begin .. video_end)
     struct Video {
@@ -124,11 +140,11 @@ struct Seedvr2::Impl {
         int64_t pushed = 0, pend = 0, encoded = 0;      // frames pushed, waiting for the encoder, encoded
         int64_t latents = 0, cond0 = 0;                 // latents encoded; the first one `cond` holds
         std::deque<float*> cond;                        // the condition latents (scaled), [h w][64] each
-        int64_t merged0 = 0, filled = 0;                // the restored latents from merged0, filled up to `filled`
+        int64_t merged0 = 0, made = 0;                  // the restored latents from merged0, made up to `made`
         std::deque<float*> merged;
         int64_t next = 0, decoded = 0, out = 0;         // the next chunk; latents decoded; frames made
         std::deque<uint8_t*> ready;                     // frames ready, RGBA8
-        float *slice = nullptr, *last = nullptr;        // the frames for the encoder [5][3][H][W]; the last frame's
+        float *slice = nullptr, *last = nullptr;        // the encoder's frames [4 vae_lat][3][H][W]; the last one's
         float *zbuf = nullptr, *ncat = nullptr, *ccat = nullptr, *vel = nullptr, *rgb = nullptr;
         uint8_t* rgba = nullptr;
         std::vector<float*> pool;                       // latents' buffers to use again
@@ -178,16 +194,22 @@ struct Seedvr2::Impl {
         scratch_bytes = 0;
         v = Video();   // its buffers were the scratch's
     }
-    void encode_slice();
+    int64_t slice_frames() const { return v.encoded == 0 ? 1 + 4 * (vae_lat - 1) : 4 * vae_lat; }
+    void encode_slice(bool keep);
     void run_chunks();
     void decode_upto(int64_t upto);
 };
 
-// the frames waiting for the encoder through it: the latents they give, scaled, to the conditions
-void Seedvr2::Impl::encode_slice() {
+// the frames waiting for the encoder through it: the latents they give, scaled, to the conditions; `keep`: more
+// frames after them
+void Seedvr2::Impl::encode_slice(bool keep) {
     const int64_t th = v.h / 16, tw = v.w / 16, n = th * tw * 64;
+    auto t0 = std::chrono::steady_clock::now();
+    vae->set_video_keep(keep);
     const int64_t k = vae->encode_video_tiled(v.slice, v.pend, th, tw, v.encoded == 0, v.zbuf, vae_tt);
+    vae->set_video_keep(true);
     vae->drop_scratch();   // the room the DiT's chunk takes next (the carried frames stay)
+    enc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     for (int64_t i = 0; i < k; ++i) {
         float* z = latent_buf();
         gpu::copy_async(z, v.zbuf + i * n, (size_t) n * 4, s);
@@ -206,7 +228,7 @@ void Seedvr2::Impl::run_chunks() {
     const int64_t th = v.h / 16, tw = v.w / 16, n = th * tw * 64, lh = v.h / 8, lw = v.w / 8;
     const int64_t end = v.ended ? v.tl : INT64_MAX;
     for (;;) {
-        if (v.ended && v.filled >= v.tl) break;
+        if (v.ended && v.made >= v.tl) break;
         const int64_t s0 = v.next * v.step, e = std::min(s0 + v.cl, end), len = e - s0;
         if (s0 >= end || e > v.latents) break;
         // the chunk's conditions one after another, and its noise: the seed's for its shape [16][len][lh][lw]
@@ -227,22 +249,20 @@ void Seedvr2::Impl::run_chunks() {
         dit->drop_activations();   // the room the VAE's slices take
         dit_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         restore(v.ncat, v.vel, len * n, 1.f / kScaling, v.vel, s);
-        // merged: the overlap crossfaded (ComfyUI's SeedVR2TemporalMerge), the rest appended
-        const int64_t fade = std::min(v.filled - s0, len);
+        // merged: the latents the chunk shares with the ones before it mixed in (their outputs as ComfyUI's
+        // SeedVR2TemporalMerge gives them), the rest appended
+        const int64_t shared = std::min(v.made - s0, len);
         for (int64_t j = 0; j < len; ++j) {
             const int64_t L = s0 + j;
-            if (j < fade) {
-                float ramp = fade > 1 ? (float) j / (float) (fade - 1) : 0.f;
-                ramp = std::clamp((ramp - 1.f / 3.f) / (1.f / 3.f), 0.f, 1.f);
-                const float wprev = 0.5f + 0.5f * std::cos(3.14159265358979f * ramp);
-                blend(v.merged[(size_t) (L - v.merged0)], v.vel + j * n, n, wprev, s);
+            if (j < shared) {
+                blend(v.merged[(size_t) (L - v.merged0)], v.vel + j * n, n, kept_share(j, shared), s);
             } else {
                 float* z = latent_buf();
                 gpu::copy_async(z, v.vel + j * n, (size_t) n * 4, s);
                 v.merged.push_back(z);
             }
         }
-        v.filled = e;
+        v.made = e;
         ++v.next;
         // the conditions no later chunk reads go
         const int64_t keep = std::min(v.next * v.step, end);
@@ -255,15 +275,19 @@ void Seedvr2::Impl::run_chunks() {
     }
 }
 
-// the restored latents up to `upto` through the decoder, one at a time (the first gives one frame, each next four):
-// their frames ready, the padding's dropped
+// the restored latents up to `upto` through the decoder, up to vae_lat a call (the first gives one frame, each next
+// four): their frames ready, the padding's dropped
 void Seedvr2::Impl::decode_upto(int64_t upto) {
-    const int64_t th = v.h / 16, tw = v.w / 16, HW = v.w * v.h;
-    upto = std::min(upto, v.filled);
+    const int64_t th = v.h / 16, tw = v.w / 16, n = th * tw * 64, HW = v.w * v.h;
+    upto = std::min(upto, v.made);
     while (v.decoded < upto) {
         auto t0 = std::chrono::steady_clock::now();
-        const int64_t T = vae->decode_video_tiled(v.merged[(size_t) (v.decoded - v.merged0)], 1, th, tw,
-                                                  v.decoded == 0, v.rgb, vae_tt);
+        const int64_t k = std::min(vae_lat, upto - v.decoded);
+        for (int64_t j = 0; j < k; ++j)
+            gpu::copy_async(v.zbuf + j * n, v.merged[(size_t) (v.decoded + j - v.merged0)], (size_t) n * 4, s);
+        vae->set_video_keep(!(v.ended && v.decoded + k >= v.tl));
+        const int64_t T = vae->decode_video_tiled(v.zbuf, k, th, tw, v.decoded == 0, v.rgb, vae_tt);
+        vae->set_video_keep(true);
         vae->drop_scratch();
         rgba8_of_raw(v.rgb, T, HW, v.rgba, s);
         for (int64_t f = 0; f < T && (!v.ended || v.out < v.frames); ++f, ++v.out) {
@@ -273,10 +297,12 @@ void Seedvr2::Impl::decode_upto(int64_t upto) {
         }
         core::Runtime::get().stream(s).wait_and_throw();
         dec_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        ++v.decoded;
-        v.pool.push_back(v.merged.front());   // the decoded latent goes
-        v.merged.pop_front();
-        ++v.merged0;
+        v.decoded += k;
+        for (int64_t j = 0; j < k; ++j) {   // the decoded latents go
+            v.pool.push_back(v.merged.front());
+            v.merged.pop_front();
+            ++v.merged0;
+        }
     }
 }
 
@@ -293,10 +319,10 @@ uint64_t Seedvr2::video_bytes(int64_t w, int64_t h, int64_t chunk, bool least) c
     // the frames, then the larger of the chunk's DiT activations and the VAE's slice (the frame whole for the full;
     // for the least, the smallest tiles with their carried frames in host memory)
     const int64_t HW = w * h;
-    uint64_t vae = vae_video_need(v, th, tw, HW, 0, false);
+    uint64_t vae = vae_video_need(v, th, tw, HW, 0, false, 1);
     if (least)   // the smallest tiles, their carried frames in host memory
-        vae = std::min(vae, vae_video_need(v, th, tw, HW, std::end(kVaeTiles)[-1], true));
-    return (uint64_t) (cl * n) * 4 * 7 + (uint64_t) HW * 4 * 27 + std::max(d.activation_bytes(th, tw, cl), vae);
+        vae = std::min(vae, vae_video_need(v, th, tw, HW, std::end(kVaeTiles)[-1], true, 1));
+    return (uint64_t) (cl * n) * 4 * 7 + (uint64_t) HW * 4 * 3 + std::max(d.activation_bytes(th, tw, cl), vae);
 }
 
 void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, int64_t chunk, int64_t overlap) {
@@ -328,7 +354,7 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
     const uint64_t margin = 512ull << 20;
     const auto fixed = [&](int64_t cl) {
         return m.vae_bytes + m.dit->weight_bytes() + m.dit->block_min() + (uint64_t) (cl * n) * 4 * 7 +
-               (uint64_t) HW * 4 * 27 + margin;
+               (uint64_t) HW * 4 * 3 + margin;
     };
     const auto work = [&](int64_t cl) {
         const uint64_t f = fixed(cl);
@@ -345,38 +371,56 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
     v.step = v.cl - v.overlap;
     v.seed = seed;
     const uint64_t act = m.dit->activation_bytes(th, tw, v.cl), room = work(v.cl);
-    {   // the tiles: the frame whole, else the largest of 64 .. 16 tokens whose slice and carried frames fit, else the
-        // largest whose slice and one tile's carried frames fit, the tiles' carried frames in host memory (copied in
-        // and out each slice: slower, but the GPU holds one tile's)
-        const auto need = [&](int64_t tt, bool host) { return vae_video_need(*m.vae, th, tw, HW, tt, host); };
-        m.vae_tt = 0;
+    {   // the tiles and the latents a VAE call takes (up to a chunk's): the frame whole, else the largest of 64 .. 16
+        // tokens whose work and carried frames fit with a latent a call; else, the tiles' carried frames in host memory
+        // (copied in and out once a call: slower, but the GPU holds one tile's), the largest whose work fits with
+        // four latents a call (fewer copies), else with one; else the least, whatever the room says.  The calls as
+        // long as the room lets them, each tile through all their frames before the next
+        const auto need = [&](int64_t tt, bool host, int64_t lat) {
+            return vae_video_need(*m.vae, th, tw, HW, tt, host, lat);
+        };
+        const auto most = [&](int64_t tt, bool host) {   // the latents a call whose need fits (0: none)
+            int64_t l = v.cl;
+            while (l > 0 && need(tt, host, l) > room) --l;
+            return l;
+        };
+        const auto pick = [&](bool host, int64_t least) {
+            for (const int64_t tt : {int64_t{0}, kVaeTiles[0], kVaeTiles[1], kVaeTiles[2], kVaeTiles[3], kVaeTiles[4],
+                                     kVaeTiles[5]})
+                if ((tt == 0 || tt < std::max(th, tw)) && most(tt, host) >= least) return tt;
+            return int64_t{-1};
+        };
         m.vae_host = false;
-        if (need(0, false) > room) {
-            const auto pick = [&](bool host) {
-                for (const int64_t tt : kVaeTiles)
-                    if (tt < std::max(th, tw) && need(tt, host) <= room) return tt;
-                return int64_t{0};
-            };
-            m.vae_tt = pick(false);
-            if (m.vae_tt == 0) {
-                m.vae_tt = pick(true);
-                m.vae_host = true;
-                if (m.vae_tt == 0) m.vae_tt = std::end(kVaeTiles)[-1];   // the least, whatever the room says
-            }
+        m.vae_tt = pick(false, 1);
+        if (m.vae_tt < 0) {
+            m.vae_host = true;
+            m.vae_tt = pick(true, std::min<int64_t>(4, v.cl));
+            if (m.vae_tt < 0) m.vae_tt = pick(true, 1);
+            if (m.vae_tt < 0) m.vae_tt = std::end(kVaeTiles)[-1];
         }
+        m.vae_lat = std::max<int64_t>(most(m.vae_tt, m.vae_host), 1);
+        // then a tile's slices within a call as long as the room left lets them, up to 4 latents (ComfyUI's
+        // SEEDVR2_MAX_SLICE_LATENTS): each convolution over more frames at once
+        m.vae_slice = 1;
+        for (int64_t sl = std::min<int64_t>(4, m.vae_lat); sl > 1; --sl)
+            if (vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, sl) <= room) {
+                m.vae_slice = sl;
+                break;
+            }
         m.vae->set_video_host_cache(m.vae_host);
-        const uint64_t vae = need(m.vae_tt, m.vae_host);
+        m.vae->set_video_slice(m.vae_slice);
+        const uint64_t vae = vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, m.vae_slice);
         const uint64_t f = fixed(v.cl) - m.dit->block_min() + std::max(act, vae);
         m.dit->set_block_budget(std::max(m.room > f ? m.room - f : 0, m.dit->block_min()));
     }
-    v.slice = m.get<float>(HW * 15);
+    v.slice = m.get<float>(4 * m.vae_lat * 3 * HW);
     v.last = m.get<float>(3 * HW);
-    v.zbuf = m.get<float>(2 * n);
+    v.zbuf = m.get<float>(m.vae_lat * n);
     v.ncat = m.get<float>(v.cl * n);
     v.ccat = m.get<float>(v.cl * n);
     v.vel = m.get<float>(v.cl * n);
-    v.rgb = m.get<float>(HW * 12);
-    v.rgba = m.get<uint8_t>(4 * HW * 4);
+    v.rgb = m.get<float>(4 * m.vae_lat * 3 * HW);
+    v.rgba = m.get<uint8_t>(4 * m.vae_lat * 4 * HW);
     m.enc_s = m.dit_s = m.dec_s = 0.0;
 }
 
@@ -385,18 +429,24 @@ void Seedvr2::video_push(const uint8_t* in, int64_t n) {
     Impl::Video& v = m.v;
     if (!v.on) throw std::logic_error("SeedVR2: a video's frames before video_begin");
     const int64_t HW = v.w * v.h;
+    // the encoder's slice when it is full: at once while more frames come, else (the frames hinted at all pushed)
+    // left for video_end, which knows whether it is the clip's last and spares its tiles' copies back then
+    const auto encode = [&] {
+        gpu::copy_async(v.last, v.slice + (v.pend - 1) * 3 * HW, (size_t) (3 * HW) * 4, m.s);
+        m.encode_slice(true);
+        m.run_chunks();
+    };
     for (int64_t f = 0; f < n; ++f) {
+        if (v.pend == m.slice_frames()) encode();
         rgb_of(in + f * HW * 4, HW, v.slice + v.pend * 3 * HW, m.s);
         ++v.pend;
         ++v.pushed;
-        if (v.pend == (v.encoded == 0 ? 5 : 4)) {   // the encoder's slice: 1 + 4 frames first, 4 after
-            gpu::copy_async(v.last, v.slice + (v.pend - 1) * 3 * HW, (size_t) (3 * HW) * 4, m.s);
-            auto t0 = std::chrono::steady_clock::now();
-            m.encode_slice();
-            m.enc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            m.run_chunks();
-        }
+        if (v.pend == m.slice_frames() && v.pushed < v.frames) encode();
     }
+    // the caller's frames read before it writes the next into the same place: rgb_of reads them on the model's
+    // stream, which a copy of the caller's (gpu::copy, ordered after the compute queue alone) does not wait for (the RX
+    // 9060 XT's second latent made of the next frames, 2026-11-07)
+    core::Runtime::get().stream(m.s).wait_and_throw();
 }
 
 int64_t Seedvr2::video_ready() const { return (int64_t) impl_->v.ready.size(); }
@@ -426,19 +476,11 @@ void Seedvr2::video_end() {
     v.tl = (v.total - 1) / 4 + 1;
     if (v.pend > 0) gpu::copy_async(v.last, v.slice + (v.pend - 1) * 3 * HW, (size_t) (3 * HW) * 4, m.s);
     while (v.encoded + v.pend < v.total) {
+        if (v.pend == m.slice_frames()) m.encode_slice(true);
         gpu::copy_async(v.slice + v.pend * 3 * HW, v.last, (size_t) (3 * HW) * 4, m.s);
         ++v.pend;
-        if (v.pend == (v.encoded == 0 ? std::min<int64_t>(5, v.total) : 4)) {
-            auto t0 = std::chrono::steady_clock::now();
-            m.encode_slice();
-            m.enc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        }
     }
-    if (v.pend > 0) {   // a first slice of one frame (a clip of one)
-        auto t0 = std::chrono::steady_clock::now();
-        m.encode_slice();
-        m.enc_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    }
+    if (v.pend > 0) m.encode_slice(false);   // the clip's last
     m.run_chunks();
     m.decode_upto(v.tl);
     v.on = false;
@@ -601,9 +643,12 @@ void Seedvr2::release(bool all) {
 
 std::string Seedvr2::parts() const {
     char b[220];
-    std::snprintf(b, sizeof b, "encode_s=%.3f dit_s=%.3f decode_s=%.3f blocks=%d chunk=%lld vae_tile=%lld vae_host=%d",
+    std::snprintf(b, sizeof b,
+                  "encode_s=%.3f dit_s=%.3f decode_s=%.3f blocks=%d chunk=%lld vae_tile=%lld vae_host=%d "
+                  "vae_latents=%lld vae_slice=%lld",
                   impl_->enc_s, impl_->dit_s, impl_->dec_s, impl_->dit ? impl_->dit->resident_blocks() : 0,
-                  (long long) impl_->last_chunk, (long long) impl_->vae_tt, (int) impl_->vae_host);
+                  (long long) impl_->last_chunk, (long long) impl_->vae_tt, (int) impl_->vae_host,
+                  (long long) impl_->vae_lat, (long long) impl_->vae_slice);
     return b;
 }
 

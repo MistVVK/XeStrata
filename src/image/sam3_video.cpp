@@ -28,6 +28,7 @@ namespace {
 
 constexpr int64_t kPad = -1, kGone = -2;   // a slot never used, a removed object's (not used again)
 constexpr float kNoObj = -1024.f;          // a mask's logits where the decoder saw no object
+constexpr int kStageMask = 100;            // Sam3's upload_async stages of the slots' masks (100 + slot)
 
 double since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -339,20 +340,20 @@ struct Sam3Video::Impl {
 
     // the frame's memory of bucket b from its objects' masks [P0] (the rest of the slots empty)
     void encode(Bucket& b, FrameMem& fm, const std::map<int64_t, const std::vector<float>*>& masks) {
-        std::vector<float> host((size_t) (M * P0), 0.f), valid((size_t) M, 0.f), is_obj((size_t) M, 0.f);
+        // the slots' masks to the GPU, the empty ones left as they are (the encoder reads only the valid)
+        std::vector<float> valid((size_t) M, 0.f), is_obj((size_t) M, 0.f);
         std::vector<float> cond(fm.cond_slot.begin(), fm.cond_slot.end());
+        low_dev.grow((size_t) (M * P0) * 4);
         for (int64_t sl = 0; sl < M; ++sl) {
             const int64_t id = b.slot[(size_t) sl];
             if (id < 0) continue;
             const auto it = masks.find(id);
             if (it == masks.end()) continue;
             const std::vector<float>& m = *it->second;
-            std::copy(m.begin(), m.end(), host.begin() + sl * P0);
+            sam.upload_async(low_dev.as<float>() + sl * P0, m.data(), (size_t) P0 * 4, kStageMask + (int) sl);
             valid[(size_t) sl] = 1.f;
             is_obj[(size_t) sl] = std::any_of(m.begin(), m.end(), [](float v) { return v > 0.f; }) ? 1.f : 0.f;
         }
-        low_dev.grow(host.size() * 4);
-        gpu::copy(low_dev.p, host.data(), host.size() * 4);
         fm.mem16.grow((size_t) (P * 2 * d) * 2);
         // the frame's image features in the rows' first half, the memory in the second
         img16.grow((size_t) (P * d) * 2);
@@ -389,6 +390,18 @@ struct Sam3Video::Impl {
         sam.sync();
     }
 
+    // a bucket's frame memory, its buffers those of a frame let go where there is one (a frame's 5 MB of rows
+    // allocated and freed each frame cost the B70 about 2 ms of the memory's 4, 2026-11-07)
+    std::vector<std::unique_ptr<FrameMem>> spare;
+    std::unique_ptr<FrameMem> fresh_mem() {
+        if (spare.empty()) return std::make_unique<FrameMem>();
+        std::unique_ptr<FrameMem> m = std::move(spare.back());
+        spare.pop_back();
+        m->cond = false;
+        m->cond_slot.fill(0.f);
+        return m;
+    }
+
     Obj* find(int64_t id) {
         for (Obj& o : objs)
             if (o.id == id) return &o;
@@ -407,16 +420,22 @@ struct Sam3Video::Impl {
         t.detect += since(t0);
         t0 = std::chrono::steady_clock::now();
         // the objects carried to this frame, bucket by bucket (their memory written after the rules)
-        sam.track_features();
+        bool tracked = false;   // the propagation's neck, made once a frame where a bucket or a new object needs it
+        const auto features = [&] {
+            if (!tracked) sam.track_features();
+            tracked = true;
+        };
+        if (std::any_of(buckets.begin(), buckets.end(), [](const auto& b) { return b->any(); })) features();
         std::map<int64_t, std::vector<float>> trk;
         std::map<int64_t, float> trk_logit;
         std::map<int64_t, std::unique_ptr<FrameMem>> now;   // by bucket
         for (size_t bi = 0; bi < buckets.size(); ++bi) {
             if (!buckets[bi]->any()) continue;
-            auto fm = std::make_unique<FrameMem>();
+            auto fm = fresh_mem();
             propagate(*buckets[bi], f, trk, trk_logit, *fm);
             now[(int64_t) bi] = std::move(fm);
         }
+        sam.sync();
         for (Obj& o : objs) {
             o.low = std::move(trk[o.id]);
             o.track_logit = trk_logit[o.id];
@@ -554,7 +573,10 @@ struct Sam3Video::Impl {
             for (size_t j = 0; j < no; ++j)
                 if (oa[j] == 0) objs[j].last_occluded = f;
         }
+        double mem_s = 0;   // the memory's share of this section: its encoder, the clean masks' pointers
+        auto m0 = std::chrono::steady_clock::now();
         for (const auto& [bi, sl] : recond_slots) condition(*now.at(bi), sl, recond_masks.at(bi));
+        mem_s += since(m0);
         // the frame's memory: each pixel to the object of its words scoring it highest, an object shrunk below 30% by
         // that left out (its masks as they are otherwise)
         std::map<int64_t, std::vector<float>> mem_masks;
@@ -586,12 +608,14 @@ struct Sam3Video::Impl {
                 mem_masks[objs[j].id] = std::move(m);
             }
         }
+        m0 = std::chrono::steady_clock::now();
         for (auto& [bi, fm] : now) {
             std::map<int64_t, const std::vector<float>*> mm;
             for (const auto& [id, m] : mem_masks) mm[id] = &m;
             encode(*buckets[(size_t) bi], *fm, mm);
         }
         sam.sync();
+        mem_s += since(m0);
         // the outputs as tracked (before this frame's removals), then the new objects
         Pending out;
         out.frame = f;
@@ -628,7 +652,7 @@ struct Sam3Video::Impl {
             if (created) {
                 buckets.push_back(std::make_unique<Bucket>());
                 target = (int64_t) buckets.size() - 1;
-                now[target] = std::make_unique<FrameMem>();
+                now[target] = fresh_mem();
                 now[target]->cond = true;
                 now[target]->ptr.grow((size_t) (M * d) * 4);
                 gpu::memset(now[target]->ptr.p, 0, (size_t) (M * d) * 4);
@@ -656,6 +680,13 @@ struct Sam3Video::Impl {
                 lows.push_back(n.low);
                 objs.push_back(std::move(o));
             }
+            if (!tracked) {   // the new objects' memory needs the frame's propagation features: the tracker's time
+                const auto n0 = std::chrono::steady_clock::now();
+                features();
+                sam.sync();
+                t.track += since(n0);
+            }
+            m0 = std::chrono::steady_clock::now();
             condition(fm, slots, lows);
             // the bucket's memory again: the objects there before give way where the new ones are
             std::map<int64_t, const std::vector<float>*> mm;
@@ -676,6 +707,7 @@ struct Sam3Video::Impl {
             }
             encode(b, fm, mm);
             sam.sync();
+            mem_s += since(m0);
         }
         // the dropped objects: their slots not used again, a bucket with none left gone
         for (int64_t id : to_remove) {
@@ -689,13 +721,17 @@ struct Sam3Video::Impl {
         for (auto& [bi, fm] : now) buckets[(size_t) bi]->mem[f] = std::move(fm);
         for (auto& b : buckets) {
             if (!b->any()) {
+                for (auto& [t, m] : b->mem) spare.push_back(std::move(m));
                 b->mem.clear();
                 continue;
             }
             for (auto it = b->mem.begin(); it != b->mem.end();) {
-                if (!it->second->cond && it->first < f - std::max<int64_t>(cfg.max_pointers, sam.mem_frames()))
+                if (!it->second->cond && it->first < f - std::max<int64_t>(cfg.max_pointers, sam.mem_frames())) {
+                    spare.push_back(std::move(it->second));
                     it = b->mem.erase(it);
-                else ++it;
+                } else {
+                    ++it;
+                }
             }
         }
         // confirmation: a masklet matched (or just found) in confirm_after frames in a row
@@ -715,7 +751,8 @@ struct Sam3Video::Impl {
         }
         for (const auto& [id, s] : first_score) out.score[id] = s;
         held.push_back(std::move(out));
-        t.rules += since(t0);
+        t.memory += mem_s;
+        t.rules += since(t0) - mem_s;
     }
 
     // a held frame shown: its masks at the clip's size, the hidden ones left out, each pixel to one object

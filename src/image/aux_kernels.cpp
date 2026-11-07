@@ -5,19 +5,26 @@
 #include "strata/image/aux_kernels.hpp"
 
 #include "strata/core/runtime.hpp"
-#include "strata/kernels/f16_bits.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <mutex>
+#include <stdexcept>
+#include <tuple>
+#include <vector>
 
 namespace strata::image {
 
 namespace {
 
-using strata::kernels::f16_from_f32;
-using strata::kernels::f32_from_f16;
+// FP16 by the GPU's own conversion (round to nearest even, as kernels::f16_from_f32): the bits' arithmetic of
+// f16_bits.hpp, a few dozen instructions a value, held the elementwise passes of SAM 3's ViT (its MLP's bias and GELU,
+// its norms) to about half the memory's rate on the RTX 4070 (2026-11-07)
+inline uint16_t f16_from_f32(float v) { return sycl::bit_cast<uint16_t>(sycl::half(v)); }
+inline float f32_from_f16(uint16_t b) { return static_cast<float>(sycl::bit_cast<sycl::half>(b)); }
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
@@ -168,7 +175,8 @@ namespace {
 // aux_layer_norm's rows, row t's output at row to(t)
 template <class To>
 void layer_norm_rows(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
-                     float* y, uint16_t* y16, To to, void* stream, const char* what, const float* rb = nullptr) {
+                     float* y, uint16_t* y16, To to, void* stream, const char* what, const float* rb = nullptr,
+                     bool gelu = false) {
     if (T <= 0) return;
     const bool regs = row_vals(C);
     const int64_t L = regs ? row_items(C) : 256;
@@ -191,7 +199,8 @@ void layer_norm_rows(const float* x, const float* r, const float* w, const float
                 for (int64_t k = 0; k < kRowVals; ++k) {
                     const int64_t c = l + k * L;
                     if (c >= C) continue;
-                    const float u = (v[k] - st[0]) * st[1] * w[c] + b[c];
+                    float u = (v[k] - st[0]) * st[1] * w[c] + b[c];
+                    if (gelu) u = 0.5f * u * (1.f + sycl::erf(u * 0.70710678118654752f));
                     if (y16 != nullptr) y16[o * C + c] = f16_from_f32(u);
                     if (y != nullptr) y[o * C + c] = u;
                 }
@@ -208,7 +217,8 @@ void layer_norm_rows(const float* x, const float* r, const float* w, const float
             const float inv =
                 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
             for (int64_t c = l; c < C; c += L) {
-                const float v = (xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean) * inv * w[c] + b[c];
+                float v = (xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean) * inv * w[c] + b[c];
+                if (gelu) v = 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
                 if (y16 != nullptr) y16[o * C + c] = f16_from_f32(v);
                 if (y != nullptr) y[o * C + c] = v;
             }
@@ -220,6 +230,71 @@ void layer_norm_rows(const float* x, const float* r, const float* w, const float
 void aux_layer_norm(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
                     float* y, uint16_t* y16, void* stream) {
     layer_norm_rows(x, r, w, b, T, C, eps, y, y16, [](int64_t t) { return t; }, stream, "aux_layer_norm");
+}
+
+void aux_layer_norm_gelu16(const float* x, const float* w, const float* b, int64_t T, int64_t C, float eps,
+                           uint16_t* y16, void* stream) {
+    if (T <= 0) return;
+    if (C > 64) {
+        layer_norm_rows(x, nullptr, w, b, T, C, eps, nullptr, y16, [](int64_t t) { return t; }, stream,
+                        "aux_layer_norm_gelu16", nullptr, true);
+        return;
+    }
+    // few channels (a mask downsampler's first layers, 16 a row over 331,776 rows): a work-item a value, 256 / C rows a
+    // work-group, each row's sums by halving in local memory - the reads and writes in rows' order (a work-group a row
+    // left most of its items idle; a work-item a row read its values C apart from its neighbours')
+    if (256 % C == 0) {
+        constexpr int L = 256;
+        const int ch = (int) C;
+        const int64_t groups = (T * C + L - 1) / L;
+        const auto e = queue_for(stream).submit([&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> sh(L, h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (groups * L)), sycl::range<1>(L)),
+                           [=](sycl::nd_item<1> it) {
+                const int l = (int) it.get_local_linear_id(), c = l % ch, base = l - c;
+                const int64_t i = (int64_t) it.get_group_linear_id() * L + l;
+                const bool live = i < T * C;
+                const float v = live ? x[i] : 0.f;
+                const auto row_sum = [&](float a) {
+                    sh[l] = a;
+                    for (int st = ch / 2; st > 0; st /= 2) {
+                        sycl::group_barrier(it.get_group());
+                        if (c < st) sh[l] += sh[l + st];
+                    }
+                    sycl::group_barrier(it.get_group());
+                    const float r = sh[base];
+                    sycl::group_barrier(it.get_group());
+                    return r;
+                };
+                const float mean = row_sum(v) / (float) ch;
+                const float dv = v - mean;
+                const float inv = 1.f / sycl::sqrt(row_sum(dv * dv) / (float) ch + eps);
+                if (!live) return;
+                const float u = dv * inv * w[c] + b[c];
+                y16[i] = f16_from_f32(0.5f * u * (1.f + sycl::erf(u * 0.70710678118654752f)));
+            });
+        });
+        finish(stream, e, "aux_layer_norm_gelu16");
+        return;
+    }
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
+        const auto t = static_cast<int64_t>(id[0]);
+        const float* xr = x + t * C;
+        float s = 0.f;
+        for (int64_t c = 0; c < C; ++c) s += xr[c];
+        const float mean = s / (float) C;
+        float s2 = 0.f;
+        for (int64_t c = 0; c < C; ++c) {
+            const float d = xr[c] - mean;
+            s2 += d * d;
+        }
+        const float inv = 1.f / sycl::sqrt(s2 / (float) C + eps);
+        for (int64_t c = 0; c < C; ++c) {
+            const float u = (xr[c] - mean) * inv * w[c] + b[c];
+            y16[t * C + c] = f16_from_f32(0.5f * u * (1.f + sycl::erf(u * 0.70710678118654752f)));
+        }
+    });
+    finish(stream, e, "aux_layer_norm_gelu16");
 }
 
 void aux_residual_norm16(float* x, const float* r, const float* rb, const float* w, const float* b, int64_t H, int64_t W,
@@ -419,6 +494,61 @@ void aux_softmax16(const float* s, int64_t rows, int64_t cols, uint16_t* p16, vo
     finish(stream, e, "aux_softmax16");
 }
 
+void aux_heads16(const uint16_t* x, int64_t rows, int64_t heads, int64_t hd, int64_t ld, bool transpose, uint16_t* y,
+                 void* stream) {
+    const int64_t n = heads * rows * hd;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);   // the source's order: rows, then its channels
+        const int64_t r = i / (heads * hd), c = i - r * heads * hd, h = c / hd, d = c - h * hd;
+        y[transpose ? (h * hd + d) * rows + r : (h * rows + r) * hd + d] = x[r * ld + c];
+    });
+    finish(stream, e, "aux_heads16");
+}
+
+void aux_heads_merge16(const float* o, int64_t rows, int64_t heads, int64_t hd, uint16_t* y, void* stream) {
+    const int64_t n = heads * rows * hd;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / (heads * hd), c = i - r * heads * hd, h = c / hd, d = c - h * hd;
+        y[i] = f16_from_f32(o[(h * rows + r) * hd + d]);
+    });
+    finish(stream, e, "aux_heads_merge16");
+}
+
+void aux_softmax_grid16(const float* s, int64_t heads, int64_t rows, int64_t G, float scale, const float* grid,
+                        int64_t skip, uint16_t* p16, void* stream) {
+    if (heads * rows <= 0) return;
+    constexpr size_t L = 256;
+    const int64_t cols = G * G;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (heads * rows) * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto hr = static_cast<int64_t>(it.get_group_linear_id());
+            const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t h = hr / rows, r = hr - h * rows;
+            const float* x = s + hr * cols;
+            const float* gb = r >= skip ? grid + (r - skip) * 2 * G * heads : nullptr;
+            const auto at = [&](int64_t c) {
+                float v = x[c] * scale;
+                if (gb != nullptr) {
+                    const int64_t y = c / G;
+                    v += gb[y * heads + h] + gb[(G + c - y * G) * heads + h];
+                }
+                return v;
+            };
+            float m = -INFINITY;
+            for (int64_t c = l; c < cols; c += (int64_t) L) m = sycl::fmax(m, at(c));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            float z = 0.f;
+            for (int64_t c = l; c < cols; c += (int64_t) L) z += sycl::exp(at(c) - m);
+            z = sycl::reduce_over_group(it.get_group(), z, sycl::plus<float>());
+            const float inv = 1.f / z;
+            for (int64_t c = l; c < cols; c += (int64_t) L) p16[hr * cols + c] = f16_from_f32(sycl::exp(at(c) - m) * inv);
+        });
+    finish(stream, e, "aux_softmax_grid16");
+}
+
 void aux_embed(const int32_t* ids, const int32_t* pos_ids, const uint16_t* tok, const uint16_t* pos, int64_t n,
                int64_t C, float scale, float* y, void* stream) {
     if (n <= 0) return;
@@ -530,11 +660,37 @@ namespace {
 inline float value_of(float v) { return v; }
 inline float value_of(uint16_t v) { return f32_from_f16(v); }
 
+// The 2D axial RoPE's cos and sin [grid^2][hd / 2][2] (a position's channel pairs: x for the first quarter, y for the
+// second), made on the host once a GPU and shape and kept: their exp, cos and sin a pair of every row of every layer
+// were most of SAM 3's ViT's split on the B70 (6.4 ms a frame, 2026-11-07)
+const float* rope_table(void* stream, int64_t grid, float pscale, int64_t hd, float theta) {
+    sycl::queue& q = queue_for(stream);
+    static std::mutex mu;
+    static std::map<std::tuple<const sycl::queue*, int64_t, float, int64_t, float>, float*> tables;
+    std::lock_guard<std::mutex> lock(mu);
+    float*& t = tables[{&q, grid, pscale, hd, theta}];
+    if (t != nullptr) return t;
+    const int64_t half = hd / 2, quarter = hd / 4, gg = grid * grid;
+    std::vector<float> h((size_t) (gg * half * 2));
+    for (int64_t li = 0; li < gg; ++li)
+        for (int64_t p = 0; p < half; ++p) {
+            const int64_t f = p < quarter ? p : p - quarter;
+            const double pos = (double) (p < quarter ? li % grid : li / grid) * pscale;
+            const double ang = pos * std::pow((double) theta, -(double) (4 * f) / (double) hd);
+            h[(size_t) ((li * half + p) * 2)] = (float) std::cos(ang);
+            h[(size_t) ((li * half + p) * 2 + 1)] = (float) std::sin(ang);
+        }
+    t = sycl::malloc_device<float>(h.size(), q);
+    if (t == nullptr) throw std::runtime_error("aux_rope2d: no GPU memory for its table");
+    q.memcpy(t, h.data(), h.size() * 4).wait();
+    return t;
+}
+
 // aux_rope2d_split16 over qkv rows of floats or of FP16 bits, `bias` [3C] added where not null
 template <class In>
 void rope2d_split16(const In* qkv, const float* bias, int64_t N, int64_t heads, int64_t hd, int64_t grid, float pscale,
                     float theta, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
-    const int64_t C = heads * hd, half = hd / 2, quarter = hd / 4;
+    const int64_t C = heads * hd, half = hd / 2;
     if (N <= 0 || half <= 0) return;
     const float* tab = rope_table(stream, grid, pscale, hd, theta);
     // a 2D range (rows, a row's pairs) and 32-bit indices
@@ -543,11 +699,9 @@ void rope2d_split16(const In* qkv, const float* bias, int64_t N, int64_t heads, 
         const int64_t t = (int64_t) id[0];
         const int hp = (int) id[1], h = hp / hf, p = hp - h * hf;
         const int li = (int) (t % gg);
-        const int ti = (li * hf + p) * 2;   // the table: grid^2 x half pairs, far below 2^31
-        const float cs = tab[ti], sn = tab[ti + 1];
-        const int p2 = 2 * p;   // the pair's first value: 32-bit, as the device counts
-        const In* row = qkv + t * 3 * C + h * hd + p2;
-        const int64_t o = t * C + h * hd + p2, c0 = h * hd + p2;
+        const float cs = tab[(li * hf + p) * 2], sn = tab[(li * hf + p) * 2 + 1];
+        const In* row = qkv + t * 3 * C + h * hd + 2 * p;
+        const int64_t o = t * C + h * hd + 2 * p, c0 = h * hd + 2 * p;
         auto at = [&](int64_t j) { return value_of(row[j]) + (bias != nullptr ? bias[c0 + j] : 0.f); };
         const float q0 = at(0), q1 = at(1), k0 = at(C), k1 = at(C + 1);
         q16[o] = f16_from_f32(q0 * cs - q1 * sn);
@@ -574,18 +728,30 @@ void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, in
 void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
                     void* stream) {
     if (T <= 0 || n <= 0) return;
-    // a work-item 8 columns of a row where n takes them (16 bytes in, 16 out), else one
-    const int64_t per = n % 8 == 0 ? 8 : 1, chunks = n / per;
-    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) chunks), [=](sycl::id<2> id) {
-        const auto t = static_cast<int64_t>(id[0]), c0 = static_cast<int64_t>(id[1]) * per;
-        const uint16_t* in = x16 + t * n + c0;
-        uint16_t* out = y16 + t * n + c0;
-        for (int64_t j = 0; j < per; ++j) {
-            float v = f32_from_f16(in[j]) + (bias != nullptr ? bias[c0 + j] : 0.f);
-            if (act == AuxAct::relu) v = sycl::fmax(v, 0.f);
-            else if (act == AuxAct::gelu) v = 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
-            out[j] = f16_from_f32(v);
-        }
+    const auto f = [=](float v, float b) {
+        v += b;
+        if (act == AuxAct::relu) v = sycl::fmax(v, 0.f);
+        else if (act == AuxAct::gelu) v = 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
+        return v;
+    };
+    if (n % 8 == 0) {   // a work-item 8 values: one 16-byte load and store (a row's 8 at a time are 16-byte aligned)
+        using V = sycl::vec<sycl::half, 8>;
+        const int64_t chunks = T * n / 8, per_row = n / 8;
+        const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) chunks), [=](sycl::id<1> id) {
+            const auto i = static_cast<int64_t>(id[0]);
+            const int64_t c0 = (i % per_row) * 8;
+            const V in = reinterpret_cast<const V*>(x16)[i];
+            V out;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) out[j] = sycl::half(f((float) in[j], bias != nullptr ? bias[c0 + j] : 0.f));
+            reinterpret_cast<V*>(y16)[i] = out;
+        });
+        finish(stream, e, "aux_bias_act16");
+        return;
+    }
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * n)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y16[i] = f16_from_f32(f(f32_from_f16(x16[i]), bias != nullptr ? bias[i % n] : 0.f));
     });
     finish(stream, e, "aux_bias_act16");
 }
@@ -740,6 +906,10 @@ void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const flo
         }
         for (int64_t o = 0; o < heads && o < 16; ++o) tmp[i * heads + o] = out[o];
     });
+    if (bias == nullptr) {
+        finish(stream, e, "aux_box_bias");
+        return;
+    }
     if (!stream) core::Runtime::get().wait(e, "aux_box_bias");
     const int64_t HW = H * W, n = heads * (Q + 1) * HW;
     e = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -1036,22 +1206,24 @@ void aux_box_refine(float* boxes, const float* delta, int64_t n, void* stream) {
 
 void aux_dwconv(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, int k, float* y,
                 void* stream) {
-    const int64_t n = H * W * C, r = k / 2;
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, p = i / C, py = p / W, px = p - py * W;
+    if (H * W * C <= 0) return;
+    // a 3D range and 32-bit indices: no 64-bit division by C and W an output (the B70 0.7 ms a 72 x 72 x 256 in the
+    // 1D form, 2026-11-07)
+    const int h = (int) H, wd = (int) W, ch = (int) C, r = k / 2;
+    const auto e = queue_for(stream).parallel_for(sycl::range<3>((size_t) H, (size_t) W, (size_t) C), [=](sycl::id<3> id) {
+        const int py = (int) id[0], px = (int) id[1], c = (int) id[2];
         float s = b != nullptr ? b[c] : 0.f;
-        for (int64_t dy = -r; dy <= r; ++dy) {
-            const int64_t yy = py + dy;
-            if (yy < 0 || yy >= H) continue;
-            for (int64_t dx = -r; dx <= r; ++dx) {
-                const int64_t xx = px + dx;
-                if (xx < 0 || xx >= W) continue;
-                s += w[(c * k + dy + r) * k + dx + r] * x[(yy * W + xx) * C + c];
+        const float* wc = w + c * k * k;
+        for (int dy = -r; dy <= r; ++dy) {
+            const int yy = py + dy;
+            if (yy < 0 || yy >= h) continue;
+            for (int dx = -r; dx <= r; ++dx) {
+                const int xx = px + dx;
+                if (xx < 0 || xx >= wd) continue;
+                s += wc[(dy + r) * k + dx + r] * x[(yy * wd + xx) * ch + c];
             }
         }
-        y[i] = s;
+        y[(py * wd + px) * ch + c] = s;
     });
     finish(stream, e, "aux_dwconv");
 }
@@ -1131,29 +1303,36 @@ void aux_mem_key16(const float* y, int64_t B, int64_t N, int64_t nsp, int64_t P,
 }
 
 void aux_mux_masks16(const float* masks, int64_t N, int64_t h, int64_t w, int64_t H, int64_t W, bool sigmoid_first,
-                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream) {
-    const int64_t n = B * H * W * 2 * M;
-    if (n <= 0) return;
+                     const float* cond, const float* valid, int64_t M, int64_t B, uint16_t* y16, void* stream,
+                     const int32_t* live, int64_t L) {
+    if (B * H * W <= 0) return;
+    if (live != nullptr) {   // one bucket's live slots alone
+        M = L;
+        B = 1;
+    }
     const float sy = (float) h / (float) H, sx = (float) w / (float) W;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t ch = i % (2 * M), px = i / (2 * M), b = px / (H * W), q = px - b * H * W;
-        const int64_t s = ch % M, o = b * M + s;
+    const int hh = (int) H, ww = (int) W, mh = (int) h, mw = (int) w, m2 = (int) (2 * M), mm = (int) M, n = (int) N;
+    // a work-item a pixel's channel, the channels innermost so neighbouring items write neighbouring halves; a 3D
+    // range and 32-bit indices (the B70 1.7 ms a 1152 x 1152 x 32 in the 1D form with 64-bit ones, 1.1 ms with a
+    // pixel's channels an item, 2026-11-07)
+    const auto e = queue_for(stream).parallel_for(sycl::range<3>((size_t) (B * H), (size_t) W, (size_t) (2 * M)),
+                                                  [=](sycl::id<3> id) {
+        const int row = (int) id[0], ox = (int) id[1], ch = (int) id[2], b = row / hh, oy = row - b * hh;
+        const int s = ch < mm ? ch : ch - mm, o = live != nullptr ? live[s] : b * mm + s;
         float v = 0.f;
-        if (o < N && (valid == nullptr || valid[o] > 0.f)) {
-            if (ch >= M) {
+        if (live != nullptr || (o < n && (valid == nullptr || valid[o] > 0.f))) {
+            if (ch >= mm) {
                 v = cond[o];
             } else {
-                const int64_t oy = q / W, ox = q - oy * W;
                 // torch's bilinear, align_corners false: the source position clamped at 0
                 const float fy = sycl::fmax(((float) oy + 0.5f) * sy - 0.5f, 0.f);
                 const float fx = sycl::fmax(((float) ox + 0.5f) * sx - 0.5f, 0.f);
-                const int64_t y0 = sycl::min((int64_t) fy, h - 1), x0 = sycl::min((int64_t) fx, w - 1);
-                const int64_t y1 = sycl::min(y0 + 1, h - 1), x1 = sycl::min(x0 + 1, w - 1);
+                const int y0 = sycl::min((int) fy, mh - 1), x0 = sycl::min((int) fx, mw - 1);
+                const int y1 = sycl::min(y0 + 1, mh - 1), x1 = sycl::min(x0 + 1, mw - 1);
                 const float wy = fy - (float) y0, wx = fx - (float) x0;
-                const float* m = masks + o * h * w;
-                const auto at = [&](int64_t yy, int64_t xx) {
-                    const float l = m[yy * w + xx];
+                const float* m = masks + (size_t) o * mh * mw;
+                const auto at = [&](int yy, int xx) {
+                    const float l = m[yy * mw + xx];
                     return sigmoid_first ? 1.f / (1.f + sycl::exp(-l)) : l;
                 };
                 float t = (1.f - wy) * ((1.f - wx) * at(y0, x0) + wx * at(y0, x1)) +
@@ -1162,7 +1341,7 @@ void aux_mux_masks16(const float* masks, int64_t N, int64_t h, int64_t w, int64_
                 v = 2.f * t - 1.f;
             }
         }
-        y16[i] = f16_from_f32(v);
+        y16[((size_t) row * ww + ox) * m2 + ch] = f16_from_f32(v);
     });
     finish(stream, e, "aux_mux_masks16");
 }

@@ -157,6 +157,8 @@ private:
     void attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, int64_t lq, int64_t lk, int64_t heads,
                    int64_t hd, int64_t q_row, int64_t k_row, int64_t v_row, uint16_t* out, int64_t batch = 1,
                    const float* bias = nullptr, bool causal = false);
+    void grid_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t lq, const float* grid,
+                        uint16_t* out);
 
     struct VitLayer {
         Norm n1, n2;
@@ -230,7 +232,10 @@ private:
     void mask_dense(const float* low, float* out);
     float* track_scratch(int slot, size_t bytes);
     void encode_bucket(const float* pix, const uint16_t* mux16, const std::vector<float>& slot_is_obj, float* mem,
-                       uint16_t* mem16, int64_t ld, int64_t col);
+                       uint16_t* mem16, int64_t ld, int64_t col, const Conv* first = nullptr);
+    /// The memory encoder's first convolution over the live slots' channels alone (their masks, then their conds):
+    /// its weights' columns for them, made once a set of slots.
+    const Conv& mds_first(const std::vector<int32_t>& live);
     int64_t P_() const { return grid_ * grid_; }
 
     std::vector<Fpn> prop_, inter_;
@@ -238,6 +243,8 @@ private:
     std::vector<MemLayer> mem_;
     Norm mem_norm_;
     std::vector<Conv> mds_;
+    std::vector<float> mds0_w_;                          // the first convolution's weights [o][2M][k][k] (host)
+    std::map<std::vector<int32_t>, Conv> mds0_live_;     // mds_first's
     std::vector<Norm> mds_ln_;
     Lin mds_out_, pix_proj_;
     std::vector<CxBlock> fuser_;

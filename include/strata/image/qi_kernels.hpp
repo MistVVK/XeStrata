@@ -199,6 +199,9 @@ int64_t qi_group_norm_ws_floats(int64_t P);
 void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
                      uint16_t* y16, float* ws, void* stream, const float* scale = nullptr, const float* shift = nullptr,
                      uint16_t* lo16 = nullptr);
+/// The same of 16-bit x16 (FP16 bits, BF16's with `bf16`), its statistics in FP32 as the FP32 form's.
+void qi_group_norm16(const uint16_t* x16, bool bf16, int64_t P, int64_t C, const float* w, const float* b, float eps,
+                     bool silu, uint16_t* y16, float* ws, void* stream);
 
 /// p16[r][:ld] = FP16(softmax(scale sc[r][:n])) and zero past n, rows ld apart (0: n), FP32 statistics: a sub-group
 /// of 32 a row up to 1,024 columns (8 rows a work-group), a work-group of 256 a row past them.  The image engine's one

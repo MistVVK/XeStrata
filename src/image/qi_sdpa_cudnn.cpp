@@ -180,6 +180,40 @@ std::shared_ptr<fe::graph::Graph> conv_graph(cudnnHandle_t handle, int64_t H, in
     return g;
 }
 
+// x [D][H][W][C] (FP16) by w [O][kt][k][k][C] (FP16), stride 1, padding k / 2 in
+// space and none in time, plus the bias and the residual where given, into y [D - kt + 1][H][W][O] (FP32, or FP16 by
+// y16)
+std::shared_ptr<fe::graph::Graph> conv3_graph(cudnnHandle_t handle, int64_t D, int64_t H, int64_t W, int64_t C,
+                                              int64_t O, int64_t kt, int64_t k, bool bias, bool add, bool y16) {
+    auto g = std::make_shared<fe::graph::Graph>();
+    g->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    auto X = g->tensor(fe::graph::Tensor_attributes().set_name("X").set_uid(kX).set_dim({1, C, D, H, W}).set_stride(
+        {D * H * W * C, 1, H * W * C, W * C, C}));
+    auto Wt = g->tensor(fe::graph::Tensor_attributes().set_name("W").set_uid(kW).set_dim({O, C, kt, k, k}).set_stride(
+        {kt * k * k * C, 1, k * k * C, k * C, C}));
+    const int64_t p = k / 2, Do = D - kt + 1;
+    auto Y = g->conv_fprop(X, Wt, fe::graph::Conv_fprop_attributes().set_padding({0, p, p}).set_stride({1, 1, 1})
+                                      .set_dilation({1, 1, 1}));
+    const std::vector<int64_t> yd{1, O, Do, H, W}, ys{Do * H * W * O, 1, H * W * O, W * O, O};
+    if (bias) {
+        auto B = g->tensor(fe::graph::Tensor_attributes().set_name("B").set_uid(kB).set_dim({1, O, 1, 1, 1})
+                               .set_stride({O, 1, O, O, O}).set_data_type(fe::DataType_t::FLOAT));
+        Y = g->pointwise(Y, B, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    }
+    if (add) {
+        auto R = g->tensor(fe::graph::Tensor_attributes().set_name("R").set_uid(kR).set_dim(yd).set_stride(ys)
+                               .set_data_type(y16 ? fe::DataType_t::HALF : fe::DataType_t::FLOAT));
+        Y = g->pointwise(Y, R, fe::graph::Pointwise_attributes().set_mode(fe::PointwiseMode_t::ADD));
+    }
+    Y->set_output(true).set_dim(yd).set_stride(ys).set_uid(kY).set_data_type(y16 ? fe::DataType_t::HALF
+                                                                                  : fe::DataType_t::FLOAT);
+    if (!g->build(handle, {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}).is_good())
+        throw std::runtime_error("cuDNN builds no convolution plan");
+    return g;
+}
+
 // cuDNN's library opened and a handle made: STRATA_CUDNN_LIB, else the system's (libcudnn.so.9; on Windows
 // cudnn64_9.dll on the PATH, then NVIDIA's installer's folders, newest first, then the one pip put in the Python the 7z
 // carries, nvidia-cudnn-cu12), the first that makes a handle
@@ -313,16 +347,17 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
     return cudnn(q, x, H, W, C, w, O, k, bias, add, y, Form{});
 }
 
-bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
-           const float* bias, bool add, void* y, const Form& f) {
+namespace {
+
+// a convolution's graph for `key` (made by `make` the first time, null where cuDNN takes none) run on q's stream: false
+// where cuDNN is not taken (`what` says the shape in the message)
+bool run_conv(sycl::queue& q, const std::vector<int64_t>& key,
+              const std::function<std::shared_ptr<cudnn_frontend::graph::Graph>(cudnnHandle_t)>& make,
+              const uint16_t* x, const uint16_t* w, const float* bias, bool add, void* y, const std::string& what) {
     namespace fe = cudnn_frontend;
-    if ((add && f.leaky >= 0.0f) || f.gelu) return false;
-    const int64_t lx = f.ldx > 0 ? f.ldx : C, ly = f.ldy > 0 ? f.ldy : O;
     std::lock_guard<std::mutex> lock(sdpa::g_mu);
     sdpa::Cudnn& d = sdpa::g_cudnn[q.get_device()];
     if (d.conv_failed) return false;
-    const std::vector<int64_t> key{H, W, C, O, k, bias != nullptr, add, lx, ly, f.y16,
-                                   f.leaky >= 0.0f ? (int64_t) (f.leaky * 1e6f) : -1};
     try {
         if (d.handle == nullptr) sdpa::open_cudnn(d.handle);
     } catch (const std::exception& e) {
@@ -333,9 +368,7 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
     }
     try {
         auto it = d.convs.find(key);
-        if (it == d.convs.end())
-            it = d.convs.emplace(key, sdpa::conv_graph(d.handle, H, W, C, O, k, bias != nullptr, add, lx, ly,
-                                                                   f.y16, f.leaky)).first;
+        if (it == d.convs.end()) it = d.convs.emplace(key, make(d.handle)).first;
         if (!it->second) return false;
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
@@ -357,12 +390,40 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
         });
     } catch (const std::exception& e) {   // this shape on the engine's own path from now on
         std::fprintf(stderr,
-                     "strata-image: cuDNN does not take a convolution of %lld x %lld x %lld to %lld (%s): the "
-                     "engine's own path for it\n",
-                     (long long) H, (long long) W, (long long) C, (long long) O, e.what());
+                     "strata-image: cuDNN does not take a convolution of %s (%s): the engine's own path for it\n",
+                     what.c_str(), e.what());
         d.convs[key] = nullptr;
         return false;
     }
+}
+
+}  // namespace
+
+bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
+           const float* bias, bool add, void* y, const Form& f) {
+    if ((add && f.leaky >= 0.0f) || f.gelu) return false;
+    const int64_t lx = f.ldx > 0 ? f.ldx : C, ly = f.ldy > 0 ? f.ldy : O;
+    const std::vector<int64_t> key{H, W, C, O, k, bias != nullptr, add, lx, ly, f.y16,
+                                   f.leaky >= 0.0f ? (int64_t) (f.leaky * 1e6f) : -1};
+    return run_conv(
+        q, key,
+        [&](cudnnHandle_t h) {
+            return sdpa::conv_graph(h, H, W, C, O, k, bias != nullptr, add, lx, ly, f.y16, f.leaky);
+        },
+        x, w, bias, add, y,
+        std::to_string(H) + " x " + std::to_string(W) + " x " + std::to_string(C) + " to " + std::to_string(O));
+}
+
+bool cudnn3(sycl::queue& q, const uint16_t* x, int64_t D, int64_t H, int64_t W, int64_t C, const uint16_t* w,
+            int64_t O, int kt, int k, const float* bias, bool add, void* y, bool y16) {
+    // (the 2D keys have 11 values: these 12 never meet them)
+    const std::vector<int64_t> key{3, D, H, W, C, O, kt, k, bias != nullptr, add, y16, 0};
+    return run_conv(
+        q, key,
+        [&](cudnnHandle_t h) { return sdpa::conv3_graph(h, D, H, W, C, O, kt, k, bias != nullptr, add, y16); }, x,
+        w, bias, add, y,
+        std::to_string(D) + " x " + std::to_string(H) + " x " + std::to_string(W) + " x " + std::to_string(C) + " to " +
+            std::to_string(O) + " (" + std::to_string(kt) + " time taps)");
 }
 
 }  // namespace strata::image::conv

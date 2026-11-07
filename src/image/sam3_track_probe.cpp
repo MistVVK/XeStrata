@@ -111,43 +111,48 @@ int video_mode(int argc, char** argv) {
         std::filesystem::create_directories(out);
         const strata::video::Info info = strata::video::probe(argv[3]);
         si::Sam3 sam(argv[2]);
-        si::Sam3Video vs(sam, info.width, info.height, info.frames, words, clicks);
-        strata::video::Reader rd(argv[3], info);
-        std::vector<uint8_t> rgb((size_t) rd.frame_bytes());
-        const auto write = [&](const std::vector<si::Sam3Video::Frame>& fs) {
-            for (const auto& f : fs) {
-                char name[64];
-                std::snprintf(name, sizeof name, "/frame_%04lld.bin", (long long) f.index);
-                std::ofstream o(out + name, std::ios::binary);
-                const auto n = (int64_t) f.objects.size();
-                o.write(reinterpret_cast<const char*>(&n), 8);
-                std::printf("%lld:", (long long) f.index);
-                for (const auto& ob : f.objects) {
-                    o.write(reinterpret_cast<const char*>(&ob.id), 8);
-                    o.write(reinterpret_cast<const char*>(&ob.score), 4);
-                    o.write(reinterpret_cast<const char*>(ob.mask.data()), (std::streamsize) ob.mask.size());
-                    std::printf(" %lld", (long long) ob.id);
+        // STRATA_PROBE_REPEAT: the clip run that many times, each one's times printed (the last warm)
+        const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+        const int repeat = rep != nullptr ? std::max(1, std::atoi(rep)) : 1;
+        for (int r = 0; r < repeat; ++r) {
+            si::Sam3Video vs(sam, info.width, info.height, info.frames, words, clicks);
+            strata::video::Reader rd(argv[3], info);
+            std::vector<uint8_t> rgb((size_t) rd.frame_bytes());
+            const auto write = [&](const std::vector<si::Sam3Video::Frame>& fs) {
+                for (const auto& f : fs) {
+                    char name[64];
+                    std::snprintf(name, sizeof name, "/frame_%04lld.bin", (long long) f.index);
+                    std::ofstream o(out + name, std::ios::binary);
+                    const auto n = (int64_t) f.objects.size();
+                    o.write(reinterpret_cast<const char*>(&n), 8);
+                    std::printf("%lld:", (long long) f.index);
+                    for (const auto& ob : f.objects) {
+                        o.write(reinterpret_cast<const char*>(&ob.id), 8);
+                        o.write(reinterpret_cast<const char*>(&ob.score), 4);
+                        o.write(reinterpret_cast<const char*>(ob.mask.data()), (std::streamsize) ob.mask.size());
+                        std::printf(" %lld", (long long) ob.id);
+                    }
+                    std::printf("\n");
                 }
-                std::printf("\n");
+            };
+            int64_t n = 0;
+            while (rd.read(rgb.data(), 1) == 1) {
+                si::QiRef pic;
+                pic.width = info.width;
+                pic.height = info.height;
+                pic.rgba.resize((size_t) (info.width * info.height * 4));
+                for (int64_t p = 0; p < info.width * info.height; ++p) {
+                    for (int c = 0; c < 3; ++c) pic.rgba[(size_t) (p * 4 + c)] = rgb[(size_t) (p * 3 + c)];
+                    pic.rgba[(size_t) (p * 4 + 3)] = 255;
+                }
+                write(vs.push(pic));
+                ++n;
             }
-        };
-        int64_t n = 0;
-        while (rd.read(rgb.data(), 1) == 1) {
-            si::QiRef pic;
-            pic.width = info.width;
-            pic.height = info.height;
-            pic.rgba.resize((size_t) (info.width * info.height * 4));
-            for (int64_t p = 0; p < info.width * info.height; ++p) {
-                for (int c = 0; c < 3; ++c) pic.rgba[(size_t) (p * 4 + c)] = rgb[(size_t) (p * 3 + c)];
-                pic.rgba[(size_t) (p * 4 + 3)] = 255;
-            }
-            write(vs.push(pic));
-            ++n;
+            write(vs.finish());
+            const auto& t = vs.times();
+            std::printf("frames=%lld trunk_s=%.3f detect_s=%.3f track_s=%.3f memory_s=%.3f rules_s=%.3f output_s=%.3f\n",
+                        (long long) n, t.trunk, t.detect, t.track, t.memory, t.rules, t.output);
         }
-        write(vs.finish());
-        const auto& t = vs.times();
-        std::printf("frames=%lld trunk_s=%.3f detect_s=%.3f track_s=%.3f rules_s=%.3f output_s=%.3f\n", (long long) n,
-                    t.trunk, t.detect, t.track, t.rules, t.output);
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "sam3-track-probe: %s\n", e.what());

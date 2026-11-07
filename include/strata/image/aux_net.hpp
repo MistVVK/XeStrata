@@ -6,6 +6,7 @@
 // qi_conv's oneDNN and cuDNN, else unfolded patches and prefill::Gemm).
 #pragma once
 
+#include "strata/core/gpu.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/image/aux_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -112,6 +113,10 @@ protected:
     /// the unfolded patches where no library takes it.
     void convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, float* y, int col_slot, bool add = false);
     void host(const char* name, const float* dev, size_t n);
+    /// `bytes` of host memory to dst on the stream, not waited for: through a host buffer of stage `stage`'s own, kept
+    /// (its last copy waited for before it is written again: free where that copy has run).  A blocking gpu::copy
+    /// waits for the stream's work before it; a frame's few small uploads so held a tracker's GPU idle.
+    void upload_async(void* dst, const void* src, size_t bytes, int stage);
 
     std::string path_, what_;
     std::unique_ptr<SafeTensors> st_;
@@ -130,6 +135,11 @@ private:
     // library's 1 x 1 convolution
     std::map<std::tuple<int64_t, int64_t, int64_t, int>, int> pick16_;
     static constexpr int kNarrowSlot = 255;                             // product16's FP32 rows when not half
+    struct Stage {   // upload_async's
+        std::vector<uint8_t> buf;
+        gpu::Event* done = nullptr;
+    };
+    std::map<int, Stage> stages_;
 };
 
 }  // namespace strata::image

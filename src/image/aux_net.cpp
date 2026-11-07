@@ -16,6 +16,7 @@
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <stdexcept>
 
@@ -55,6 +56,19 @@ void AuxNet::drop_scratch() {
     steps_.clear();
     for (auto& w : work_) gpu::free(w.first);
     work_.clear();
+    for (auto& st : stages_)
+        if (st.second.done != nullptr) gpu::event_destroy(st.second.done);
+    stages_.clear();
+}
+
+void AuxNet::upload_async(void* dst, const void* src, size_t bytes, int stage) {
+    Stage& st = stages_[stage];
+    if (st.done != nullptr) gpu::event_sync(st.done);
+    else if (!gpu::event_create(&st.done)) throw std::runtime_error("image engine (" + what_ + "): an event");
+    st.buf.resize(bytes);
+    std::memcpy(st.buf.data(), src, bytes);
+    gpu::copy_async(dst, st.buf.data(), bytes, s_);
+    gpu::event_record(st.done, s_);
 }
 
 void AuxNet::release() {

@@ -54,8 +54,11 @@ enum Slot {
     kL0 = 100, kL1, kL2, kHr016, kHr116, kStream, kNormed16, kImg16, kQa, kQb, kQ16, kK16, kV16, kA16, kY, kKey, kHid16,
     kQkv16, kTok, kTokPe, kKeys, kKeyPe, kUp, kUp16, kUp2, kHyper, kHyper16, kMasks, kSmall, kSmall16, kMux16,
     kConvA, kConvB, kConv16, kFeat, kFeat16, kDw, kPix16, kImds, kPrompt, kPrompt16, kInterL2, kCol,
-    kInterL0, kInterL1, kIHr0, kIHr1,
+    kInterL0, kInterL1, kIHr0, kIHr1, kLive,
 };
+
+// upload_async's stages: the memory encoder's cond and valid values, its live slots, its no-object sum
+enum Stage { kStageCond = 1, kStageValid, kStageLive, kStageAdd };
 
 // the random Fourier positions of a w x h grid ((x + 0.5) / w, (y + 0.5) / h, as SAM's PositionEmbeddingRandom): sin
 // and cos of 2 pi (2 c - 1) . G for G [2][F] -> [h w][2F]
@@ -208,6 +211,7 @@ void Sam3::track_load() {
     // the memory encoder
     mds_.clear();
     mds_ln_.clear();
+    mds0_live_.clear();
     for (int i = 0;; i += 3) {
         const std::string b = t + "maskmem_backbone.mask_downsampler.encoder.";
         if (st_->find(b + std::to_string(i + 1) + ".weight") == nullptr) {
@@ -217,6 +221,7 @@ void Sam3::track_load() {
         }
         mds_.push_back(conv(b + std::to_string(i), 2, 1));
         mds_ln_.push_back(norm(b + std::to_string(i + 1)));
+        if (i == 0) mds0_w_ = host_f32(b + "0.weight");
     }
     {
         const Conv c = conv(t + "maskmem_backbone.pix_feat_proj", 1, 0);
@@ -522,16 +527,33 @@ void Sam3::mem_encode(const float* pix, const float* masks, int64_t N, int64_t h
     if ((int64_t) cond.size() != N || (int64_t) is_obj.size() != N || (valid != nullptr && (int64_t) valid->size() != N))
         throw std::invalid_argument("SAM 3 tracker: cond");
     float* dcond = scratch(kSmall, (size_t) std::max<int64_t>(2 * N, 1) * 4);
-    gpu::copy(dcond, cond.data(), (size_t) N * 4);
-    if (valid != nullptr) gpu::copy(dcond + N, valid->data(), (size_t) N * 4);
+    upload_async(dcond, cond.data(), (size_t) N * 4, kStageCond);
+    if (valid != nullptr) upload_async(dcond + N, valid->data(), (size_t) N * 4, kStageValid);
     auto* mux16 = scratch_as<uint16_t>(kMux16, (size_t) (S * S * 2 * M));
     for (int64_t b = 0; b < B; ++b) {
-        aux_mux_masks16(masks + b * M * h * w, std::min<int64_t>(M, N - b * M), h, w, S, S, sigmoid_first,
-                        dcond + b * M, valid != nullptr ? dcond + N + b * M : nullptr, M, 1, mux16, s_);
         std::vector<float> slot((size_t) M, 0.f);
-        for (int64_t s = 0; s < M && b * M + s < N; ++s) slot[(size_t) s] = is_obj[(size_t) (b * M + s)];
+        std::vector<int32_t> live;
+        for (int64_t s = 0; s < M && b * M + s < N; ++s) {
+            slot[(size_t) s] = is_obj[(size_t) (b * M + s)];
+            if (valid == nullptr || (*valid)[(size_t) (b * M + s)] > 0.f) live.push_back((int32_t) s);
+        }
+        // a bucket of few objects: the input of its live slots alone, the empty ones' zero channels left out of the
+        // first convolution (the same sums; the B70's input 1152 x 1152 x 32 0.9 ms an encode, 2026-11-07)
+        const Conv* first = nullptr;
+        if (!live.empty() && (int64_t) live.size() < M) {
+            first = &mds_first(live);
+            auto* dl = reinterpret_cast<int32_t*>(scratch(kLive, live.size() * 4));
+            std::vector<int32_t> abs(live);
+            for (int32_t& v : abs) v += (int32_t) (b * M);
+            upload_async(dl, abs.data(), abs.size() * 4, kStageLive);
+            aux_mux_masks16(masks, N, h, w, S, S, sigmoid_first, dcond, nullptr, M, 1, mux16, s_, dl,
+                            (int64_t) live.size());
+        } else {
+            aux_mux_masks16(masks + b * M * h * w, std::min<int64_t>(M, N - b * M), h, w, S, S, sigmoid_first,
+                            dcond + b * M, valid != nullptr ? dcond + N + b * M : nullptr, M, 1, mux16, s_);
+        }
         encode_bucket(pix, mux16, slot, mem != nullptr ? mem + b * P_() * d_ : nullptr,
-                      mem16 != nullptr ? mem16 + b * P_() * ld : nullptr, ld, col);
+                      mem16 != nullptr ? mem16 + b * P_() * ld : nullptr, ld, col, first);
     }
 }
 
@@ -540,8 +562,25 @@ void Sam3::mem_encode_muxed(const float* pix, const uint16_t* mux16, const std::
     encode_bucket(pix, mux16, slot_is_obj, mem, nullptr, 0, 0);
 }
 
+const AuxNet::Conv& Sam3::mds_first(const std::vector<int32_t>& live) {
+    const auto it = mds0_live_.find(live);
+    if (it != mds0_live_.end()) return it->second;
+    const Conv& c = mds_[0];
+    const int64_t M = kMux, L = (int64_t) live.size(), kk = (int64_t) c.k * c.k;
+    std::vector<float> w((size_t) (c.o * 2 * L * kk));
+    for (int64_t o = 0; o < c.o; ++o)
+        for (int64_t j = 0; j < 2 * L; ++j) {
+            const int64_t src = j < L ? live[(size_t) j] : M + live[(size_t) (j - L)];
+            std::copy_n(mds0_w_.begin() + (o * 2 * M + src) * kk, kk, w.begin() + (o * 2 * L + j) * kk);
+        }
+    std::vector<float> b((size_t) c.o);
+    gpu::copy(b.data(), c.b, b.size() * 4);
+    if (mds0_live_.size() >= 64) mds0_live_.clear();   // the sets a clip's buckets went through: few
+    return mds0_live_[live] = conv_host(w, b, c.o, 2 * L, c.k, c.stride, c.pad);
+}
+
 void Sam3::encode_bucket(const float* pix, const uint16_t* mux16, const std::vector<float>& slot_is_obj, float* mem,
-                         uint16_t* mem16, int64_t ld, int64_t col) {
+                         uint16_t* mem16, int64_t ld, int64_t col, const Conv* first) {
     const int64_t d = d_, G = grid_, P = G * G, M = kMux, S = 16 * G;
     auto* pix16 = scratch_as<uint16_t>(kPix16, (size_t) (P * d));
     kernels::f32_to_f16_bulk(pix, pix16, P * d, s_);
@@ -550,13 +589,12 @@ void Sam3::encode_bucket(const float* pix, const uint16_t* mux16, const std::vec
     const uint16_t* in16 = mux16;
     int64_t side = S;
     for (size_t i = 0; i < mds_.size(); ++i) {
-        const Conv& c = mds_[i];
+        const Conv& c = i == 0 && first != nullptr ? *first : mds_[i];
         const int64_t out = (side + 2 * c.pad - c.k) / c.stride + 1;
         float* y = scratch(kConvA, (size_t) (out * out * c.o * 4));
         convolve(c, in16, side, side, y, kCol);
         auto* y16 = scratch_as<uint16_t>(i % 2 == 0 ? kConv16 : kFeat16, (size_t) (out * out * c.o));
-        aux_layer_norm(y, nullptr, mds_ln_[i].w, mds_ln_[i].b, out * out, c.o, kEps2d, nullptr, y16, s_);
-        aux_bias_act16(y16, nullptr, out * out, c.o, AuxAct::gelu, y16, s_);
+        aux_layer_norm_gelu16(y, mds_ln_[i].w, mds_ln_[i].b, out * out, c.o, kEps2d, y16, s_);
         in16 = y16;
         side = out;
     }
@@ -583,7 +621,7 @@ void Sam3::encode_bucket(const float* pix, const uint16_t* mux16, const std::vec
         for (int64_t c = 0; c < d; ++c) add[(size_t) c] += no_obj_spatial_[(size_t) (s * d + c)];
     }
     float* da = scratch(kSmall16, (size_t) d * 4);
-    gpu::copy(da, add.data(), add.size() * 4);
+    upload_async(da, add.data(), add.size() * 4, kStageAdd);
     aux_bias_act(feat, P, d, d, da, false, s_);
     if (mem != nullptr) gpu::copy_async(mem, feat, (size_t) (P * d) * 4, s_);
     if (mem16 != nullptr) {

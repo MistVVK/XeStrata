@@ -236,6 +236,10 @@ int vae(const std::string& path, const std::string& dir, const std::string& out_
         const auto got = fetch(rgb, img.size());
         compare("image", got.data(), img.data(), img.size());
         psnr(got, img);
+        if (!out_path.empty()) {   // the whole's decode beside the tiled one's
+            std::ofstream o(out_path + ".whole", std::ios::binary);
+            o.write(reinterpret_cast<const char*>(got.data()), (std::streamsize) (got.size() * 4));
+        }
         // in tiles: decode within a quarter of the whole's scratch (rgba 0 .. 1, back to -1 .. 1 for the PSNR)
         const uint64_t limit = v.scratch_bytes(h, w) / 4;
         float* rgba = nullptr;

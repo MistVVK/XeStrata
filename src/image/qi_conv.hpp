@@ -36,5 +36,10 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
 /// The same in `f`'s form.
 bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
            const float* bias, bool add, void* y, const Form& f);
+/// y [D - kt + 1][H][W][O] (FP32, FP16 with y16) = the kt x k x k convolution of x [D][H][W][C] (FP16) by w
+/// [O][kt][k][k][C] (FP16), stride 1, padding k / 2 in space and none in time, plus `bias`; `add`: added to y.  One
+/// pass for the taps, where a 2D convolution a tap writes y as many times.
+bool cudnn3(sycl::queue& q, const uint16_t* x, int64_t D, int64_t H, int64_t W, int64_t C, const uint16_t* w,
+            int64_t O, int kt, int k, const float* bias, bool add, void* y, bool y16 = false);
 
 }  // namespace strata::image::conv
