@@ -1422,7 +1422,7 @@ JSON の形式とツールや MCP の組み合わせは、はっきり断りま�
 **Chat settings**（入力欄の横のボタン）に、サンプリングと思考の設定と、下のスイッチがあります。
 下のスイッチは**どれも既定でオフ**で、全部オフなら画面は前と同じに動きます。
 
-- **Render math.** `\( ... \)`・`\[ ... \]`・`$x$`・`$$ ... $$` で書いた式を、KaTeX 0.19.0 で数式として描きます。
+- **Render math.** `\( ... \)`・`\[ ... \]`・`$x$`・`$$ ... $$` で書いた式を、KaTeX 0.19.1 で数式として描きます。
   KaTeX は `third_party/main/katex` にあり（MIT。そこの `PROVENANCE.json` がパッケージとファイルごとのハッシュを示します）、サーバーが `/web/vendor/katex/` で配ります。
   メッセージの文は変えません。コピー・Markdown の書き出し・次の要求は、どれもモデルが書いたとおりの文を使います。
   コード、金額（`$5 and $10`）、書いている途中の式は文のままです。KaTeX が読めない式は元の文のままです。
@@ -2117,7 +2117,7 @@ Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコー�
    - comfyanonymous と ComfyUI の貢献者による [ComfyUI](https://github.com/comfyanonymous/ComfyUI)（GPL-3.0）の `comfy_extras/nodes_cfg.py`・`nodes_apg.py`・`nodes_slg.py`: 画像のサンプリングのガイダンス（`src/image/guidance.cpp`、`serve/images.py` の `GUIDANCE_METHODS`）の式・適用の位置（CFG の前後、予測した画像の上）・既定値と範囲（CFGNorm の後置きの形、CFGZeroStar、APG、SkipLayerGuidanceDiT）。コードは写さずに書いています。
    - Jonseed による [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon)（MIT）と、その元の muerrilla による [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon)（MIT）: Detail Daemon の表の作り方（`make_detail_daemon_schedule`）、sigma での引き方と補間（`get_dd_schedule`）、モデルに渡す sigma だけを変える DetailDaemonSamplerNode のやり方と既定値（`src/image/guidance.cpp` の `detail_daemon_schedule` と `Guidance::model_sigma`）。コードは写さずに書いています。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
-  チャットの数式は [KaTeX](https://katex.org/) 0.19.0（MIT、`third_party/main/katex/LICENSE`）で描きます。
+  チャットの数式は [KaTeX](https://katex.org/) 0.19.1（MIT、`third_party/main/katex/LICENSE`）で描きます。
   チャットの画面の広い窓の使い方・svg と html のプレビュー・数式・Load と Unload・保存した会話・編集と巻き戻しは upstream の PR #3176（@mnott）・#1628（@thoives）・#2972 と #2974（@CC-David-CC）・#3550（@sakuumomo）・#1787（@Scotty-Hudson）・#2615（@uppet）から、巻き戻しの選び方と答えている間の送信は issue #3823 と #4004（@xvcezrqpbxtpzblrt）から来ました。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。

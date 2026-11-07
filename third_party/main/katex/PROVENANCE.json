@@ -1,10 +1,10 @@
 {
   "package": "katex",
-  "version": "0.19.0",
-  "url": "https://registry.npmjs.org/katex/-/katex-0.19.0.tgz",
-  "integrity": "sha512-v6Tznz3zJ7u3niRCoDTsumM2+HA2XXcCu+WAacCeHD2z3p9A9Ks987o5FzfTGBN0e8A0vjEgIDvLbICrXpdw/Q==",
+  "version": "0.19.1",
+  "url": "https://registry.npmjs.org/katex/-/katex-0.19.1.tgz",
+  "integrity": "sha512-jG8uKntjSEcm2EpQOh0XturpPuuC9r3Sq5HLHdsFdWZT27E672SF19QEi+of0/YeOy15lDgRhKvr5614uRrEfA==",
   "license": "MIT",
-  "verified": "the tarball's sha512 was checked against the integrity above when these files were copied from package/dist (2026-10-26)",
+  "verified": "the tarball's sha512 was checked against the integrity above when these files were copied from package/dist (2026-11-07)",
   "changes": "dist/katex.min.css lost the .woff and .ttf fallbacks of its 20 @font-face rules (every browser that runs this page reads woff2); nothing else was edited. katex.min.js and the 20 woff2 fonts are the package's files unchanged.",
   "sha256": {
     "LICENSE": "766ccc1f306c885aa45542a9846bbd0a505b27a0374f146778171c2254ce18e3",
@@ -28,7 +28,7 @@
     "dist/fonts/KaTeX_Size3-Regular.woff2": "73d591271b1604960cb10bb90fee021670af7297017e0e98480b332d11f51995",
     "dist/fonts/KaTeX_Size4-Regular.woff2": "a4af7d414440a1c1790825cfb700cf9cf43b0f2c4b04f0ebc523011ad9853ec0",
     "dist/fonts/KaTeX_Typewriter-Regular.woff2": "71d517d67827787cfabdf186914cc3358eda539e37931941f2b2fd4a21f68c0b",
-    "dist/katex.min.css": "864f909fc1f3da0f140321d0e277ac0a444d8909e072cdbf174bcea93b95c089",
-    "dist/katex.min.js": "103a53763cc033bba8d175bf3f0ba597c3505c9b6747dd3f2c7bc2a6bfcc8ae7"
+    "dist/katex.min.css": "1a18155222e88777a8ad26099cca6bddb1a5173c3f8e6aecb7904002114c14e1",
+    "dist/katex.min.js": "fa140498b8cfc8302cbe5e7cb1bdbc1f952bc38b3fa258ede09e73edbf9a74bc"
   }
 }

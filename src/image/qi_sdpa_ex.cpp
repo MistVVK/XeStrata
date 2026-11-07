@@ -170,10 +170,6 @@ bool qi_sdpa_ex_library(const QiSdpa& a, void* stream) {
     if (a.key_len != nullptr || a.bias != nullptr || a.mask != nullptr) return false;
     // causal rows the libraries take: each row its own position among as many keys (a text tower's)
     if (a.causal && (a.causal_off != 0 || a.lq != a.lk || a.batch != 1 || !qi_sdpa_causal(stream))) return false;
-    // a few keys (a prompt's words) go to the engine's own kernel, which costs little there: oneDNN's fused SDPA gave
-    // NaN now and then over SAM 3's 3 words' keys inside the model on the B70 (2026-11-07; not in a test of the call
-    // alone, nor with 32 keys or more; cuDNN's on the RTX 4070 gave none)
-    if (a.lk < 32) return false;
     if (a.q_row != row || a.k_row != row || a.v_row != row || a.o_row != row) return false;
     if (std::abs(a.scale * std::sqrt((float) a.hd) - 1.f) > 1e-6f) return false;
     // every batch reads the same keys and the rows lie one after another: one attention of batch x lq rows

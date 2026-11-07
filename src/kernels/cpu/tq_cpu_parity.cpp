@@ -57,12 +57,11 @@ bool ggml_has_type(int type) { return GGML_TYPE_COUNT > type; }
 
 size_t row_bytes(int type, int n) {
     if (tq_supported(type)) return (size_t) (n / 128) * tq_block_bytes(type);   // the trellis types
-    return ggml_row_size((ggml_type) type, n);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): ggml's ids
+    return ggml_row_size((ggml_type) type, n);
 }
 
 const char* type_name(int t) {
     static const char* const tq[] = {"tq2_t", "tqk6", "tqk7", "tqp5", "tqp6", "tqp7"};
-    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): ggml's ids
     return t >= 144 && t <= 149 ? tq[t - 144] : ggml_type_name((ggml_type) t);
 }
 

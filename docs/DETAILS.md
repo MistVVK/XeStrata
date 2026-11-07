@@ -1466,7 +1466,7 @@ Chats, settings and the API key stay in the browser.
 **Chat settings** (the button next to the message box) holds the sampling and thinking settings and the switches below.
 Every switch below is **off by default**; with all of them off the page behaves as it did before.
 
-- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0.
+- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.1.
   KaTeX is in `third_party/main/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file), and the server hands it out at `/web/vendor/katex/`.
   The text of a message is never changed: copying, the Markdown export and the next request all carry what the model wrote.
   Code, prices (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source.
@@ -2215,7 +2215,7 @@ The model files are not part of it; their licenses apply to them (below).
      (`src/image/guidance.cpp`'s `detail_daemon_schedule` and `Guidance::model_sigma`). Written without copying its
      code.
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
-  without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
+  without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.1 (MIT, see
   `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
   The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved chats, edit and rewind came from upstream's PRs #3176 (@mnott), #1628 (@thoives), #2972 and #2974 (@CC-David-CC), #3550 (@sakuumomo), #1787 (@Scotty-Hudson) and #2615 (@uppet), and the rewind choice and sending while answering from issues #3823 and #4004 (@xvcezrqpbxtpzblrt).
 - **`third_party/nonfree/`**: Qwen Community License 1.0, not free; XeStrata runs without it.

@@ -8,4 +8,7 @@
 # check (opt-in) too: it would have the options, the engine's state and the kernels' argument blocks ordered by size
 # rather than by meaning, for bytes that do not matter there.  The unchecked optional access: its flow analysis took
 # 491 of the 590 s clang-tidy spent on src/program/generate.cpp (2026-10-24), for a type the code uses in a few places.
-Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier,-clang-analyzer-optin.performance.Padding,-bugprone-unchecked-optional-access'
+# The opt-in enum cast range check: SYCL's own barrier (its memory semantics, flags ORed into one enum value in
+# sycl/detail/spirv.hpp) trips it from whichever kernel the analyzer happens to walk into, where no suppression in
+# XeStrata's code reaches; and its other findings were ggml's type ids past its enum, cast on purpose (2026-11-07).
+Checks: '-*,bugprone-*,performance-*,clang-analyzer-*,-bugprone-easily-swappable-parameters,-performance-enum-size,-performance-no-int-to-ptr,-bugprone-reserved-identifier,-clang-analyzer-optin.performance.Padding,-bugprone-unchecked-optional-access,-clang-analyzer-optin.core.EnumCastOutOfRange'

@@ -59,7 +59,7 @@ Every copyright holder whose work is in this repository, its license and where t
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright (c) 2013-2020 Khan Academy and other contributors
-  MIT - third_party/main/katex/ (KaTeX 0.19.0, its script, style sheet and fonts as upstream Strata vendors them),
+  MIT - third_party/main/katex/ (KaTeX 0.19.1, its script, style sheet and fonts as upstream Strata vendors them),
   which the web app's chat draws math with - third_party/main/katex/LICENSE, LICENSES/MIT.txt
 - Copyright The containers/common authors (https://github.com/containers/container-libs); changes Copyright 2026
   MistVVK and the XeStrata contributors

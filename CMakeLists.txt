@@ -869,13 +869,15 @@ if(STRATA_ENABLE_XE)
       set(_strata_onednn_url URL ${STRATA_ONEDNN_SOURCE})
     else()
       set(_strata_onednn_url
-        URL https://github.com/uxlfoundation/oneDNN/archive/refs/tags/v3.12.tar.gz
-        URL_HASH SHA256=efa94db6e8395daaef8e307a48e9527bbaab58a64b44e5d59a3662b4b155099d)
+        URL https://github.com/uxlfoundation/oneDNN/archive/refs/tags/v3.14.2.tar.gz
+        URL_HASH SHA256=ed509c84b9d73bacabff00e6aaedbde570568e26dedb129030fee9c8c196f168)
     endif()
     set(_strata_onednn_dir ${CMAKE_BINARY_DIR}/onednn)
     set(_strata_onednn_args -DCMAKE_INSTALL_PREFIX=${_strata_onednn_dir} -DCMAKE_INSTALL_LIBDIR=lib
         -DDNNL_CPU_RUNTIME=NONE -DDNNL_GPU_RUNTIME=SYCL -DDNNL_GPU_VENDOR=INTEL -DDNNL_LIBRARY_TYPE=SHARED
-        -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_BUILD_DOC=OFF)
+        -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DDNNL_BUILD_DOC=OFF
+        # a build folder configured with v3.12 keeps OFF here, which v3.14 refuses (NONE or GCOV)
+        -DONEDNN_CODE_COVERAGE=NONE)
     if(WIN32)
       list(APPEND _strata_onednn_args ${_strata_win_ep} -DDNNL_ENABLE_JIT_PROFILING=OFF -DDNNL_ENABLE_ITT_TASKS=OFF)
       set(_strata_dnnl_lib ${_strata_onednn_dir}/lib/dnnl.lib)
@@ -984,8 +986,8 @@ if(STRATA_ENABLE_XE)
           include(ExternalProject)
           set(_strata_xz_dir ${CMAKE_BINARY_DIR}/_deps/aotriton/xz)
           ExternalProject_Add(strata_xz
-            URL https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.gz
-            URL_HASH SHA256=507825b599356c10dca1cd720c9d0d0c9d5400b9de300af00e4d1ea150795543
+            URL https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.gz
+            URL_HASH SHA256=0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9
             DOWNLOAD_EXTRACT_TIMESTAMP FALSE PREFIX ${CMAKE_BINARY_DIR}/_deps/aotriton/xz-build
             CMAKE_ARGS ${_strata_win_ep} -DCMAKE_INSTALL_PREFIX=${_strata_xz_dir} -DBUILD_SHARED_LIBS=OFF
               -DBUILD_TESTING=OFF -DXZ_TOOL_XZ=OFF -DXZ_TOOL_XZDEC=OFF -DXZ_TOOL_LZMADEC=OFF -DXZ_TOOL_LZMAINFO=OFF
@@ -1067,8 +1069,8 @@ if(STRATA_ENABLE_XE)
     # inside a checkout), in which git apply would skip the paths outside its folder without a word
     find_package(Git REQUIRED)
     FetchContent_Populate(strata_kitchen QUIET
-      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.40.tar.gz
-      URL_HASH SHA256=9f983556cc1a7bb7f5814f86a78d4eb4557e2a7c60554c50c95a2b6fd2ea2683
+      URL https://github.com/Comfy-Org/comfy-kitchen/archive/refs/tags/v0.2.41.tar.gz
+      URL_HASH SHA256=53050948120731ea817581d8f94bcdd79fb69d07ed51447dcf128e8a0a771865
       PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
                     ${CMAKE_SOURCE_DIR}/third_party/main/comfy-kitchen/patches/0001-wmma-bf16-operands.patch
       DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_kitchen-src
@@ -1142,8 +1144,8 @@ if(STRATA_ENABLE_XE)
     if(_strata_cudnn_inc)
       include(FetchContent)
       FetchContent_Populate(strata_cudnn_fe QUIET
-        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.31.0.tar.gz
-        URL_HASH SHA256=130f3e98e3f07defd60bf39b250ae7d96c61ca99443782ce77fd470964fbd899
+        URL https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.32.2.tar.gz
+        URL_HASH SHA256=5c8dc0e757fb55efb8145837c1c02b61c0b60c6cd5cfb38c5ca5565d3f30e700
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
       target_sources(strata_image PRIVATE src/image/qi_sdpa_cudnn.cpp)

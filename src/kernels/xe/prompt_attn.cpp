@@ -359,9 +359,12 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         auto* qv = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
         auto* out = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
         queue.wait_and_throw();
-        // a warm run of a few queries (the kernel's compile), then the timed chunk; -1: not taken
+        // a warm run of the timed shape itself, then the timed chunk; -1: not taken.  The warm run is the whole chunk:
+        // a library compiles a kernel per shape (oneDNN's SDPA), and a cold kernel cache (a first start, a new
+        // driver) put that compile into a shorter warm-up's timed chunk: 419.7 ms for oneDNN's 8.2 on the B70
+        // (2026-11-07), the slower kernel kept for the run
         auto timed = [&](auto&& run) -> double {
-            if (!run(std::min<int64_t>(T, 16))) return -1.0;
+            if (!run(T)) return -1.0;
             queue.wait_and_throw();
             const auto t0 = std::chrono::steady_clock::now();
             run(T);
