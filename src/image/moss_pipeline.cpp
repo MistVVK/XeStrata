@@ -41,18 +41,6 @@ uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std:
 // an edit's references in the stream at every step (MossDit::set_refs), rather than kept as keys and values
 bool in_stream(QiRefLayout l) { return l == QiRefLayout::TimestepZero || l == QiRefLayout::Index; }
 
-// The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
-// (their code, their workspaces), other programs', and what the allocations take past their sizes.  The HIP runtime
-// takes a block of 1 to 2 MiB as 2 MiB and a larger one in steps of 2 MiB (the RX 9060 XT, ROCm 7.1 and 10.1,
-// 2026-11-05: 200 blocks of 1 MiB + 4 KiB took 400 MiB), so it grows with the engine's blocks: an edit after a refined
-// edit on ROCm 10.1 held 15176 MiB in 1151 blocks of a 15358 MiB budget with 46 MiB free, 1082 MiB of the 16304 past
-// them against 434 when the budget was set.
-int64_t vram_other() {
-    size_t free = 0, total = 0;
-    if (!gpu::mem_info(&free, &total)) return 0;
-    return (int64_t) total - (int64_t) free - (int64_t) gpu::device_held();
-}
-
 // RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque
 std::vector<float> base_rgb(const QiRef& f, int64_t W, int64_t H) {
     const std::vector<uint8_t> px = resize_nearest(f, W, H);
@@ -205,14 +193,8 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
     auto_budget_ = vram_cap(free);
-    other_base_ = vram_other();
+    note_others();
     return true;
-}
-
-uint64_t MossPipeline::budget() const {
-    const uint64_t b = budget_ > 0 ? budget_ : auto_budget_;
-    const int64_t grown = vram_other() - other_base_;
-    return grown > 0 ? b - std::min(b, (uint64_t) grown) : b;
 }
 
 void MossPipeline::use_loras(const QiRequest& r) {
@@ -348,7 +330,7 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
 
 void MossPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
-    other_base_ = vram_other();
+    note_others();
     if (held() == 0 || !dit_) return;
     (void) plan(0, 1, 0);   // shrink at once what no longer fits
 }

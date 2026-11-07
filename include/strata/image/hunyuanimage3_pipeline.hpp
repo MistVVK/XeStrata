@@ -74,8 +74,6 @@ public:
     bool edits() const { return !vision_path_.empty(); }
 
     void set_budget(uint64_t bytes) override;
-    /// The budget in force: the one set, else the free VRAM's at open.
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     /// Frees the sequence's buffers and the VAE's, and lets every streamed bank's region go (the dense weights
     /// stay: the next request loads banks, not the model).  `all`: the parts themselves - the next request opens
     /// them again, which for this model means re-dequantizing its dense products.
@@ -168,7 +166,7 @@ private:
     std::unique_ptr<HunyuanImage3Dit> dit_size_;
     std::unique_ptr<HunyuanImage3Vae> vae_size_;
     std::unique_ptr<HunyuanImage3EntryExit> around_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0, banks_set_ = 0;
+    uint64_t banks_set_ = 0;
     // the text rows of the last request's sequence: `wte` does not change between a request's steps, so they are
     // gathered once and copied back in, and the same ids coming again do not pay for it twice
     std::vector<int32_t> text_ids_;

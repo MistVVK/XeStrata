@@ -47,6 +47,25 @@ uint64_t free_vram() {
     return free;
 }
 
+// The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
+// (their code, their workspaces), other programs', and what the allocations take past their sizes.  The HIP runtime
+// takes a block of 1 to 2 MiB as 2 MiB and a larger one in steps of 2 MiB (the RX 9060 XT, ROCm 7.1 and 10.1,
+// 2026-11-05: 200 blocks of 1 MiB + 4 KiB took 400 MiB), so it grows with the engine's blocks: an edit after a refined
+// edit on ROCm 10.1 held 15176 MiB in 1151 blocks of a 15358 MiB budget with 46 MiB free, 1082 MiB of the 16304 past
+// them against 434 when the budget was set.
+int64_t vram_other() {
+    size_t free = 0, total = 0;
+    if (!gpu::mem_info(&free, &total)) return 0;
+    return (int64_t) total - (int64_t) free - (int64_t) gpu::device_held();
+}
+
+void ImagePipeline::note_others() { other_base_ = vram_other(); }
+
+uint64_t ImagePipeline::less_others(uint64_t b) const {
+    const int64_t grown = vram_other() - other_base_;
+    return grown > 0 ? b - std::min(b, (uint64_t) grown) : b;
+}
+
 void ImagePipeline::fit(uint64_t reserve) {
     const uint64_t have = held() + free_vram();
     set_budget(have > reserve ? have - reserve : 0);
@@ -88,6 +107,7 @@ bool QiPipeline::open(const std::string& dit, const std::string& vae, const std:
     // the budget a request plans with: what was free before the parts, less a margin, within the small-card limit the
     // engine takes too
     auto_budget_ = vram_cap(free);
+    note_others();
     return true;
 }
 
@@ -165,6 +185,7 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
 
 void QiPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    note_others();
     if (!(dit_ && vae_ && te_)) return;   // released: the next request plans with it
     const QiPlan p = plan(0, 0, 0);   // shrink at once what no longer fits (a grown budget is taken at the next request)
     (void) p;
@@ -211,7 +232,7 @@ void QiPipeline::te_layers() {
 
 QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t n_neg_pre) {
     QiPlan p;
-    p.budget = budget_ > 0 ? budget_ : auto_budget_;
+    p.budget = budget();
     // the prefix's rows stay through the sampling and the decode (an edit's: its references' tokens too)
     const int64_t n_pre = T > 0 ? T - h * w : 0;
     // the adapters' A and B are the fixed weights' (in VRAM whatever the plan does with the blocks; their scratch of a

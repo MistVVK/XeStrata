@@ -138,8 +138,9 @@ public:
     void set_lora_bake(bool on) { lora_bake_ = on; }
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
     virtual void set_budget(uint64_t bytes) = 0;
-    /// The budget in force: the one set, else the free VRAM's at open.
-    virtual uint64_t budget() const = 0;
+    /// The budget in force: the one set, else the free VRAM's at open, less what the device's use past this engine's
+    /// allocations has grown since then (vram_other).
+    uint64_t budget() const { return less_others(budget_ > 0 ? budget_ : auto_budget_); }
     /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
     /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
     virtual void release(bool all = false) = 0;
@@ -179,14 +180,21 @@ protected:
     /// n's held, free and cap: what the engine holds, the device's free VRAM and vram_cap of its memory (the end of
     /// every model's need)
     void vram_into(QiNeed& n) const;
+    /// The device's use past the engine's allocations taken as the budget's base (at open, and as a budget is set).
+    void note_others();
+    uint64_t less_others(uint64_t b) const;
 
     bool lora_bake_ = true;
+    uint64_t budget_ = 0, auto_budget_ = 0;   // the budget set (0: none) and the one from the free VRAM at open
+    int64_t other_base_ = 0;                  // vram_other() as the budget was set
 };
 
 /// The most the engine could have: a device's memory less the driver's margin, within STRATA_VRAM_LIMIT_MIB.
 uint64_t vram_cap(uint64_t total);
 /// The device's free VRAM now (gpu::mem_info).
 uint64_t free_vram();
+/// The device's memory in use past this process's own allocations (gpu::device_held).
+int64_t vram_other();
 
 /// A plan's DiT MLP in bands of rows (4096 .. 512) while its activations take more than a third of `avail` ->
 /// the rows (0: the whole MLP at once), `activations` the bytes with them; `act(rows)` the activations' bytes with

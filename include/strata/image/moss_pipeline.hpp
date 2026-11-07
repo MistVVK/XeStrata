@@ -64,9 +64,6 @@ public:
               const std::string& vision = "");
 
     void set_budget(uint64_t bytes) override;
-    /// The budget set (or the automatic one) less what the device's own use past this engine's allocations has grown
-    /// since it was set (vram_other)
-    uint64_t budget() const override;
     void release(bool all = false) override;
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
@@ -123,8 +120,7 @@ private:
     // first open and first encode (0: not yet; te_measure_ 0 neither, 1 the open, 2 both)
     uint64_t te_layers_ = 0, te_layer_max_ = 0, te_other_ = 0, te_fixed_ = 0;
     int te_measure_ = 0;
-    uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
-    int64_t other_base_ = 0;   // vram_other() as the budget was set
+    uint64_t dit_set_ = 0, te_set_ = 0;
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_, last_neg_ids_;
     std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens

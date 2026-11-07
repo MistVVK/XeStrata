@@ -53,7 +53,6 @@ public:
               int q8 = -1, const std::string& edit_dit = "", const std::string& vision = "", bool keep = true);
 
     void set_budget(uint64_t bytes) override;
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     void release(bool all = false) override;
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
@@ -96,7 +95,7 @@ private:
     std::unique_ptr<QiText> te_size_;
     std::unique_ptr<MfDit> dit_size_, dit16_size_;   // the DiT's sizes as Q8_0 and as FP16
     std::unique_ptr<MfVae> vae_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
+    uint64_t dit_set_ = 0, te_set_ = 0;
     uint64_t te_want_ = 0;   // the encoder's layers the plan left room for, set where it encodes (te_layers)
     void te_layers();
     int64_t mlp_set_ = -1;

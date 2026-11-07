@@ -111,6 +111,7 @@ bool AnimaPipeline::open(const std::string& dit, const std::string& vae, const s
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
     auto_budget_ = vram_cap(free);
+    note_others();
     return true;
 }
 
@@ -229,6 +230,7 @@ QiNeed AnimaPipeline::need(int64_t n_text, int64_t width, int64_t height,
 
 void AnimaPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    note_others();
     if (held() == 0 || !dit_) return;
     (void) plan(0, 1);
 }

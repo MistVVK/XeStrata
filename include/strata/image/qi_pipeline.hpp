@@ -43,8 +43,6 @@ public:
 
     /// The VRAM the engine may take (0: the free VRAM at open, less a margin, within STRATA_VRAM_LIMIT_MIB).
     void set_budget(uint64_t bytes) override;
-    /// The budget in force: the one set, else the free VRAM's at open.
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
     /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
     void release(bool all = false) override;
@@ -98,7 +96,6 @@ private:
     std::unique_ptr<QiText> te_size_;
     std::unique_ptr<QiDit> dit_size_;
     std::unique_ptr<QiVae> vae_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0;
     uint64_t dit_set_ = 0, te_set_ = 0;
     uint64_t te_want_ = 0;   // the encoder's layers the plan gives them: taken when it encodes (te_layers)
     int64_t mlp_set_ = -1;

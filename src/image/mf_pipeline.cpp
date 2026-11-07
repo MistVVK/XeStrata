@@ -167,6 +167,7 @@ bool MfPipeline::open(const std::string& dit, const std::string& vae, const std:
         if (!vision_size_->open(vision_path_, s_, err, true) || !vae_size_->open_encoder(err, true)) return false;
     }
     auto_budget_ = vram_cap(free);
+    note_others();
     return true;
 }
 
@@ -320,6 +321,7 @@ void MfPipeline::te_layers() {
 
 void MfPipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    note_others();
     if (held() == 0 || active() == nullptr) return;
     (void) plan(0, 1, 0, 0);   // shrink at once what no longer fits
 }

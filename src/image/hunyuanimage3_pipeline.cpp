@@ -109,6 +109,7 @@ bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae,
         }
     }
     auto_budget_ = vram_cap(free);
+    note_others();
     return true;
 }
 
@@ -145,6 +146,7 @@ void HunyuanImage3Pipeline::ensure_open() {
 
 void HunyuanImage3Pipeline::set_budget(uint64_t bytes) {
     budget_ = bytes;
+    note_others();
     if (dit_ == nullptr) return;   // released: the next request plans with it
     const QiPlan p = plan(dit_->tokens(), 0, 0);
     (void) p;   // a shrink takes effect at once; a grown budget is taken at the next request
@@ -480,7 +482,7 @@ uint64_t HunyuanImage3Pipeline::refs_encode_bytes(const std::vector<HunyuanImage
 
 QiPlan HunyuanImage3Pipeline::size_plan(int64_t T, int64_t th, int64_t tw, bool refs, uint64_t encode) const {
     QiPlan p;
-    p.budget = budget_ > 0 ? budget_ : auto_budget_;
+    p.budget = budget();
     const HunyuanImage3Vision* vision = vision_ ? vision_.get() : vision_size_.get();
     // the VAE's encoder and the vision model are an edit's: put on the card with its first reference image
     p.fixed = dit_->dense_bytes() + vae_->weight_bytes() + around_->weight_bytes() +

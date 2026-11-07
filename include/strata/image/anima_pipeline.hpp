@@ -40,7 +40,6 @@ public:
     /// The release's blocks in an expanded DiT (AnimaDit::set_lora_block_map), for the adapters made for the release.
     void set_lora_block_map(std::vector<int> map) { block_map_ = std::move(map); }
     void set_budget(uint64_t bytes) override;
-    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
     void release(bool all = false) override;
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
@@ -73,7 +72,7 @@ private:
     std::vector<std::vector<uint8_t>> dit_host_;
     std::vector<int> block_map_;
     std::unique_ptr<QiVae> vae_, vae_size_;
-    uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0;
+    uint64_t dit_set_ = 0;
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_, last_neg_ids_;
     std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens
