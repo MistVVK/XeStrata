@@ -36,8 +36,8 @@ struct CropBox {
 /// Pillow's resampling filters (its LANCZOS, BILINEAR and BICUBIC).
 enum class Filter { lanczos, triangle, bicubic };
 
-/// `src` (RGBA8) at w x h by Pillow's filter, its support widened by the scale when it shrinks, in floats (Pillow
-/// rounds to 8 bits between its two passes: an output within 1 of its).
+/// `src` (RGBA8) at w x h by Pillow's filter, its support widened by the scale when it shrinks, the rows' pass rounded
+/// and clipped to 8 bits before the columns' as Pillow's is (its fixed-point weights aside: an output within 1 of its).
 QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter);
 
 /// `src` (RGBA8) at w x h by Pillow's Lanczos, its support widened by the scale when it shrinks (an upscale's base

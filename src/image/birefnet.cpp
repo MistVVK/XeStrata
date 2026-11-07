@@ -37,7 +37,7 @@ enum Slot {
     kH0, kH1, kH2, kH3,
     kC1, kC2, kC3, kC4,            // the stages of both passes, concatenated
     kCat, kCat16, kSq, kT, kT16, kAspp5, kAspp16, kOm, kGap, kGap16, kP, kP16, kGdt, kGdt16, kAttn, kPatch16,
-    kIpt, kIpt2, kLogit, kLogitUp, kAlpha,
+    kIpt, kIpt2, kLogit, kLogitUp, kAlpha, kFgRgba, kFgX, kFgT, kFgY, kFgRgb,
 };
 
 }  // namespace
@@ -74,6 +74,9 @@ AuxNet::Conv Birefnet::conv_bn(const std::string& conv, const std::string& bn, i
 }
 
 void Birefnet::load_weights() {
+    // again after a release(): the last load's stages and the shifted windows' masks (in its buffers) are gone
+    stages_.clear();
+    masks_.clear();
     patch_ = conv("bb.patch_embed.proj", 4, 0);
     patch_norm_ = norm("bb.patch_embed.norm");
     const int64_t ws = window_, n = ws * ws, side = 2 * ws - 1;
@@ -177,23 +180,25 @@ const float* Birefnet::shift_mask(int64_t Hp, int64_t Wp) {
     return d;
 }
 
-uint64_t Birefnet::need_bytes(int64_t size, int64_t width, int64_t height) const {
-    const int64_t P1 = (size / 4) * (size / 4), C0 = embed_;
+uint64_t Birefnet::need_bytes(int64_t sw, int64_t sh, int64_t width, int64_t height, bool refine) const {
+    const int64_t P1 = (sh / 4) * (sw / 4), C0 = embed_, SS = sw * sh;
     // the first stage's attention and MLP buffers, the concatenated stages, the largest decoder block's branches,
     // the picture's planes and the alpha
     uint64_t want = (uint64_t) P1 * C0 * (4 * 2 + 2 * 4 + 4 * 4 * 2 + 4 * 2);
     want += (uint64_t) P1 * (2 * C0) * 4 * 2 + (uint64_t) P1 * (5 * kAspp) * 6 + (uint64_t) P1 * kDecInter * 4 * 8;
-    want += (uint64_t) size * size * (4 * 3 + 2 * 3 + 64 * 6 + 8) + (uint64_t) width * height * 6 + (64ull << 20);
+    want += (uint64_t) SS * (4 * 3 + 2 * 3 + 64 * 6 + 8) + (uint64_t) width * height * 6 + (64ull << 20);
+    if (refine) want += (uint64_t) width * height * (3 * 7 * 4 + 4 + 3);   // foreground()'s, beside the rest
     const uint64_t have = held() - weight_bytes_;
     return (loaded_ ? 0 : file_bytes_ + file_bytes_ / 8) + (want > have ? want - have : 0);
 }
 
-void Birefnet::backbone(const uint16_t* img16, int64_t S, int slot0, float* feat[4], int64_t side[4]) {
+void Birefnet::backbone(const uint16_t* img16, int64_t SH, int64_t SW, int slot0, float* feat[4], int64_t sh[4],
+                        int64_t sw[4]) {
     const int64_t ws = window_, n = ws * ws;
-    int64_t H = S / 4, W = S / 4, C = embed_;
+    int64_t H = SH / 4, W = SW / 4, C = embed_;
     const int64_t P0 = H * W, mlp = stages_[0].blocks[0].fc1.n / embed_;   // the MLPs' ratio (4)
     // the buffers at the first stage's size, the largest (its windows padded)
-    const int64_t Hp0 = (H + ws - 1) / ws * ws, T0 = Hp0 * Hp0;
+    const int64_t T0 = (H + ws - 1) / ws * ws * ((W + ws - 1) / ws * ws);
     float* x = scratch(kX, (size_t) (P0 * C * 4));
     float* y = scratch(kY, (size_t) (std::max(T0, P0) * C * 4));
     float* big = scratch(kBig, (size_t) (std::max(T0 * 3, P0 * mlp) * C * 4));
@@ -205,7 +210,7 @@ void Birefnet::backbone(const uint16_t* img16, int64_t S, int slot0, float* feat
     auto* v16 = scratch_as<uint16_t>(kV16, (size_t) (T0 * C));
     auto* a16 = scratch_as<uint16_t>(kA16, (size_t) (T0 * C));
     // the patches and their norm
-    convolve(patch_, img16, S, S, x, kCol);
+    convolve(patch_, img16, SH, SW, x, kCol);
     aux_layer_norm(x, nullptr, patch_norm_.w, patch_norm_.b, P0, C, kEps, x, nullptr, s_);
     for (size_t si = 0; si < stages_.size(); ++si) {
         const Stage& st = stages_[si];
@@ -236,14 +241,16 @@ void Birefnet::backbone(const uint16_t* img16, int64_t S, int slot0, float* feat
             qi_axpy(x, y, 1.f, P * C, s_);
         }
         feat[si] = scratch(slot0 + (int) si, (size_t) (P * C * 4));
-        side[si] = H;
+        sh[si] = H;
+        sw[si] = W;
         aux_layer_norm(x, nullptr, st.out_norm.w, st.out_norm.b, P, C, kEps, feat[si], nullptr, s_);
         if (st.merge.w == nullptr) break;
         // patch merging: each 2 x 2 of the grid as one row of 4C, normed, to 2C
-        float* m = scratch(kMerge, (size_t) (P * C * 4));
+        const int64_t Ho = (H + 1) / 2, Wo = (W + 1) / 2;
+        float* m = scratch(kMerge, (size_t) (Ho * Wo * 4 * C * 4));
         aux_merge2(x, H, W, C, m, s_);
-        aux_layer_norm(m, nullptr, st.merge_norm.w, st.merge_norm.b, P / 4, 4 * C, kEps, nullptr, h16, s_);
-        H /= 2, W /= 2, C *= 2;
+        aux_layer_norm(m, nullptr, st.merge_norm.w, st.merge_norm.b, Ho * Wo, 4 * C, kEps, nullptr, h16, s_);
+        H = Ho, W = Wo, C *= 2;
         product(h16, st.merge, x, H * W);
     }
 }
@@ -286,80 +293,84 @@ void Birefnet::dec_block(const DecBlk& b, const uint16_t* x16, int64_t H, int64_
     convolve(b.out, t16, H, W, y, kCol);
 }
 
-void Birefnet::ipt(const Ipt& p, const float* img, int64_t S, int64_t side, float* y, int64_t ldy, int64_t c0) {
-    const int64_t hg = S / side, P = side * side, cin = 3 * hg * hg;
+void Birefnet::ipt(const Ipt& p, const float* img, int64_t SH, int64_t SW, int64_t sh, int64_t sw, float* y,
+                   int64_t ldy, int64_t c0) {
+    const int64_t hg = SH / sh, P = sh * sw, cin = 3 * hg * hg;
     auto* pt16 = scratch_as<uint16_t>(kPatch16, (size_t) (P * cin));
-    aux_image_patches16(img, S, hg, pt16, s_);
+    aux_image_patches16(img, SH, SW, hg, pt16, s_);
     float* t = scratch(kIpt, (size_t) (P * p.c1.o * 4));
     auto* t16 = scratch_as<uint16_t>(kT16, (size_t) (P * std::max(p.c1.o, kDecInter)));
-    convolve(p.c1, pt16, side, side, t, kCol);
+    convolve(p.c1, pt16, sh, sw, t, kCol);
     kernels::f32_to_f16_bulk(t, t16, P * p.c1.o, s_);
     float* u = scratch(kIpt2, (size_t) (P * p.c2.o * 4));
-    convolve(p.c2, t16, side, side, u, kCol);
-    aux_resize_into(u, side, side, p.c2.o, y, side, side, ldy, c0, true, false, s_);
+    convolve(p.c2, t16, sh, sw, u, kCol);
+    aux_resize_into(u, sh, sw, p.c2.o, y, sh, sw, ldy, c0, true, false, s_);
 }
 
-std::vector<uint8_t> Birefnet::run(const QiRef& image, int64_t S, Times* tm) {
+std::vector<uint8_t> Birefnet::run(const QiRef& image, int64_t SW, int64_t SH, Times* tm) {
     Times local;
     Times& tt = tm != nullptr ? *tm : local;
-    if (S % 64 != 0) throw std::invalid_argument("image engine (BiRefNet): the size is not a multiple of 64");
+    if (SW % 32 != 0 || SH % 32 != 0 || SW <= 0 || SH <= 0)
+        throw std::invalid_argument("image engine (BiRefNet): the size is not a multiple of 32");
     load();
     auto t0 = std::chrono::steady_clock::now();
-    // the picture at S x S (Pillow's bilinear), ImageNet's normalization; at S / 2 too (bilinear, corners aligned)
-    const QiRef r = pillow_resize(image, S, S, Filter::triangle);
+    // the picture at SW x SH (Pillow's bilinear), ImageNet's normalization; at half that too (bilinear, corners
+    // aligned)
+    const QiRef r = pillow_resize(image, SW, SH, Filter::triangle);
     auto* rgba = scratch_as<uint8_t>(kRgba, r.rgba.size());
     gpu::copy(rgba, r.rgba.data(), r.rgba.size());
     static const float mean[3] = {0.485f, 0.456f, 0.406f}, stdv[3] = {0.229f, 0.224f, 0.225f};
-    float* img = scratch(kImg, (size_t) (S * S * 3 * 4));
-    aux_rgb_norm(rgba, S, S, mean, stdv, img, s_);
-    auto* img16 = scratch_as<uint16_t>(kImg16, (size_t) (S * S * 3));
-    kernels::f32_to_f16_bulk(img, img16, S * S * 3, s_);
-    const int64_t S2 = S / 2;
-    float* half = scratch(kHalf, (size_t) (S2 * S2 * 3 * 4));
-    aux_resize_into(img, S, S, 3, half, S2, S2, 3, 0, true, false, s_);
-    auto* half16 = scratch_as<uint16_t>(kHalf16, (size_t) (S2 * S2 * 3));
-    kernels::f32_to_f16_bulk(half, half16, S2 * S2 * 3, s_);
+    const int64_t SS = SW * SH;
+    float* img = scratch(kImg, (size_t) (SS * 3 * 4));
+    aux_rgb_norm(rgba, SW, SH, mean, stdv, img, s_);
+    auto* img16 = scratch_as<uint16_t>(kImg16, (size_t) (SS * 3));
+    kernels::f32_to_f16_bulk(img, img16, SS * 3, s_);
+    const int64_t SH2 = SH / 2, SW2 = SW / 2;
+    float* half = scratch(kHalf, (size_t) (SH2 * SW2 * 3 * 4));
+    aux_resize_into(img, SH, SW, 3, half, SH2, SW2, 3, 0, true, false, s_);
+    auto* half16 = scratch_as<uint16_t>(kHalf16, (size_t) (SH2 * SW2 * 3));
+    kernels::f32_to_f16_bulk(half, half16, SH2 * SW2 * 3, s_);
     // both passes, each stage of the half's resized onto the full's and the two concatenated
     float* full[4];
     float* hf[4];
-    int64_t side[4], hside[4], dim[4];
-    backbone(img16, S, kF0, full, side);
-    backbone(half16, S2, kH0, hf, hside);
+    int64_t sh[4], sw[4], hsh[4], hsw[4], dim[4];
+    backbone(img16, SH, SW, kF0, full, sh, sw);
+    backbone(half16, SH2, SW2, kH0, hf, hsh, hsw);
     float* x[4];
     for (int i = 0; i < 4; ++i) {
         dim[i] = stages_[(size_t) i].dim;
-        const int64_t P = side[i] * side[i];
+        const int64_t P = sh[i] * sw[i];
         x[i] = scratch(kC1 + i, (size_t) (P * 2 * dim[i] * 4));
-        aux_resize_into(full[i], side[i], side[i], dim[i], x[i], side[i], side[i], 2 * dim[i], 0, true, false, s_);
-        aux_resize_into(hf[i], hside[i], hside[i], dim[i], x[i], side[i], side[i], 2 * dim[i], dim[i], true, false, s_);
+        aux_resize_into(full[i], sh[i], sw[i], dim[i], x[i], sh[i], sw[i], 2 * dim[i], 0, true, false, s_);
+        aux_resize_into(hf[i], hsh[i], hsw[i], dim[i], x[i], sh[i], sw[i], 2 * dim[i], dim[i], true, false, s_);
         host(("x" + std::to_string(i + 1)).c_str(), x[i], (size_t) (P * 2 * dim[i]));
     }
     gpu::stream_sync(s_);
     tt.backbone = since(t0);
     t0 = std::chrono::steady_clock::now();
     // the coarsest level with the three others resized onto it, squeezed
-    const int64_t s4 = side[3], P4 = s4 * s4;
+    const int64_t h4 = sh[3], w4 = sw[3], P4 = h4 * w4;
     int64_t ctot = 0;
     for (int i = 0; i < 4; ++i) ctot += 2 * dim[i];
     float* cat = scratch(kCat, (size_t) (P4 * ctot * 4));
     for (int i = 0, c0 = 0; i < 4; c0 += 2 * (int) dim[i], ++i)
-        aux_resize_into(x[i], side[i], side[i], 2 * dim[i], cat, s4, s4, ctot, c0, true, false, s_);
+        aux_resize_into(x[i], sh[i], sw[i], 2 * dim[i], cat, h4, w4, ctot, c0, true, false, s_);
     auto* cat16 = scratch_as<uint16_t>(kCat16, (size_t) (P4 * ctot));
     kernels::f32_to_f16_bulk(cat, cat16, P4 * ctot, s_);
     float* x4 = scratch(kSq, (size_t) (P4 * squeeze_.out.o * 4));
-    dec_block(squeeze_, cat16, s4, s4, x4);
+    dec_block(squeeze_, cat16, h4, w4, x4);
     host("squeeze", x4, (size_t) (P4 * squeeze_.out.o));
     // the decoder, coarse to fine: level 4 (x4 and the picture's pixels), then 3, 2, 1, each from the coarser one's
     // output gated by its gradient branch, plus its stage's lateral convolution and the pixels
     float* p = nullptr;
-    int64_t ps = 0, pc = 0;
+    int64_t ph = 0, pw = 0, pc = 0;
     for (int lv = 3; lv >= 0; --lv) {
-        const int64_t sd = side[lv], P = sd * sd;
+        const int64_t hd = sh[lv], wd = sw[lv], P = hd * wd;
         const DecBlk& b = dec_[lv];
         const int64_t cin = b.in.c, ci = ipt_[lv + 1].c2.o, cmain = cin - ci;
         float* in = scratch(kCat, (size_t) (P * cin * 4));
         if (lv == 3) {
-            aux_resize_into(x4, sd, sd, cmain, in, sd, sd, cin, 0, true, false, s_);
+            aux_resize_into(x4, hd, wd, cmain, in, hd, wd, cin, 0, true, false, s_);
         } else {
             // the lateral 1 x 1 convolution of the stage, then the coarser output resized onto it and added
             const Conv& l = lateral_[lv];
@@ -367,13 +378,13 @@ std::vector<uint8_t> Birefnet::run(const QiRef& image, int64_t S, Times* tm) {
             kernels::f32_to_f16_bulk(x[lv], xs16, P * 2 * dim[lv], s_);
             gemm_.f16(xs16, l.w, in, P, l.o, l.c, cin);
             aux_bias_act(in, P, l.o, cin, l.b, false, s_);
-            aux_resize_into(p, ps, ps, pc, in, sd, sd, cin, 0, true, true, s_);
+            aux_resize_into(p, ph, pw, pc, in, hd, wd, cin, 0, true, true, s_);
         }
-        ipt(ipt_[lv + 1], img, S, sd, in, cin, cmain);
+        ipt(ipt_[lv + 1], img, SH, SW, hd, wd, in, cin, cmain);
         auto* in16 = scratch_as<uint16_t>(kCat16, (size_t) (P * cin));
         kernels::f32_to_f16_bulk(in, in16, P * cin, s_);
         float* out = scratch(lv % 2 == 0 ? kP : kGdt, (size_t) (P * b.out.o * 4));
-        dec_block(b, in16, sd, sd, out);
+        dec_block(b, in16, hd, wd, out);
         if (lv > 0) {
             // the gradient branch: a 3 x 3 convolution to 16 (its norm folded), ReLU, a 1 x 1 to one logit per pixel,
             // whose sigmoid scales the block's output
@@ -382,45 +393,71 @@ std::vector<uint8_t> Birefnet::run(const QiRef& image, int64_t S, Times* tm) {
             const Conv& g = gdt_[lv - 1];
             float* gt = scratch(kAttn, (size_t) (P * (g.o + 1) * 4));
             auto* gt16 = scratch_as<uint16_t>(kGdt16, (size_t) (P * g.o));
-            convolve(g, o16, sd, sd, gt, kCol);
+            convolve(g, o16, hd, wd, gt, kCol);
             aux_relu(gt, P * g.o, nullptr, gt16, s_);
             float* logit = gt + P * g.o;
-            convolve(gdt_attn_[lv - 1], gt16, sd, sd, logit, kCol);
+            convolve(gdt_attn_[lv - 1], gt16, hd, wd, logit, kCol);
             aux_scale_by_sigmoid(out, P, b.out.o, logit, s_);
         }
         host(("p" + std::to_string(lv + 1)).c_str(), out, (size_t) (P * b.out.o));
-        p = out, ps = sd, pc = b.out.o;
+        p = out, ph = hd, pw = wd, pc = b.out.o;
     }
     // the last 1 x 1 convolution: its weights on the decoder's channels taken at the finest level and resized (both
-    // linear, so in either order), then the picture's own pixels' branch at S x S with the rest of its weights
+    // linear, so in either order), then the picture's own pixels' branch at SW x SH with the rest of its weights
     {
-        const int64_t P1 = ps * ps, ci = ipt_[0].c2.o;
+        const int64_t P1 = ph * pw, ci = ipt_[0].c2.o;
         if (out_.c != pc + ci) throw std::runtime_error("image engine (BiRefNet): the last convolution's width");
         auto* p16 = scratch_as<uint16_t>(kP16, (size_t) (P1 * pc));
         kernels::f32_to_f16_bulk(p, p16, P1 * pc, s_);
-        float* lo = scratch(kLogit, (size_t) (P1 * 4 + S * S * (ci + 1) * 4));
+        float* lo = scratch(kLogit, (size_t) (P1 * 4 + SS * (ci + 1) * 4));
         gemm_.f16(p16, out_.w, lo, P1, 1, pc, 0);   // the first pc of each weight row: row stride out_.c
-        float* up = scratch(kLogitUp, (size_t) (S * S * 4));
-        aux_resize_into(lo, ps, ps, 1, up, S, S, 1, 0, true, false, s_);
+        float* up = scratch(kLogitUp, (size_t) (SS * 4));
+        aux_resize_into(lo, ph, pw, 1, up, SH, SW, 1, 0, true, false, s_);
         float* pix = lo + P1;
-        ipt(ipt_[0], img, S, S, pix, ci, 0);
-        auto* pix16 = scratch_as<uint16_t>(kPatch16, (size_t) (S * S * ci));
-        kernels::f32_to_f16_bulk(pix, pix16, S * S * ci, s_);
-        gemm_.f16(pix16, out_.w + pc, up, S * S, 1, ci, 0, false, true);
-        aux_bias_act(up, S * S, 1, 1, out_.b, false, s_);
-        host("logits", up, (size_t) (S * S));
+        ipt(ipt_[0], img, SH, SW, SH, SW, pix, ci, 0);
+        auto* pix16 = scratch_as<uint16_t>(kPatch16, (size_t) (SS * ci));
+        kernels::f32_to_f16_bulk(pix, pix16, SS * ci, s_);
+        gemm_.f16(pix16, out_.w + pc, up, SS, 1, ci, 0, false, true);
+        aux_bias_act(up, SS, 1, 1, out_.b, false, s_);
+        host("logits", up, (size_t) SS);
     }
     gpu::stream_sync(s_);
     tt.decoder = since(t0);
     t0 = std::chrono::steady_clock::now();
     const int64_t W = image.width, H = image.height;
     auto* alpha = scratch_as<uint8_t>(kAlpha, (size_t) (W * H));
-    aux_alpha_bicubic(scratch(kLogitUp, (size_t) (S * S * 4)), S, S, W, H, alpha, s_);
+    aux_alpha_bicubic(scratch(kLogitUp, (size_t) (SS * 4)), SH, SW, W, H, alpha, s_);
     std::vector<uint8_t> outv((size_t) (W * H));
     gpu::stream_sync(s_);
     gpu::copy(outv.data(), alpha, outv.size());
     tt.mask = since(t0);
     return outv;
+}
+
+std::vector<uint8_t> Birefnet::foreground(const QiRef& image, const std::vector<uint8_t>& alpha) {
+    const int64_t n = image.width * image.height;
+    if (n <= 0 || alpha.size() != (size_t) n) throw std::invalid_argument("image engine (BiRefNet): the alpha's size");
+    load();
+    auto* rgba = scratch_as<uint8_t>(kFgRgba, (size_t) n * 4);
+    gpu::copy(rgba, image.rgba.data(), (size_t) n * 4);
+    auto* a = scratch_as<uint8_t>(kAlpha, (size_t) n);
+    gpu::copy(a, alpha.data(), (size_t) n);
+    float* x = scratch(kFgX, (size_t) n * 7 * 4);
+    float* t = scratch(kFgT, (size_t) n * 7 * 4);
+    float* y = scratch(kFgY, (size_t) n * 7 * 4);
+    auto* rgb = scratch_as<uint8_t>(kFgRgb, (size_t) n * 3);
+    // the first round over 90 pixels from the picture's colors, its foreground and background (into t) the second's
+    // start over 6
+    aux_fg_stack(rgba, a, nullptr, n, x, s_);
+    aux_box_mean(x, image.height, image.width, 7, 90, t, y, s_);
+    aux_fg_combine(rgba, a, y, n, t, nullptr, s_);
+    aux_fg_stack(rgba, a, t, n, y, s_);
+    aux_box_mean(y, image.height, image.width, 7, 6, x, t, s_);
+    aux_fg_combine(rgba, a, t, n, nullptr, rgb, s_);
+    std::vector<uint8_t> out((size_t) n * 3);
+    gpu::stream_sync(s_);
+    gpu::copy(out.data(), rgb, out.size());
+    return out;
 }
 
 }  // namespace strata::image

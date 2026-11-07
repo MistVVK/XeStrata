@@ -37,12 +37,16 @@ public:
         double backbone = 0, decoder = 0, mask = 0;
     };
     /// The alpha of `image`'s foreground at its size (255 the subject, 0 the background), from the logits at
-    /// `size` x `size` (the model's resolution: 1024, or 2048 for the HR versions) resized to the picture (bicubic)
-    /// before their sigmoid.
-    std::vector<uint8_t> run(const QiRef& image, int64_t size = 1024, Times* t = nullptr);
+    /// sw x sh (the model's resolution, multiples of 32: 1024 x 1024; 2048 x 2048 for the HR versions, 2560 x 1440
+    /// for lite-2K, the picture's own for dynamic) resized to the picture (bicubic) before their sigmoid.
+    std::vector<uint8_t> run(const QiRef& image, int64_t sw = 1024, int64_t sh = 1024, Times* t = nullptr);
 
-    /// What a run at `size` needs on the GPU beyond what it holds now.
-    uint64_t need_bytes(int64_t size, int64_t width, int64_t height) const;
+    /// The foreground's colors of `image` under its `alpha` (run()'s), RGB8 at its size: refine_foreground's blur
+    /// fusion (aux_fg_stack), for a cut-out laid on another background.
+    std::vector<uint8_t> foreground(const QiRef& image, const std::vector<uint8_t>& alpha);
+
+    /// What a run at sw x sh needs on the GPU beyond what it holds now; with `refine`, foreground() after it too.
+    uint64_t need_bytes(int64_t sw, int64_t sh, int64_t width, int64_t height, bool refine = false) const;
 
 private:
     void load_weights() override;
@@ -75,12 +79,14 @@ private:
         Conv c1, c2;
     };
 
-    /// The Swin's four stage outputs (normed, FP32 [side^2][dim]) of img16 [S][S][3] in scratch slots slot0 ..
-    /// slot0 + 3; side[i] = S / 4 >> i.
-    void backbone(const uint16_t* img16, int64_t S, int slot0, float* feat[4], int64_t side[4]);
+    /// The Swin's four stage outputs (normed, FP32 [sh[i]][sw[i]][dim]) of img16 [SH][SW][3] in scratch slots slot0 ..
+    /// slot0 + 3; sh[i] = SH / 4 >> i, sw[i] = SW / 4 >> i.
+    void backbone(const uint16_t* img16, int64_t SH, int64_t SW, int slot0, float* feat[4], int64_t sh[4],
+                  int64_t sw[4]);
     void dec_block(const DecBlk& b, const uint16_t* x16, int64_t H, int64_t W, float* y);
     void deform(const Deform& d, const uint16_t* x16, int64_t H, int64_t W, float* y, int64_t ldy);
-    void ipt(const Ipt& p, const float* img, int64_t S, int64_t side, float* y, int64_t ldy, int64_t c0);
+    void ipt(const Ipt& p, const float* img, int64_t SH, int64_t SW, int64_t sh, int64_t sw, float* y, int64_t ldy,
+             int64_t c0);
     Conv conv_bn(const std::string& conv, const std::string& bn, int stride, int pad);
 
     Conv patch_;

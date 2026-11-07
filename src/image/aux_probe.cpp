@@ -11,20 +11,27 @@
 //       SAM 3 on the picture and the words' ids: its parts as raw FP32 files in outdir (embed, vit<i>, fpn<i>, text,
 //       encoder, queries, scores, boxes, mask_logits), each instance's mask as mask<i>.u8 (raw, 255 inside), the
 //       boxes, scores and times (a cold run, then a warm one) on stdout.
-//   strata-image-aux-probe birefnet <weights.safetensors> <image> <outdir> [size]
-//       BiRefNet on the picture at size x size (1024): its parts as raw FP32 files in outdir (x1 .. x4, squeeze,
-//       p4 .. p1, logits), the alpha as alpha.u8 (raw, the picture's size), the times (a cold run, then warm ones).
-
+//   strata-image-aux-probe birefnet <weights.safetensors> <image> <outdir> [width [height]]
+//       BiRefNet on the picture at width x height (1024; height: the width): its parts as raw FP32 files in outdir (x1 .. x4, squeeze,
+//       p4 .. p1, logits), the alpha as alpha.u8 (raw, the picture's size), the foreground's colors (refine) as
+//       fg.rgb (raw RGB8), the times (a cold run, then warm ones).
+//   strata-image-aux-probe florence <model.safetensors> <image> <ids,...> <outdir> [beams] [max_new]
+//       Florence-2 on the picture and the task's ids: its parts as raw FP32 files in outdir (vision_out, stage<i>,
+//       image_features, encoder, logits0), the tokens and the times on stdout.
+//   strata-image-aux-probe mask <W> <H> <outfile> <x,y,x,y,...>...
+//       The polygons' mask (aux_polygon_fill), raw bytes (255 inside).
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/birefnet.hpp"
+#include "strata/image/florence2.hpp"
 #include "strata/image/sam3.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -226,26 +233,77 @@ int main(int argc, char** argv) {
             img.rgba = si::load_rgba8(argv[3], img.width, img.height, err);
             if (img.rgba.empty()) throw std::runtime_error(err);
             const std::string out = argv[4];
-            const int64_t size = argc > 5 ? std::stoll(argv[5]) : 1024;
+            const int64_t sw = argc > 5 ? std::stoll(argv[5]) : 1024, sh = argc > 6 ? std::stoll(argv[6]) : sw;
             m.dump = [&out](const char* name, const std::vector<float>& v) {
                 write_raw(out + "/" + name + ".f32", v.data(), v.size() * 4);
             };
             si::Birefnet::Times t;
-            auto alpha = m.run(img, size, &t);
+            auto alpha = m.run(img, sw, sh, &t);
             m.dump = nullptr;
             write_raw(out + "/alpha.u8", alpha.data(), alpha.size());
-            std::printf("cold backbone_s=%.4f decoder_s=%.4f mask_s=%.4f\n", t.backbone, t.decoder, t.mask);
+            auto t0 = std::chrono::steady_clock::now();
+            const auto fg = m.foreground(img, alpha);
+            const double fg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            write_raw(out + "/fg.rgb", fg.data(), fg.size());
+            std::printf("cold backbone_s=%.4f decoder_s=%.4f mask_s=%.4f refine_s=%.4f\n", t.backbone, t.decoder,
+                        t.mask, fg_s);
             const char* rep = std::getenv("STRATA_PROBE_REPEAT");
             const int reps = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             for (int r = 0; r < reps; ++r) {
                 si::Birefnet::Times t2;
-                alpha = m.run(img, size, &t2);
-                std::printf("warm backbone_s=%.4f decoder_s=%.4f mask_s=%.4f held_mib=%llu\n", t2.backbone,
-                            t2.decoder, t2.mask, (unsigned long long) (m.held() >> 20));
+                alpha = m.run(img, sw, sh, &t2);
+                t0 = std::chrono::steady_clock::now();
+                (void) m.foreground(img, alpha);
+                std::printf("warm backbone_s=%.4f decoder_s=%.4f mask_s=%.4f refine_s=%.4f held_mib=%llu\n",
+                            t2.backbone, t2.decoder, t2.mask,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                            (unsigned long long) (m.held() >> 20));
             }
             return 0;
         }
-        std::fprintf(stderr, "usage: %s sdpa | sam3 <weights> <image> <ids> <outdir> [score] [mask] | birefnet <weights> <image> <outdir> [size]\n", argv[0]);
+        if (mode == "florence" && argc >= 6) {
+            si::Florence2 f(argv[2]);
+            si::QiRef img;
+            std::string err;
+            img.rgba = si::load_rgba8(argv[3], img.width, img.height, err);
+            if (img.rgba.empty()) throw std::runtime_error(err);
+            const auto ids = ints(argv[4]);
+            const std::string out = argv[5];
+            const int beams = argc > 6 ? std::stoi(argv[6]) : 3, max_new = argc > 7 ? std::stoi(argv[7]) : 1024;
+            f.dump = [&out](const char* name, const std::vector<float>& v) {
+                write_raw(out + "/" + name + ".f32", v.data(), v.size() * 4);
+            };
+            si::Florence2::Times t;
+            const auto print = [](const std::vector<int32_t>& v) {
+                std::printf("ids");
+                for (int32_t i : v) std::printf(" %d", i);
+                std::printf("\n");
+            };
+            auto got = f.run(img, ids, max_new, beams, &t);
+            f.dump = nullptr;
+            print(got);
+            // once more, warm, for the times (and the same tokens without the dumps' waits)
+            si::Florence2::Times t2;
+            got = f.run(img, ids, max_new, beams, &t2);
+            print(got);
+            std::printf("cold vision_s=%.4f encoder_s=%.4f decoder_s=%.4f steps=%d\n", t.vision, t.encoder,
+                        t.decoder, t.steps);
+            std::printf("warm vision_s=%.4f encoder_s=%.4f decoder_s=%.4f steps=%d held_mib=%llu\n", t2.vision,
+                        t2.encoder, t2.decoder, t2.steps, (unsigned long long) (f.held() >> 20));
+            return 0;
+        }
+        if (mode == "mask" && argc >= 5) {
+            std::vector<std::vector<float>> polys;
+            for (int i = 5; i < argc; ++i) polys.push_back(floats(argv[i]));
+            const int64_t W = std::stoll(argv[2]), H = std::stoll(argv[3]);
+            const auto m = si::Florence2::polygon_mask(polys, W, H);
+            std::vector<uint8_t> raw((size_t) (W * H));
+            for (size_t i = 0; i < raw.size(); ++i) raw[i] = (uint8_t) (255 - m.rgba[i * 4 + 3]);
+            write_raw(argv[4], raw.data(), raw.size());
+            return 0;
+        }
+        std::fprintf(stderr, "usage: %s sdpa | sam3 <weights> <image> <ids> <outdir> [score] [mask] | birefnet <weights> <image> <outdir> [width [height]] | florence <model> <image> <ids> <outdir> [beams] [max_new] | mask <W> <H> <out> "
+                             "<x,y,...>...\n", argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-aux-probe: %s\n", e.what());

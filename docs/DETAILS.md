@@ -2203,6 +2203,20 @@ The model files are not part of it; their licenses apply to them (below).
      ComfyUI's (GPL-3.0) SeedVR2 color corrections; the ranks are matched by a histogram of 65,536 bins, not a sort.
      Crop and Stitch's color match's CIE Lab follows ComfyUI's ColorTransfer (kornia's CIE Lab). The code is written
      without copying theirs.
+   - SAM 3's detector (`src/image/sam3.cpp`, `include/strata/image/sam3.hpp`): written again for the engine after
+     [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) port, `vllm_omni/diffusion/models/sam3/`
+     at 15bb15d (LGPL-3.0-or-later AND Apache-2.0, `NOTICE`), and checked against transformers' Sam3Model. Neither
+     Meta's code (SAM License) nor ComfyUI's is used. CLIP's BPE that reads the words (`tools/strata_tokenizer.py`'s
+     `ClipTokenizer`) is written from its `tokenizer.json`'s shape.
+   - Florence-2 (`src/image/florence2.cpp`, `serve/image_regions.py`): written from Microsoft's
+     [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (MIT) `modeling_florence2.py` (DaViT, BART, the
+     beam search) and `processing_florence2.py` (the task prompts, the added tokens, reading `<loc_*>` and the
+     polygons), and checked against transformers' Florence2ForConditionalGeneration (florence-community's weights).
+   - BiRefNet (`src/image/birefnet.cpp`; the foreground's colors `src/image/aux_kernels.cpp`'s `aux_fg_*`): written
+     from Peng Zheng's [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) (MIT) `birefnet.py` and `image_proc.py`'s
+     `refine_foreground` (the GPU version of Photoroom's
+     [fast-foreground-estimation](https://github.com/Photoroom/fast-foreground-estimation) blur fusion). It was
+     checked against ComfyUI's (GPL-3.0) BiRefNet port's outputs only; none of its code is copied.
    - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors
      (GPL-3.0), its `comfy_extras/nodes_cfg.py`, `nodes_apg.py` and `nodes_slg.py`: the image sampling's guidance
      (`src/image/guidance.cpp`, `serve/images.py`'s `GUIDANCE_METHODS`), its formulas, where they apply (before or

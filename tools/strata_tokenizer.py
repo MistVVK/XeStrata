@@ -101,6 +101,10 @@ CHATGLM4_PATTERN = (
 # token (a CJK string, a whole word) taken as that one token instead of run through the merges.
 HUNYUANIMAGE3_PRE = "hunyuanimage3"
 
+# `gpt2` (Florence-2's BART tokenizer: RoBERTa's, GPT-2's vocabulary): Hugging Face's ByteLevel pre-tokenizer with
+# its regex on (`use_regex`, the default; tokenizers' `byte_level.rs`, GPT-2's encoder.py), `add_prefix_space` off.
+GPT2_PATTERN = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -109,6 +113,7 @@ PRE_TYPES = {
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
+    "gpt2": (GPT2_PATTERN, False, "Hugging Face tokenizers' ByteLevel pre-tokenizer (byte_level.rs), GPT-2's"),
 }
 
 # The strings a file's pre-tokenizer regex is compared against another shape's on: enough of the classes
@@ -255,9 +260,9 @@ class Tokenizer:
         if not isinstance(vocab, dict):
             raise ValueError("%s: no model.vocab (a BPE tokenizer.json is expected)" % f)
         added = j.get("added_tokens") or []
-        n = len(vocab) + len(added)
-        for a in added:
-            n = max(n, int(a["id"]) + 1)
+        # the ids the vocabulary and the added tokens use (an added token may already be in the vocabulary, as
+        # RoBERTa's <s> and </s> are)
+        n = max([int(i) + 1 for i in vocab.values()] + [int(a["id"]) + 1 for a in added] + [0])
         tokens = [""] * n
         for t, i in vocab.items():
             tokens[int(i)] = t
@@ -270,7 +275,13 @@ class Tokenizer:
             types[i] = 3 if a.get("special") else 1
         raw_merges = model.get("merges") or []
         merges = [m if isinstance(m, str) else " ".join(m) for m in raw_merges]
-        pre = cls._hf_pre(cls._hf_regex(j.get("pre_tokenizer")), bool(model.get("ignore_merges")))
+        pt = j.get("pre_tokenizer") or {}
+        if pt.get("type") == "ByteLevel":   # GPT-2's own regex inside the byte layer (Florence-2's, RoBERTa's)
+            if pt.get("add_prefix_space") or pt.get("use_regex") is False or model.get("ignore_merges"):
+                raise ValueError("%s: a ByteLevel pre-tokenizer with a prefix space or without its regex" % f)
+            pre = "gpt2"
+        else:
+            pre = cls._hf_pre(cls._hf_regex(pt), bool(model.get("ignore_merges")))
         if model.get("dropout") not in (None, 0, 0.0):
             raise ValueError("%s: a BPE dropout of %r is not supported" % (f, model["dropout"]))
         if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):

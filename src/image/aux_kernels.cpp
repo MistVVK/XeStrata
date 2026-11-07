@@ -453,14 +453,14 @@ void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const flo
 }
 
 void aux_merge2(const float* x, int64_t H, int64_t W, int64_t C, float* y, void* stream) {
-    const int64_t h = H / 2, w = W / 2, n = h * w * 4 * C;
+    const int64_t h = (H + 1) / 2, w = (W + 1) / 2, n = h * w * 4 * C;
     if (n <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c4 = i % (4 * C), p = i / (4 * C), part = c4 / C, c = c4 - part * C;
         const int64_t py = p / w, px = p - py * w;
         const int64_t sy = 2 * py + part % 2, sx = 2 * px + part / 2;   // x0 (0, 0), x1 (1, 0), x2 (0, 1), x3 (1, 1)
-        y[i] = x[(sy * W + sx) * C + c];
+        y[i] = sy < H && sx < W ? x[(sy * W + sx) * C + c] : 0.f;
     });
     finish(stream, e, "aux_merge2");
 }
@@ -559,14 +559,14 @@ void aux_scale_by_sigmoid(float* x, int64_t P, int64_t C, const float* logit, vo
     finish(stream, e, "aux_scale_by_sigmoid");
 }
 
-void aux_image_patches16(const float* img, int64_t S, int64_t g, uint16_t* y16, void* stream) {
-    const int64_t s = S / g, ch = 3 * g * g, n = s * s * ch;
+void aux_image_patches16(const float* img, int64_t SH, int64_t SW, int64_t g, uint16_t* y16, void* stream) {
+    const int64_t sh = SH / g, sw = SW / g, ch = 3 * g * g, n = sh * sw * ch;
     if (n <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i % ch, p = i / ch, py = p / s, px = p - py * s;
+        const int64_t q = i % ch, p = i / ch, py = p / sw, px = p - py * sw;
         const int64_t c = q / (g * g), gy = (q / g) % g, gx = q % g;
-        y16[i] = f16_from_f32(img[((gy * s + py) * S + gx * s + px) * 3 + c]);
+        y16[i] = f16_from_f32(img[((gy * sh + py) * SW + gx * sw + px) * 3 + c]);
     });
     finish(stream, e, "aux_image_patches16");
 }
@@ -617,6 +617,89 @@ void aux_alpha_bicubic(const float* logits, int64_t h, int64_t w, int64_t W, int
         alpha[i] = (uint8_t) sycl::round(255.f / (1.f + sycl::exp(-v)));
     });
     finish(stream, e, "aux_alpha_bicubic");
+}
+
+void aux_fg_stack(const uint8_t* rgba, const uint8_t* alpha, const float* fb, int64_t n, float* x, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const float a = (float) alpha[i] / 255.f;
+        float* o = x + i * 7;
+        o[0] = a;
+        for (int c = 0; c < 3; ++c) {
+            const float img = (float) rgba[4 * i + c] / 255.f;
+            const float f = fb != nullptr ? fb[i * 6 + c] : img, b = fb != nullptr ? fb[i * 6 + 3 + c] : img;
+            o[1 + c] = f * a;
+            o[4 + c] = b * (1.f - a);
+        }
+    });
+    finish(stream, e, "aux_fg_stack");
+}
+
+void aux_box_mean(const float* x, int64_t H, int64_t W, int64_t C, int64_t k, float* tmp, float* y, void* stream) {
+    if (H <= 0 || W <= 0 || C <= 0 || k <= 0) return;
+    const int64_t lo = k % 2 == 0 ? k / 2 - 1 : k / 2, hi = k / 2;
+    const float inv = 1.f / (float) k;
+    sycl::queue& q = queue_for(stream);
+    // a running sum along each row (a work-item a row and channel), then along each column (one a column and channel:
+    // neighbours read neighbouring bytes).  A window of zeros gives 0 exactly, not the sum's rounding left over from
+    // the values that left it: the foreground divides the means by the alpha's mean plus 1e-5, which would make that
+    // residue a color where the picture is transparent
+    auto e = q.parallel_for(sycl::range<1>((size_t) (H * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / C, c = i - r * C;
+        const float* in = x + r * W * C + c;
+        float* out = tmp + r * W * C + c;
+        auto at = [&](int64_t j) { return in[sycl::clamp(j, (int64_t) 0, W - 1) * C]; };
+        float sum = 0.f;
+        int64_t nz = 0;
+        for (int64_t j = -lo; j <= hi; ++j) sum += at(j), nz += at(j) != 0.f;
+        for (int64_t j = 0; j < W; ++j) {
+            out[j * C] = nz != 0 ? sum * inv : 0.f;
+            const float in1 = at(j + hi + 1), out1 = at(j - lo);
+            sum += in1 - out1;
+            nz += (in1 != 0.f) - (out1 != 0.f);
+        }
+    });
+    finish(stream, e, "aux_box_mean rows");
+    e = q.parallel_for(sycl::range<1>((size_t) (W * C)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const float* in = tmp + i;
+        float* out = y + i;
+        const int64_t row = W * C;
+        auto at = [&](int64_t j) { return in[sycl::clamp(j, (int64_t) 0, H - 1) * row]; };
+        float sum = 0.f;
+        int64_t nz = 0;
+        for (int64_t j = -lo; j <= hi; ++j) sum += at(j), nz += at(j) != 0.f;
+        for (int64_t j = 0; j < H; ++j) {
+            out[j * row] = nz != 0 ? sum * inv : 0.f;
+            const float in1 = at(j + hi + 1), out1 = at(j - lo);
+            sum += in1 - out1;
+            nz += (in1 != 0.f) - (out1 != 0.f);
+        }
+    });
+    finish(stream, e, "aux_box_mean columns");
+}
+
+void aux_fg_combine(const uint8_t* rgba, const uint8_t* alpha, const float* y, int64_t n, float* fb, uint8_t* rgb,
+                    void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const float a = (float) alpha[i] / 255.f;
+        const float* m = y + i * 7;
+        const float da = m[0] + 1e-5f, db = (1.f - m[0]) + 1e-5f;
+        for (int c = 0; c < 3; ++c) {
+            const float img = (float) rgba[4 * i + c] / 255.f, mf = m[1 + c] / da, mb = m[4 + c] / db;
+            const float f = sycl::clamp(mf + a * (img - a * mf - (1.f - a) * mb), 0.f, 1.f);
+            if (fb != nullptr) {
+                fb[i * 6 + c] = f;
+                fb[i * 6 + 3 + c] = mb;
+            }
+            if (rgb != nullptr) rgb[i * 3 + c] = (uint8_t) (f * 255.f);
+        }
+    });
+    finish(stream, e, "aux_fg_combine");
 }
 
 }  // namespace strata::image

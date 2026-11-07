@@ -112,6 +112,22 @@
 //                            tile=... tiles=...
 //   UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
 //                            the VRAM that upscale needs (from the files)                   -> NEED as NEED's
+// The image tools' auxiliary models (aux_net.hpp: their weights image_aux's files), on a picture (PNG, JPEG...):
+//   SEGMENT <weights> <picture> <ids> <score threshold> <mask threshold> <masks>
+//                            SAM 3: the instances of the words (CLIP's ids), highest score first, each mask written to
+//                            <masks>.<i> (width x height bytes, 255 inside)  -> SEGMENT n=... segment_s=... boxes=...
+//   FLORENCE <weights> <picture> <ids> <beams> <max new>
+//                            Florence-2: the tokens it answers the task's ids (BART's) with  -> FLORENCE ids=... ...
+//   POLYMASK <width> <height> <out> <x,y,x,y,...>...
+//                            the polygons filled (Florence-2's answer read by the server), 255 inside  -> POLYMASK ok
+//   MATTE <weights> <picture> <model width> <model height> <out> [REFINE]
+//                            BiRefNet: the alpha (width x height bytes) to <out>; REFINE, the foreground's colors
+//                            (RGB8) to <out>.fg too                                    -> MATTE matte_s=... ...
+//   AUXNEED <sam3|florence|birefnet> <weights> <width> <height> [<beams> <max new> | <model width> <model height>
+//           <refine 0|1>]    the VRAM that run needs beyond what the engine holds             -> NEED as NEED's
+// Each runs in the room the image model's budget leaves (its cache given back first, then its parts, where that is too
+// little; ERROR memory: ... when even that is), its scratch freed after it; its weights kept for the next while a
+// quarter of the GPU's memory stays free, and let go before the next image job (IMG, NEED, RATIO, UPS, UPSNEED).
 //   FREE                     the free VRAM, what the engine holds and the GPU's memory     -> FREE free_mib=... held_mib=...
 //                                                                                              total_mib=...
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
@@ -136,6 +152,8 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/anima_pipeline.hpp"
+#include "strata/image/birefnet.hpp"
+#include "strata/image/florence2.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
 #include "strata/image/img_crop.hpp"
@@ -143,6 +161,7 @@
 #include "strata/image/mf_pipeline.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
+#include "strata/image/sam3.hpp"
 #include "strata/image/yolo_detect.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
@@ -675,6 +694,74 @@ si::QiRef upscale_base(si::ImagePipeline& p, Upscalers& ups, const si::QiRequest
     return out;
 }
 
+// The auxiliary models the process has opened (SAM 3, Florence-2, BiRefNet), by their file: opened once, their weights
+// loaded at their first run and kept (aux_done) while the budget leaves room for them
+struct AuxNets {
+    std::map<std::string, std::unique_ptr<si::AuxNet>> open;
+    template <class T> T& get(const std::string& path) {
+        auto& m = open[path];
+        if (!m) {
+            try {
+                m = std::make_unique<T>(path);
+            } catch (...) {
+                open.erase(path);
+                throw;
+            }
+        }
+        auto* t = dynamic_cast<T*>(m.get());
+        if (t == nullptr) throw std::invalid_argument(path + ": opened as another model");
+        return *t;
+    }
+    void release(bool all) {
+        for (auto& m : open) {
+            if (all) m.second->release();
+            else m.second->drop_scratch();
+        }
+        if (all) open.clear();
+    }
+};
+
+// Room for an auxiliary model's run that needs `need` bytes beyond what it holds: what the budget leaves beside the
+// image model's holdings, within the free VRAM; the image model's cache given back first where that is too little,
+// then its parts, as an upscale's (run_upscale)
+void aux_room(si::ImagePipeline& p, uint64_t need, const char* what) {
+    const auto room = [&p] {
+        const uint64_t b = p.budget(), held = p.held();
+        return std::min<uint64_t>(si::free_vram(), b > held ? b - held : 0);
+    };
+    if (room() < need) p.release(false);
+    if (room() < need) p.release(true);
+    if (const uint64_t r = room(); r < need)
+        throw std::runtime_error("memory: " + std::string(what) + " needs " + std::to_string(need >> 20) +
+                                 " MiB, the GPU has " + std::to_string(r >> 20) + " MiB for it");
+}
+
+// After an auxiliary model's run: its scratch freed (the image model's budget, fitted around what the engine holds,
+// has no room for it); its weights kept for the next tool's run while a quarter of the GPU's memory is still free
+// (reading SAM 3's 1.7 GB again took 3.2 s of a 3.3 s run on the B70, 2026-11-07), else let go as upscale_base lets a
+// large upscaler go, the VRAM given back added to the budget.  The next image job lets them go first (aux_yield)
+void aux_done(si::ImagePipeline& p, si::AuxNet& m) {
+    m.drop_scratch();
+    size_t free = 0, total = 0;
+    strata::gpu::mem_info(&free, &total);
+    if (m.held() > kUpsReserve && free < total / 4) {
+        const uint64_t before = p.held() + si::free_vram();
+        m.release();
+        const uint64_t after = p.held() + si::free_vram();
+        if (after > before) p.set_budget(p.budget() + (after - before));
+    }
+}
+
+// Before an image job (IMG, NEED, RATIO, UPS, UPSNEED): the auxiliary models' weights let go, so the image model has
+// the room it had without them (its budget fitted again by the server's FIT after its NEED)
+void aux_yield(AuxNets& aux) {
+    if (!aux.open.empty()) aux.release(true);
+}
+
+double seconds_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // DETECT's answer: "DETECT n=<count> detect_s=<seconds> boxes=<x0>,<y0>,<x1>,<y1>,<score>,<class>;..." (the boxes on
 // the picture, highest score first), each mask (a segmentation head's, with `masks` given) written to <masks>.<i> as
 // width x height bytes, 255 inside.  The detection's buffers are freed after it (`keep`: kept for the next, a timing's
@@ -779,6 +866,7 @@ int serve(si::ImagePipeline& p) {
     Loras loras;   // the adapters' files, read once for the requests that name them
     Detectors detectors;
     Upscalers ups;
+    AuxNets aux;
     {
         // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead.  A model whose
@@ -808,6 +896,7 @@ int serve(si::ImagePipeline& p) {
         std::string op;
         ls >> op;
         try {
+            if (op == "IMG" || op == "NEED" || op == "RATIO" || op == "UPS" || op == "UPSNEED") aux_yield(aux);
             if (op == "QUIT") {
                 break;
             } else if (op == "IMG") {
@@ -949,6 +1038,135 @@ int serve(si::ImagePipeline& p) {
                 if (!ls) throw std::invalid_argument("DETECT <weights> <picture> <threshold> [<masks>]");
                 ls >> masks;
                 std::printf("%s\n", detect_line(detectors.get(weights), read_image(pic), conf, masks).c_str());
+            } else if (op == "SEGMENT") {   // SEGMENT <weights> <picture> <ids> <score> <mask> <masks>
+                std::string weights, pic, ids, masks;
+                float score = 0.5f, mask = 0.5f;
+                ls >> weights >> pic >> ids >> score >> mask >> masks;
+                if (!ls) throw std::invalid_argument("SEGMENT <weights> <picture> <ids> <score> <mask> <masks>");
+                const auto t0 = std::chrono::steady_clock::now();
+                si::Sam3& m = aux.get<si::Sam3>(weights);
+                const si::QiRef img = read_image(pic);
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3");
+                si::Sam3::Times t;
+                std::vector<si::Segment> segs;
+                try {
+                    segs = m.run(img, parse_ids(ids), score, mask, &t);
+                } catch (...) {
+                    aux_done(p, m);
+                    throw;
+                }
+                aux_done(p, m);
+                std::string line = "SEGMENT n=" + std::to_string(segs.size());
+                char b[200];
+                std::snprintf(b, sizeof b, " segment_s=%.4f vision_s=%.4f text_s=%.4f detect_s=%.4f masks_s=%.4f boxes=",
+                              seconds_since(t0), t.vision, t.text, t.detect, t.masks);
+                line += b;
+                for (size_t i = 0; i < segs.size(); ++i) {
+                    const auto& s = segs[i];
+                    std::snprintf(b, sizeof b, "%s%.2f,%.2f,%.2f,%.2f,%.4f", i ? ";" : "", s.x0, s.y0, s.x1, s.y1,
+                                  s.score);
+                    line += b;
+                    write_file(masks + "." + std::to_string(i), s.mask);
+                }
+                std::printf("%s\n", line.c_str());
+            } else if (op == "FLORENCE") {   // FLORENCE <weights> <picture> <ids> <beams> <max new>
+                std::string weights, pic, ids;
+                int beams = 3, max_new = 1024;
+                ls >> weights >> pic >> ids >> beams >> max_new;
+                if (!ls || beams < 1 || max_new < 1)
+                    throw std::invalid_argument("FLORENCE <weights> <picture> <ids> <beams> <max new>");
+                const auto t0 = std::chrono::steady_clock::now();
+                si::Florence2& m = aux.get<si::Florence2>(weights);
+                const si::QiRef img = read_image(pic);
+                aux_room(p, m.need_bytes(beams, max_new), "Florence-2");
+                si::Florence2::Times t;
+                std::vector<int32_t> got;
+                try {
+                    got = m.run(img, parse_ids(ids), max_new, beams, &t);
+                } catch (...) {
+                    aux_done(p, m);
+                    throw;
+                }
+                aux_done(p, m);
+                std::string out;
+                for (size_t i = 0; i < got.size(); ++i) out += (i ? "," : "") + std::to_string(got[i]);
+                std::printf("FLORENCE florence_s=%.4f vision_s=%.4f encoder_s=%.4f decoder_s=%.4f steps=%d ids=%s\n",
+                            seconds_since(t0), t.vision, t.encoder, t.decoder, t.steps, out.c_str());
+            } else if (op == "POLYMASK") {   // POLYMASK <width> <height> <out> <x,y,...>...
+                int64_t w = 0, h = 0;
+                std::string out;
+                ls >> w >> h >> out;
+                if (!ls || w <= 0 || h <= 0) throw std::invalid_argument("POLYMASK <width> <height> <out> <x,y,...>...");
+                std::vector<std::vector<float>> polys;
+                for (std::string word; ls >> word;) {
+                    std::vector<float> v;
+                    std::stringstream ws(word);
+                    for (std::string x; std::getline(ws, x, ',');) v.push_back(std::stof(x));
+                    if (v.size() < 6 || v.size() % 2 != 0) throw std::invalid_argument("POLYMASK: a polygon of x,y pairs");
+                    polys.push_back(std::move(v));
+                }
+                const si::QiRef m = si::Florence2::polygon_mask(polys, w, h);
+                std::vector<uint8_t> raw((size_t) (w * h));
+                for (size_t i = 0; i < raw.size(); ++i) raw[i] = (uint8_t) (255 - m.rgba[i * 4 + 3]);
+                write_file(out, raw);
+                std::printf("POLYMASK ok\n");
+            } else if (op == "MATTE") {   // MATTE <weights> <picture> <model width> <model height> <out> [REFINE]
+                std::string weights, pic, out, word;
+                int64_t sw = 0, sh = 0;
+                ls >> weights >> pic >> sw >> sh >> out;
+                if (!ls) throw std::invalid_argument("MATTE <weights> <picture> <model width> <model height> <out> [REFINE]");
+                const bool refine = (ls >> word) && word == "REFINE";
+                const auto t0 = std::chrono::steady_clock::now();
+                si::Birefnet& m = aux.get<si::Birefnet>(weights);
+                const si::QiRef img = read_image(pic);
+                aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet");
+                si::Birefnet::Times t;
+                double refine_s = 0.0;
+                try {
+                    const auto alpha = m.run(img, sw, sh, &t);
+                    write_file(out, alpha);
+                    if (refine) {
+                        const auto t1 = std::chrono::steady_clock::now();
+                        write_file(out + ".fg", m.foreground(img, alpha));
+                        refine_s = seconds_since(t1);
+                    }
+                } catch (...) {
+                    aux_done(p, m);
+                    throw;
+                }
+                aux_done(p, m);
+                std::printf("MATTE matte_s=%.4f backbone_s=%.4f decoder_s=%.4f mask_s=%.4f refine_s=%.4f\n",
+                            seconds_since(t0), t.backbone, t.decoder, t.mask, refine_s);
+            } else if (op == "AUXNEED") {   // AUXNEED <kind> <weights> <width> <height> [...]
+                std::string kind, weights;
+                int64_t w = 0, h = 0;
+                ls >> kind >> weights >> w >> h;
+                if (!ls) throw std::invalid_argument("AUXNEED <sam3|florence|birefnet> <weights> <width> <height> ...");
+                uint64_t need = 0, held = 0;
+                if (kind == "sam3") {
+                    si::Sam3& m = aux.get<si::Sam3>(weights);
+                    need = m.need_bytes(w, h), held = m.held();
+                } else if (kind == "florence") {
+                    int beams = 3, max_new = 1024;
+                    ls >> beams >> max_new;
+                    si::Florence2& m = aux.get<si::Florence2>(weights);
+                    need = m.need_bytes(beams, max_new), held = m.held();
+                } else if (kind == "birefnet") {
+                    int64_t sw = 1024, sh = 1024;
+                    int refine = 0;
+                    ls >> sw >> sh >> refine;
+                    si::Birefnet& m = aux.get<si::Birefnet>(weights);
+                    need = m.need_bytes(sw, sh, w, h, refine != 0), held = m.held();
+                } else {
+                    throw std::invalid_argument("AUXNEED: sam3, florence or birefnet, not " + kind);
+                }
+                size_t free = 0, total = 0;
+                strata::gpu::mem_info(&free, &total);
+                const uint64_t all = need + held;   // its weights and work, what it holds now counted in
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0\n",
+                            (unsigned long long) (all >> 20), (unsigned long long) (all >> 20),
+                            (unsigned long long) ((p.held() + held) >> 20), (unsigned long long) (free >> 20),
+                            (unsigned long long) (total >> 20));
             } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
                 si::QiRequest r;
                 std::string ids;
@@ -1025,6 +1243,7 @@ int serve(si::ImagePipeline& p) {
                 p.release(what == "ALL");
                 detectors.release(what == "ALL");
                 ups.release(what == "ALL");
+                aux.release(what == "ALL");
                 std::printf("RELEASE ok\n");
             } else if (!op.empty()) {
                 throw std::invalid_argument("unknown request " + op);

@@ -172,6 +172,7 @@ HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guida
 - Qwen-Image-2.1 では、透明な背景も選べます。
 - 画像を添付すると、編集のあるモデルでは編集に、編集のないモデル（MageTrail など）では 1 枚の画像から始める img2img になります（PNG、JPEG、GIF、BMP、WebP）。HunyuanImage 3.0 の参照画像は 3 枚までです。
 - 画像を添付すると、1 枚目の画像の上で描き直す部分を塗れます（ブラシの大きさ、消しゴム、全部消す）。塗った部分だけを描き直し、残りは元の画素のまま残します（API の `mask`。塗った部分の周りを拡大して描き直すので、縁のすぐ外も少し変わります）。塗らなければ、画像全体です。
+  言葉（`hair` など）を書いて「マスクを作る」を押すと、その場所を見つけて塗ります（API の言葉からマスク。後からブラシで直せます）。「背景を消す」は 1 枚目の画像の背景を消した透明の PNG を結果に並べます。SAM 3 のライセンスに同意していないと Florence-2 で見つけ、「SAM 3 のライセンス…」から文を読んで同意できます。
 - 画像を添付すると Strength の欄が出ます（API の `strength`）。小さいほど元の画像を多く残します。空欄はモデルの既定で、編集は 1（元の画像の潜在から始めない、今までの編集）、img2img は 0.87 です（ステップ数の少ないモデルでは、少なくとも 1 ステップ飛ばす値まで下げます）。
 - LoRA の行で、そのモデルが当てられるファイルを選べます（[LoRA](#loraアダプター)）。選んだものはチップになり、強さ（-2〜2）を変えられ、`trigger` のあるファイルは「トリガー」のボタンでその語をプロンプトの末尾に足せます。4 本までで、選んだものと強さはモデルごとにブラウザーが覚えます。API と同じく、名前は要求の欄で出します（タグは書きません）。
 - 画像は 1 枚ずつ作ります。何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にそちらを先に動かし、終わってから残りを作ります（文章のモデルを外す `unload` のときは、外したまま最後まで作ります）。
@@ -323,7 +324,9 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - 部分 k の seed は要求の seed + k です（`n` が 2 以上なら、i 枚目はさらに + 1000 i）。設定の `budget_s` は、次の部分を描き始める前にも見ます。GPU の番が来てから（検出を含めて）その秒数を過ぎると、残りの部分は飛ばして、応答にそう書きます（描いている途中の部分は止めません）。
    - `prompt` は直した部分の見た目です。付けないと、部分ごとの決まった言葉（「a detailed, well-drawn face」など）で描きます。マスク・`extend`・`upscale` と一緒には使えません。
    - 応答の `strata` の `fix` に、描いた部分（`regions`: 部分の名前、画像の上の箱、点数、seed、切り出した範囲、描いた大きさ、秒数。飛ばしたものはその理由）と、検出の時間（`detect_s`）が入ります。
+- **言葉の場所（`region`）**: `region` に `"hair"` のような言葉を付けると、マスクを塗る代わりに、1 枚目の画像からその言葉の場所を見つけてマスクにし、そこだけ描き直します（上の「マスク」と同じ道筋）。見つけたものをすべて合わせ、短い辺の 1%（4 ピクセル以上）広げます。見つけるのは下の「言葉からマスク」と同じモデルで、`region_model` で選べます。マスクとは一緒に使えません。
 - **補助の重み**: 道具が使う重み（Detailer の検出器など）は、初めて使うときにサーバーが Hugging Face から取ります（版と SHA-256 を固定し、`HF_ENDPOINT` のミラーも使えます）。置き場所は画像のモデルと同じフォルダーの `image-tools/` です。取っている間は画像を作らず、Images API は 503（`code` が `weights_downloading`、`downloads` に大きさと進み具合とライセンス）、チャットの道具は「取っている途中」と返します。終わったら、もう一度頼むと使えます。取れなかったとき（オフライン、ディスクがいっぱい、書き込めないフォルダー）は、その理由を返します。進み具合はサーバーのログに出ます。
+  SAM 3.1 の重みは、利用者が SAM License に同意するまで取りません（setup の問い、または Web の画像の画面の「SAM 3 のライセンス…」で同意します。同意は `image-tools/sam3.accepted` に残ります）。同意するまでは Florence-2 が場所を見つけます。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
 - **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（PedroMarinhoDev の版の説明の値。強さが 1 より小さいと、編集でなく描き直しになります）。
@@ -339,6 +342,30 @@ LocalAI の拡大と同じ形です。multipart の `image`（1 枚）・`model`
 - `extra_params` に、色の補正 `color_correction_method`（vLLM-Omni の SeedVR2 と同じ名前。`none`・`lab`・`adain`・`wavelet`）と、XeStrata の拡張の `redraw`（`true` で拡大の後に画像のモデルで描き直す。既定は `false`）・`redraw_strength`（描き直しの strength、既定 0.35）・`redraw_model`（描き直す画像のモデル、既定は既定のモデル）を書けます。描き直すときは `prompt` も要ります。
 - 中身は上の「拡大」と同じです（`upscale` の `method`・`redraw`・`strength`・`color`）。応答の `strata` の `upscale` に、使った手段、色の補正、拡大の時間（`upscale_s`、そのうちモデル `model_s`・大きさの合わせ `resize_s`・色の補正 `color_s`）、タイルに分けたときはその大きさと数（`tile`・`tiles`）が入ります。
 
+### 言葉からマスク（`POST /v1/images/segmentations`）
+
+vLLM-Omni の SAM 3 の分割と同じ形です。multipart の `image`（1 枚）・`prompt`（見つけるものの言葉）・`score_threshold`（既定 0.5）・`mask_threshold`（既定 0.5）・`mask_format`（`png` か `rle`）・`model`、または JSON（`image` に data: URL か http(s) の URL）で送ります。
+
+- 応答は `created`・`model`・`width`・`height`・`mask_format`・`data[]`（見つけたもの 1 つずつの `score`・`box`（画素の x0・y0・x1・y1）・`mask`）です。`png` の `mask` は 1 チャンネルの PNG（中が 255）の base64、`rle` は COCO の圧縮しない RLE（`size` と、列の順の連続の長さ。背景から始まる）です。
+- `model` は `sam3.1`、`florence-2-large`、`florence-2-base`、`auto`（付けないときも `auto`）です。これらは `/v1/models` にも出ます。
+   - `sam3.1`: Meta の SAM 3.1（Comfy-Org の FP16 の重み）。言葉の表すもの（概念）をすべて見つけ、点数の高い順に返します。
+   - `florence-2-large`・`florence-2-base`: Microsoft の Florence-2。言葉を指し示しの言い回しとして読み、多角形で答えたものを塗ってマスクにします。点数は出さないので `score` は `null` です。
+   - `auto`: SAM License に同意していて、言葉が 4 語以下（概念）で CLIP の 32 トークンに収まるときは SAM 3.1、そうでないとき（「左の女の子」のような言い回し）は Florence-2 large、GPU のメモリに入らないときは base です。応答の `strata` の `fallback` に、SAM 3.1 にしなかった理由が入ります。
+- 拡張の `task` で、`mask`（既定）、`box`（箱だけ。`mask` は `null`）、`grounding`（Florence-2 の言葉の位置合わせ。文の中の言い回しごとの箱と `label`）を選べます。
+- vLLM-Omni の見本の箱（`boxes`）は受けません。
+- 応答の `strata` に、かかった秒数とエンジンの秒数が入ります。
+
+### 背景を消す（`POST /v1/images/remove-background`）
+
+BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `image` か JSON で送り、応答は vLLM-Omni の画像の形（`created`、`data[].b64_json` か `url`）です。欄は fal の BiRefNet と同じです。
+
+- `model` は BiRefNet の版です。`general`（既定、1024x1024）、`lite`（Swin-T、小さい）、`lite-2k`（2560x1440）、`portrait`（人物）、`matting`（髪・毛・ガラス・煙などの半透明の縁）、`hr`（2048x2048）、`dynamic`（画像そのものの大きさ。256〜2304）。fal の名前（`General Use (Light)` など）も受けます。GPU のメモリに入らないときは `lite`（大きいものは `lite-2k`）にし、応答にそう書きます。
+- `operating_resolution`（`1024x1024` など。32 の倍数で 256〜2304）、`refine_foreground`（既定 `true`。前景の色を推し量り、別の背景に重ねても元の背景の色が縁に残らないようにする）、`mask_only`（マスクだけを返す）、`output_mask`（マスクも返す。`data` の 2 つ目、`role` が `mask`）、`output_format`（`png`・`webp`・`gif`・`jpeg`）、`response_format`（`b64_json`・`url`）を受けます。
+- 拡張は `background_color`（`#ffffff` など。付けると透明でなくその色を敷く）、`mask_grow`（画素。負なら縮める）、`mask_blur`（ぼかしの半径の画素）です。
+- Stability の `POST /v2beta/stable-image/edit/remove-background`（`image` と `output_format` の `png`・`webp`）も同じ形で受けます。`Accept: application/json` なら `{"image": base64, "finish_reason": "SUCCESS", "seed": 0}`、そうでなければ画像そのものを返します。
+
+言葉からマスクと背景を消すは、画像の仕事と同じ GPU の順番で動き、終わるとその場で返します（ジョブにはしません）。重みは GPU のメモリの 4 分の 1 が空いている間は次の道具のために残し、次の画像の仕事の前に放します。
+
 ### 応答
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
@@ -353,6 +380,7 @@ LocalAI の拡大と同じ形です。multipart の `image`（1 枚）・`model`
   `extend_image` は、会話の最後の画像の外側を描き足します（上の「描き足し」と同じ。引数は上下左右の画素か `aspect`）。
   `upscale_image` は、会話の最後の画像を大きくし、`redraw` で細かく描き直します（上の「拡大」と同じ。引数は `scale`（既定は 2）・`method`・`redraw`（既定は描き直さない）・`strength`）。「そのまま大きく」なら描き直さず、「大きく、細かく描き込んで」なら描き直す、という使い分けは、スキルの `tools/upscale_image` に書いてあります。
   `fix_image` は、会話の最後の画像の顔・手・人物を見つけて描き直します（上の「部分を直す」と同じ。引数は `parts` と `strength`）。重みを取っている間は、その旨を返し、チャットのモデルは後で呼び直します。
+  `edit_region` は、言葉の場所（`region`）だけを `prompt` のとおりに描き直し（上の「言葉の場所」と同じ）、`find_region` は言葉の場所を赤で塗った画像を見せ（描き直さない）、`remove_background` は背景を消すか単色を敷きます（引数は `version` と `background_color`）。使いどころはスキルの `tools/edit_region`・`tools/find_region`・`tools/remove_background` に書いてあります。
   Qwen-Image-2.1 と Mage-Flow では、`generate_image` と `edit_image` に `guidance`（上の「サンプリングのガイダンス」の名前の配列）も渡します。CFG の要る 3 つは、モデルの既定で CFG が掛かるときだけ並べます。使いどころは `image_skill` の `guidance` に書いてあります。
 - `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
 - `strata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
@@ -535,3 +563,6 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - Detailer の検出器（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）は Bingsu の [adetailer](https://huggingface.co/Bingsu/adetailer) で、公開元のライセンスは Apache 2.0 です。
   どれも Ultralytics の YOLOv8 で学習されていて、Ultralytics は YOLO で学習したモデルを既定で AGPL-3.0 としています（[Ultralytics のライセンス](https://www.ultralytics.com/license)。重みのファイルの中にも `AGPL-3.0 License` と書かれています）。使う前に両方を読んでください。
   サーバーは配られている `.pt` を取り、`tools/image/yolo_pt.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換で、元のファイルの SHA-256 を変換後のファイルに書き残します。XeStrata は Ultralytics のコードを使わず、検出器を自分で書いています（[DETAILS](DETAILS.ja.md#クレジットとライセンス)）。
+- 言葉からマスクの SAM 3.1 の重みは Meta の SAM License で、オープンソースのライセンスではありません（使う人を拘束し、禁じる使い方があります）。サーバーは利用者が同意するまで取りません。重みは Comfy-Org の [sam3.1](https://huggingface.co/Comfy-Org/sam3.1) の FP16 のものをそのまま使います。言葉を読む CLIP の `tokenizer.json`（openai/clip-vit-large-patch14）は MIT です。
+- Florence-2（large と base）の重みと `tokenizer.json` は Microsoft の [Florence-2](https://huggingface.co/microsoft/Florence-2-large) で、MIT です。
+- 背景を消す BiRefNet の 7 つの版の重みは、Peng Zheng の [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) で、MIT です。

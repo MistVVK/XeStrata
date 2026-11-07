@@ -845,7 +845,7 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
                            src/image/hunyuanimage3_vision.cpp
                            src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_net.cpp
-                           src/image/sam3.cpp src/image/birefnet.cpp)
+                           src/image/sam3.cpp src/image/birefnet.cpp src/image/florence2.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
@@ -914,7 +914,7 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(strata_kernels PRIVATE strata_dnnl)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
     set_property(SOURCE src/image/qi_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
-                 src/image/yolo_detect.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp
+                 src/image/yolo_detect.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp src/image/florence2.cpp
                  APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
@@ -1192,8 +1192,8 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-dit-probe PRIVATE strata_image)
   add_executable(strata-image-vae-probe src/image/qi_vae_probe.cpp)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
-  # SAM 3's and BiRefNet's parts against a reference's dumps (tools' scripts in the records), and qi_sdpa_ex's shapes
-  # against FP64
+  # SAM 3's, BiRefNet's and Florence-2's parts against a reference's dumps (tools' scripts in the records), and
+  # qi_sdpa_ex's shapes against FP64
   add_executable(strata-image-aux-probe src/image/aux_probe.cpp)
   target_link_libraries(strata-image-aux-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)

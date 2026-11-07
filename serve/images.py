@@ -2933,7 +2933,14 @@ class ImageGen:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
         resident), held_mib (what it holds now), free_mib (the device's free VRAM), cap_mib (the most the engine could
         have) and host_mib (the prefix cache in pinned RAM at cap_mib).  An upscale without a drawing (ups_only): its
-        upscaler's (UPSNEED)."""
+        upscaler's (UPSNEED).  An auxiliary model's run (job["aux"]: image_regions' segmentation or background removal):
+        its own (AUXNEED)."""
+        if job.get("aux"):
+            a = job["aux"]
+            with self.lock:
+                self._ready()
+                return self.engine.ask(f"AUXNEED {a['kind']} {a['path']} {job['width']} {job['height']}"
+                                       + "".join(f" {v}" for v in a.get("need_args") or ()), "NEED", 600)
         if job.get("ups_only"):
             w0, h0 = image_dims(job["init"])
             u = job["upscaler"]
@@ -3041,6 +3048,13 @@ class ImageGen:
                 with contextlib.suppress(OSError):
                     work.rmdir()
         return png, got
+
+    def aux_ask(self, line: str, want: str, timeout: float = 600) -> dict:
+        """One request of the image tools' auxiliary models (image_regions: SEGMENT, FLORENCE, POLYMASK, MATTE) -> its
+        answer's fields."""
+        with self.lock:
+            self._ready()
+            return self.engine.ask(line, want, timeout)
 
     def detect(self, weights: Path, picture: bytes, threshold: float = FIX_THRESHOLD,
                masks: bool = False) -> tuple[list[dict], float]:
@@ -3298,7 +3312,7 @@ class ImageGen:
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
                     "refs": "Reading the reference images",
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)",
-                    "upscale": "Upscaling"}
+                    "upscale": "Upscaling", "segment": "Finding the region", "matte": "Removing the background"}
 
     def begin(self, job: dict) -> None:
         """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
@@ -3526,9 +3540,37 @@ TOOLS: list[dict[str, Any]] = [
          "strength": {"type": "number", "description": "how much each part may change, above 0 to 1 (default 0.5)"},
          "seed": {"type": "integer"}},
          "required": ["parts"]}},
+    {"name": "edit_region",
+     "description": "Draw again only the part of an image that words name (her hair, the sky, the red car); the "
+                    "rest kept as it is.",
+     "parameters": {"type": "object", "properties": {
+         "region": {"type": "string", "description": "what to change, in English words, e.g. hair, the left cup"},
+         "prompt": {"type": "string", "description": "what the part should become"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
+         "strength": {"type": "number", "description": "how much the part may change, above 0 to 1 (default 1)"},
+         "seed": {"type": "integer"}},
+         "required": ["region", "prompt"]}},
+    {"name": "find_region",
+     "description": "Find a part of an image by words and show it to the user marked; nothing is drawn.",
+     "parameters": {"type": "object", "properties": {
+         "region": {"type": "string", "description": "what to find, in English words, e.g. hair, every face"},
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"}},
+         "required": ["region"]}},
+    {"name": "remove_background",
+     "description": "Take an image's background away (a transparent PNG), or put a plain color behind its subject.",
+     "parameters": {"type": "object", "properties": {
+         "image": {"type": "string",
+                   "description": "a /v1/images/files/... link; default the conversation's last image"},
+         "version": {"type": "string", "enum": ["general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic"],
+                     "description": "BiRefNet's version (default general)"},
+         "background_color": {"type": "string", "description": "a color behind it, e.g. #ffffff (default none)"}}}},
 ]
 
-EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image")   # the tools that start from an image
+# the tools that start from an image
+EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image", "edit_region", "find_region",
+              "remove_background")
 SKILLS = Path(__file__).resolve().parent / "image_skills"
 # how a model's prompt is written, by its name without -uncensored, else its family: booru.md's Danbooru tags, else
 # natural.md's sentences
@@ -3995,6 +4037,61 @@ class ImageTools:
                     return data
         return None
 
+    def _aux_tool(self, name: str, args: dict, t0: float, cancel: threading.Event | None) -> dict:
+        """find_region (the region marked on the image: image_regions.segment) and remove_background (BiRefNet's
+        cut-out, image_regions.matte): an image shown to the user, nothing drawn by the image model."""
+        from serve import image_regions
+        urls: list[str] = []
+        seen = None
+        try:
+            data = self._image(str(args.get("image") or ""))
+            if data is None:
+                raise ImageRequestError(f"there is no image in the conversation to {name.split('_')[0]} in")
+            gens = self._gens()
+            gen = gens[0] if gens else self.gen
+            check_tool(gen.cfg, name)
+            picture = self.normalize(data)
+            if name == "find_region":
+                region = str(args.get("region") or "").strip()
+                got = image_regions.segment(self.svc, gen, picture, region, "mask", cancel=cancel)
+                png = image_regions.marked(picture, got["instances"])
+                url = f"/v1/images/files/{gen.store(png, 'png')}"
+                scores = [i["score"] for i in got["instances"] if i["score"] is not None]
+                text = (f"{len(got['instances'])} {region!r} region(s) found by {got['model']}"
+                        + (f" (scores {', '.join(f'{s:.2f}' for s in scores)})" if scores else "")
+                        + (f" ({got['fallback']})" if got.get("fallback") else "")
+                        + f"; the user sees them marked in red: {url}. To change only that part, call edit_region "
+                          f"with region {region!r} (its image: the image the regions were found in).")
+                if not got["instances"]:
+                    text = f"no {region!r} found by {got['model']}: try other words."
+            else:
+                version = image_regions.birefnet_version(args.get("version"))
+                bg = image_regions.parse_color(args.get("background_color"))
+                got = image_regions.matte(self.svc, gen, picture, version, None, True, cancel)
+                png = image_regions.encode(image_regions.cut_out(picture, got, bg), "png")
+                url = f"/v1/images/files/{gen.store(png, 'png')}"
+                text = (f"The background is {'replaced' if bg else 'removed'} (BiRefNet {got['version']}, "
+                        f"{got['seconds']:.1f} s"
+                        + (f"; {got['fallback']}" if got.get("fallback") else "")
+                        + f") and the user sees it: {url}.")
+            self.made.append(url.rsplit("/", 1)[1])
+            urls = [url]
+            seen = self._seen(gen, png)
+            ok = True
+        except AuxPending as e:
+            failed = any(d.get("status") == "failed" for d in e.downloads)
+            text = f"error: {e}" if failed else f"downloading: {e}"
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False,
+                    "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": [],
+                    "download": [{k: d.get(k) for k in AUX_FIELDS if d.get(k) is not None} for d in e.downloads]}
+        except (ValueError, ImageJobFailed) as e:
+            text, ok = f"error: {e}", False
+        return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
+                **({"model_content": [
+                    {"type": "text", "text": text + " A small copy is attached: check that it shows what was asked."},
+                    {"type": "image", "source": str(seen)}]} if seen is not None else {}),
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls}
+
     def call(self, name: str, arguments, cancel: threading.Event | None = None) -> dict:
         if name == SKILL_TOOL:   # reading skills makes no image: not one of max_tool_calls' calls
             return self._read_skills(arguments)
@@ -4010,7 +4107,10 @@ class ImageTools:
                     "tool": name, "images": []}
         self.calls += 1
         args = arguments if isinstance(arguments, dict) else {}
+        if name in ("find_region", "remove_background"):
+            return self._aux_tool(name, args, t0, cancel)
         urls: list[str] = []
+        found: dict | None = None
         try:
             req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
             if self.user.get("layout") is not None:   # the user's boxes, at their size
@@ -4030,7 +4130,7 @@ class ImageTools:
                         raise ImageRequestError("layout: a JSON object") from None
                 w, h = parse_size(req.get("size"), 2048)
                 req["layout"] = tidy_layout(layout, w, h)
-            if name == "edit_image" and args.get("strength") not in (None, ""):
+            if name in ("edit_image", "edit_region") and args.get("strength") not in (None, ""):
                 req["strength"] = args["strength"]
             if name == "edit_image" and args.get("edit_adapter") not in (None, ""):
                 req["edit_adapter"] = args["edit_adapter"]
@@ -4083,6 +4183,16 @@ class ImageTools:
                                                             else MAX_REFS))   # as parse_edit_request counts them
                     images += [self.normalize(p) for p in self.attached() if p != data][:max(0, limit - 1)]
                 job = parse_edit_request(req, images, gen.cfg, mask)
+            elif name == "edit_region":   # the words' mask (image_regions: SAM 3 or Florence-2), then a masked edit
+                data = self._image(str(args.get("image") or ""))
+                if data is None:
+                    raise ImageRequestError("there is no image in the conversation to edit")
+                if not str(args.get("region") or "").strip():
+                    raise ImageRequestError("region: the words of the part to change")
+                from serve import image_regions
+                picture = self.normalize(data)
+                mask, found = image_regions.region_mask(self.svc, gen, picture, str(args["region"]), cancel=cancel)
+                job = parse_edit_request(req, [picture], gen.cfg, mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
             preview = None
@@ -4101,6 +4211,10 @@ class ImageTools:
             text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
                     f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. To change it, call edit_image "
                     f"(its image: {urls[0]}).")
+            if found is not None:   # where edit_region drew
+                text += (f" edit_region redrew {len(found['instances'])} {args['region']!r} region(s) that "
+                         f"{found['model']} found" + (f" ({found['fallback']})" if found.get("fallback") else "")
+                         + ".")
             if job.get("fix"):   # what the Detailer found and drew
                 fx = figures["fix"]
                 regs = fx["regions"]

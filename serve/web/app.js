@@ -3384,6 +3384,96 @@ function imgMaskSetup() {
   c.onpointerup = c.onpointercancel = () => { last = null; };
 })();
 $("img-mask-clear").onclick = () => { const c = $("img-mask-paint"); c.getContext("2d").clearRect(0, 0, c.width, c.height); };
+// the words' mask (POST /v1/images/segmentations: SAM 3, or Florence-2 where its license is not agreed to) painted
+// into the canvas over what is there, the brush free to change it after
+async function imgRegionMask() {
+  const f = ($("img-ref").files || [])[0], words = $("img-region").value.trim();
+  if (!f || !words) return;
+  $("img-region-go").disabled = true;
+  try {
+    const r = await fetch("v1/images/segmentations", {method: "POST", headers: headers(true),
+      body: JSON.stringify({image: await readAsDataURL(f), prompt: words})});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    const c = $("img-mask-paint"), g = c.getContext("2d");
+    const px = g.getImageData(0, 0, c.width, c.height);
+    for (const d of j.data) {
+      if (!d.mask) continue;
+      const im = new Image();
+      await new Promise((ok, no) => { im.onload = ok; im.onerror = no; im.src = "data:image/png;base64," + d.mask; });
+      const t = document.createElement("canvas");
+      t.width = c.width; t.height = c.height;
+      t.getContext("2d").drawImage(im, 0, 0, c.width, c.height);
+      const m = t.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+      for (let i = 0; i < m.length; i += 4)
+        if (m[i] > 127) { px.data[i] = 0xe1; px.data[i + 1] = 0x1d; px.data[i + 2] = 0x48; px.data[i + 3] = 255; }
+    }
+    g.putImageData(px, 0, 0);
+    $("img-hint").textContent = j.data.length ? tr("img.regionFound", "{n} found by {model}", {n: j.data.length, model: j.model})
+      : tr("img.regionNone", "Not found: try other words");
+    $("img-sam-license").hidden = !(j.strata && /license/.test(j.strata.fallback || ""));
+  } catch (e) {
+    toast("error", tr("img.regionGo", "Make mask"), String(e.message || e), 8000);
+  } finally {
+    $("img-region-go").disabled = false;
+  }
+}
+$("img-region-go").onclick = imgRegionMask;
+$("img-region").onkeydown = (ev) => { if (ev.key === "Enter") { ev.preventDefault(); imgRegionMask(); } };
+// the first image's subject cut out (POST /v1/images/remove-background: BiRefNet general), among the results
+$("img-rembg").onclick = async () => {
+  const f = ($("img-ref").files || [])[0];
+  if (!f) return;
+  $("img-rembg").disabled = true;
+  const t0 = performance.now();
+  try {
+    const r = await fetch("v1/images/remove-background", {method: "POST", headers: headers(true),
+      body: JSON.stringify({image: await readAsDataURL(f)})});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
+    img.src = `data:image/${j.output_format};base64,` + j.data[0].b64_json;
+    img.alt = cap.textContent = tr("img.rembgDone", "Background removed ({model}, {s} s)",
+      {model: j.model, s: ((performance.now() - t0) / 1000).toFixed(1)});
+    fig.append(img, cap);
+    $("img-results").prepend(fig);
+  } catch (e) {
+    toast("error", tr("img.rembg", "Remove background"), String(e.message || e), 8000);
+  } finally {
+    $("img-rembg").disabled = false;
+  }
+};
+// SAM 3's license (Meta's SAM License, fetched to show): agreed here, the server fetches its weights and finds parts
+// with it; until then Florence-2 (MIT) does
+$("img-sam-license").onclick = async (ev) => {
+  ev.preventDefault();
+  try {
+    const r = await fetch("v1/images/licenses/sam3", {headers: headers()});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    if (j.status !== "ready") { toast("info", tr("img.samLicense", "SAM 3's license…"), tr("img.samFetching", "Fetching the license's text: try again in a moment."), 6000); return; }
+    const d = document.createElement("dialog");
+    d.className = "attach-preview";
+    d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span></div><div class="attach-preview__body"><pre></pre></div>` +
+      `<div class="attach-preview__foot"><button type="button" class="st-btn" data-agree></button> <button type="button" class="st-btn" data-close></button></div>`;
+    d.querySelector(".attach-preview__name").textContent = tr("img.samTitle", "SAM 3.1: the SAM License (Meta's)");
+    d.querySelector("pre").textContent = j.text;
+    d.querySelector("[data-agree]").textContent = j.accepted ? tr("img.samAgreed", "Agreed") : tr("img.samAgree", "I agree");
+    d.querySelector("[data-agree]").disabled = !!j.accepted;
+    d.querySelector("[data-close]").textContent = tr("close", "Close");
+    d.querySelector("[data-close]").onclick = () => d.close();
+    d.querySelector("[data-agree]").onclick = async () => {
+      const a = await fetch("v1/images/licenses/sam3", {method: "POST", headers: headers(true), body: JSON.stringify({accept: true})});
+      if (a.ok) { $("img-sam-license").hidden = true; toast("info", tr("img.samTitle", "SAM 3.1: the SAM License (Meta's)"), tr("img.samDone", "Agreed: the next mask is found by SAM 3 (its weights, 1.7 GB, are fetched first)."), 8000); }
+      d.close();
+    };
+    d.addEventListener("close", () => d.remove());
+    document.body.appendChild(d);
+    d.showModal();
+  } catch (e) {
+    toast("error", tr("img.samLicense", "SAM 3's license…"), String(e.message || e), 8000);
+  }
+};
 // the mask as a data: URL, or null where nothing is painted
 function imgMask() {
   const c = $("img-mask-paint");

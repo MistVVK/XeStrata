@@ -316,8 +316,11 @@ uint8_t* rgba8_device(Buffers& b, const std::vector<uint8_t>& v) { return b.put(
 
 namespace {
 
-// src (RGBA8, device) at w x h by Pillow's filter into dst (device)
-void resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h, Filter filter) {
+// src (RGBA8, device) at w x h by Pillow's filter into dst (device); `pillow8`: the rows' pass rounded and clipped to
+// 8 bits before the columns', as Pillow's resampling of an 8-bit picture does (with Bicubic's and Lanczos's negative
+// lobes the float pass differs from Pillow's by up to 6 levels: Florence-2's 768 x 768 input, 2026-11-07)
+void resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int64_t w, int64_t h, Filter filter,
+                   bool pillow8 = false) {
     if (sw <= 0 || sh <= 0 || w <= 0 || h <= 0)
         throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
     Buffers b;
@@ -327,11 +330,16 @@ void resize_device(const uint8_t* src, int64_t sw, int64_t sh, uint8_t* dst, int
         Resize rz(b, sw, sh, w, h, filter);
         float* mid = b.get<float>((size_t) (4 * sh * w));
         rows_rgba8(src, sw, sh, 0, 0, sh, rz.tx, rz.lox, rz.wx, mid);
+        if (pillow8)
+            done(queue().parallel_for(sycl::range<1>((size_t) (4 * sh * w)), [=](sycl::id<1> id) {
+                float& v = mid[id[0]];
+                v = sycl::clamp(sycl::floor(v + 0.5f), 0.0f, 255.0f);
+            }), "resize: rows to 8 bits");
         columns(mid, 4, sh, w, rz.ty, rz.loy, rz.wy, planes, 0.0f, 255.0f);
     }
     done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const int64_t i = (int64_t) id[0];
-        for (int c = 0; c < 4; ++c) dst[i * 4 + c] = (uint8_t) sycl::round(planes[c * n + i]);
+        for (int c = 0; c < 4; ++c) dst[i * 4 + c] = (uint8_t) sycl::floor(planes[c * n + i] + 0.5f);
     }), "resize: outputs");
 }
 
@@ -350,7 +358,21 @@ uint64_t lanczos_resize_bytes(int64_t sw, int64_t sh, int64_t w, int64_t h) {
     return (uint64_t) (4 * w * h) * 4 + (uint64_t) (4 * sh * w) * 4 + taps(sw, w) + taps(sh, h);
 }
 
-QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) { return pillow_resize(src, w, h, Filter::lanczos); }
+QiRef lanczos_resize(const QiRef& src, int64_t w, int64_t h) {
+    if (src.width <= 0 || src.height <= 0 || src.rgba.size() != (size_t) (src.width * src.height * 4) || w <= 0 ||
+        h <= 0)
+        throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
+    Buffers b;
+    const uint8_t* pic = rgba8_device(b, src.rgba);
+    uint8_t* out = b.get<uint8_t>((size_t) (4 * w * h));
+    resize_device(pic, src.width, src.height, out, w, h, Filter::lanczos);
+    QiRef r;
+    r.width = w;
+    r.height = h;
+    r.rgba.resize((size_t) (4 * w * h));
+    gpu::copy(r.rgba.data(), out, r.rgba.size());
+    return r;
+}
 
 QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter) {
     if (src.width <= 0 || src.height <= 0 || src.rgba.size() != (size_t) (src.width * src.height * 4) || w <= 0 ||
@@ -359,7 +381,7 @@ QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter) {
     Buffers b;
     const uint8_t* pic = rgba8_device(b, src.rgba);
     uint8_t* out = b.get<uint8_t>((size_t) (4 * w * h));
-    resize_device(pic, src.width, src.height, out, w, h, filter);
+    resize_device(pic, src.width, src.height, out, w, h, filter, true);
     QiRef r;
     r.width = w;
     r.height = h;

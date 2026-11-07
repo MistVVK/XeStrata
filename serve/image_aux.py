@@ -13,9 +13,12 @@ beside the image models.
 ensure() returns at once: {"status": "ready", "path": ...} when the file is there; else it starts the download on a
 thread of its own (one per weight, however many requests ask) and returns {"status": "downloading", "name", "bytes",
 "total", "license", "source", "retry_s"}; a download that failed is {"status": "failed", "error", ...} until it is
-asked for again, which starts it over.  The caller (a tool) tells the chat so and does not wait: the chat's model calls
-it again later, in a new request.  Every step goes to the server's log through `say` (start, progress about every 10
-seconds, the check, the conversion, the end or the reason it stopped).
+asked for again, which starts it over.  A weight whose license the user must agree to first (AUX "consent": SAM 3's)
+is {"status": "consent", ...} and fetches nothing until accept() has recorded the agreement (<name>.accepted in the
+folder, which setup writes too); license_text() fetches the license's own text to show before that.  The caller (a
+tool) tells the chat so and does not wait: the chat's model calls it again later, in a new request.  Every step goes
+to the server's log through `say` (start, progress about every 10 seconds, the check, the conversion, the end or the
+reason it stopped).
 
 The file is fetched into <name>.part (resumed from its length after an interruption), checked against the pinned size
 and SHA-256 and only then converted, into a temporary file renamed into place: a reader never sees a part of one.  A
@@ -79,6 +82,34 @@ def path(name: str, root: Path) -> Path:
     return Path(root) / _qimage().AUX[name]["out"]
 
 
+def consent_mark(name: str, root: Path) -> Path:
+    return Path(root) / f"{name}.accepted"
+
+
+def needs_consent(name: str, root: Path) -> bool:
+    """A weight whose license the user has not agreed to yet."""
+    return bool(_qimage().AUX[name].get("consent")) and not consent_mark(name, root).is_file()
+
+
+def accept(name: str, root: Path, who: str) -> None:
+    """Records that the user agreed to `name`'s license (`who`: where, the web page or setup): ensure() fetches it."""
+    if not _qimage().AUX[name].get("consent"):
+        raise KeyError(name)
+    Path(root).mkdir(parents=True, exist_ok=True)
+    consent_mark(name, root).write_text(f"{time.strftime('%Y-%m-%d %H:%M')} {who}\n{info(name)['license']}\n",
+                                        encoding="utf-8")
+
+
+def license_text(name: str, root: Path, say: Callable[[str], None] | None = None) -> dict:
+    """The text of the license `name` asks consent to: {"status": "ready", "text"}, or its file's download status."""
+    lic = _qimage().AUX[name]["consent"]
+    got = ensure(lic, root, say)
+    if got["status"] != "ready":
+        return got
+    return {"status": "ready", "name": name, "license": info(name)["license"],
+            "text": Path(got["path"]).read_text(encoding="utf-8", errors="replace")}
+
+
 def ready(name: str, root: Path) -> bool:
     out = path(name, root)
     return out.is_file() and out.with_name(out.name + ".done").is_file()
@@ -102,6 +133,8 @@ def ensure(name: str, root: Path, say: Callable[[str], None] | None = None) -> d
         raise KeyError(name)
     if ready(name, root):
         return status(name, root)
+    if needs_consent(name, root):
+        return {**info(name), "status": "consent", "bytes": 0}
     with _lock:
         job = _jobs.get(name)
         if job is None or job["status"] == "failed":
@@ -146,7 +179,8 @@ def _run(name: str, root: Path, job: dict, say: Callable[[str], None]) -> None:
     a = q.AUX[name]
     repo, rpath, size, sha = q.FILES[a["file"]]
     out = path(name, root)
-    src = root / Path(rpath).name
+    # a file used as it is goes straight to its name (two versions' model.safetensors would otherwise meet)
+    src = out if a.get("convert") not in CONVERTERS else root / Path(rpath).name
     try:
         root.mkdir(parents=True, exist_ok=True)
         while True:
@@ -242,7 +276,7 @@ def _convert(a: dict, src: Path, out: Path, sha: str, say, name: str) -> None:
                            capture_output=True, text=True, timeout=CONVERT_TIMEOUT_S, check=False)
         if r.returncode != 0:
             raise OSError(f"the conversion failed: {(r.stderr or r.stdout).strip()[-300:]}")
-    else:
+    elif src != out:
         os.replace(src, out)
     out.with_name(out.name + ".done").write_text(f"{sha} {time.strftime('%Y-%m-%d %H:%M')}", encoding="utf-8")
 

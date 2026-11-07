@@ -4886,6 +4886,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
         ok(f"system prompt: {prompt.name} ({len(prompt.read_text(encoding='utf-8'))} characters) out of "
            f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
         write_ratio_head(QI, models_dir)
+    ask_sam3_license(a, models_dir / QI.AUX_DIR)
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
@@ -4899,6 +4900,25 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
            + (f", text encoder {p['tquant']}" if p['tquant'] else "")
            + f", GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
     return cfgs[0], cfgs[1:]
+
+
+def ask_sam3_license(a, aux: Path) -> None:
+    """SAM 3.1's weights (find_region, edit_region: words to masks) are under Meta's SAM License, so the server fetches
+    them only once the user has agreed (serve/image_aux.py, its record <aux>/sam3.accepted): asked here, no by default
+    and with --yes (agreeing is the user's own act); the web page's Images view asks it too.  Florence-2 (MIT) finds
+    the parts until then."""
+    QI = _qimage()
+    mark = aux / "sam3.accepted"
+    if mark.is_file():
+        return
+    say("  find_region and edit_region find a part of a picture by words with SAM 3.1, whose weights are under "
+        f"{QI.SAM3_LICENSE}; until you agree to it, Florence-2 (MIT) finds the parts (you can agree later on the web "
+        "page's Images view)")
+    if ask("  Agree to the SAM License (read it at the address above)?", ["y", "n"], "n", a.yes) != "y":
+        return
+    aux.mkdir(parents=True, exist_ok=True)
+    mark.write_text(f"{time.strftime('%Y-%m-%d %H:%M')} setup\n{QI.SAM3_LICENSE}\n", encoding="utf-8")
+    ok("the SAM License agreed to: the server fetches SAM 3.1 (1.7 GB) when a part is first found")
 
 
 def image_gpu(a, cfg: dict) -> str | None:

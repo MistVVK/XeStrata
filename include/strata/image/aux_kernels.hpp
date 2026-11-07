@@ -108,8 +108,8 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
 void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const float* mlp, int64_t hidden, int64_t heads,
                   float* tmp, float* bias, void* stream);
 
-/// x [H][W][C] -> y [(H / 2) (W / 2)][4C]: Swin's patch merging's gather, each 2 x 2 of the grid in the order (0, 0),
-/// (1, 0), (0, 1), (1, 1) (row offset first); H and W even.
+/// x [H][W][C] -> y [((H + 1) / 2) ((W + 1) / 2)][4C]: Swin's patch merging's gather, each 2 x 2 of the grid in the
+/// order (0, 0), (1, 0), (0, 1), (1, 1) (row offset first); an odd side padded with zeros, as Swin pads it.
 void aux_merge2(const float* x, int64_t H, int64_t W, int64_t C, float* y, void* stream);
 
 /// dst [H][W] at channels c0 .. c0 + C of rows ld wide = src [h][w][C] resized bilinearly (torch's interpolate,
@@ -133,9 +133,9 @@ void aux_col_mean(const float* x, int64_t P, int64_t C, float* mean, void* strea
 /// x [P][C] *= sigmoid(logit[p]), each pixel's channels by its own gate.
 void aux_scale_by_sigmoid(float* x, int64_t P, int64_t C, const float* logit, void* stream);
 
-/// y [S / g][S / g][3 g g] FP16 = img [S][S][3] rearranged as BiRefNet's image2patches ('b c (hg h) (wg w) -> b (c hg
-/// wg) h w'): channel (c, gy, gx) of pixel (y, x) the picture's (gy (S / g) + y, gx (S / g) + x).
-void aux_image_patches16(const float* img, int64_t S, int64_t g, uint16_t* y16, void* stream);
+/// y [SH / g][SW / g][3 g g] FP16 = img [SH][SW][3] rearranged as BiRefNet's image2patches ('b c (hg h) (wg w) -> b
+/// (c hg wg) h w'): channel (c, gy, gx) of pixel (y, x) the picture's (gy (SH / g) + y, gx (SW / g) + x).
+void aux_image_patches16(const float* img, int64_t SH, int64_t SW, int64_t g, uint16_t* y16, void* stream);
 
 /// y [H][W][3] (FP32) = (rgba[...] / 255 - mean[c]) / std[c] of an RGBA8 picture's RGB.
 void aux_rgb_norm(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, const float* std, float* y,
@@ -144,5 +144,23 @@ void aux_rgb_norm(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, 
 /// alpha [H][W] = 255 sigmoid of logits [h][w] resized bicubically (torch's interpolate, align_corners=False, A
 /// -0.75, the border replicated), rounded.
 void aux_alpha_bicubic(const float* logits, int64_t h, int64_t w, int64_t W, int64_t H, uint8_t* alpha, void* stream);
+
+// BiRefNet's refine_foreground (Photoroom's blur fusion, as its image_proc.py's GPU version runs it): the foreground's
+// colors estimated from the picture and the alpha, so a cut-out laid on another background carries no fringe of the
+// old one.  Two rounds of box means (90, then 6 pixels), each a stack, the means and their combination.
+
+/// x [n][7] = (a, F a, B (1 - a)) of the picture rgba (RGBA8) and its alpha (a = alpha / 255), F and B the picture's
+/// colors (fb null) or fb [n][6]'s (F, then B: the first round's).
+void aux_fg_stack(const uint8_t* rgba, const uint8_t* alpha, const float* fb, int64_t n, float* x, void* stream);
+
+/// y [H][W][C] = the mean of x over a k x k box (cv2.blur's: k / 2 - 1 before and k / 2 after a pixel when k is even,
+/// k / 2 each side when odd), the edges replicated; by rows into tmp, then by columns.
+void aux_box_mean(const float* x, int64_t H, int64_t W, int64_t C, int64_t k, float* tmp, float* y, void* stream);
+
+/// The round's foreground from the means y [n][7] (aux_fg_stack's, box-averaged): F = clamp(mF + a (I - a mF - (1 - a)
+/// mB)), mF = y[1..3] / (y[0] + 1e-5), mB = y[4..6] / (1 - y[0] + 1e-5); into fb [n][6] (F, mB) when given, and as
+/// RGB8 into rgb (255 F truncated, as torch's to(uint8)) when given.
+void aux_fg_combine(const uint8_t* rgba, const uint8_t* alpha, const float* y, int64_t n, float* fb, uint8_t* rgb,
+                    void* stream);
 
 }  // namespace strata::image

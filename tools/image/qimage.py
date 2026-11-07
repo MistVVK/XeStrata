@@ -103,6 +103,17 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "Bingsu/adetailer": "53cc19de382014514d9d4038601d261a7faa9b7b",                                # 2026-11-05
     "lllyasviel/Annotators": "982e7edaec38759d914a963c48c4726685de7d96",                           # 2026-11-05
     "Comfy-Org/SeedVR2": "df48879708206a403d2a61acd55578c2e80fd233",                               # 2026-11-06
+    "Comfy-Org/sam3.1": "7bb8374780a725b4353ed31f3a9395c9742b5621",                                # 2026-11-07
+    "openai/clip-vit-large-patch14": "32bd64288804d66eefd0ccbe215aa642df71cc41",                   # 2026-11-07
+    "microsoft/Florence-2-large": "21a599d414c4d928c9032694c424fb94458e3594",                      # 2026-11-07
+    "microsoft/Florence-2-base": "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac",                       # 2026-11-07
+    "ZhengPeng7/BiRefNet": "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4",                             # 2026-11-07
+    "ZhengPeng7/BiRefNet_lite": "aa62cd87eafb9cc43056d08ef3615a14628b831d",                        # 2026-11-07
+    "ZhengPeng7/BiRefNet_lite-2K": "3f789d2ba403e2ee59ce08ee9250d4c1c590b418",                     # 2026-11-07
+    "ZhengPeng7/BiRefNet-portrait": "b6561965a70070d9143fd9e558f6ca3c481510db",                    # 2026-11-07
+    "ZhengPeng7/BiRefNet-matting": "eccde0a8cbdce7ac5fecfeb06340fe7b949e85d9",                     # 2026-11-07
+    "ZhengPeng7/BiRefNet_HR": "a7a562f6fd16021180f2f4348f4de003a2d3d1e1",                          # 2026-11-07
+    "ZhengPeng7/BiRefNet_dynamic": "280306042f57b7a33854319da62fd86aaa89ec4c",                     # 2026-11-07
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -130,6 +141,10 @@ _AD = "Bingsu/adetailer"   # the Detailer's YOLOv8 detectors (fix_image)
 # as ControlNet's annotators keep it
 _ANN = "lllyasviel/Annotators"
 _SV = "Comfy-Org/SeedVR2"   # the upscaler SeedVR2 (ByteDance Seed's), its DiTs in FP16 and int8_convrot and its VAE
+_SAM = "Comfy-Org/sam3.1"   # SAM 3.1 (Meta's), as ComfyUI repackaged it: words to masks (find_region, edit_region)
+_CLIP = "openai/clip-vit-large-patch14"   # SAM 3's text encoder's tokenizer (CLIP's BPE)
+_FL = "microsoft/Florence-2-large"        # Florence-2: words to masks where SAM 3 is not taken, and boxes
+_FB = "microsoft/Florence-2-base"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -306,6 +321,32 @@ FILES = {
                         "98669fd2c06df5eca88baf68cd5c478775c8e61fc110e598c52b350145ea2660"),
     "seedvr2-3b-int8": (_SV, "diffusion_models/seedvr2_3b_int8_convrot.safetensors", 3_458_259_704,
                         "c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157"),
+    "sam3": (_SAM, "checkpoints/sam3.1_multiplex_fp16.safetensors", 1_745_546_848,
+             "9ba99c92703c2e8b4f47de2d34a539bb8e18923049e238b780d70dbe6368eb03"),
+    "sam3-license": (_SAM, "LICENSE", 7_352, "bec48f70bd37bf8280a9d1ebf01642d26086f6122ba735baa08fe03c5a6e7448"),
+    "clip-tokenizer": (_CLIP, "tokenizer.json", 2_224_003,
+                       "a83e0809aa4c3af7208b2df632a7a69668c6d48775b3c3fe4e1b1199d1f8b8f4"),
+    "florence-2-large": (_FL, "model.safetensors", 1_553_563_458,
+                         "4f38ce741c6b71188fe2b3419a55e11917a8a7b321ae2e63c61da0191b0ebad7"),
+    "florence-2-base": (_FB, "model.safetensors", 463_221_266,
+                        "03075d2d2d2bbd3e180b9ba0afae4aa8563226e2d32911656966e05b2f2ee060"),
+    "florence-2-tokenizer": (_FB, "tokenizer.json", 1_355_863,   # the large's the same bytes
+                             "847bbeab6174d66a88898f729d52fa8d355fafe1bea101cf960dd404581df70e"),
+    # BiRefNet's versions (ZhengPeng7's): the FP16 ones' 444 MB, lite's 178, portrait's and matting's 885 in FP32
+    "birefnet-general": ("ZhengPeng7/BiRefNet", "model.safetensors", 444_473_596,
+                         "9ab37426bf4de0567af6b5d21b16151357149139362e6e8992021b8ce356a154"),
+    "birefnet-lite": ("ZhengPeng7/BiRefNet_lite", "model.safetensors", 177_634_392,
+                      "4417d89795250e698c3cb0ae8df15743810065f646f48a694fdfa7ca052d0815"),
+    "birefnet-lite-2k": ("ZhengPeng7/BiRefNet_lite-2K", "model.safetensors", 177_634_392,
+                         "aa2e4a5af5eb3904694feb40f2b39ec5dd7cd9110906590cfeb982f09a46021d"),
+    "birefnet-portrait": ("ZhengPeng7/BiRefNet-portrait", "model.safetensors", 884_878_856,
+                          "4a4eb3a5469b75f0cccaec6772c22fc30e6c12ed429c2c0ba71b43e3d8d97182"),
+    "birefnet-matting": ("ZhengPeng7/BiRefNet-matting", "model.safetensors", 884_878_856,
+                         "a9875de5b1e6c8eb5fdaa8c727a82927ce442cdc87ba3abee6a77e6fa46c25bb"),
+    "birefnet-hr": ("ZhengPeng7/BiRefNet_HR", "model.safetensors", 444_473_596,
+                    "9d678bafec0b0019fbb073b7fd02f05ede25dc4b15254f23b2fb0be333200c0d"),
+    "birefnet-dynamic": ("ZhengPeng7/BiRefNet_dynamic", "model.safetensors", 444_473_596,
+                         "e3d2e4884e51ff30f0cd630edc6b1e41b06b7f23a0a2a5169f7b7cb33a711c2d"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -419,7 +460,8 @@ LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-
                "moss-mmproj": "Qwen3.5-9B-mmproj-F16.gguf",
                "anima-t5-tokenizer": "t5-tokenizer.json"}
 # the image tools the server offers for every model (serve/images.py TOOLS), for setup --describe
-IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "fix_image")
+IMAGE_TOOLS = ("generate_image", "edit_image", "extend_image", "upscale_image", "fix_image", "edit_region",
+               "find_region", "remove_background")
 # The image tools' auxiliary weights (serve/image_aux.py): name -> the FILES entry downloaded, what it is converted
 # with ("yolo": tools/image/yolo_pt.py, "esrgan": tools/image/esrgan.py, each a PyTorch checkpoint to safetensors; None:
 # used as it is), the file the engine reads, and the license shown when it is downloaded.  They live in AUX_DIR beside
@@ -432,6 +474,12 @@ _ESRGAN_LICENSE = ("BSD-3-Clause, Xintao Wang, Liangbin Xie, Chao Dong and Ying 
                    "(https://github.com/xinntao/Real-ESRGAN)")
 _SEEDVR2_LICENSE = ("Apache-2.0, ByteDance Seed's SeedVR2 (https://github.com/ByteDance-Seed/SeedVR), as Comfy-Org "
                     "repackaged it (https://huggingface.co/Comfy-Org/SeedVR2)")
+SAM3_LICENSE = ("the SAM License, Meta's (not an open-source license: it binds whoever uses the weights, and "
+                f"forbids some uses), https://huggingface.co/{_SAM}/blob/{REVISIONS[_SAM]}/LICENSE")
+_CLIP_LICENSE = f"MIT, OpenAI's CLIP (https://huggingface.co/{_CLIP})"
+_FLORENCE_LICENSE = f"MIT, Microsoft's Florence-2 (https://huggingface.co/{_FL})"
+_BIREFNET_LICENSE = "MIT, Peng Zheng's BiRefNet (https://github.com/ZhengPeng7/BiRefNet)"
+BIREFNET_VERSIONS = ("general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic")
 AUX = {
     "yolo-face": {"file": "yolo-face", "convert": "yolo", "out": "face_yolov8m.safetensors", "license": _YOLO_LICENSE},
     "yolo-hand": {"file": "yolo-hand", "convert": "yolo", "out": "hand_yolov8s.safetensors", "license": _YOLO_LICENSE},
@@ -445,6 +493,20 @@ AUX = {
     **{f"seedvr2-{v}-{q}": {"file": f"seedvr2-{v}-{q}", "convert": None,
                             "out": Path(FILES[f"seedvr2-{v}-{q}"][1]).name, "license": _SEEDVR2_LICENSE}
        for v in ("7b", "7b-sharp", "3b") for q in ("fp16", "int8")},
+    # SAM 3 only once the user has agreed to its license (serve/image_aux.py consent), its text fetched to show first
+    "sam3": {"file": "sam3", "convert": None, "out": "sam3.1_multiplex_fp16.safetensors", "license": SAM3_LICENSE,
+             "consent": "sam3-license"},
+    "sam3-license": {"file": "sam3-license", "convert": None, "out": "SAM-LICENSE.txt", "license": SAM3_LICENSE},
+    "clip-tokenizer": {"file": "clip-tokenizer", "convert": None, "out": "clip-vit-large-patch14-tokenizer.json",
+                       "license": _CLIP_LICENSE},
+    "florence-2-large": {"file": "florence-2-large", "convert": None, "out": "florence-2-large.safetensors",
+                         "license": _FLORENCE_LICENSE},
+    "florence-2-base": {"file": "florence-2-base", "convert": None, "out": "florence-2-base.safetensors",
+                        "license": _FLORENCE_LICENSE},
+    "florence-2-tokenizer": {"file": "florence-2-tokenizer", "convert": None, "out": "florence-2-tokenizer.json",
+                             "license": _FLORENCE_LICENSE},
+    **{f"birefnet-{v}": {"file": f"birefnet-{v}", "convert": None, "out": f"birefnet-{v}.safetensors",
+                         "license": _BIREFNET_LICENSE} for v in BIREFNET_VERSIONS},
 }
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
@@ -598,7 +660,10 @@ def aux_note() -> str:
     """What setup says of the image tools' weights, which it does not fetch (AUX)."""
     return ("The image tools' weights are fetched by the server the first time a tool needs them (not now): "
             f"fix_image's YOLOv8 detectors (face_yolov8m, hand_yolov8s, person_yolov8m-seg), {_YOLO_LICENSE}; the "
-            f"upscalers RealESRGAN x4plus, {_ESRGAN_LICENSE}, and SeedVR2 (7B, 7B sharp, 3B), {_SEEDVR2_LICENSE}")
+            f"upscalers RealESRGAN x4plus, {_ESRGAN_LICENSE}, and SeedVR2 (7B, 7B sharp, 3B), {_SEEDVR2_LICENSE}; "
+            f"find_region's and edit_region's SAM 3.1, under {SAM3_LICENSE}, fetched only after you agree to it "
+            f"(Florence-2 large or base instead until then, {_FLORENCE_LICENSE}); remove_background's BiRefNet "
+            f"(general, lite, lite-2K, portrait, matting, HR, dynamic), {_BIREFNET_LICENSE}")
 
 
 def license_note(dit: str) -> str:

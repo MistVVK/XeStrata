@@ -88,6 +88,8 @@ from serve.structured import (StructuredOutputError, answer_grammar, checked_cal
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import image_aux  # noqa: E402
+from serve import image_regions as regions_api  # noqa: E402
 from serve import loras as lora_api  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -7485,6 +7487,10 @@ def make_handler(svc: Service):
                                  "kept_replies": True,
                                  "debug_chat_log": svc.debug_log is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
+            elif path.startswith("/v1/images/licenses/"):   # a tool's weights' license to agree to (SAM 3's)
+                if not self._authorized():
+                    return
+                self._image_license(path[len("/v1/images/licenses/"):], None)
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
                     return
@@ -7582,6 +7588,8 @@ def make_handler(svc: Service):
                           "upscale": {"method": method, **({"variant": variant} if variant else {}),
                                       "scale": 4 if method == "realesrgan" else None}}
                          for name, (method, variant) in images_api.UPSCALE_MODELS.items()]
+                # the segmenters and BiRefNet: POST /v1/images/segmentations, /v1/images/remove-background
+                data += [{**m, **common, "status": {"value": "loaded"}} for m in regions_api.models()]
             return data
 
         def do_POST(self):
@@ -7684,6 +7692,14 @@ def make_handler(svc: Service):
                     return
                 if path == "/v1/images/upscale":              # a form (LocalAI's multipart) or JSON: read there
                     self._images_upscale()
+                    return
+                if path in ("/v1/images/segmentations", "/v1/images/remove-background",
+                            "/v2beta/stable-image/edit/remove-background"):   # forms or JSON (image_regions)
+                    self._images_regions(path)
+                    return
+                if path.startswith("/v1/images/licenses/"):   # agreeing to a tool's weights' license (SAM 3's)
+                    if self._own_page("a license can be agreed to"):
+                        self._image_license(path[len("/v1/images/licenses/"):], json.loads(self._body() or b"{}"))
                     return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -7881,8 +7897,27 @@ def make_handler(svc: Service):
                     mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
             # the image model it names; else the default, or where that one has no edits (MageTrail), the first that
             # edits - unless the request is img2img's (a strength or a mask), which the default takes
-            gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
+            region = req.pop("region", None)
+            region_model = req.pop("region_model", None)
+            gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None
+                                       or region not in (None, ""))
             images_api.check_tool(gen.cfg, "edit_image")
+            if region not in (None, ""):   # the words' mask (image_regions: SAM 3 or Florence-2) in the GPU's turn
+                images_api.check_tool(gen.cfg, "edit_region")
+                if mask is not None:
+                    raise ValueError("region: a mask or a region, not both")
+                if not files:
+                    raise ValueError("region: an image to find it in")
+                cancel = threading.Event()
+                self._watch_client(cancel)
+                try:
+                    mask, found = regions_api.region_mask(svc, gen, Vision.normalize(files[0]), str(region),
+                                                          region_model, cancel)
+                except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                    self._aux_failed(e)
+                    return
+                print(f"[strata] image: region {str(region)[:40]!r}: {len(found['instances'])} instance(s) by "
+                      f"{found['model']}", flush=True)
             for key, tool in (("fix", "fix_image"), ("upscale", "upscale_image"), ("extend", "extend_image")):
                 if req.get(key) is not None:
                     images_api.check_tool(gen.cfg, tool)
@@ -7899,6 +7934,16 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
                                            "message": images_api.not_set_up_message()}})
                 return
+            fields, picture = self._one_image()
+            req, model = images_api.upscale_request(fields)
+            gen = svc.images.pick_edit(model, True)
+            images_api.check_tool(gen.cfg, "upscale_image")
+            job = images_api.parse_edit_request(req, [Vision.normalize(picture, keep_alpha=True)], gen.cfg)
+            self._image_job(gen, job, edit=True)
+
+        def _one_image(self) -> tuple[dict, bytes]:
+            """A request of one image: a multipart form (its image file and text fields) or JSON (image: a data: URL,
+            an http(s) URL or a path, or {"image_url": ...}) -> (the fields, the image's bytes)."""
             body = self._body()
             ctype = self.headers.get("Content-Type", "") or ""
             if ctype.lower().startswith("multipart/form-data"):
@@ -7918,11 +7963,83 @@ def make_handler(svc: Service):
                 files = [svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)]
             if len(files) != 1:
                 raise ValueError("image: one image")
-            req, model = images_api.upscale_request(fields)
-            gen = svc.images.pick_edit(model, True)
-            images_api.check_tool(gen.cfg, "upscale_image")
-            job = images_api.parse_edit_request(req, [Vision.normalize(files[0], keep_alpha=True)], gen.cfg)
-            self._image_job(gen, job, edit=True)
+            return fields, files[0]
+
+        def _aux_failed(self, e: Exception) -> None:
+            """An image tool's request that could not run: its weights downloading or failed (AuxPending: 503, 500),
+            or the engine's failure (500)."""
+            if isinstance(e, images_api.AuxPending):
+                failed = any(d.get("status") == "failed" for d in e.downloads)
+                body = {"error": {
+                    "type": "server_error", "code": "weights_download_failed" if failed else "weights_downloading",
+                    "message": str(e), "downloads": [{k: v for k, v in d.items() if k != "path"}
+                                                     for d in e.downloads]}}
+                self._json(500 if failed else 503, body, headers=None if failed else {"Retry-After": image_aux.RETRY_S})
+                return
+            self._json(500, {"error": {"type": "server_error", "code": "image_tool_failed", "message": str(e)}})
+
+        def _images_regions(self, path: str) -> None:
+            """POST /v1/images/segmentations (vLLM-Omni's), /v1/images/remove-background (fal's BiRefNet fields,
+            vLLM-Omni's images answer) and Stability's /v2beta/stable-image/edit/remove-background (image_regions),
+            synchronous, in the image jobs' GPU turn; on the image model the GPU has now (none: the default)."""
+            if svc.images is None:
+                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                           "message": images_api.not_set_up_message()}})
+                return
+            fields, picture = self._one_image()
+            picture = Vision.normalize(picture)
+            gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
+            images_api.check_tool(gen.cfg, "find_region" if path.endswith("segmentations") else "remove_background")
+            svc.last_request_at = time.time()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            try:
+                if path == "/v1/images/segmentations":
+                    print(f"[strata] segmentation: {str(fields.get('prompt') or '')[:60]!r}", flush=True)
+                    self._json(200, regions_api.segmentation_response(svc, gen, fields, picture, cancel))
+                elif path == "/v1/images/remove-background":
+                    req = regions_api.remove_background_request(fields)
+                    print(f"[strata] remove background: BiRefNet {req['version']}", flush=True)
+                    addr = cast(Any, self.server.server_address)
+                    host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
+                    scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
+                    self._json(200, regions_api.remove_background_response(svc, gen, req, picture,
+                                                                           f"{scheme}://{host}", cancel))
+                else:   # Stability's: the image's bytes, or with Accept application/json {"image": base64}
+                    data, fmt = regions_api.stability_remove_background(svc, gen, fields, picture, cancel)
+                    if "application/json" in (self.headers.get("Accept") or ""):
+                        self._json(200, {"image": base64.b64encode(data).decode(), "finish_reason": "SUCCESS",
+                                         "seed": 0})
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", images_api.FORMATS[fmt])
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("finish-reason", "SUCCESS")
+                    self.send_header("seed", "0")
+                    self.end_headers()
+                    self.wfile.write(data)
+            except (images_api.AuxPending, images_api.ImageJobFailed) as e:
+                self._aux_failed(e)
+
+        def _image_license(self, name: str, req: dict | None) -> None:
+            """GET: a tool's weights' license (image_aux.license_text: SAM 3's, fetched to show) and whether it is
+            agreed to; POST {"accept": true} (from the server's own page): agreed (image_aux.accept)."""
+            if svc.images is None:
+                self._json(404, {"error": {"message": "the image tools are not set up"}})
+                return
+            q = image_aux._qimage()
+            if name not in q.AUX or not q.AUX[name].get("consent"):
+                self._json(404, {"error": {"message": f"no license to agree to for {name!r}"}})
+                return
+            root = image_aux.aux_dir(svc.images.default.cfg)
+            if req is not None:
+                if req.get("accept") is not True:
+                    raise ValueError('send {"accept": true} to agree to the license')
+                image_aux.accept(name, root, "the web page")
+                print(f"[strata] image tools: the {name} license agreed to on the web page", flush=True)
+            got = image_aux.license_text(name, root, lambda m: print(f"[strata] {m}", flush=True))
+            self._json(200, {**{k: v for k, v in got.items() if k != "path"},
+                             "accepted": not image_aux.needs_consent(name, root)})
 
         def _image_job(self, gen, job, stream=False, edit=False):
             """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one

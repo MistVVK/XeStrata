@@ -103,6 +103,12 @@ Sam3::Attn Sam3::attn(const std::string& name) {
 }
 
 void Sam3::load_weights() {
+    // again after a release(): what the last load built is gone with the GPU's buffers
+    vit_.clear();
+    fpn_.clear();
+    txt_.clear();
+    enc_.clear();
+    dec_.clear();
     patch_conv_ = conv(std::string(kV) + "trunk.patch_embed.proj", (int) patch_, 0);
     {
         // the pretraining's table without its class token's row: [24 * 24][wd]
