@@ -1652,11 +1652,11 @@ PACKAGES = {
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
     "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg"},
     "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg-free"},
     "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
-             "pdf": "poppler", "jsonschema": "python-jsonschema"},
+             "pdf": "poppler", "jsonschema": "python-jsonschema", "ffmpeg": "ffmpeg"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -2255,6 +2255,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     agrees (`install`: not with --check)."""
     if WIN:
         windows_libs(makers, gfx, yes, install)
+        check_ffmpeg()
         return
     check_igc(makers)
     check_xe_kernel(makers)
@@ -2262,6 +2263,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
     check_pdf()
     check_jsonschema()
+    check_ffmpeg()
     need, fast, repos = runtime_missing(makers)
     if not need and not fast:
         return
@@ -2308,6 +2310,20 @@ def check_pdf() -> None:
         return
     warn("a PDF a request sends is read with poppler's pdftotext and pdftoppm (without them it is refused):")
     say(f"  {install_cmd([tool_pkg('pdf')])}")
+
+
+def check_ffmpeg() -> None:
+    """The video tools (SeedVR2's and SAM 3's videos) read and write a video with the ffmpeg and ffprobe commands, run
+    as programs (not part of XeStrata: the deb and rpm packages recommend the distribution's, the Windows 7z does not
+    carry them).  Without them only the video tools are refused: said, with the command that installs them, never a
+    stop."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+    warn("the video tools read and write a video with ffmpeg and ffprobe (without them a video is refused):")
+    if WIN:
+        say("  install ffmpeg (https://ffmpeg.org/download.html) and put its bin folder on the PATH")
+    else:
+        say(f"  {install_cmd([tool_pkg('ffmpeg')])}")
 
 
 def check_jsonschema() -> None:

@@ -212,10 +212,17 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- host-only platform and n-gram reader ----------------------------------
 # These never touched the GPU runtime; they sat inside the CUDA build only because their consumers did.
-add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_file.cpp)
+add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp)
 target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
+
+# A video's frames in and out through the ffmpeg and ffprobe commands (host only; not linked into the engine's
+# start: a machine without ffmpeg runs everything but the video tools)
+add_library(strata_video STATIC src/video/video_io.cpp)
+target_link_libraries(strata_video PUBLIC strata_platform)
+add_executable(strata-video-probe src/video/video_probe.cpp)
+target_link_libraries(strata-video-probe PRIVATE strata_video)
 
 # `ngram.cpp` is the PLE hash and table geometry the GPU PLE block will share with the reader.
 add_library(strata_ngram STATIC src/kernels/ngram.cpp src/ngram/ple_reader.cpp)
@@ -1180,7 +1187,7 @@ if(STRATA_ENABLE_XE)
   # qi_image_io.cpp alone, its own warnings not the build's
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
   set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
-  target_link_libraries(strata_image PUBLIC strata_prefill)
+  target_link_libraries(strata_image PUBLIC strata_prefill strata_video)
   add_executable(strata-image-lora-probe src/image/lora_probe.cpp)
   target_link_libraries(strata-image-lora-probe PRIVATE strata_image)
   # the adapter's delta (y += scale (x A^T) B^T) against an FP64 reference: the plain form, a fused weight's rows, a

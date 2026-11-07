@@ -22,12 +22,20 @@
 // distribution, the lightness mostly kept: SeedVR2's), adain (each RGB channel's mean and spread) or none.  These are
 // SeedVR2's names for its corrections (vLLM-Omni's color_correction_method, ComfyUI's SeedVR2PostProcessing); each
 // model has its default.
+//
+// A video (run_video) goes the same way frame by frame: read a few frames at a time from its file (video_io.hpp), each
+// at the size asked for through the model, the colors corrected against the frame it came from, written to a file with
+// the source's audio.  A model whose frames depend on the others (temporal(): SeedVR2's) takes the frames in time
+// (video_begin, video_push, its frames ready later, video_end); the others each frame on its own (run's way).
 #pragma once
 
 #include "strata/image/pipeline.hpp"
+#include "strata/video/video_io.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace strata::upscale {
@@ -80,6 +88,26 @@ public:
     /// The last run's parts' seconds as key=value words (a model of several parts: SeedVR2's encode, DiT, decode);
     /// empty where it has none to tell.
     virtual std::string parts() const { return {}; }
+    /// A model whose frames depend on the others in a video (a video's frames through video_begin .. video_end; the
+    /// others' each through run_clip).
+    virtual bool temporal() const { return false; }
+    /// The temporal models' video, frames of w x h (the model's multiples) RGBA8 on the GPU: begun (about `frames`
+    /// of them; chunks of `chunk` frames overlapping by `overlap` where it cuts the video so, 0 its own choice), the
+    /// frames pushed in order, those made taken as they are ready, then the end (the rest made ready).
+    virtual void video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, int64_t chunk, int64_t overlap) {
+        (void) w, (void) h, (void) frames, (void) seed, (void) chunk, (void) overlap;
+        throw std::logic_error("upscale: not a temporal model");
+    }
+    virtual void video_push(const uint8_t* in, int64_t n) { (void) in, (void) n; }
+    virtual int64_t video_ready() const { return 0; }
+    virtual void video_take(uint8_t* out, int64_t n) { (void) out, (void) n; }
+    virtual void video_end() {}
+    /// A temporal model's VRAM for a video's chunk of `chunk` frames of w x h besides its weights, at its least
+    /// (`least`) or whole (0 for the others).
+    virtual uint64_t video_bytes(int64_t w, int64_t h, int64_t chunk, bool least) const {
+        (void) w, (void) h, (void) chunk, (void) least;
+        return 0;
+    }
 };
 
 /// The model `name` ("lanczos", "realesrgan") from its weights' file `path` (none for Lanczos) -> the model;
@@ -104,6 +132,25 @@ struct Report {
     bool color_applied = false;   // false where the statistics gave nothing to move (a flat image)
 };
 
+/// A video's upscale: its frames as Request's, the temporal models' chunks (0: the model's choice) and the file's
+/// codec.
+struct VideoRequest {
+    Request frame;
+    int64_t chunk = 0, overlap = 0;
+    video::Codec codec = video::Codec::automatic;
+};
+
+/// What a video's run made: the file, its frames and their rate (the source's average: a VFR source was read at it),
+/// the parts' seconds.
+struct VideoReport {
+    std::string path, mime;
+    int64_t frames = 0, width = 0, height = 0;
+    double fps = 0.0;
+    bool vfr = false;
+    double read_s = 0.0, model_s = 0.0, resize_s = 0.0, color_s = 0.0, write_s = 0.0;
+    ColorFix color = ColorFix::none;
+};
+
 class UpscaleRunner {
 public:
     /// `src` (RGBA8) at r.width x r.height through `m`, in `avail` bytes of VRAM (the model's weights included): the
@@ -114,6 +161,13 @@ public:
     static uint64_t least_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h,
                                 ColorFix color);
     static uint64_t full_bytes(const UpscaleModel& m, int64_t sw, int64_t sh, int64_t w, int64_t h, ColorFix color);
+    /// The video `in` upscaled to r.frame's size through `m` into `stem` + its container's extension, in `avail`
+    /// bytes of VRAM; `step` told each frame written (the frames written, the source's count, an estimate where its
+    /// stream gives none), false from it stops the run (std::runtime_error, the file not left).  video::VideoError for
+    /// a file it does not read or write.
+    static VideoReport run_video(UpscaleModel& m, const std::string& in, const std::string& stem,
+                                 const VideoRequest& r, uint64_t avail,
+                                 const std::function<bool(int64_t, int64_t)>& step = nullptr);
 };
 
 }  // namespace strata::upscale

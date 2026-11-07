@@ -69,6 +69,7 @@ python3-requests, python3-pil, python3-psutil, python3-jsonschema"
     vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-tools"   # cjxl: the images' JPEG XL (serve/images.py)
     pdf="poppler-utils"  # a PDF a request sends: pdftotext and pdftoppm (serve/server.py read_file)
+    ffmpeg="ffmpeg"      # the video tools' input and output: ffmpeg and ffprobe (src/video/video_io.cpp)
     if [ "$license" = contrib ]; then
       case "$cuda_ver" in
         12.4) apt-get install -y -q --no-install-recommends nvidia-cuda-toolkit
@@ -100,6 +101,7 @@ python3-requests, python3-pillow, python3-psutil, python3-jsonschema"
     vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-utils"
     pdf="poppler-utils"     # as on Ubuntu
+    ffmpeg="ffmpeg-free"    # Fedora's own ffmpeg (H.264 through openh264, else VP9: video_io.cpp takes what it has)
     if [ "$license" = contrib ]; then
       dnf install -y -q dnf5-plugins   # config-manager
       dnf config-manager addrepo \
@@ -195,10 +197,10 @@ lap engine
 # maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver and AMD's
 # ROCm libraries (both free software, for the GPUs it runs), and the cuda ones, for a PC with GPUs of one maker or
 # more, only suggest every maker's, so that apt and dnf do not install the others'.  Every package recommends libjxl's
-# tools (the images' JPEG XL) and poppler's (a PDF a request sends).  jsonschema is a Python module it depends on: a
+# tools (the images' JPEG XL), poppler's (a PDF a request sends) and ffmpeg (the video tools).  jsonschema is a Python module it depends on: a
 # strict request is refused without it (serve/structured.py).
 depends=$python_deps
-recommends="$jxl, $pdf"
+recommends="$jxl, $pdf, $ffmpeg"
 suggests=""
 # the packages of the libraries the HIP adapter and oneMath's rocBLAS backend open: ROCm's HIP runtime, rocBLAS and
 # hipBLASLt

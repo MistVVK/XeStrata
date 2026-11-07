@@ -112,6 +112,19 @@
 //                            tile=... tiles=...
 //   UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
 //                            the VRAM that upscale needs (from the files)                   -> NEED as NEED's
+//   UPSVNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
+//                            the VRAM a video's upscale needs: UPSNEED's, a temporal model's chunk of one latent
+//                            in the VAE's smallest tiles (least) or of 21 frames with the frame whole (full, the
+//                            default chunk of ComfyUI's template) added                    -> NEED as NEED's
+//   UPSV <width> <height> <in> <out stem> <name>[:<path>] [COLOR:<m>] [SEED:<s>] [CHUNK:<frames>] [OVERLAP:<latents>]
+//        [CODEC:<h264|vp9|ffv1>]
+//                            the video <in> (a file ffmpeg reads) upscaled to width x height by the upscaler, written
+//                            to <out stem> + its container's extension with the source's audio (upscale.hpp's
+//                            run_video: SeedVR2 in time, in chunks of CHUNK frames overlapping by OVERLAP latents, 0
+//                            its own choice; the others frame by frame); the image model's room let go first
+//                            -> STAGE upscale-video, STEP <frames written> <frames>, then UPSVIDEO path=... mime=...
+//                            frames=... width=... height=... fps=... vfr=... upscale_s=... read_s=... model_s=...
+//                            resize_s=... color_s=... write_s=... color=...
 // The image tools' auxiliary models (aux_net.hpp: their weights image_aux's files), on a picture (PNG, JPEG...):
 //   SEGMENT <weights> <picture> <ids> <score threshold> <mask threshold> <masks>
 //                            SAM 3: the instances of the words (CLIP's ids), highest score first, each mask written to
@@ -896,7 +909,9 @@ int serve(si::ImagePipeline& p) {
         std::string op;
         ls >> op;
         try {
-            if (op == "IMG" || op == "NEED" || op == "RATIO" || op == "UPS" || op == "UPSNEED") aux_yield(aux);
+            if (op == "IMG" || op == "NEED" || op == "RATIO" || op == "UPS" || op == "UPSNEED" || op == "UPSV" ||
+                op == "UPSVNEED")
+                aux_yield(aux);
             if (op == "QUIT") {
                 break;
             } else if (op == "IMG") {
@@ -1013,6 +1028,73 @@ int serve(si::ImagePipeline& p) {
                             "color=%s tile=%lld tiles=%lld%s%s\n", (long long) big.width, (long long) big.height, secs,
                             rep.model_s, rep.resize_s, rep.color_s, rep.color_applied ? su::color_name(rep.color) : "none",
                             (long long) rep.tile, (long long) rep.tiles, parts.empty() ? "" : " ", parts.c_str());
+            } else if (op == "UPSV") {   // UPSV <width> <height> <in> <out stem> <name>[:<path>] [words]
+                su::VideoRequest vr;
+                std::string src, stem, spec;
+                ls >> vr.frame.width >> vr.frame.height >> src >> stem >> spec;
+                if (!ls || spec.empty())
+                    throw std::invalid_argument("UPSV <width> <height> <in> <out stem> <name>[:<path>] [COLOR:<m>]");
+                for (std::string word; ls >> word;) {
+                    if (word.rfind("COLOR:", 0) == 0) {
+                        vr.frame.color = su::parse_color(word.substr(6));
+                        vr.frame.color_set = true;
+                    } else if (word.rfind("SEED:", 0) == 0) {
+                        vr.frame.seed = std::stoull(word.substr(5));
+                    } else if (word.rfind("CHUNK:", 0) == 0) {
+                        vr.chunk = std::stoll(word.substr(6));
+                    } else if (word.rfind("OVERLAP:", 0) == 0) {
+                        vr.overlap = std::stoll(word.substr(8));
+                    } else if (word.rfind("CODEC:", 0) == 0) {
+                        const std::string c = word.substr(6);
+                        vr.codec = c == "h264" ? strata::video::Codec::h264 : c == "vp9" ? strata::video::Codec::vp9
+                                   : c == "ffv1" ? strata::video::Codec::ffv1
+                                                 : throw std::invalid_argument("UPSV: CODEC: h264, vp9 or ffv1");
+                    } else {
+                        throw std::invalid_argument("UPSV: unknown word " + word);
+                    }
+                }
+                su::UpscaleModel& m = ups.get(spec);
+                p.release(true);   // a video's run is long: the image model's room its
+                const uint64_t avail = ups_room(p, m);
+                std::printf("STAGE upscale-video\n");
+                std::fflush(stdout);
+                in.stop = false;
+                const auto t0 = std::chrono::steady_clock::now();
+                const auto step = [&in](int64_t d, int64_t n) {
+                    std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
+                    std::fflush(stdout);
+                    return !in.stop.load();
+                };
+                const su::VideoReport vp = su::UpscaleRunner::run_video(m, src, stem, vr, avail, step);
+                const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                const std::string parts = m.parts();
+                std::printf("UPSVIDEO path=%s mime=%s frames=%lld width=%lld height=%lld fps=%.6f vfr=%d "
+                            "upscale_s=%.3f read_s=%.3f model_s=%.3f resize_s=%.3f color_s=%.3f write_s=%.3f "
+                            "color=%s%s%s\n",
+                            vp.path.c_str(), vp.mime.c_str(), (long long) vp.frames, (long long) vp.width,
+                            (long long) vp.height, vp.fps, (int) vp.vfr, secs, vp.read_s, vp.model_s, vp.resize_s,
+                            vp.color_s, vp.write_s, su::color_name(vp.color), parts.empty() ? "" : " ", parts.c_str());
+            } else if (op == "UPSVNEED") {   // UPSVNEED <width> <height> <in width> <in height> <name>[:<path>]
+                int64_t w = 0, h = 0, iw = 0, ih = 0;
+                std::string spec, word;
+                ls >> w >> h >> iw >> ih >> spec;
+                if (!ls || spec.empty())
+                    throw std::invalid_argument("UPSVNEED <width> <height> <in width> <in height> <name>[:<path>]");
+                su::UpscaleModel& m = ups.get(spec);
+                su::ColorFix color = m.info().color;
+                if (ls >> word && word.rfind("COLOR:", 0) == 0) color = su::parse_color(word.substr(6));
+                size_t free = 0, total = 0;
+                strata::gpu::mem_info(&free, &total);
+                const int64_t mul = std::max<int64_t>(1, m.info().multiple);
+                const int64_t fw = (w + mul - 1) / mul * mul, fh = (h + mul - 1) / mul * mul;
+                const uint64_t least =
+                    su::UpscaleRunner::least_bytes(m, iw, ih, w, h, color) + m.video_bytes(fw, fh, 1, true);
+                const uint64_t full =
+                    su::UpscaleRunner::full_bytes(m, iw, ih, w, h, color) + m.video_bytes(fw, fh, 21, false);
+                std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=0\n",
+                            (unsigned long long) (least >> 20), (unsigned long long) (full >> 20),
+                            (unsigned long long) ((p.held() + ups.held()) >> 20), (unsigned long long) (free >> 20),
+                            (unsigned long long) (total >> 20));
             } else if (op == "UPSNEED") {   // UPSNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:]
                 int64_t w = 0, h = 0, iw = 0, ih = 0;
                 std::string spec, word;
@@ -1277,6 +1359,8 @@ int upscale_main(int argc, char** argv) {
     double scale = 0.0;
     uint64_t budget = 0;
     int repeat = 1;
+    bool video = false;
+    int64_t chunk = 0, overlap = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -1284,6 +1368,9 @@ int upscale_main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--upscale") in = val();
+        else if (a == "--video") video = true;
+        else if (a == "--chunk") chunk = std::stoll(val());
+        else if (a == "--overlap") overlap = std::stoll(val());
         else if (a == "--upscaler") name = val();
         else if (a == "--model") model = val();
         else if (a == "--out") out = val();
@@ -1303,10 +1390,39 @@ int upscale_main(int argc, char** argv) {
     if (in.empty() || out.empty() || name.empty()) {
         std::fprintf(stderr, "usage: %s --upscale IMAGE --upscaler lanczos|realesrgan [--model WEIGHTS] --out "
                      "IMAGE.rgba [--width W --height H | --scale S] [--color none|lab|adain|wavelet] [--tile N] "
-                     "[--budget-mib M] [--repeat N]\n", argv[0]);
+                     "[--budget-mib M] [--repeat N] [--video [--chunk FRAMES] [--overlap LATENTS]]\n"
+                     "  --video: IMAGE a video and --out its file's stem (the container's extension added)\n", argv[0]);
         return 2;
     }
     const std::unique_ptr<su::UpscaleModel> m = su::open_model(name, model);
+    if (video) {
+        const strata::video::Info info = strata::video::probe(in);
+        su::VideoRequest vr;
+        vr.frame = rq;
+        vr.chunk = chunk;
+        vr.overlap = overlap;
+        if (vr.frame.width <= 0 || vr.frame.height <= 0) {
+            const double s = scale > 0.0 ? scale : (m->info().scale > 0 ? m->info().scale : 2.0);
+            vr.frame.width = (int64_t) std::lround((double) info.width * s);
+            vr.frame.height = (int64_t) std::lround((double) info.height * s);
+        }
+        size_t free = 0, total = 0;
+        strata::gpu::mem_info(&free, &total);
+        const uint64_t room = budget > 0 ? budget : (uint64_t) free;
+        const auto t0 = std::chrono::steady_clock::now();
+        const su::VideoReport vp = su::UpscaleRunner::run_video(*m, in, out, vr, room, [](int64_t d, int64_t n) {
+            std::fprintf(stderr, "\rframe %lld / %lld", (long long) d, (long long) n);
+            return true;
+        });
+        std::fprintf(stderr, "\n");
+        std::printf("UPSVIDEO path=%s frames=%lld width=%lld height=%lld fps=%.3f vfr=%d upscale_s=%.3f read_s=%.3f "
+                    "model_s=%.3f resize_s=%.3f color_s=%.3f write_s=%.3f color=%s %s\n",
+                    vp.path.c_str(), (long long) vp.frames, (long long) vp.width, (long long) vp.height, vp.fps,
+                    (int) vp.vfr, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                    vp.read_s, vp.model_s, vp.resize_s, vp.color_s, vp.write_s, su::color_name(vp.color),
+                    m->parts().c_str());
+        return 0;
+    }
     const si::QiRef src = read_image(in);
     if (rq.width <= 0 || rq.height <= 0) {
         const double s = scale > 0.0 ? scale : (m->info().scale > 0 ? m->info().scale : 2.0);

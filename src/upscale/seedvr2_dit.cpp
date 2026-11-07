@@ -492,18 +492,19 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
     }
 }
 
-// the window layouts of an h x w grid (one frame): each window's joint rows (its text rows, then its video tokens in the
-// window's order, padded to qi_attn_rows) and its tokens' RoPE, window-local
-void Seedvr2Dit::layout(int which, int64_t h, int64_t w, std::vector<void*>& owned) {
+// the window layouts of a t x h x w grid (t latent frames): each window's joint rows (its text rows, then its video
+// tokens in the window's order, padded to qi_attn_rows) and its tokens' RoPE, window-local
+void Seedvr2Dit::layout(int which, int64_t t, int64_t h, int64_t w, std::vector<void*>& owned) {
     static const int64_t kNum[3] = {4, 3, 3};   // the release's window: 720p's grid in 4 x 3 x 3
-    const std::vector<Win> wins = windows_of(1, h, w, which == 1, kNum);
+    const std::vector<Win> wins = windows_of(t, h, w, which == 1, kNum);
     Layout& l = lay_[which];
     l.windows = (int64_t) wins.size();
     l.at.clear();
     l.len.clear();
     std::vector<int32_t> src;
     const int64_t half = hd_ / 2, nf = (int64_t) freqs_.size();
-    std::vector<float> cs((size_t) (h * w * half), 1.f), sn((size_t) (h * w * half), 0.f);
+    const int64_t N = t * h * w;
+    std::vector<float> cs((size_t) (N * half), 1.f), sn((size_t) (N * half), 0.f);
     int64_t covered = 0;
     for (const Win& v : wins) {
         const int64_t wt = v.t1 - v.t0, wh = v.h1 - v.h0, ww = v.w1 - v.w0, n = wt * wh * ww, rows = L_ + n;
@@ -513,7 +514,7 @@ void Seedvr2Dit::layout(int which, int64_t h, int64_t w, std::vector<void*>& own
         for (int64_t a = 0; a < wt; ++a)
             for (int64_t y = 0; y < wh; ++y)
                 for (int64_t x = 0; x < ww; ++x) {
-                    const int64_t tok = (v.h0 + y) * w + (v.w0 + x);   // one frame: the frame index is 0
+                    const int64_t tok = ((v.t0 + a) * h + v.h0 + y) * w + (v.w0 + x);
                     src.push_back((int32_t) tok);
                     // the 7B's pixel positions (-1 .. 1 over the window), the 3B's integer ones (the frame after the
                     // text's rows)
@@ -529,28 +530,28 @@ void Seedvr2Dit::layout(int which, int64_t h, int64_t w, std::vector<void*>& own
                 }
         for (int64_t r = rows; r < image::qi_attn_rows(rows); ++r) src.push_back(kPad);
     }
-    if (covered != h * w) throw std::runtime_error("image engine (SeedVR2 DiT): the windows are not a partition");
+    if (covered != N) throw std::runtime_error("image engine (SeedVR2 DiT): the windows are not a partition");
     l.jrows = (int64_t) src.size();
     l.src = alloc<int32_t>(owned, l.jrows);
     gpu::copy(l.src, src.data(), src.size() * 4);
     const std::vector<int32_t> starts(l.at.begin(), l.at.end());
     l.starts = alloc<int32_t>(owned, l.windows);
     gpu::copy(l.starts, starts.data(), starts.size() * 4);
-    l.cos = alloc<float>(owned, h * w * half);
-    l.sin = alloc<float>(owned, h * w * half);
+    l.cos = alloc<float>(owned, N * half);
+    l.sin = alloc<float>(owned, N * half);
     gpu::copy(l.cos, cs.data(), cs.size() * 4);
     gpu::copy(l.sin, sn.data(), sn.size() * 4);
 }
 
-uint64_t Seedvr2Dit::activation_bytes(int64_t h, int64_t w) const {
-    const int64_t N = h * w;
+uint64_t Seedvr2Dit::activation_bytes(int64_t h, int64_t w, int64_t t) const {
+    const int64_t N = t * h * w;
     // the joint rows at most: each window's text, its tokens, and up to 127 rows of padding a window
     int64_t jr = 0;
     for (int which = 0; which < 2; ++which) {
         static const int64_t kNum[3] = {4, 3, 3};
-        const auto wins = windows_of(1, h, w, which == 1, kNum);
+        const auto wins = windows_of(t, h, w, which == 1, kNum);
         int64_t r = 0;
-        for (const Win& v : wins) r += image::qi_attn_rows(L_ + (v.h1 - v.h0) * (v.w1 - v.w0));
+        for (const Win& v : wins) r += image::qi_attn_rows(L_ + (v.t1 - v.t0) * (v.h1 - v.h0) * (v.w1 - v.w0));
         jr = std::max(jr, r);
     }
     const uint64_t f32 = (uint64_t) (N * C_ * 2 + L_ * C_ * 2 + N * 3 * C_ + L_ * 3 * C_ + N * (v2_ ? 2 : 1) * F_ +
@@ -566,17 +567,17 @@ uint64_t Seedvr2Dit::activation_bytes(int64_t h, int64_t w) const {
 void Seedvr2Dit::drop_activations() {
     for (void* p : act_) gpu::free(p);
     act_.clear();
-    cap_h_ = cap_w_ = 0;
+    cap_t_ = cap_h_ = cap_w_ = 0;
     held_ = 0;
     for (Layout& l : lay_) l = Layout();
 }
 
-void Seedvr2Dit::ensure(int64_t h, int64_t w) {
-    if (h == cap_h_ && w == cap_w_) return;
+void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
+    if (t == cap_t_ && h == cap_h_ && w == cap_w_) return;
     drop_activations();
-    const int64_t N = h * w;
-    layout(0, h, w, act_);
-    layout(1, h, w, act_);
+    const int64_t N = t * h * w;
+    layout(0, t, h, w, act_);
+    layout(1, t, h, w, act_);
     const int64_t jr = std::max(lay_[0].jrows, lay_[1].jrows);
     x_ = alloc<float>(act_, N * C_);
     y_ = alloc<float>(act_, N * C_);
@@ -620,9 +621,10 @@ void Seedvr2Dit::ensure(int64_t h, int64_t w) {
     } else if (q8_) {
         rot16_ = alloc<uint16_t>(act_, std::max(N, L_) * std::max(C_, F_));
     }
+    cap_t_ = t;
     cap_h_ = h;
     cap_w_ = w;
-    held_ = activation_bytes(h, w);
+    held_ = activation_bytes(h, w, t);
 }
 
 MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
@@ -711,9 +713,9 @@ void Seedvr2Dit::stream_mlp(const Stream& st, const uint8_t* base, float* x, int
     rows::gate_add(x, y, mod + 5 * C_, T, C_, s_);
 }
 
-void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out) {
-    ensure(h, w);
-    const int64_t N = h * w, C = C_, L = L_;
+void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t) {
+    ensure(t, h, w);
+    const int64_t N = t * h * w, C = C_, L = L_;
     patch_in16(noise, cond, N, lat_, kin_, in16_, s_);
     product(in16_, nullptr, vin_, nullptr, x_, N, b_vin_);
     gpu::copy_async(t_, txt0_, (size_t) (L * C) * 4, s_);

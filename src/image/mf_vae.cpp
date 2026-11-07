@@ -61,6 +61,14 @@ template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
     return p;
 }
 
+template<class T> T* alloc_pinned(std::vector<void*>& owned, int64_t n) {
+    void* p = gpu::alloc_host((size_t) std::max<int64_t>(n, 1) * sizeof(T));
+    if (p == nullptr)
+        throw std::runtime_error(std::string("image engine (Mage-VAE): pinned host memory: ") + gpu::last_error());
+    owned.push_back(p);
+    return static_cast<T*>(p);
+}
+
 void release(std::vector<void*>& owned, void* p) {
     if (p == nullptr) return;
     owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
@@ -283,6 +291,17 @@ void f2_shuffle16(const float* in, int64_t H, int64_t W, int64_t C, uint16_t* ou
     });
 }
 
+// SeedVR2's video upsampling: out16[z][2 Y + x][2 X + y][c] = in[Y][X][((2 x + y) Z + z) C + c], in [H][W][4 Z C]
+// (its 1 x 1 convolution's output, the reference's "(x y z c)" channels): Z frames of 2 H x 2 W
+void f2_shuffle_t16(const float* in, int64_t H, int64_t W, int64_t C, int64_t Z, uint16_t* out16, void* s) {
+    const int64_t W2 = 2 * W, F = 4 * H * W * C;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (Z * F)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t z = i / F, r = i - z * F, p = r / C, c = r - p * C, Y2 = p / W2, X2 = p - Y2 * W2;
+        out16[i] = f16_from_f32(in[((Y2 / 2) * W + X2 / 2) * 4 * Z * C + ((2 * (Y2 % 2) + X2 % 2) * Z + z) * C + c]);
+    });
+}
+
 // the Flux2 VAE encoder's input: out16[p][c] = rgb[c][p] for the 3 channels, 0 for the other 5 (its first
 // convolution's input widened to 8 channels)
 void f2_rgb8_16(const float* rgb, int64_t HW, uint16_t* out16, void* s) {
@@ -438,6 +457,11 @@ MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, i
     c.k = t->shape.size() >= 4 ? t->shape[t->shape.size() - 1] : 1;
     if (c.in % 8 != 0) throw std::runtime_error("image engine (Mage-VAE): " + name + ": input channels not 8s");
     weight_bytes_ += (uint64_t) (c.out * c.k * c.k * c.in) * 2;
+    const bool taps = video_ && kt > 1;   // the video form: each time tap besides their sum
+    if (taps) {
+        c.kt = kt;
+        weight_bytes_ += (uint64_t) (kt * c.out * c.k * c.k * c.in) * 2;
+    }
     if (!dry_) {
         const auto w = st.f32(name + ".weight");   // [out][in][kt][k][k]
         std::vector<uint16_t> h((size_t) (c.out * c.k * c.k * c.in));
@@ -455,6 +479,22 @@ MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, i
         uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
         gpu::copy(d, h.data(), h.size() * 2);
         c.w = d;
+        if (taps) {
+            std::vector<uint16_t> tw((size_t) (kt * c.out * c.k * c.k * c.in));
+            for (int64_t z = 0; z < kt; ++z)
+                for (int64_t o = 0; o < c.out; ++o) {
+                    const int64_t src = rows != nullptr ? (*rows)[(size_t) o] : o;
+                    for (int64_t i = 0; i < c.in; ++i)
+                        for (int64_t dy = 0; dy < c.k; ++dy)
+                            for (int64_t dx = 0; dx < c.k; ++dx)
+                                tw[(size_t) ((((z * c.out + o) * c.k + dy) * c.k + dx) * c.in + i)] =
+                                    kernels::f16_from_f32(
+                                        w[(size_t) ((((src * in + col0 + i) * kt + z) * c.k + dy) * c.k + dx)]);
+                }
+            uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size());
+            gpu::copy(td, tw.data(), tw.size() * 2);
+            c.taps = td;
+        }
     }
     if (bias) {
         if (rows == nullptr) {
@@ -669,6 +709,11 @@ void MfVae::drop_scratch() {
     f2_qk16_ = f2_p16_ = nullptr;
     f2_cap_ = F2Sizes();
     f2_held_ = 0;
+    // a video's slice buffers (not the frames its convolutions carry)
+    for (void* p : {(void*) vx_, (void*) vy_, (void*) vt_, (void*) va16_}) release(allocs_, p);
+    vx_ = vy_ = vt_ = nullptr;
+    va16_ = nullptr;
+    vcap_ = 0;
 }
 
 void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
@@ -698,12 +743,12 @@ void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
     if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_);
 }
 
-void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
+void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
     const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
     for (int64_t p0 = 0; p0 < HWo; p0 += rows) {
         const int64_t n = std::min(rows, HWo - p0);
         qi_im2col16(in16, 1, H, W, c.in, 1, 3, 2, 0, H / 2, W / 2, p0, n, col16_, s_);
-        gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
+        gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
     }
     if (c.b != nullptr) qi_bias_add(out, c.b, HWo, c.out, s_);
 }
@@ -1112,6 +1157,10 @@ void MfVae::open_flux2(SafeTensors& st) {
             for (int64_t xy = 0; xy < 4; ++xy)
                 for (int64_t c = 0; c < C; ++c) rows.push_back(xy * Z * C + c);
             l.shuffle = conv_w(st, nm(p + "upsample.upscale_conv"), true, 0, -1, &rows);
+            if (video_) {   // all its outputs: "(x y z c)", 2 x 2 positions of z frames
+                l.shuffle_t = conv_w(st, nm(p + "upsample.upscale_conv"));
+                l.z = Z;
+            }
         }
         f2_levels_.push_back(std::move(l));
     }
@@ -1498,6 +1547,11 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
         f2_ein_.in = 8;
         f2_ein_.k = 3;
         weight_bytes_ += (uint64_t) (f2_ein_.out * 9 * 8) * 2;
+        const bool taps = video_ && kt > 1;
+        if (taps) {
+            f2_ein_.kt = kt;
+            weight_bytes_ += (uint64_t) (kt * f2_ein_.out * 9 * 8) * 2;
+        }
         if (!dry_) {
             const auto w = st.f32(n + ".weight");   // [out][3][kt][3][3]
             std::vector<uint16_t> h((size_t) (f2_ein_.out * 9 * 8), 0);
@@ -1511,6 +1565,18 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
             uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
             gpu::copy(d, h.data(), h.size() * 2);
             f2_ein_.w = d;
+            if (taps) {   // [kt][out][9][8], the input widened to 8 alike
+                std::vector<uint16_t> tw((size_t) (kt * f2_ein_.out * 9 * 8), 0);
+                for (int64_t z = 0; z < kt; ++z)
+                    for (int64_t o = 0; o < f2_ein_.out; ++o)
+                        for (int64_t i = 0; i < 3; ++i)
+                            for (int64_t k = 0; k < 9; ++k)
+                                tw[(size_t) (((z * f2_ein_.out + o) * 9 + k) * 8 + i)] =
+                                    kernels::f16_from_f32(w[(size_t) (((o * 3 + i) * kt + z) * 9 + k)]);
+                uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size());
+                gpu::copy(td, tw.data(), tw.size() * 2);
+                f2_ein_.taps = td;
+            }
         }
         f2_ein_.b = vec(st, n + ".bias");
     }
@@ -1616,6 +1682,366 @@ void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
     }
     f2_patch(m, f2_mean_, f2_std_, h, w, f2_lc_, z, s_);
     gpu::stream_sync(s_);
+}
+
+// ---- the video form (SeedVR2's VAE) ----
+
+// a slice's frame buffers, `values` floats each
+void MfVae::v_grow(int64_t values) {
+    if (values <= vcap_) return;
+    for (void* p : {(void*) vx_, (void*) vy_, (void*) vt_, (void*) va16_}) release(allocs_, p);
+    vx_ = alloc<float>(allocs_, values);
+    vy_ = alloc<float>(allocs_, values);
+    vt_ = alloc<float>(allocs_, values);
+    va16_ = alloc<uint16_t>(allocs_, values);
+    vcap_ = values;
+}
+
+// the two of vx, vy, vt that are not `x`
+void MfVae::v_others(const float* x, float*& a, float*& b) const {
+    float* all[3] = {vx_, vy_, vt_};
+    int k = 0;
+    for (float* p : all)
+        if (p != x) (k++ == 0 ? a : b) = p;
+}
+
+void MfVae::video_reset() {
+    for (auto& side : vcache_) {
+        for (auto& [c, v] : side) release(allocs_, v.buf);
+        side.clear();
+    }
+    for (auto& side : vdev_) {
+        for (auto& [c, v] : side) release(allocs_, v.buf);
+        side.clear();
+    }
+}
+
+void MfVae::set_video_host_cache(bool on) {
+    if (on == vhost_) return;
+    gpu::stream_sync(s_);   // a host buffer may still be a copy's source or destination
+    video_reset();
+    vhost_ = on;
+}
+
+// A causal convolution over T frames in16 [T][H W in] (FP16), stride ts in time: its time taps over the frames the
+// last slice left (kt - ts of them) and these, the first slice's first frame repeated kt - 1 times before them (the
+// reference's extend_head); s2: 3 x 3 of stride 2 in space (conv_s2's).  out [To][H' W' out] (+= with `add`); what
+// the next slice sees kept.  A convolution of one tap: each frame alone.
+void MfVae::vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t ts, bool s2,
+                  float* out, bool add, int64_t& To) {
+    const int64_t fin = H * W * c.in, fout = (s2 ? (H / 2) * (W / 2) : H * W) * c.out;
+    const auto one = [&](const Conv& k, const uint16_t* f, float* o, bool a) {
+        if (s2) conv_s2(k, f, H, W, o, a);
+        else conv(k, f, H, W, o, a);
+    };
+    if (c.kt <= 1 || c.taps == nullptr) {
+        if (ts != 1) throw std::logic_error("image engine (VAE): a stride in time without time taps");
+        for (int64_t t = 0; t < T; ++t) one(c, in16 + t * fin, out + t * fout, add);
+        To = T;
+        return;
+    }
+    VCache& vc = vcache_[vside_][VKey{&c, vtile_}];
+    const int64_t m = c.kt - ts;
+    if (vc.frame != fin || vc.m != m) {   // a new size (another tile's): nothing carried
+        release(allocs_, vc.buf);
+        vc = VCache();
+        vc.buf = m <= 0 ? nullptr
+                 : vhost_ ? alloc_pinned<uint16_t>(allocs_, m * fin) : alloc<uint16_t>(allocs_, m * fin);
+        vc.frame = fin;
+        vc.m = m;
+    }
+    uint16_t* buf = vc.buf;   // where the carried frames are read and kept on the GPU
+    if (vhost_ && m > 0) {    // the GPU's copy, shared by the tiles: this tile's frames in for its turn
+        VCache& d = vdev_[vside_][&c];
+        if (d.frame * d.m < m * fin) {
+            release(allocs_, d.buf);
+            d.buf = alloc<uint16_t>(allocs_, m * fin);
+            d.frame = fin;
+            d.m = m;
+        }
+        buf = d.buf;
+        if (vc.n == m) gpu::copy_async(buf, vc.buf, (size_t) (m * fin) * 2, s_);
+    }
+    std::vector<const uint16_t*> ext;
+    if (vc.n == m && m > 0) {
+        for (int64_t i = 0; i < m; ++i) ext.push_back(buf + i * fin);
+    } else {
+        for (int64_t i = 0; i + 1 < c.kt; ++i) ext.push_back(in16);
+    }
+    for (int64_t t = 0; t < T; ++t) ext.push_back(in16 + t * fin);
+    const auto L = (int64_t) ext.size();
+    To = L >= c.kt ? (L - c.kt) / ts + 1 : 0;
+    const int64_t per = c.out * c.k * c.k * c.in;
+    for (int64_t j = 0; j < To; ++j)
+        for (int64_t i = 0; i < c.kt; ++i) {
+            Conv k = c;
+            k.w = c.taps + i * per;
+            k.b = i == 0 ? c.b : nullptr;   // the bias once
+            one(k, ext[(size_t) (j * ts + i)], out + j * fout, add || i > 0);
+        }
+    if (m > 0) {   // the last m frames, each to a lower or the same place of the cache: in order, no overlap read
+        for (int64_t i = 0; i < m; ++i) {
+            const uint16_t* src = ext[(size_t) (L - m + i)];
+            if (src != buf + i * fin) gpu::copy_async(buf + i * fin, src, (size_t) fin * 2, s_);
+        }
+        if (buf != vc.buf) gpu::copy_async(vc.buf, buf, (size_t) (m * fin) * 2, s_);   // back to the tile's own
+        vc.n = m;
+    }
+}
+
+// a ResNet block over T frames x [T][H W c]: as f2_resblock's, its convolutions causal in time
+void MfVae::v_resblock(const F2Res& r, float*& x, int64_t T, int64_t H, int64_t W) {
+    const int64_t HW = H * W;
+    float *t = nullptr, *y = nullptr;
+    v_others(x, t, y);
+    for (int64_t f = 0; f < T; ++f)
+        gn_silu16(x + f * HW * r.c1.in, r.n1w, r.n1b, HW, r.c1.in, true, va16_ + f * HW * r.c1.in);
+    int64_t To = 0;
+    vconv(r.c1, va16_, T, H, W, 1, false, t, false, To);
+    for (int64_t f = 0; f < T; ++f)
+        gn_silu16(t + f * HW * r.c1.out, r.n2w, r.n2b, HW, r.c1.out, true, va16_ + f * HW * r.c1.out);
+    if (r.nin.out > 0) {
+        vconv(r.c2, va16_, T, H, W, 1, false, y, false, To);
+        kernels::f32_to_f16_bulk(x, va16_, T * HW * r.nin.in, s_);
+        vconv(r.nin, va16_, T, H, W, 1, false, y, true, To);
+        x = y;
+    } else {
+        vconv(r.c2, va16_, T, H, W, 1, false, x, true, To);
+    }
+}
+
+// the middle's attention, each frame's own (the reference's "(b f) c h w")
+void MfVae::v_attention(const Attn& a, float* x, int64_t T, int64_t H, int64_t W) {
+    const int64_t f = H * W * a.qkv.in;
+    for (int64_t t = 0; t < T; ++t) {
+        gpu::copy_async(f2_x_, x + t * f, (size_t) f * 4, s_);
+        f2_attention(a, f2_x_, H, W);
+        gpu::copy_async(x + t * f, f2_x_, (size_t) f * 4, s_);
+    }
+}
+
+uint64_t MfVae::video_scratch_bytes(int64_t h, int64_t w, int64_t frames) const {
+    const int n = (int) f2_levels_.size();
+    F2Sizes z = f2_walk(h, w, 0, n, true, true);
+    if (!f2_down_.empty()) z = f2_max(z, f2_enc_walk(h, w));
+    // the frame buffers (3 FP32, 1 FP16) of the largest stage's frames, and one frame's own buffers
+    return (uint64_t) (frames * z.most) * (3 * 4 + 2) + f2_bytes(z);
+}
+
+int64_t MfVae::encode_video(const float* rgb, int64_t T, int64_t h, int64_t w, bool first, float* z) {
+    if (!video_ || f2_ein_.taps == nullptr) throw std::logic_error("image engine (VAE): not opened as a video's");
+    if (!has_encoder()) throw std::runtime_error("image engine (VAE): the encoder is not loaded");
+    if (T < 1 || (first ? (T - 1) % 4 : T % 4) != 0)
+        throw std::invalid_argument("image engine (VAE): a video slice of 1 + 4 k frames first, then 4 k");
+    vside_ = 0;
+    if (first)   // the tile's own (another tile's carry on)
+        for (auto& [k, v] : vcache_[0])
+            if (k.tile == vtile_) v.n = 0;
+    int64_t H = 16 * h, W = 16 * w;
+    const F2Sizes fz = f2_enc_walk(h, w);
+    f2_grow(fz);
+    v_grow(T * fz.most);
+    for (int64_t f = 0; f < T; ++f) f2_rgb8_16(rgb + f * 3 * H * W, H * W, va16_ + f * H * W * 8, s_);
+    float* x = vx_;
+    int64_t Tc = 0;
+    vconv(f2_ein_, va16_, T, H, W, 1, false, x, false, Tc);
+    int64_t c = f2_ein_.out;
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) v_resblock(r, x, Tc, H, W);
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.down.out > 0) {
+            kernels::f32_to_f16_bulk(x, va16_, Tc * H * W * c, s_);
+            float *y = nullptr, *unused = nullptr;
+            v_others(x, y, unused);
+            int64_t To = 0;
+            vconv(l.down, va16_, Tc, H, W, l.down.kt > 1 ? 2 : 1, true, y, false, To);
+            H /= 2;
+            W /= 2;
+            x = y;
+            Tc = To;
+            c = l.down.out;
+        }
+    }
+    v_resblock(f2_emid_[0], x, Tc, H, W);
+    v_attention(f2_eattn_, x, Tc, H, W);
+    v_resblock(f2_emid_[1], x, Tc, H, W);
+    const int64_t HW = H * W;
+    for (int64_t f = 0; f < Tc; ++f) gn_silu16(x + f * HW * c, f2_enw_, f2_enb_, HW, c, true, va16_ + f * HW * c);
+    float *m = nullptr, *unused = nullptr;
+    v_others(x, m, unused);
+    int64_t To = 0;
+    vconv(f2_eout_, va16_, Tc, H, W, 1, false, m, false, To);
+    if (f2_qc_.out > 0) throw std::runtime_error("image engine (VAE): a video's encoder with a quant_conv");
+    for (int64_t f = 0; f < To; ++f)
+        f2_patch(m + f * HW * f2_eout_.out, f2_mean_, f2_std_, h, w, f2_lc_, z + f * h * w * 4 * f2_lc_, s_);
+    gpu::stream_sync(s_);
+    return To;
+}
+
+int64_t MfVae::decode_video(const float* z, int64_t n, int64_t h, int64_t w, bool first, float* rgb) {
+    if (!video_ || cin_.taps == nullptr) throw std::logic_error("image engine (VAE): not opened as a video's");
+    if (n < 1) throw std::invalid_argument("image engine (VAE): no latents to decode");
+    vside_ = 1;
+    if (first)
+        for (auto& [k, v] : vcache_[1])
+            if (k.tile == vtile_) v.n = 0;
+    const int nl = (int) f2_levels_.size();
+    const F2Sizes fz = f2_walk(h, w, 0, nl, true, true);
+    f2_grow(fz);
+    const int64_t frames = first ? 1 + 4 * (n - 1) : 4 * n;
+    v_grow(std::max<int64_t>(frames, 2 * n) * fz.most);
+    int64_t H = 2 * h, W = 2 * w;
+    for (int64_t f = 0; f < n; ++f)
+        f2_unpatch16(z + f * h * w * 4 * f2_lc_, f2_mean_, f2_std_, h, w, f2_lc_, va16_ + f * H * W * f2_lc_, s_);
+    if (f2_pq_.out > 0) throw std::runtime_error("image engine (VAE): a video's decoder with a post_quant_conv");
+    float* x = vx_;
+    int64_t Tc = 0;
+    vconv(cin_, va16_, n, H, W, 1, false, x, false, Tc);
+    v_resblock(f2_mid_[0], x, Tc, H, W);
+    v_attention(f2_attn_, x, Tc, H, W);
+    v_resblock(f2_mid_[1], x, Tc, H, W);
+    int64_t c = C_;
+    for (const F2Level& l : f2_levels_) {
+        for (const F2Res& r : l.blocks) v_resblock(r, x, Tc, H, W);
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.up.out == 0) continue;
+        if (l.shuffle_t.out == 0)
+            throw std::runtime_error("image engine (VAE): a video's upsampling without its 1 x 1 convolution");
+        const int64_t Z = l.z, F = 4 * H * W * c;
+        for (int64_t f = 0; f < Tc; ++f) {   // each frame's 1 x 1 convolution to Z frames of 2 H x 2 W
+            kernels::f32_to_f16_bulk(x + f * H * W * c, a16_, H * W * c, s_);
+            conv(l.shuffle_t, a16_, H, W, f2_t_);
+            f2_shuffle_t16(f2_t_, H, W, c, Z, va16_ + f * Z * F, s_);
+        }
+        int64_t Tz = Tc * Z;
+        if (first && Z > 1) {   // the first slice's duplicated first frame (the reference's remove_head)
+            for (int64_t f = 2; f < Tz; ++f) gpu::copy_async(va16_ + (f - 1) * F, va16_ + f * F, (size_t) F * 2, s_);
+            --Tz;
+        }
+        H *= 2;
+        W *= 2;
+        float *y = nullptr, *unused = nullptr;
+        v_others(x, y, unused);
+        vconv(l.up, va16_, Tz, H, W, 1, false, y, false, Tc);
+        x = y;
+        c = l.up.out;
+    }
+    const int64_t HW = H * W;
+    for (int64_t f = 0; f < Tc; ++f) gn_silu16(x + f * HW * c, gnw_, gnb_, HW, c, true, va16_ + f * HW * c);
+    float *y = nullptr, *unused = nullptr;
+    v_others(x, y, unused);
+    int64_t To = 0;
+    vconv(cout_, va16_, Tc, H, W, 1, false, y, false, To);
+    for (int64_t f = 0; f < To; ++f) hwc3_to_chw(y + f * HW * 3, HW, rgb + f * 3 * HW, s_);
+    gpu::stream_sync(s_);
+    return To;
+}
+
+namespace {
+// the tiles' corners along a side of n: `side` apart less the overlap, the last flush with the edge
+std::vector<int64_t> tile_starts(int64_t n, int64_t side) {
+    std::vector<int64_t> v;
+    for (int64_t a = 0;; a += side - kF2Overlap) {
+        if (a + side >= n) {
+            v.push_back(n - side);
+            break;
+        }
+        v.push_back(a);
+    }
+    return v;
+}
+}  // namespace
+
+uint64_t MfVae::video_carried_bytes(int64_t h, int64_t w) const {
+    // a causal convolution carries kt - stride frames of its input: the encoder's at its level's size, the decoder's
+    // alike; a bound: every one of 2 frames at the largest of its input's widths a level
+    uint64_t b = 0;
+    int64_t pix = 256 * h * w;
+    const auto carry = [&](const Conv& c) {
+        if (c.kt > 1) b += (uint64_t) (2 * pix * c.in) * 2;
+    };
+    carry(f2_ein_);
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) carry(r.c1), carry(r.c2), carry(r.nin);
+        carry(l.down);
+        if (l.down.out > 0) pix /= 4;
+    }
+    for (const F2Res& r : f2_emid_) carry(r.c1), carry(r.c2);
+    carry(f2_eout_);
+    pix = 4 * h * w;
+    carry(cin_);
+    for (const F2Res& r : f2_mid_) carry(r.c1), carry(r.c2);
+    for (const F2Level& l : f2_levels_) {
+        for (const F2Res& r : l.blocks) carry(r.c1), carry(r.c2), carry(r.nin);
+        if (l.up.out > 0) pix *= 4;
+        carry(l.up);
+    }
+    carry(cout_);
+    return b;
+}
+
+int64_t MfVae::encode_video_tiled(const float* rgb, int64_t T, int64_t h, int64_t w, bool first, float* z, int64_t tt) {
+    if (tt <= 0 || (tt >= h && tt >= w)) {
+        vtile_ = 0;
+        return encode_video(rgb, T, h, w, first, z);
+    }
+    const int64_t th = std::min(h, tt), tw = std::min(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
+    const int64_t k = first ? (T - 1) / 4 + 1 : T / 4, plane = th * tw * kPix;
+    std::vector<void*> tmp;
+    float* acc = alloc<float>(tmp, k * (V + 1) * h * w);
+    float* trgb = alloc<float>(tmp, T * 3 * plane);
+    float* tz = alloc<float>(tmp, k * th * tw * V);
+    gpu::memset_async(acc, 0, (size_t) (k * (V + 1) * h * w) * 4, s_);
+    const auto ys = tile_starts(h, th), xs = tile_starts(w, tw);
+    int tile = 0;
+    for (const int64_t y0 : ys)
+        for (const int64_t x0 : xs) {
+            vtile_ = tile++;
+            for (int64_t f = 0; f < T; ++f)
+                for (int64_t c = 0; c < 3; ++c)
+                    tile_gather(rgb + (f * 3 + c) * H * W, W, 1, y0 * kPatch, x0 * kPatch, th * kPatch, tw * kPatch,
+                                trgb + (f * 3 + c) * plane, s_);
+            const int64_t got = encode_video(trgb, T, th, tw, first, tz);
+            for (int64_t j = 0; j < got; ++j)
+                tile_blend(tz + j * th * tw * V, th, tw, y0, x0, h, w, kF2Overlap, y0 > 0, y0 + th < h, x0 > 0,
+                           x0 + tw < w, acc + j * (V + 1) * h * w, s_, V, true);
+        }
+    vtile_ = 0;
+    for (int64_t j = 0; j < k; ++j) tile_finish(acc + j * (V + 1) * h * w, h * w, z + j * h * w * V, s_, V, true);
+    gpu::stream_sync(s_);
+    for (void* p : tmp) gpu::free(p);
+    return k;
+}
+
+int64_t MfVae::decode_video_tiled(const float* z, int64_t n, int64_t h, int64_t w, bool first, float* rgb, int64_t tt) {
+    if (tt <= 0 || (tt >= h && tt >= w)) {
+        vtile_ = 0;
+        return decode_video(z, n, h, w, first, rgb);
+    }
+    const int64_t th = std::min(h, tt), tw = std::min(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
+    const int64_t frames = first ? 1 + 4 * (n - 1) : 4 * n, TH = th * kPatch, TW = tw * kPatch;
+    std::vector<void*> tmp;
+    float* acc = alloc<float>(tmp, frames * 4 * H * W);
+    float* tz = alloc<float>(tmp, n * th * tw * V);
+    float* trgb = alloc<float>(tmp, frames * 3 * TH * TW);
+    gpu::memset_async(acc, 0, (size_t) (frames * 4 * H * W) * 4, s_);
+    const auto ys = tile_starts(h, th), xs = tile_starts(w, tw);
+    int tile = 0;
+    for (const int64_t y0 : ys)
+        for (const int64_t x0 : xs) {
+            vtile_ = tile++;
+            for (int64_t j = 0; j < n; ++j)
+                tile_gather(z + j * h * w * V, w, V, y0, x0, th, tw, tz + j * th * tw * V, s_);
+            const int64_t got = decode_video(tz, n, th, tw, first, trgb);
+            for (int64_t f = 0; f < got; ++f)
+                tile_blend(trgb + f * 3 * TH * TW, TH, TW, y0 * kPatch, x0 * kPatch, H, W, kF2Overlap * kPatch, y0 > 0,
+                           y0 + th < h, x0 > 0, x0 + tw < w, acc + f * 4 * H * W, s_);
+        }
+    vtile_ = 0;
+    for (int64_t f = 0; f < frames; ++f) tile_finish(acc + f * 4 * H * W, H * W, rgb + f * 3 * H * W, s_);
+    gpu::stream_sync(s_);
+    for (void* p : tmp) gpu::free(p);
+    return frames;
 }
 
 }  // namespace strata::image

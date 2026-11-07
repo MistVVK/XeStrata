@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -322,6 +323,162 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
     res.rgba.resize((size_t) (w * h * 4));
     gpu::copy(res.rgba.data(), out, res.rgba.size());
     return res;
+}
+
+namespace {
+
+// RGB24 rows to RGBA8 (the alpha 255), and back
+void rgba_of_rgb(const uint8_t* rgb, int64_t n, std::vector<uint8_t>& rgba) {
+    rgba.resize((size_t) (n * 4));
+    for (int64_t p = 0; p < n; ++p) {
+        rgba[(size_t) (p * 4)] = rgb[p * 3];
+        rgba[(size_t) (p * 4 + 1)] = rgb[p * 3 + 1];
+        rgba[(size_t) (p * 4 + 2)] = rgb[p * 3 + 2];
+        rgba[(size_t) (p * 4 + 3)] = 255;
+    }
+}
+
+void rgb_of_rgba(const std::vector<uint8_t>& rgba, uint8_t* rgb) {
+    const size_t n = rgba.size() / 4;
+    for (size_t p = 0; p < n; ++p)
+        for (int c = 0; c < 3; ++c) rgb[p * 3 + c] = rgba[p * 4 + c];
+}
+
+}  // namespace
+
+VideoReport UpscaleRunner::run_video(UpscaleModel& m, const std::string& in, const std::string& stem,
+                                     const VideoRequest& r, uint64_t avail,
+                                     const std::function<bool(int64_t, int64_t)>& step) {
+    const ModelInfo& mi = m.info();
+    const video::Info info = video::probe(in);
+    const int64_t sw = info.width, sh = info.height, w = r.frame.width, h = r.frame.height;
+    if (w <= 0 || h <= 0) throw std::invalid_argument("upscale: no size to upscale to");
+    VideoReport rep;
+    rep.width = w;
+    rep.height = h;
+    rep.fps = info.fps;
+    rep.vfr = info.vfr;
+    rep.color = r.frame.color_set ? r.frame.color : mi.color;
+    video::WriteOptions wo;
+    wo.codec = r.codec;
+    wo.audio_from = in;
+    video::Reader rd(in, info);
+    video::Writer wr(stem, w, h, info.fps, wo);
+    const int64_t fb = sw * sh * 3, ob = w * h * 3;
+    constexpr int64_t kRead = 4;   // the frames read at a time
+    std::vector<uint8_t> buf((size_t) (fb * kRead)), rgba, out_rgb((size_t) ob);
+    const auto tell = [&](int64_t done) {
+        if (step && !step(done, std::max(info.frames, done)))
+            throw std::runtime_error("upscale: the video was stopped");
+    };
+    if (!m.temporal()) {   // each frame on its own, as an image
+        for (;;) {
+            const auto r0 = std::chrono::steady_clock::now();
+            const int64_t n = rd.read(buf.data(), kRead);
+            rep.read_s += since(r0);
+            if (n <= 0) break;
+            for (int64_t f = 0; f < n; ++f) {
+                QiRef src;
+                src.width = sw;
+                src.height = sh;
+                rgba_of_rgb(buf.data() + f * fb, sw * sh, src.rgba);
+                Report fr;
+                const QiRef big = run(m, src, r.frame, avail, &fr);
+                rep.model_s += fr.model_s;
+                rep.resize_s += fr.resize_s;
+                rep.color_s += fr.color_s;
+                rgb_of_rgba(big.rgba, out_rgb.data());
+                const auto t0 = std::chrono::steady_clock::now();
+                wr.write(out_rgb.data(), 1);
+                rep.write_s += since(t0);
+                tell(++rep.frames);
+            }
+        }
+    } else {
+        // the model's frames: the frame at the size asked for, padded to the model's multiple by its edges
+        const int64_t fw = padded(w, mi.multiple), fh = padded(h, mi.multiple);
+        Buf pic((uint64_t) (sw * sh * 4)), sized((uint64_t) (w * h * 4)), feed((uint64_t) (fw * fh * 4)),
+            made((uint64_t) (fw * fh * 4)), out((uint64_t) (w * h * 4)), ref((uint64_t) (w * h * 4));
+        const uint64_t frame = frame_bytes(mi, sw, sh, w, h, rep.color) + (uint64_t) (fw * fh * 4) * 2;
+        m.set_room(avail > frame ? avail - frame : 0);
+        m.video_begin(fw, fh, info.frames, r.frame.seed, r.chunk, r.overlap);
+        std::deque<std::vector<uint8_t>> waiting;   // the frames pushed whose output is not out yet (their colors')
+        std::vector<uint8_t> host((size_t) (w * h * 4));
+        const auto drain = [&] {
+            while (m.video_ready() > 0) {
+                auto t0 = std::chrono::steady_clock::now();
+                m.video_take(made.p, 1);
+                rep.model_s += since(t0);
+                t0 = std::chrono::steady_clock::now();
+                uint8_t* z = out.p;
+                const uint8_t* a = made.p;
+                done(queue().parallel_for(sycl::range<2>((size_t) h, (size_t) w), [=](sycl::id<2> id) {
+                    const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+                    for (int c = 0; c < 4; ++c) z[(y * w + x) * 4 + c] = a[(y * fw + x) * 4 + c];
+                }), "upscale: crop");
+                rep.resize_s += since(t0);
+                t0 = std::chrono::steady_clock::now();
+                namespace color = image::color;
+                if (rep.color != ColorFix::none) {   // against the frame it came from
+                    rgba_of_rgb(waiting.front().data(), sw * sh, rgba);
+                    gpu::copy(pic.p, rgba.data(), rgba.size());
+                    if (rep.color == ColorFix::adain) {
+                        const color::Stats from = color::stats(out.p, w * h, color::Space::rgb),
+                                           to = color::stats(pic.p, sw * sh, color::Space::rgb);
+                        color::transfer(out.p, w * h, color::Space::rgb, from, to, 1.0);
+                    } else {
+                        image::lanczos_resize_device(pic.p, sw, sh, ref.p, w, h);
+                        if (rep.color == ColorFix::lab) color::lab_match(out.p, ref.p, w, h);
+                        else color::wavelet(out.p, ref.p, w, h);
+                    }
+                }
+                rep.color_s += since(t0);
+                waiting.pop_front();
+                gpu::copy(host.data(), out.p, host.size());
+                rgb_of_rgba(host, out_rgb.data());
+                t0 = std::chrono::steady_clock::now();
+                wr.write(out_rgb.data(), 1);
+                rep.write_s += since(t0);
+                tell(++rep.frames);
+            }
+        };
+        for (;;) {
+            auto t0 = std::chrono::steady_clock::now();
+            const int64_t n = rd.read(buf.data(), kRead);
+            rep.read_s += since(t0);
+            if (n <= 0) break;
+            for (int64_t f = 0; f < n; ++f) {
+                t0 = std::chrono::steady_clock::now();
+                rgba_of_rgb(buf.data() + f * fb, sw * sh, rgba);
+                gpu::copy(pic.p, rgba.data(), rgba.size());
+                image::lanczos_resize_device(pic.p, sw, sh, sized.p, w, h);
+                uint8_t* fd = feed.p;
+                const uint8_t* zd = sized.p;
+                done(queue().parallel_for(sycl::range<2>((size_t) fh, (size_t) fw), [=](sycl::id<2> id) {
+                    const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+                    const int64_t yy = sycl::min(y, h - 1), xx = sycl::min(x, w - 1);
+                    for (int c = 0; c < 4; ++c) fd[(y * fw + x) * 4 + c] = zd[(yy * w + xx) * 4 + c];
+                }), "upscale: padding");
+                rep.resize_s += since(t0);
+                waiting.emplace_back(buf.begin() + f * fb, buf.begin() + (f + 1) * fb);
+                t0 = std::chrono::steady_clock::now();
+                m.video_push(feed.p, 1);
+                rep.model_s += since(t0);
+                drain();
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        m.video_end();
+        rep.model_s += since(t0);
+        drain();
+        m.release(false);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    wr.finish();
+    rep.write_s += since(t0);
+    rep.path = wr.path();
+    rep.mime = wr.mime();
+    return rep;
 }
 
 }  // namespace strata::upscale

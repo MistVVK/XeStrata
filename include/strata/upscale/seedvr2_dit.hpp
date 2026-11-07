@@ -58,9 +58,10 @@ public:
     /// for its sizes only.  std::runtime_error inside: false and `err` for a file that is not SeedVR2 7B's.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
-    /// The velocity [h w][64] (device FP32, the tokens' order) of the noise and the condition latent ([h w][64] each,
-    /// device FP32), h x w tokens.
-    void forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out);
+    /// The velocity [t h w][64] (device FP32, the tokens' order) of the noise and the condition latent ([t h w][64]
+    /// each, device FP32): t latent frames (a video's; 1 an image's) of h x w tokens, the windows and the RoPE over
+    /// all three axes.
+    void forward(const float* noise, const float* cond, int64_t h, int64_t w, float* out, int64_t t = 1);
 
     uint64_t weight_bytes() const { return weight_bytes_; }   // the parts outside the blocks
     uint64_t block_bytes() const { return blocks_.total(); }
@@ -69,8 +70,8 @@ public:
     int resident_blocks() const { return blocks_.resident(); }
     uint64_t blocks_vram() const { return blocks_.vram(); }
     void drop_blocks() { blocks_.drop(); }
-    /// The working buffers h x w tokens take, and what they take now.
-    uint64_t activation_bytes(int64_t h, int64_t w) const;
+    /// The working buffers t frames of h x w tokens take, and what they take now.
+    uint64_t activation_bytes(int64_t h, int64_t w, int64_t t = 1) const;
     uint64_t activations_held() const { return held_; }
     void drop_activations();
 
@@ -99,8 +100,8 @@ private:
         float *cos = nullptr, *sin = nullptr;   // the video tokens' RoPE [h w][hd / 2] (window-local)
     };
     struct File;
-    void ensure(int64_t h, int64_t w);
-    void layout(int which, int64_t h, int64_t w, std::vector<void*>& owned);
+    void ensure(int64_t t, int64_t h, int64_t w);
+    void layout(int which, int64_t t, int64_t h, int64_t w, std::vector<void*>& owned);
     // y [T][n] = x16 [T][k] W^T, times the rows' scales rs (null: 1), plus bias (null: none); an 8-bit weight's input
     // is the one `input` made (xq8_ and xs_in_, or rot16_)
     void product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
@@ -135,8 +136,8 @@ private:
     float *tcos_ = nullptr, *tsin_ = nullptr;   // the 3B's text RoPE [L][hd / 2]
     std::vector<Block> blocks_v_;
     image::LayerStream blocks_;
-    // activations for an h x w grid
-    int64_t cap_h_ = 0, cap_w_ = 0;
+    // activations for a t x h x w grid
+    int64_t cap_t_ = 0, cap_h_ = 0, cap_w_ = 0;
     Layout lay_[2];
     float *x_ = nullptr, *t_ = nullptr, *qkv_ = nullptr, *qkt_ = nullptr, *y_ = nullptr, *hid_ = nullptr,
           *tsum_ = nullptr, *rs_ = nullptr, *rs2_ = nullptr;
