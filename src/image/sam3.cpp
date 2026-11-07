@@ -46,11 +46,6 @@ double since(std::chrono::steady_clock::time_point t0) {
 
 float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
-float inverse_sigmoid(float x) {
-    x = std::clamp(x, 0.f, 1.f);
-    return std::log(std::max(x, 1e-3f) / std::max(1.f - x, 1e-3f));
-}
-
 // The sine embedding of one value (the DETR decoder's boxes): F channels, sin and cos interleaved at 10000^(2i/F)
 void sine(float v, int64_t F, float* out) {
     for (int64_t i = 0; i < F; ++i) {
@@ -71,7 +66,7 @@ std::vector<uint16_t> f16_of(const float* v, size_t n) {
 enum Slot {
     kPix, kRgba, kX, kH16, kW16, kBig, kG16, kQ16, kK16, kV16, kA16, kY, kCol,
     kF0, kF1, kF2, kPos, kTxt, kTxt16, kEnc, kEnc16, kEncPos16, kDec, kDec16, kQp, kBias, kTmp, kPix0, kPix1,
-    kInst16, kMasks, kMasks8, kPart, kSmall, kSmall16, kTxtOut, kTmp2, kQo16, kNeck,
+    kInst16, kMasks, kMasks8, kPart, kSmall, kSmall16, kTxtOut, kTmp2, kQo16, kNeck, kProj16, kRef,
 };
 
 }  // namespace
@@ -329,6 +324,7 @@ void Sam3::vision(const QiRef& image) {
     auto* w16 = scratch_as<uint16_t>(kW16, (size_t) (N * C));
     const int64_t mlp = vit_[0].fc1.n;
     float* big = scratch(kBig, (size_t) (N * std::max(mlp, 3 * C) * 4));
+    auto* big16 = reinterpret_cast<uint16_t*>(big);   // product16's rows (qkv, the MLP's first): half big's bytes
     auto* g16 = scratch_as<uint16_t>(kG16, (size_t) (N * mlp));
     auto* q16 = scratch_as<uint16_t>(kQ16, (size_t) (N * C));
     auto* k16 = scratch_as<uint16_t>(kK16, (size_t) (N * C));
@@ -342,28 +338,27 @@ void Sam3::vision(const QiRef& image) {
     host("embed", x, (size_t) (N * C));
     const int64_t ws = window_, nwin = (G / ws) * (G / ws);
     if (G % ws != 0) throw std::runtime_error("image engine (SAM 3): the patches are not whole windows");
+    // layer 0's first norm here; each layer's residual adds then take the next norm with them (aux_residual_norm16):
+    // the projections' bias, the residual and the norm in one pass, the windows' order where the layer has windows
+    const auto win = [&](const VitLayer& l) { return l.global ? (int64_t) 0 : ws; };
+    if (vit_[0].global) aux_layer_norm(x, nullptr, vit_[0].n1.w, vit_[0].n1.b, N, C, kVitEps, nullptr, h16, s_);
+    else aux_layer_norm_window16(x, vit_[0].n1.w, vit_[0].n1.b, G, G, C, ws, kVitEps, w16, s_);
     for (size_t li = 0; li < vit_.size(); ++li) {
         const VitLayer& l = vit_[li];
-        aux_layer_norm(x, nullptr, l.n1.w, l.n1.b, N, C, kVitEps, nullptr, h16, s_);
-        const uint16_t* in16 = h16;
-        if (!l.global) {
-            aux_window16(h16, G, G, C, ws, 0, G, G, w16, s_);
-            in16 = w16;
-        }
-        product(in16, l.qkv, big, N);
-        // the window's positions, or every patch's scaled onto the window's grid
-        if (l.global) aux_rope2d_split16(big, N, vit_heads_, hd, G, (float) ws / (float) G, kTheta, q16, k16, v16, s_);
-        else aux_rope2d_split16(big, N, vit_heads_, hd, ws, 1.f, kTheta, q16, k16, v16, s_);
+        product16(l.global ? h16 : w16, l.qkv, big16, N);
+        // the window's positions, or every patch's scaled onto the window's grid; the bias added as they are read
+        if (l.global)
+            aux_rope2d_split16h(big16, l.qkv.b, N, vit_heads_, hd, G, (float) ws / (float) G, kTheta, q16, k16, v16, s_);
+        else aux_rope2d_split16h(big16, l.qkv.b, N, vit_heads_, hd, ws, 1.f, kTheta, q16, k16, v16, s_);
         if (l.global) attention(q16, k16, v16, N, N, vit_heads_, hd, C, C, C, a16);
         else attention(q16, k16, v16, ws * ws, ws * ws, vit_heads_, hd, C, C, C, a16, nwin);
-        product(a16, l.o, y, N);
-        if (l.global) qi_axpy(x, y, 1.f, N * C, s_);
-        else aux_unwindow_add(x, y, G, G, C, ws, 0, G, G, s_);
-        aux_layer_norm(x, nullptr, l.n2.w, l.n2.b, N, C, kVitEps, nullptr, h16, s_);
-        product(h16, l.fc1, big, N);
-        qi_gelu_erf16(big, N * l.fc1.n, g16, s_);
-        product(g16, l.fc2, y, N);
-        qi_axpy(x, y, 1.f, N * C, s_);
+        product(a16, l.o, y, N, 0, false);
+        aux_residual_norm16(x, y, l.o.b, l.n2.w, l.n2.b, G, G, C, win(l), 0, kVitEps, h16, s_);
+        product16(h16, l.fc1, g16, N, true, AuxAct::gelu);
+        product(g16, l.fc2, y, N, 0, false);
+        const VitLayer* next = li + 1 < vit_.size() ? &vit_[li + 1] : nullptr;
+        aux_residual_norm16(x, y, l.fc2.b, next ? next->n1.w : nullptr, next ? next->n1.b : nullptr, G, G, C, 0,
+                            next ? win(*next) : 0, kVitEps, next && !next->global ? w16 : h16, s_);
         if (li == 0 || li == 7 || li + 1 == vit_.size()) host(("vit" + std::to_string(li)).c_str(), x, (size_t) (N * C));
     }
     // the neck: 4x, 2x and 1x levels of d_ channels
@@ -474,8 +469,7 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
         kernels::f32_to_f16_bulk(small, vt16, T * d, s_);
     };
     const auto to16 = [&](const uint16_t* in16, const Lin& l, int64_t rows, uint16_t* out16) {
-        product(in16, l, big, rows);
-        kernels::f32_to_f16_bulk(big, out16, rows * l.n, s_);
+        product16(in16, l, out16, rows, true);
     };
     // the DETR encoder over the 1x level
     for (const EncLayer& l : enc_) {
@@ -485,19 +479,16 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
         to16(hp16, l.self.k, N, k16);
         to16(h16, l.self.v, N, v16);
         attention(q16, k16, v16, N, N, heads_, hd, d, d, d, a16);
-        product(a16, l.self.o, h, N);
-        qi_axpy(x, h, 1.f, N * d, s_);
-        aux_layer_norm(x, nullptr, l.n2.w, l.n2.b, N, d, kEps, nullptr, h16, s_);
+        product(a16, l.self.o, h, N, 0, false);
+        aux_residual_norm16(x, h, l.self.o.b, l.n2.w, l.n2.b, G, G, d, 0, 0, kEps, h16, s_);
         to16(h16, l.cross.q, N, q16);
         word_kv(l.cross);
         attention(q16, kt16, vt16, N, T, heads_, hd, d, d, d, a16);
-        product(a16, l.cross.o, h, N);
-        qi_axpy(x, h, 1.f, N * d, s_);
-        aux_layer_norm(x, nullptr, l.n3.w, l.n3.b, N, d, kEps, nullptr, h16, s_);
-        product(h16, l.fc1, big, N);
-        aux_relu(big, N * l.fc1.n, nullptr, g16, s_);
-        product(g16, l.fc2, h, N);
-        qi_axpy(x, h, 1.f, N * d, s_);
+        product(a16, l.cross.o, h, N, 0, false);
+        aux_residual_norm16(x, h, l.cross.o.b, l.n3.w, l.n3.b, G, G, d, 0, 0, kEps, h16, s_);
+        product16(h16, l.fc1, g16, N, true, AuxAct::relu);
+        product(g16, l.fc2, h, N, 0, false);
+        aux_residual_norm16(x, h, l.fc2.b, nullptr, nullptr, G, G, d, 0, 0, kEps, nullptr, s_);
     }
     host("encoder", x, (size_t) (N * d));
     // the decoder's keys' inputs: the patches with and without their positions
@@ -524,31 +515,18 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
     }
     std::vector<float> ref((size_t) (Q * 4));
     for (int64_t i = 0; i < Q * 4; ++i) ref[(size_t) i] = sigmoid(ref_points_[(size_t) i]);
-    std::vector<float> delta((size_t) (Q * 4));
     float presence = 0.f;
     // the words' keys and values for the scoring's and the masks' attention are computed where used; the decoder's
     // per layer (each its own projections)
+    // the boxes stay on the GPU through the layers (their sines and corners, and their refinement, its kernels): the
+    // host reads them once after the last
+    float* ref_dev = scratch(kRef, (size_t) (Q * 4 * 4));
+    gpu::copy(ref_dev, ref.data(), ref.size() * 4);
     for (size_t li = 0; li < dec_.size(); ++li) {
         const DecLayer& l = dec_[li];
         {
             // the query positions from the boxes (their sines: y, x, w, h) and the box bias
-            std::vector<float> sn((size_t) (Q * 2 * d)), xyxy((size_t) (Q * 4));
-            for (int64_t q = 0; q < Q; ++q) {
-                const float* b = ref.data() + q * 4;
-                float* o = sn.data() + q * 2 * d;
-                sine(b[1], d / 2, o);
-                sine(b[0], d / 2, o + d / 2);
-                sine(b[2], d / 2, o + d);
-                sine(b[3], d / 2, o + 3 * d / 2);
-                xyxy[(size_t) (q * 4)] = b[0] - 0.5f * b[2];
-                xyxy[(size_t) (q * 4 + 1)] = b[1] - 0.5f * b[3];
-                xyxy[(size_t) (q * 4 + 2)] = b[0] + 0.5f * b[2];
-                xyxy[(size_t) (q * 4 + 3)] = b[1] + 0.5f * b[3];
-            }
-            const auto s16 = f16_of(sn.data(), sn.size());
-            gpu::stream_sync(s_);
-            gpu::copy(sin16, s16.data(), s16.size() * 2);
-            gpu::copy(boxes_dev, xyxy.data(), xyxy.size() * 4);
+            aux_box_sine16(ref_dev, Q, d / 2, sin16, boxes_dev, s_);
             product(sin16, ref1_, small, Q);
             aux_relu(small, Q * d, nullptr, a16, s_);
             product(a16, ref2_, qp + d, Q);
@@ -590,10 +568,7 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
         product(a16, box2_, small, Q);
         aux_relu(small, Q * d, nullptr, a16, s_);
         product(a16, box3_, small, Q);
-        gpu::stream_sync(s_);
-        gpu::copy(delta.data(), small, delta.size() * 4);
-        for (int64_t i = 0; i < Q * 4; ++i)
-            ref[(size_t) i] = sigmoid(delta[(size_t) i] + inverse_sigmoid(ref[(size_t) i]));
+        aux_box_refine(ref_dev, small, Q * 4, s_);
         if (li + 1 == dec_.size()) {
             aux_layer_norm(hq, nullptr, pres_norm_.w, pres_norm_.b, 1, d, kEps, nullptr, a16, s_);
             product(a16, pres1_, small, 1);
@@ -606,6 +581,8 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
             presence = std::clamp(presence, -10.f, 10.f);
         }
     }
+    gpu::stream_sync(s_);
+    gpu::copy(ref.data(), ref_dev, ref.size() * 4);
     host("queries", qo, (size_t) (Q * d));
     // the scores: each query against the words' pooled projection
     std::vector<float> score((size_t) Q);
@@ -685,8 +662,8 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
         convolve(pix_conv_[1], t16, 4 * G, 4 * G, c0, kCol);
         aux_group_norm(c0, 16 * N, d, 8, pix_gn_[1].w, pix_gn_[1].b, kEps, true, nullptr, t16, part, s_);
         // the instance projection (1 x 1), FP16 for the masks' product
-        product(t16, inst_, c0, 16 * N);
-        kernels::f32_to_f16_bulk(c0, t16, 16 * N * d, s_);
+        auto* p16 = scratch_as<uint16_t>(kProj16, (size_t) (16 * N * d));
+        product16(t16, inst_, p16, 16 * N, true);
         // the kept queries' mask embeddings by the projection, a chunk at a time
         std::vector<float> qh((size_t) (Q * d));
         gpu::stream_sync(s_);
@@ -708,7 +685,7 @@ std::vector<Segment> Sam3::run(const QiRef& image, const std::vector<int32_t>& i
             aux_relu(small, k * d, nullptr, a16, s_);
             product(a16, emb3_, small, k);
             kernels::f32_to_f16_bulk(small, a16, k * d, s_);
-            gemm_.f16(a16, t16, logits, k, 16 * N, d);
+            gemm_.f16(a16, p16, logits, k, 16 * N, d);
             if (k0 == 0) host("mask_logits", logits, (size_t) (16 * N));
             aux_mask_resize(logits, k, 4 * G, 4 * G, H, W, mask_threshold, m8, s_);
             gpu::stream_sync(s_);

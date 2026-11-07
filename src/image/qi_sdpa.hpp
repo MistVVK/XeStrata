@@ -13,8 +13,9 @@
 
 namespace strata::image::sdpa {
 
+/// `batch` attentions of the same shape one after another in each tensor (q0 0 where there are more than one).
 bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-           int64_t T, int64_t heads, int64_t hd, uint16_t* out16);
+           int64_t T, int64_t heads, int64_t hd, uint16_t* out16, int64_t batch = 1);
 bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
               int64_t T, int64_t heads, int64_t hd, uint16_t* out16, bool causal);
 

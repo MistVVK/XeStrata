@@ -6,10 +6,13 @@
 // qi_conv's oneDNN and cuDNN, else unfolded patches and prefill::Gemm).
 #pragma once
 
+#include "strata/image/aux_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
 #include <functional>
+#include <map>
+#include <tuple>
 #include <memory>
 #include <string>
 #include <vector>
@@ -88,8 +91,16 @@ protected:
     const uint16_t* f16(const std::string& name);
     std::vector<float> host_f32(const std::string& name);
 
-    /// y = x16 . l.w^T (+ l.b); ldy: y's row stride (0: l.n).
-    void product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int64_t ldy = 0);
+    /// y = x16 . l.w^T (+ l.b, unless `bias` is false: the reader adds it); ldy: y's row stride (0: l.n).
+    void product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int64_t ldy = 0, bool bias = true);
+    /// y16 [T][l.n] FP16 = x16 . l.w^T, with `bias` + l.b, else the bias left to the reader (aux_bias_act16,
+    /// aux_rope2d_split16h): half the bytes of product's FP32 rows, the bias's pass saved.  The library's half product (Gemm::native_half) or the FP32
+    /// product narrowed, whichever the GPU runs the shape in less time (each warmed, then timed, at its first call):
+    /// the half product took the B70 (oneMKL) 0.22 ms for SAM 3's 5184 x 3072 x 1024 against 0.29, the RTX 4070
+    /// (cuBLAS) 0.35 against 0.58 (2026-11-07), and a library's FP16 output can be the slower (oneDNN's in the LLM's
+    /// prompt on the B70).
+    void product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t T, bool bias = false,
+                   AuxAct act = AuxAct::none);
     /// y [OH][OW][O] (+= with `add`) = the convolution of x16 [H][W][C] plus its bias; `col_slot` a scratch slot for
     /// the unfolded patches where no library takes it.
     void convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, float* y, int col_slot, bool add = false);
@@ -105,6 +116,10 @@ protected:
 private:
     std::vector<void*> weights_;
     std::vector<std::pair<void*, size_t>> work_;
+    // product16's way by (T, N, K, the activation and the bias): 0 the FP32 product narrowed, 1 the half product, 2 a
+    // library's 1 x 1 convolution
+    std::map<std::tuple<int64_t, int64_t, int64_t, int>, int> pick16_;
+    static constexpr int kNarrowSlot = 255;                             // product16's FP32 rows when not half
 };
 
 }  // namespace strata::image

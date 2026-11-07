@@ -46,7 +46,7 @@ namespace fe = cudnn_frontend;
 struct Cudnn {
     bool failed = false, conv_failed = false;   // conv_failed: cuDNN not opened for the convolutions
     cudnnHandle_t handle = nullptr;
-    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, std::shared_ptr<fe::graph::Graph>> graphs;
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, std::shared_ptr<fe::graph::Graph>> graphs;
     std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
     void* ws = nullptr;
     int64_t ws_bytes = 0;
@@ -56,23 +56,23 @@ std::unordered_map<sycl::device, Cudnn> g_cudnn;
 constexpr int64_t kQ = 1, kK = 2, kV = 3, kO = 4;   // the tensors' ids in the variant pack
 
 std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows, int64_t T, int64_t heads,
-                                              int64_t hd) {
+                                              int64_t hd, int64_t B) {
     auto g = std::make_shared<fe::graph::Graph>();
     g->set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
     const int64_t row = heads * hd;
-    auto Q = g->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(kQ).set_dim({1, heads, rows, hd}).set_stride(
+    auto Q = g->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(kQ).set_dim({B, heads, rows, hd}).set_stride(
         {rows * row, hd, row, 1}));
-    auto K = g->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(kK).set_dim({1, heads, T, hd}).set_stride(
+    auto K = g->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(kK).set_dim({B, heads, T, hd}).set_stride(
         {T * row, hd, row, 1}));
-    auto V = g->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(kV).set_dim({1, heads, T, hd}).set_stride(
+    auto V = g->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(kV).set_dim({B, heads, T, hd}).set_stride(
         {T * row, hd, row, 1}));
     auto opts = fe::graph::SDPA_attributes().set_name("sdpa").set_generate_stats(false).set_attn_scale(
         1.0f / std::sqrt((float) hd));
     auto [O, stats] = g->sdpa(Q, K, V, opts);
     (void) stats;
-    O->set_output(true).set_dim({1, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
+    O->set_output(true).set_dim({B, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
     if (!g->build(handle, {fe::HeurMode_t::A}).is_good()) throw std::runtime_error("cuDNN builds no SDPA plan");
     return g;
 }
@@ -206,7 +206,7 @@ void open_cudnn(cudnnHandle_t& handle) {
 }  // namespace
 
 bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-                int64_t T, int64_t heads, int64_t hd, uint16_t* out16) {
+                int64_t T, int64_t heads, int64_t hd, uint16_t* out16, int64_t batch) {
     std::lock_guard<std::mutex> lock(g_mu);
     Cudnn& d = g_cudnn[q.get_device()];
     if (d.failed) return false;
@@ -214,9 +214,10 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
         if (d.handle == nullptr) open_cudnn(d.handle);
         const CUstream cs = sycl::get_native<sycl::backend::ext_oneapi_cuda>(q);
         if (fe::detail::set_stream(d.handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
-        const auto key = std::make_tuple(q1 - q0, T, heads, hd);
+        const auto key = std::make_tuple(q1 - q0, T, heads, hd, batch);
         auto it = d.graphs.find(key);
-        if (it == d.graphs.end()) it = d.graphs.emplace(key, cudnn_graph(d.handle, q1 - q0, T, heads, hd)).first;
+        if (it == d.graphs.end())
+            it = d.graphs.emplace(key, cudnn_graph(d.handle, q1 - q0, T, heads, hd, batch)).first;
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
         if (ws > d.ws_bytes) {
@@ -251,7 +252,7 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
 bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, const uint16_t* w, int64_t O, int k,
            const float* bias, bool add, void* y, const Form& f) {
     namespace fe = cudnn_frontend;
-    if (add && f.leaky >= 0.0f) return false;
+    if ((add && f.leaky >= 0.0f) || f.gelu) return false;
     const int64_t lx = f.ldx > 0 ? f.ldx : C, ly = f.ldy > 0 ? f.ldy : O;
     std::lock_guard<std::mutex> lock(sdpa::g_mu);
     sdpa::Cudnn& d = sdpa::g_cudnn[q.get_device()];

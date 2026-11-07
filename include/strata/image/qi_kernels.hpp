@@ -64,9 +64,11 @@ const char* qi_attention_path();
 /// The attention of query rows q0 .. q1 - 1 over all T keys (no mask), FP16 out16 [q1 - q0][heads * head_dim] (the
 /// layout of qi_attention's), through a GPU maker's kernel where the build has one for the GPU (src/image/qi_sdpa.cpp:
 /// oneDNN's SDPA on Intel GPUs); false where none takes it.  `causal`: each query row t reads keys 0 .. t only (q0 0,
-/// q1 T: the text encoder's prompt), so far through aotriton on AMD GPUs alone.
+/// q1 T: the text encoder's prompt), so far through aotriton on AMD GPUs alone.  `batch` attentions of the same shape
+/// one after another in each tensor (a ViT's windows; q0 0 and not causal where there are more than one): one call of
+/// the library where it takes a batch (oneDNN, cuDNN), else one a batch.
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
-             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal = false);
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal = false, int64_t batch = 1);
 /// qi_sdpa can take a causal attention on the stream's GPU (a kernel for it in the build and the GPU's runtime).
 bool qi_sdpa_causal(void* stream);
 

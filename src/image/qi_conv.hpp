@@ -18,6 +18,7 @@ struct Form {
     int64_t ldy = 0;       // y's (0: O)
     bool y16 = false;      // y FP16 (uint16_t bits) rather than FP32
     float leaky = -1.0f;   // 0 or more: LeakyReLU of that slope after the bias (not with `add`)
+    bool gelu = false;     // GELU (erf's) after the bias (not with `add` or `leaky`; oneDNN alone)
 };
 
 /// y [OH][OW][O] (FP32) = the k x k convolution of stride `stride` of x [H][W][C] (FP16) by w [O][k][k][C] (FP16)

@@ -77,33 +77,148 @@ void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, 
     finish(stream, e, "aux_dwconv3_add");
 }
 
-void aux_layer_norm(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
-                    float* y, uint16_t* y16, void* stream) {
+void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
+                        int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream) {
+    const int64_t T = H * W;
     if (T <= 0) return;
     constexpr size_t L = 256;
     const auto e = queue_for(stream).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t py = t / W, px = t - py * W;
+            float* yr = y + t * C;
+            float s = 0.f;
+            for (int64_t c = l; c < C; c += (int64_t) L) {   // each item its own channels: written, then read back
+                float v = b[c];
+                for (int64_t dy = -1; dy <= 1; ++dy) {
+                    const int64_t yy = py + dy;
+                    if (yy < 0 || yy >= H) continue;
+                    for (int64_t dx = -1; dx <= 1; ++dx) {
+                        const int64_t xx = px + dx;
+                        if (xx >= 0 && xx < W) v += w[c * 9 + (dy + 1) * 3 + dx + 1] * x[(yy * W + xx) * C + c];
+                    }
+                }
+                v += x[t * C + c];
+                yr[c] = v;
+                s += v;
+            }
+            const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+            float s2 = 0.f;
+            for (int64_t c = l; c < C; c += (int64_t) L) {
+                const float d = yr[c] - mean;
+                s2 += d * d;
+            }
+            const float inv =
+                1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
+            const int64_t o = o_ws > 0 ? ((py / o_ws) * (W / o_ws) + px / o_ws) * o_ws * o_ws + (py % o_ws) * o_ws +
+                                             px % o_ws
+                                       : t;
+            for (int64_t c = l; c < C; c += (int64_t) L) y16[o * C + c] = f16_from_f32((yr[c] - mean) * inv * nw[c] + nb[c]);
+        });
+    finish(stream, e, "aux_dwconv3_norm16");
+}
+
+namespace {
+// aux_layer_norm's rows, row t's output at row to(t)
+template <class To>
+void layer_norm_rows(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
+                     float* y, uint16_t* y16, To to, void* stream, const char* what, const float* rb = nullptr) {
+    if (T <= 0) return;
+    constexpr size_t L = 256;
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto t = static_cast<int64_t>(it.get_group_linear_id());
+            const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t o = to(t);
             const float* xr = x + t * C;
             const float* rr = r != nullptr ? r + t * C : nullptr;
             float s = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) s += xr[c] + (rr ? rr[c] : 0.f);
+            for (int64_t c = l; c < C; c += (int64_t) L) s += xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f);
             const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
             float s2 = 0.f;   // two passes: the variance about the mean (the residual streams' large values)
             for (int64_t c = l; c < C; c += (int64_t) L) {
-                const float d = xr[c] + (rr ? rr[c] : 0.f) - mean;
+                const float d = xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean;
                 s2 += d * d;
             }
             const float inv =
                 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
             for (int64_t c = l; c < C; c += (int64_t) L) {
-                const float v = (xr[c] + (rr ? rr[c] : 0.f) - mean) * inv * w[c] + b[c];
-                if (y16 != nullptr) y16[t * C + c] = f16_from_f32(v);
-                if (y != nullptr) y[t * C + c] = v;
+                const float v = (xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean) * inv * w[c] + b[c];
+                if (y16 != nullptr) y16[o * C + c] = f16_from_f32(v);
+                if (y != nullptr) y[o * C + c] = v;
             }
         });
-    finish(stream, e, "aux_layer_norm");
+    finish(stream, e, what);
+}
+}  // namespace
+
+void aux_layer_norm(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
+                    float* y, uint16_t* y16, void* stream) {
+    layer_norm_rows(x, r, w, b, T, C, eps, y, y16, [](int64_t t) { return t; }, stream, "aux_layer_norm");
+}
+
+void aux_residual_norm16(float* x, const float* r, const float* rb, const float* w, const float* b, int64_t H, int64_t W,
+                         int64_t C, int64_t r_ws, int64_t o_ws, float eps, uint16_t* y16, void* stream) {
+    const int64_t T = H * W;
+    if (T <= 0) return;
+    constexpr size_t L = 256;
+    // row t of the grid at its window's place (ws > 0: aux_window16's order, no shift, whole windows), else as it is
+    const auto place = [=](int64_t t, int64_t ws) {
+        if (ws <= 0) return t;
+        const int64_t py = t / W, px = t - py * W;
+        return ((py / ws) * (W / ws) + px / ws) * ws * ws + (py % ws) * ws + px % ws;
+    };
+    const auto e = queue_for(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto t = static_cast<int64_t>(it.get_group_linear_id());
+            const auto l = static_cast<int64_t>(it.get_local_linear_id());
+            float* xr = x + t * C;
+            const float* rr = r + place(t, r_ws) * C;
+            float s = 0.f;
+            for (int64_t c = l; c < C; c += (int64_t) L) {   // each item its own columns: written, then read back
+                const float v = xr[c] + rr[c] + (rb != nullptr ? rb[c] : 0.f);
+                xr[c] = v;
+                s += v;
+            }
+            if (w == nullptr) return;
+            const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+            float s2 = 0.f;
+            for (int64_t c = l; c < C; c += (int64_t) L) {
+                const float d = xr[c] - mean;
+                s2 += d * d;
+            }
+            const float inv =
+                1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
+            uint16_t* yr = y16 + place(t, o_ws) * C;
+            for (int64_t c = l; c < C; c += (int64_t) L) yr[c] = f16_from_f32((xr[c] - mean) * inv * w[c] + b[c]);
+        });
+    finish(stream, e, "aux_residual_norm16");
+}
+
+void aux_add_norm(const float* x, const float* r, const float* rb, const float* w, const float* b, int64_t T, int64_t C,
+                  float eps, float* y, uint16_t* y16, void* stream) {
+    layer_norm_rows(x, r, w, b, T, C, eps, y, y16, [](int64_t t) { return t; }, stream, "aux_add_norm", rb);
+}
+
+void aux_cache_put_kv(const uint16_t* src16, int64_t B, int64_t ld, int64_t koff, int64_t voff, int64_t C,
+                      uint16_t* kc, uint16_t* vc, int64_t cap, int64_t at, void* stream) {
+    if (B <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) B, (size_t) C), [=](sycl::id<2> id) {
+        const auto b = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        kc[(b * cap + at) * C + c] = src16[b * ld + koff + c];
+        vc[(b * cap + at) * C + c] = src16[b * ld + voff + c];
+    });
+    finish(stream, e, "aux_cache_put_kv");
+}
+
+void aux_layer_norm_window16(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C,
+                             int64_t ws, float eps, uint16_t* y16, void* stream) {
+    const int64_t nwx = W / ws;
+    layer_norm_rows(x, nullptr, w, b, H * W, C, eps, nullptr, y16, [=](int64_t t) {
+        const int64_t py = t / W, px = t - py * W;
+        return ((py / ws) * nwx + px / ws) * ws * ws + (py % ws) * ws + px % ws;
+    }, stream, "aux_layer_norm_window16");
 }
 
 void aux_window16(const uint16_t* src16, int64_t H, int64_t W, int64_t C, int64_t ws, int64_t shift, int64_t Hp,
@@ -149,6 +264,55 @@ void aux_channel_split(const float* qkv, int64_t N, int64_t C, int64_t G, float 
         v16[(g * N + t) * Cg + c] = f16_from_f32(row[2 * C + g * Cg + c]);
     });
     finish(stream, e, "aux_channel_split");
+}
+
+void aux_channel_split16(const uint16_t* qkv16, int64_t N, int64_t C, int64_t G, float scale, uint16_t* qT16,
+                         uint16_t* kT16, uint16_t* v16, void* stream) {
+    if (N <= 0 || C <= 0) return;
+    constexpr int64_t TS = 32, RW = 8;   // a tile of 32 tokens by 32 channels, 8 rows of items
+    const int64_t Cg = C / G, nt = (N + TS - 1) / TS;
+    sycl::queue& q = queue_for(stream);
+    // q and k (2C channels) transposed through local memory: read along the channels, written along the tokens
+    auto e = q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint16_t, 2> tile(sycl::range<2>(TS, TS + 1), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (nt * RW), (size_t) (2 * C)),
+                                         sycl::range<2>((size_t) RW, (size_t) TS)),
+                       [=](sycl::nd_item<2> it) {
+            const auto ly = static_cast<int64_t>(it.get_local_id(0)), lx = static_cast<int64_t>(it.get_local_id(1));
+            const int64_t t0 = static_cast<int64_t>(it.get_group(0)) * TS, c0 = static_cast<int64_t>(it.get_group(1)) * TS;
+            for (int64_t r = ly; r < TS; r += RW) {
+                const int64_t t = t0 + r;
+                tile[r][lx] = t < N ? qkv16[t * 3 * C + c0 + lx] : (uint16_t) 0;
+            }
+            sycl::group_barrier(it.get_group());
+            const int64_t t = t0 + lx;
+            if (t < N)
+                for (int64_t r = ly; r < TS; r += RW) {
+                    const int64_t c = c0 + r;
+                    const uint16_t v = tile[lx][r];
+                    if (c < C) qT16[c * N + t] = f16_from_f32(f32_from_f16(v) * scale);
+                    else kT16[(c - C) * N + t] = v;
+                }
+        });
+    });
+    finish(stream, e, "aux_channel_split16 (q, k)");
+    e = q.parallel_for(sycl::range<2>((size_t) N, (size_t) C), [=](sycl::id<2> id) {
+        const auto t = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        const int64_t g = c / Cg;
+        v16[(g * N + t) * Cg + c - g * Cg] = qkv16[t * 3 * C + 2 * C + c];
+    });
+    finish(stream, e, "aux_channel_split16 (v)");
+}
+
+void aux_channel_merge16(const float* yg, int64_t N, int64_t C, int64_t G, uint16_t* y16, void* stream) {
+    if (N <= 0 || C <= 0) return;
+    const int64_t Cg = C / G;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) N, (size_t) C), [=](sycl::id<2> id) {
+        const auto t = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        const int64_t g = c / Cg;
+        y16[t * C + c] = f16_from_f32(yg[(g * N + t) * Cg + c - g * Cg]);
+    });
+    finish(stream, e, "aux_channel_merge16");
 }
 
 void aux_softmax16(const float* s, int64_t rows, int64_t cols, uint16_t* p16, void* stream) {
@@ -278,30 +442,77 @@ void aux_tile_add(float* x, const float* table, int64_t H, int64_t W, int64_t C,
     finish(stream, e, "aux_tile_add");
 }
 
-void aux_rope2d_split16(const float* qkv, int64_t N, int64_t heads, int64_t hd, int64_t grid, float pscale, float theta,
-                        uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
+namespace {
+inline float value_of(float v) { return v; }
+inline float value_of(uint16_t v) { return f32_from_f16(v); }
+
+// aux_rope2d_split16 over qkv rows of floats or of FP16 bits, `bias` [3C] added where not null
+template <class In>
+void rope2d_split16(const In* qkv, const float* bias, int64_t N, int64_t heads, int64_t hd, int64_t grid, float pscale,
+                    float theta, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
     const int64_t C = heads * hd, half = hd / 2, quarter = hd / 4;
     if (N <= 0 || half <= 0) return;
-    const float lt = sycl::log(theta);   // f_i = exp(-4 i / hd * ln theta)
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (N * heads * half)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i % half, th = i / half, t = th / heads, h = th - t * heads;
-        const int64_t li = t % (grid * grid), px = li % grid, py = li / grid;
-        const int64_t f = p < quarter ? p : p - quarter;
-        const float pos = (float) (p < quarter ? px : py) * pscale;
-        const float ang = pos * sycl::exp(-(float) (4 * f) / (float) hd * lt);
-        const float cs = sycl::cos(ang), sn = sycl::sin(ang);
-        const float* row = qkv + t * 3 * C + h * hd + 2 * p;
-        const int64_t o = t * C + h * hd + 2 * p;
-        const float q0 = row[0], q1 = row[1], k0 = row[C], k1 = row[C + 1];
+    const float* tab = rope_table(stream, grid, pscale, hd, theta);
+    // a 2D range (rows, a row's pairs) and 32-bit indices
+    const int hf = (int) half, gg = (int) (grid * grid);
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) N, (size_t) (heads * half)), [=](sycl::id<2> id) {
+        const int64_t t = (int64_t) id[0];
+        const int hp = (int) id[1], h = hp / hf, p = hp - h * hf;
+        const int li = (int) (t % gg);
+        const int ti = (li * hf + p) * 2;   // the table: grid^2 x half pairs, far below 2^31
+        const float cs = tab[ti], sn = tab[ti + 1];
+        const int p2 = 2 * p;   // the pair's first value: 32-bit, as the device counts
+        const In* row = qkv + t * 3 * C + h * hd + p2;
+        const int64_t o = t * C + h * hd + p2, c0 = h * hd + p2;
+        auto at = [&](int64_t j) { return value_of(row[j]) + (bias != nullptr ? bias[c0 + j] : 0.f); };
+        const float q0 = at(0), q1 = at(1), k0 = at(C), k1 = at(C + 1);
         q16[o] = f16_from_f32(q0 * cs - q1 * sn);
         q16[o + 1] = f16_from_f32(q1 * cs + q0 * sn);
         k16[o] = f16_from_f32(k0 * cs - k1 * sn);
         k16[o + 1] = f16_from_f32(k1 * cs + k0 * sn);
-        v16[o] = f16_from_f32(row[2 * C]);
-        v16[o + 1] = f16_from_f32(row[2 * C + 1]);
+        v16[o] = f16_from_f32(at(2 * C));
+        v16[o + 1] = f16_from_f32(at(2 * C + 1));
     });
     finish(stream, e, "aux_rope2d_split16");
+}
+}  // namespace
+
+void aux_rope2d_split16(const float* qkv, int64_t N, int64_t heads, int64_t hd, int64_t grid, float pscale, float theta,
+                        uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
+    rope2d_split16(qkv, nullptr, N, heads, hd, grid, pscale, theta, q16, k16, v16, stream);
+}
+
+void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, int64_t heads, int64_t hd, int64_t grid,
+                         float pscale, float theta, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream) {
+    rope2d_split16(qkv16, bias, N, heads, hd, grid, pscale, theta, q16, k16, v16, stream);
+}
+
+void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
+                    void* stream) {
+    if (T <= 0 || n <= 0) return;
+    // a work-item 8 columns of a row where n takes them (16 bytes in, 16 out), else one
+    const int64_t per = n % 8 == 0 ? 8 : 1, chunks = n / per;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) chunks), [=](sycl::id<2> id) {
+        const auto t = static_cast<int64_t>(id[0]), c0 = static_cast<int64_t>(id[1]) * per;
+        const uint16_t* in = x16 + t * n + c0;
+        uint16_t* out = y16 + t * n + c0;
+        for (int64_t j = 0; j < per; ++j) {
+            float v = f32_from_f16(in[j]) + (bias != nullptr ? bias[c0 + j] : 0.f);
+            if (act == AuxAct::relu) v = sycl::fmax(v, 0.f);
+            else if (act == AuxAct::gelu) v = 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
+            out[j] = f16_from_f32(v);
+        }
+    });
+    finish(stream, e, "aux_bias_act16");
+}
+
+void aux_narrow_bias16(const float* y, const float* bias, int64_t T, int64_t n, uint16_t* y16, void* stream) {
+    if (T <= 0 || n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * n)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y16[i] = f16_from_f32(y[i] + (bias != nullptr ? bias[i % n] : 0.f));
+    });
+    finish(stream, e, "aux_narrow_bias16");
 }
 
 void aux_deconv2_scatter(const float* y, int64_t H, int64_t W, int64_t O, const float* bias, bool gelu, float* out,
@@ -365,11 +576,11 @@ void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float
         }
     });
     if (!stream) core::Runtime::get().wait(e, "aux_group_norm");
-    const int64_t n = N * C;
-    e = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, g = c / Cg;
-        // the chunks' statistics combined (Chan et al.'s pairwise update)
+    // each group's chunks combined once (Chan et al.'s pairwise update), its mean and 1 / deviation into its first
+    // chunk's slots (each group's own: the items do not meet); the pass over the values reads those two (combining
+    // them for every value took the B70 9.7 ms of SAM 3's 82,944 x 256, 2026-11-07)
+    e = q.parallel_for(sycl::range<1>((size_t) G), [=](sycl::id<1> id) {
+        const auto g = static_cast<int64_t>(id[0]);
         float cnt = 0.f, mean = 0.f, m2 = 0.f;
         for (int64_t ch = 0; ch < P; ++ch) {
             const float nb = part[3 * (g * P + ch)];
@@ -379,7 +590,15 @@ void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float
             m2 += part[3 * (g * P + ch) + 2] + d * d * cnt * nb / tot;
             cnt = tot;
         }
-        const float inv = 1.f / sycl::sqrt(m2 / cnt + eps);
+        part[3 * g * P] = mean;
+        part[3 * g * P + 1] = 1.f / sycl::sqrt(m2 / cnt + eps);
+    });
+    if (!stream) core::Runtime::get().wait(e, "aux_group_norm");
+    const int64_t n = N * C;
+    e = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t c = i % C, g = c / Cg;
+        const float mean = part[3 * g * P], inv = part[3 * g * P + 1];
         float v = (x[i] - mean) * inv * w[c] + b[c];
         if (relu) v = sycl::fmax(v, 0.f);
         if (y != nullptr) y[i] = v;
@@ -700,6 +919,35 @@ void aux_fg_combine(const uint8_t* rgba, const uint8_t* alpha, const float* y, i
         }
     });
     finish(stream, e, "aux_fg_combine");
+}
+
+void aux_box_sine16(const float* boxes, int64_t Q, int64_t F, uint16_t* sin16, float* xyxy, void* stream) {
+    if (Q <= 0 || F <= 0) return;
+    const float two_pi = 6.28318530717958647692f;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) Q, (size_t) (4 * F)), [=](sycl::id<2> id) {
+        const auto q = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        const float* b = boxes + q * 4;
+        const int64_t part = c / F, i = c - part * F, pair = i / 2;
+        const float v = part == 0 ? b[1] : part == 1 ? b[0] : part == 2 ? b[2] : b[3];   // y, x, w, h
+        const float p = v * two_pi / sycl::pow(10000.f, (float) (2 * pair) / (float) F);
+        sin16[q * 4 * F + c] = f16_from_f32(i % 2 == 0 ? sycl::sin(p) : sycl::cos(p));
+        if (c < 4) {
+            const float h = 0.5f * (c % 2 == 0 ? b[2] : b[3]);
+            xyxy[q * 4 + c] = (c % 2 == 0 ? b[0] : b[1]) + (c < 2 ? -h : h);
+        }
+    });
+    finish(stream, e, "aux_box_sine16");
+}
+
+void aux_box_refine(float* boxes, const float* delta, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const float x = sycl::clamp(boxes[i], 0.f, 1.f);
+        const float inv = sycl::log(sycl::fmax(x, 1e-3f) / sycl::fmax(1.f - x, 1e-3f));
+        boxes[i] = 1.f / (1.f + sycl::exp(-(delta[i] + inv)));
+    });
+    finish(stream, e, "aux_box_refine");
 }
 
 }  // namespace strata::image

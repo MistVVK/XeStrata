@@ -122,6 +122,11 @@ void Florence2::load_weights() {
                     vb.conv2 = dw(q + "conv2.fn.dw");
                     vb.n1 = norm(a + ".norm");
                     vb.qkv = lin(a + ".fn.qkv");
+                    const int64_t third = vb.qkv.n / 3;
+                    Lin* views[3] = {&vb.q, &vb.k, &vb.v};
+                    for (int64_t i = 0; i < 3; ++i)
+                        *views[i] = Lin{vb.qkv.w + i * third * vb.qkv.k,
+                                        vb.qkv.b != nullptr ? vb.qkv.b + i * third : nullptr, third, vb.qkv.k};
                     vb.proj = lin(a + ".fn.proj");
                     vb.n2 = norm(q + "ffn.norm");
                     vb.fc1 = lin(q + "ffn.fn.net.fc1");
@@ -270,58 +275,65 @@ void Florence2::vision(const QiRef& image) {
         if (H % ws != 0 || W % ws != 0)
             throw std::runtime_error("image engine (Florence-2): the stage's size is not a multiple of the window");
         const int64_t win = ws * ws, nw = N / win, heads = st.heads, hd = C / heads, G = st.groups, Cg = C / G;
+        // the products' bias and activation with them (product16) and their residual's add with its bias in one pass
+        // (aux_residual_norm16, no norm: a depthwise convolution comes next)
         auto ffn = [&](const VBlock& b) {
-            aux_dwconv3_add(x, b.conv2.w, b.conv2.b, H, W, C, y, s_);
+            aux_dwconv3_norm16(x, b.conv2.w, b.conv2.b, b.n2.w, b.n2.b, H, W, C, 0, kEps, y, h16, s_);
             std::swap(x, y);
-            aux_layer_norm(x, nullptr, b.n2.w, b.n2.b, N, C, kEps, nullptr, h16, s_);
-            product(h16, b.fc1, big, N);
-            qi_gelu_erf16(big, N * b.fc1.n, g16, s_);
-            product(g16, b.fc2, y, N);
-            qi_axpy(x, y, 1.f, N * C, s_);
+            product16(h16, b.fc1, g16, N, true, AuxAct::gelu);
+            product(g16, b.fc2, y, N, 0, false);
+            aux_residual_norm16(x, y, b.fc2.b, nullptr, nullptr, H, W, C, 0, 0, kEps, nullptr, s_);
         };
         for (size_t j = 0; j < st.spatial.size(); ++j) {
             // the spatial block: windows of ws x ws, heads of 32 channels
             const VBlock& sb = st.spatial[j];
-            aux_dwconv3_add(x, sb.conv1.w, sb.conv1.b, H, W, C, y, s_);
+            aux_dwconv3_norm16(x, sb.conv1.w, sb.conv1.b, sb.n1.w, sb.n1.b, H, W, C, ws, kEps, y, w16, s_);
             std::swap(x, y);
-            aux_layer_norm(x, nullptr, sb.n1.w, sb.n1.b, N, C, kEps, nullptr, h16, s_);
-            aux_window16(h16, H, W, C, ws, 0, H, W, w16, s_);
-            product(w16, sb.qkv, big, N);
-            kernels::f32_to_f16_bulk(big, g16, N * 3 * C, s_);
+            // q, k and v each its own rows (the packed weight's thirds), so the windows go to a library in one call
+            const Lin* parts[3] = {&sb.q, &sb.k, &sb.v};
+            uint16_t* out3[3] = {qT, kT, v16};
+            for (int i = 0; i < 3; ++i) product16(w16, *parts[i], out3[i], N, true);
             QiSdpa a;
-            a.q = g16;
-            a.k = g16 + C;
-            a.v = g16 + 2 * C;
+            a.q = qT;
+            a.k = kT;
+            a.v = v16;
             a.out = a16;
             a.batch = nw;
             a.heads = heads;
             a.lq = a.lk = win;
             a.hd = hd;
-            a.q_row = a.k_row = a.v_row = 3 * C;
-            a.q_batch = a.k_batch = a.v_batch = win * 3 * C;
+            a.q_row = a.k_row = a.v_row = C;
+            a.q_batch = a.k_batch = a.v_batch = win * C;
             a.o_row = C;
             a.o_batch = win * C;
             a.scale = 1.f / std::sqrt((float) hd);
             qi_sdpa_ex(a, s_);
-            product(a16, sb.proj, y, N);
-            aux_unwindow_add(x, y, H, W, C, ws, 0, H, W, s_);
+            product(a16, sb.proj, y, N, 0, false);
+            aux_residual_norm16(x, y, sb.proj.b, nullptr, nullptr, H, W, C, ws, 0, kEps, nullptr, s_);
             ffn(sb);
             if (si == 0 && j == 0) host("s0spatial", x, (size_t) (N * C));
             // the channel block: groups of Cg channels attend to each other over the N tokens
             const VBlock& cb = st.channel[j];
-            aux_dwconv3_add(x, cb.conv1.w, cb.conv1.b, H, W, C, y, s_);
+            aux_dwconv3_norm16(x, cb.conv1.w, cb.conv1.b, cb.n1.w, cb.n1.b, H, W, C, 0, kEps, y, h16, s_);
             std::swap(x, y);
-            aux_layer_norm(x, nullptr, cb.n1.w, cb.n1.b, N, C, kEps, nullptr, h16, s_);
-            product(h16, cb.qkv, big, N);
-            aux_channel_split(big, N, C, G, 1.f / std::sqrt((float) N), qT, kT, v16, s_);
+            // the groups' products as one batch each (G of them a block: 750 small products in the large's vision)
+            product16(h16, cb.qkv, g16, N, true);
+            if (C % 32 == 0) {
+                aux_channel_split16(g16, N, C, G, 1.f / std::sqrt((float) N), qT, kT, v16, s_);
+            } else {
+                product(h16, cb.qkv, big, N);
+                aux_channel_split(big, N, C, G, 1.f / std::sqrt((float) N), qT, kT, v16, s_);
+            }
             float* sc = scratch(kS, (size_t) (G * Cg * Cg * 4));
-            for (int64_t g = 0; g < G; ++g) gemm_.f16(qT + g * Cg * N, kT + g * Cg * N, sc + g * Cg * Cg, Cg, Cg, N);
+            gemm_.f16_batch(qT, kT, sc, Cg, Cg, N, G, Cg * N, Cg * N, Cg * Cg);
             auto* p16 = reinterpret_cast<uint16_t*>(big);   // big is free again
             aux_softmax16(sc, G * Cg, Cg, p16, s_);
-            for (int64_t g = 0; g < G; ++g) gemm_.f16(v16 + g * N * Cg, p16 + g * Cg * Cg, y + g * Cg, N, Cg, Cg, C);
-            kernels::f32_to_f16_bulk(y, a16, N * C, s_);
-            product(a16, cb.proj, y, N);
-            qi_axpy(x, y, 1.f, N * C, s_);
+            // each group's out [N][Cg] after the last (a library's batch takes no interleaved outputs), merged into
+            // the tokens' rows as they are narrowed
+            gemm_.f16_batch(v16, p16, y, N, Cg, Cg, G, N * Cg, Cg * Cg, N * Cg);
+            aux_channel_merge16(y, N, C, G, a16, s_);
+            product(a16, cb.proj, y, N, 0, false);
+            aux_residual_norm16(x, y, cb.proj.b, nullptr, nullptr, H, W, C, 0, 0, kEps, nullptr, s_);
             ffn(cb);
         }
         host(("stage" + std::to_string(si)).c_str(), x, (size_t) (N * C));
@@ -442,6 +454,7 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
     int64_t cur_len = 1;
     std::vector<int32_t> toks((size_t) B, kEos);
     const int64_t K2 = 2 * B;
+    std::vector<char> banned((size_t) V, 0);   // the step's banned tokens of a beam, cleared after it
     steps = 0;
     for (;;) {
         // the step: each beam's last token at position cur_len - 1
@@ -458,10 +471,10 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             const DLayer& l = dec_[(size_t) li];
             uint16_t* kc = cache + (li * 2) * B * cap * d;
             uint16_t* vc = cache + (li * 2 + 1) * B * cap * d;
+            // the step's few rows: the post-norms with the residual and the bias, the caches' writes in one
             product(h16, l.qkv, y, B);
             kernels::f32_to_f16_bulk(y, g16, B * 3 * d, s_);
-            aux_cache_put(g16, B, 3 * d, d, d, kc, cap, at, s_);
-            aux_cache_put(g16, B, 3 * d, 2 * d, d, vc, cap, at, s_);
+            aux_cache_put_kv(g16, B, 3 * d, d, 2 * d, d, kc, vc, cap, at, s_);
             QiSdpa a;
             a.q = g16;
             a.k = kc;
@@ -478,8 +491,8 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             a.o_row = a.o_batch = d;
             a.scale = 1.f / std::sqrt((float) hd);
             qi_sdpa_ex(a, s_);
-            product(a16, l.o, y, B);
-            aux_layer_norm(h, y, l.n_self.w, l.n_self.b, B, d, kEps, h, h16, s_);
+            product(a16, l.o, y, B, 0, false);
+            aux_add_norm(h, y, l.o.b, l.n_self.w, l.n_self.b, B, d, kEps, h, h16, s_);
             // the cross-attention over the encoder's states, every beam the same keys
             product(h16, l.cq, y, B);
             kernels::f32_to_f16_bulk(y, q16, B * d, s_);
@@ -499,12 +512,12 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             c.k_batch = c.v_batch = T * d;
             c.scale = 1.f / std::sqrt((float) hd);
             qi_sdpa_ex(c, s_);
-            product(a16, l.co, y, B);
-            aux_layer_norm(h, y, l.n_cross.w, l.n_cross.b, B, d, kEps, h, h16, s_);
+            product(a16, l.co, y, B, 0, false);
+            aux_add_norm(h, y, l.co.b, l.n_cross.w, l.n_cross.b, B, d, kEps, h, h16, s_);
             product(h16, l.fc1, y, B);
             qi_gelu_erf16(y, B * ffn_, g16, s_);
-            product(g16, l.fc2, y, B);
-            aux_layer_norm(h, y, l.n_ffn.w, l.n_ffn.b, B, d, kEps, h, h16, s_);
+            product(g16, l.fc2, y, B, 0, false);
+            aux_add_norm(h, y, l.fc2.b, l.n_ffn.w, l.n_ffn.b, B, d, kEps, h, h16, s_);
         }
         gemm_.f16(h16, shared_, logits, B, V, d);
         qi_bias_add(logits, logits_bias_, B, V, s_);
@@ -515,37 +528,45 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
         ++steps;
 
         // log-softmax, the processors (no repeated 3-gram, <s> first, </s> at the last place), the running scores
+        // a beam's values: the log-softmax, the banned ones and all but the forced token -inf, plus its running score.
+        // The step's top 2 x beams (the higher first, the lower index on a tie) are among each beam's own top 2 x beams,
+        // each picked in one pass over its row (adding a beam's running score keeps its order)
         constexpr float ninf = -std::numeric_limits<float>::infinity();
+        std::vector<std::pair<float, int64_t>> pool;
+        pool.reserve((size_t) (B * K2));
+        const bool forced = cur_len == 1 || cur_len == max_length - 1;
+        const int32_t keep = cur_len == 1 ? kBos : kEos;
         for (int64_t b = 0; b < B; ++b) {
-            float* r = lg.data() + b * V;
+            const float* r = lg.data() + b * V;
             const float mx = *std::max_element(r, r + V);
             double z = 0.0;
             for (int64_t v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
             const float lse = mx + (float) std::log(std::max(z, 1.0));   // the largest's own term is 1
-            for (int64_t v = 0; v < V; ++v) r[v] -= lse;
             const auto& sq = run_seq[(size_t) b];
+            std::vector<int32_t> ban;
             if (cur_len + 1 >= kNgram) {
                 const int32_t p0 = sq[(size_t) (cur_len - 2)], p1 = sq[(size_t) (cur_len - 1)];
                 for (int64_t i = 0; i + 2 < cur_len; ++i)
-                    if (sq[(size_t) i] == p0 && sq[(size_t) (i + 1)] == p1) r[sq[(size_t) (i + 2)]] = ninf;
+                    if (sq[(size_t) i] == p0 && sq[(size_t) (i + 1)] == p1) ban.push_back(sq[(size_t) (i + 2)]);
             }
-            if (cur_len == 1 || cur_len == max_length - 1) {
-                const int32_t keep = cur_len == 1 ? kBos : kEos;
-                std::fill(r, r + V, ninf);
-                r[keep] = 0.f;
+            for (int32_t t : ban) banned[(size_t) t] = 1;
+            std::vector<std::pair<float, int64_t>> best;   // the beam's top K2, the higher first
+            for (int64_t v = 0; v < V; ++v) {
+                const float val = forced ? (v == keep ? 0.f : ninf) : banned[(size_t) v] ? ninf : r[v] - lse;
+                if ((int64_t) best.size() == K2 && !(val > best.back().first)) continue;
+                auto at = std::find_if(best.begin(), best.end(), [&](const auto& e) { return val > e.first; });
+                best.insert(at, {val, v});
+                if ((int64_t) best.size() > K2) best.pop_back();
             }
-            for (int64_t v = 0; v < V; ++v) r[v] += run_score[(size_t) b];
+            for (int32_t t : ban) banned[(size_t) t] = 0;
+            for (const auto& e : best) pool.push_back({e.first + run_score[(size_t) b], b * V + e.second});
         }
-        // the top 2 x beams continuations, the higher first (the lower index on a tie)
+        std::stable_sort(pool.begin(), pool.end(), [](const auto& a, const auto& c) {
+            return a.first > c.first || (a.first == c.first && a.second < c.second);
+        });
         std::vector<int64_t> top((size_t) K2);
-        {
-            std::vector<int64_t> idx((size_t) (B * V));
-            std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(), idx.begin() + K2, idx.end(), [&](int64_t i, int64_t j) {
-                return lg[(size_t) i] > lg[(size_t) j] || (lg[(size_t) i] == lg[(size_t) j] && i < j);
-            });
-            std::copy(idx.begin(), idx.begin() + K2, top.begin());
-        }
+        std::vector<float> top_val((size_t) K2);
+        for (int64_t k = 0; k < K2; ++k) top[(size_t) k] = pool[(size_t) k].second, top_val[(size_t) k] = pool[(size_t) k].first;
         std::vector<std::vector<int32_t>> cand_seq((size_t) K2);
         std::vector<float> cand_score((size_t) K2);
         std::vector<int32_t> cand_src((size_t) K2);
@@ -557,7 +578,7 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             cand_src[(size_t) k] = (int32_t) src;
             cand_seq[(size_t) k] = run_seq[(size_t) src];
             cand_seq[(size_t) k].push_back(tok);
-            cand_score[(size_t) k] = lg[(size_t) f];
+            cand_score[(size_t) k] = top_val[(size_t) k];
             hits[(size_t) k] = tok == kEos || cur_len + 1 >= max_length ? 1 : 0;
             all_hit = all_hit && hits[(size_t) k];
         }

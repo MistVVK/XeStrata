@@ -44,8 +44,8 @@ void sdpa_free(void* ptr, const void*, const void* ctx, void* ev) {
 }
 
 // a device's oneDNN engine, its compiled partitions by shape, and the scale (FP16, 1 / sqrt(head_dim)) on it
-// rows, keys, heads, kv_heads, head_dim, causal
-using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool>;
+// rows, keys, heads, kv_heads, head_dim, causal, batch
+using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
 struct Sdpa {
     bool failed = false, failed_causal = false;   // a failure: the form not taken again on the device
     std::unique_ptr<dnnl::engine> eng;
@@ -63,14 +63,14 @@ enum : size_t { kQ = 0, kK, kV, kScale, kO, kKeys, kRows, kNegInf };
 // v [1][kv_heads][1][keys][hd].  causal: the bottom-right aligned mask oneDNN generates (GenIndex), its lengths host
 // scalars as its pattern has them (its fused kernel reads the offset from the shapes).
 dg::compiled_partition compile(const dnnl::engine& eng, int64_t rows, int64_t keys, int64_t heads, int64_t kv_heads,
-                               int64_t hd, bool causal) {
+                               int64_t hd, bool causal, int64_t B) {
     const int64_t G = heads / kv_heads, row = heads * hd, krow = kv_heads * hd;
     std::vector<int64_t> qd, kd, sd, qs, ks;
     if (G == 1) {
-        qd = {1, heads, rows, hd}, kd = {1, heads, keys, hd}, sd = {1, heads, rows, keys};
+        qd = {B, heads, rows, hd}, kd = {B, heads, keys, hd}, sd = {B, heads, rows, keys};
         qs = {rows * row, hd, row, 1}, ks = {keys * krow, hd, krow, 1};
     } else {
-        qd = {1, kv_heads, G, rows, hd}, kd = {1, kv_heads, 1, keys, hd}, sd = {1, kv_heads, G, rows, keys};
+        qd = {B, kv_heads, G, rows, hd}, kd = {B, kv_heads, 1, keys, hd}, sd = {B, kv_heads, G, rows, keys};
         qs = {rows * row, G * hd, hd, row, 1}, ks = {keys * krow, hd, hd, krow, 1};
     }
     size_t id = 100;
@@ -145,7 +145,8 @@ dg::compiled_partition compile(const dnnl::engine& eng, int64_t rows, int64_t ke
 }  // namespace
 
 bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
-                 int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal) {
+                 int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal,
+                 int64_t batch) {
     // its kernels run on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with them) leaves the
     // attention to the engine's own kernels
     if (no_xmx()) return false;
@@ -153,7 +154,7 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     // oneDNN's GPU kernels are Intel's: its Level Zero and OpenCL devices
     const sycl::backend be = q.get_device().get_backend();
     if (be != sycl::backend::ext_oneapi_level_zero && be != sycl::backend::opencl) return false;
-    if (kv_heads <= 0 || heads % kv_heads != 0) return false;
+    if (kv_heads <= 0 || heads % kv_heads != 0 || batch <= 0) return false;
     std::lock_guard<std::mutex> lock(g_mu);
     Sdpa& d = g_sdpa[q.get_device()];
     bool& failed = causal ? d.failed_causal : d.failed;
@@ -164,14 +165,14 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
             d.eng = std::make_unique<dnnl::engine>(
                 dg::sycl_interop::make_engine_with_allocator(q.get_device(), q.get_context(), alloc));
         }
-        const Shape key = std::make_tuple(rows, keys, heads, kv_heads, hd, causal);
+        const Shape key = std::make_tuple(rows, keys, heads, kv_heads, hd, causal, batch);
         auto it = d.parts.find(key);
         if (it == d.parts.end()) {
             if (d.parts.size() >= 64) {
                 d.parts.erase(d.order.back());
                 d.order.pop_back();
             }
-            it = d.parts.emplace(key, compile(*d.eng, rows, keys, heads, kv_heads, hd, causal)).first;
+            it = d.parts.emplace(key, compile(*d.eng, rows, keys, heads, kv_heads, hd, causal, batch)).first;
         } else {
             d.order.remove(key);
         }

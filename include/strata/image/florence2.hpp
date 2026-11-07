@@ -57,6 +57,7 @@ private:
         Dw conv1, conv2;
         Norm n1, n2;
         Lin qkv, proj, fc1, fc2;
+        Lin q, k, v;   // qkv's thirds, views of its rows (the spatial blocks' attention reads each on its own)
     };
     struct Stage {
         Conv embed;

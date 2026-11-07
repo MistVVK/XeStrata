@@ -44,7 +44,8 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
     using md = dnnl::memory::desc;
     using dt = dnnl::memory::data_type;
     using tag = dnnl::memory::format_tag;
-    if (add && f.leaky >= 0.0f) return false;
+    if ((add || f.gelu) && f.leaky >= 0.0f) return false;
+    if (add && f.gelu) return false;
     std::lock_guard<std::mutex> lock(g_mu);
     Conv& d = g_conv[q.get_device()];
     if (d.failed) return false;
@@ -60,7 +61,7 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
             dst({1, O, OH, OW}, f.y16 ? dt::f16 : dt::f32, dnnl::memory::dims{OH * OW * ly, 1, OW * ly, ly}),
             bmd({O}, dt::f32, tag::a);
         const key_t key{H, W, C, O, k, stride, pt, pl, pb, pr, bias != nullptr, add, lx, ly, f.y16,
-                        f.leaky >= 0.0f ? (int64_t) (f.leaky * 1e6f) : -1};
+                        f.leaky >= 0.0f ? (int64_t) (f.leaky * 1e6f) : -1, f.gelu};
         if (d.refused.count(key) != 0) return false;
         auto it = d.prims.find(key);
         if (it == d.prims.end()) try {
@@ -68,6 +69,7 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
             dnnl::post_ops po;
             if (add) po.append_sum(1.f);   // the residual: y += the convolution, read in the convolution's own pass
             if (f.leaky >= 0.0f) po.append_eltwise(dnnl::algorithm::eltwise_relu, f.leaky, 0.f);
+            if (f.gelu) po.append_eltwise(dnnl::algorithm::eltwise_gelu_erf, 0.f, 0.f);
             attr.set_post_ops(po);
             const auto pd = bias != nullptr
                 ? dnnl::convolution_forward::primitive_desc(*d.eng, dnnl::prop_kind::forward_inference,

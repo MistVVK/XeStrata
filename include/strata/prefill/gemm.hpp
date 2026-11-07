@@ -41,6 +41,11 @@ public:
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              bool half_sums = false, bool accumulate = false);
 
+    /// `batch` products of the same shape at strides (elements): Y + b sy (row stride ldy, 0: N) = (X + b sx) [T][K] .
+    /// (W + b sw)^T [N][K], FP16 in, FP32 out; one call of oneMath's strided batch where it has one for the GPU, else
+    /// one product each.
+    void f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t batch,
+                   int64_t sx, int64_t sw, int64_t sy, int64_t ldy = 0);
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
     /// GPU: the caller runs kernels::xmx_gemm_grouped then.
@@ -59,7 +64,8 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
     /// native with FP16 sums into FP16 rows Y16 (row stride ldy), not widened into FP32: the reader takes them as they
-    /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Only where half_ok says yes.
+    /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Where half_ok says no, the FP32 product
+    /// narrowed into Y16 (the same rows, a pass more).
     void native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
                      int64_t K, int64_t ldy = 0);
     /// Whether `stream`'s GPU takes native_half (oneMath's half GEMM).

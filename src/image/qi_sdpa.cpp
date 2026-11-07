@@ -25,25 +25,33 @@ namespace strata::image {
 bool qi_sdpa_causal(void* stream) { return kernels::aotriton_sdpa_ready(stream); }
 
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
-             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal) {
-    if (q1 <= q0) return true;
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal, int64_t batch) {
+    if (q1 <= q0 || batch <= 0) return true;
+    if (batch > 1 && (q0 != 0 || causal)) return false;
     // every maker's kernel here runs on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with
     // them) leaves the attention to the engine's own kernels, which take their paths without them
     if (kernels::no_xmx()) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
     [[maybe_unused]] const sycl::backend be = q.get_device().get_backend();
-    if (be == sycl::backend::ext_oneapi_hip)
-        return kernels::aotriton_sdpa(q16 + q0 * heads * head_dim, k16, v16, q1 - q0, T, heads, heads, head_dim, out16,
-                                      stream, causal);
+    if (be == sycl::backend::ext_oneapi_hip) {   // aotriton: one call a batch
+        const int64_t row = heads * head_dim;
+        for (int64_t b = 0; b < batch; ++b)
+            if (!kernels::aotriton_sdpa(q16 + (b * (q1 - q0) + q0) * row, k16 + b * T * row, v16 + b * T * row,
+                                        q1 - q0, T, heads, heads, head_dim, out16 + b * (q1 - q0) * row, stream,
+                                        causal))
+                return false;
+        return true;
+    }
     if (causal) return false;   // the other makers' kernels take the unmasked rows only
 #if STRATA_CUDNN
-    if (be == sycl::backend::ext_oneapi_cuda) return sdpa::cudnn(q, q16, k16, v16, q0, q1, T, heads, head_dim, out16);
+    if (be == sycl::backend::ext_oneapi_cuda)
+        return sdpa::cudnn(q, q16, k16, v16, q0, q1, T, heads, head_dim, out16, batch);
 #endif
 #if STRATA_ONEDNN
     // oneDNN's GPU kernels are Intel's: its Level Zero and OpenCL devices
     if (be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl)
         return kernels::onednn_sdpa(q16 + q0 * heads * head_dim, k16, v16, q1 - q0, T, heads, heads, head_dim, out16,
-                                    stream);
+                                    stream, false, batch);
 #endif
     (void) k16, (void) v16, (void) T, (void) heads, (void) head_dim, (void) out16, (void) q16;
     return false;

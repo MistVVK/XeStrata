@@ -13,15 +13,15 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/rows_cols.hpp"
 
 #if STRATA_ONEMATH
 #include "strata/kernels/matrix_report.hpp"
-#include "strata/kernels/rows_cols.hpp"
 #include <oneapi/math/blas.hpp>
 #include <filesystem>
 #include <future>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 #if defined(_WIN32)
 #define NOMINMAX
@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 
 namespace strata::prefill {
 
@@ -471,6 +472,27 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
 }
 
+void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t batch,
+                     int64_t sx, int64_t sw, int64_t sy, int64_t ldy) {
+    if (T <= 0 || N <= 0 || batch <= 0) return;
+    if (ldy <= 0) ldy = N;
+#if STRATA_ONEMATH
+    sycl::queue& q = core::Runtime::get().stream(stream_);
+    if (backend(q.get_device()).blas) {
+        try {
+            namespace om = oneapi::math;
+            om::blas::column_major::gemm_batch(q, om::transpose::trans, om::transpose::nontrans, N, T, K, 1.0f,
+                                               reinterpret_cast<const sycl::half*>(W), K, sw,
+                                               reinterpret_cast<const sycl::half*>(X), K, sx, 0.0f, Y, ldy, sy, batch);
+            return;
+        } catch (const oneapi::math::exception& e) {
+            std::fprintf(stderr, "strata: oneMath (a batch of FP16 products): %s; one product each\n", e.what());
+        }
+    }
+#endif
+    for (int64_t b = 0; b < batch; ++b) f16(X + b * sx, W + b * sw, Y + b * sy, T, N, K, ldy);
+}
+
 // Whether oneMath's backend for `stream`'s GPU has int8 products (asked of it once, by a trial).
 static bool onemath_i8(void* stream) {
 #if STRATA_ONEMATH
@@ -646,15 +668,38 @@ bool Gemm::half_ok(void* stream) {
 #endif
 }
 
-void Gemm::native_half([[maybe_unused]] const uint16_t* X, int ggml_type, const void* W_blocks,
-                       [[maybe_unused]] uint16_t* Y16, [[maybe_unused]] int64_t T, int64_t N, int64_t K, int64_t ldy) {
+void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, uint16_t* Y16, int64_t T, int64_t N,
+                       int64_t K, int64_t ldy) {
     if (ldy <= 0) ldy = N;
-    with_f16(ggml_type, W_blocks, N, K,
-             [&]([[maybe_unused]] const uint16_t* w, [[maybe_unused]] int64_t r0, [[maybe_unused]] int64_t n) {
+    with_f16(ggml_type, W_blocks, N, K, [&](const uint16_t* w, int64_t r0, int64_t n) {
 #if STRATA_ONEMATH
         if (half_out(X, w, Y16 + r0, T, n, K, ldy, stream_)) return;
 #endif
-        throw std::runtime_error("prefill gemm: an FP16 product into FP16 rows on a GPU oneMath has none for");
+        // no half product for the GPU: the FP32 product into a buffer kept per queue (grown to the largest), narrowed
+        sycl::queue& q = core::Runtime::get().stream(stream_);
+        struct Buf { float* p = nullptr; size_t n = 0; };
+        static std::mutex mu;
+        static std::unordered_map<const sycl::queue*, Buf> bufs;
+        const size_t need = (size_t) T * (size_t) n;
+        float* y = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            Buf& c = bufs[&q];
+            if (c.n < need) {
+                q.wait();
+                if (c.p != nullptr) sycl::free(c.p, q);
+                c.p = sycl::malloc_device<float>(need, q);
+                c.n = c.p != nullptr ? need : 0;
+            }
+            y = c.p;
+        }
+        if (y == nullptr) throw std::runtime_error("prefill gemm: no GPU memory for an FP16 product's FP32 sums");
+        f16(X, w, y, T, n, K, n);
+        uint16_t* out = Y16 + r0;
+        const int64_t nn = n, ld = ldy;
+        strata::kernels::for_rows_cols(q, T, n, [=](int64_t t, int64_t c) {
+            out[t * ld + c] = strata::kernels::f16_from_f32(y[t * nn + c]);
+        });
     });
 }
 

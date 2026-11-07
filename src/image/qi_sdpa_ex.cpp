@@ -18,6 +18,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 
@@ -53,7 +55,9 @@ struct Masks {
     }
 };
 
-template <int HD> void rows_kernel(const QiSdpa& a, int64_t qb, void* stream) {
+// S > 1: the keys in S parts, part p of each row's into part[((row's (batch, head, i)) * S + p) * (HD + 2)]: its
+// running maximum, its sum and its HD weighted values, which split_combine joins
+template <int HD> void rows_kernel(const QiSdpa& a, int64_t qb, void* stream, int64_t S = 1, float* part = nullptr) {
     constexpr int64_t KT = 32;
     const int64_t hd = a.hd, nb = (a.lq + qb - 1) / qb, heads = a.heads;
     const Masks mk{a.key_len, a.bias, a.mask, a.lq, a.lk, std::max<int64_t>(a.mask_n, 1), a.causal_off, a.causal};
@@ -64,10 +68,11 @@ template <int HD> void rows_kernel(const QiSdpa& a, int64_t qb, void* stream) {
     const float scale = a.scale;
     const auto e = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> ks(KT * HD, h), vs(KT * HD, h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (a.batch * heads * nb * qb)), sycl::range<1>((size_t) qb)),
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (a.batch * heads * nb * S * qb)), sycl::range<1>((size_t) qb)),
                        [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
+            const auto gs = static_cast<int64_t>(it.get_group_linear_id());
             const auto lid = static_cast<int64_t>(it.get_local_linear_id());
+            const int64_t sp = gs % S, g = gs / S;
             const int64_t blk = g % nb, bh = g / nb, hh = bh % heads, b = bh / heads, kb = b / div;
             const int64_t i = blk * qb + lid;
             const bool live = i < lq;
@@ -78,10 +83,13 @@ template <int HD> void rows_kernel(const QiSdpa& a, int64_t qb, void* stream) {
             }
             // the block's keys: the most any of its rows reads
             const int64_t last = sycl::min(lq - 1, blk * qb + qb - 1);
-            const int64_t nk = sycl::max(mk.keys(b, last), mk.keys(b, blk * qb));
+            const int64_t all = sycl::max(mk.keys(b, last), mk.keys(b, blk * qb));
+            // this part's keys: whole tiles of the block's
+            const int64_t per = (all + S * KT - 1) / (S * KT) * KT, k0 = sp * per;
+            const int64_t nk = sycl::min(all, k0 + per);
             const int64_t mine = live ? mk.keys(b, i) : 0;
             float m = -INFINITY, l = 0.f;
-            for (int64_t j0 = 0; j0 < nk; j0 += KT) {
+            for (int64_t j0 = k0; j0 < nk; j0 += KT) {
                 const int64_t n = sycl::min(KT, nk - j0);
                 for (int64_t x = lid; x < KT * HD; x += qb) {
                     const int64_t jj = x / HD, d = x - jj * HD;
@@ -109,11 +117,66 @@ template <int HD> void rows_kernel(const QiSdpa& a, int64_t qb, void* stream) {
                 sycl::group_barrier(it.get_group());
             }
             if (!live) return;
+            if (part != nullptr) {
+                float* pr = part + (((b * heads + hh) * lq + i) * S + sp) * (HD + 2);
+                pr[0] = m;
+                pr[1] = l;
+                for (int d = 0; d < HD; ++d) pr[2 + d] = acc[d];
+                return;
+            }
             const float r = l > 0.f ? 1.f / l : 0.f;   // a row that reads no key: zero
             for (int64_t d = 0; d < hd; ++d) O[b * obs + i * orw + hh * hd + d] = f16_from_f32(acc[d] * r);
         });
     });
     finish(stream, e, "qi_sdpa_ex (rows)");
+}
+
+// rows_kernel's S parts of each row joined: the parts' sums rescaled to the largest maximum
+void split_combine(const QiSdpa& a, int64_t S, int64_t HDP, const float* part, void* stream) {
+    const int64_t hd = a.hd, heads = a.heads, lq = a.lq, orw = a.o_row, obs = a.o_batch;
+    uint16_t* O = a.out;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) (a.batch * heads * lq), (size_t) hd),
+                                                  [=](sycl::id<2> id) {
+        const auto r = static_cast<int64_t>(id[0]), d = static_cast<int64_t>(id[1]);
+        const int64_t i = r % lq, bh = r / lq, hh = bh % heads, b = bh / heads;
+        const float* pr = part + r * S * (HDP + 2);
+        float m = -INFINITY;
+        for (int64_t p = 0; p < S; ++p) m = sycl::fmax(m, pr[p * (HDP + 2)]);
+        float l = 0.f, acc = 0.f;
+        for (int64_t p = 0; p < S; ++p) {
+            const float* q = pr + p * (HDP + 2);
+            if (q[0] == -INFINITY) continue;
+            const float c = sycl::exp(q[0] - m);
+            l += q[1] * c;
+            acc += q[2 + d] * c;
+        }
+        O[b * obs + i * orw + hh * hd + d] = f16_from_f32(l > 0.f ? acc / l : 0.f);
+    });
+    finish(stream, e, "qi_sdpa_ex (combine)");
+}
+
+// rows_kernel over S parts of the keys, then joined
+template <int HD> void rows_split(const QiSdpa& a, int64_t qb, int64_t S, void* stream) {
+    sycl::queue& q = queue_for(stream);
+    struct Buf { float* p = nullptr; size_t n = 0; };
+    static std::mutex mu;
+    static std::unordered_map<const sycl::queue*, Buf> bufs;
+    const size_t need = (size_t) (a.batch * a.heads * a.lq * S * (HD + 2));
+    float* part = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        Buf& c = bufs[&q];
+        if (c.n < need) {
+            q.wait();
+            if (c.p != nullptr) sycl::free(c.p, q);
+            c.p = sycl::malloc_device<float>(need, q);
+            c.n = c.p != nullptr ? need : 0;
+        }
+        part = c.p;
+    }
+    if (part == nullptr) throw std::runtime_error("qi_sdpa_ex: no GPU memory for the keys' parts");
+    rows_kernel<HD>(a, qb, stream, S, part);
+    split_combine(a, S, HD, part, stream);
 }
 
 void few_kernel(const QiSdpa& a, int64_t L, void* stream) {
@@ -175,8 +238,12 @@ bool qi_sdpa_ex_library(const QiSdpa& a, void* stream) {
     // every batch reads the same keys and the rows lie one after another: one attention of batch x lq rows
     const bool shared = a.batch == 1 || (a.kv_div >= a.batch && a.q_batch == a.lq * row && a.o_batch == a.lq * row);
     if (shared) return qi_sdpa(a.q, a.k, a.v, 0, a.batch * a.lq, a.lk, a.heads, a.hd, a.out, stream, a.causal);
-    // each batch its own keys (the windows of a ViT): one call each, the first telling whether the library takes it
+    // each batch its own keys (the windows of a ViT): one call where the batches lie one after another in each tensor,
+    // else one call each, the first telling whether the library takes it
     if (a.kv_div != 1) return false;
+    if (!a.causal && a.q_batch == a.lq * row && a.o_batch == a.lq * row && a.k_batch == a.lk * row &&
+        a.v_batch == a.lk * row)
+        return qi_sdpa(a.q, a.k, a.v, 0, a.lq, a.lk, a.heads, a.hd, a.out, stream, false, a.batch);
     for (int64_t b = 0; b < a.batch; ++b)
         if (!qi_sdpa(a.q + b * a.q_batch, a.k + b * a.k_batch, a.v + b * a.v_batch, 0, a.lq, a.lk, a.heads, a.hd,
                      a.out + b * a.o_batch, stream)) {
@@ -202,6 +269,18 @@ void qi_sdpa_ex(const QiSdpa& a, void* stream) {
         }
     }
     const int64_t qb = std::min<int64_t>(wg, 64);
+    // fewer blocks of rows than the GPU has compute units, and many keys: the keys in parts, so the parts fill it (SAM
+    // 3's 201 queries over 5,184 patches: 32 blocks, 4.1 ms a layer on the B70 in one part; its detection 0.042 s,
+    // 0.022 in parts, 2026-11-07); a part at least 4 tiles of keys
+    const auto units = (int64_t) dev.get_info<sycl::info::device::max_compute_units>();
+    const int64_t blocks = a.batch * a.heads * ((a.lq + qb - 1) / qb);
+    const int64_t S = blocks >= units ? 1 : std::min((units + blocks - 1) / blocks, std::max<int64_t>(1, a.lk / 128));
+    if (S > 1) {
+        if (a.hd <= 32) rows_split<32>(a, qb, S, stream);
+        else if (a.hd <= 64) rows_split<64>(a, qb, S, stream);
+        else rows_split<128>(a, qb, S, stream);
+        return;
+    }
     if (a.hd <= 32) rows_kernel<32>(a, qb, stream);
     else if (a.hd <= 64) rows_kernel<64>(a, qb, stream);
     else rows_kernel<128>(a, qb, stream);

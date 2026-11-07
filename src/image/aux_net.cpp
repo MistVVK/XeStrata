@@ -12,9 +12,11 @@
 #include "strata/image/aux_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace strata::image {
@@ -258,9 +260,65 @@ AuxNet::Lin AuxNet::deconv2(const std::string& name) {
     return l;
 }
 
-void AuxNet::product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int64_t ldy) {
+void AuxNet::product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t T, bool bias, AuxAct act) {
+    const float* b = bias ? l.b : nullptr;
+    const auto narrow = [&] {
+        float* y = scratch(kNarrowSlot, (size_t) (T * l.n * 4));
+        gemm_.f16(x16, l.w, y, T, l.n, l.k);
+        aux_narrow_bias16(y, b, T, l.n, y16, s_);
+        if (act != AuxAct::none) aux_bias_act16(y16, nullptr, T, l.n, act, y16, s_);
+    };
+    const auto half = [&] {
+        gemm_.native_half(x16, 1, l.w, y16, T, l.n, l.k);   // type 1: F16 rows
+        if (b != nullptr || act != AuxAct::none) aux_bias_act16(y16, b, T, l.n, act, y16, s_);
+    };
+    // a library's 1 x 1 convolution: the bias and the activation in its own pass over the sums (oneDNN's post-ops;
+    // cuDNN's with ReLU only); false where it does not take the form
+    const auto library = [&] {
+#if STRATA_ONEDNN || STRATA_CUDNN
+        conv::Form f;
+        f.y16 = true;
+        if (act == AuxAct::relu) f.leaky = 0.f;
+        f.gelu = act == AuxAct::gelu;
+        sycl::queue& q = core::Runtime::get().stream(s_);
+#endif
+#if STRATA_ONEDNN
+        if (conv::onednn(q, x16, 1, T, l.k, l.w, l.n, 1, 1, 0, 0, 0, 0, b, false, y16, f)) return true;
+#endif
+#if STRATA_CUDNN
+        if (conv::cudnn(q, x16, 1, T, l.k, l.w, l.n, 1, b, false, y16, f)) return true;
+#endif
+        return false;
+    };
+    const auto key = std::make_tuple(T, l.n, l.k, (int) act * 2 + (b != nullptr ? 1 : 0));
+    auto it = pick16_.find(key);
+    if (it == pick16_.end()) {
+        // each way warmed (a library makes its kernels at its first product of a shape), then timed; -1: not taken
+        const auto timed = [&](const auto& run) -> double {
+            if (!run()) return -1.0;
+            gpu::stream_sync(s_);
+            const auto t0 = std::chrono::steady_clock::now();
+            run();
+            gpu::stream_sync(s_);
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        };
+        const double t_narrow = timed([&] { narrow(); return true; });
+        const double t_half = prefill::Gemm::half_ok(s_) ? timed([&] { half(); return true; }) : -1.0;
+        const double t_lib = timed(library);
+        int pick = 0;
+        double best = t_narrow;
+        if (t_half >= 0.0 && t_half < best) pick = 1, best = t_half;
+        if (t_lib >= 0.0 && t_lib < best) pick = 2;
+        it = pick16_.emplace(key, pick).first;
+    }
+    if (it->second == 2 && library()) return;
+    if (it->second == 1) half();
+    else narrow();
+}
+
+void AuxNet::product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int64_t ldy, bool bias) {
     gemm_.f16(x16, l.w, y, T, l.n, l.k, ldy);
-    if (l.b != nullptr) {
+    if (bias && l.b != nullptr) {
         if (ldy != 0 && ldy != l.n) throw std::logic_error(what_ + ": a biased product with a row stride");
         qi_bias_add(y, l.b, T, l.n, s_);
     }

@@ -28,6 +28,27 @@ void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, 
 /// where not null.
 void aux_layer_norm(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
                     float* y, uint16_t* y16, void* stream);
+/// y = x + the depthwise 3 x 3 convolution of x [H][W][C] (w [C][9], b [C]; y not x), then y16 = its LayerNorm (nw,
+/// nb) in aux_window16's order of windows of o_ws (as it is at 0): DaViT's positional convolution and the norm after
+/// it in one pass.
+void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
+                        int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream);
+/// x [H][W][C] += r + rb (r's rows in aux_window16's order of windows of r_ws where r_ws > 0; rb [C], none where
+/// null), then, where w is not null, y16 = its LayerNorm (w, b) in the windows' order of o_ws (as it is at 0): a
+/// residual's product, its bias and the next norm in one pass.
+void aux_residual_norm16(float* x, const float* r, const float* rb, const float* w, const float* b, int64_t H, int64_t W,
+                         int64_t C, int64_t r_ws, int64_t o_ws, float eps, uint16_t* y16, void* stream);
+/// aux_layer_norm of x + r + rb (rb [C], a product's bias left out of it; none where null): a post-norm's residual
+/// and its product's bias in its pass.  y may be x.
+void aux_add_norm(const float* x, const float* r, const float* rb, const float* w, const float* b, int64_t T, int64_t C,
+                  float eps, float* y, uint16_t* y16, void* stream);
+/// aux_cache_put of a row's keys and values (at koff and voff) into their caches in one pass.
+void aux_cache_put_kv(const uint16_t* src16, int64_t B, int64_t ld, int64_t koff, int64_t voff, int64_t C,
+                      uint16_t* kc, uint16_t* vc, int64_t cap, int64_t at, void* stream);
+/// aux_layer_norm of x [H][W][C] into y16 in aux_window16's order (no shift, H and W whole windows of ws): the norm
+/// and the windows in one pass.
+void aux_layer_norm_window16(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C,
+                             int64_t ws, float eps, uint16_t* y16, void* stream);
 
 /// Windows of ws x ws over the grid padded to Hp x Wp (multiples of ws; the padding zero), cyclically shifted by
 /// `shift` (Swin's shifted windows; 0: none): dst16 [windows][ws * ws][C] (row-major windows, row-major in each) from
@@ -40,6 +61,12 @@ void aux_unwindow_add(float* x, const float* y, int64_t H, int64_t W, int64_t C,
 
 /// DaViT's channel attention's operands from qkv [N][3C] (q, k, v, each G groups of C / G): qT16 and kT16
 /// [G][C / G][N] (q times `scale`), v16 [G][N][C / G].
+/// The same from FP16 rows (AuxNet::product16's, the bias in), C a multiple of 32: q and k transposed through local
+/// memory, a tile at a time.
+void aux_channel_split16(const uint16_t* qkv16, int64_t N, int64_t C, int64_t G, float scale, uint16_t* qT16,
+                         uint16_t* kT16, uint16_t* v16, void* stream);
+/// y16 [N][C] FP16 = yg [G][N][C / G] (the channel attention's groups' outputs, each after the last), merged.
+void aux_channel_merge16(const float* yg, int64_t N, int64_t C, int64_t G, uint16_t* y16, void* stream);
 void aux_channel_split(const float* qkv, int64_t N, int64_t C, int64_t G, float scale, uint16_t* qT16, uint16_t* kT16,
                        uint16_t* v16, void* stream);
 
@@ -80,6 +107,15 @@ void aux_tile_add(float* x, const float* table, int64_t H, int64_t W, int64_t C,
 /// (2p, 2p + 1) of each head turn by x * f_p for p < hd / 4, else y * f_(p - hd / 4), f_i = theta^(-4i / hd).
 void aux_rope2d_split16(const float* qkv, int64_t N, int64_t heads, int64_t hd, int64_t grid, float pscale, float theta,
                         uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
+/// aux_rope2d_split16 from FP16 rows (AuxNet::product16's), `bias` [3 heads hd] added where not null.
+void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, int64_t heads, int64_t hd, int64_t grid,
+                         float pscale, float theta, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
+enum class AuxAct { none, relu, gelu };
+/// y16 [T][n] = act(x16 + bias[n]) (no bias where null; GELU erf's); y16 may be x16.
+void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
+                    void* stream);
+/// y16 [T][n] = y + bias[n] (none where null), FP32 narrowed.
+void aux_narrow_bias16(const float* y, const float* bias, int64_t T, int64_t n, uint16_t* y16, void* stream);
 
 /// A 2 x 2 transposed convolution of stride 2 from its product y [H * W][(dy, dx, O)]: out [2H][2W][O] = y + bias
 /// (GELU of it with `gelu`), to out (FP32) and out16, each where not null.
@@ -107,6 +143,11 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
 /// heads floats.
 void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const float* mlp, int64_t hidden, int64_t heads,
                   float* tmp, float* bias, void* stream);
+/// SAM 3's decoder's query positions from boxes [Q][4] (cx, cy, w, h): sin16 [Q][4F] the sine embeddings of y, x, w
+/// and h (F channels each, sin and cos interleaved at 10000^(2i/F)), xyxy [Q][4] their corners.
+void aux_box_sine16(const float* boxes, int64_t Q, int64_t F, uint16_t* sin16, float* xyxy, void* stream);
+/// boxes [n] = sigmoid(delta + inverse_sigmoid(boxes)) (the inverse clamped as the model's, 1e-3), in place.
+void aux_box_refine(float* boxes, const float* delta, int64_t n, void* stream);
 
 /// x [H][W][C] -> y [((H + 1) / 2) ((W + 1) / 2)][4C]: Swin's patch merging's gather, each 2 x 2 of the grid in the
 /// order (0, 0), (1, 0), (0, 1), (1, 1) (row offset first); an odd side padded with zeros, as Swin pads it.
