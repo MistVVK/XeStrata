@@ -93,7 +93,7 @@ NVIDIA のコードの PTX は、既定ではツールキットの版です（CU
 PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。
-oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-12`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library、Windows での oneMKL の SYCL のリンクの `-fsycl-allow-device-image-dependencies` の除去）が入り、本家の `develop` をマージした oneMath です。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-13`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library、Windows での oneMKL の SYCL のリンクの `-fsycl-allow-device-image-dependencies` の除去、rocBLAS の後端の SYCL のグラフへの記録）が入り、本家の `develop` をマージした oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
 変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。

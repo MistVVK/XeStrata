@@ -6,6 +6,7 @@
 // qi_conv's oneDNN and cuDNN, else unfolded patches and prefill::Gemm).
 #pragma once
 
+#include "strata/core/graph.hpp"
 #include "strata/image/aux_kernels.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -110,6 +111,9 @@ protected:
     std::unique_ptr<SafeTensors> st_;
     void* s_ = nullptr;
     prefill::Gemm gemm_;
+    /// A step run again and again (a decoder's), with a graph or straight (STRATA_AUX_EAGER=0 / 1 fixes it); its
+    /// graphs go with the scratch
+    core::StepForm steps_{"STRATA_AUX_EAGER"};
     bool loaded_ = false;
     uint64_t weight_bytes_ = 0, file_bytes_ = 0;
 

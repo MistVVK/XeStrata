@@ -52,6 +52,7 @@ void* AuxNet::alloc(size_t bytes) {
 
 void AuxNet::drop_scratch() {
     if (s_ != nullptr) gpu::stream_sync(s_);
+    steps_.clear();
     for (auto& w : work_) gpu::free(w.first);
     work_.clear();
 }

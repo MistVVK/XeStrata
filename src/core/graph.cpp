@@ -6,8 +6,11 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::core {
 namespace {
@@ -129,6 +132,101 @@ bool GraphRegistry::launch(LayerType type, int n_tokens, int timeout_ms, std::st
     }
     if (!g->launch(stream_, err)) return false;
     return g->wait_ms(timeout_ms, err);
+}
+
+namespace {
+std::atomic<uint64_t> g_epoch{0};
+}
+
+uint64_t graph_epoch() { return g_epoch.load(std::memory_order_acquire); }
+void graph_epoch_bump() { g_epoch.fetch_add(1, std::memory_order_acq_rel); }
+
+StepForm::StepForm(const char* env) {
+    const char* e = env != nullptr ? std::getenv(env) : nullptr;
+    if (e != nullptr && (e[0] == '0' || e[0] == '1')) form_ = e[0] - '0';
+}
+
+void StepForm::timed(double ms, const char* who, const char* what) {
+    if (form_ != -1) return;
+    if (setup_) {   // a step that set up or recorded: not counted
+        setup_ = false;
+        return;
+    }
+    if (trial_ >= 2) ms_[(trial_ & 1) == 0 ? 1 : 0] += ms;
+    if (++trial_ == 10) {
+        form_ = ms_[1] < ms_[0] ? 1 : 0;
+        std::fprintf(stderr, "%s: %s %s (timed: %.2f ms with a graph, %.2f ms without)\n", who, what,
+                     form_ == 1 ? "without a graph" : "with a graph", ms_[0] / 4, ms_[1] / 4);
+    }
+}
+
+bool StepForm::run(uint64_t key, void* stream, const std::function<void()>& body, std::string& err,
+                   const std::function<std::vector<uint8_t>()>& outputs, const std::function<void()>& clear) {
+    if (straight()) {
+        body();
+        return true;
+    }
+    if (epoch_ != graph_epoch()) {
+        clear();
+        epoch_ = graph_epoch();
+    }
+    auto it = graphs_.find(key);
+    if (it == graphs_.end()) {   // a key's first step straight: what its libraries set up at a first call is done
+        if (graphs_.size() >= 16) clear();   // the keys of buffers since grown or shapes since gone
+        graphs_.emplace(key, nullptr);
+        setup_ = true;
+        body();
+        return true;
+    }
+    if (it->second == nullptr) {
+        std::vector<uint8_t> want;
+        if (outputs) {
+            body();
+            want = outputs();
+        }
+        if (!gpu::begin_capture(stream)) return fail(err, "begin_capture");
+        gpu::Graph* g = nullptr;
+        try {
+            body();
+        } catch (const std::exception& e) {
+            gpu::abandon_capture(stream);
+            std::fprintf(stderr, "strata: a step could not be recorded (%s); its steps go straight\n", e.what());
+            form_ = 1;
+            body();
+            return true;
+        }
+        if (!gpu::end_capture(stream, &g)) {
+            std::fprintf(stderr, "strata: a step could not be recorded (%s); its steps go straight\n",
+                         gpu::last_error());
+            form_ = 1;
+            body();
+            return true;
+        }
+        it->second = g;
+        setup_ = true;
+        if (outputs) {
+            if (clear) clear();
+            if (!gpu::graph_launch(g, stream)) return fail(err, "graph_launch");
+            const std::vector<uint8_t> got = outputs();
+            if (got != want) {
+                size_t differ = 0;
+                for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) differ += got[i] != want[i];
+                std::fprintf(stderr, "strata: a recorded step gave other results than the step itself (%zu of %zu "
+                                     "bytes); its steps go straight\n", differ, want.size());
+                form_ = 1;
+                body();
+            }
+            return true;
+        }
+    }
+    if (!gpu::graph_launch(it->second, stream)) return fail(err, "graph_launch");
+    return true;
+}
+
+void StepForm::clear() {
+    for (auto& [k, g] : graphs_)
+        if (g != nullptr) gpu::graph_destroy(g);
+    graphs_.clear();
 }
 
 }  // namespace strata::core

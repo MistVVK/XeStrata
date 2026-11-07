@@ -42,9 +42,10 @@ void aux_residual_norm16(float* x, const float* r, const float* rb, const float*
 /// and its product's bias in its pass.  y may be x.
 void aux_add_norm(const float* x, const float* r, const float* rb, const float* w, const float* b, int64_t T, int64_t C,
                   float eps, float* y, uint16_t* y16, void* stream);
-/// aux_cache_put of a row's keys and values (at koff and voff) into their caches in one pass.
+/// aux_cache_put of a row's keys and values (at koff and voff) into their caches in one pass, at the row the device's
+/// `at` [1] says (a recorded step's position).
 void aux_cache_put_kv(const uint16_t* src16, int64_t B, int64_t ld, int64_t koff, int64_t voff, int64_t C,
-                      uint16_t* kc, uint16_t* vc, int64_t cap, int64_t at, void* stream);
+                      uint16_t* kc, uint16_t* vc, int64_t cap, const int32_t* at, void* stream);
 /// aux_layer_norm of x [H][W][C] into y16 in aux_window16's order (no shift, H and W whole windows of ws): the norm
 /// and the windows in one pass.
 void aux_layer_norm_window16(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C,

@@ -413,8 +413,72 @@ void Florence2::encoder(const std::vector<int32_t>& text_ids) {
     host("encoder", x, (size_t) (T * d_));
 }
 
+// A decoder step of B beams, onto the stream: what changes from step to step is data in `dids` (decode()), so a
+// recording of it replays any step
+void Florence2::step(int64_t B, int64_t T, int64_t cap, uint16_t* cache, const uint16_t* ckv, const int32_t* dids,
+                     float* h, float* y, uint16_t* h16, uint16_t* g16, uint16_t* a16, uint16_t* q16, float* logits) {
+    const int64_t d = d_, L = (int64_t) dec_.size(), hd = d_ / heads_, V = vocab_;
+    aux_embed(dids, dids + B, shared_, dec_pos_, B, d, 1.f, h, s_);
+    aux_layer_norm(h, nullptr, dec_ln_.w, dec_ln_.b, B, d, kEps, h, h16, s_);
+    for (int64_t li = 0; li < L; ++li) {
+        const DLayer& l = dec_[(size_t) li];
+        uint16_t* kc = cache + (li * 2) * B * cap * d;
+        uint16_t* vc = cache + (li * 2 + 1) * B * cap * d;
+        // the step's few rows: the post-norms with the residual and the bias, the caches' writes in one
+        product(h16, l.qkv, y, B);
+        kernels::f32_to_f16_bulk(y, g16, B * 3 * d, s_);
+        aux_cache_put_kv(g16, B, 3 * d, d, 2 * d, d, kc, vc, cap, dids + 2 * B, s_);
+        QiSdpa a;
+        a.q = g16;
+        a.k = kc;
+        a.v = vc;
+        a.out = a16;
+        a.batch = B;
+        a.heads = heads_;
+        a.lq = 1;
+        a.lk = cap;
+        a.key_len = dids + 2 * B + 1;
+        a.hd = hd;
+        a.q_row = a.q_batch = 3 * d;
+        a.k_row = a.v_row = d;
+        a.k_batch = a.v_batch = cap * d;
+        a.o_row = a.o_batch = d;
+        a.scale = 1.f / std::sqrt((float) hd);
+        qi_sdpa_ex(a, s_);
+        product(a16, l.o, y, B, 0, false);
+        aux_add_norm(h, y, l.o.b, l.n_self.w, l.n_self.b, B, d, kEps, h, h16, s_);
+        // the cross-attention over the encoder's states, every beam the same keys
+        product(h16, l.cq, y, B);
+        kernels::f32_to_f16_bulk(y, q16, B * d, s_);
+        QiSdpa c;
+        c.q = q16;
+        c.k = ckv + li * 2 * T * d;
+        c.v = ckv + (li * 2 + 1) * T * d;
+        c.out = a16;
+        c.batch = B;
+        c.kv_div = B;
+        c.heads = heads_;
+        c.lq = 1;
+        c.lk = T;
+        c.hd = hd;
+        c.q_row = c.q_batch = c.o_row = c.o_batch = d;
+        c.k_row = c.v_row = d;
+        c.k_batch = c.v_batch = T * d;
+        c.scale = 1.f / std::sqrt((float) hd);
+        qi_sdpa_ex(c, s_);
+        product(a16, l.co, y, B, 0, false);
+        aux_add_norm(h, y, l.co.b, l.n_cross.w, l.n_cross.b, B, d, kEps, h, h16, s_);
+        product(h16, l.fc1, y, B);
+        qi_gelu_erf16(y, B * ffn_, g16, s_);
+        product(g16, l.fc2, y, B, 0, false);
+        aux_add_norm(h, y, l.fc2.b, l.n_ffn.w, l.n_ffn.b, B, d, kEps, h, h16, s_);
+    }
+    gemm_.f16(h16, shared_, logits, B, V, d);
+    qi_bias_add(logits, logits_bias_, B, V, s_);
+}
+
 std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
-    const int64_t B = beams, T = enc_T_, d = d_, L = (int64_t) dec_.size(), hd = d_ / heads_, V = vocab_;
+    const int64_t B = beams, T = enc_T_, d = d_, L = (int64_t) dec_.size(), V = vocab_;
     const int64_t max_length = 1 + max_new, cap = max_length;
     if (max_length > max_pos_) throw std::invalid_argument("image engine (Florence-2): max_new past the positions");
     const uint16_t* enc16 = reinterpret_cast<const uint16_t*>(scratch(kEnc16, (size_t) (T * d * 2)));
@@ -440,7 +504,10 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
     auto* a16 = reinterpret_cast<uint16_t*>(scratch(kA16, (size_t) (B * d * 2)));
     auto* q16 = reinterpret_cast<uint16_t*>(scratch(kQT, (size_t) (B * d * 2)));
     float* logits = scratch(kCol, (size_t) (B * V * 4));
-    auto* dids = reinterpret_cast<int32_t*>(scratch(kS, (size_t) (3 * B * 4)));
+    // the step's data on the device (a recorded step reads it at each replay): the beams' tokens [B], their positions
+    // [B], the caches' row, the self-attention's keys [B]; then the reorder's sources [B], which the copy of the next
+    // step's leaves alone (the copy does not wait for the stream's gather)
+    auto* dids = reinterpret_cast<int32_t*>(scratch(kS, (size_t) ((4 * B + 1) * 4)));
     std::vector<float> lg((size_t) (B * V));
 
     // the beam search's state (transformers' _beam_search, one batch)
@@ -458,70 +525,39 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
     steps = 0;
     for (;;) {
         // the step: each beam's last token at position cur_len - 1
-        std::vector<int32_t> in((size_t) (2 * B));
+        const int64_t at = cur_len - 1;
+        std::vector<int32_t> in((size_t) (3 * B + 1));
         for (int64_t b = 0; b < B; ++b) {
             in[(size_t) b] = toks[(size_t) b];
-            in[(size_t) (B + b)] = (int32_t) (cur_len - 1 + kPosOffset);
+            in[(size_t) (B + b)] = (int32_t) (at + kPosOffset);
+            in[(size_t) (2 * B + 1 + b)] = (int32_t) (at + 1);
         }
+        in[(size_t) (2 * B)] = (int32_t) at;
         gpu::copy(dids, in.data(), in.size() * 4);
-        aux_embed(dids, dids + B, shared_, dec_pos_, B, d, 1.f, h, s_);
-        aux_layer_norm(h, nullptr, dec_ln_.w, dec_ln_.b, B, d, kEps, h, h16, s_);
-        const int64_t at = cur_len - 1;
-        for (int64_t li = 0; li < L; ++li) {
-            const DLayer& l = dec_[(size_t) li];
-            uint16_t* kc = cache + (li * 2) * B * cap * d;
-            uint16_t* vc = cache + (li * 2 + 1) * B * cap * d;
-            // the step's few rows: the post-norms with the residual and the bias, the caches' writes in one
-            product(h16, l.qkv, y, B);
-            kernels::f32_to_f16_bulk(y, g16, B * 3 * d, s_);
-            aux_cache_put_kv(g16, B, 3 * d, d, 2 * d, d, kc, vc, cap, at, s_);
-            QiSdpa a;
-            a.q = g16;
-            a.k = kc;
-            a.v = vc;
-            a.out = a16;
-            a.batch = B;
-            a.heads = heads_;
-            a.lq = 1;
-            a.lk = at + 1;
-            a.hd = hd;
-            a.q_row = a.q_batch = 3 * d;
-            a.k_row = a.v_row = d;
-            a.k_batch = a.v_batch = cap * d;
-            a.o_row = a.o_batch = d;
-            a.scale = 1.f / std::sqrt((float) hd);
-            qi_sdpa_ex(a, s_);
-            product(a16, l.o, y, B, 0, false);
-            aux_add_norm(h, y, l.o.b, l.n_self.w, l.n_self.b, B, d, kEps, h, h16, s_);
-            // the cross-attention over the encoder's states, every beam the same keys
-            product(h16, l.cq, y, B);
-            kernels::f32_to_f16_bulk(y, q16, B * d, s_);
-            QiSdpa c;
-            c.q = q16;
-            c.k = ckv + li * 2 * T * d;
-            c.v = ckv + (li * 2 + 1) * T * d;
-            c.out = a16;
-            c.batch = B;
-            c.kv_div = B;
-            c.heads = heads_;
-            c.lq = 1;
-            c.lk = T;
-            c.hd = hd;
-            c.q_row = c.q_batch = c.o_row = c.o_batch = d;
-            c.k_row = c.v_row = d;
-            c.k_batch = c.v_batch = T * d;
-            c.scale = 1.f / std::sqrt((float) hd);
-            qi_sdpa_ex(c, s_);
-            product(a16, l.co, y, B, 0, false);
-            aux_add_norm(h, y, l.co.b, l.n_cross.w, l.n_cross.b, B, d, kEps, h, h16, s_);
-            product(h16, l.fc1, y, B);
-            qi_gelu_erf16(y, B * ffn_, g16, s_);
-            product(g16, l.fc2, y, B, 0, false);
-            aux_add_norm(h, y, l.fc2.b, l.n_ffn.w, l.n_ffn.b, B, d, kEps, h, h16, s_);
-        }
-        gemm_.f16(h16, shared_, logits, B, V, d);
-        qi_bias_add(logits, logits_bias_, B, V, s_);
+        // what the step bakes in: the buffers (the caches' current set among them) and the shapes
+        uint64_t key = 1469598103934665603ull;
+        for (const uint64_t v : {(uint64_t) (uintptr_t) cache, (uint64_t) (uintptr_t) h, (uint64_t) (uintptr_t) y,
+                                 (uint64_t) (uintptr_t) logits, (uint64_t) (uintptr_t) dids,
+                                 (uint64_t) (uintptr_t) ckv, (uint64_t) (uintptr_t) g16, (uint64_t) (uintptr_t) h16,
+                                 (uint64_t) (uintptr_t) a16, (uint64_t) (uintptr_t) q16, (uint64_t) B,
+                                 (uint64_t) cap, (uint64_t) T})
+            key = (key ^ v) * 1099511628211ull;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string err;
+        // a recording checked once against the step itself on the logits, cleared before its replay (the step writes
+        // its caches' row again)
+        const auto out = [&] {
+            std::vector<uint8_t> v((size_t) (B * V * 4));
+            gpu::stream_sync(s_);
+            gpu::copy(v.data(), logits, v.size());
+            return v;
+        };
+        if (!steps_.run(key, s_, [&] { step(B, T, cap, cache, ckv, dids, h, y, h16, g16, a16, q16, logits); }, err,
+                        out, [&] { gpu::memset_async(logits, 0, (size_t) (B * V * 4), s_); }))
+            throw std::runtime_error("image engine (Florence-2): " + err);
         gpu::stream_sync(s_);
+        if (steps_.form() == -1)
+            steps_.timed(since(t0) * 1e3, "strata image (Florence-2)", "the decoder's steps");
         gpu::copy(lg.data(), logits, lg.size() * 4);
         if (steps < 4 && dump)
             dump(("logits" + std::to_string(steps)).c_str(), std::vector<float>(lg.begin(), lg.begin() + V));
@@ -624,9 +660,9 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             toks[(size_t) b] = cand_seq[k].back();
         }
         if (!same) {
-            gpu::copy(dids + 2 * B, from.data(), (size_t) B * 4);
+            gpu::copy(dids + 3 * B + 1, from.data(), (size_t) B * 4);
             for (int64_t li = 0; li < 2 * L; ++li)
-                aux_cache_gather(cache + li * B * cap * d, dids + 2 * B, B, cap, cur_len, d, cache2 + li * B * cap * d, s_);
+                aux_cache_gather(cache + li * B * cap * d, dids + 3 * B + 1, B, cap, cur_len, d, cache2 + li * B * cap * d, s_);
             std::swap(cache, cache2);
         }
         ++cur_len;

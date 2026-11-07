@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp and qi_conv.hpp: cuDNN's SDPA and convolution through cudnn-frontend
 // on NVIDIA GPUs (contrib-llvm), cuDNN opened at the first use (the user's installation, not free software:
-// open_cudnn), on the queue's CUDA stream, a graph built once a shape and kept.
+// open_cudnn), on the queue's CUDA stream through a native command (a SYCL graph being recorded takes it), a cuDNN
+// graph built once a shape and kept.
 
 #include <cudnn_frontend.h>   // with its dynamic loading: windows.h on Windows
 #include <sycl/backend/cuda.hpp>
@@ -19,6 +20,7 @@ void* cudnn_dlhandle = nullptr;
 #endif
 
 #include "qi_conv.hpp"
+#include "strata/core/graph.hpp"
 #include "qi_sdpa.hpp"
 
 #include <sycl/sycl.hpp>
@@ -54,6 +56,66 @@ struct Cudnn {
 std::unordered_map<sycl::device, Cudnn> g_cudnn;
 
 constexpr int64_t kQ = 1, kK = 2, kV = 3, kO = 4;   // the tensors' ids in the variant pack
+
+// The driver's stream capture into a given CUDA graph (CUDA 12.3), from the driver the SYCL runtime has loaded
+struct Capture {
+#if CUDA_VERSION >= 12030
+    CUresult (*begin)(CUstream, CUgraph, const CUgraphNode*, const CUgraphEdgeData*, size_t, CUstreamCaptureMode) = nullptr;
+    CUresult (*end)(CUstream, CUgraph*) = nullptr;
+#endif
+    bool ok() const {
+#if CUDA_VERSION >= 12030
+        return begin != nullptr && end != nullptr;
+#else
+        return false;
+#endif
+    }
+};
+
+const Capture& capture() {
+    static const Capture c = [] {
+        Capture r;
+#if CUDA_VERSION >= 12030
+#if defined(_WIN32)
+        HMODULE h = GetModuleHandleW(L"nvcuda.dll");
+        auto sym = [h](const char* n) { return h != nullptr ? (void*) GetProcAddress(h, n) : nullptr; };
+#else
+        void* h = dlopen("libcuda.so.1", RTLD_NOW | RTLD_NOLOAD);
+        auto sym = [h](const char* n) { return h != nullptr ? dlsym(h, n) : nullptr; };
+#endif
+        r.begin = reinterpret_cast<decltype(r.begin)>(sym("cuStreamBeginCaptureToGraph"));
+        r.end = reinterpret_cast<decltype(r.end)>(sym("cuStreamEndCapture"));
+#endif
+        return r;
+    }();
+    return c;
+}
+
+// cuDNN's work (`run`, on `handle`) onto the queue as a native command, as oneMath's cuBLAS backend puts its own: while
+// the queue records a SYCL graph, the command's stream is captured into the graph's CUDA graph.  Called on the queue's
+// stream straight, the work ran once at the recording and never at the replays (Florence-2's decoder, 2026-11-07).
+// False, and nothing submitted, where a recording cannot take it.
+bool on_queue(sycl::queue& q, cudnnHandle_t handle, std::function<void()> run) {
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (q.ext_oneapi_get_state() == sx::queue_state::recording && !capture().ok()) return false;
+    q.submit([&](sycl::handler& h) {
+        h.ext_codeplay_enqueue_native_command([handle, run](const sycl::interop_handle& ih) {
+            const CUstream cs = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+            if (fe::detail::set_stream(handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
+#if CUDA_VERSION >= 12030
+            const bool rec = ih.ext_codeplay_has_graph();
+            CUgraph g = rec ? ih.ext_codeplay_get_native_graph<sycl::backend::ext_oneapi_cuda>() : nullptr;
+            if (rec && capture().begin(cs, g, nullptr, nullptr, 0, CU_STREAM_CAPTURE_MODE_GLOBAL) != CUDA_SUCCESS)
+                throw std::runtime_error("cuStreamBeginCaptureToGraph");
+            run();
+            if (rec && capture().end(cs, &g) != CUDA_SUCCESS) throw std::runtime_error("cuStreamEndCapture");
+#else
+            run();
+#endif
+        });
+    });
+    return true;
+}
 
 std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows, int64_t T, int64_t heads,
                                               int64_t hd, int64_t B) {
@@ -212,8 +274,6 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
     if (d.failed) return false;
     try {
         if (d.handle == nullptr) open_cudnn(d.handle);
-        const CUstream cs = sycl::get_native<sycl::backend::ext_oneapi_cuda>(q);
-        if (fe::detail::set_stream(d.handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
         const auto key = std::make_tuple(q1 - q0, T, heads, hd, batch);
         auto it = d.graphs.find(key);
         if (it == d.graphs.end())
@@ -222,7 +282,10 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
         if (ws > d.ws_bytes) {
             q.wait();
-            if (d.ws != nullptr) sycl::free(d.ws, q);
+            if (d.ws != nullptr) {
+                sycl::free(d.ws, q);
+                core::graph_epoch_bump();   // a recorded step may hold the old one
+            }
             d.ws = sycl::malloc_device(ws, q);
             d.ws_bytes = d.ws != nullptr ? ws : 0;
         }
@@ -230,8 +293,9 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
             {kQ, const_cast<uint16_t*>(q16 + q0 * row)}, {kK, const_cast<uint16_t*>(k16)},
             {kV, const_cast<uint16_t*>(v16)}, {kO, out16}};
-        if (!it->second->execute(d.handle, pack, d.ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
-        return true;
+        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+            if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
+        });
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
                      e.what());
@@ -268,8 +332,6 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
         return false;
     }
     try {
-        const CUstream cs = sycl::get_native<sycl::backend::ext_oneapi_cuda>(q);
-        if (fe::detail::set_stream(d.handle, cs) != CUDNN_STATUS_SUCCESS) throw std::runtime_error("cudnnSetStream");
         auto it = d.convs.find(key);
         if (it == d.convs.end())
             it = d.convs.emplace(key, sdpa::conv_graph(d.handle, H, W, C, O, k, bias != nullptr, add, lx, ly,
@@ -279,7 +341,10 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
         if (ws > d.ws_bytes) {
             q.wait();
-            if (d.ws != nullptr) sycl::free(d.ws, q);
+            if (d.ws != nullptr) {
+                sycl::free(d.ws, q);
+                core::graph_epoch_bump();
+            }
             d.ws = sycl::malloc_device(ws, q);
             d.ws_bytes = d.ws != nullptr ? ws : 0;
         }
@@ -287,9 +352,9 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
             {sdpa::kX, const_cast<uint16_t*>(x)}, {sdpa::kW, const_cast<uint16_t*>(w)}, {sdpa::kY, y}};
         if (bias != nullptr) pack.emplace(sdpa::kB, const_cast<float*>(bias));
         if (add) pack.emplace(sdpa::kR, y);
-        if (!it->second->execute(d.handle, pack, d.ws).is_good())
-            throw std::runtime_error("cuDNN's convolution failed");
-        return true;
+        return sdpa::on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+            if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's convolution failed");
+        });
     } catch (const std::exception& e) {   // this shape on the engine's own path from now on
         std::fprintf(stderr,
                      "strata-image: cuDNN does not take a convolution of %lld x %lld x %lld to %lld (%s): the "

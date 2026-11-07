@@ -77,19 +77,44 @@ void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, 
     finish(stream, e, "aux_dwconv3_add");
 }
 
+namespace {
+// A row's norm by a work-group of L items, each holding its kRowVals channels c = l + k L in registers: L about a
+// quarter of the channels (32 to 256), so a narrow row is not 256 items of one channel and two group reductions (the
+// B70's Florence-2 large vision, 2026-11-07: its 256-channel rows' fused depthwise convolution and norm 476 us at
+// 256 items, at 170 GB/s).  Rows wider than kRowVals x 256 channels take the loops over memory (row_vals() 0).
+constexpr int64_t kRowVals = 8;
+int64_t row_items(int64_t C) { return std::clamp<int64_t>((C / 4 + 31) / 32 * 32, 32, 256); }
+bool row_vals(int64_t C) { return C <= kRowVals * row_items(C); }
+
+// The mean and the inverse deviation of a row's values held as above (two passes: the variance about the mean)
+inline sycl::float2 row_stats(const sycl::nd_item<1>& it, const float (&v)[kRowVals], int64_t l, int64_t L, int64_t C,
+                              float eps) {
+    float s = 0.f;
+#pragma unroll
+    for (int64_t k = 0; k < kRowVals; ++k)
+        if (l + k * L < C) s += v[k];
+    const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
+    float s2 = 0.f;
+#pragma unroll
+    for (int64_t k = 0; k < kRowVals; ++k)
+        if (l + k * L < C) s2 += (v[k] - mean) * (v[k] - mean);
+    return {mean, 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps)};
+}
+}  // namespace
+
 void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
                         int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream) {
     const int64_t T = H * W;
     if (T <= 0) return;
-    constexpr size_t L = 256;
+    const bool regs = row_vals(C);
+    const int64_t L = regs ? row_items(C) : 256;
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+        sycl::nd_range<1>(sycl::range<1>((size_t) (T * L)), sycl::range<1>((size_t) L)), [=](sycl::nd_item<1> it) {
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
             const int64_t py = t / W, px = t - py * W;
             float* yr = y + t * C;
-            float s = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {   // each item its own channels: written, then read back
+            const auto conv = [&](int64_t c) {
                 float v = b[c];
                 for (int64_t dy = -1; dy <= 1; ++dy) {
                     const int64_t yy = py + dy;
@@ -99,22 +124,42 @@ void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const fl
                         if (xx >= 0 && xx < W) v += w[c * 9 + (dy + 1) * 3 + dx + 1] * x[(yy * W + xx) * C + c];
                     }
                 }
-                v += x[t * C + c];
+                return v + x[t * C + c];
+            };
+            const int64_t o = o_ws > 0 ? ((py / o_ws) * (W / o_ws) + px / o_ws) * o_ws * o_ws + (py % o_ws) * o_ws +
+                                             px % o_ws
+                                       : t;
+            if (regs) {
+                float v[kRowVals];
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    v[k] = c < C ? conv(c) : 0.f;
+                    if (c < C) yr[c] = v[k];
+                }
+                const sycl::float2 st = row_stats(it, v, l, L, C, eps);
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    if (c < C) y16[o * C + c] = f16_from_f32((v[k] - st[0]) * st[1] * nw[c] + nb[c]);
+                }
+                return;
+            }
+            float s = 0.f;
+            for (int64_t c = l; c < C; c += L) {   // each item its own channels: written, then read back
+                const float v = conv(c);
                 yr[c] = v;
                 s += v;
             }
             const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
             float s2 = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {
+            for (int64_t c = l; c < C; c += L) {
                 const float d = yr[c] - mean;
                 s2 += d * d;
             }
             const float inv =
                 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
-            const int64_t o = o_ws > 0 ? ((py / o_ws) * (W / o_ws) + px / o_ws) * o_ws * o_ws + (py % o_ws) * o_ws +
-                                             px % o_ws
-                                       : t;
-            for (int64_t c = l; c < C; c += (int64_t) L) y16[o * C + c] = f16_from_f32((yr[c] - mean) * inv * nw[c] + nb[c]);
+            for (int64_t c = l; c < C; c += L) y16[o * C + c] = f16_from_f32((yr[c] - mean) * inv * nw[c] + nb[c]);
         });
     finish(stream, e, "aux_dwconv3_norm16");
 }
@@ -125,25 +170,44 @@ template <class To>
 void layer_norm_rows(const float* x, const float* r, const float* w, const float* b, int64_t T, int64_t C, float eps,
                      float* y, uint16_t* y16, To to, void* stream, const char* what, const float* rb = nullptr) {
     if (T <= 0) return;
-    constexpr size_t L = 256;
+    const bool regs = row_vals(C);
+    const int64_t L = regs ? row_items(C) : 256;
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+        sycl::nd_range<1>(sycl::range<1>((size_t) (T * L)), sycl::range<1>((size_t) L)), [=](sycl::nd_item<1> it) {
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
             const int64_t o = to(t);
             const float* xr = x + t * C;
             const float* rr = r != nullptr ? r + t * C : nullptr;
+            if (regs) {
+                float v[kRowVals];
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    v[k] = c < C ? xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) : 0.f;
+                }
+                const sycl::float2 st = row_stats(it, v, l, L, C, eps);
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    if (c >= C) continue;
+                    const float u = (v[k] - st[0]) * st[1] * w[c] + b[c];
+                    if (y16 != nullptr) y16[o * C + c] = f16_from_f32(u);
+                    if (y != nullptr) y[o * C + c] = u;
+                }
+                return;
+            }
             float s = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) s += xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f);
+            for (int64_t c = l; c < C; c += L) s += xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f);
             const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
             float s2 = 0.f;   // two passes: the variance about the mean (the residual streams' large values)
-            for (int64_t c = l; c < C; c += (int64_t) L) {
+            for (int64_t c = l; c < C; c += L) {
                 const float d = xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean;
                 s2 += d * d;
             }
             const float inv =
                 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
-            for (int64_t c = l; c < C; c += (int64_t) L) {
+            for (int64_t c = l; c < C; c += L) {
                 const float v = (xr[c] + (rr ? rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f) - mean) * inv * w[c] + b[c];
                 if (y16 != nullptr) y16[o * C + c] = f16_from_f32(v);
                 if (y != nullptr) y[o * C + c] = v;
@@ -162,7 +226,8 @@ void aux_residual_norm16(float* x, const float* r, const float* rb, const float*
                          int64_t C, int64_t r_ws, int64_t o_ws, float eps, uint16_t* y16, void* stream) {
     const int64_t T = H * W;
     if (T <= 0) return;
-    constexpr size_t L = 256;
+    const bool regs = row_vals(C);
+    const int64_t L = regs ? row_items(C) : 256;
     // row t of the grid at its window's place (ws > 0: aux_window16's order, no shift, whole windows), else as it is
     const auto place = [=](int64_t t, int64_t ws) {
         if (ws <= 0) return t;
@@ -170,13 +235,31 @@ void aux_residual_norm16(float* x, const float* r, const float* rb, const float*
         return ((py / ws) * (W / ws) + px / ws) * ws * ws + (py % ws) * ws + px % ws;
     };
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) T * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+        sycl::nd_range<1>(sycl::range<1>((size_t) (T * L)), sycl::range<1>((size_t) L)), [=](sycl::nd_item<1> it) {
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
             float* xr = x + t * C;
             const float* rr = r + place(t, r_ws) * C;
+            if (regs) {
+                float v[kRowVals];
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    v[k] = c < C ? xr[c] + rr[c] + (rb != nullptr ? rb[c] : 0.f) : 0.f;
+                    if (c < C) xr[c] = v[k];
+                }
+                if (w == nullptr) return;
+                const sycl::float2 st = row_stats(it, v, l, L, C, eps);
+                uint16_t* yr = y16 + place(t, o_ws) * C;
+#pragma unroll
+                for (int64_t k = 0; k < kRowVals; ++k) {
+                    const int64_t c = l + k * L;
+                    if (c < C) yr[c] = f16_from_f32((v[k] - st[0]) * st[1] * w[c] + b[c]);
+                }
+                return;
+            }
             float s = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {   // each item its own columns: written, then read back
+            for (int64_t c = l; c < C; c += L) {   // each item its own columns: written, then read back
                 const float v = xr[c] + rr[c] + (rb != nullptr ? rb[c] : 0.f);
                 xr[c] = v;
                 s += v;
@@ -184,14 +267,14 @@ void aux_residual_norm16(float* x, const float* r, const float* rb, const float*
             if (w == nullptr) return;
             const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
             float s2 = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {
+            for (int64_t c = l; c < C; c += L) {
                 const float d = xr[c] - mean;
                 s2 += d * d;
             }
             const float inv =
                 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
             uint16_t* yr = y16 + place(t, o_ws) * C;
-            for (int64_t c = l; c < C; c += (int64_t) L) yr[c] = f16_from_f32((xr[c] - mean) * inv * w[c] + b[c]);
+            for (int64_t c = l; c < C; c += L) yr[c] = f16_from_f32((xr[c] - mean) * inv * w[c] + b[c]);
         });
     finish(stream, e, "aux_residual_norm16");
 }
@@ -202,12 +285,13 @@ void aux_add_norm(const float* x, const float* r, const float* rb, const float* 
 }
 
 void aux_cache_put_kv(const uint16_t* src16, int64_t B, int64_t ld, int64_t koff, int64_t voff, int64_t C,
-                      uint16_t* kc, uint16_t* vc, int64_t cap, int64_t at, void* stream) {
+                      uint16_t* kc, uint16_t* vc, int64_t cap, const int32_t* at, void* stream) {
     if (B <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) B, (size_t) C), [=](sycl::id<2> id) {
         const auto b = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
-        kc[(b * cap + at) * C + c] = src16[b * ld + koff + c];
-        vc[(b * cap + at) * C + c] = src16[b * ld + voff + c];
+        const int64_t r = (b * cap + at[0]) * C + c;
+        kc[r] = src16[b * ld + koff + c];
+        vc[r] = src16[b * ld + voff + c];
     });
     finish(stream, e, "aux_cache_put_kv");
 }

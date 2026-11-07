@@ -11,6 +11,7 @@
 
 #include "strata/image/qi_kernels.hpp"
 
+#include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -156,49 +157,59 @@ void split_combine(const QiSdpa& a, int64_t S, int64_t HDP, const float* part, v
 }
 
 // rows_kernel over S parts of the keys, then joined
-template <int HD> void rows_split(const QiSdpa& a, int64_t qb, int64_t S, void* stream) {
+// the keys' parts of S parts a row, (stride + 2) floats each: a buffer kept per queue, grown to the largest
+float* parts(const QiSdpa& a, int64_t S, int64_t stride, void* stream) {
     sycl::queue& q = queue_for(stream);
     struct Buf { float* p = nullptr; size_t n = 0; };
     static std::mutex mu;
     static std::unordered_map<const sycl::queue*, Buf> bufs;
-    const size_t need = (size_t) (a.batch * a.heads * a.lq * S * (HD + 2));
-    float* part = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        Buf& c = bufs[&q];
-        if (c.n < need) {
-            q.wait();
-            if (c.p != nullptr) sycl::free(c.p, q);
-            c.p = sycl::malloc_device<float>(need, q);
-            c.n = c.p != nullptr ? need : 0;
+    const size_t need = (size_t) (a.batch * a.heads * a.lq * S * (stride + 2));
+    std::lock_guard<std::mutex> lock(mu);
+    Buf& c = bufs[&q];
+    if (c.n < need) {
+        q.wait();
+        if (c.p != nullptr) {
+            sycl::free(c.p, q);
+            core::graph_epoch_bump();   // a recorded step may hold the old one
         }
-        part = c.p;
+        c.p = sycl::malloc_device<float>(need, q);
+        c.n = c.p != nullptr ? need : 0;
     }
-    if (part == nullptr) throw std::runtime_error("qi_sdpa_ex: no GPU memory for the keys' parts");
+    if (c.p == nullptr) throw std::runtime_error("qi_sdpa_ex: no GPU memory for the keys' parts");
+    return c.p;
+}
+
+template <int HD> void rows_split(const QiSdpa& a, int64_t qb, int64_t S, void* stream) {
+    float* part = parts(a, S, HD, stream);
     rows_kernel<HD>(a, qb, stream, S, part);
     split_combine(a, S, HD, part, stream);
 }
 
-void few_kernel(const QiSdpa& a, int64_t L, void* stream) {
+// S > 1: the keys in S parts of ceil(lk / S) (lk, not a row's key_len: a recorded step's parts stay as recorded),
+// part p of each row's into part[(row * S + p) * (hd + 2)] as rows_kernel's
+void few_kernel(const QiSdpa& a, int64_t L, void* stream, int64_t S = 1, float* part = nullptr) {
     const int64_t hd = a.hd, heads = a.heads, lq = a.lq;
     const Masks mk{a.key_len, a.bias, a.mask, a.lq, a.lk, std::max<int64_t>(a.mask_n, 1), a.causal_off, a.causal};
     const uint16_t *Q = a.q, *K = a.k, *V = a.v;
     uint16_t* O = a.out;
     const int64_t qr = a.q_row, qbs = a.q_batch, kr = a.k_row, kbs = a.k_batch, vr = a.v_row, vbs = a.v_batch,
                   orw = a.o_row, obs = a.o_batch, div = std::max<int64_t>(a.kv_div, 1);
+    const int64_t per = (a.lk + S - 1) / S;
     const float scale = a.scale;
     const auto e = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qs((size_t) hd, h), ps((size_t) L, h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (a.batch * heads * lq * L)), sycl::range<1>((size_t) L)),
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (a.batch * heads * lq * S * L)),
+                                         sycl::range<1>((size_t) L)),
                        [=](sycl::nd_item<1> it) {
             const auto g = static_cast<int64_t>(it.get_group_linear_id());
             const auto lid = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t i = g % lq, bh = g / lq, hh = bh % heads, b = bh / heads, kb = b / div;
+            const int64_t sp = g % S, row = g / S;
+            const int64_t i = row % lq, bh = row / lq, hh = bh % heads, b = bh / heads, kb = b / div;
             for (int64_t d = lid; d < hd; d += L) qs[d] = f32_from_f16(Q[b * qbs + i * qr + hh * hd + d]) * scale;
             sycl::group_barrier(it.get_group());
-            const int64_t nk = mk.keys(b, i);
+            const int64_t nk = sycl::min(mk.keys(b, i), (sp + 1) * per);
             float m = -INFINITY, l = 0.f, acc = 0.f;
-            for (int64_t j0 = 0; j0 < nk; j0 += L) {
+            for (int64_t j0 = sp * per; j0 < nk; j0 += L) {
                 const int64_t j = j0 + lid;
                 float s = -INFINITY;
                 if (j < nk) {
@@ -219,6 +230,15 @@ void few_kernel(const QiSdpa& a, int64_t L, void* stream) {
                     for (int64_t jj = 0; jj < n; ++jj) acc += ps[jj] * f32_from_f16(V[kb * vbs + (j0 + jj) * vr + hh * hd + lid]);
                 sycl::group_barrier(it.get_group());
                 m = nm;
+            }
+            if (part != nullptr) {
+                float* pr = part + (row * S + sp) * (hd + 2);
+                if (lid == 0) {
+                    pr[0] = m;
+                    pr[1] = l;
+                }
+                if (lid < hd) pr[2 + lid] = acc;
+                return;
             }
             if (lid < hd) O[b * obs + i * orw + hh * hd + lid] = f16_from_f32(l > 0.f ? acc / l : 0.f);
         });
@@ -260,11 +280,23 @@ void qi_sdpa_ex(const QiSdpa& a, void* stream) {
     if (qi_sdpa_ex_library(a, stream)) return;
     const sycl::device dev = queue_for(stream).get_device();
     const auto wg = (int64_t) dev.get_info<sycl::info::device::max_work_group_size>();
-    // a step's few rows: a work-group each, its items over the keys (more of the GPU than a block of rows would use)
+    const auto units = (int64_t) dev.get_info<sycl::info::device::max_compute_units>();
+    // a step's few rows: a work-group each, its items over the keys (more of the GPU than a block of rows would use),
+    // and the keys in parts, a work-group's L at least, while the groups are fewer than 16 a compute unit (Florence-2
+    // large's decoder, 3 beams of 16 heads over up to 1,025 keys: the RTX 4070 4.87 s in one part, 3.98 at 4 groups a
+    // unit, 3.46 at 16; the B70 6.45 s, 3.97 from 2 on, 2026-11-07)
     if (a.lq <= 4) {
         const int64_t L = std::min<int64_t>(wg, 128);
         if (a.hd <= L) {
-            few_kernel(a, L, stream);
+            const int64_t rows = a.batch * a.heads * a.lq;
+            const int64_t S = std::min((16 * units + rows - 1) / rows, (a.lk + L - 1) / L);
+            if (S > 1) {
+                float* part = parts(a, S, a.hd, stream);
+                few_kernel(a, L, stream, S, part);
+                split_combine(a, S, a.hd, part, stream);
+            } else {
+                few_kernel(a, L, stream);
+            }
             return;
         }
     }
@@ -272,7 +304,6 @@ void qi_sdpa_ex(const QiSdpa& a, void* stream) {
     // fewer blocks of rows than the GPU has compute units, and many keys: the keys in parts, so the parts fill it (SAM
     // 3's 201 queries over 5,184 patches: 32 blocks, 4.1 ms a layer on the B70 in one part; its detection 0.042 s,
     // 0.022 in parts, 2026-11-07); a part at least 4 tiles of keys
-    const auto units = (int64_t) dev.get_info<sycl::info::device::max_compute_units>();
     const int64_t blocks = a.batch * a.heads * ((a.lq + qb - 1) / qb);
     const int64_t S = blocks >= units ? 1 : std::min((units + blocks - 1) / blocks, std::max<int64_t>(1, a.lk / 128));
     if (S > 1) {

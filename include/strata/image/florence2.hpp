@@ -78,6 +78,8 @@ private:
     void load_weights() override;
     Dw dw(const std::string& name);
     void vision(const QiRef& image);
+    void step(int64_t B, int64_t T, int64_t cap, uint16_t* cache, const uint16_t* ckv, const int32_t* dids, float* h,
+              float* y, uint16_t* h16, uint16_t* g16, uint16_t* a16, uint16_t* q16, float* logits);
     void encoder(const std::vector<int32_t>& text_ids);
     std::vector<int32_t> decode(int max_new, int beams, int& steps);
 

@@ -282,10 +282,13 @@ int main(int argc, char** argv) {
             auto got = f.run(img, ids, max_new, beams, &t);
             f.dump = nullptr;
             print(got);
-            // once more, warm, for the times (and the same tokens without the dumps' waits)
+            // once more (STRATA_PROBE_REPEAT times), warm, for the times (and the same tokens without the dumps' waits)
             si::Florence2::Times t2;
-            got = f.run(img, ids, max_new, beams, &t2);
-            print(got);
+            const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+            for (int r = 0, n = rep ? std::max(1, (int) std::strtol(rep, nullptr, 10)) : 1; r < n; ++r) {
+                got = f.run(img, ids, max_new, beams, &t2);
+                print(got);
+            }
             std::printf("cold vision_s=%.4f encoder_s=%.4f decoder_s=%.4f steps=%d\n", t.vision, t.encoder,
                         t.decoder, t.steps);
             std::printf("warm vision_s=%.4f encoder_s=%.4f decoder_s=%.4f steps=%d held_mib=%llu\n", t2.vision,

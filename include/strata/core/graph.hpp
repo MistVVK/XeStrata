@@ -120,4 +120,56 @@ private:
     size_t captures_ = 0;
 };
 
+/// A count raised wherever a buffer shared between calls (a library's workspace, a kernel's buffer kept per queue) is
+/// freed and allocated anew: a graph recorded before it may hold the old address, so StepForm drops its graphs.
+uint64_t graph_epoch();
+void graph_epoch_bump();
+
+/// A step the same every time (what changes per step DATA in device buffers, NOTE 2), run with a recorded graph or
+/// straight onto the stream, whichever is faster on this GPU.  The graph is not always faster (Qwen3.5-9B's decode,
+/// 2026-10-27: the B70 46.9 tok/s with it, 52.7 without; the RTX 4070 79.9 and 77.1, the RX 9060 XT 47.5 and 41.4),
+/// so the first steps take the two in turns, then the faster stays: one of each to warm up, then 4 of each counted
+/// (each step timed in the slower form costs the run, and the two differ by a tenth or so).  A key's first step goes
+/// straight, so what a library sets up at its first call (a plan, a scratch buffer, a wait) is done before a recording.
+/// An environment variable may fix it: "0" a graph, "1" straight (a profiler that cannot take the graphs sees the
+/// kernels).  Optionally it keeps the graphs too, by a key the caller makes of everything the step bakes in (its
+/// buffers' addresses and sizes): a recording that fails leaves the steps straight.
+class StepForm {
+public:
+    explicit StepForm(const char* env = nullptr);
+    ~StepForm() { clear(); }
+    StepForm(const StepForm&) = delete;
+    StepForm& operator=(const StepForm&) = delete;
+
+    /// -1 while timed, 0 with a graph, 1 straight
+    int form() const { return form_; }
+    void fix(int form) { form_ = form; }
+    /// Whether this step goes straight (while timed, in turns).
+    bool straight() const { return form_ == 1 || (form_ == -1 && (trial_ & 1) == 0); }
+    /// After a step taken while timed, its milliseconds; the tenth counted picks the form and says so (`who`, `what`).
+    /// A step of run()'s that ran a key the first time or recorded it is not counted.
+    void timed(double ms, const char* who, const char* what);
+
+    /// The step: `body` onto `stream` straight, or recorded once for `key` and replayed.  Does not synchronise.
+    /// With `outputs` (the step's results read back, the stream synchronised) and `clear` (which puts something else
+    /// in them onto the stream), a recording is checked once: the step straight, then its results cleared and its graph
+    /// replayed on the same inputs, must give the same bytes, else the steps go straight.  A library that runs outside
+    /// a recording (oneMath's rocBLAS backend before xestrata-13) did its work once, at the recording, and is left out
+    /// of the replays; the clearing keeps what it wrote then from passing for the replay's results.  That needs a step
+    /// that gives the same results when run again on its inputs.
+    bool run(uint64_t key, void* stream, const std::function<void()>& body, std::string& err,
+             const std::function<std::vector<uint8_t>()>& outputs = nullptr,
+             const std::function<void()>& clear = nullptr);
+    /// Drops the graphs (before their buffers go).
+    void clear();
+
+private:
+    int form_ = -1;
+    int trial_ = 0;
+    double ms_[2] = {};                    ///< the timed steps' milliseconds, with a graph and straight
+    bool setup_ = false;                   ///< the last run() set a key up
+    std::map<uint64_t, gpu::Graph*> graphs_;   ///< null: the key's first step, run straight
+    uint64_t epoch_ = 0;                   ///< graph_epoch() when the graphs were recorded
+};
+
 }  // namespace strata::core

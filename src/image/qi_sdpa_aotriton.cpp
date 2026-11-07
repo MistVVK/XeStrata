@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/qi_sdpa_aotriton.cpp - see include/strata/kernels/sdpa_aotriton.hpp: aotriton's flash attention on AMD
-// GPUs (MIT; its library and its kernels' images beside the engine), on the queue's HIP stream.  A module of its own
+// GPUs (MIT; its library and its kernels' images beside the engine), on the queue's HIP stream (while the queue records
+// a SYCL graph, in a native command whose stream the graph takes in).  A module of its own
 // (libstrata_sdpa_aotriton.so, strata_sdpa_aotriton.dll), which the kernels open on an AMD GPU only
 // (kernels::aotriton_sdpa): aotriton needs AMD's HIP runtime, which a machine with other makers' GPUs need not have,
 // and the engine must start there.
 
 #include <aotriton/flash.h>
+#include <hip/hip_runtime.h>
 #include <sycl/ext/oneapi/backend/hip.hpp>
 
 
@@ -17,6 +19,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 #include <vector>
@@ -76,6 +80,32 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
     p.Max_seqlen_q = (int32_t) rows;
     p.Max_seqlen_k = (int32_t) keys;
     q.memset(d.counter, 0, sizeof(int32_t));
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (q.ext_oneapi_get_state() == sx::queue_state::recording) {
+        // called on the queue's stream straight, the kernel would run once, at the recording, and not at the replays:
+        // a native command whose stream is taken into the graph's HIP graph, as oneMath's backends do (HIP 6.2)
+#if HIP_VERSION >= 60200000
+        q.submit([&](sycl::handler& h) {
+            h.ext_codeplay_enqueue_native_command([p](const sycl::interop_handle& ih) {
+                const hipStream_t hs = ih.get_native_queue<sycl::backend::ext_oneapi_hip>();
+                hipGraph_t g = nullptr;
+                if (ih.ext_codeplay_has_graph()) g = ih.ext_codeplay_get_native_graph<sycl::backend::ext_oneapi_hip>();
+                if (g != nullptr &&
+                    hipStreamBeginCaptureToGraph(hs, g, nullptr, nullptr, 0, hipStreamCaptureModeGlobal) != hipSuccess)
+                    throw std::runtime_error("aotriton: hipStreamBeginCaptureToGraph failed");
+                const hipError_t e = ao::v3::flash::attn_fwd(p, ao::v3::flash::attn_fwd_params::kVersion,
+                                                             ao::Stream(hs));
+                if (g != nullptr && hipStreamEndCapture(hs, &g) != hipSuccess)
+                    throw std::runtime_error("aotriton: hipStreamEndCapture failed");
+                if (e != hipSuccess)
+                    throw std::runtime_error("aotriton's attention: HIP error " + std::to_string((int) e));
+            });
+        });
+        return true;
+#else
+        return false;   // the engine's own kernel, which the graph records
+#endif
+    }
     const hipStream_t hs = sycl::get_native<sycl::backend::ext_oneapi_hip>(q);
     const hipError_t e = ao::v3::flash::attn_fwd(p, ao::v3::flash::attn_fwd_params::kVersion, ao::Stream(hs));
     if (e != hipSuccess) {

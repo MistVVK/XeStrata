@@ -11,6 +11,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -218,7 +219,10 @@ bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         Buf& c = bufs[&q];
         if (c.n < need) {
             q.wait();
-            if (c.p != nullptr) sycl::free(c.p, q);
+            if (c.p != nullptr) {
+                sycl::free(c.p, q);
+                core::graph_epoch_bump();   // a recorded step may hold the old one
+            }
             c.p = sycl::malloc_device<sycl::half>(need, q);
             c.n = c.p != nullptr ? need : 0;
         }
@@ -246,7 +250,10 @@ bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         Copies& c = copies[&q];
         if (c.n < need) {
             q.wait();
-            if (c.p != nullptr) sycl::free(c.p, q);
+            if (c.p != nullptr) {
+                sycl::free(c.p, q);
+                core::graph_epoch_bump();
+            }
             c.p = sycl::malloc_device<float>(need, q);
             c.n = c.p != nullptr ? need : 0;
         }
@@ -687,7 +694,10 @@ void Gemm::native_half(const uint16_t* X, int ggml_type, const void* W_blocks, u
             Buf& c = bufs[&q];
             if (c.n < need) {
                 q.wait();
-                if (c.p != nullptr) sycl::free(c.p, q);
+                if (c.p != nullptr) {
+                    sycl::free(c.p, q);
+                    core::graph_epoch_bump();
+                }
                 c.p = sycl::malloc_device<float>(need, q);
                 c.n = c.p != nullptr ? need : 0;
             }
