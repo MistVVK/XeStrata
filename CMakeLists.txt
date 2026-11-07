@@ -442,8 +442,8 @@ if(STRATA_ENABLE_XE)
       math(EXPR _strata_cutlass_minor "(${CMAKE_MATCH_1} % 1000) / 10")
       include(FetchContent)
       FetchContent_Populate(strata_cutlass QUIET
-        URL https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.2.1.tar.gz
-        URL_HASH SHA256=a4513ba33ae82fd754843c6d8437bee1ac71a6ef1c74df886de2338e3917d4df
+        URL https://github.com/NVIDIA/cutlass/archive/refs/tags/v4.8.1.tar.gz
+        URL_HASH SHA256=71fc2892e8bcd929398b5aa72e3393af1bad0cae9814cd75661ca88e688c2159
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cutlass-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cutlass-subbuild)
       list(SORT _strata_cutlass_sm COMPARE NATURAL)
@@ -490,10 +490,11 @@ if(STRATA_ENABLE_XE)
           list(APPEND _strata_cutlass_sms ${sm})
           list(APPEND _strata_cutlass_ptx false)
         endif()
+        # the headers it includes in a depfile (CUTLASS's among them: a new CUTLASS compiles it again)
         add_custom_command(OUTPUT ${_out}
           COMMAND ${CMAKE_CXX_COMPILER} ${_strata_cutlass_flags} --cuda-device-only ${_mode} ${_strata_cutlass_src}
-                  -o ${_out}
-          DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr}
+                  -o ${_out} -MD -MF ${_out}.d
+          DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr} DEPFILE ${_out}.d
           COMMENT "CUTLASS's int8 product for NVIDIA ${sm}" VERBATIM)
         list(APPEND _strata_cutlass_images ${_out})
       endforeach()
@@ -510,7 +511,8 @@ if(STRATA_ENABLE_XE)
       add_custom_command(OUTPUT ${_strata_cutlass_host}
         COMMAND ${CMAKE_CXX_COMPILER} ${_strata_cutlass_flags} --cuda-host-only
                 --cuda-gpu-arch=sm_${_strata_cutlass_oldest} -c ${_strata_cutlass_src} -o ${_strata_cutlass_host}
-        DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr}
+                -MD -MF ${_strata_cutlass_host}.d
+        DEPENDS ${_strata_cutlass_src} ${_strata_cutlass_hdr} DEPFILE ${_strata_cutlass_host}.d
         COMMENT "CUTLASS's int8 product: its parameters" VERBATIM)
       target_sources(strata_kernels PRIVATE ${_strata_cutlass_dir}/i8_gemm_cutlass_images.cpp ${_strata_cutlass_host})
       set_source_files_properties(${_strata_cutlass_host} PROPERTIES EXTERNAL_OBJECT ON GENERATED ON)
@@ -1117,7 +1119,9 @@ if(STRATA_ENABLE_XE)
       set(_obj ${_strata_kitchen_dir}/${_name}${CMAKE_CXX_OUTPUT_EXTENSION})
       add_custom_command(OUTPUT ${_obj}
         COMMAND ${CMAKE_CXX_COMPILER} ${_strata_kitchen_flags} -c ${_strata_kitchen_hip}/${src}.hip -o ${_obj}
+                -MD -MF ${_obj}.d
         DEPENDS ${_strata_kitchen_hip}/${src}.hip ${CMAKE_SOURCE_DIR}/src/kernels/hip/ocml_f16_declares.hpp
+        DEPFILE ${_obj}.d
         COMMENT "comfy-kitchen's ${src} for AMD ${_strata_kitchen_archs}" VERBATIM)
       list(APPEND _strata_kitchen_objs ${_obj})
     endforeach()

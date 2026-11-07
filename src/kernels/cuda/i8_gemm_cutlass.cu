@@ -8,6 +8,12 @@
 // at the first product) on the SYCL queue's CUDA stream - so no CUDA runtime is linked and nothing registers kernels.
 // The two compiles see the same types: the block the host fills is the kernel's argument byte for byte.
 
+#if defined(__clang__) && !defined(__NVCC__) && !defined(__NV_ATOMIC_RELAXED)
+// nvcc's atomic builtins under their names, as clang's own: CUTLASS 4.8.1's sub-byte references (which these products
+// do not use) call them when told a CUDA of 12.8 or later (__CUDACC_VER_*, given from the toolkit's cuda.h)
+#define __NV_ATOMIC_RELAXED __ATOMIC_RELAXED
+#define __nv_atomic_load_n(p, order) __atomic_load_n((p), (order))
+#endif
 #include <cutlass/cutlass.h>
 #include <cutlass/detail/helper_macros.hpp>
 #if defined(_MSC_VER)

@@ -97,7 +97,7 @@ Corporation, with the third-party programs its THIRD-PARTY-PROGRAMS lists), AOTr
 AMD GPUs (MIT, Copyright Advanced Micro Devices, Inc.; the images can carry parts of AMD's aiter (MIT), FlyDSL's kernels
 (Apache-2.0) and Triton (MIT)), and in the contrib-llvm ones oneMath (Apache-2.0) with XeStrata's changes, cuDNN
 Frontend (Apache-2.0, parts MIT, Copyright NVIDIA CORPORATION & AFFILIATES), which the image engine is compiled with,
-and CUTLASS (BSD-3-Clause, Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES), which the engine's int8
+and CUTLASS (BSD-3-Clause, Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES), which the engine's int8
 products for NVIDIA GPUs are compiled with.  Both carry, where built for AMD GPUs with WMMA, a module of comfy-kitchen's
 HIP int8 product and int8 attention (Apache-2.0, Copyright (c) 2025 Comfy Org; parts derived from SageAttention,
 Apache-2.0) with its NOTICE.
