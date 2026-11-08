@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <queue>
 #include <sstream>
@@ -458,7 +459,26 @@ uint64_t CropStitch::bytes(int64_t W, int64_t H, int64_t w, int64_t h, int64_t g
 
 CropStitch::~CropStitch() { gpu::free(crop_dev_); }
 
-void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep) {
+QiRef CropStitch::cut(const QiRef& base, const CropBox& box) {
+    const int64_t W = base.width, H = base.height;
+    if (W != box.width || H != box.height || base.rgba.size() != (size_t) (W * H * 4))
+        throw std::invalid_argument("image engine: CROP: the picture is not the size the box was made for");
+    QiRef out;
+    out.width = box.w;
+    out.height = box.h;
+    out.rgba.resize((size_t) (box.w * box.h * 4));
+    for (int64_t y = 0; y < box.h; ++y) {
+        const int64_t sy = std::clamp<int64_t>(box.y + y, 0, H - 1);
+        for (int64_t x = 0; x < box.w; ++x) {
+            const int64_t sx = std::clamp<int64_t>(box.x + x, 0, W - 1);
+            std::memcpy(&out.rgba[(size_t) ((y * box.w + x) * 4)], &base.rgba[(size_t) ((sy * W + sx) * 4)], 4);
+        }
+    }
+    return out;
+}
+
+void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep,
+                         const QiRef* scaled) {
     const int64_t W = base.width, H = base.height;
     if (W != box.width || H != box.height || base.rgba.size() != (size_t) (W * H * 4))
         throw std::invalid_argument("image engine: CROP: the picture is not the size the box was made for");
@@ -486,10 +506,20 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
         gwd = b.put(gw8);
         blur(m, tmp, W, H, gwd, r);
     }
-    // the box at the drawing's size: the picture (Lanczos) and the mask (bilinear), the mask blurred again there
+    if (scaled != nullptr &&
+        (scaled->width != gw || scaled->height != gh || scaled->rgba.size() != (size_t) (gw * gh * 4)))
+        throw std::invalid_argument("image engine: CROP: the upscaled cut is not the drawing's size");
+    // the box at the drawing's size: the picture (Lanczos, or the upscaler's `scaled`) and the mask (bilinear), the
+    // mask blurred again there
     const int64_t n = gw * gh;
     float* planes = b.get<float>((size_t) (4 * n));
-    {
+    if (scaled != nullptr) {
+        const uint8_t* up = rgba8_device(b, scaled->rgba);
+        done(queue().parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+            const int64_t i = (int64_t) id[0];
+            for (int c = 0; c < 4; ++c) planes[c * n + i] = (float) up[i * 4 + c];
+        }), "crop: the upscaled cut");
+    } else {
         Resize rz(b, box.w, box.h, gw, gh, true);
         float* mid = b.get<float>((size_t) (4 * box.h * gw));
         rows_rgba8(pic, W, H, box.x, box.y, box.h, rz.tx, rz.lox, rz.wx, mid);

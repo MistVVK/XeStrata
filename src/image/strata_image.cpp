@@ -73,7 +73,8 @@
 //                            UPSCALE: the base image (INIT:, else the first REF:) Lanczos-resized to the line's size
 //                            first (an upscale's second pass; its time in crop_s); UPS:<name>[:<path>] with it: that
 //                            upscaler's (UPS's) first, then the drawing (its time in ups_s), UPSCOLOR:<m> its color
-//                            correction (UPS's COLOR:);
+//                            correction (UPS's COLOR:); UPS: with CROP: the box enlarged to the drawing's size by that
+//                            upscaler instead of Lanczos (crop_upscale; its time in ups_s);
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
 //                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
 //                            %XX'd, the word's whitespace being the line's);
@@ -821,14 +822,30 @@ struct AuxNets {
 
 // Room for an auxiliary model's run that needs `need` bytes beyond what it holds: what the budget leaves beside the
 // image model's holdings, within the free VRAM; the image model's cache given back first where that is too little,
-// then its parts, as an upscale's (run_upscale)
-void aux_room(si::ImagePipeline& p, uint64_t need, const char* what) {
+// then its parts, as an upscale's (run_upscale), then the other auxiliary models' weights that aux_done kept (`aux`,
+// all but `keep`: a chat's find_region after its remove_background found BiRefNet's still held and Florence-2 150 MiB
+// short on the B70 beside the text model, 2026-11-09), the VRAM they give back added to the budget as aux_done adds it
+void aux_room(si::ImagePipeline& p, uint64_t need, const char* what, AuxNets* aux = nullptr,
+              const si::AuxNet* keep = nullptr) {
     const auto room = [&p] {
         const uint64_t b = p.budget(), held = p.held();
         return std::min<uint64_t>(si::free_vram(), b > held ? b - held : 0);
     };
     if (room() < need) p.release(false);
     if (room() < need) p.release(true);
+    if (room() < need && aux != nullptr) {
+        for (auto it = aux->open.begin(); it != aux->open.end();) {
+            if (it->second.get() == keep) {
+                ++it;
+                continue;
+            }
+            const uint64_t before = p.held() + si::free_vram();
+            it->second->release();
+            const uint64_t after = p.held() + si::free_vram();
+            if (after > before) p.set_budget(p.budget() + (after - before));
+            it = aux->open.erase(it);
+        }
+    }
     if (const uint64_t r = room(); r < need)
         throw std::runtime_error("memory: " + std::string(what) + " needs " + std::to_string(need >> 20) +
                                  " MiB, the GPU has " + std::to_string(r >> 20) + " MiB for it");
@@ -1393,7 +1410,7 @@ int serve(si::ImagePipeline& p) {
                     continue;
                 }
                 double ups_s = 0.0;   // the upscaler's time (UPS:), apart from crop_s
-                if (!r.upscaler.empty() && !r.upscale) throw std::invalid_argument("UPS: with UPSCALE");
+                if (!r.upscaler.empty() && !r.upscale && !crop) throw std::invalid_argument("UPS: with UPSCALE or CROP:");
                 if (r.upscale) {   // the base image at the line's size (Lanczos, or the upscaler) before it is drawn again
                     si::QiRef* base = !r.init.rgba.empty() ? &r.init : !r.refs.empty() ? &r.refs[0] : nullptr;
                     if (base == nullptr) throw std::invalid_argument("UPSCALE: a base image (INIT: or the first REF:)");
@@ -1405,7 +1422,19 @@ int serve(si::ImagePipeline& p) {
                     if (base == nullptr || r.mask.rgba.empty())
                         throw std::invalid_argument("CROP: a mask and its base image (INIT: or the first REF:)");
                     cs = std::make_unique<si::CropStitch>();
-                    timed([&] { cs->prepare(*base, r.mask, *crop, r.width, r.height, r.crop_color > 0); });
+                    // UPS: with CROP: (the request's crop_upscale): the box enlarged by that upscaler, not Lanczos
+                    std::optional<si::QiRef> scaled;
+                    if (!r.upscaler.empty() && !r.upscale) {
+                        timed([&] {
+                            scaled = upscale_base(p, ups, r, si::CropStitch::cut(*base, *crop), r.width, r.height,
+                                                  ups_s);
+                        });
+                        crop_s -= ups_s;
+                    }
+                    timed([&] {
+                        cs->prepare(*base, r.mask, *crop, r.width, r.height, r.crop_color > 0,
+                                    scaled ? &*scaled : nullptr);
+                    });
                     if (crop->ref_w > 0 && base != &r.init) {   // the base the init image, the reference its own size
                         r.init = cs->crop();
                         *base = cs->ref();
@@ -1439,7 +1468,7 @@ int serve(si::ImagePipeline& p) {
                     std::vector<uint8_t> whole;
                     timed([&] { whole = cs->stitch(img, r.crop_color); });
                     write_file(out, whole);
-                    std::printf("IMAGE %s crop_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s);
+                    std::printf("IMAGE %s crop_s=%.3f ups_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s, ups_s);
                 } else if (r.upscale) {
                     write_file(out, img);
                     std::printf("IMAGE %s crop_s=%.3f ups_s=%.3f\n", plan_kv(t, pl).c_str(), crop_s, ups_s);
@@ -1582,7 +1611,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Sam3& m = aux.get<si::Sam3>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3");
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
                 si::Sam3::Times t;
                 std::vector<si::Segment> segs;
                 try {
@@ -1620,7 +1649,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Sam3& m = aux.get<si::Sam3>(decoded_path(weights));
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3");
+                aux_room(p, m.need_bytes(img.width, img.height), "SAM 3", &aux, &m);
                 std::vector<std::vector<si::Segment>> found;
                 try {
                     found = m.run_many(img, ids, score, mask);
@@ -1661,7 +1690,8 @@ int serve(si::ImagePipeline& p) {
                 }
                 si::Sam3& m = aux.get<si::Sam3>(weights);
                 const strata::video::Info info = strata::video::probe(src);
-                aux_room(p, m.video_need_bytes(info.width, info.height, 1), "SAM 3.1's video segmentation");
+                aux_room(p, m.video_need_bytes(info.width, info.height, 1), "SAM 3.1's video segmentation", &aux,
+                         &m);
                 std::printf("STAGE segment-video\n");
                 std::fflush(stdout);
                 in.stop = false;
@@ -1688,7 +1718,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Florence2& m = aux.get<si::Florence2>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(beams, max_new), "Florence-2");
+                aux_room(p, m.need_bytes(beams, max_new), "Florence-2", &aux, &m);
                 si::Florence2::Times t;
                 std::vector<int32_t> got;
                 try {
@@ -1729,7 +1759,7 @@ int serve(si::ImagePipeline& p) {
                 const auto t0 = std::chrono::steady_clock::now();
                 si::Birefnet& m = aux.get<si::Birefnet>(weights);
                 const si::QiRef img = read_image(pic);
-                aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet");
+                aux_room(p, m.need_bytes(sw, sh, img.width, img.height, refine), "BiRefNet", &aux, &m);
                 si::Birefnet::Times t;
                 double refine_s = 0.0;
                 try {

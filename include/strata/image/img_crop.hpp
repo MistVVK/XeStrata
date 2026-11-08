@@ -59,8 +59,13 @@ public:
     /// base: 0 where the picture changes).  Throws std::invalid_argument when the sizes do not agree, and
     /// std::runtime_error when the GPU has no room for the steps.
     /// `keep`: the cut kept on the GPU too, for stitch's color match (not copied up again: 2.8 ms of a 1 MP cut over
-    /// the RTX 4070's PCIe x4).
-    void prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep = false);
+    /// the RTX 4070's PCIe x4).  `scaled`: the box already at gw x gh (an upscaler's, the request's crop_upscale), taken
+    /// for the drawing's base instead of the box resized here (Lanczos); the mask is resized here either way.
+    void prepare(const QiRef& base, const QiRef& mask, const CropBox& box, int64_t gw, int64_t gh, bool keep = false,
+                 const QiRef* scaled = nullptr);
+    /// The box of `base` at its own size (RGBA8 rows, the picture's edge repeated where the box passes it): what an
+    /// upscaler enlarges for prepare's `scaled`.
+    static QiRef cut(const QiRef& base, const CropBox& box);
     CropStitch() = default;
     CropStitch(const CropStitch&) = delete;
     CropStitch& operator=(const CropStitch&) = delete;
