@@ -226,8 +226,8 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
                     url = keep_image(data) if keep_image is not None else None
                 except ValueError as e:
                     raise ResponsesError(f"an image_generation_call's result: {e}", param + ".result") from None
-                text = (f"The image is made and the user sees it: {url}. To change it, call edit_image (its image: "
-                        f"{url}).") if url else "The image is made and the user sees it."
+                text = (f"The image is made and the user sees it: {url}. This step is done." if url else
+                        "The image is made and the user sees it.")
             prompt = item.get("revised_prompt")
             target = open_turn if open_turn is not None and not thinking else turn()
             target.setdefault("tool_calls", []).append({"function": {

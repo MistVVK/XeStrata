@@ -422,8 +422,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <option value="lanczos">Lanczos</option>
               <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
               <option value="seedvr2-7b">SeedVR2 7B</option>
-              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
-              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option></select></label>
           <span class="composer-hint" id="tool-up-about"></span>
           <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
             <input class="st-input" id="tool-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
@@ -567,8 +566,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
               <option value="lanczos">Lanczos</option>
               <option value="realesrgan-x4plus">RealESRGAN x4plus</option>
               <option value="seedvr2-7b">SeedVR2 7B</option>
-              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option>
-              <option value="seedvr2-3b">SeedVR2 3B</option></select></label>
+              <option value="seedvr2-7b-sharp" data-i18n="tool.upSharp">SeedVR2 7B sharp</option></select></label>
           <label class="st-field img-sl"><span class="img-sl__head"><span data-i18n="tool.upScale">Scale</span>
             <input class="st-input" id="vid-up-scale" type="number" min="1.1" max="4" step="0.1" placeholder="2"></span>
             <input class="img-sl__range" type="range" data-for="vid-up-scale" tabindex="-1" aria-hidden="true"></label>
@@ -854,6 +852,31 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>
+    <div class="st-field" id="textgpu-row" hidden>
+      <label class="st-label" for="s-textgpu"><span data-i18n="drawer.textGpu">Lend the chat model's GPU to the image tools</span></label>
+      <select class="st-input" id="s-textgpu">
+        <option value="" data-i18n="drawer.textGpuServer">The server's setting</option>
+        <option value="off" data-i18n="drawer.textGpuOff">Never</option>
+        <option value="ask" data-i18n="drawer.textGpuAsk">When the model asks for it</option>
+        <option value="on" data-i18n="drawer.textGpuOn">Whenever it helps</option>
+      </select>
+      <span class="muted small" data-i18n="drawer.textGpuNote">The image calls of one answer then run on both GPUs at once; a chat waits while the chat model's GPU makes an image.</span>
+    </div>
+    <div class="drawer-group" role="group" aria-labelledby="g-skills">
+      <h3 class="drawer-group__title" id="g-skills" data-i18n="skills.title">Skills</h3>
+      <div class="toggle-row"><span><span data-i18n="skills.use">Use the skills added here</span><br><span class="muted small"
+        data-i18n="skills.useNote">the model reads one when a request needs it (Agent Skills' SKILL.md)</span></span>
+        <button class="st-toggle" id="s-skills" role="switch" aria-checked="true" aria-label="Use the skills added here" data-i18n-label="skills.use"></button></div>
+      <div class="skills-list" id="skills-list"></div>
+      <details class="skills-own"><summary class="small skills-own__sum" id="skills-own-sum" data-i18n="skills.own">XeStrata's skills</summary>
+        <div class="skills-list" id="skills-own-list"></div></details>
+      <div class="skills-actions">
+        <button type="button" class="st-btn st-btn--secondary" id="skills-add" data-i18n="skills.add">Add a skill</button>
+        <button type="button" class="st-btn st-btn--secondary" id="skills-import" data-i18n="skills.import">Import a file…</button>
+        <input type="file" id="skills-file" accept=".md,.zip,text/markdown,application/zip" hidden>
+      </div>
+      <span class="muted small" id="skills-dir"></span>
+    </div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>

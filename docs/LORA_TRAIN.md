@@ -275,7 +275,7 @@ The data is the data folder's `records/2026-11-02-lora-train-data/` (`<data>`: L
 | character | `character-teal-bob/` (an original girl) | 18 | `tsumikaze` | only what changes (clothes, pose, background, angle). **Not what never changes (hair, eyes, freckles, build, hair clip)**. `a girl` stays as the class | memorizes the background and clothes too; drifts to another character |
 
 - Each caption is one English line, `<trigger word>, <description>`, in `NN.txt` beside the image with the same number. Preprocessing reads these files as they are.
-- MageTrail reads tags as well as sentences (`serve/image_skills/magetrail.md`), but v1 gives it the same English sentences as the other three.
+- MageTrail reads tags as well as sentences (`serve/skills/magetrail/SKILL.md`), but v1 gives it the same English sentences as the other three.
 - Sample images check with: a style — the trigger word plus a subject that is not in the data; a character — the trigger word plus new clothes and a new scene (as the data's README asks).
 
 ## The checks

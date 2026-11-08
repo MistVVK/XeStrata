@@ -1113,6 +1113,125 @@ function renderMcp() {
   }).join("");
 }
 
+// ------------------------------------------------------------------ Skills (GET / POST /skills, serve/skills.py)
+// Agent Skills' SKILL.md files the user adds here (kept in the server's data folder, the same from every browser) and
+// XeStrata's own (the image tools'): each switched on or off; the user's added, edited, imported and deleted.  The
+// chat sends "xestrata_skills": true while one of the user's is on: the model sees their names and reads the bodies it
+// needs with load_skill.
+let skillsInfo = {skills: [], broken: []};
+async function loadSkills() {
+  try {
+    const r = await fetch("skills", {headers: headers()});
+    if (!r.ok) return;
+    skillsInfo = await r.json();
+  } catch (e) { return; /* an older server: no skills */ }
+  renderSkills();
+}
+const userSkillsOn = () => (skillsInfo.skills || []).some((s) => !s.builtin && s.on);
+async function skillsPost(body) {
+  const r = await fetch("skills", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+  skillsInfo = j;
+  renderSkills();
+  return j;
+}
+function skillRow(s) {
+  const row = document.createElement("div");
+  row.className = "skill-row";
+  row.innerHTML = `<div class="skill-row__text"><span class="skill-row__name"></span><span class="muted small"></span>` +
+    `<div class="skill-row__acts"></div></div><button class="st-toggle" role="switch"></button>`;
+  row.querySelector(".skill-row__name").textContent = s.name;
+  row.querySelector(".muted").textContent = s.description;
+  const sw = row.querySelector(".st-toggle");
+  sw.setAttribute("aria-checked", String(!!s.on));
+  sw.setAttribute("aria-label", tr("skills.switch", "Use {name}", {name: s.name}));
+  sw.onclick = async () => {
+    try { await skillsPost({action: "switch", name: s.name, on: !s.on}); } catch (e) { toast("error", s.name, String(e.message || e), 6000); }
+  };
+  const acts = row.querySelector(".skill-row__acts");
+  const btn = (label, fn) => { const b = document.createElement("button"); b.type = "button"; b.className = "st-btn st-btn--secondary"; b.textContent = label; b.onclick = fn; acts.appendChild(b); };
+  btn(s.builtin ? tr("skills.view", "View") : tr("skills.edit", "Edit"), () => openSkill(s.name, s.builtin));
+  if (!s.builtin) btn(tr("skills.delete", "Delete"), async () => {
+    if (!confirm(tr("skills.deleteAsk", "Delete the skill {name}?", {name: s.name}))) return;
+    try { await skillsPost({action: "delete", name: s.name}); } catch (e) { toast("error", s.name, String(e.message || e), 6000); }
+  });
+  return row;
+}
+function renderSkills() {
+  const all = skillsInfo.skills || [];
+  const mine = all.filter((s) => !s.builtin), own = all.filter((s) => s.builtin);
+  const list = $("skills-list");
+  list.replaceChildren(...mine.map(skillRow));
+  for (const b of skillsInfo.broken || []) {
+    const e = document.createElement("div");
+    e.className = "msg-error small";
+    e.textContent = `${b.name}: ${b.error}`;
+    list.appendChild(e);
+  }
+  if (!mine.length && !(skillsInfo.broken || []).length) {
+    const e = document.createElement("span");
+    e.className = "muted small";
+    e.textContent = tr("skills.none", "No skill is added yet.");
+    list.appendChild(e);
+  }
+  $("skills-own-list").replaceChildren(...own.map(skillRow));
+  $("skills-own-sum").textContent = tr("skills.ownN", "XeStrata's skills ({n}; they can be switched off)", {n: own.length});
+  $("skills-dir").textContent = skillsInfo.dir ? tr("skills.dir", "Kept in {dir}", {dir: skillsInfo.dir}) : "";
+}
+const SKILL_TEMPLATE = "---\nname: my-skill\ndescription: What it does, and when the model should read it.\n---\n" +
+  "Write the instructions here.\n";
+async function openSkill(name, builtin) {
+  let text = SKILL_TEMPLATE;
+  if (name) {
+    try {
+      const r = await fetch("skills/" + encodeURIComponent(name), {headers: headers()});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+      text = j.text;
+    } catch (e) { toast("error", name, String(e.message || e), 6000); return; }
+  }
+  const d = document.createElement("dialog");
+  d.className = "attach-preview skill-editor";
+  d.innerHTML = `<div class="attach-preview__head"><span class="attach-preview__name"></span></div>` +
+    `<div class="attach-preview__body"><textarea spellcheck="false"></textarea><p class="msg-error small" hidden></p></div>` +
+    `<div class="attach-preview__foot"><button type="button" class="st-btn st-btn--primary" data-save></button> <button type="button" class="st-btn" data-close></button></div>`;
+  d.querySelector(".attach-preview__name").textContent = name ? name + (builtin ? " · " + tr("skills.readOnly", "XeStrata's, read only") : "") : tr("skills.add", "Add a skill");
+  const ta = d.querySelector("textarea");
+  ta.value = text;
+  ta.readOnly = !!builtin;
+  ta.setAttribute("aria-label", "SKILL.md");
+  const save = d.querySelector("[data-save]");
+  save.textContent = tr("skills.save", "Save");
+  save.hidden = !!builtin;
+  d.querySelector("[data-close]").textContent = tr("close", "Close");
+  d.querySelector("[data-close]").onclick = () => d.close();
+  save.onclick = async () => {
+    const err = d.querySelector(".msg-error");
+    try {
+      await skillsPost({action: "save", text: ta.value, ...(name ? {old: name} : {})});
+      d.close();
+    } catch (e) { err.hidden = false; err.textContent = String(e.message || e); }
+  };
+  d.addEventListener("close", () => d.remove());
+  document.body.appendChild(d);
+  d.showModal();
+}
+$("skills-add").onclick = () => openSkill(null, false);
+$("skills-import").onclick = () => $("skills-file").click();
+$("skills-file").onchange = async () => {
+  const f = $("skills-file").files[0];
+  $("skills-file").value = "";
+  if (!f) return;
+  try {
+    const buf = new Uint8Array(await f.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode(...buf.subarray(i, i + 0x8000));
+    const j = await skillsPost({action: "import", filename: f.name, data: btoa(bin)});
+    toast("info", tr("skills.title", "Skills"), tr("skills.imported", "Added {name}", {name: j.saved}), 4000);
+  } catch (e) { toast("error", tr("skills.import", "Import a file…"), String(e.message || e), 8000); }
+};
+
 // ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
 // A few documented keys of the run config (xestrata-<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.  A key that can also be set
@@ -2101,6 +2220,7 @@ async function generateReply(opts = {}) {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (settings.skills !== false && userSkillsOn()) body.xestrata_skills = true;   // the skills the user added (load_skill)
   // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
   const ci = $("chat-images").value;
   if (health.image_generation && ci !== "off") body.xestrata_images = ci === "auto" || !ci ? true : {model: ci};
@@ -2109,6 +2229,9 @@ async function generateReply(opts = {}) {
   // what the user marked on a picture in its preview (previewAttachment): this message's image tools take it, even with
   // images off
   if (health.image_generation && imageMarks && !opts.resume) body.xestrata_images = marksBody(body.xestrata_images);
+  // the chat model's GPU lent to the image calls (the drawer's choice over the server's use_text_gpu)
+  if (body.xestrata_images && health.image_text_gpu && settings.textGpu)
+    body.xestrata_images = {...(body.xestrata_images === true ? {} : body.xestrata_images), use_text_gpu: settings.textGpu};
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
@@ -2750,7 +2873,7 @@ function openDrawer(open) {
   $("drawer").dataset.open = String(open);
   $("drawer").setAttribute("aria-hidden", String(!open));
   $("scrim").hidden = !open;
-  if (open) { loadDrawer(); loadShared(); loadMcp(); }
+  if (open) { loadDrawer(); loadShared(); loadMcp(); loadSkills(); }
 }
 const checked = (id) => $(id).getAttribute("aria-checked") === "true";
 const segValue = (id) => { const b = [...$(id).children].find((x) => x.getAttribute("aria-checked") === "true"); return b ? b.dataset.v : null; };
@@ -2768,6 +2891,9 @@ function loadDrawer(s = settings) {
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+  $("s-skills").setAttribute("aria-checked", String(s.skills !== false));
+  $("s-textgpu").value = s.textGpu || "";
+  $("textgpu-row").hidden = !health.image_text_gpu;
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   $("s-list").setAttribute("aria-checked", String(!!s.chatList));
   $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
@@ -2864,7 +2990,7 @@ for (const b of $("s-script").children) b.onclick = () => {
   $("script-ctx-row").hidden = b.dataset.v === "off";        // the switch under it is kept as it was while hidden
 };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-skills", "s-share", "s-list", "s-edit", "s-scriptctx"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
 // going on past the context is what keeps a long chat going: switching it off asks first
@@ -2883,6 +3009,7 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
+              skills: checked("s-skills"), textGpu: $("s-textgpu").value,
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
               whileBusy: segValue("s-busy") || "queue", segments: checked("s-seg"), segmentLimit: $("s-seglimit").value.trim(),
               // the language's own choice stays "": it follows a later change of the page's language
@@ -2988,7 +3115,7 @@ async function start() {
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
   thinkingButtons();   // the four of before until /health says the model's own
-  loadHealth().then(() => resumeReplies()).then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  loadHealth().then(() => resumeReplies()).then(loadSwitcher).then(loadMcp).then(loadSkills).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
   poll();
   setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

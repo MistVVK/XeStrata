@@ -1779,6 +1779,21 @@ XeStrata がほかの機器から届くなら、API キーを設定してくだ�
 
 ---
 
+## Web のチャットのスキル
+
+チャットの画面には、[Agent Skills](https://agentskills.io) の形のスキル（フォルダーごとの `SKILL.md`。先頭の `name` と `description`、その下に本文）を足せます。
+モデルに渡すのは名前と `description` の一覧だけで、モデルは要求に要るときだけ `load_skill` の道具で本文を読みます。読まない会話には本文が入りません。
+
+- Chat settings の引き出しの **スキル** で、足す（その場で書く、`SKILL.md` か、`SKILL.md` を含む zip を取り込む）、直す、消す、オンとオフを切り替えます。
+  **ここで足したスキルを使う** をオフにすると、足したスキルを渡しません。
+- 置き場所はサーバーのデータフォルダーの `skills/` で、どのブラウザーから開いても同じです（setup が設定に `"skills_dir"` を書きます）。オンとオフは同じフォルダーの `.state.json` に残ります。
+- XeStrata が同梱するスキル（画像の道具のもの、`serve/skills/`）も同じ一覧に並び、同じ `load_skill` で読みます。オフにはできますが、直したり消したりはできません。同じ名前のスキルは足せません。
+- 足したスキルの本文は、XeStrata のものではない印を付けてモデルに渡します。
+- 足す・直す・消す・切り替えるのは、チャットの画面自身からだけです（よそのサイトの Origin や、JSON でない要求は断ります）。API キーを設定していれば、それも要ります。
+- `/v1/chat/completions` への要求は、`"xestrata_skills": true` で足したスキルを使うことを選べます（Web のページは、オンのスキルがあるときに付けます）。
+
+---
+
 ## AI アシスタントから XeStrata を操作する（MCP サーバー）
 
 `tools/strata_mcp.py` は、Claude Code、Claude Desktop、Cursor、VS Code、Codex などのための MCP サーバーです。

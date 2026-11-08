@@ -7176,6 +7176,13 @@ def conversation_save_default(a, cfg: dict) -> dict:
     return {"conversation_save": str(Path(a.models_dir) / "conversations" / cfg["model_name"])}
 
 
+def skills_default(a) -> dict:
+    """The skills the web page's user adds (serve/skills.py) are kept in the data folder's skills/, one folder for every
+    model's server, so a skill added with one model is there with the others."""
+    data = getattr(a, "data_folder", None)
+    return {"skills_dir": str(Path(data) / "skills")} if data else {}
+
+
 def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gpus_chosen: bool = False,
                        defaults: dict | None = None) -> None:
     """Setup's run config, written over an earlier one for the same model without losing what the user added to it:
@@ -7666,7 +7673,7 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     if free is not None and "--vram-free-mib" not in cfg["args"]:
         cfg["args"] = [*cfg["args"], "--vram-free-mib", free]
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
-                       getattr(a, "gpus_chosen", False), conversation_save_default(a, cfg))
+                       getattr(a, "gpus_chosen", False), {**conversation_save_default(a, cfg), **skills_default(a)})
     script = None if PACKAGED else write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     if not a.no_warmup:
         warm_up(cfg_path)
@@ -8170,6 +8177,7 @@ def main() -> int:
     else:
         data, elsewhere = data_folder(a.data_dir, a.move_data, a.yes, a.set_default_data_dir)   # found from any copy
     roots = [data, *elsewhere]
+    a.data_folder = str(data)
     if a.models_dir is None:
         a.models_dir = str(data / "models")
 

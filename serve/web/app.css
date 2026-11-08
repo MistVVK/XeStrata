@@ -297,6 +297,23 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .st-mermaid g.node[data-step="running"] .xs-step-mark { fill: var(--st-info-text); }
 .st-mermaid g.node[data-step="done"] .xs-step-mark { fill: var(--st-accent-text); }
 .st-mermaid g.node[data-step="error"] .xs-step-mark { fill: var(--st-danger-text); }
+/* the chat's skills (the drawer's Skills): a row each, its switch on the right */
+.skills-list { display: flex; flex-direction: column; gap: var(--st-s-2); }
+.skill-row { display: flex; align-items: flex-start; gap: var(--st-s-3); padding-top: var(--st-s-2); border-top: 1px solid var(--st-line-soft);
+             font-size: var(--st-fs-sm); }
+.skill-row:first-child { border-top: 0; padding-top: 0; }
+.skill-row__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.skill-row__name { font: var(--st-fw-medium) var(--st-fs-sm) var(--st-font-mono); color: var(--st-ink); }
+.skill-row__acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.skill-row__acts .st-btn { height: 28px; padding: 0 10px; font-size: var(--st-fs-xs); }
+.skill-row .st-toggle { flex: none; }
+.skills-own__sum { cursor: pointer; color: var(--st-ink-muted); padding: 4px 0; }
+.skills-own[open] > .skills-own__sum { margin-bottom: var(--st-s-2); }
+.skills-actions { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
+.skill-editor { width: min(92vw, 820px); }
+.skill-editor textarea { width: 100%; min-height: min(60vh, 520px); font: 400 var(--st-fs-sm) var(--st-font-mono); resize: vertical; box-sizing: border-box;
+                         border: 0; padding: 12px 14px; background: var(--st-bg); color: var(--st-ink); }
+.skill-editor .msg-error { margin: 0 14px 8px; }
 
 /* ---------------------------------------------------------------- about */
 .about { max-width: min(100%, 1100px); }

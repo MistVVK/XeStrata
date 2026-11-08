@@ -76,6 +76,8 @@ from serve import runconfig  # noqa: E402
 from serve import places  # noqa: E402
 from serve import envvars  # noqa: E402
 from serve import search as search_api  # noqa: E402
+from serve import skills as skills_api  # noqa: E402
+from serve import tool_parallel  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import kernel_check  # noqa: E402
@@ -3853,6 +3855,7 @@ class Service:
         self.xe_kernel: str | None = None   # a kernel whose xe driver lacks a fix (serve/kernel_check.py; the web app)
         self.status_lock = threading.Lock()
         self.mcp: McpHub | None = None                   # serve/mcp.py's McpHub when MCP servers are configured
+        self.skills = skills_api.Skills(None)           # the chat's skills (serve/skills.py): main sets the user's
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
@@ -5968,6 +5971,9 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+FREE_ROUNDS = 3   # run_with_mcp's rounds that only read skills or stubs' arguments, not counted in max_rounds
+
+
 class ToolHubs:
     """Hubs that run_with_mcp runs as one: the MCP servers' tools and the image tools (serve/images.py ImageTools)."""
 
@@ -5980,6 +5986,10 @@ class ToolHubs:
         for h in self.hubs:
             out.update(h.routes())
         return out
+
+    def new_tools(self) -> list:
+        """The tools a hub declares from the next round on (the image tools unlocked by load_skill)."""
+        return [t for h in self.hubs if hasattr(h, "new_tools") for t in h.new_tools()]
 
     def call(self, name: str, arguments, cancel=None) -> dict:
         for h in self.hubs:
@@ -6003,7 +6013,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     could not reach the model before the client's).  `force` (forced_call): the first round's reply opens that call;
     the rounds after a tool ran are the model's own."""
     max_rounds = int(hub.settings["max_rounds"])
-    total, rounds = 0, 0
+    total, rounds, free_rounds = 0, 0, 0
     done: dict = {}
     finalizing = False   # PR #3741 (upstream e0469a585): the round after the limit answers with no tools
     messages = list(messages)
@@ -6037,13 +6047,83 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         rounds += 1
         force = None
+        # a chart of the plan a call carries (an image tool's `plan`, combine-tools): put into the reply before the
+        # calls run, as a ```mermaid block the web page draws - a model that writes no text beside its calls gives it so
+        for c in calls:
+            try:
+                plan = json.loads(c.arguments).get("plan") if isinstance(c.arguments, str) else None
+            except (ValueError, AttributeError):
+                plan = None
+            if isinstance(plan, str) and plan.strip():
+                chart = plan.strip()
+                if not chart.startswith("```"):
+                    chart = "```mermaid\n" + chart + "\n```"
+                chunk = ("\n\n" if text else "") + chart + "\n\n"
+                text.append(chunk)
+                yield "event", Event("content", chunk)
+                break
         if isinstance(sampling, dict) and sampling.get("strata_grammar_first_round"):   # the forced call's name only
             sampling = {k: v for k, v in sampling.items() if k not in ("strata_grammar", "strata_grammar_first_round")}
-        results = []
-        for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
-            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
+        routes = hub.routes()
+        light: list[bool] = []   # each result: a skill read, or a stub's arguments (no tool's work done)
+
+        def call_event(c):
+            s, tool = routes.get(c.name, (None, c.name))
+            return {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None, "tool": tool,
+                    "arguments": c.arguments, "round": rounds}
+
+        def finished(c, r):
+            """A call's result: logged (and kept beside the debug log) -> (the client's event, what the model reads)."""
+            light.append(c.name == skills_api.TOOL or bool(r.get("stub")) or bool(r.get("skipped")))
+            print(f"[xestrata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
+            dbg = getattr(svc.request_trace, "debug", None)
+            if dbg is not None:
+                made = []                                # the images the tool made, saved beside the log
+                log = cast(debuglog.DebugLog, svc.debug_log)
+                for u in r.get("images") or []:
+                    f = svc.images.file(u.rsplit("/", 1)[-1]) if isinstance(u, str) and svc.images is not None else None
+                    try:
+                        made.append(log.picture(f.read_bytes(), f.suffix[1:]) if f is not None else u)
+                    except OSError:
+                        made.append(u)
+                dbg["tools"].append({"round": rounds, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
+                                     "ms": r["ms"], "result": r.get("model_content", r["text"]),
+                                     **({"images": made} if made else {}),
+                                     **({"image": r["image"]} if r.get("image") else {})})
+            # an MCP tool's pictures (mcp.image_results, upstream 7c9b6f3a2) reach the model only with a picture reader
+            seen = r.get("model_content", r["text"]) if svc.vision is not None else r["text"]
+            return ({"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
+                     **({"skipped": True} if r.get("skipped") else {}),
+                     **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
+                     **({"image": r["image"]} if r.get("image") else {}),
+                     **({"sources": r["sources"]} if "sources" in r else {})}, seen)   # a web search's (search.py)
+
+        # the image and video calls of this reply, two or more: run side by side (serve/tool_parallel.py), their
+        # results kept in the reply's order; every other call runs in turn as before, meanwhile
+        image_hub = next((h for h in (hub.hubs if isinstance(hub, ToolHubs) else [hub])
+                          if isinstance(h, images_api.ImageTools)), None)
+        names = set(image_hub.routes()) if image_hub is not None else set()
+        side = [(i, c) for i, c in enumerate(calls) if c.name in names]
+        runner = tool_parallel.Runner(image_hub, side, cancel) if len(side) > 1 else None
+        by_index: dict[int, object] = {}
+
+        def flush():
+            for ev in runner.take() if runner is not None else []:
+                c = calls[ev[1]]
+                if ev[0] == "start":
+                    yield "mcp", call_event(c)
+                else:
+                    event, seen = finished(c, ev[2])
+                    by_index[ev[1]] = seen
+                    yield "mcp", event
+        if runner is not None:
+            runner.start()
+        stopped = False
+        for i, c in enumerate(calls):
+            if runner is not None and c.name in names:
+                continue
+            yield "mcp", call_event(c)
             # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
             # keep-alive lines, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
             box: dict = {}
@@ -6063,37 +6143,35 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                         index, data = partials.get()
                         yield "mcp", {"event": "partial", "id": c.id, "index": index,
                                       "b64": base64.b64encode(data).decode("ascii")}
+                    yield from flush()
                     if worker.is_alive():
                         yield "ping", None
             except GeneratorExit:
                 cancel.set()                             # the client is gone: stop the tool too
                 raise
             if "r" not in box:
+                stopped = True
                 break
-            r = box["r"]
-            print(f"[xestrata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
-                  f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            dbg = getattr(svc.request_trace, "debug", None)
-            if dbg is not None:
-                made = []                                # the images the tool made, saved beside the log
-                log = cast(debuglog.DebugLog, svc.debug_log)
-                for u in r.get("images") or []:
-                    f = svc.images.file(u.rsplit("/", 1)[-1]) if isinstance(u, str) and svc.images is not None else None
-                    try:
-                        made.append(log.picture(f.read_bytes(), f.suffix[1:]) if f is not None else u)
-                    except OSError:
-                        made.append(u)
-                dbg["tools"].append({"round": rounds, "name": c.name, "arguments": c.arguments, "ok": r["ok"],
-                                     "ms": r["ms"], "result": r.get("model_content", r["text"]),
-                                     **({"images": made} if made else {}),
-                                     **({"image": r["image"]} if r.get("image") else {})})
-            # an MCP tool's pictures (mcp.image_results, upstream 7c9b6f3a2) reach the model only with a picture reader
-            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
-            yield "mcp", {"event": "result", "id": c.id,
-                          **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")},
-                          **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
-                          **({"image": r["image"]} if r.get("image") else {}),
-                          **({"sources": r["sources"]} if "sources" in r else {})}   # a web search's (search.py)
+            event, seen = finished(c, box["r"])
+            by_index[i] = seen
+            yield "mcp", event
+        if runner is not None:
+            try:
+                while runner.alive():
+                    runner.join(1.0)
+                    yield from flush()
+                    if runner.alive():
+                        yield "ping", None
+                yield from flush()
+            except GeneratorExit:
+                cancel.set()
+                raise
+        results = [by_index[i] for i in range(len(calls)) if i in by_index] if not stopped else []
+        # a round that only read skills or a stub's arguments does no tool's work: not one of max_rounds, FREE_ROUNDS
+        # such rounds at most (a chain of three image tools spent its four rounds before its last step)
+        if light and all(light) and free_rounds < FREE_ROUNDS:
+            rounds -= 1
+            free_rounds += 1
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
@@ -6111,6 +6189,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 "reply. Answer the user's original request in their language using the results already obtained. "
                 "Explain any gaps in the available evidence. Do not request or emit further tool calls.")})
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+        more = hub.new_tools() if hasattr(hub, "new_tools") and not finalizing else []
+        if more:                                         # tools given whole from this round on (their stubs' places)
+            whole = {t["name"]: t for t in more}
+            tools = [whole.pop(t["name"], t) if isinstance(t, dict) else t for t in tools or []] + list(whole.values())
+            mcp_names.update(t["name"] for t in more)
         try:
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
@@ -7532,6 +7615,10 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, model_switcher(svc))
                 return
+            if path == "/skills" or path.startswith("/skills/"):   # the chat's skills (the web page's Skills)
+                if self._authorized():
+                    self._skills_get(path)
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -7557,6 +7644,11 @@ def make_handler(svc: Service):
                                  "image_note": svc.images.note() if svc.images is not None else None,
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
+                                 # the text model's GPU lent to a reply's image calls (use_text_gpu): its setting, and
+                                 # whether a job runs there now (the chat waits for it)
+                                 "image_text_gpu": {"mode": images_api.text_gpu_mode(
+                                     svc.images.default.cfg.get("use_text_gpu")), "lent": svc.images.lending()}
+                                 if svc.images is not None and svc.images.lend_cfgs is not None else None,
                                  "video": videos_api.status(svc.images.default.cfg,
                                                             Path(svc.images.default.dir) / "video-jobs")
                                  if svc.images is not None else None,
@@ -7713,6 +7805,9 @@ def make_handler(svc: Service):
                 return
             if path == "/config":
                 self._config_post()
+                return
+            if path == "/skills":
+                self._skills_post()
                 return
             if path in ("/unload", "/load") and not self._control_body():
                 return
@@ -8627,6 +8722,61 @@ def make_handler(svc: Service):
                 return False
             return True
 
+        def _skills_get(self, path):
+            """GET /skills: every skill (XeStrata's and the user's), whether each is on, and the user's that do not
+            read; GET /skills/<name>: a skill's SKILL.md (a built-in one's to read only)."""
+            if path == "/skills":
+                self._json(200, svc.skills.listing())
+                return
+            name = path[len("/skills/"):]
+            s = svc.skills.get(name)
+            if s is None:
+                self._json(404, {"error": {"message": f"no skill named {name!r}"}})
+                return
+            text = (svc.skills.text(name) if not s.builtin else
+                    (svc.skills.builtin_dir / name / "SKILL.md").read_text(encoding="utf-8"))
+            self._json(200, {"name": s.name, "builtin": s.builtin, "on": svc.skills.on(s.name), "text": text})
+
+        def _skills_post(self):
+            """POST /skills {"action": "save", "text": SKILL.md, "old": the name it had} | {"action": "import",
+            "filename", "data": base64 of a SKILL.md or a zip} | {"action": "switch", "name", "on"} | {"action":
+            "delete", "name"}: the user's skills added, changed, removed, and any switched on or off - from this
+            server's own page (or a trusted origin), as /settings."""
+            if not self._own_page("skills can be changed"):
+                return
+            try:
+                req = json.loads(self._body() or b"{}")
+            except ValueError:
+                req = None
+            if not isinstance(req, dict):
+                self._json(400, {"error": {"type": "invalid_request_error", "message": "send a JSON object"}})
+                return
+            act = req.get("action")
+            try:
+                if act == "save":
+                    old = req.get("old")
+                    got = svc.skills.save(str(req.get("text") or ""), old if isinstance(old, str) and old else None)
+                    self._json(200, {"saved": got.name, **svc.skills.listing()})
+                elif act == "import":
+                    try:
+                        data = base64.b64decode(str(req.get("data") or ""), validate=True)
+                    except ValueError:
+                        raise skills_api.SkillError("data: the file in base64") from None
+                    got = svc.skills.import_file(data, str(req.get("filename") or "SKILL.md"))
+                    self._json(200, {"saved": got.name, **svc.skills.listing()})
+                elif act == "switch":
+                    svc.skills.switch(str(req.get("name") or ""), req.get("on") is True)
+                    self._json(200, svc.skills.listing())
+                elif act == "delete":
+                    svc.skills.delete(str(req.get("name") or ""))
+                    self._json(200, svc.skills.listing())
+                else:
+                    raise skills_api.SkillError('action: "save", "import", "switch" or "delete"')
+            except skills_api.SkillError as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except OSError as e:
+                self._json(500, {"error": {"message": f"the skills' folder could not be written ({e})"}})
+
         def _loras_post(self, path):
             """The Images view's adapters (serve/loras.py): an upload (POST /v1/images/loras?name=<file>, the file
             itself the body, application/octet-stream: a page elsewhere cannot send that without a CORS preflight,
@@ -8949,7 +9099,11 @@ def make_handler(svc: Service):
                                                     lambda d: Vision.normalize(d, keep_alpha=True),
                                                     model=want.get("model") if isinstance(want, dict) else None,
                                                     user=user, skills="inline" if image_force else "index",
-                                                    tools=want.get("tools") if isinstance(want, dict) else None)
+                                                    tools=want.get("tools") if isinstance(want, dict) else None,
+                                                    text_gpu=want.get("use_text_gpu") if isinstance(want, dict)
+                                                    else None,
+                                                    all_tools=want.get("all_tools") if isinstance(want, dict)
+                                                    else None)
                 if user:
                     images_api.note_marks(messages, user)
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
@@ -8965,6 +9119,16 @@ def make_handler(svc: Service):
                 if more:
                     extra += [] if image_force else more
                     hubs.append(image_tools)
+            # load_skill (serve/skills.py): the image tools' rules and skills' list with them, and the skills the web
+            # page's user added (xestrata_skills); one tool reads them all
+            image_hub = next((h for h in hubs if isinstance(h, images_api.ImageTools)), None)
+            want_skills = own_field(req, "skills") is True
+            if (image_hub is not None and not image_force) or want_skills:
+                skill_tools = skills_api.SkillTools(svc.skills, None if image_force else image_hub, user=want_skills)
+                more = skill_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(skill_tools)
             search_tools = None                               # web_search_options: the search tools (search.py)
             ws = req.get("web_search_options")
             if ws is not None and not isinstance(ws, dict):
@@ -10714,6 +10878,8 @@ def main() -> int:
                 print(f"[xestrata] {said}", flush=True)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
             svc.images.helper_card = image_helper_card(cfg)
+            if separate and not svc.images.helper_card:   # the text model's GPU may be lent to them (use_text_gpu)
+                svc.images.lend_cfgs = (icfgs, ilog, child_env(cfg))
             svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
         except ValueError as e:
             raise SystemExit(f"[xestrata] config: {e}")
@@ -10914,6 +11080,9 @@ def main() -> int:
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    # the skills the web page's user adds (serve/skills.py): the config's "skills_dir" (setup writes the data folder's
+    # skills/), else that of the data folder in the settings
+    svc.skills = skills_api.Skills(cfg.get("skills_dir") or skills_api.default_dir())
     if hub is not None:
         import atexit
         svc.mcp = hub

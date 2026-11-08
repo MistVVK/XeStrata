@@ -426,12 +426,24 @@ def region_mask(svc, gen, picture: bytes, region: str, model: str | None = None,
     """The edits' `region`: OpenAI's mask (a PNG whose transparent pixels change) of every instance of `region` in
     `picture`, their union grown by REGION_GROW of the short side -> (the mask, segment's answer without the masks);
     ImageRequestError when nothing is found."""
+    got = segment(svc, gen, picture, region, "mask", model, cancel=cancel)
+    out = union_mask(got)
+    if out is None:
+        raise img.ImageRequestError(f"region: no {region!r} found in the image ({got['model']})")
+    info = {k: v for k, v in got.items() if k != "instances"}
+    info["instances"] = [{k: v for k, v in i.items() if k != "mask"} for i in got["instances"]]
+    info["grow"] = out[1]
+    return out[0], info
+
+
+def union_mask(got: dict) -> tuple[bytes, int] | None:
+    """segment's instances as one edit's mask: OpenAI's (transparent where it changes), their union grown by
+    REGION_GROW of the short side -> (the mask, the pixels grown), None when none has a mask."""
     import numpy as np
     from PIL import Image
-    got = segment(svc, gen, picture, region, "mask", model, cancel=cancel)
-    found = [i["mask"] for i in got["instances"] if i["mask"] is not None]
+    found = [i["mask"] for i in got["instances"] if i.get("mask") is not None]
     if not found:
-        raise img.ImageRequestError(f"region: no {region!r} found in the image ({got['model']})")
+        return None
     union = np.logical_or.reduce(found).astype(np.uint8) * 255
     grow = max(REGION_GROW_MIN, round(REGION_GROW * min(got["width"], got["height"])))
     m = spread(union, grow)
@@ -439,10 +451,7 @@ def region_mask(svc, gen, picture: bytes, region: str, model: str | None = None,
     out.putalpha(Image.fromarray(255 - m, "L"))
     buf = io.BytesIO()
     out.save(buf, "PNG")
-    info = {k: v for k, v in got.items() if k != "instances"}
-    info["instances"] = [{k: v for k, v in i.items() if k != "mask"} for i in got["instances"]]
-    info["grow"] = grow
-    return buf.getvalue(), info
+    return buf.getvalue(), grow
 
 
 def marked(picture: bytes, instances: list[dict]) -> bytes:

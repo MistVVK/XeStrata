@@ -191,7 +191,7 @@ install(DIRECTORY serve tools ref DESTINATION ${_pkg_share}
         FILES_MATCHING PATTERN "*.py" PATTERN "test_*" EXCLUDE PATTERN "mcp_fake_server.py" EXCLUDE
         PATTERN "__pycache__" EXCLUDE PATTERN "lint" EXCLUDE PATTERN "vision" EXCLUDE PATTERN "package" EXCLUDE)
 install(DIRECTORY serve/web DESTINATION ${_pkg_share}/serve)
-install(DIRECTORY serve/image_skills DESTINATION ${_pkg_share}/serve)   # the chat's image tools' rules
+install(DIRECTORY serve/skills DESTINATION ${_pkg_share}/serve)   # the chat's skills (the image tools' among them)
 install(DIRECTORY data DESTINATION ${_pkg_share})
 install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/main)
 install(DIRECTORY third_party/main/katex DESTINATION ${_pkg_share}/third_party/main)   # the web chat's math

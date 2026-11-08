@@ -1846,6 +1846,21 @@ If XeStrata is reachable from other devices, set an API key.
 
 ---
 
+## Skills in the web chat
+
+The chat page takes skills in [Agent Skills](https://agentskills.io)' form (a folder's `SKILL.md`: `name` and `description` at its top, the skill below them).
+The model is given their names and descriptions alone, and reads a body with the `load_skill` tool only when a request needs it; a conversation that reads none carries none.
+
+- Chat settings' drawer, **Skills**: add one (written there, or a `SKILL.md`, or a zip that holds one, imported), edit, delete, switch on and off.
+  **Use the skills added here** off gives the model none of them.
+- They are kept in the server's data folder, `skills/`: the same from every browser (setup writes `"skills_dir"` into the config). Which are on is kept in the same folder's `.state.json`.
+- XeStrata's own skills (the image tools', `serve/skills/`) are in the same list and read with the same `load_skill`. They can be switched off, not edited or deleted, and a skill of the same name cannot be added.
+- An added skill's body reaches the model marked as not XeStrata's.
+- Skills are added, edited, deleted and switched only from the chat page itself (a request from another site's origin, or not JSON, is refused), with the API key where one is set.
+- A `/v1/chat/completions` request opts in to the added skills with `"xestrata_skills": true` (the web page sends it while one is on).
+
+---
+
 ## Manage XeStrata from your AI assistant (MCP server)
 
 `tools/strata_mcp.py` is an MCP server for Claude Code, Claude Desktop, Cursor, VS Code, Codex and other assistants.

@@ -224,6 +224,9 @@ FIX_STRENGTH = 0.5
 FIX_THRESHOLD = 0.5
 FIX_DILATION = 10
 FIX_CROP_FACTOR = 3.0
+# crop_upscale auto: an upscaler (RealESRGAN, the one the redraw's auto takes) for a cut enlarged this many times or
+# more, Lanczos below it - the larger the enlargement, the more of the drawing's base a plain resize leaves blurred
+CROP_UPS_AUTO = 2.0
 FIX_GUIDE = 1024
 FIX_DROP = 10
 FIX_BLEND = 20
@@ -1286,6 +1289,15 @@ def upscale_request(fields: dict) -> tuple[dict, str | None]:
     return req, model_name if isinstance(model_name, str) and model_name else None
 
 
+def refs_limit(cfg: dict) -> int:
+    """The images an edit of the model takes at most, the one it edits among them: the config's max_refs, else its
+    family's own limit."""
+    family = cfg.get("family")
+    return int(cfg.get("max_refs") or (MF_MAX_REFS if family == "mage-flow" else HUNYUANIMAGE3_MAX_REFS
+                                       if family == "hunyuan-image-3" else MOSS_MAX_REFS if family == "moss-image"
+                                       else MAX_REFS))
+
+
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
     """An edit (/v1/images/edits): parse_request's fields with `images` (PNG, JPEG, GIF or BMP).  A model that edits
     takes them as its reference images (job["refs"]); one that does not (can_edit) takes one image as img2img's base
@@ -1307,10 +1319,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     if not images:
         raise ImageRequestError("image: one reference image or more" if edits else "image: the image to start from")
     if edits:
-        max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else HUNYUANIMAGE3_MAX_REFS if hunyuan
-                                               else MOSS_MAX_REFS if moss else MAX_REFS))
-        if len(images) > max_refs:
-            raise ImageRequestError(f"image: at most {max_refs} reference images")
+        limit = refs_limit(cfg)
+        if len(images) > limit:
+            raise ImageRequestError(f"image: at most {limit} reference images")
     elif len(images) > 1:
         raise ImageRequestError("image: one image (this image model has no edits: it starts from one image, "
                                 "img2img)")
@@ -1400,6 +1411,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job["mask"] = mask
     if crop is not None:   # the image at the first image's size, drawn at the plan's
         job["crop"] = crop
+        crop_upscaler(job, req)
         job["color_match"] = color_match_mode(req, cfg)
         job["width"], job["height"] = w0, h0
         if moss and edits and len(images) > 1 and not crop.get("empty") and not crop["whole"]:   # CROP_REFINE_STRENGTH
@@ -1727,6 +1739,46 @@ def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEX
     return {"box": [x, y, w, h], "gen": [gw, gh], "blend": blend, "size": [W, H], "whole": False}
 
 
+def crop_upscaler(job: dict, req: dict) -> None:
+    """A request's crop_upscale ("auto", "lanczos", "realesrgan", "seedvr2", or {"method", "variant"}: SeedVR2's 7b or
+    7b-sharp), how Crop and Stitch enlarges its cut to the drawing's size -> job["crop_ups"] (an upscaler as
+    job["upscaler"] is, and the enlargement) where it is an upscaler; Lanczos is the engine's own resize.  auto: an
+    upscaler from CROP_UPS_AUTO times on.  A cut that is not enlarged is resized as it is."""
+    v = req.get("crop_upscale")
+    if isinstance(v, str) and v.strip().startswith("{"):   # a form's field
+        try:
+            v = json.loads(v)
+        except ValueError:
+            raise ImageRequestError("crop_upscale: a JSON object, or the method's name") from None
+    if isinstance(v, str):
+        v = {"method": v}
+    if v is None:
+        v = {}
+    if not isinstance(v, dict) or not set(v) <= {"method", "variant"}:
+        raise ImageRequestError('crop_upscale: "auto", "lanczos", "realesrgan" or "seedvr2" (or {"method", '
+                                '"variant"})')
+    method = v.get("method") or "auto"
+    if method not in CROP_UPSCALE:
+        raise ImageRequestError(f"crop_upscale: one of {', '.join(CROP_UPSCALE)}, not {method!r}")
+    variant = v.get("variant") or None
+    if variant is not None and variant not in SEEDVR2_VARIANTS[:2]:
+        raise ImageRequestError(f"crop_upscale's variant: SeedVR2's {' or '.join(SEEDVR2_VARIANTS[:2])}")
+    if variant is not None and method not in ("seedvr2", "auto"):
+        raise ImageRequestError("crop_upscale's variant: SeedVR2's alone")
+    if variant is not None:
+        method = "seedvr2"
+    crop = job.get("crop") or {}
+    if crop.get("empty") or "gen" not in crop:
+        return
+    (gw, gh), (w, h) = crop["gen"], crop["box"][2:]
+    scale = max(gw / max(1, w), gh / max(1, h))
+    resolved = method if method != "auto" else "realesrgan" if scale >= CROP_UPS_AUTO else "lanczos"
+    if resolved == "lanczos" or scale <= 1.0:
+        return
+    job["crop_ups"] = {"method": resolved, "asked": method, "color": None, "scale": round(scale, 2),
+                       **({"variant": variant or "7b"} if resolved == "seedvr2" else {})}
+
+
 def crop_whole(cfg: dict, W: int, H: int, blend: int = CROP_BLEND) -> dict:
     """plan_crop's plan of the whole picture of W x H: drawn at the model's size in its shape and put back at its own,
     the part outside the mask kept."""
@@ -1774,7 +1826,8 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
         if min(pads) < 0:
             raise ImageRequestError("extend: 0 or more pixels a side")
     if not any(pads):
-        raise ImageRequestError("extend: the canvas grows on no side")
+        raise ImageRequestError("extend: the canvas grows on no side: give aspect (e.g. 16:9 wide, 9:16 tall) or the "
+                                "pixels of a side (left, top, right, bottom)")
     if w + pads[0] + pads[2] > side or h + pads[1] + pads[3] > side:
         raise ImageRequestError(f"extend: the canvas would pass {side} pixels a side (max_side)")
     return pads
@@ -2702,6 +2755,7 @@ class ImageGen:
         # the job in the GPU's turn as the Monitor shows it (live()), and the jobs that ended, newest last (recent()):
         # the one record of an image job's progress, which /metrics reads
         self.job: dict | None = None
+        self.owner: ImageModels | None = None   # the ImageModels it is one of (gpu_turn's GPU)
         self.ended: collections.deque[dict] = collections.deque(maxlen=100)
 
     def note(self) -> str | None:
@@ -3019,6 +3073,8 @@ class ImageGen:
                     else "")
                  + (f" COLOR:{job['color_match']}" if job.get("crop") and not job["crop"].get("empty")
                     and job.get("color_match") else "")
+                 + (ImageGen._ups_words(job, False, "crop_ups") if job.get("crop_ups") and job.get("crop")
+                    and not job.get("upscale") else "")
                  + (" UPSCALE" + ImageGen._ups_words(job, need) if job.get("upscale") else "")
                  + ("" if not job.get("tiles") else
                     f" TILES:{job['tiles']['tile']},{job['tiles']['pad']},{job['tiles']['blur']}")
@@ -3036,21 +3092,22 @@ class ImageGen:
         return words
 
     @staticmethod
-    def _ups_spec(job: dict) -> str:
+    def _ups_spec(job: dict, key: str = "upscaler") -> str:
         """The engine's name of an upscale's upscaler: <method>[:<its weights' path, %XX'd as LORA:'s>]
-        (job["upscaler"]["path"], set by upscaler_weights)."""
-        u = job["upscaler"]
+        (job[key]["path"], set by upscaler_weights; key "crop_ups": Crop and Stitch's, crop_upscaler)."""
+        u = job[key]
         return u["method"] + (f":{lora_api.encode_path(u['path'])}" if u.get("path") else "")
 
     @staticmethod
-    def _ups_words(job: dict, need: bool = False) -> str:
+    def _ups_words(job: dict, need: bool = False, key: str = "upscaler") -> str:
         """An upscale's first pass on IMG and NEED: UPS:<spec> and its color correction (UPSCOLOR:), none for Lanczos
-        alone (the engine's own resize); NEED's the base image's size too (UPSIN:)."""
-        u = job.get("upscaler") or {}
+        alone (the engine's own resize); NEED's the base image's size too (UPSIN:).  key "crop_ups": the upscaler
+        Crop and Stitch's cut is enlarged by (beside CROP:)."""
+        u = job.get(key) or {}
         if not u or u["method"] == "lanczos" and u.get("color") in (None, "none"):
             return ""
-        words = f" UPS:{ImageGen._ups_spec(job)}" + (f" UPSCOLOR:{u['color']}" if u.get("color") else "")
-        if need:   # an upscale in tiles: the whole size too (NEED's is a tile's)
+        words = f" UPS:{ImageGen._ups_spec(job, key)}" + (f" UPSCOLOR:{u['color']}" if u.get("color") else "")
+        if need and key == "upscaler":   # an upscale in tiles: the whole size too (NEED's is a tile's)
             words += " UPSIN:{},{}".format(*image_dims(job["init"])) + (
                 f",{job['width']},{job['height']}" if job.get("tiles") else "")
         return words
@@ -3576,9 +3633,30 @@ class ImageModels:
             g = ImageGen(c, log=log, env=env)
             if g.model in self.gens:
                 raise ValueError(f'two image models are named {g.model!r} ("images" and "image_models")')
+            g.owner = self
             self.gens[g.model] = g
         self.default = self.current = next(iter(self.gens.values()))
         self.gpu = GpuTurn(self.default.engine.env)   # the models share one environment, so one GPU
+        # the text model's GPU lent to the images (use_text_gpu, tool_parallel): the same models with the text engine's
+        # environment, made when first lent (server.py sets lend_cfgs on a card of their own)
+        self.lend_cfgs: tuple | None = None
+        self._lent: ImageModels | None = None
+        self._lent_lock = threading.Lock()
+
+    def lending(self) -> bool:
+        """Whether a job runs on the text model's GPU, lent to the images, now (the chat's requests wait meanwhile)."""
+        return self._lent is not None and any(g.job is not None for g in self._lent.gens.values())
+
+    def lent(self) -> "ImageModels":
+        """The models' engines on the text model's GPU (made once): their jobs take the GPU's turn there as on a
+        shared card, the text model making room for them (gpu_turn)."""
+        with self._lent_lock:
+            if self._lent is None:
+                if self.lend_cfgs is None:
+                    raise ImageRequestError("use_text_gpu: the images have no card of their own here")
+                cfgs, log, env = self.lend_cfgs
+                self._lent = ImageModels(cfgs, log=log, env=env, separate=False)
+            return self._lent
 
     def __getattr__(self, name):
         return getattr(self.current, name)
@@ -3615,6 +3693,8 @@ class ImageModels:
         engine was unloaded kept its layers (policy keep: nothing to make room from), and the text engine that starts
         after it would find the card full (no expert cache: it stops before the prompt).  Not on a card of their own
         (separate), where a job may be running."""
+        if self._lent is not None:   # the text model's GPU, lent to the images before: given back too
+            self._lent.give_back()
         if self.separate:
             return
         for g in self.gens.values():
@@ -3661,176 +3741,197 @@ class ImageModels:
 # ------------------------------------------------------------------------------------------- chat's image tools
 OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "background")
 FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))")
+# an image tool's picture: a kept image's link (a tool's result, or the conversation's), else the conversation's last
+IMAGE_ARG = {"type": "string", "description": "a link a result gave; left out: the last image (an attached one too)"}
+# how Crop and Stitch enlarges the part it cuts out before it is drawn (crop_upscale), and SeedVR2's version for it
+CROP_UPSCALE = ("auto", "lanczos", "realesrgan", "seedvr2")
+CROP_ARGS: dict[str, Any] = {"crop_upscale": {"type": "string", "enum": list(CROP_UPSCALE)},
+                             "variant": {"type": "string", "enum": ["7b", "7b-sharp"]}}
+# what every image and video tool takes besides its own: the plan's step it does (the chart's box), and the group of
+# calls run side by side that one failure stops (server.py run_with_mcp)
+PLAN_ARGS: dict[str, Any] = {"step": {"type": "string"}, "group": {"type": "string"},
+                             "plan": {"type": "string", "description": "the first call's: the steps' mermaid chart"}}
 TOOLS: list[dict[str, Any]] = [
     {"name": "generate_image",
-     "description": "Make an image with the image model on this computer. The image is shown to the user; the "
-                    "result says where it is.",
+     "description": "Make a new image from words alone; the user sees it, and the result gives its link. Not for a "
+                    "new image in an attached picture's pose or layout (control), nor a change of a picture "
+                    "(edit_image).",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "the image's prompt"},
-         "size": {"type": "string",
-                  "description": "WIDTHxHEIGHT, e.g. 1024x1024, 1536x1024 (wide), 1024x1536 (tall)"},
-         "seed": {"type": "integer", "description": "the same seed and prompt make the same image"}},
-         "required": ["prompt"]}},
-    {"name": "edit_image",
-     "description": "Change an image, or make a new one from it (its subject, its style); the new image is shown "
-                    "to the user. A model without edits draws the prompt over the image (img2img): the prompt then "
-                    "says what the whole picture shows.",
-     "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "what to change, or what to make from the image"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
-         "strength": {"type": "number",
-                      "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
-                                     "default 1 for an edit, 0.87 for img2img (less with few steps)"},
-         "refine": {"type": "boolean",
-                    "description": "MOSS-Image, with a painted part and more images than the one edited: draw "
-                                   "the part again after the whole picture, finer, in about 1.6 times the time"},
+         "prompt": {"type": "string"},
+         "size": {"type": "string", "description": "WxH, e.g. 1024x1024"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
-    {"name": "extend_image",
-     "description": "Grow an image past its edges (outpaint), the image kept as it is: pixels a side, or a shape.",
+    {"name": "edit_image",
+     "description": "Change a whole image, or make a new one from it; the user sees it. Not for: one part only (her "
+                    "hair, the clothes, the sky: edit_region), larger or finer (upscale_image), wider, taller or "
+                    "another shape (extend_image keeps the picture; this redraws it), a cut-out or plain background "
+                    "(remove_background), faces or hands (fix_image), a new subject in a picture's pose (control). "
+                    "The same person in another picture's pose: that picture in references. A model without edits "
+                    "draws over it (img2img): the prompt then says the whole picture.",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "what the whole image shows, its new area too"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
+         "prompt": {"type": "string", "description": "the change"},
+         "image": IMAGE_ARG,
+         "size": {"type": "string", "description": "WxH; left out: the image's shape (another shape: extend_image)"},
+         "strength": {"type": "number", "description": "0 to 1"},
+         "references": {"type": "array", "items": {"type": "string"}, "description": "links: images 2, 3, ..."},
+         "mask": {"type": "string", "description": "a mask's link (white changes)"},
+         "refine": {"type": "boolean", "description": "MOSS-Image: the masked part again, finer"},
+         **CROP_ARGS, "seed": {"type": "integer"}},
+         "required": ["prompt"]}},
+    {"name": "extend_image",
+     "description": "Grow an image past its edges (outpaint), the image kept as it is.",
+     "parameters": {"type": "object", "properties": {
+         "prompt": {"type": "string", "description": "the whole image, its new area too"},
+         "image": IMAGE_ARG,
          "left": {"type": "integer"}, "top": {"type": "integer"}, "right": {"type": "integer"},
          "bottom": {"type": "integer"},
-         "aspect": {"type": "string", "description": "the shape to grow to instead of pixels, e.g. 16:9"},
+         "aspect": {"type": "string", "description": "e.g. 16:9"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
     {"name": "upscale_image",
-     "description": "Make an image larger by an upscaler, and with redraw draw it again finer (the same picture).",
+     "description": "Make an image larger by an upscaler; with redraw, draw it again finer.",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "what the image shows (needed with redraw)"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
-         "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
-         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
-         "redraw": {"type": "boolean", "description": "draw it again after the upscaler (default false)"},
-         "strength": {"type": "number", "description": "with redraw: how much may change (default 0.35)"},
+         "prompt": {"type": "string", "description": "what it shows (with redraw)"},
+         "image": IMAGE_ARG,
+         "scale": {"type": "number"},
+         "method": {"type": "string", "enum": list(UPSCALE_METHODS)},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2])},
+         "redraw": {"type": "boolean"},
+         "strength": {"type": "number"},
          "seed": {"type": "integer"}}}},
     {"name": "upscale_video",
-     "description": "Make a video the user attached larger by an upscaler (SeedVR2 by default), its sound kept. It "
-                    "runs as a job on the server for minutes or more: the answer says where the user follows it and "
-                    "gets the video; do not wait for it.",
+     "description": "Make the attached video larger: a job on the server; the answer says where it goes. Do not wait.",
      "parameters": {"type": "object", "properties": {
-         "video": {"type": "string",
-                   "description": "a /v1/videos/files/... link; default the conversation's last video"},
-         "scale": {"type": "number", "description": "how many times larger: 1.5 or 2 (default 2)"},
-         "method": {"type": "string", "enum": list(UPSCALE_METHODS), "description": "the upscaler (default auto)"},
-         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2]), "description": "SeedVR2's (default 7b)"},
+         "video": {"type": "string", "description": "a /v1/videos/files/ link (default: the last video)"},
+         "scale": {"type": "number"},
+         "method": {"type": "string", "enum": list(UPSCALE_METHODS)},
+         "variant": {"type": "string", "enum": list(SEEDVR2_VARIANTS[:2])},
          "seed": {"type": "integer"}}}},
     {"name": "segment_video",
-     "description": "Find and follow objects through a video the user attached (SAM 3.1): each named thing, every "
-                    "instance of it, on every frame; makes a video with them colored over it, and their masks. It "
-                    "runs as a job on the server: the answer says where the user follows it; do not wait for it.",
+     "description": "Find and follow things through the attached video (SAM 3.1): a job on the server; the answer says "
+                    "where it goes. Do not wait.",
      "parameters": {"type": "object", "properties": {
-         "prompts": {"type": "array", "items": {"type": "string"},
-                     "description": 'short English noun phrases of what to find, e.g. ["person", "red car"]'},
-         "video": {"type": "string",
-                   "description": "a /v1/videos/files/... link; default the conversation's last video"},
-         "masks": {"type": "boolean", "description": "also a black-and-white mask video of each object"}},
+         "prompts": {"type": "array", "items": {"type": "string"}, "description": "English noun phrases"},
+         "video": {"type": "string", "description": "a /v1/videos/files/ link (default: the last video)"},
+         "masks": {"type": "boolean"}},
          "required": ["prompts"]}},
     {"name": "fix_image",
-     "description": "Find faces, hands or people in an image and draw each again, finer (a Detailer); the rest of "
-                    "the image kept.",
+     "description": "Find faces, hands or people in an image and draw each again, finer; the rest kept.",
      "parameters": {"type": "object", "properties": {
-         "parts": {"type": "array", "items": {"type": "string", "enum": list(FIX_PARTS)},
-                   "description": 'what to find and redraw, e.g. ["face"], ["face", "hands"], ["person"]'},
-         "prompt": {"type": "string", "description": "what the parts should look like (default: well drawn)"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "strength": {"type": "number", "description": "how much each part may change, above 0 to 1 (default 0.5)"},
-         "seed": {"type": "integer"}},
+         "parts": {"type": "array", "items": {"type": "string", "enum": list(FIX_PARTS)}},
+         "prompt": {"type": "string"},
+         "image": IMAGE_ARG,
+         "strength": {"type": "number"},
+         **CROP_ARGS, "seed": {"type": "integer"}},
          "required": ["parts"]}},
     {"name": "edit_region",
-     "description": "Draw again only the part of an image that words name (her hair, the sky, the red car); the "
-                    "rest kept as it is.",
+     "description": "Draw again only the part of an image that words name; the rest kept.",
      "parameters": {"type": "object", "properties": {
-         "region": {"type": "string", "description": "what to change, in English words, e.g. hair, the left cup"},
-         "prompt": {"type": "string", "description": "what the part should become"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "strength": {"type": "number", "description": "how much the part may change, above 0 to 1 (default 1)"},
-         "seed": {"type": "integer"}},
-         "required": ["region", "prompt"]}},
+         "region": {"type": "string", "description": "English words, e.g. hair"},
+         "mask": {"type": "string", "description": "instead of region: a mask's link (find_region's)"},
+         "prompt": {"type": "string", "description": "what the part becomes"},
+         "image": IMAGE_ARG,
+         "strength": {"type": "number"},
+         **CROP_ARGS, "seed": {"type": "integer"}},
+         "required": ["prompt"]}},
     {"name": "find_region",
-     "description": "Find a part of an image by words and show it to the user marked; nothing is drawn.",
+     "description": "Find a part of an image by words: the user sees it marked, the result links its mask.",
      "parameters": {"type": "object", "properties": {
-         "region": {"type": "string", "description": "what to find, in English words, e.g. hair, every face"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"}},
+         "region": {"type": "string", "description": "English words, e.g. face"},
+         "image": IMAGE_ARG},
          "required": ["region"]}},
     {"name": "control",
-     "description": "Make a new image whose composition follows a picture: the pose of its people, its outlines, its "
-                    "depth or its straight lines (the picture's map made first). The new image is shown to the user.",
+     "description": "Make a new image whose composition follows a picture's (pose, outlines, depth); the user sees it. "
+                    "Nothing of the picture's people but their pose is kept: to keep a given person (their face, "
+                    "their clothes), edit_image with the pose's picture in references.",
      "parameters": {"type": "object", "properties": {
-         "prompt": {"type": "string", "description": "the new image's whole prompt (what it shows)"},
+         "prompt": {"type": "string", "description": "the whole new image"},
          "type": {"type": "string", "enum": ["canny", "depth", "pose", "lineart", "lineart_coarse", "hed",
-                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "color"],
-                  "description": "what to take from the picture: pose (people's pose), canny or lineart (outlines), "
-                                 "depth (composition), mlsd (a room's or a building's straight lines), scribble (a "
-                                 "sketch), gray (its shading), color (MOSS-Image: where each object is)"},
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "size": {"type": "string", "description": "WIDTHxHEIGHT; default the picture's shape at about 1024x1024"},
-         "strength": {"type": "number", "description": "with ControlNet: how strongly it follows, 0 to 2 (default 1)"},
-         "end": {"type": "number", "description": "with ControlNet: the share of the steps it follows, 0 to 1 "
-                                                  "(default 1; lower frees the details)"},
+                                             "scribble_hed", "scribble", "scribble_xdog", "mlsd", "gray", "color",
+                                             "none"]},
+         "image": IMAGE_ARG,
+         "size": {"type": "string", "description": "WxH"},
+         "strength": {"type": "number"},
+         "end": {"type": "number"},
          "seed": {"type": "integer"}},
          "required": ["prompt", "type"]}},
     {"name": "remove_background",
      "description": "Take an image's background away (a transparent PNG), or put a plain color behind its subject.",
      "parameters": {"type": "object", "properties": {
-         "image": {"type": "string",
-                   "description": "a /v1/images/files/... link; default the conversation's last image"},
-         "version": {"type": "string", "enum": ["general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic"],
-                     "description": "BiRefNet's version (default general)"},
-         "background_color": {"type": "string", "description": "a color behind it, e.g. #ffffff (default none)"}}}},
+         "image": IMAGE_ARG,
+         "version": {"type": "string", "enum": ["general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic"]},
+         "background_color": {"type": "string", "description": "e.g. #ffffff"}}}},
 ]
 
+# the image tools every request declares; the others once the chat's model reads their skills (ImageTools.unlock)
+CORE_TOOLS = ("generate_image", "edit_image")
 # the tools that start from an image
 EDIT_TOOLS = ("edit_image", "extend_image", "upscale_image", "fix_image", "edit_region", "find_region",
               "remove_background", "control")
-SKILLS = Path(__file__).resolve().parent / "image_skills"
-# how a model's prompt is written, by its name without -uncensored, else its family: booru.md's Danbooru tags, else
-# natural.md's sentences
-PROMPT_STYLE = {"anima": "booru", "magetrail": "booru"}
-STYLE_NAME = {"booru": "Danbooru tags", "natural": "natural language"}
-
-
-@functools.cache
-def skill(name: str) -> str:
-    """serve/image_skills/<name>.md without its license comment: "" when there is none.  common.md goes into every
-    image tool's description; the prompt style's (booru.md or natural.md, PROMPT_STYLE) into those its models are
-    offered in; then a model's own (magetrail.md, by its name without -uncensored), else its family's (anima.md)."""
-    try:
-        text = (SKILLS / f"{name}.md").read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return ""
-    return re.sub(r"\A<!--.*?-->\s*", "", text, flags=re.S).strip()
-
-
-def skill_when(name: str) -> str:
-    """A skill's "When:" line (when the chat's model reads it): its line in image_skill's index."""
-    m = re.search(r"^When: (.+)$", skill(name), flags=re.M)
-    return m.group(1).strip() if m else ""
-
-
-# image_skill's index, the skills of each kind in the order they are joined (a later kind wins where they differ): the
-# models' catalog (with several models), the prompt style's (booru.md, natural.md), a model's own or its family's, a
-# tool's (image_skills/tools/<tool>.md)
-SKILL_KINDS = ("catalog", "style", "model", "tool")
-SKILL_MODELS = "models"   # the catalog: what each image model offered is made for (the tools' "model" choice)
+# the always-shown skill of the image tools (serve/skills/image-tools), and the catalog load_skill reads: what each
+# image model offered is made for (the tools' "model" choice)
+SKILL_ALWAYS = "image-tools"
+SKILL_MODELS = "models"
 SKILL_MODELS_WHEN = "choosing the image model: what each one is made for."
-SKILL_TOOL = "image_skill"
+SKILL_COMBINE = "combine-tools"   # its "tool" is "*": offered with two image tools or more
+STYLE_DEFAULT = "natural"         # the prompt style of a model whose skill names none
 # the copy of a made image an image tool's result shows a chat model that reads pictures: its longer side, and how many
 # such copies the image folder's seen/ keeps (a request's later rounds read them)
 SEEN_SIDE = 512
 SEEN_KEEP = 32
-SKILL_READ = " Before writing its prompt, read the skills it needs with image_skill."
+
+
+@functools.cache
+def _builtin_skills():
+    from serve import skills as skills_api
+    return skills_api.Skills(None)
+
+
+TEXT_GPU_MODES = ("off", "ask", "on")
+
+
+def text_gpu_mode(conf, asked=None) -> str:
+    """The use_text_gpu setting in force: the request's (xestrata_images use_text_gpu: off, ask, on, or true / false)
+    over the config's, "ask" by default.  ImageRequestError for a value that is none of them."""
+    out = "ask"
+    for v, where in ((conf, 'the config\'s "use_text_gpu"'), (asked, "xestrata_images.use_text_gpu")):
+        if v is None:
+            continue
+        v = {True: "on", False: "off"}.get(v, v) if isinstance(v, bool) else v
+        if v not in TEXT_GPU_MODES:
+            raise ImageRequestError(f"{where}: off, ask or on, not {v!r}")
+        out = v
+    return out
+
+
+def mask_to_bw(mask: bytes) -> bytes:
+    """An edit's mask (OpenAI's: transparent where it changes) as the picture a tool's result links: white where it
+    changes, black elsewhere (a grey PNG)."""
+    import io
+    from PIL import Image
+    a = Image.open(io.BytesIO(mask)).convert("RGBA").getchannel("A")
+    out = io.BytesIO()
+    a.point(lambda v: 255 - v).save(out, format="PNG")
+    return out.getvalue()
+
+
+def mask_from_bw(data: bytes) -> bytes:
+    """A mask's picture a tool's argument links -> OpenAI's mask.  A black-and-white one (mask_to_bw's, or any grey
+    picture): white changes; one with transparent pixels: as OpenAI reads it."""
+    import io
+    from PIL import Image
+    try:
+        im = Image.open(io.BytesIO(data))
+    except Exception as e:
+        raise ImageRequestError(f"mask: the picture could not be read ({e})") from None
+    if im.mode in ("RGBA", "LA", "PA") and im.getchannel("A").getextrema()[0] < 255:
+        out = im.convert("RGBA")
+    else:
+        out = Image.new("RGBA", im.size, (0, 0, 0, 255))
+        out.putalpha(im.convert("L").point(lambda v: 255 - v))
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
 
 
 def fit_mask(mask: bytes, image: bytes) -> bytes:
@@ -3936,7 +4037,7 @@ class ImageTools:
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
                  model: str | None = None, mask: bytes | None = None, user: dict | None = None,
-                 skills: str = "index", tools=None):
+                 skills: str = "index", tools=None, text_gpu=None, all_tools=None):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
         if model is not None:   # the request's own image model (xestrata_images {"model": ...}): that one alone
@@ -3955,10 +4056,10 @@ class ImageTools:
             if self.models is None and gen.family != "moss-image":
                 gen = moss[0]
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
-        # the skills: "index", the tools' short descriptions and image_skill, whose description carries common.md and
-        # the index of the rest, the chat's model reading those it needs (a chat that makes no image carries no more);
-        # "inline", every skill of the models offered in the tools' descriptions (the image button's request, which is
-        # an image's for certain, and the Responses route's image_generation tool)
+        # the skills: "index", the tools' short descriptions, load_skill's (serve/skills.py SkillTools) carrying
+        # skill_part and the list of the rest, the chat's model reading those it needs (a chat that makes no image
+        # carries no more); "inline", every skill of the models offered in the tools' descriptions (the image button's
+        # request, which is an image's for certain, and the Responses route's image_generation tool)
         self.skills = skills
         # the image tools this request may use: the config's "image_tools" (every one by default), narrowed by the
         # request's xestrata_images.tools - a tool the config leaves out cannot be asked for
@@ -3978,7 +4079,17 @@ class ImageTools:
         self.options = {k: v for k, v in (options or {}).items()
                         if k in OPTION_KEYS and v is not None and not (k == "size" and v == "auto")}
         self.settings = {"max_rounds": 4}
+        # the text model's GPU lent to the images of a reply's calls (tool_parallel): the config's "use_text_gpu" (off,
+        # ask: the chat's model asks for it by a call's use_text_gpu, on), the request's xestrata_images
+        # use_text_gpu over it
+        self.text_gpu = text_gpu_mode(gen.cfg.get("use_text_gpu"), text_gpu)
+        # the tools beyond CORE_TOOLS declared once their skills are read (template_tools); all_tools: every one at
+        # once (the image button's request, the Responses route's, xestrata_images' all_tools)
+        self.all_tools = skills == "inline" or all_tools is True
+        self.unlocked: set[str] = self._unlocked_before()
+        self._declared = set(self.unlocked)
         self.made: list[str] = []          # the images this request made (file names)
+        self.done_calls: dict[tuple, str] = {}   # the calls that ran well, by name and arguments -> their link
         self.max_calls: int | None = None  # a Responses request's max_tool_calls: the calls that run, at most
         self.calls = 0
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
@@ -4001,6 +4112,47 @@ class ImageTools:
         return [g for g in gens if can_edit(g.cfg)] + [g for g in gens if not can_edit(g.cfg)] if edits else gens
 
     def template_tools(self, exclude=()) -> list[dict]:
+        """The image tools this request declares now: generate_image and edit_image (CORE_TOOLS), and the others once
+        the chat's model has read their skills (unlock, through load_skill) - every one from the start for the image
+        button's request, the Responses route's and a request that asks for all (xestrata_images all_tools)."""
+        offered = self.offered(exclude)
+        names = [t["name"] for t in offered]
+        if self.all_tools or not any(n in CORE_TOOLS for n in names):
+            return offered
+        return [t if t["name"] in CORE_TOOLS or t["name"] in self.unlocked else self._stub(t) for t in offered]
+
+    def _stub(self, t: dict) -> dict:
+        """A tool not given yet, as its name and one line: called, it runs where its arguments are there, else answers
+        with its skill and arguments, and is given whole from the next round on (unlock)."""
+        s = self._tool_skill(t["name"])
+        when = s.description if s is not None else t["description"]
+        return {"name": t["name"], "description": f"{when} Call it; its arguments come with the first call.",
+                "parameters": {"type": "object", "properties": {}}}
+
+    def _tool_skill(self, tool: str):
+        return next((s for s in self._skills().all() if s.builtin and s.kind == "tool" and s.meta.get("tool") == tool),
+                    None)
+
+    def _stub_answer(self, name: str, args: dict, t0: float) -> dict | None:
+        """A call of a tool given as a stub: None where its required arguments are there (it runs as it is), else its
+        skill and arguments, the tool given whole from the next round on."""
+        full = next((t for t in self.offered() if t["name"] == name), None)
+        self.unlock(name)
+        props = full["parameters"]["properties"] if full is not None else {}
+        if full is None or args and all(k in args for k in full["parameters"].get("required", [])) \
+                and set(args) & set(props):
+            return None   # its arguments are there: it runs as it is (a word it does not take is left out)
+        s = self._tool_skill(name)
+        listed = "; ".join(f"{k} ({v.get('type', '')}" + (f": {v['description']}" if v.get("description") else "")
+                           + ")" for k, v in props.items())
+        text = (f"Not run yet: {name} is ready now. Call {name} again at once, with these arguments, to do the step. "
+                f"{full['description']}\nArguments: {listed}."
+                + (f"\n\n# {s.name}\n\n{s.body}" if s is not None else ""))
+        return {"ok": True, "text": text, "chars": len(text), "truncated": False,
+                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": [], "stub": True}
+
+    def offered(self, exclude=()) -> list[dict]:
+        """Every image tool this request may use, declared now or once its skill is read (template_tools)."""
         out = []
         for t in TOOLS:
             gens = self._gens(t["name"] in EDIT_TOOLS)
@@ -4015,21 +4167,26 @@ class ImageTools:
             if t["name"] in ("upscale_video", "segment_video") and self._video("") is None:
                 continue   # offered for a video in the conversation
             t = dict(t)
-            if self.skills == "inline":
+            if self.skills == "inline":   # the image button's request: the models' skills in the description
                 styles, rules = self._skill_groups(gens)
+                store = self._skills()
                 t["description"] = "\n\n".join(
-                    [t["description"], skill("common")]
-                    + [f"With {', '.join(models)} ({STYLE_NAME[name]}):\n{text}"
-                       for name, models in styles.items() if (text := skill(name))]
-                    + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items() if (text := skill(name))])
-            else:
-                t["description"] += SKILL_READ
+                    [t["description"], store.body(SKILL_ALWAYS)]
+                    + [f"With {', '.join(models)} ({(s.meta.get('name') if (s := store.get(name)) else '') or name}):"
+                       f"\n{text}" for name, models in styles.items() if (text := store.body(name))]
+                    + [f"With {', '.join(models)}:\n{text}" for name, models in rules.items()
+                       if (text := store.body(name))])
             if t["name"] == "edit_image" and self.attached():
-                t["description"] += ("\n\nThe pictures the user attached to their last message go with the edit as "
-                                     "reference images after the image it edits: the image edited is image 1, the "
-                                     "attached ones image 2, 3 and so on (in the order attached). Say in the prompt "
-                                     "which to take from and what (\"the face from image 2\"). A model without edits "
-                                     "(img2img) takes the image edited alone.")
+                t["description"] += ("\n\nWithout references, the pictures the user attached to their last message "
+                                     "go with the edit after the image it edits: images 2, 3 and so on, in the order "
+                                     "attached.")
+            if t["name"] == "generate_image" and self.attached() and "control" in self.allowed:
+                t["description"] += (" The user attached a picture: a new image in its pose or layout is "
+                                     "control's, a change of it edit_image's.")
+            if self.attached() and "image" in t["parameters"]["properties"]:   # their names for image, references
+                t["description"] += (f" The user's pictures: attached:1 to attached:{len(self.attached())}, in "
+                                     "the order attached." if len(self.attached()) > 1 else
+                                     " The user's picture: attached:1.")
             if t["name"] == "edit_image" and self.user.get("mask") is not None:
                 t["description"] += ("\n\nThe user has painted over an image the part to change (a mask): "
                                      "edit_image changes that part of that image only; its image and mask are set.")
@@ -4045,9 +4202,8 @@ class ImageTools:
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "guidance": {
                     "type": "array", "items": {"type": "string", "enum": methods},
-                    "description": "sampling guidance, rarely needed (image_skill's guidance says when)"
-                                   + ("" if len(guided) == len(gens) else
-                                      f"; {', '.join(g.model for g in guided)} only")}}
+                    **({} if len(guided) == len(gens) else
+                       {"description": f"{', '.join(g.model for g in guided)} only"})}}
                 t["parameters"] = params
             moss = [g.model for g in gens if g.family == "moss-image"]
             if t["name"] == "edit_image" and not any(can_edit(g.cfg) for g in gens if g.family == "moss-image"):
@@ -4070,34 +4226,33 @@ class ImageTools:
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "layout": {
                     "type": "object",
-                    "description": f"where things and text go ({', '.join(moss)})",
+                    "description": f"{', '.join(moss)}: where things and text go",
                     "properties": {
                         "summary": {"type": "object", "properties": {
-                            "caption": {"type": "string", "description": "the whole image"},
-                            "canvas": {"type": "string", "enum": list(MOSS_CANVASES),
-                                       "description": "one picture (default), panels, or a collage"}}},
+                            "caption": {"type": "string"},
+                            "canvas": {"type": "string", "enum": list(MOSS_CANVASES)}}},
                         "items": {"type": "array", "items": {"type": "object", "properties": {
                             "label": {"type": "string", "enum": list(MOSS_LABELS)},
-                            "caption": {"type": "string", "description": "how it looks"},
-                            "text": {"type": "string", "description": "a text item's exact words"},
-                            "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
-                                     "description": "[x_min, y_min, x_max, y_max] in the image's pixels from its "
-                                                    "top-left corner"}},
+                            "caption": {"type": "string"},
+                            "text": {"type": "string"},
+                            "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}},
                             "required": ["label", "caption", "bbox"]}}},
                     "required": ["items"]}}
                 t["parameters"] = params
+            params = dict(t["parameters"])   # the plan's step and group (combine-tools), every tool's
+            params["properties"] = {**params["properties"], **PLAN_ARGS}
+            if self.text_gpu == "ask" and t["name"] not in ("upscale_video", "segment_video") and self._can_lend():
+                params["properties"]["use_text_gpu"] = {"type": "boolean"}
+            t["parameters"] = params
             if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
                 lines = ("; ".join(self._model_lines(gens)) if self.skills == "inline" else
-                         f"image_skill's {SKILL_MODELS} says what each is made for")
+                         f"the {SKILL_MODELS} skill says what each is for")
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "model": {
                     "type": "string", "enum": [g.model for g in gens],
-                    "description": f"the image model, when the user asks for one or for what one is made for "
-                                   f"({lines}); default {gens[0].model}"}}
+                    "description": f"default {gens[0].model}" + (f" ({lines})" if self.skills == "inline" else "")}}
                 t["parameters"] = params
             out.append(t)
-        if self.skills != "inline" and out and SKILL_TOOL not in exclude:
-            out.append(self._skill_tool([t["name"] for t in out]))
         return out
 
     def _model_lines(self, gens: list) -> list[str]:
@@ -4106,83 +4261,111 @@ class ImageTools:
         choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
         return [f"{g.model}: {about.get(choice.get(g.model, ''), '') or self._about(g)}".rstrip(": ") for g in gens]
 
-    @staticmethod
-    def _skill_groups(gens: list) -> tuple[dict, dict]:
-        """The prompt styles and the model skills of `gens`: {skill: [model, ...]} each (a model's own skill, by its
-        name without -uncensored, else its family's)."""
+    def _skills(self):
+        """The skills' store (serve/skills.py): the server's, else XeStrata's own alone."""
+        return getattr(self.svc, "skills", None) or _builtin_skills()
+
+    def _model_skill(self, g):
+        """The skill of a model: its own (by its name without -uncensored), else its family's; None when there is
+        none.  Its prompt style is read even where the skill is switched off."""
+        own = g.model.removesuffix("-uncensored")
+        found = [s for s in self._skills().all() if s.builtin and s.kind == "model"]
+        return (next((s for s in found if s.meta.get("for") == own), None)
+                or next((s for s in found if s.meta.get("for") == g.family), None))
+
+    def _style(self, g) -> str:
+        s = self._model_skill(g)
+        return (s.meta.get("style") if s is not None else None) or STYLE_DEFAULT
+
+    def _skill_groups(self, gens: list) -> tuple[dict, dict]:
+        """The prompt styles and the model skills of `gens`: {skill: [model, ...]} each."""
         styles: dict[str, list[str]] = {}
         rules: dict[str, list[str]] = {}
         for g in gens:
-            own = g.model.removesuffix("-uncensored")
-            styles.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", []).append(g.model)
-            rules.setdefault(own if skill(own) else g.family, []).append(g.model)
+            styles.setdefault(self._style(g), []).append(g.model)
+            s = self._model_skill(g)
+            if s is not None:
+                rules.setdefault(s.name, []).append(g.model)
         return styles, rules
 
-    def _skill_index(self, tools: list[str]) -> dict[str, tuple[str, list[str]]]:
-        """The skills the chat's model may read for this request: {name: (kind, the models it is for)}, the styles' and
-        the models' of the models offered, and the tools' of the tools offered (`tools`) - only those with a file."""
+    def skill_index(self) -> list[tuple[str, str, str]]:
+        """The image skills the chat's model may read for this request, in the order they are joined: [(name, kind,
+        when to read it)] - the catalog (with several models), the styles' and the models' of the models offered, the
+        tools' of the tools offered (combine-tools with two of them or more); a skill switched off is left out."""
+        store = self._skills()
+        tools = [t["name"] for t in self.offered()]
+        if not tools:
+            return []
         styles, rules = self._skill_groups(self._gens())
-        out: dict[str, tuple[str, list[str]]] = {}
-        if len(self._gens()) > 1:   # what each model is made for: the tools' model choice
-            out[SKILL_MODELS] = ("catalog", [])
-        for name, models in styles.items():
-            if skill(name):
-                out[name] = ("style", models)
-        for name, models in rules.items():
-            if skill(name):
-                out[name] = ("model", models)
-        for name in tools:
-            if skill(f"tools/{name}"):
-                out[name] = ("tool", [])
-        if (any(t in tools for t in ("generate_image", "edit_image")) and skill("tools/guidance")
-                and any(chat_guidance_methods(g.cfg) for g in self._gens())):   # generate_image's, edit_image's
-            out["guidance"] = ("tool", [])
+        out: list[tuple[str, str, str]] = []
+        if len(self._gens()) > 1:
+            out.append((SKILL_MODELS, "catalog", SKILL_MODELS_WHEN))
+        on = {s.name: s for s in store.enabled(builtin=True)}
+        for name in [*styles, *rules]:
+            if name in on:
+                out.append((name, on[name].kind, on[name].description))
+        guided = any(chat_guidance_methods(g.cfg) for g in self._gens())
+        for s in on.values():
+            want = s.meta.get("tool")
+            if s.kind != "tool" or not want:
+                continue
+            if want in tools and want not in CORE_TOOLS and not self.all_tools:
+                continue   # its tool's stub carries its line, and its call answers with the skill (_stub_answer)
+            if (want in tools or want == "*" and len(tools) > 1
+                    or want == "guidance" and guided and {"generate_image", "edit_image"} & set(tools)):
+                out.append((s.name, "tool", s.description))
         return out
 
-    def _skill_tool(self, tools: list[str]) -> dict:
-        """image_skill: its description common.md, which models take which prompt style, and the index (each skill's
-        name and its "When:" line); it reads the skills named, several at once."""
-        index = self._skill_index(tools)
-        lines = [f"- {name}: "
-                 + (SKILL_MODELS_WHEN if k == "catalog" else skill_when(f"tools/{name}" if k == "tool" else name))
-                 for kind in SKILL_KINDS for name, (k, _) in index.items() if k == kind]
-        # which models take which style, by their families (a model with a style of its own, MageTrail, by its name)
+    def skill_part(self) -> str:
+        """What always goes with the image tools, in load_skill's description: their rules (the image-tools skill),
+        which models take which prompt style, and what this setup can do."""
+        rules = self._skills().body(SKILL_ALWAYS)
         kinds: dict[str, list[str]] = {}
-        for g in self._gens():
-            own = g.model.removesuffix("-uncensored")
-            key = own if own in PROMPT_STYLE else g.family
-            names = kinds.setdefault(PROMPT_STYLE.get(own) or PROMPT_STYLE.get(g.family) or "natural", [])
+        for g in self._gens():   # by their families (a model with a skill of its own, MageTrail, by its name)
+            s = self._model_skill(g)
+            key = s.meta.get("for", g.family) if s is not None else g.family
+            names = kinds.setdefault(self._style(g), [])
             if key not in names:
                 names.append(key)
-        style = "; ".join(f"{STYLE_NAME[name]} for the {' and '.join(fams)} models" for name, fams in kinds.items())
-        text = ("Read the image skills a request needs before an image tool's call: the names, several at once (the "
-                "prompt style's, the image model's, the tool's).\n\n" + skill("common")
-                + (f"\n\nPrompts are written in {style}." if style else "") + "\n\nSkills:\n" + "\n".join(lines))
-        return {"name": SKILL_TOOL, "description": text,
-                "parameters": {"type": "object", "properties": {
-                    "names": {"type": "array", "items": {"type": "string", "enum": list(index)},
-                              "description": "the skills to read"}},
-                    "required": ["names"]}}
+        store = self._skills()
+        named = {n: (s.meta.get("name") if (s := store.get(n)) is not None else None) or n for n in kinds}
+        style = "; ".join(f"{named[n]} for {', '.join(fams)}" for n, fams in kinds.items())
+        return "\n\n".join(p for p in (rules, f"Prompt style: {style}." if style else "", self.can_do()) if p)
 
-    def _read_skills(self, arguments) -> dict:
-        """image_skill's call: the skills named, in the order of SKILL_KINDS (style, model, tool), each once."""
-        t0 = time.monotonic()
-        index = self._skill_index([t["name"] for t in self.template_tools(exclude={SKILL_TOOL})])
-        names = arguments.get("names") if isinstance(arguments, dict) else None
-        if isinstance(names, str):
-            names = [names]
-        if not isinstance(names, list) or not names or any(n not in index for n in names):
-            text = f"error: names: some of {', '.join(index)}"
-            return {"ok": False, "text": text, "chars": len(text), "truncated": False,
-                    "ms": round((time.monotonic() - t0) * 1000), "server": None, "tool": SKILL_TOOL, "images": []}
-        picked = [n for kind in SKILL_KINDS for n in dict.fromkeys(names) if index[n][0] == kind]
-        body = "\n\n".join("# Image models\n\n" + "\n".join(f"- {line}" for line in self._model_lines(self._gens()))
-                           if index[n][0] == "catalog" else skill(n if index[n][0] != "tool" else f"tools/{n}")
-                           for n in picked)
-        if len(picked) > 1:
-            body = "Where these differ, the later one wins.\n\n" + body
-        return {"ok": True, "text": body, "chars": len(body), "truncated": False,
-                "ms": round((time.monotonic() - t0) * 1000), "server": None, "tool": SKILL_TOOL, "images": []}
+    def can_do(self) -> str:
+        """What this setup's image tools can do (the image models offered, their edits and references, the
+        composition's control, the video tools), one line each: the chat's model plans with it."""
+        gens = self._gens()
+        tools = {t["name"] for t in self.offered()}
+        lines = []
+        edits = [g for g in gens if can_edit(g.cfg)]
+        if edits and "edit_image" in tools:
+            lines.append("edit_image: " + ", ".join(f"{g.model} (up to {refs_limit(g.cfg) - 1} references)"
+                                                    for g in edits)
+                         + "".join(f"; {g.model} img2img only" for g in gens if not can_edit(g.cfg)))
+        if "control" in tools:
+            ways: dict[str, list[str]] = {}
+            for g in gens:
+                mode = _controls().capability(g.cfg)
+                if mode == "controlnet":
+                    ways.setdefault("ControlNet", []).append(g.model)
+                elif mode == "moss":
+                    ways.setdefault("color and depth adapter", []).append(g.model)
+                elif mode == "reference":
+                    ways.setdefault("as a reference", []).append(g.model)
+            lines.append("control: " + "; ".join(f"{k} with {', '.join(v)}" for k, v in ways.items()))
+        videos = [n for n in ("upscale_video", "segment_video") if n in tools]
+        if videos:
+            lines.append(f"the attached video: {', '.join(videos)}")
+        if getattr(self.svc, "vision", None) is not None:
+            lines.append("you see a small copy of each image a tool makes")
+        return "This setup:\n" + "\n".join(f"- {line}" for line in lines) if lines else ""
+
+    def skill_body(self, name: str) -> str:
+        """load_skill's text of one of skill_index's skills."""
+        if name == SKILL_MODELS:
+            return "# Image models\n\n" + "\n".join(f"- {line}" for line in self._model_lines(self._gens()))
+        return self._skills().body(name)
 
     @staticmethod
     def _seen(gen, png: bytes) -> Path | None:
@@ -4213,6 +4396,84 @@ class ImageTools:
 
     def routes(self) -> dict:
         return {t["name"]: (None, t["name"]) for t in self.template_tools()}
+
+    def unlock(self, tool: str) -> bool:
+        """A tool whose skill the chat's model read: declared from the next round on (new_tools).  -> whether it is
+        new."""
+        if tool in self.unlocked or tool not in {t["name"] for t in self.offered()}:
+            return False
+        self.unlocked.add(tool)
+        return True
+
+    def new_tools(self) -> list[dict]:
+        """The tools unlocked since the last ask, for run_with_mcp to declare from the next round on."""
+        out = [t for t in self.template_tools() if t["name"] in self.unlocked - self._declared]
+        self._declared |= {t["name"] for t in out}
+        return out
+
+    def _unlocked_before(self) -> set[str]:
+        """The tools the conversation's earlier turns unlocked (their load_skill calls, or calls of the tools
+        themselves): the chat's model's choice then, kept, so the tools stay as the earlier turn ended them."""
+        out: set[str] = set()
+        tool_of = {s.name: s.meta.get("tool") for s in self._skills().all() if s.builtin and s.kind == "tool"}
+        names = {t["name"] for t in TOOLS}
+        for msg in self.messages:
+            for call in msg.get("tool_calls") or [] if isinstance(msg, dict) else []:
+                fn = call.get("function") if isinstance(call, dict) else None
+                name = fn.get("name") if isinstance(fn, dict) else None
+                if isinstance(name, str) and name in names:
+                    out.add(name)
+                elif name == "load_skill" and isinstance(fn, dict):
+                    args = fn.get("arguments")
+                    try:
+                        args = json.loads(args) if isinstance(args, str) else args
+                    except ValueError:
+                        args = None
+                    for n in (args or {}).get("names") or [] if isinstance(args, dict) else []:
+                        if tool_of.get(n) in names:
+                            out.add(tool_of[n])
+        return out
+
+    def lane(self, name: str, args: dict) -> tuple[str, str, bool]:
+        """Where a call of the reply runs beside the others (serve/tool_parallel.py) -> ("now": no GPU job to wait
+        for, or "images": the image GPU's lane; the image model it takes; whether it may run on the text model's GPU,
+        lent to it, instead)."""
+        if name in ("upscale_video", "segment_video"):   # a job started on the server: the answer comes at once
+            return "now", "", False
+        if name == "upscale_image" and args.get("method") == "lanczos" and not args.get("redraw"):
+            return "now", "lanczos", False
+        if name in ("find_region", "remove_background"):
+            gens = self._gens()
+            return "images", gens[0].model if gens else self.gen.model, False
+        gens = self._gens(name in EDIT_TOOLS)
+        if name == "control":
+            gens = [g for g in gens if _controls().capability(g.cfg)]
+        if args.get("layout") not in (None, "", {}):
+            gens = [g for g in gens if g.family == "moss-image"] or gens
+        asked = args.get("model")
+        gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
+        return "images", gen.model, self.may_lend(args)
+
+    def _can_lend(self) -> bool:
+        models = self.models or getattr(self.svc, "images", None)
+        return isinstance(models, ImageModels) and models.separate and models.lend_cfgs is not None
+
+    def may_lend(self, args: dict) -> bool:
+        """Whether a call may run on the text model's GPU, lent to the images: the images have a card of their own
+        (ImageModels.separate), the setting (the config's "use_text_gpu", else the request's xestrata_images
+        use_text_gpu) is on, or ask with the call's use_text_gpu; and no other request's text is being written or waits
+        (a lent GPU makes them wait)."""
+        models = self.models or getattr(self.svc, "images", None)
+        if not isinstance(models, ImageModels) or not models.separate or models.lend_cfgs is None:
+            return False
+        mode = self.text_gpu
+        if mode == "off" or mode == "ask" and args.get("use_text_gpu") is not True:
+            return False
+        eng = getattr(self.svc, "engine", None)
+        if eng is None or not hasattr(eng, "unload"):
+            return False
+        status = getattr(self.svc, "status", None) or {}
+        return not status.get("queued") and not getattr(self.svc, "live_reqs", None)
 
     def _file(self, name: str) -> bytes | None:
         p = (self.models or self.gen).file(name)
@@ -4246,7 +4507,11 @@ class ImageTools:
         return False
 
     def _image(self, which: str) -> bytes | None:
-        """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
+        """The image an edit takes: a /v1/images/files/ link (or its file name), attached:N, else the conversation's
+        last."""
+        named = self._attached_named(which)
+        if named is not None:
+            return named
         m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")
         if m:
             return self._file(m.group(1))
@@ -4263,6 +4528,26 @@ class ImageTools:
                 if found and (data := self._file(found[-1])) is not None:
                     return data
         return None
+
+    def _attached_named(self, which: str) -> bytes | None:
+        """attached:N, the user's N-th picture in their last message (the name the tools' descriptions give it)."""
+        m = re.fullmatch(r"\s*attached:(\d+)\s*", which or "")
+        pics = self.attached() if m else []
+        return pics[int(m.group(1)) - 1] if m and 1 <= int(m.group(1)) <= len(pics) else None
+
+    def _linked(self, which: str, arg: str) -> bytes:
+        """A picture an argument names by its link (a tool's result, or one in the conversation) or as attached:N: its
+        bytes, or an ImageRequestError that says which argument and what it may name."""
+        data = self._attached_named(which)
+        if data is not None:
+            return data
+        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")
+        data = self._file(m.group(1)) if m else None
+        if data is None:
+            n = len(self.attached())
+            raise ImageRequestError(f"{arg}: {which!r} is not an image here: give a link a result gave"
+                                    + (f", or the user's pictures attached:1 to attached:{n}" if n else ""))
+        return data
 
     def _video(self, which: str):
         """The video upscale_video takes: a /v1/videos/files/ link, else the conversation's last (the chat's page
@@ -4356,17 +4641,21 @@ class ImageTools:
             gen = gens[0] if gens else self.gen
             check_tool(gen.cfg, name)
             picture = self.normalize(data)
-            if name == "find_region":
-                region = str(args.get("region") or "").strip()
+            if name == "find_region":   # `prompt` read as the words too: the name a chat model reaches for first
+                region = str(args.get("region") or args.get("prompt") or "").strip()
                 got = image_regions.segment(self.svc, gen, picture, region, "mask", cancel=cancel)
                 png = image_regions.marked(picture, got["instances"])
                 url = f"/v1/images/files/{gen.store(png, 'png')}"
+                union = image_regions.union_mask(got)
+                mask_url = (f"/v1/images/files/{gen.store(mask_to_bw(union[0]), 'png')}" if union is not None
+                            else None)
                 scores = [i["score"] for i in got["instances"] if i["score"] is not None]
                 text = (f"{len(got['instances'])} {region!r} region(s) found by {got['model']}"
                         + (f" (scores {', '.join(f'{s:.2f}' for s in scores)})" if scores else "")
                         + (f" ({got['fallback']})" if got.get("fallback") else "")
-                        + f"; the user sees them marked in red: {url}. To change only that part, call edit_region "
-                          f"with region {region!r} (its image: the image the regions were found in).")
+                        + f"; the user sees them marked in red: {url}."
+                        + (f" Their mask (white: the regions): {mask_url}, for edit_image's mask." if mask_url else
+                           " Boxes only, no mask: edit_region with the same words draws the part."))
                 if not got["instances"]:
                     text = f"no {region!r} found by {got['model']}: try other words."
             else:
@@ -4398,8 +4687,6 @@ class ImageTools:
                 "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls}
 
     def call(self, name: str, arguments, cancel: threading.Event | None = None) -> dict:
-        if name == SKILL_TOOL:   # reading skills makes no image: not one of max_tool_calls' calls
-            return self._read_skills(arguments)
         t0 = time.monotonic()
         if name not in self.allowed:   # checked as it runs, not only by the tools offered
             text = (f"error: not run: {name} is not one of this request's image tools "
@@ -4410,14 +4697,30 @@ class ImageTools:
             text = f"error: not run: this response may make {self.max_calls} image tool call(s) (max_tool_calls)"
             return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
                     "tool": name, "images": []}
-        self.calls += 1
-        args = arguments if isinstance(arguments, dict) else {}
-        if name in ("find_region", "remove_background"):
-            return self._aux_tool(name, args, t0, cancel)
-        if name == "upscale_video":
-            return self._video_tool(args, t0)
-        if name == "segment_video":
-            return self._segment_video_tool(args, t0)
+        args = dict(arguments) if isinstance(arguments, dict) else {}
+        args.pop("plan", None)   # the chart, put into the reply by run_with_mcp
+        key = (name, json.dumps({k: v for k, v in args.items() if k not in ("step", "group")}, sort_keys=True,
+                                ensure_ascii=False))
+        done = self.done_calls.get(key)
+        if done is not None:   # the same call ran in this request and is done: not again (a model's loop)
+            text = (f"not run: this same {name} call already ran in this request and is done ({done}). Do not call "
+                    "it again: answer the user, or take the next step.")
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
+                    "tool": name, "images": [], "skipped": True}
+        if name not in self.unlocked and name not in CORE_TOOLS and not self.all_tools:
+            answer = self._stub_answer(name, args, t0)   # a stub's call: its arguments, or it runs as it is
+            if answer is not None:
+                return answer
+        merged = args.pop("_n", None)        # tool_parallel: generate_image's calls that differ in their seed alone
+        merged = merged if isinstance(merged, int) and not isinstance(merged, bool) and merged > 1 else None
+        lend = args.pop("_lend", None) is True   # tool_parallel: on the text model's GPU, lent to the images
+        self.calls += merged or 1
+        if name in ("find_region", "remove_background", "upscale_video", "segment_video"):
+            r = (self._aux_tool(name, args, t0, cancel) if name in ("find_region", "remove_background") else
+                 self._video_tool(args, t0) if name == "upscale_video" else self._segment_video_tool(args, t0))
+            if r["ok"]:
+                self.done_calls[key] = (r.get("images") or ["done"])[0]
+            return r
         urls: list[str] = []
         found: dict | None = None
         try:
@@ -4447,6 +4750,9 @@ class ImageTools:
                 req["refine"] = args["refine"]
             if name in ("generate_image", "edit_image") and args.get("guidance") not in (None, "", []):
                 req["guidance"] = args["guidance"]
+            if name in ("edit_image", "edit_region", "fix_image") and (args.get("crop_upscale") or args.get("variant")):
+                req["crop_upscale"] = {k: v for k, v in (("method", args.get("crop_upscale")),
+                                                         ("variant", args.get("variant"))) if v}
             if name == "upscale_image":
                 req["upscale"] = {k: args[k] for k in ("scale", "method", "redraw", "strength", "variant")
                                   if args.get(k) not in (None, "")}
@@ -4464,6 +4770,10 @@ class ImageTools:
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
             if asked not in (None, "") and gen.model != asked:
                 raise ImageRequestError(f"model: one of {', '.join(g.model for g in gens)}, not {asked!r}")
+            if lend:   # the same model's engine on the text model's GPU (ImageModels.lent)
+                gen = self.svc.images.lent().gens[gen.model]
+            if merged:
+                req["n"] = merged
             if req.get("guidance") not in (None, "", []) and not guidance_methods(gen.cfg):
                 takes = [g.model for g in gens if guidance_methods(g.cfg)]
                 raise ImageRequestError(f"guidance: {gen.model} takes none" + (
@@ -4488,21 +4798,42 @@ class ImageTools:
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
                 images = [self.normalize(data)]
-                if can_edit(gen.cfg):                    # the user's attached pictures as references (attached)
-                    limit = int(gen.cfg.get("max_refs") or (MF_MAX_REFS if gen.family == "mage-flow" else
-                                                            HUNYUANIMAGE3_MAX_REFS if gen.family == "hunyuan-image-3"
-                                                            else MAX_REFS))   # as parse_edit_request counts them
-                    images += [self.normalize(p) for p in self.attached() if p != data][:max(0, limit - 1)]
+                if args.get("mask") not in (None, ""):   # a mask a tool made (find_region's, edit_region's)
+                    if mask is not None:
+                        raise ImageRequestError("mask: the user painted this edit's mask already; leave mask out")
+                    m = self._linked(args["mask"], "mask")
+                    mask = fit_mask(mask_from_bw(m), images[0])
+                refs = args.get("references")
+                if isinstance(refs, str):
+                    refs = [refs]
+                if refs not in (None, []) and not (isinstance(refs, list) and all(isinstance(r, str) for r in refs)):
+                    raise ImageRequestError("references: a list of /v1/images/files/ links")
+                if refs and not can_edit(gen.cfg):
+                    raise ImageRequestError(f"references: {gen.model} has no edits (img2img takes one image)"
+                                            + (f"; give model {self._gens(True)[0].model}"
+                                               if can_edit(self._gens(True)[0].cfg) else ""))
+                if can_edit(gen.cfg):   # the references named, else the user's attached pictures (attached)
+                    limit = refs_limit(gen.cfg)
+                    more = ([self.normalize(self._linked(r, "references")) for r in refs] if refs else
+                            [self.normalize(p) for p in self.attached() if p != data])
+                    if refs and len(more) > limit - 1:
+                        raise ImageRequestError(f"references: {gen.model} takes at most {limit - 1}")
+                    images += more[:max(0, limit - 1)]
                 job = parse_edit_request(req, images, gen.cfg, mask)
             elif name == "edit_region":   # the words' mask (image_regions: SAM 3 or Florence-2), then a masked edit
                 data = self._image(str(args.get("image") or ""))
                 if data is None:
                     raise ImageRequestError("there is no image in the conversation to edit")
-                if not str(args.get("region") or "").strip():
-                    raise ImageRequestError("region: the words of the part to change")
-                from serve import image_regions
                 picture = self.normalize(data)
-                mask, found = image_regions.region_mask(self.svc, gen, picture, str(args["region"]), cancel=cancel)
+                if args.get("mask") not in (None, ""):   # a mask a tool gave (find_region's) instead of words
+                    mask = fit_mask(mask_from_bw(self._linked(str(args["mask"]), "mask")), picture)
+                    found = None
+                else:
+                    if not str(args.get("region") or "").strip():
+                        raise ImageRequestError("region: the words of the part to change (or mask: a mask's link)")
+                    from serve import image_regions
+                    mask, found = image_regions.region_mask(self.svc, gen, picture, str(args["region"]),
+                                                            cancel=cancel)
                 job = parse_edit_request(req, [picture], gen.cfg, mask)
             elif name == "control":   # a new image by a picture's composition (image_controls)
                 data = self._image(str(args.get("image") or ""))
@@ -4526,12 +4857,12 @@ class ImageTools:
             urls = [f"/v1/images/files/{n}" for n in names]
             by = f" with {gen.model}" if len(self._gens()) > 1 else ""
             text = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed']}, "
-                    f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. To change it, call edit_image "
-                    f"(its image: {urls[0]}).")
-            if found is not None:   # where edit_region drew
+                    f"{figures['seconds']:.0f} s) and the user sees it: {urls[0]}. This step is done.")
+            if found is not None:   # where edit_region drew, and its mask (another tool may take it)
+                mask_url = f"/v1/images/files/{gen.store(mask_to_bw(job['mask']), 'png')}"
                 text += (f" edit_region redrew {len(found['instances'])} {args['region']!r} region(s) that "
                          f"{found['model']} found" + (f" ({found['fallback']})" if found.get("fallback") else "")
-                         + ".")
+                         + f"; their mask: {mask_url}.")
             if job.get("fix"):   # what the Detailer found and drew
                 fx = figures["fix"]
                 regs = fx["regions"]
@@ -4541,10 +4872,14 @@ class ImageTools:
                             f": no {', '.join(job['fix']['parts'])} found, the image is as it was")
                          + "".join(f"; skipped {r['part']} ({r['skipped']})" for r in regs + fx["left_out"]
                                    if "skipped" in r) + ".")
+            if job.get("crop_ups"):   # how Crop and Stitch's cut was enlarged (crop_upscale)
+                c = job["crop_ups"]
+                text += (f" The cut was enlarged {c['scale']:g} times by {c['method']}"
+                         + (f" {c['variant']}" if c.get("variant") else "") + seedvr2_3b_note(c) + ".")
             if job.get("upscaler"):   # how it was made larger
                 u = job["upscaler"]
                 text += (f" upscale_image made it larger by {u['method']}"
-                         + (f" {u['variant']}" if u.get("variant") else "")
+                         + (f" {u['variant']}" if u.get("variant") else "") + seedvr2_3b_note(u)
                          + (f" (auto's choice; {u['fallback']})" if u.get("fallback") else
                             " (auto's choice)" if u["asked"] == "auto" else "")
                          + (f", then drew it again at strength {job['strength']:g}." if not job.get("ups_only")
@@ -4555,6 +4890,10 @@ class ImageTools:
                          + ("through ControlNet." if cf.get("mode") == "controlnet" else
                             "through MOSS-Image's color and depth adapter." if cf.get("mode") == "moss" else
                             "as a reference image (this model has no ControlNet)."))
+                made_map = job["control"].get("map_png")
+                if made_map is not None and job["control"]["type"] != "none":
+                    map_url = f"/v1/images/files/{gen.store(made_map, 'png')}"
+                    text += f" The map: {map_url} (control type none takes it as it is)."
             seen = self._seen(gen, images[0])
             ok = True
         except AuxPending as e:   # the tool's weights are downloading: not an image, not an error to retry now
@@ -4565,16 +4904,30 @@ class ImageTools:
                     "download": [{k: d.get(k) for k in AUX_FIELDS if d.get(k) is not None} for d in e.downloads]}
         except (ValueError, ImageJobFailed) as e:
             text, ok, seen = f"error: {e}", False, None
-        return {"ok": ok, "text": text, "chars": len(text), "truncated": False,
-                # a small copy of the image for a chat model that reads pictures (run_with_mcp passes it with one):
-                # it sees whether the image shows what was asked, and can fix it with the tools
-                **({"model_content": [
-                    {"type": "text", "text": text + " A small copy is attached: check that it shows what was asked."},
-                    {"type": "image", "source": str(seen)}]} if seen is not None else {}),
-                "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls,
-                **({"image": {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
-                              "background": job["background"], "output_format": job["output_format"],
-                              "revised_prompt": model_prompt(job)}} if ok else {})}
+        out: dict[str, Any] = {
+            "ok": ok, "text": text, "chars": len(text), "truncated": False,
+            # a small copy of the image for a chat model that reads pictures (run_with_mcp passes it with one):
+            # it sees whether the image shows what was asked, and can fix it with the tools
+            **({"model_content": [
+                {"type": "text", "text": text + " A small copy is attached: check that it shows what was asked."},
+                {"type": "image", "source": str(seen)}]} if seen is not None else {}),
+            "ms": int((time.monotonic() - t0) * 1000), "server": None, "tool": name, "images": urls,
+            **({"image": {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
+                          "background": job["background"], "output_format": job["output_format"],
+                          "revised_prompt": model_prompt(job)}} if ok else {})}
+        if ok:
+            self.done_calls[key] = urls[0] if urls else "done"
+        if merged and ok and len(urls) == merged:   # each merged call its own image, seed and copy to look at
+            parts = []
+            for i, u in enumerate(urls):
+                t = (f"The image is made{by} ({job['width']}x{job['height']}, seed {job['seed'] + i}) and the user "
+                     f"sees it: {u}. This step is done.")
+                copy = self._seen(gen, images[i])
+                parts.append({**out, "text": t, "chars": len(t), "images": [u],
+                              **({"model_content": [{"type": "text", "text": t + " A small copy is attached."},
+                                                    {"type": "image", "source": str(copy)}]} if copy else {})})
+            out["split"] = parts
+        return out
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
@@ -4813,6 +5166,8 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
     if job.get("upscaler"):
         upscaler_weights(gen, job)
         seedvr2_or_realesrgan(gen, job)
+    if job.get("crop_ups"):   # crop_upscale's upscaler
+        upscaler_weights(gen, job, "crop_ups")
     if job.get("ups_only"):
         return upscale_images(svc, gen, job, cancel)
     if job.get("enhance") and not job.get("enhanced"):
@@ -4870,11 +5225,17 @@ def seedvr2_file(gen: ImageGen, variant: str) -> str:
     return "seedvr2-3b-fp16" if vram >= mib("seedvr2-3b-fp16") + SEEDVR2_WORK_MIB else "seedvr2-3b-int8"
 
 
-def upscaler_weights(gen: ImageGen, job: dict) -> None:
+def seedvr2_3b_note(u: dict) -> str:
+    """What a result says when SeedVR2's 7B did not fit and its 3B ran instead (seedvr2_file)."""
+    return (" (its 3B: the 7B fits neither this GPU's memory nor the RAM)"
+            if str(u.get("file") or "").startswith("seedvr2-3b") and u.get("variant") != "3b" else "")
+
+
+def upscaler_weights(gen: ImageGen, job: dict, key: str = "upscaler") -> None:
     """An upscale's upscaler weights (image_aux's, UPSCALE_WEIGHTS; SeedVR2's DiT by seedvr2_file and its VAE beside
-    it): their path into job["upscaler"], or AuxPending while they download (the upscale is not made with another
-    method meanwhile)."""
-    u = job["upscaler"]
+    it): their path into job[key] ("upscaler", or "crop_ups": Crop and Stitch's), or AuxPending while they download
+    (the upscale is not made with another method meanwhile)."""
+    u = job[key]
     names = [seedvr2_file(gen, u.get("variant") or "7b"), "seedvr2-vae"] if u["method"] == "seedvr2" else \
         [UPSCALE_WEIGHTS[u["method"]]] if u["method"] in UPSCALE_WEIGHTS else []
     if not names:
@@ -4929,6 +5290,15 @@ def upscale_images(svc, gen: ImageGen, job: dict,
     return [png], figures, policy
 
 
+def crop_ups_names(gen: ImageGen, v) -> list[str]:
+    """The weights crop_upscale `v` may take (crop_upscaler's choice, before the cut is known)."""
+    method = (v.get("method") if isinstance(v, dict) else v) or "auto"
+    variant = (v.get("variant") if isinstance(v, dict) else None) or "7b"
+    if method == "seedvr2" or isinstance(v, dict) and v.get("variant"):
+        return [seedvr2_file(gen, variant), "seedvr2-vae"]
+    return [UPSCALE_WEIGHTS["realesrgan"]] if method in ("auto", "realesrgan") else []
+
+
 def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -> dict:
     """One Detailer region's img2img: the picture (as it is after the regions before) with the region's mask, drawn
     at the fix's strength in the region's crop (the cut, img_crop.hpp), the image at the picture's size.  A
@@ -4940,6 +5310,10 @@ def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -
                              region["mask"])
     one.update(crop=region["crop"], width=job["width"], height=job["height"], n=1, seed=seed)
     one.pop("refine", None)
+    one.pop("crop_ups", None)
+    crop_upscaler(one, req)   # the region's own cut and enlargement
+    if one.get("crop_ups"):
+        upscaler_weights(gen, one, "crop_ups")
     if gen.cfg.get("schedule") == "turbo":
         # the Turbo's own sigmas put half its steps above 0.89 (its schedule is a picture's from noise): its second half
         # redraws a face anew (the expression lost, 2026-11-05).  The base model's schedule (base_sigmas, diffusers'
@@ -4957,7 +5331,10 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
     so; a region running is not cut short.  No region found gives the picture as it is."""
     root = image_aux.aux_dir(gen.cfg)
     downloads = [image_aux.ensure(FIX_PARTS[p], root, gen._say) for p in job["fix"]["parts"]]
-    pending = [d for d in downloads if d["status"] != "ready"]
+    # crop_upscale's upscaler (auto's RealESRGAN where a region is enlarged enough): fetched before the turn, as the
+    # detectors are, since a region's own enlargement is known only once it is found
+    ups = crop_ups_names(gen, job["fix_req"].get("crop_upscale"))
+    pending = [d for d in downloads + [image_aux.ensure(n, root, gen._say) for n in ups] if d["status"] != "ready"]
     if pending:
         raise AuxPending(pending)
     picture = as_png(job["picture"])
@@ -5026,7 +5403,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     once no slot is generating), and the text engine made room for it per the policy.  Yields the policy used.  On a
     card of its own (ImageModels.separate), that card's turn alone (separate_turn)."""
     refuse_during_long_job(svc)
-    if isinstance(getattr(svc, "images", None), ImageModels) and svc.images.separate:
+    owner = getattr(gen, "owner", None) or getattr(svc, "images", None)   # the lent text GPU's models: their own
+    if isinstance(owner, ImageModels) and owner.separate:
         with separate_turn(svc, gen, job, cancel) as policy:
             yield policy
         return
@@ -5040,7 +5418,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
             with svc.status_lock:
                 svc.status["queued"] -= 1
             queued = False
-            models = getattr(svc, "images", None)
+            models = owner
             if isinstance(models, ImageModels):   # every server's image jobs on this GPU in turn
                 def waiting():
                     gen._say("image job: waiting for another server's image job on this GPU")
@@ -5074,6 +5452,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                     svc.status.update(busy=True, phase="generating an image", started=time.time(),
                                       first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
                 restore = _make_room(svc, gen, policy, need)
+                if policy == "shrink" and restore not in ("shrunk", None):
+                    policy = "unload"   # the cache could not shrink far enough: the text engine was unloaded instead
 
                 def yield_turn() -> None:
                     """A long job's pause (a video's chunk out): the requests waiting for the service's turn run on
@@ -5178,7 +5558,7 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
     """gpu_turn on a card no text engine takes: only that GPU's turn (GpuTurn), so chat requests run meanwhile and the
     text engine is left as it is (the policy separate); the chat's status is not touched.  MOSS-Image's prompt read by
     the chat's engine (text_states) takes the service's turn for that read alone."""
-    models: ImageModels = svc.images
+    models: ImageModels = getattr(gen, "owner", None) or svc.images
     error: str | None = None
     held = False
     try:
@@ -5225,7 +5605,23 @@ def _make_room(svc, gen: ImageGen, policy: str, need: dict):
         want = max(0, need["full_mib"] - need["held_mib"]) + gen.reserve
         try:
             out = eng.vram(want)
+            got = out.get("vram_free_mib")
+            # the cache gives back whole slots and the driver's free count lags: a give-back short of what was asked
+            # (2,301 of 2,404 MiB beside Qwen3.6-35B-A3B on the B70, 2026-11-09, which left Florence-2 103 MiB short)
+            # is asked once more, by what it lacked
+            if isinstance(got, (int, float)) and got < want:
+                out = eng.vram(want + (want - int(got)))
             gen._say(f"image job: the engine's expert cache gave VRAM back ({out.get('vram_free_mib')} MiB free)")
+            got = out.get("vram_free_mib")
+            least = max(0, need["least_mib"] - need["held_mib"]) + gen.reserve
+            if isinstance(got, (int, float)) and got < least:
+                # at its smallest the cache still leaves the job short (Florence-2 200 MiB short beside
+                # Qwen3.6-35B-A3B on the B70, 2026-11-09): back to its size, and the text engine unloaded for the job
+                gen._say(f"image job: {got} MiB free with the expert cache at its smallest, the job needs {least}: "
+                         "the model is unloaded for it instead")
+                with contextlib.suppress(Exception):
+                    eng.vram(svc.vram_reserve)
+                return _make_room(svc, gen, "unload", need)
             return "shrunk"
         except Exception as e:                       # noqa: BLE001 - the job still runs, with what is free
             gen._say(f"image job: the engine could not give VRAM back ({e}); the job runs with what is free")

@@ -49,7 +49,7 @@ SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 Mis
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
-path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md",
+path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md", "serve/skills/**/SKILL.md",
         "windows/launcher/Core/locales/*.json"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"

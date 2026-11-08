@@ -397,6 +397,7 @@ def prepare(svc, gen, job: dict, cancel=None) -> None:
     made = preprocess(svc, gen, c, cancel)
     c["figures"] = {"type": c["type"], "size": f"{made['width']}x{made['height']}", "seconds": made["seconds"],
                     "engine_s": made["engine_s"], "mode": mode}
+    c["map_png"] = made["image"]   # the chat's control links it, so another call takes it as it is (type none)
     if mode == "controlnet":
         c["net"] = weights(gen, [UNION])[0]
         c["map"] = made["image"]
@@ -454,6 +455,7 @@ def _prepare_moss(svc, gen, job: dict, cancel=None) -> None:
     job["loras"] = list(job.get("loras") or []) + [{"name": MOSS_CONTROL, "path": path, "scale": c["strength"]}]
     c["figures"] = {"type": c["type"], "mode": "moss", "maps": figures,
                     "size": figures[0]["size"] if figures else "as given"}
+    c["map_png"] = made.get("color") or made.get("depth")
     c["ready"] = True
 
 
