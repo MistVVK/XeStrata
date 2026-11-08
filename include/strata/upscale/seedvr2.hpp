@@ -5,15 +5,15 @@
 // Lanczos and pads them to 16s) and restores them in one step.
 //
 // A frame (an image is a clip of one): its RGB in -1 .. 1 through SeedVR2's VAE encoder (MfVae's SeedVR2 form, the
-// posterior's mean, as ComfyUI's encode takes it), times 0.9152, the condition; a noise of the latent's shape
-// (torch.randn of a CPU generator seeded by the request's seed, [16][h][w], as ComfyUI's sampler makes it); the DiT's
+// posterior's mean), times 0.9152, the condition; a noise of the latent's shape
+// (torch.randn of a CPU generator seeded by the request's seed, [16][h][w]); the DiT's
 // velocity of them (seedvr2_dit.hpp); the noise less the velocity, divided by 0.9152, through the decoder.  The alpha
 // comes from the input as it is.
 //
 // The files: the DiT's (Comfy-Org's seedvr2_7b_fp16 or 7b_sharp) and the VAE's, ema_vae_fp16.safetensors, beside it.
 //
-// A video goes through in time, as ComfyUI's SeedVR2 video template takes it (its VAE encode of the whole clip, the
-// latent split by SeedVR2TemporalChunk, a step a chunk, SeedVR2TemporalMerge, the decode of the whole), streamed: the
+// A video goes through in time (the VAE's encode of the whole clip, the latent split into overlapping chunks, a step a
+// chunk, the chunks merged over their overlaps, the decode of the whole), streamed: the
 // frames pushed are encoded in the VAE's slices (its causal convolutions carry what the slice before left: the same
 // latents as the whole clip at once); each chunk of latents goes through the DiT once its latents are there (the noise
 // the same seed's for every chunk, of the chunk's shape [16][t][h][w], as the sampler makes it for each); the chunks

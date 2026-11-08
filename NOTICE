@@ -53,6 +53,15 @@ Every copyright holder whose work is in this repository, its license and where t
   and its video segmentation's rules (src/image/sam3_video.cpp, include/strata/image/sam3_video.hpp), after
   vllm_omni/diffusion/models/sam3/sam3_video.py at 2b610b3; that code stays under Apache-2.0, the files as a whole are
   under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright 2020 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team
+  Apache-2.0 - the image engine's Florence-2 beam search (src/image/florence2.cpp), written after transformers'
+  generation (https://github.com/huggingface/transformers, src/transformers/generation/utils.py, _beam_search); that
+  code stays under Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
+  LICENSES/Apache-2.0.txt
+- Copyright 2024 Microsoft and The HuggingFace Inc. team
+  Apache-2.0 - the words Florence-2's phrase grounding leaves out (serve/image_regions.py, GROUNDING_SKIP), from
+  Florence-2's processing_florence2.py (https://huggingface.co/microsoft/Florence-2-large); that list stays under
+  Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
 - Copyright (c) 2017 Sean Barrett
   MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,

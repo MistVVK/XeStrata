@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2024 Microsoft and The HuggingFace Inc. team
+# SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 """serve/image_regions.py - words to masks, and the background taken away: the image tools' auxiliary models in the
 image engine (src/image: sam3, florence2, birefnet), their weights image_aux's.
 
@@ -64,7 +65,8 @@ FLORENCE_ADDED = (["<od>", "</od>", "<ocr>", "</ocr>"] + [f"<loc_{i}>" for i in 
                      "<seg>", "</seg>", "<sep>", "<region_cap>", "</region_cap>", "<region_to_desciption>",
                      "</region_to_desciption>", "<proposal>", "</proposal>", "<poly>", "</poly>", "<and>"])
 FLORENCE_SPECIAL = {0: "<s>", 1: "<pad>", 2: "</s>", 3: "<unk>", 50264: "<mask>"}
-# processing_florence2.py's black_list_of_phrase_grounding: words its phrase grounding does not keep
+# the words Florence-2's phrase grounding does not keep: its processor's black_list_of_phrase_grounding (Microsoft's
+# processing_florence2.py, Apache-2.0), as it is
 GROUNDING_SKIP = frozenset((
     "it", "I", "me", "mine", "you", "your", "yours", "he", "him", "his", "she", "her", "hers", "they", "them", "their",
     "theirs", "one", "oneself", "we", "us", "our", "ours", "its", "myself", "yourself", "himself", "herself", "itself",
@@ -73,7 +75,7 @@ GROUNDING_SKIP = frozenset((
     "many", "nobody", "none", "several", "some", "somebody", "someone", "something", "each other", "one another",
     "the image", "image", "images", "the", "a", "an", "a group", "other objects", "lots", "a set"))
 # an edit's region grown past its mask (the share of the picture's short side, at least REGION_GROW_MIN pixels): the
-# masks hug the object, and its edge belongs to the redrawing, as ComfyUI's workflows grow a detector's mask
+# masks hug the object, and its edge belongs to the redrawing
 REGION_GROW = 0.01
 REGION_GROW_MIN = 4
 
@@ -295,45 +297,99 @@ def _dequant(v: int, side: int) -> float:
     return (v + 0.5) * side / 1000.0
 
 
-def florence_polygons(text: str, W: int, H: int) -> list[list[list[float]]]:
-    """A referring-expression segmentation's answer -> its instances, each a list of polygons [x0, y0, x1, y1, ...]
-    (processing_florence2.py's parse_description_with_polygons_from_text_and_spans, an empty phrase allowed)."""
+_MARK = re.compile(r"(?:loc_(\d+)|sep|poly|/poly)>")
+
+
+def florence_pieces(text: str) -> list[tuple[str | None, int | None, str, str]]:
+    """Florence-2's answer (its <s>, </s> and <pad> dropped) cut at each "<": for each piece, its mark ("loc", "sep",
+    "poly" or "/poly" where the piece starts as one does, else None), the bin of a <loc_N>, what follows the mark (the
+    whole piece without one) and the whole piece.  The first piece, before any "<", has no mark."""
     text = text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
-    tokens = r"(?:<loc_\d+>|<sep>|<poly>|</poly>)"
+    first, *rest = text.split("<")
+    out: list[tuple[str | None, int | None, str, str]] = [(None, None, first, first)]
+    for piece in rest:
+        m = _MARK.match(piece)
+        if m is None:
+            out.append((None, None, piece, piece))
+        else:
+            mark = "loc" if m.group(1) is not None else piece[:m.end() - 1]
+            out.append((mark, int(m.group(1)) if mark == "loc" else None, piece[m.end():], piece))
+    return out
+
+
+def florence_polygons(text: str, W: int, H: int) -> list[list[list[float]]]:
+    """A referring-expression segmentation's answer -> its instances, each a list of polygons [x0, y0, x1, y1, ...]:
+    a stretch of four or more marks with nothing between them (its phrase may be empty) is cut into parts, those between
+    <poly> and the next </poly> where it has both, else the whole stretch, and a part with polygons is an instance;
+    within a part, each row of bins that a <sep> or the part's end closes is a polygon, its bins in (x, y) pairs."""
     out = []
-    for phrase in re.findall(rf"(?:{tokens}){{4,}}", text):
-        parts = re.findall(r"<poly>(.*?)</poly>", phrase) if "<poly>" in phrase and "</poly>" in phrase else [phrase]
-        for part in parts:
-            polys = []
-            for m in re.finditer(r"((?:<loc_\d+>)+)(?:<sep>|$)", part):
-                v = [int(x) for x in re.findall(r"<loc_(\d+)>", m.group(1))]
-                v = v[:len(v) // 2 * 2]
-                if v:
-                    polys.append([_dequant(c, W if k % 2 == 0 else H) for k, c in enumerate(v)])
-            if polys:
-                out.append(polys)
+    stretch: list[tuple[str, int | None]] = []
+    for mark, bin_, after, _ in florence_pieces(text) + [(None, None, "", "")]:
+        if mark is not None:
+            stretch.append((mark, bin_))
+            if not after:
+                continue
+        if len(stretch) >= 4:
+            if {"poly", "/poly"} <= {m for m, _ in stretch}:
+                parts, part = [], None
+                for m in stretch:
+                    if part is None:
+                        part = [] if m[0] == "poly" else None
+                    elif m[0] == "/poly":
+                        parts.append(part)
+                        part = None
+                    else:
+                        part.append(m)
+            else:
+                parts = [stretch]
+            for part in parts:
+                polys, row = [], []
+                for m, b in part + [("sep", None)]:
+                    if m == "loc":
+                        row.append(b)
+                        continue
+                    pairs = row[:len(row) // 2 * 2] if m == "sep" else []
+                    if pairs:
+                        polys.append([_dequant(v, H if k % 2 else W) for k, v in enumerate(pairs)])
+                    row = []
+                if polys:
+                    out.append(polys)
+        stretch = []
     return out
 
 
 def florence_boxes(text: str, W: int, H: int, grounding: bool = False) -> list[dict]:
-    """An open-vocabulary detection's or a phrase grounding's answer -> [{"label", "box"}] (processing_florence2.py's
-    parse_description_with_bboxes_from_text_and_spans and parse_phrase_grounding_from_text_and_spans: a phrase and
-    its boxes; non-ASCII left out of the label as there; the grounding's pronouns and the like skipped)."""
-    text = text.replace("<s>", "").replace("</s>", "").replace("<pad>", "")
+    """An open-vocabulary detection's or a phrase grounding's answer -> [{"label", "box"}]: words directly followed by
+    four or more bins name the boxes those bins make, four at a time (x0, y0, x1, y1).  The words run from the last
+    "<" before the bins, or from the end of the bins a box took before; a piece is words even where it starts as a
+    mark no box took, its mark's name kept, as the model's processor reads them.  The label is the words with their
+    ends' white space taken off and their non-ASCII letters left out; words that run over a line break (past their
+    leading white space) name nothing; a grounding skips the phrases GROUNDING_SKIP lists."""
     out = []
-    for chunk in re.findall(r"([^<]+(?:<loc_\d+>){4,})", text):
-        stripped = chunk.replace("<obj>", "", 1)
-        if stripped == "":
+    pieces = florence_pieces(text)
+    at, after_box = 0, False
+    while at < len(pieces):
+        words = pieces[at][2] if after_box else pieces[at][3]
+        bins, nxt = [], at + 1
+        if words:
+            while nxt < len(pieces) and pieces[nxt][0] == "loc":
+                bins.append(pieces[nxt][1])
+                if pieces[nxt][2]:
+                    break
+                nxt += 1
+        if len(bins) < 4:
+            at, after_box = at + 1, False
             continue
-        m = re.search(r"^\s*(.*?)(?=<od>|</od>|<box>|</box>|<bbox>|</bbox>|<loc_)", stripped)
-        if m is None:
+        last = at + len(bins)   # the piece of the last bin: the next words start after its mark
+        at, after_box = last, True
+        if "\n" in words.lstrip():
             continue
-        label = m.group().strip()
+        label = words.strip()
         if grounding and label in GROUNDING_SKIP:
             continue
         label = label.encode("ascii", errors="ignore").decode("ascii")
-        for b in re.finditer(r"<loc_(\d+)><loc_(\d+)><loc_(\d+)><loc_(\d+)>", chunk):
-            x0, y0, x1, y1 = (int(b.group(j)) for j in range(1, 5))
+        for k in range(0, len(bins) - 3, 4):
+            x0, y0, x1, y1 = bins[k:k + 4]
             out.append({"label": label, "box": [_dequant(x0, W), _dequant(y0, H), _dequant(x1, W), _dequant(y1, H)]})
     return out
 

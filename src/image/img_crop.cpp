@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 
@@ -32,7 +34,7 @@ struct Buffers {
     template <class T> T* get(size_t n) {
         T* p = nullptr;
         if (!gpu::alloc_device(&p, n * sizeof(T)))
-            throw std::runtime_error(std::string("image engine: GPU memory (crop and stitch): ") + gpu::last_error());
+            throw std::runtime_error(std::string("image engine: GPU memory (the cut and its return): ") + gpu::last_error());
         held.push_back(p);
         return p;
     }
@@ -149,15 +151,15 @@ inline int64_t reflect(int64_t i, int64_t n) {
     }
 }
 
-// InpaintCropImproved's mask before its growth, on the host (a fill is a walk, not a GPU's work): the edit share
-// (1 - alpha / 255), its values below 0.1 out (mask_hipass_filter), then its holes filled at each of
-// fillholes_iterative_hipass_fill_m's steps - the share at least t set, closed by the 3 x 3 square with the picture's
-// outside counted as set (scipy's binary_closing, border_value 1), its holes filled (binary_fill_holes: the unset
-// pixels, 4-connected, that the edges do not reach), and the filled pixels at least t.  The closing and the fill
-// change nothing more than 2 pixels past the mask's box (InpaintCropImproved's, checked against scipy), so they run in
-// that box: the server's box (serve/images.py, crop_reach) counts the 2 pixels.
+// The mask before its growth, on the host (a flood is a walk, not a GPU's work): the edit share (1 - alpha / 255), its
+// values below a tenth out, then closed and its holes filled in grey.  The closing is the 3 x 3 square's (dilated with
+// the picture's outside as full, then eroded within the picture); a pixel's fill is the lowest level a 4-connected way
+// from outside the mask's box to it has to climb over the closed values (a flood from the box's frame, lowest first),
+// and the pixel takes the higher of its share and its fill: a hole or a gap the closing shuts takes the level of what
+// encloses it, so a ring painted at 0.97 redraws its middle at 0.97.  A binary mask comes out binary.  The closing and
+// the fill change nothing more than 2 pixels past the mask's box, so they run in that box: the server's box
+// (serve/images.py, crop_reach) counts the 2 pixels.
 std::vector<float> filled_share(const QiRef& mask) {
-    static const float kSteps[] = {1.0f, 0.99f, 0.97f, 0.95f, 0.93f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f, 0.4f, 0.3f, 0.2f, 0.1f};
     const int64_t W = mask.width, H = mask.height;
     std::vector<float> m((size_t) (W * H));
     int64_t x0 = W, y0 = H, x1 = -1, y1 = -1;
@@ -172,66 +174,65 @@ std::vector<float> filled_share(const QiRef& mask) {
             }
         }
     if (x1 < 0) return m;
-    // the box R (the mask's, 2 pixels wider) and R1 (1 more), within the picture
+    // the box R (the mask's, 2 pixels wider) and A (1 more), within the picture
     const int64_t rx0 = std::max<int64_t>(0, x0 - 2), ry0 = std::max<int64_t>(0, y0 - 2);
     const int64_t rx1 = std::min(W, x1 + 3), ry1 = std::min(H, y1 + 3), rw = rx1 - rx0, rh = ry1 - ry0;
     const int64_t ax0 = std::max<int64_t>(0, rx0 - 1), ay0 = std::max<int64_t>(0, ry0 - 1);
     const int64_t ax1 = std::min(W, rx1 + 1), ay1 = std::min(H, ry1 + 1), aw = ax1 - ax0;
-    std::vector<uint8_t> b((size_t) (rw * rh)), last, dil((size_t) (aw * (ay1 - ay0))), grid((size_t) ((rw + 2) * (rh + 2)));
-    std::vector<int64_t> todo;
-    const auto set = [&](int64_t x, int64_t y) {   // b at a pixel of the picture (unset outside R)
-        return x >= rx0 && x < rx1 && y >= ry0 && y < ry1 && b[(size_t) ((y - ry0) * rw + x - rx0)] != 0;
+    const auto at = [&](int64_t x, int64_t y) -> float {   // the share the closing sees: full outside the picture
+        if (x < 0 || y < 0 || x >= W || y >= H) return 1.0f;
+        return x >= rx0 && x < rx1 && y >= ry0 && y < ry1 ? m[(size_t) (y * W + x)] : 0.0f;
     };
-    for (const float t : kSteps) {
-        for (int64_t y = 0; y < rh; ++y)
-            for (int64_t x = 0; x < rw; ++x) b[(size_t) (y * rw + x)] = m[(size_t) ((y + ry0) * W + x + rx0)] >= t;
-        if (b == last) continue;   // the same set: the same fill, its pixels already at a higher step
-        last = b;
-        for (int64_t y = ay0; y < ay1; ++y)   // dilated, the outside set
-            for (int64_t x = ax0; x < ax1; ++x) {
-                bool v = false;
-                for (int64_t dy = -1; dy <= 1 && !v; ++dy)
-                    for (int64_t dx = -1; dx <= 1 && !v; ++dx) {
-                        const int64_t nx = x + dx, ny = y + dy;
-                        v = nx < 0 || ny < 0 || nx >= W || ny >= H || set(nx, ny);
-                    }
-                dil[(size_t) ((y - ay0) * aw + x - ax0)] = v;
-            }
-        // eroded (closed), on a frame of unset pixels the fill starts from
-        std::fill(grid.begin(), grid.end(), 0);
-        for (int64_t y = 0; y < rh; ++y)
-            for (int64_t x = 0; x < rw; ++x) {
-                bool v = true;
-                for (int64_t dy = -1; dy <= 1 && v; ++dy)
-                    for (int64_t dx = -1; dx <= 1 && v; ++dx) {
-                        const int64_t nx = x + rx0 + dx, ny = y + ry0 + dy;
-                        if (nx >= 0 && ny >= 0 && nx < W && ny < H) v = dil[(size_t) ((ny - ay0) * aw + nx - ax0)] != 0;
-                    }
-                grid[(size_t) ((y + 1) * (rw + 2) + x + 1)] = v;
-            }
-        // the unset pixels the frame reaches (2); the rest of the unset ones are holes
-        const int64_t gw = rw + 2, gh = rh + 2;
-        todo.assign(1, 0);
-        grid[0] = 2;
-        while (!todo.empty()) {
-            const int64_t i = todo.back();
-            todo.pop_back();
-            const int64_t x = i % gw, y = i / gw;
-            const int64_t next[4] = {x > 0 ? i - 1 : -1, x + 1 < gw ? i + 1 : -1, y > 0 ? i - gw : -1,
-                                     y + 1 < gh ? i + gw : -1};
-            for (const int64_t j : next)
-                if (j >= 0 && grid[(size_t) j] == 0) {
-                    grid[(size_t) j] = 2;
-                    todo.push_back(j);
-                }
+    std::vector<float> grown((size_t) (aw * (ay1 - ay0)));
+    for (int64_t y = ay0; y < ay1; ++y)
+        for (int64_t x = ax0; x < ax1; ++x) {
+            float v = 0.0f;
+            for (int64_t dy = -1; dy <= 1; ++dy)
+                for (int64_t dx = -1; dx <= 1; ++dx) v = std::max(v, at(x + dx, y + dy));
+            grown[(size_t) ((y - ay0) * aw + x - ax0)] = v;
         }
-        for (int64_t y = 0; y < rh; ++y)
-            for (int64_t x = 0; x < rw; ++x)
-                if (grid[(size_t) ((y + 1) * gw + x + 1)] != 2) {
-                    float& v = m[(size_t) ((y + ry0) * W + x + rx0)];
-                    v = std::max(v, t);
+    // the closed box on a frame (rw + 2) x (rh + 2) whose cells are the flood's sources, at 0
+    const int64_t gw = rw + 2, gh = rh + 2;
+    std::vector<float> closed((size_t) (gw * gh), 0.0f), level((size_t) (gw * gh), 2.0f);
+    for (int64_t y = 0; y < rh; ++y)
+        for (int64_t x = 0; x < rw; ++x) {
+            float v = 1.0f;
+            for (int64_t dy = -1; dy <= 1; ++dy)
+                for (int64_t dx = -1; dx <= 1; ++dx) {
+                    const int64_t nx = x + rx0 + dx, ny = y + ry0 + dy;
+                    if (nx >= 0 && ny >= 0 && nx < W && ny < H) v = std::min(v, grown[(size_t) ((ny - ay0) * aw + nx - ax0)]);
                 }
+            closed[(size_t) ((y + 1) * gw + x + 1)] = v;
+        }
+    using Step = std::pair<float, int64_t>;   // a cell's level so far, the cell
+    std::priority_queue<Step, std::vector<Step>, std::greater<Step>> open;
+    for (int64_t i = 0; i < gw * gh; ++i) {
+        const int64_t x = i % gw, y = i / gw;
+        if (x == 0 || y == 0 || x == gw - 1 || y == gh - 1) {
+            level[(size_t) i] = 0.0f;
+            open.emplace(0.0f, i);
+        }
     }
+    while (!open.empty()) {
+        const auto [lv, i] = open.top();
+        open.pop();
+        if (lv > level[(size_t) i]) continue;   // reached lower already
+        const int64_t x = i % gw, y = i / gw;
+        const int64_t next[4] = {x > 0 ? i - 1 : -1, x + 1 < gw ? i + 1 : -1, y > 0 ? i - gw : -1, y + 1 < gh ? i + gw : -1};
+        for (const int64_t j : next) {
+            if (j < 0) continue;
+            const float up = std::max(lv, closed[(size_t) j]);
+            if (up < level[(size_t) j]) {
+                level[(size_t) j] = up;
+                open.emplace(up, j);
+            }
+        }
+    }
+    for (int64_t y = 0; y < rh; ++y)
+        for (int64_t x = 0; x < rw; ++x) {
+            float& v = m[(size_t) ((y + ry0) * W + x + rx0)];
+            v = std::max(v, level[(size_t) ((y + 1) * gw + x + 1)]);
+        }
     return m;
 }
 
@@ -472,13 +473,14 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     const uint8_t* pic = rgba8_device(b, base.rgba);
     float* m = b.put(filled_share(mask));
     float* tmp = b.get<float>((size_t) (W * H));
-    // the mask grown and blurred over the picture (InpaintCropImproved's mask_blend_pixels)
-    const double sigma = (double) box.blend * 0.5 / 4.0;
+    // the mask grown and blurred over the picture: a window of 3/8 of the blend width and a pixel (rounded up), then a
+    // Gaussian of an eighth of it
+    const double sigma = (double) box.blend / 8.0;
     std::vector<float> gw8;
     float* gwd = nullptr;
     int r = 0;
     if (box.blend > 0) {
-        dilate(m, tmp, W, H, (int64_t) std::ceil((double) box.blend / 4.0 * 1.5 + 1.0));
+        dilate(m, tmp, W, H, (int64_t) std::ceil((double) box.blend * 0.375 + 1.0));
         gw8 = gauss(sigma);
         r = (int) (gw8.size() / 2);
         gwd = b.put(gw8);
@@ -523,7 +525,7 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     crop_dev_ = nullptr;
     if (keep) {
         if (!gpu::alloc_device(&crop_dev_, (size_t) (4 * n)))
-            throw std::runtime_error(std::string("image engine: GPU memory (crop and stitch): ") + gpu::last_error());
+            throw std::runtime_error(std::string("image engine: GPU memory (the cut and its return): ") + gpu::last_error());
         gpu::copy(crop_dev_, out, (size_t) (4 * n));
     }
     gpu::copy(regen_.rgba.data(), reg, (size_t) (4 * n));

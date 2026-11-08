@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/sam3_track_probe.cpp - strata-image-sam3-track-probe: SAM 3.1's tracker's parts (sam3.hpp's video
 // section) on the GPU against a reference run's calls of the same parts, each fed the run's own inputs: a folder per
-// call (<part>_<k>/<name>.npy, FP32, as the records' golden_sam3_track.py and npz_split.py write ComfyUI's).
+// call (<part>_<k>/<name>.npy, FP32, as the records' golden_sam3_track.py and npz_split.py write them).
 //
 //   strata-image-sam3-track-probe CKPT.safetensors GOLDEN_DIR
 //   strata-image-sam3-track-probe video CKPT.safetensors VIDEO IDS OUT_DIR
@@ -10,7 +10,7 @@
 //       frame's objects to OUT_DIR/frame_<i>.bin (their count as int64, then each: id int64, score float32, the mask
 //       width x height bytes), the parts' seconds.
 //
-// Prints each part's cosine and relative L1 against the run's.  Where ComfyUI and Meta's sam3 differ (the sine
+// Prints each part's cosine and relative L1 against the run's.  Where the engine and the run differ (the sine
 // positions' formula, the trunk's input range), the run's own inputs are given, so the parts' arithmetic is what is
 // compared.
 
@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
             const auto in = at(part, "in0", &s);
             const auto want = at(part, "out0");
             Dev di(in.size() * 4), dp(in.size() * 4);
-            // all seen (the projection alone: ComfyUI's no-object blend comes after the hooked call)
+            // all seen (the projection alone: the run's no-object blend comes after the hooked call)
             sam.pointers(up(di, in), s[0], std::string(part) == "iptrproj_0", std::vector<float>((size_t) s[0], 1.f),
                          dp.as<float>());
             const auto g = down(dp.as<float>(), in.size());

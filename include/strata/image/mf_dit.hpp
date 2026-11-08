@@ -217,8 +217,8 @@ public:
                 const std::function<void(float*, float)>& after = {},
                 const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
                 const GuidanceSpec* guide = nullptr);
-    /// forward of context 0 alone with `blocks` skipped (their image and text rows past them as they came: ComfyUI's
-    /// double_block replaced by its input): skip layer guidance's pass.
+    /// forward of context 0 alone with `blocks` skipped (their image and text rows past them as they came: a skipped
+    /// block's output is its input): skip layer guidance's pass.
     void forward_skip(const float* x, float sigma, int64_t h, int64_t w, const std::vector<int>& blocks, float* out);
 
     int64_t hidden() const { return C_; }

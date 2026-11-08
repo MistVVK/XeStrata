@@ -44,9 +44,9 @@ std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H);
 /// than opaque (the part that changes), 0 elsewhere, [H / patch][W / patch].  `px`: the mask at W x H (nearest).
 std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t patch);
 
-/// The sampler's mask of a request: latent_mask's, or with r.mask_share (Crop and Stitch's) that share's mean over
+/// The sampler's mask of a request: latent_mask's, or with r.mask_share (the cut's) that share's mean over
 /// each position, the part a position changes (the step's blend, qi_inpaint_blend, takes a share as it takes 0 and 1:
-/// a position at the mask's blurred edge follows the base image as much as it is kept, ComfyUI's noise mask).
+/// a position at the mask's blurred edge follows the base image as much as it is kept).
 std::vector<float> request_latent_mask(const QiRequest& r, const std::vector<uint8_t>& px, int64_t W, int64_t H,
                                        int64_t patch);
 

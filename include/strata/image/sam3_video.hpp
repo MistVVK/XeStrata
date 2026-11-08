@@ -4,18 +4,17 @@
 // include/strata/image/sam3_video.hpp - SAM 3.1's video segmentation: every frame the detector finds the words'
 // instances, the multiplex tracker (sam3.hpp's video section) carries the objects found before, and the two are
 // matched.  The rules follow vLLM-Omni's sam3_video.py (2b610b3, Apache-2.0: its association, hot start, occlusion
-// suppression and delayed outputs), with Meta's SAM 3.1 defaults and what 3.1 adds (read from Meta's sam3
-// at f1647e8 and written anew): masks compared by their intersection over the smaller one (IoM), detections whose
-// centers are near the frame's edges left out, a masklet shown only once confirmed, reconditioning by IoM, up to 16
-// objects in buckets of 16 slots.
+// suppression and delayed outputs), with SAM 3.1's defaults and what 3.1 adds: masks compared by their intersection
+// over the smaller one (IoM), detections whose centers are near the frame's edges left out, a masklet shown only once
+// confirmed, reconditioning by IoM, up to 16 objects in buckets of 16 slots.
 //
 // A clip goes in a frame at a time (push); each frame's objects come out confirm_after - 1 frames later (a masklet
-// shown once it is confirmed: Meta's 3.1 holds its outputs hot_start frames, but hides only the unconfirmed ones,
+// shown once it is confirmed: the outputs need not wait the whole hot start, only the unconfirmed ones are hidden,
 // which that many frames tell), the rest at finish().  A masklet the hot start removes stops being tracked.
 //
 // Several words at once are vLLM-Omni's: each frame the detector runs for each, a detection matches only its own
 // words' masklets, and the occlusion, the memory's overlaps and the outputs' are settled among one words' objects.
-// XeStrata adds words that start on a later frame, and clicks (points and boxes) on any frame: Meta's tracker's
+// XeStrata adds words that start on a later frame, and clicks (points and boxes) on any frame: the tracker's
 // prompts (its interactive decoder on the frame without memory), which add an object or redo one's mask there; such
 // an object is shown at once, kept whatever the detector finds, and tracked from that frame on.
 #pragma once
@@ -32,7 +31,7 @@
 
 namespace strata::image {
 
-/// Meta's SAM 3.1 defaults (model_builder.py's build_sam3_multiplex_video_predictor and its classes').
+/// SAM 3.1's defaults for its video predictor.
 struct Sam3VideoConfig {
     float score_threshold = 0.4f;    // a detection kept
     float nms_iom = 0.1f;            // detections overlapping a better one past this (IoM) dropped

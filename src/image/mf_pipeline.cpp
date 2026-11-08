@@ -626,7 +626,7 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        if (r.sampler == "er_sde") {   // ComfyUI's er_sde (MageTrail's author's sampler) over the same forward
+        if (r.sampler == "er_sde") {   // er_sde (MageTrail's author's sampler) over the same forward
             Guidance g(r.guide, s_, n, Cl, true, guided ? r.cfg : 1.0f, sigmas);
             flow_sample(s_, [&](const float* xx, float sigma, int nn, float* o) { d.forward(xx, sigma, h, w, nn, o); },
                         x, n, guided ? 2 : 1, sigmas, guided ? r.cfg : 1.0f, true, 6.0f, r.seed, step, ls.after(s_),

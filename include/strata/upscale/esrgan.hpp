@@ -40,8 +40,8 @@ public:
     void release(bool all) override;
     uint64_t held() const override;
 
-    /// Pixels of the frame read around a tile's core (each side, where the frame has them): ComfyUI's tiles overlap by
-    /// 32 (ImageUpscaleWithModel), each seeing as far past the seam.
+    /// Pixels of the frame read around a tile's core (each side, where the frame has them): the tiles overlap by 32,
+    /// each seeing as far past the seam.
     static constexpr int64_t kContext = 32;
 
 private:

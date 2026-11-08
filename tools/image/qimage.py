@@ -52,7 +52,7 @@ the chat engine encode the prompts (serve/images.py's text_states).  Its edits t
 up to four reference images, the instruction in the prompt.  Setup fetches three ("edit_adapters"; the config's
 "edit_adapter" or XESTRATA_MOSS_EDIT chooses): chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy, GPL-3.0),
 the default - beside akhaliq's MOSS-Image-Edit-HQ armV5 (Apache 2.0) it kept the clothes a face swap was not asked to
-change, in 30 steps against 50 (the same face swap and expression through ComfyUI and the engine, 2026-11-04) - and
+change, in 30 steps against 50 (the same face swap and expression, 2026-11-04) - and
 armV5 and armV6 (armV5 trained on with other captions and loss, its card's experiment), ai-toolkit adapters whose
 text encoder sees the references too: Qwen3.5-9B's vision encoder (Unsloth's mmproj, the same for every size of the
 text encoder) comes with them.

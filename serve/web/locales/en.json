@@ -487,7 +487,7 @@
   "img.gStrength": "Strength",
   "img.gZeroTitle": "CFG-Zero*: the negative prompt's prediction scaled to the prompt's before guidance; needs CFG",
   "img.cropStitch": "Cut out the painted part and draw it larger",
-  "img.cropStitchTitle": "Crop and Stitch: the part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size",
+  "img.cropStitchTitle": "The part around the paint is drawn at about 1024 x 1024 and put back; off draws again at the output's size",
   "img.refine": "Draw the painted part again, finer (about 1.6 times the time)",
   "img.refineTitle": "MOSS-Image with two images or more: the whole picture first, then the painted part cut out of it and drawn again",
   "img.madeCrop": "(drawn at {size} around the painted part)",

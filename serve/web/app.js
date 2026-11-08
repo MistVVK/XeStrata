@@ -3915,8 +3915,8 @@ async function imgStream(r) {
   if (!j.data.length) throw new Error(tr("img.none", "No image"));
   return j;
 }
-// the pictures made on this page, newest first: the one chosen large with its save, its generation info (A1111's lines,
-// for a reader who knows them) and the buttons that use it; the others as a row of thumbnails below it
+// the pictures made on this page, newest first: the one chosen large with its save, its generation info (the request in
+// the API's names) and the buttons that use it; the others as a row of thumbnails below it
 const imgShots = [];   // [{url, name, seed, info, note}]
 let imgSel = -1;
 function imgShow(i) {

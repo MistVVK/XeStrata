@@ -365,7 +365,7 @@ void Sam3::detect_restore() {
 void Sam3::trunk(const QiRef& image, Filter filter) {
     const int64_t S = image_;
     // the picture at S x S (a picture's: torchvision's antialiased bilinear, Pillow's triangle filter; a video's
-    // frames: OpenCV's cubic, as Meta's loader), normalized to [-1, 1]
+    // frames: OpenCV's cubic), normalized to [-1, 1]
     const QiRef r = pillow_resize(image, S, S, filter);
     auto* rgba = scratch_as<uint8_t>(kRgba, r.rgba.size());
     gpu::copy(rgba, r.rgba.data(), r.rgba.size());

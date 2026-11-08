@@ -177,7 +177,7 @@ private:
     int64_t in_w_ = 288, in_h_ = 384, K_ = 133, E_ = 512, S_ = 128, D_ = 256;
 };
 
-/// The pose map: each person's body, hands and face drawn as OpenPose's skeletons are (the limbs as coloured
+/// The pose map: each person's body, hands and face drawn as DWPose draws its skeletons (the limbs as coloured
 /// ellipses, the hands' bones in a hue wheel, the face's points white) on black, W x H, RGB8.  A keypoint is drawn
 /// where its score passes 0.3.
 std::vector<uint8_t> draw_pose(const std::vector<WholeBody>& people, int64_t W, int64_t H, bool body, bool hands,

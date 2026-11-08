@@ -458,7 +458,7 @@
   "img.gStrength": "Intensidade",
   "img.gZeroTitle": "CFG-Zero*: a previsão do prompt negativo escalada para a do prompt antes da orientação; precisa de CFG",
   "img.cropStitch": "Recortar a parte pintada e desenhá-la maior",
-  "img.cropStitchTitle": "Crop and Stitch: a área em volta da pintura é desenhada a cerca de 1024 x 1024 e recolocada; desligado, redesenha no tamanho de saída",
+  "img.cropStitchTitle": "A área em volta da pintura é desenhada a cerca de 1024 x 1024 e recolocada; desligado, redesenha no tamanho de saída",
   "img.refine": "Redesenhar a parte pintada com mais detalhe (cerca de 1,6 vezes o tempo)",
   "img.refineTitle": "MOSS-Image com duas imagens ou mais: primeiro a imagem inteira, depois a parte pintada recortada dela e redesenhada",
   "img.madeCrop": "(desenhada em {size} em volta da parte pintada)",

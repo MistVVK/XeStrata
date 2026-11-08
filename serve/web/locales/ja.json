@@ -458,7 +458,7 @@
   "img.gStrength": "強さ",
   "img.gZeroTitle": "CFG-Zero*: CFG の前に、ネガティブの予測をプロンプトの予測に合わせて縮めます。CFG が要ります",
   "img.cropStitch": "塗った部分を切り出して大きく描く",
-  "img.cropStitchTitle": "Crop and Stitch: 塗った部分の周りを約 1024x1024 で描き直して貼り戻します。オフでは出力の大きさのまま描き直します",
+  "img.cropStitchTitle": "塗った部分の周りを約 1024x1024 で描き直して貼り戻します。オフでは出力の大きさのまま描き直します",
   "img.refine": "塗った部分をもう一度細かく描き直す（時間はおよそ 1.6 倍）",
   "img.refineTitle": "MOSS-Image で画像が 2 枚以上のとき: まず全体を描き、その塗った部分を切り出して描き直します",
   "img.madeCrop": "（塗った部分の周りを {size} で描画）",

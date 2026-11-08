@@ -108,8 +108,8 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
 [...]}, "transparency": false} - no "llm" (no text encoder).
   lora_dir: the folder of the LoRA adapters the model may apply (setup writes <data>/models/loras; serve/loras.py
   lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
-  crop_stitch: false draws an edit with a mask at the output's size, as before Crop and Stitch (plan_crop; a request's
-  crop_stitch overrides it)
+  crop_stitch: false draws an edit with a mask at the output's size, without cutting the part out (plan_crop; a
+  request's crop_stitch overrides it)
   MOSS-Image's edit_adapters ({name: {"lora", "format", "vision"}}, setup's chinoll, armv5 and armv6) and
   edit_adapter (the one used; XESTRATA_MOSS_EDIT over it: moss_edit_adapter); edit_format: an edit_lora's layout
   (moss_edit_format)
@@ -166,8 +166,8 @@ HELPER_REOPEN_S = 2.0              # an image job closed the text engine's helpe
 # ComfyUI's own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img), lowered for a model of few steps
 # (img2img_strength).  An edit's, and a mask's alone, is 1.0, the default denoise of ComfyUI's KSampler (nodes.py)
 STRENGTH_IMG2IMG = 0.87
-# Crop and Stitch (plan_crop, img_crop.hpp): the defaults of InpaintCropImproved (lquesada's ComfyUI node):
-# mask_blend_pixels, mask_hipass_filter and context_from_mask_extend_factor;
+# the cut and its return (plan_crop, img_crop.hpp): the blend of the drawing's edge back into the picture in pixels,
+# the least mask value the box takes and how far the context around the part grows beyond its box;
 # an edit with reference images beside the picture (a face from image 2) sees more around the part, the factor of
 # pixlstash's Qwen-Image-Edit 2511 workflow
 CROP_BLEND = 32
@@ -177,20 +177,19 @@ CROP_CONTEXT = 1.2
 CROP_CONTEXT_REFS = 1.6
 # MOSS-Image's edit with references besides the picture: its edit adapter matches them with the whole picture it was
 # trained beside, and a cut part alone takes their content (the face swap of 2026-11-04 drew image 2's body in place of
-# the face; ComfyUI's Inpaint Crop and Stitch did the same).  So the whole picture is edited in one pass (its whole
+# the face).  So the whole picture is edited in one pass (its whole
 # box: the part outside the mask kept), and with the request's refine the part is then cut out of that and drawn again
-# with the references at this strength (FaceDetailer's denoise): the same face swap kept image 2's face and drew its
+# with the references at this strength: the same face swap kept image 2's face and drew its
 # eyes and mouth finer; 0.7 turned the hair grey
 CROP_REFINE_STRENGTH = 0.5
-# an outpaint's (extend) fade of the change into the image from each side that grows, in pixels: ImagePadForOutpaint's
-# feathering default
+# an outpaint's (extend) fade of the change into the image from each side that grows, in pixels
 EXTEND_FEATHER = 40
-# Crop and Stitch's color match by default (color_match_mode): set by the images compared (C4)
+# the cut's color match by default (color_match_mode): set by the images compared (C4)
 COLOR_MATCH = "off"
-# an upscale's second pass (parse_upscale): its strength, the low end of the 0.3 to 0.6 ComfyUI's two-pass workflows
-# use (less drift from the first image); the largest scale and side; past max_side, tiles as Ultimate SD Upscale draws
-# them, 1024 pixels with more context and blend than its defaults (32 and 8): with those a swimsuit's edge across a
-# tile's border came out broken (Qwen-Image-2.1-Turbo, 2x of 832x1248, 2026-11-05); 128 and 32 drew it whole
+# an upscale's second pass (parse_upscale): its strength, the low end of the 0.3 to 0.6 a second pass commonly takes
+# (less drift from the first image); the largest scale and side; past max_side, drawn again a tile at a time, 1024
+# pixels with a context of 128 and a blend of 32: with 32 and 8 a swimsuit's edge across a tile's border came out
+# broken (Qwen-Image-2.1-Turbo, 2x of 832x1248, 2026-11-05); 128 and 32 drew it whole
 UPSCALE_STRENGTH = 0.35
 UPSCALE_MAX_SCALE = 4.0
 UPSCALE_MAX_SIDE = 4096
@@ -208,15 +207,15 @@ UPSCALE_WEIGHTS = {"realesrgan": "realesrgan"}
 SEEDVR2_VARIANTS = ("7b", "7b-sharp", "3b")
 SEEDVR2_WORK_MIB = 4096   # what a 7B run takes besides its weights at a couple of megapixels (the DiT's activations)
 # the color corrections after it (vLLM-Omni's SeedVR2 color_correction_method's names); none given, the upscaler's
-# own: none for RealESRGAN (as ComfyUI's ImageUpscaleWithModel), lab for SeedVR2 (its pipeline's)
+# own: none for RealESRGAN, lab for SeedVR2 (its pipeline's)
 UPSCALE_COLORS = ("none", "lab", "adain", "wavelet")
 # /v1/images/upscale's models (its `model`, and /v1/models' entries) -> the method and SeedVR2's variant
 UPSCALE_MODELS = {"realesrgan-x4plus": ("realesrgan", None), "lanczos": ("lanczos", None),
                   "seedvr2-7b": ("seedvr2", "7b"), "seedvr2-7b-sharp": ("seedvr2", "7b-sharp"),
                   "seedvr2-3b": ("seedvr2", "3b")}
-# the Detailer (fix_image, the edits' `fix`): Impact Pack's FaceDetailer's steps and defaults (bbox_threshold 0.5,
-# bbox_dilation 10, bbox_crop_factor 3, drop_size 10, denoise 0.5, noise_mask_feather 20), its guide_size 1024 for
-# the models that draw about 1 MP (ComfyUI's 512 is SD 1.5's) and its max_size the Crop and Stitch drawing's
+# the Detailer (fix_image, the edits' `fix`): a detection kept from a score of 0.5, its box grown by 10 pixels, cut
+# out with 3 times its size around it, parts smaller than 10 pixels dropped, drawn again at strength 0.5 with the
+# mask's edge feathered by 20 pixels, at 1024 for the models that draw about 1 MP and at most the cut's drawing size
 # (crop_gen_size); the parts' detectors are image_aux's weights
 FIX_PARTS = {"face": "yolo-face", "hands": "yolo-hand", "person": "yolo-person"}
 FIX_PROMPTS = {"face": "a detailed, well-drawn face", "hands": "detailed, well-drawn hands",
@@ -282,19 +281,19 @@ MOSS_FEW_STEPS = 4                 # the 4-step adapter's step codes (its card: 
 MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
 MOSS_SHIFT_MAX = 20.0
 # MOSS-Image's edits: chinoll's Moss-Image-Edit adapter (the config's "edit_lora", at strength 1: below 1 the scene is
-# drawn again rather than edited), as PedroMarinhoDev's ComfyUI copy's model card sets it: CFG 5, 30 steps, block 22
-# skipped by the negative pass, up to four references, each at about 1 MP in its own shape (smaller than the image
-# made, the scene zooms out); ComfyUI's TextEncodeMOSSImageEdit, its Moss-Image-Edit format (no image to the text
-# encoder, the references' latents to the DiT)
+# drawn again rather than edited), as its model card sets it: CFG 5, 30 steps, block 22 skipped by the negative pass,
+# up to four references, each at about 1 MP in its own shape (smaller than the image made, the scene zooms out); as it
+# was trained, no image to the text encoder, the references' latents to the DiT
 MOSS_EDIT_STEPS = 30
 MOSS_EDIT_CFG = 5.0
 MOSS_MAX_REFS = 4
-# the layouts edit adapters are trained in, as ComfyUI's TextEncodeMOSSImageEdit has them (moss_edit_format): chinoll's
-# Moss-Image-Edit; ai-toolkit's (ostris), whose text encoder sees the references too (each as "Picture N:" before the
-# prompt, at most MOSS_PICTURE_PIXELS, the node's 384 x 384), their latents at most MOSS_AITK_REF_PIXELS (its
+# the layouts edit adapters are trained in (moss_edit_format; ai-toolkit's training code and each adapter's model
+# card): chinoll's Moss-Image-Edit (the references at timestep 0, seeing only each other); ai-toolkit's (ostris), whose
+# text encoder sees the references too (each as "Picture N:" before the prompt, at most MOSS_PICTURE_PIXELS, 384 x
+# 384), their latents at most MOSS_AITK_REF_PIXELS (its
 # control_image_max_pixels, akhaliq's armV5's) and its steps and guidance MOSS-Image's own; ai-toolkit's with its
-# kv_cache off (the references in the sequence at every step, at timestep 0); and "index", ComfyUI's method of that
-# name (the references in the sequence at the image's timestep, no picture to the text encoder; thearkorbit's
+# kv_cache off (the references in the sequence at every step, at timestep 0); and "index" (the references in the
+# sequence at the image's timestep, no picture to the text encoder; thearkorbit's
 # moss-image-edit-lora-poc), its references and steps as ai-toolkit's.  The engine's EDITFMT: word of each but the
 # first (QiRefLayout)
 MOSS_EDIT_FORMATS = ("moss-image-edit", "ai-toolkit", "ai-toolkit-no-kv", "index")
@@ -411,7 +410,7 @@ def model_defaults(cfg: dict) -> dict:
                             else (cfg.get("prompt_start", ANIMA_QUALITY) or "") if anima else ""),
            "transparency": cfg.get("transparency") is not False,
            "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG,
-           # an edit with a mask: Crop and Stitch by default (crop_wanted), MOSS-Image's second pass on request
+           # an edit with a mask: its part cut out by default (crop_wanted), MOSS-Image's second pass on request
            "crop_stitch": cfg.get("crop_stitch") is not False, "refine": bool(moss and can_edit(cfg)),
            # the image tools a chat may use with it (and the Images API's operations): the config's image_tools
            "tools": [t["name"] for t in TOOLS if cfg.get("image_tools") is None or t["name"] in cfg["image_tools"]],
@@ -876,11 +875,11 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
     return out
 
 
-# the sampling guidance of ComfyUI's nodes (the engine's guidance.hpp), by name: each method's parameters as
-# (default, least, most) - the nodes' own defaults and ranges.  The order a request lists them in does not matter: the
-# engine applies APG before CFG, then CFGZero*, skip layer guidance and CFGNorm, and Detail Daemon to the sigma the
-# model is asked at.  cfg_norm, cfg_zero_star and apg act on classifier-free guidance's two predictions: a request
-# without guidance (true_cfg_scale at 1, or no negative prompt for Qwen-Image-2.1) is refused them.
+# the sampling guidance (the engine's guidance.hpp), by name: each method's parameters as (default, least, most).  The
+# order a request lists them in does not matter: the engine applies APG before CFG, then CFGZero*, skip layer guidance
+# and CFGNorm, and Detail Daemon to the sigma the model is asked at.  cfg_norm, cfg_zero_star and apg act on
+# classifier-free guidance's two predictions: a request without guidance (true_cfg_scale at 1, or no negative prompt for
+# Qwen-Image-2.1) is refused them.
 GUIDANCE_METHODS: dict[str, dict[str, tuple]] = {
     "cfg_norm": {"strength": (1.0, 0.0, 100.0)},
     "cfg_zero_star": {},
@@ -894,9 +893,9 @@ GUIDANCE_METHODS: dict[str, dict[str, tuple]] = {
                       "cfg_scale_override": (0.0, 0.0, 100.0)},
 }
 GUIDANCE_NEEDS_CFG = ("cfg_norm", "cfg_zero_star", "apg")
-# Skip layer guidance's blocks by model where ComfyUI's node default (7, 8, 9, made for SD3's) does not suit it:
-# Mage-Flow has 12 blocks, and three of them skipped wash its image out (ComfyUI's as XeStrata's; block 10 alone does
-# too, 4 and 6 do not, 2026-11-05 on the B70); Qwen-Image-2.1 keeps the node's
+# Skip layer guidance's blocks by model where the default (7, 8, 9, made for SD3's) does not suit it: Mage-Flow has
+# 12 blocks, and three of them skipped wash its image out (block 10 alone does too, 4 and 6 do not, 2026-11-05 on the
+# B70); Qwen-Image-2.1 keeps the default
 GUIDANCE_SLG_LAYERS = {"mage-flow": [6]}
 
 
@@ -912,7 +911,7 @@ def guidance_defaults(cfg: dict) -> dict[str, dict[str, tuple]]:
 
 def guidance_methods(cfg: dict) -> list[str]:
     """The guidance methods this image model's sampling takes (model_defaults' guidance_methods): Qwen-Image-2.1's
-    and Mage-Flow's (MageTrail's too), each method checked against ComfyUI's node on that model's sampler; none for
+    and Mage-Flow's (MageTrail's too), each method checked on that model's sampler; none for
     the others (MOSS-Image keeps its own skip-layer guidance, slg_layers and the rest)."""
     return list(GUIDANCE_METHODS) if cfg.get("family") in (None, "", "mage-flow") else []
 
@@ -997,9 +996,8 @@ def guidance_request(req: dict, cfg: dict, job: dict) -> list[dict]:
 
 
 def percent_sigma(cfg: dict, width: int, height: int, percent: float) -> float:
-    """The model's sigma at a share of its schedule, as ComfyUI's model_sampling.percent_to_sigma gives it (skip layer
-    guidance's window): Qwen-Image-2.1's exponential shift by its size's mu (base_sigmas', without the terminal
-    stretch; ModelSamplingFlux), Mage-Flow's static shift (ModelSamplingDiscreteFlow)."""
+    """The model's sigma at a share of its schedule (skip layer guidance's window): Qwen-Image-2.1's exponential
+    shift by its size's mu (base_sigmas', without the terminal stretch), Mage-Flow's static shift."""
     if percent <= 0.0:
         return 1.0
     if percent >= 1.0:
@@ -1175,14 +1173,14 @@ def img2img_strength(steps: int) -> float:
 
 
 def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
-    """An upscale (the edits' `upscale`, the chat's upscale_image, /v1/images/upscale), as ComfyUI's two-pass workflows
-    make one: `image` made larger by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU by
-    `method` (UPSCALE_METHODS: Lanczos, or an upscaler model whose weights image_aux fetches; job["upscaler"]) with its
-    color correction (`color`, UPSCALE_COLORS), then with `redraw` (asked for: not the default, as ComfyUI's upscale
-    nodes draw nothing again) drawn again from it at `strength` (UPSCALE_STRENGTH), an img2img of the whole picture
-    (job["init"], job["upscale"]); past the model's max_side, in tiles as Ultimate SD Upscale draws them (job["tiles"]:
-    UPSCALE_TILE pixels, UPSCALE_PAD of context around each, UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most.
-    Without redraw, the first pass alone (job["ups_only"]: no image model run, one image, the prompt not needed)."""
+    """An upscale (the edits' `upscale`, the chat's upscale_image, /v1/images/upscale) in two passes: `image` made
+    larger by `scale` (1 to UPSCALE_MAX_SCALE; the sides multiples of SIZE_STEP) on the GPU by `method`
+    (UPSCALE_METHODS: Lanczos, or an upscaler model whose weights image_aux fetches; job["upscaler"]) with its color
+    correction (`color`, UPSCALE_COLORS), then with `redraw` (asked for: not the default) drawn again from it at
+    `strength` (UPSCALE_STRENGTH), an img2img of the whole picture (job["init"], job["upscale"]); past the model's
+    max_side, drawn again a tile at a time (job["tiles"]: UPSCALE_TILE pixels, UPSCALE_PAD of context around each,
+    UPSCALE_BLUR of blend), UPSCALE_MAX_SIDE a side at most.  Without redraw, the first pass alone (job["ups_only"]: no
+    image model run, one image, the prompt not needed)."""
     v = req["upscale"]
     if isinstance(v, str):   # a form's field
         try:
@@ -1294,7 +1292,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     image (job["init"]).  size "auto" (or none): the first image's shape at about 1024 x 1024 pixels, its sides
     multiples of SIZE_STEP.  `mask` (OpenAI's): a PNG of the first image's size whose transparent pixels are where it
     changes, the rest kept as it is, as job["mask"].  With a mask and the size left to it (none, "auto" or the first
-    image's own), the edit is Crop and Stitch's (crop_wanted; not with MOSS-Image's layout): job["crop"] its plan
+    image's own), the part is cut out and put back (crop_wanted; not with MOSS-Image's layout): job["crop"] its plan
     (plan_crop), the image the first image's size (job["width"], job["height"]), drawn at the plan's (made_size); a
     mask that changes nothing is job["crop"] {"empty": True} (the picture as it is); a MOSS-Image edit with references
     besides the picture is drawn at the whole picture's plan, and with the request's refine its part cut out of that
@@ -1384,7 +1382,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job = parse_request(req, cfg)
     if edits:
         job["refs"] = list(images)
-        # the references at about 1 MP (Crop and Stitch's first, the picture the engine cuts from, as it is: an
+        # the references at about 1 MP (the cut's first, the picture the engine cuts from, as it is: an
         # ai-toolkit edit's cut again at the references' size beside the drawing's base, _crop_ref)
         if moss:
             keep = 1 if crop is not None and not crop.get("empty") else 0
@@ -1539,22 +1537,20 @@ def parse_fix(v) -> dict:
 
 
 def fix_crop(box: tuple[float, float, float, float], W: int, H: int, cfg: dict) -> dict:
-    """FaceDetailer's crop of a detection's box (make_crop_region): the box times FIX_CROP_FACTOR about its centre,
-    moved inside the picture (the whole side where it is larger), grown on one side to the drawing's shape
-    (_crop_to_shape) -> a plan_crop plan, drawn at crop_gen_size (about 1 MP: FaceDetailer's guide_size of the box's
-    shorter side, capped by its max_size, for a crop three times the box, is always that cap)."""
-    x0, y0, x1, y1 = box
-    cw, ch = (x1 - x0) * FIX_CROP_FACTOR, (y1 - y0) * FIX_CROP_FACTOR
+    """The part of the picture a detection is redrawn in: its box widened FIX_CROP_FACTOR times about its centre, in
+    whole pixels, and slid back inside the picture where it sticks out (the whole side where it is wider), then grown
+    on one side to the drawing's shape (_crop_to_shape) -> a plan_crop plan, drawn at crop_gen_size (about 1 MP)."""
 
-    def place(c: float, n: float, side: int) -> tuple[int, int]:   # normalize_region
-        a = int(c - n / 2)
-        n = int(n)
-        if n >= side:
+    def widened(lo: float, hi: float, side: int) -> tuple[int, int]:
+        length = (hi - lo) * FIX_CROP_FACTOR
+        size = int(length)
+        if size >= side:
             return 0, side
-        a = min(max(a, 0), side - n)
-        return a, a + n
-    ax, bx = place((x0 + x1) / 2, cw, W)
-    ay, by = place((y0 + y1) / 2, ch, H)
+        first = int((lo + hi) / 2 - length / 2)
+        first = min(first, side - size) if first > 0 else 0
+        return first, first + size
+    ax, bx = widened(box[0], box[2], W)
+    ay, by = widened(box[1], box[3], H)
     gw, gh = crop_gen_size(cfg, bx - ax, by - ay)
     x, y, w, h = _crop_to_shape(ax, ay, bx - ax, by - ay, W, H, gw, gh)
     return {"box": [x, y, w, h], "gen": [gw, gh], "blend": FIX_BLEND, "size": [W, H], "whole": False}
@@ -1616,7 +1612,7 @@ def fix_regions(found: list[dict], W: int, H: int, cfg: dict) -> tuple[list[dict
     regions = []
     for d in keep:
         x0, y0, x1, y1 = d["box"]
-        # grown as Impact Pack's dilation of FIX_DILATION grows it: a square of that side centred as OpenCV centres
+        # grown by a dilation of FIX_DILATION: a square of that side centred as OpenCV centres
         # an even one, lo pixels up and left and hi down and right
         hi = FIX_DILATION // 2
         lo = FIX_DILATION - 1 - hi
@@ -1646,7 +1642,7 @@ def crop_share(mask: bytes) -> Any:
 
 def crop_reach(blend: int) -> int:
     """How far past the mask's box the engine's mask reaches (img_crop.hpp): its hole fill's 2 pixels (the closing at
-    the picture's edges; InpaintCropImproved's, checked against scipy), the growth's window's half, ceil(blend / 4 *
+    the picture's edges, checked against scipy), the growth's window's half, ceil(blend / 4 *
     1.5 + 1) // 2, and the Gaussian's cut, int(4 sigma + 0.5) of sigma blend / 8.  The box planned on the server holds
     every pixel at which the engine's mask is above 0."""
     if blend <= 0:
@@ -1679,7 +1675,7 @@ def crop_gen_size(cfg: dict, w: float, h: float) -> tuple[int, int]:
 
 
 def _crop_to_shape(x: int, y: int, w: int, h: int, W: int, H: int, gw: int, gh: int) -> tuple[int, int, int, int]:
-    """InpaintCropImproved's crop_magic_im: the box grown on one side to the drawing's shape and kept inside the
+    """The box grown on one side to the drawing's shape and kept inside the
     picture where it fits, else centred on it (reaching past its edges)."""
     target = gw / gh
     if w / h < target:
@@ -1701,9 +1697,9 @@ def _crop_to_shape(x: int, y: int, w: int, h: int, W: int, H: int, gw: int, gh: 
 
 def plan_crop(image: bytes, mask: bytes, cfg: dict, context: float = CROP_CONTEXT,
               blend: int = CROP_BLEND) -> dict | None:
-    """Crop and Stitch's plan of an edit with a mask (img_crop.hpp, the engine's part, which fills the mask's holes):
-    the box of the mask's values from CROP_HIPASS on (mask_hipass_filter), grown by the engine's reach (crop_reach), by
-    `context` around (context_from_mask_extend_factor) and to the drawing's shape (crop_gen_size, _crop_to_shape).  A
+    """The cut's plan of an edit with a mask (img_crop.hpp, the engine's part, which fills the mask's holes): the box
+    of the mask's values from CROP_HIPASS on, grown by the engine's reach (crop_reach), by `context` around and to the
+    drawing's shape (crop_gen_size, _crop_to_shape).  A
     box the drawing would not enlarge is the whole picture's (drawn at the model's size and put back at the picture's,
     its pixels outside the mask kept).  -> {"box": [x, y, w, h], "gen": [gw, gh], "blend", "size": [W, H], "whole":
     the whole picture}; {"empty": True} for a mask that changes nothing; None for one that changes every pixel (the
@@ -1785,11 +1781,11 @@ def parse_extend(v, w: int, h: int, side: int) -> tuple[int, int, int, int]:
 
 
 def extend_canvas(data: bytes, pads: tuple[int, int, int, int], feather: int = EXTEND_FEATHER) -> tuple[bytes, bytes]:
-    """The first image grown by `pads` (left, top, right, bottom) for an outpaint, as ComfyUI's ImagePadForOutpaint
-    with InpaintCropImproved's extend_for_outpainting: the new area its edges' copies (a base the model continues
-    rather than grey), and the mask (OpenAI's alpha: 0 where the picture changes) the new area, faded into the image
-    over `feather` pixels from each side that grows ((1 - d / feather)^2 of the change at d pixels in) -> (the canvas,
-    the mask) as PNG."""
+    """The first image grown by `pads` (left, top, right, bottom) for an outpaint -> (the canvas, the mask) as PNG.
+    The new area repeats the picture's edge pixels (a base the model continues rather than a flat colour); the mask
+    (OpenAI's alpha: 0 where the picture changes) is the new area, and inside the picture the change fades out over
+    `feather` pixels from each side that grows, as the square of the share of `feather` still to go - a fade that
+    needs room, so a picture no more than twice `feather` on a side keeps all of itself."""
     import io
     import numpy as np
     from PIL import Image
@@ -1797,19 +1793,19 @@ def extend_canvas(data: bytes, pads: tuple[int, int, int, int], feather: int = E
     h, w = im.shape[:2]
     left, t, r, b = pads
     canvas = np.pad(im, ((t, b), (left, r), (0, 0)), mode="edge")
-    change = np.ones(canvas.shape[:2], np.float32)
-    inner = np.zeros((h, w), np.float32)
-    if feather > 0 and feather * 2 < h and feather * 2 < w:
-        ys, xs = np.arange(h, dtype=np.float32)[:, None], np.arange(w, dtype=np.float32)[None, :]
-        big = np.float32(max(h, w))
-        d = np.minimum.reduce([np.broadcast_to(ys if t else big, (h, w)),
-                               np.broadcast_to(h - ys if b else big, (h, w)),
-                               np.broadcast_to(xs if left else big, (h, w)),
-                               np.broadcast_to(w - xs if r else big, (h, w))])
-        inner = np.where(d < feather, ((feather - d) / feather) ** 2, 0).astype(np.float32)
-    change[t:t + h, left:left + w] = inner
+    keep = np.ones(canvas.shape[:2], np.float32)   # 1 where the picture stays as it is
+    keep[:t] = keep[t + h:] = 0
+    keep[:, :left] = keep[:, left + w:] = 0
+    if feather > 0 and min(h, w) > 2 * feather:
+        # the distance to the nearest growing side, by rows and by columns (sides that stay: never near)
+        def reach(n: int, before: int, after: int) -> np.ndarray:
+            at = np.arange(n, dtype=np.float32)
+            far = np.full(n, np.inf, np.float32)
+            return np.minimum(at if before else far, n - at if after else far)
+        near = np.minimum(reach(h, t, b)[:, None], reach(w, left, r)[None, :])
+        keep[t:t + h, left:left + w] = 1 - np.square(np.maximum(feather - near, 0) / feather)
     mask = np.zeros(canvas.shape, np.uint8)
-    mask[..., 3] = np.round((1 - change) * 255).astype(np.uint8)
+    mask[..., 3] = np.round(keep * 255).astype(np.uint8)
     out = []
     for a in (canvas, mask):
         buf = io.BytesIO()
@@ -1840,9 +1836,8 @@ def parse_flag(v, name: str) -> bool | None:
 
 
 def color_match_mode(req: dict, cfg: dict) -> str:
-    """Crop and Stitch's color match as the drawing goes back (the engine's COLOR:): the request's color_match, else
-    the config's, else COLOR_MATCH - "auto" by the part kept around the paint, "full" by the whole cut (ComfyUI's
-    ColorTransfer), "off"."""
+    """The cut's color match as the drawing goes back (the engine's COLOR:): the request's color_match, else the
+    config's, else COLOR_MATCH - "auto" by the part kept around the paint, "full" by the whole cut, "off"."""
     v = req.get("color_match")
     if v is None or v == "":
         v = cfg.get("color_match") or COLOR_MATCH
@@ -1852,8 +1847,8 @@ def color_match_mode(req: dict, cfg: dict) -> str:
 
 
 def crop_wanted(req: dict, cfg: dict) -> bool:
-    """Whether an edit with a mask is drawn by Crop and Stitch: the request's crop_stitch, else the config's (on by
-    default)."""
+    """Whether an edit with a mask is drawn on its part cut out and put back: the request's crop_stitch, else the
+    config's (on by default)."""
     v = parse_flag(req.get("crop_stitch"), "crop_stitch")
     return cfg.get("crop_stitch") is not False if v is None else v
 
@@ -1882,7 +1877,7 @@ def usage(job: dict) -> dict:
         text -= block + refs
     else:
         sizes = [ref_size(*image_dims(r)) for r in job.get("refs") or ()]
-        if sizes and job.get("crop") and not job["crop"].get("empty"):   # Crop and Stitch's first, at the drawing's
+        if sizes and job.get("crop") and not job["crop"].get("empty"):   # the cut's first, at the drawing's
             sizes[0] = (mw, mh)
         refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
         if job.get("init"):   # img2img's image, read at the made size
@@ -1893,7 +1888,7 @@ def usage(job: dict) -> dict:
 
 
 def made_size(job: dict) -> tuple[int, int]:
-    """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP; Crop and Stitch's, the
+    """The size the engine makes for `job`: each side rounded up to a multiple of SIZE_STEP; the cut's, the
     plan's drawing (the engine puts it back into the picture, job["width"] x job["height"])."""
     if job.get("crop") and not job["crop"].get("empty"):
         return job["crop"]["gen"][0], job["crop"]["gen"][1]
@@ -2270,7 +2265,7 @@ def moss_pick_adapter(cfg: dict, name: str) -> dict:
 
 
 def moss_picture(data: bytes, box: list | None = None) -> bytes:
-    """A picture the text encoder of an ai-toolkit MOSS-Image edit sees, as ComfyUI's TextEncodeMOSSImageEdit makes it:
+    """A picture the text encoder of an ai-toolkit MOSS-Image edit sees, as the adapter was trained with it:
     the image (or its `box`, x y w h, its parts past the edges the edges' copies) shrunk by area to at most
     MOSS_PICTURE_PIXELS, then its sides rounded to multiples of 32 (bilinear; process_qwen2vl_images) -> a PNG."""
     import io
@@ -2960,7 +2955,7 @@ class ImageGen:
     def stage(self, job: dict) -> None:
         """An edit's reference images, img2img's image and a mask into files the engine reads (job["ref_paths"],
         job["init_path"], job["mask_path"]); an ai-toolkit MOSS-Image edit's pictures too (job["pic_paths"],
-        moss_picture: the first one Crop and Stitch's box of it); unstage removes them."""
+        moss_picture: the first one the cut's box of it); unstage removes them."""
         if (job.get("refs") or job.get("init")) and not job.get("ref_dir"):
             work = Path(tempfile.mkdtemp(prefix="refs-", dir=self.dir))
             job["ref_dir"] = str(work)
@@ -3005,7 +3000,7 @@ class ImageGen:
 
     @staticmethod
     def _crop_ref(job: dict) -> tuple[int, int] | None:
-        """An ai-toolkit (or "index") MOSS-Image edit's first reference beside a Crop and Stitch drawing: the cut at the
+        """An ai-toolkit (or "index") MOSS-Image edit's first reference beside a cut's drawing: the cut at the
         references' size (MOSS_AITK_REF_PIXELS), as the other references are, where it is smaller than the drawing."""
         if not (job.get("edit_format") in MOSS_EDITFMT_WORDS and job.get("refs")):
             return None
@@ -3118,7 +3113,7 @@ class ImageGen:
         return n, f" NEG:{len(job['neg_ids']) - self.drop_of(job) + wide}"
 
     def _refine_job(self, job: dict, picture: bytes | None = None) -> dict:
-        """The second pass of a job with "refine" (CROP_REFINE_STRENGTH): its Crop and Stitch plan and strength, the
+        """The second pass of a job with "refine" (CROP_REFINE_STRENGTH): its cut's plan and strength, the
         first pass's `picture` as the first reference (the first image's until then), its own files staged."""
         job2 = {k: v for k, v in job.items()
                 if k not in ("ref_dir", "ref_paths", "pic_paths", "mask_path", "init_path", "refine")}
@@ -3328,7 +3323,7 @@ class ImageGen:
                 if job.get("choose_size"):
                     self._choose_size(job, timeout, cancel)
                 mw, mh = made_size(job)
-                # the engine's RGBA rows: the size made (cut to the size asked for), or Crop and Stitch's picture; an
+                # the engine's RGBA rows: the size made (cut to the size asked for), or the cut's picture; an
                 # upscale in tiles is asked at its whole size (the engine draws it tile by tile: upscale_tiles)
                 whole = crop and not crop.get("empty") or job.get("tiles")
                 rw, rh = (job["width"], job["height"]) if whole else (mw, mh)
@@ -3424,7 +3419,7 @@ class ImageGen:
                    **({"enhance": job["enhanced"]} if job.get("enhanced") else {})}
         if (mw, mh) != (job["width"], job["height"]) and not crop.get("empty"):   # made larger and cut, or a part
             figures["made_size"] = f"{mw}x{mh}"                                    # drawn larger: the web page says so
-        if crop:   # Crop and Stitch: the box drawn (on the picture, x y w h) or nothing to change
+        if crop:   # the cut: the box drawn (on the picture, x y w h) or nothing to change
             figures["crop"] = ({"empty": True} if crop.get("empty") else
                                {"box": list(crop["box"]), "whole": bool(crop.get("whole"))})
         if job.get("refine"):   # its second pass: the part cut out of the first and drawn again
@@ -4936,9 +4931,9 @@ def upscale_images(svc, gen: ImageGen, job: dict,
 
 def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -> dict:
     """One Detailer region's img2img: the picture (as it is after the regions before) with the region's mask, drawn
-    at the fix's strength in the region's crop (Crop and Stitch, img_crop.hpp), the image at the picture's size.  A
-    model that edits draws it as img2img too, from the cut and the prompt without the picture as a reference, as
-    FaceDetailer's KSampler does (an edit's reference would add the vision encoder's pass and its tokens to every
+    at the fix's strength in the region's crop (the cut, img_crop.hpp), the image at the picture's size.  A
+    model that edits draws it as img2img too, from the cut and the prompt without the picture as a reference (an
+    edit's reference would add the vision encoder's pass and its tokens to every
     step)."""
     req = {**job["fix_req"], "strength": job["fix"]["strength"], "seed": seed, "n": 1}
     one = parse_edit_request(req, [picture], {**gen.cfg, "edit_lora": None, "vision": None},
@@ -4946,16 +4941,15 @@ def fix_job(gen: ImageGen, job: dict, picture: bytes, region: dict, seed: int) -
     one.update(crop=region["crop"], width=job["width"], height=job["height"], n=1, seed=seed)
     one.pop("refine", None)
     if gen.cfg.get("schedule") == "turbo":
-        # the Turbo's own sigmas put half its steps above 0.89 (its schedule is a picture's from noise): its second
-        # half redraws a face anew (the expression lost, 2026-11-05).  The base model's schedule (base_sigmas, ComfyUI's
-        # and diffusers' Qwen-Image-2.1 one) starts its second half at 0.58, as FaceDetailer's denoise 0.5 does there
-        # (0.67): the face drawn finer, as it was
+        # the Turbo's own sigmas put half its steps above 0.89 (its schedule is a picture's from noise): its second half
+        # redraws a face anew (the expression lost, 2026-11-05).  The base model's schedule (base_sigmas, diffusers'
+        # Qwen-Image-2.1 one) starts its second half at 0.58: the face drawn finer, as it was
         one["sigmas"] = base_sigmas(one["steps"], *region["crop"]["gen"])
     return one
 
 
 def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict, str]:
-    """The Detailer (fix_image, the edits' `fix`), as Impact Pack's FaceDetailer: the picture's parts found once
+    """The Detailer (fix_image, the edits' `fix`): the picture's parts found once
     (the engine's YOLOv8 detectors, image_aux's weights: AuxPending while they download), then each region (fix_regions,
     largest first) drawn again in turn on the picture as the regions before left it, in one GPU turn.  Region k's seed
     is the job's + k (fixed after the detection, whatever is skipped), candidate i's the job's + 1000 i.  budget_s is

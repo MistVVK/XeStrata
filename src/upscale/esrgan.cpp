@@ -277,7 +277,7 @@ Esrgan::Esrgan(const std::string& path) : impl_(std::make_unique<Impl>()) {
     info_.scale = 4;
     info_.context = kContext;
     info_.min_tile = 64;
-    info_.color = ColorFix::none;   // ComfyUI's ImageUpscaleWithModel corrects nothing
+    info_.color = ColorFix::none;   // the model's output as it is
 }
 
 Esrgan::~Esrgan() {

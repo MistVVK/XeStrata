@@ -458,7 +458,7 @@
   "img.gStrength": "강도",
   "img.gZeroTitle": "CFG-Zero*: 가이던스 전에 네거티브 예측을 프롬프트 예측에 맞춰 줄입니다. CFG가 필요합니다",
   "img.cropStitch": "칠한 부분을 잘라 내어 크게 그리기",
-  "img.cropStitchTitle": "Crop and Stitch: 칠한 부분 주변을 약 1024x1024로 다시 그려 붙입니다. 끄면 출력 크기 그대로 다시 그립니다",
+  "img.cropStitchTitle": "칠한 부분 주변을 약 1024x1024로 다시 그려 붙입니다. 끄면 출력 크기 그대로 다시 그립니다",
   "img.refine": "칠한 부분을 한 번 더 세밀하게 그리기 (시간은 약 1.6배)",
   "img.refineTitle": "MOSS-Image에서 이미지가 2장 이상일 때: 먼저 전체를 그리고, 거기서 칠한 부분을 잘라 내어 다시 그립니다",
   "img.madeCrop": "(칠한 부분 주변을 {size}로 그림)",

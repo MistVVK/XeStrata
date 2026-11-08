@@ -795,7 +795,7 @@ void MossDit::build_lora_targets() {
         add(p + "ffn_down", b.down, 0, b.down.n, 0, true);
     }
     // the 42 blocks: proj.q, proj.k, proj.v (or one proj.qkv, its rows q's, k's and v's, as a trainer that fuses them
-    // writes it: ComfyUI cuts it the same way), proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
+    // writes it), proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const std::string p = "layers." + std::to_string(bi) + ".proj.";
         Block& b = blocks_[(size_t) bi];

@@ -152,41 +152,45 @@ struct Win {
     int64_t t0, t1, h0, h1, w0, w1;
 };
 
-// the reference's 720pwin_by_size_bysize (regular) and 720pswin_by_size_bysize (shifted by half a window) windows of a
-// t x h x w grid, num (nt, nh, nw) windows of the 720p grid, in its order (the width's windows outermost)
-std::vector<Win> windows_of(int64_t t, int64_t h, int64_t w, bool shifted, const int64_t num[3]) {
-    const double scale = std::sqrt((45.0 * 80.0) / (double) (h * w));
-    const int64_t rh = py_round((double) h * scale), rw = py_round((double) w * scale);
-    const int64_t wh = (rh + num[1] - 1) / num[1], ww = (rw + num[2] - 1) / num[2];
-    const int64_t wt = (std::min<int64_t>(t, 30) + num[0] - 1) / num[0];
-    std::vector<Win> out;
-    if (!shifted) {
-        const int64_t nt = (t + wt - 1) / wt, nh = (h + wh - 1) / wh, nw = (w + ww - 1) / ww;
-        for (int64_t iw = 0; iw < nw; ++iw)
-            for (int64_t ih = 0; ih < nh; ++ih)
-                for (int64_t it = 0; it < nt; ++it) {
-                    Win v{it * wt, std::min((it + 1) * wt, t), ih * wh, std::min((ih + 1) * wh, h), iw * ww,
-                          std::min((iw + 1) * ww, w)};
-                    if (v.t1 > v.t0 && v.h1 > v.h0 && v.w1 > v.w0) out.push_back(v);
-                }
+using Span = std::pair<int64_t, int64_t>;   // [first, end) along one axis
+
+// One axis of `side` tokens cut into spans of `size`: back to back from 0, or, for the shifted layers, the same cut
+// moved back by half a span (the first span its later half, the last one cut at the side).  The half rounds as the
+// model's training layout rounds it: a span starts (size + 1) / 2 and ends size / 2 past its multiple of size.  An
+// axis no longer than a span stays one span either way.
+std::vector<Span> axis_spans(int64_t side, int64_t size, bool shifted) {
+    std::vector<Span> out;
+    if (!shifted || size >= side) {
+        for (int64_t at = 0; at < side; at += size) out.emplace_back(at, std::min(at + size, side));
         return out;
     }
-    const double st = wt < t ? 0.5 : 0.0, sh = wh < h ? 0.5 : 0.0, sw = ww < w ? 0.5 : 0.0;
-    const int64_t nt = st > 0 ? (int64_t) std::ceil(((double) t - st) / (double) wt) + 1 : 1;
-    const int64_t nh = sh > 0 ? (int64_t) std::ceil(((double) h - sh) / (double) wh) + 1 : 1;
-    const int64_t nw = sw > 0 ? (int64_t) std::ceil(((double) w - sw) / (double) ww) + 1 : 1;
-    // int() of the reference: toward zero
-    const auto lo = [](int64_t i, double s, int64_t n) { return std::max<int64_t>((int64_t) (((double) i - s) * (double) n), 0); };
-    const auto hi = [](int64_t i, double s, int64_t n, int64_t side) {
-        return std::min<int64_t>((int64_t) (((double) i - s + 1.0) * (double) n), side);
-    };
-    for (int64_t iw = 0; iw < nw; ++iw)
-        for (int64_t ih = 0; ih < nh; ++ih)
-            for (int64_t it = 0; it < nt; ++it) {
-                Win v{lo(it, st, wt), hi(it, st, wt, t), lo(ih, sh, wh), hi(ih, sh, wh, h), lo(iw, sw, ww),
-                      hi(iw, sw, ww, w)};
-                if (v.t1 > v.t0 && v.h1 > v.h0 && v.w1 > v.w0) out.push_back(v);
-            }
+    const int64_t before = (size + 1) / 2, after = size / 2;
+    for (int64_t k = 0, count = (side - 1) / size + 2; k < count; ++k) {
+        const int64_t first = std::max<int64_t>(k * size - before, 0), end = std::min(k * size + after, side);
+        if (end > first) out.emplace_back(first, end);
+    }
+    return out;
+}
+
+// The attention windows of a t x h x w token grid, as the model was trained on them: a 720p frame's grid (45 x 80
+// tokens) and 30 frames split into num (frames, rows, columns) parts give a window's size, the grid scaled to 720p's
+// area first; the windows tile the grid regular or shifted by half a window, the columns' spans outermost and the
+// frames' innermost.
+std::vector<Win> windows_of(int64_t t, int64_t h, int64_t w, bool shifted, const int64_t num[3]) {
+    constexpr double kFrameTokens = 45.0 * 80.0;
+    constexpr int64_t kClipFrames = 30;
+    const double to720 = std::sqrt(kFrameTokens / (double) (h * w));
+    const auto ceil_div = [](int64_t a, int64_t b) { return (a + b - 1) / b; };
+    const int64_t rows = ceil_div(py_round((double) h * to720), num[1]);
+    const int64_t cols = ceil_div(py_round((double) w * to720), num[2]);
+    const int64_t frames = ceil_div(std::min(t, kClipFrames), num[0]);
+    const std::vector<Span> ts = axis_spans(t, frames, shifted), hs = axis_spans(h, rows, shifted),
+                            ws = axis_spans(w, cols, shifted);
+    std::vector<Win> out;
+    out.reserve(ts.size() * hs.size() * ws.size());
+    for (const Span& c : ws)
+        for (const Span& r : hs)
+            for (const Span& f : ts) out.push_back(Win{f.first, f.second, r.first, r.second, c.first, c.second});
     return out;
 }
 

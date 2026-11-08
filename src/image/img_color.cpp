@@ -38,7 +38,7 @@ struct Buffers {
     }
 };
 
-// sRGB (0 .. 255) <-> CIE Lab, D65, as kornia's rgb_to_lab and lab_to_rgb (ComfyUI's ColorTransfer)
+// sRGB (0 .. 255) <-> CIE Lab, D65, as kornia's rgb_to_lab and lab_to_rgb
 inline void to_lab(float r, float g, float b, float* lab) {
     auto lin = [](float v) { v /= 255.0f; return v > 0.04045f ? sycl::pow((v + 0.055f) / 1.055f, 2.4f) : v / 12.92f; };
     const float R = lin(r), G = lin(g), B = lin(b);

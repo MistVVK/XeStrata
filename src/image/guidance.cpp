@@ -31,13 +31,11 @@ sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 constexpr int kSums = 4;   // the most sums one reduction makes
 constexpr double kPi = 3.14159265358979323846;   // MSVC's <cmath> has no M_PI without a define
 
-// numpy's linspace(a, b, num)
-std::vector<double> linspace(double a, double b, int64_t num) {
-    std::vector<double> v((size_t) std::max<int64_t>(num, 0));
-    if (num == 1) v[0] = a;
-    for (int64_t i = 0; num > 1 && i < num; ++i) v[(size_t) i] = a + (b - a) * (double) i / (double) (num - 1);
-    if (num > 1) v.back() = b;
-    return v;
+// point k of `count` evenly spaced from `from` to `to`, both ends exact (numpy's linspace, value for value)
+double even_point(double from, double to, int64_t k, int64_t count) {
+    if (count <= 1 || k == 0) return from;
+    if (k == count - 1) return to;
+    return from + (to - from) * (double) k / (double) (count - 1);
 }
 
 // Python's round() to an int: halves to even
@@ -76,29 +74,32 @@ void sums(void* s, int64_t n, size_t wg, size_t groups, float* part, float* out,
 }  // namespace
 
 std::vector<float> detail_daemon_schedule(const GuidanceSpec& g, int steps) {
-    // make_detail_daemon_schedule, in doubles as numpy works it
-    const double start = std::min(g.dd_start, g.dd_end), end = g.dd_end;
-    const double mid = start + g.dd_bias * (end - start);
-    std::vector<double> m((size_t) std::max(steps, 0), 0.0);
+    // Each step's multiplier on its own: the offsets before the window and after it; inside, a climb from the first
+    // step to the peak and a descent from the peak to the last, each eased by half a cosine (when smooth), raised to
+    // the exponent and spread from its offset to the amount; the fade lowers it.  The steps are Python's round() of
+    // the window's shares and a ramp's points numpy's linspace's, in doubles, so the values are Detail Daemon's own,
+    // bit for bit.
     if (steps <= 0) return {};
-    const int64_t si = py_round(start * (steps - 1)), mi = py_round(mid * (steps - 1)), ei = py_round(end * (steps - 1));
-    auto shape = [&](std::vector<double> v, double offset) {
-        for (double& x : v) {
-            if (g.dd_smooth) x = 0.5 * (1.0 - std::cos(x * kPi));
-            x = std::pow(x, (double) g.dd_exponent);
-        }
-        if (std::any_of(v.begin(), v.end(), [](double x) { return x != 0.0; }))
-            for (double& x : v) x = x * ((double) g.dd_amount - offset) + offset;
-        return v;
+    const double first = std::min(g.dd_start, g.dd_end), last = g.dd_end, span = (double) (steps - 1);
+    const int64_t s0 = py_round(first * span), peak = py_round((first + g.dd_bias * (last - first)) * span),
+                  s1 = py_round(last * span);
+    const auto ramp = [&](double t, double base) {
+        const double eased = g.dd_smooth ? 0.5 * (1.0 - std::cos(t * kPi)) : t;
+        return std::pow(eased, (double) g.dd_exponent) * ((double) g.dd_amount - base) + base;
     };
-    const std::vector<double> sv = shape(linspace(0.0, 1.0, mi - si + 1), g.dd_start_offset);
-    const std::vector<double> ev = shape(linspace(1.0, 0.0, ei - mi + 1), g.dd_end_offset);
-    for (size_t k = 0; k < sv.size() && si + (int64_t) k < steps; ++k) m[(size_t) si + k] = sv[k];
-    for (size_t k = 0; k < ev.size() && mi + (int64_t) k < steps; ++k) m[(size_t) mi + k] = ev[k];
-    for (int64_t k = 0; k < std::min<int64_t>(si, steps); ++k) m[(size_t) k] = g.dd_start_offset;
-    for (int64_t k = ei + 1; k < steps; ++k) m[(size_t) k] = g.dd_end_offset;
-    std::vector<float> out(m.size());
-    for (size_t k = 0; k < m.size(); ++k) out[k] = (float) (m[k] * (1.0 - (double) g.dd_fade));
+    std::vector<float> out((size_t) steps);
+    for (int64_t k = 0; k < steps; ++k) {
+        double v;
+        if (k < s0)
+            v = g.dd_start_offset;
+        else if (k > s1)
+            v = g.dd_end_offset;
+        else if (k < peak)   // a climb of two points or more: it reaches 1, so it is spread
+            v = ramp(even_point(0.0, 1.0, k - s0, peak - s0 + 1), g.dd_start_offset);
+        else                 // the descent, from 1 at the peak (the peak's own point is the descent's)
+            v = ramp(even_point(1.0, 0.0, k - peak, s1 - peak + 1), g.dd_end_offset);
+        out[(size_t) k] = (float) (v * (1.0 - (double) g.dd_fade));
+    }
     return out;
 }
 
@@ -137,38 +138,29 @@ void Guidance::release() {
 
 float Guidance::model_sigma(float sigma) const {
     if (!g_.dd || dd_.size() < 2 || sig_.size() < 2) return sigma;
-    // DetailDaemonSamplerNode's model_wrapper: outside the schedule's sigmas, the sigma as it is
-    const float smax = sig_.front(), smin = (float) ((double) sig_.back() + 1e-05);
-    if (!(smin <= sigma && sigma <= smax)) return sigma;
-    // get_dd_schedule: the nearest of the steps' sigmas, else the two around it interpolated
+    // a sigma past the schedule's (above its first, or within 1e-5 of its end) is asked as it is
+    if (sigma > sig_.front() || sigma < (float) ((double) sig_.back() + 1e-05)) return sigma;
+    // the multiplier at the sigma: the steps' sigmas fall, so the first at or below it and the one before bound it,
+    // and between the two it goes straight; below the last step's, that step's
     const size_t len = dd_.size();
     float d = 0.0f;
-    if (sigma > 0.0f && sig_.back() <= sigma && sigma <= sig_.front()) {
-        size_t idx = 0;
-        float best = std::fabs(sig_[0] - sigma);
-        for (size_t k = 1; k + 1 < sig_.size(); ++k) {
-            const float dk = std::fabs(sig_[k] - sigma);
-            if (dk < best) {
-                best = dk;
-                idx = k;
-            }
-        }
-        if ((idx == 0 && sigma >= sig_[0]) || (idx == len - 1 && sigma <= sig_[sig_.size() - 2]) || best == 0.0f) {
-            d = dd_[idx];
+    if (sigma > 0.0f && sigma >= sig_.back()) {
+        size_t below = 0;
+        while (below < len && sig_[below] > sigma) ++below;
+        if (below == len) {
+            d = dd_[len - 1];
+        } else if (below == 0 || sig_[below] == sigma) {
+            d = dd_[below];
         } else {
-            const size_t lo = sigma > sig_[idx] ? idx : idx + 1, hi = sigma > sig_[idx] ? idx - 1 : idx;
-            const float nl = sig_[lo], nh = sig_[hi];
-            if (nh - nl == 0.0f) {
-                d = dd_[lo];
-            } else {
-                const float r = std::clamp((sigma - nl) / (nh - nl), 0.0f, 1.0f);
-                d = dd_[lo] + r * (dd_[hi] - dd_[lo]);   // torch.lerp
-            }
+            const float at = sig_[below], above = sig_[below - 1];
+            const float r = std::clamp((sigma - at) / (above - at), 0.0f, 1.0f);
+            d = dd_[below] + r * (dd_[below - 1] - dd_[below]);
         }
     }
-    const double cfg = g_.dd_cfg > 0.0f ? (double) g_.dd_cfg : (double) cfg_;
-    const double adj = (double) d * 0.1;
-    return sigma * (float) std::max(1e-06, 1.0 - adj * cfg);
+    // the model sees a sigma lowered by a tenth of the multiplier per unit of guidance scale (the override, else the
+    // request's), never below 1e-6 of it
+    const double scale = g_.dd_cfg > 0.0f ? (double) g_.dd_cfg : (double) cfg_;
+    return sigma * (float) std::max(1e-06, 1.0 - (double) d * 0.1 * scale);
 }
 
 bool Guidance::skip_pass(float sigma) const {
@@ -281,7 +273,7 @@ void Guidance::denoised(const float* x, const float* c, const float* u, const fl
 void Guidance::dump(const float* x, const float* c, const float* u, const float* k, float sigma, const float* den) {
     // STRATA_GUIDANCE_DUMP=<folder>: each call's inputs and result as raw FP32 files (g<run>_step<i>_<x|c|u|k|den>.f32,
     // a run one guided sampling of this process) and a line of meta.txt (the run, the step, the model's sigma, cfg, n,
-    // channels, layout): what checks the methods against ComfyUI's nodes on the same values
+    // channels, layout): what checks the methods against a reference on the same values
     const char* dir = strata::env_get("GUIDANCE_DUMP");
     if (dir == nullptr || *dir == '\0') return;
     gpu::stream_sync(s_);

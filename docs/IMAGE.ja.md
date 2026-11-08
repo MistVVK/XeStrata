@@ -226,22 +226,21 @@ Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。�
 
 #### サンプリングのガイダンス（`guidance`）
 
-Qwen-Image-2.1 と Mage-Flow（MageTrail も）は、ComfyUI のノードと同じサンプリングの工夫を受けます（生成と編集の両方）。
+Qwen-Image-2.1 と Mage-Flow（MageTrail も）は、サンプリングのガイダンス（CFG の掛け方の工夫と、モデルに渡す sigma の調整）を受けます（生成と編集の両方）。
 `guidance` に名前の配列（`["detail_daemon"]`）か、名前とパラメーターのオブジェクトの配列（`[{"name": "apg", "eta": 0.5}]`）を付けます。どれも、付けなければ掛けません。
 
-| 名前 | ComfyUI のノード | パラメーター（既定） | 働き |
-| --- | --- | --- | --- |
-| `cfg_norm` | CFGNorm | `strength`（1） | CFG の後の予測を、位置ごとにチャンネル方向の大きさがプロンプトの予測を超えないように縮めます。CFG が要ります |
-| `cfg_zero_star` | CFGZeroStar | なし | ネガティブの予測を、プロンプトの予測への射影の係数で縮めてから CFG を掛けます。CFG が要ります |
-| `apg` | APG | `eta`（1）、`norm_threshold`（5）、`momentum`（0） | CFG の差の大きさを `norm_threshold` までに抑え、プロンプトの予測に平行な分を `eta` 倍にします（色の飽和を抑えます）。CFG が要ります |
-| `skip_layer_guidance` | SkipLayerGuidanceDiT | `layers`（Qwen-Image-2.1 は `[7, 8, 9]`、Mage-Flow は `[6]`。Mage-Flow はブロックが 12 しかなく、3 つ飛ばすと絵が白っぽく崩れます）、`scale`（3）、`start`（0.01）、`end`（0.15）、`rescaling_scale`（0） | `layers` のブロックを飛ばしたプロンプトをもう 1 回計算し、差の `scale` 倍を足します。`start`〜`end` はスケジュールの割合で、その間のステップだけ計算が 1 回分増えます。CFG 1 でも使えます |
-| `detail_daemon` | Detail Daemon（Jonseed の DetailDaemonSamplerNode） | `detail_amount`（0.1）、`start`（0.2）、`end`（0.8）、`bias`（0.5）、`exponent`（1）、`start_offset`（0）、`end_offset`（0）、`fade`（0）、`smooth`（true）、`cfg_scale_override`（0） | サンプラーの sigma と刻みはそのままで、モデルに渡す sigma だけを少し小さくして細部を足します。小さくする量は CFG の強さ倍です（`cfg_scale_override` が 0 なら要求の CFG、CFG なしは 1）。CFG 1 でも使えます |
+| 名前 | パラメーター（既定） | 働き |
+| --- | --- | --- |
+| `cfg_norm` | `strength`（1） | CFG の後の予測を、位置ごとにチャンネル方向の大きさがプロンプトの予測を超えないように縮めます。CFG が要ります |
+| `cfg_zero_star` | なし | ネガティブの予測を、プロンプトの予測への射影の係数で縮めてから CFG を掛けます。CFG が要ります |
+| `apg` | `eta`（1）、`norm_threshold`（5）、`momentum`（0） | CFG の差の大きさを `norm_threshold` までに抑え、プロンプトの予測に平行な分を `eta` 倍にします（色の飽和を抑えます）。CFG が要ります |
+| `skip_layer_guidance` | `layers`（Qwen-Image-2.1 は `[7, 8, 9]`、Mage-Flow は `[6]`。Mage-Flow はブロックが 12 しかなく、3 つ飛ばすと絵が白っぽく崩れます）、`scale`（3）、`start`（0.01）、`end`（0.15）、`rescaling_scale`（0） | `layers` のブロックを飛ばしたプロンプトをもう 1 回計算し、差の `scale` 倍を足します。`start`〜`end` はスケジュールの割合で、その間のステップだけ計算が 1 回分増えます。CFG 1 でも使えます |
+| `detail_daemon` | `detail_amount`（0.1）、`start`（0.2）、`end`（0.8）、`bias`（0.5）、`exponent`（1）、`start_offset`（0）、`end_offset`（0）、`fade`（0）、`smooth`（true）、`cfg_scale_override`（0） | サンプラーの sigma と刻みはそのままで、モデルに渡す sigma だけを少し小さくして細部を足します。小さくする量は CFG の強さ倍です（`cfg_scale_override` が 0 なら要求の CFG、CFG なしは 1）。CFG 1 でも使えます |
 
 - CFG が要る 3 つは、CFG のない要求（Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるとき、Mage-Flow は CFG の強さが 1 より大きいときに CFG が掛かります）では 400 です。
   受けないモデル（HunyuanImage 3.0、MOSS-Image、Anima）、同じ名前を 2 度、知らないパラメーター、範囲の外の値も 400 です。MOSS-Image は自分の `slg_layers` などを使います。
-- 名前の並びの順によらず、APG（CFG の前）→ CFG → CFGZero* → Skip Layer Guidance → CFGNorm の順に掛け、Detail Daemon はモデルに渡す sigma に掛かります。
-- 式は ComfyUI と同じく、速度ではなく予測した画像（x0 = x − sigma v）の上で計算します。
-  Qwen-Image-2.1（Euler）と Mage-Flow（Euler と er_sde）の各ステップで、エンジンの入力を ComfyUI のノードの関数に渡した結果と相対誤差 2e-6 以下で一致することを確かめています。
+- 名前の並びの順によらず、`apg`（CFG の前）→ CFG → `cfg_zero_star` → `skip_layer_guidance` → `cfg_norm` の順に掛け、`detail_daemon` はモデルに渡す sigma に掛かります。
+- 式は、速度ではなく予測した画像（x0 = x − sigma v）の上で計算します。
 - APG の `momentum` の積み上げは、1 枚・1 タイル・1 か所の描き直しごとに 0 から始めます。
 - 使える方式とパラメーターの範囲は、`/health` と `--describe` の画像のモデルごとの `guidance_methods` に出ます。Web の画像の画面では「サンプリングのガイダンス」の欄で選びます。
 
@@ -315,39 +314,39 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - **参照画像の読み方**: Qwen-Image-2.1 は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024x1024 ピクセルで読みます。参照画像が多いほど時間とメモリがかかります。
   Mage-Flow は、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます。
   HunyuanImage 3.0 は、参照画像を縦横比のいちばん近いバケットの大きさに切り出して VAE で読み（1024x1024 なら 64x64 = 4,096 トークン）、SigLIP2 でも読みます（最大 1,024 パッチ）。参照画像 1 枚でおよそ 5,000 トークンが増え、その分 1 ステップが長くなります。
-  MOSS-Image は、参照画像を 1 枚ずつ縦横比を保った約 1024x1024 ピクセルにして VAE で読み、最初に 1 度だけ DiT に通して、各ステップで描く画像がそれを見ます（ComfyUI の MOSS-Image の編集の Moss-Image-Edit の形。文の読み手は画像を見ません）。参照画像 1 枚で約 2 GB の VRAM を使います。
+  MOSS-Image は、参照画像を 1 枚ずつ縦横比を保った約 1024x1024 ピクセルにして VAE で読み、最初に 1 度だけ DiT に通して、各ステップで描く画像がそれを見ます（chinoll の Moss-Image-Edit の形。文の読み手は画像を見ません）。参照画像 1 枚で約 2 GB の VRAM を使います。
 - **マスク**: `mask` に、1 枚目の画像と同じ大きさのアルファ付きの PNG を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します。どのモデルでも使えます。
-  `size` を付けないか、`auto` か 1 枚目の画像と同じ大きさのときは、塗った部分の周りを切り出し、モデルの得意な約 1024x1024 ピクセルに拡大して描き直し、縮めて元の画像に貼り戻します（ComfyUI の Inpaint Crop and Stitch の手順と既定値）。顔のような小さな部分も細かく描け、出力は 1 枚目の画像と同じ大きさです。
+  `size` を付けないか、`auto` か 1 枚目の画像と同じ大きさのときは、塗った部分の周りを切り出し、モデルの得意な約 1024x1024 ピクセルに拡大して描き直し、縮めて元の画像に貼り戻します。顔のような小さな部分も細かく描け、出力は 1 枚目の画像と同じ大きさです。
    - 貼り戻しの縁はぼかすので、塗った部分のすぐ外（数十ピクセル）も少し変わります。それより外の画素は 1 枚目の画像とまったく同じです。
    - 切り出す範囲は、塗った部分の 1.2 倍です。参照画像が 2 枚以上のとき（「画像 2 の顔に差し替える」など）は、周りがよく分かるよう 1.6 倍です。
    - 塗った部分が大きく、切り出しても拡大にならないときは、画像全体を約 1024x1024 ピクセルで描き直し、元の大きさに戻して貼り戻します。
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
-   - `color_match` に `auto` を付けると、描いた部分を貼り戻す前に、塗った部分のすぐ外（元のまま残る所）で元の画像と描いた画像の色（Lab の平均と標準偏差）をそろえ、モデルの色のずれだけを直します。塗った部分の中で頼んだ色の変更は打ち消しません。`full` は ComfyUI の Transfer Color（reinhard_lab）と同じく、切り出した全体の色を元の画像に寄せます（頼んだ色の変更も薄まります）。既定は `off`（設定の `images` の `color_match` で変えられます）で、試したモデル（Qwen-Image-2.1-Turbo、MOSS-Image）では描いた後の色のずれが小さかったためです。
-   - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です（ComfyUI の Text Encode MOSS-Image Edit の ai-toolkit と同じ）。
-   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（ComfyUI の Edit Model Reference Method の `index`。thearkorbit の moss-image-edit-lora-poc）は `index` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
+   - `color_match` に `auto` を付けると、描いた部分を貼り戻す前に、塗った部分のすぐ外（元のまま残る所）で元の画像と描いた画像の色（Lab の平均と標準偏差）をそろえ、モデルの色のずれだけを直します。塗った部分の中で頼んだ色の変更は打ち消しません。`full` は、切り出した全体の色（Lab の平均と標準偏差）を元の画像に寄せます（頼んだ色の変更も薄まります）。既定は `off`（設定の `images` の `color_match` で変えられます）で、試したモデル（Qwen-Image-2.1-Turbo、MOSS-Image）では描いた後の色のずれが小さかったためです。
+   - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です。
+   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（thearkorbit の moss-image-edit-lora-poc）は `index` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
    - LoRA の置き場（`lora_dir`）に置いた MOSS-Image の編集の LoRA も、形がファイルから分かれば選べます。分かるのは、隣の `<名前>.json` の `"edit_format"`、Moss-Image-Edit の形のメタデータ（`adapter_config` の `moss-edit-lora`）、ai-toolkit が出力に書く学習の設定（隣の `<名前>.yaml` か、ジョブの名前が同じ `config.yaml`）の `model_kwargs` の `edit` と `kv_cache` です。チャットで「armv6 の LoRA で」のように名指しすると、チャットのモデルが `edit_image` の `edit_adapter` でその LoRA を選び、Images API の編集でも `edit_adapter` に名前を書けます。使えない名前（形の分からない LoRA など）は、既定の LoRA で描かずに理由を返します。
-   - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです（ComfyUI の Inpaint Crop and Stitch でも同じでした）。
+   - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです。
      `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
    - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
-- **描き足し**: `extend` に `{"left": 256, "bottom": 128}` のような上下左右の画素か、`{"aspect": "16:9"}` のような形を付けると、1 枚目の画像の外側を描き足します（ComfyUI の ImagePadForOutpaint と同じく、足した部分と、元の画像の縁から 40 ピクセルの内側を描き直し、元の画像のそれより内側はそのまま残します）。足した部分は縁の画素で下塗りします。形を付けたときは、足りない向きの両側に同じだけ足します。マスクとは一緒に使えません。出力は足した後の大きさで、一辺は `max_side` までです。
-- **拡大**: `upscale` に `{"scale": 2}`（倍率は 1 より大きく 4 まで）を付けると、1 枚目の画像を拡大の手段で大きくします（ComfyUI の拡大のノードと同じく、それだけでは描き直しません）。`{"scale": 2, "redraw": true}` で、その大きさで strength 0.35 で描き直します（ComfyUI でよく使う 2 段描きと同じ。`"strength": 0.5` で strength も変えられます）。描き直す大きさが `max_side` を超えるときは、Ultimate SD Upscale と同じく 1024 ピクセルのタイル（周りに 128 ピクセル、縁を 32 ピクセルぼかす。Ultimate SD Upscale の既定の 32 と 8 では、タイルの境目にかかる服が崩れたため広げています）に分けて描き直します。一辺は 4096 までです。マスク・`extend` と一緒には使えません。
+- **描き足し**: `extend` に `{"left": 256, "bottom": 128}` のような上下左右の画素か、`{"aspect": "16:9"}` のような形を付けると、1 枚目の画像の外側を描き足します（足した部分と、元の画像の縁から 40 ピクセルの内側を描き直し、元の画像のそれより内側はそのまま残します）。足した部分は縁の画素で下塗りします。形を付けたときは、足りない向きの両側に同じだけ足します。マスクとは一緒に使えません。出力は足した後の大きさで、一辺は `max_side` までです。
+- **拡大**: `upscale` に `{"scale": 2}`（倍率は 1 より大きく 4 まで）を付けると、1 枚目の画像を拡大の手段で大きくします（それだけでは描き直しません）。`{"scale": 2, "redraw": true}` で、その大きさで strength 0.35 で描き直します（`"strength": 0.5` で strength も変えられます）。描き直す大きさが `max_side` を超えるときは、1024 ピクセルのタイル（周りに 128 ピクセル、縁を 32 ピクセルぼかす。周り 32・縁 8 ピクセルでは、タイルの境目にかかる服が崩れたため広げています）に分けて描き直します。一辺は 4096 までです。マスク・`extend` と一緒には使えません。
    - `method` は拡大の手段です。
       - `lanczos`: Lanczos の拡大。
-      - `realesrgan`: 超解像のモデル RealESRGAN x4plus。4 倍にしてから、頼んだ大きさに Lanczos で縮めます（ComfyUI の ImageUpscaleWithModel と ImageScale と同じ）。
-      - `seedvr2`: ByteDance Seed の SeedVR2。頼んだ大きさに Lanczos で拡大した画像を、拡散のモデルが 1 ステップで復元します（ComfyUI の SeedVR2 と同じ手順）。`variant` で `7b`（既定。写真や動画のフレーム）、`7b-sharp`（アニメ、ぼやけた画像、細部をくっきりさせたいとき）、`3b` を選べます。GPU のメモリに 16 ビットの 7B が入るときは 16 ビット、入らないときは 8 ビット（int8_convrot）を使い、VRAM に入らない層は RAM から流します。8 ビットの 7B が VRAM と RAM のどちらにも入らないときだけ 3B にします。
+      - `realesrgan`: 超解像のモデル RealESRGAN x4plus。4 倍にしてから、頼んだ大きさに Lanczos で縮めます。
+      - `seedvr2`: ByteDance Seed の SeedVR2。頼んだ大きさに Lanczos で拡大した画像を、拡散のモデルが 1 ステップで復元します。`variant` で `7b`（既定。写真や動画のフレーム）、`7b-sharp`（アニメ、ぼやけた画像、細部をくっきりさせたいとき）、`3b` を選べます。GPU のメモリに 16 ビットの 7B が入るときは 16 ビット、入らないときは 8 ビット（int8_convrot）を使い、VRAM に入らない層は RAM から流します。8 ビットの 7B が VRAM と RAM のどちらにも入らないときだけ 3B にします。
       - `auto`（既定）: 描き直すときは RealESRGAN、描き直さないときは SeedVR2。SeedVR2 が GPU のメモリに入らないときは RealESRGAN にし、応答にそう書きます。
       - 拡大のモデルの重みは、初めて使うときにサーバーが取ります（下の「補助の重み」。SeedVR2 の 7B は 16 ビットで 16.5 GB、8 ビットで 8.3 GB、VAE は 0.5 GB）。取っている間は、ほかの手段に替えずに「取っている途中」と返します。
    - `redraw` を付けないか `false` のときは、拡大の手段だけで大きくします（画像のモデルは動かず、`prompt` も要りません。`n` は 1）。`true` で描き直し、そのときは `prompt` も要ります。
-   - `color` は拡大の後の色の補正で、元の画像を Lanczos で同じ大きさにしたものに色を寄せます。名前は vLLM-Omni と ComfyUI の SeedVR2 と同じです。
+   - `color` は拡大の後の色の補正で、元の画像を Lanczos で同じ大きさにしたものに色を寄せます。名前は vLLM-Omni と同じです。
       - `wavelet`: 細かい成分は拡大の結果、粗い成分は元の画像のもの。
       - `lab`: `wavelet` の後、CIE Lab の各チャンネルの値の分布を元の画像の分布に順位ごとに合わせます（明るさは 8 割を拡大の結果のまま残す）。
       - `adain`: RGB の各チャンネルの平均と広がりを合わせます。
       - `none`: 補正しません。
-      - 付けないときは手段の既定で、RealESRGAN は `none`（ComfyUI の ImageUpscaleWithModel と同じ）、SeedVR2 は `lab` です。
-- **部分を直す（Detailer）**: `fix` に `{"parts": ["face", "hands"], "strength": 0.5}`（部分の名前の並びだけでも書けます）を付けると、1 枚目の画像から顔（`face`）・手（`hands`）・人物（`person`）を見つけ、1 か所ずつ描き直します（ComfyUI の Impact Pack の FaceDetailer の手順と既定値）。
+      - 付けないときは手段の既定で、RealESRGAN は `none`、SeedVR2 は `lab` です。
+- **部分を直す（Detailer）**: `fix` に `{"parts": ["face", "hands"], "strength": 0.5}`（部分の名前の並びだけでも書けます）を付けると、1 枚目の画像から顔（`face`）・手（`hands`）・人物（`person`）を見つけ、1 か所ずつ描き直します。
    - 見つけるのは YOLOv8 の検出器（Bingsu/adetailer の `face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）で、点数 0.5 以上のものです。重みは setup では取らず、初めて使うときにサーバーが取ります（下の「補助の重み」）。
-   - 見つけた部分の箱の 3 倍の範囲を切り出し、約 1024x1024 ピクセルに拡大して strength 0.5 で描き直し、縮めて貼り戻します（上の「マスク」の切り出しと同じ部品です）。描き直すのは、顔と手では箱を、人物では人の形のマスクを、Impact Pack と同じく 10×10 の正方形で広げた部分（上と左に 4、下と右に 5 ピクセル）で、貼り戻しの縁を 20 ピクセルぼかします。
-   - 大きい部分から 1 か所ずつ、前の部分を直した後の画像の上で描きます（大きい順は XeStrata の選び方で、FaceDetailer の既定は検出の順です）。重なる部分は、後から描いた方が前の結果を変えることがあります。箱の一辺が 10 ピクセル以下のものと、両辺が 1024 ピクセル以上のもの（もう十分大きい）は飛ばします。何も見つからないときは、元の画像をそのまま返します。
+   - 見つけた部分の箱の 3 倍の範囲を切り出し、約 1024x1024 ピクセルに拡大して strength 0.5 で描き直し、縮めて貼り戻します（上の「マスク」の切り出しと同じ部品です）。描き直すのは、顔と手では箱を、人物では人の形のマスクを、10×10 の正方形で広げた部分（上と左に 4、下と右に 5 ピクセル）で、貼り戻しの縁を 20 ピクセルぼかします。
+   - 大きい部分から 1 か所ずつ、前の部分を直した後の画像の上で描きます。重なる部分は、後から描いた方が前の結果を変えることがあります。箱の一辺が 10 ピクセル以下のものと、両辺が 1024 ピクセル以上のもの（もう十分大きい）は飛ばします。何も見つからないときは、元の画像をそのまま返します。
    - 部分 k の seed は要求の seed + k です（`n` が 2 以上なら、i 枚目はさらに + 1000 i）。設定の `budget_s` は、次の部分を描き始める前にも見ます。GPU の番が来てから（検出を含めて）その秒数を過ぎると、残りの部分は飛ばして、応答にそう書きます（描いている途中の部分は止めません）。
    - `prompt` は直した部分の見た目です。付けないと、部分ごとの決まった言葉（「a detailed, well-drawn face」など）で描きます。マスク・`extend`・`upscale` と一緒には使えません。
    - 応答の `xestrata-engine` の `fix` に、描いた部分（`regions`: 部分の名前、画像の上の箱、点数、seed、切り出した範囲、描いた大きさ、秒数。飛ばしたものはその理由）と、検出の時間（`detect_s`）が入ります。
@@ -356,7 +355,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
   SAM 3.1 の重みは、利用者が SAM License に同意するまで取りません（setup の問いか `--image-sam3-license agree`（`xestrata images` では `--sam3-license agree`）、ランチャーの画像の設定のチェック、または Web の画像の画面の「SAM 3 のライセンス…」で同意します。同意は `image-tools/sam3.accepted` に残ります）。同意するまでは Florence-2 が場所を見つけます。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
-- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（PedroMarinhoDev の版の説明の値。強さが 1 より小さいと、編集でなく描き直しになります）。
+- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（強さが 1 より小さいと、編集でなく描き直しになります）。
 - **LoRA**: 生成と同じ `lora`（とプロンプトのタグ）を受け、参照画像を使う画像にも同じアダプターを当てます（[LoRA](#loraアダプター)）。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
 
@@ -469,7 +468,7 @@ vLLM-Omni の動画の形です。multipart で次を送ります。
 - `size`（`幅x高さ`）か `scale`（既定 2）、`seed`。
 - `extra_params`: 色の補正 `color_correction_method`（`none`・`lab`・`adain`・`wavelet`）と、XeStrata の拡張の `chunk_frames`（SeedVR2 の塊のフレーム数。4n + 1。既定は GPU に入るだけ）・`temporal_overlap`（塊の重なり。潜在のフレームで、1 つが 4 フレーム）・`video_codec`（`h264`・`vp9`・`ffv1`）。
 
-SeedVR2 は動画を時間の塊で通し、塊の重なりは潜在で混ぜます（ComfyUI の SeedVR2TemporalMerge と同じ）。VAE は時間の端を次の塊に持ち越して切れ目なく通し、大きなフレームはタイルに分けます。RealESRGAN と Lanczos はフレームごとです。色の補正は、フレームごとにその元のフレームに合わせます。
+SeedVR2 は動画を時間の塊で通し、塊の重なりは潜在で混ぜます。VAE は時間の端を次の塊に持ち越して切れ目なく通し、大きなフレームはタイルに分けます。RealESRGAN と Lanczos はフレームごとです。色の補正は、フレームごとにその元のフレームに合わせます。
 
 - `/v1/videos/sync` は動画そのものを返します。ヘッダーの `X-Video-Frames`・`X-Video-Fps`、平均の fps で読み直したときは `X-Video-Vfr` が付きます。
 - `/v1/videos` はジョブで、OpenAI の Videos API の形の記録（`id`、`status` が `queued`・`in_progress`・`completed`・`failed`、`progress`）をすぐ返します。
@@ -491,7 +490,7 @@ vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画�
    - `outputs`: `["overlay"]`（物体に色を重ねた動画。音声つき）と `["mask"]`（全物体のマスクの動画 1 本）を頼めます。応答の `overlay_video`・`mask_union_video` に base64 で入ります。
    - `job`: `true` でジョブにします（記録をすぐ返します）。答えの JSON は `GET /v1/videos/{id}/content`、動画は `?variant=overlay`・`mask`・`object_<id>` で取ります。
    - `video_url`: チャットに添付した動画（`/v1/videos/files/...`）を、アップロードの代わりに使います。
-- SAM 3.1 は Meta の既定どおりに動かします（multiplex の追跡器、検出の点数 0.4、確かめが 3 フレーム続いた物体だけを出す、16 フレームごとの付け直し）。
+- SAM 3.1 は次の既定で動かします（multiplex の追跡器、検出の点数 0.4、確かめが 3 フレーム続いた物体だけを出す、16 フレームごとの付け直し）。
 
 ## LoRA（アダプター）
 
@@ -665,7 +664,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   サーバーは、公式の v0.1.0 のリリースと同じファイル（`RealESRGAN_x4plus.pth`、SHA-256 で同じと確かめたもの）を [lllyasviel/Annotators](https://huggingface.co/lllyasviel/Annotators) から取り、`tools/image/esrgan.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換です。
 - Detailer の検出器（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）は Bingsu の [adetailer](https://huggingface.co/Bingsu/adetailer) で、公開元のライセンスは Apache 2.0 です。
   どれも Ultralytics の YOLOv8 で学習されていて、Ultralytics は YOLO で学習したモデルを既定で AGPL-3.0 としています（[Ultralytics のライセンス](https://www.ultralytics.com/license)。重みのファイルの中にも `AGPL-3.0 License` と書かれています）。使う前に両方を読んでください。
-  サーバーは配られている `.pt` を取り、`tools/image/yolo_pt.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換で、元のファイルの SHA-256 を変換後のファイルに書き残します。XeStrata は Ultralytics のコードを使わず、検出器を自分で書いています（[DETAILS](DETAILS.ja.md#クレジットとライセンス)）。
+  サーバーは配られている `.pt` を取り、`tools/image/yolo_pt.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換で、元のファイルの SHA-256 を変換後のファイルに書き残します。検出器は XeStrata のコードです（[DETAILS](DETAILS.ja.md#クレジットとライセンス)）。
 - 言葉からマスクの SAM 3.1 の重みは Meta の SAM License で、オープンソースのライセンスではありません（使う人を拘束し、禁じる使い方があります）。サーバーは利用者が同意するまで取りません。重みは Comfy-Org の [sam3.1](https://huggingface.co/Comfy-Org/sam3.1) の FP16 のものをそのまま使います。言葉を読む CLIP の `tokenizer.json`（openai/clip-vit-large-patch14）は MIT です。
 - Florence-2（large と base）の重みと `tokenizer.json` は Microsoft の [Florence-2](https://huggingface.co/microsoft/Florence-2-large) で、MIT です。
 - 背景を消す BiRefNet の 7 つの版の重みは、Peng Zheng の [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) で、MIT です。

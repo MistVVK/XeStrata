@@ -7,20 +7,19 @@
 //
 // A model is a `clip` model: each clip of frames on its own (an image is a clip of one frame).  Its native scale says
 // how it is fed: RealESRGAN x4plus (scale 4) takes the frames at their own size and gives them four times as large, the
-// driver then resizing that to the size asked for (Lanczos, as ComfyUI's ImageUpscaleWithModel followed by its
-// ImageScale does); a model of scale 0 takes the frames at the size asked for (the driver resizes them first, by
-// Lanczos, and pads them to the model's multiple by repeating the edges, then cuts the padding off again).  A model
-// with a context (a convolutional one: what a pixel sees is near it) runs on tiles of the frame, each with that many
-// pixels of the frame around it, as large as the VRAM allows (the whole frame where it fits); the tiles' outputs are
-// put together from their cores.
+// driver then resizing that to the size asked for (Lanczos); a model of scale 0 takes the frames at the size asked for
+// (the driver resizes them first, by Lanczos, and pads them to the model's multiple by repeating the edges, then cuts
+// the padding off again).  A model with a context (a convolutional one: what a pixel sees is near it) runs on tiles of
+// the frame, each with that many pixels of the frame around it, as large as the VRAM allows (the whole frame where it
+// fits); the tiles' outputs are put together from their cores.
 //
 // Lanczos is a model of its own here (scale 0, nothing to run): the plain resize, chosen the same way as the others.
 //
-// The color correction (color::, img_color.hpp, whose statistics Crop and Stitch's color match shares) moves the
+// The color correction (color::, img_color.hpp, whose statistics the cut's color match shares) moves the
 // output's colors back toward the input's (Lanczos-resized to the output's size): wavelet (the output's high
 // frequencies over the input's low ones), lab (the wavelet's, then each CIE Lab channel matched to the input's
 // distribution, the lightness mostly kept: SeedVR2's), adain (each RGB channel's mean and spread) or none.  These are
-// SeedVR2's names for its corrections (vLLM-Omni's color_correction_method, ComfyUI's SeedVR2PostProcessing); each
+// SeedVR2's names for its corrections (vLLM-Omni's color_correction_method); each
 // model has its default.
 //
 // A video (run_video) goes the same way frame by frame: read a few frames at a time from its file (video_io.hpp), each

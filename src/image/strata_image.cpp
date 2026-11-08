@@ -63,7 +63,7 @@
 //                            (EDITFMT:moss, the default, Moss-Image-Edit's; QiRefLayout), PIC:<path> a picture the text
 //                            encoder sees (at the ids' next <|image_pad|>; its sides multiples of 32; --vision,
 //                            Qwen3.5-9B's mmproj);
-//                            CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height> Crop and Stitch (img_crop.hpp): the mask's
+//                            CROP:<x>,<y>,<w>,<h>,<blend>,<width>,<height> the cut (img_crop.hpp): the mask's
 //                            box of the base image drawn at <width> <height> and put back, the image at the base
 //                            image's own size (its partial images too), the IMAGE line's crop_s the steps' time;
 //                            ,<ref_w>,<ref_h> after it: the first reference the box at that size beside the base
@@ -125,7 +125,7 @@
 //   UPSVNEED <width> <height> <in width> <in height> <name>[:<path>] [COLOR:<m>]
 //                            the VRAM a video's upscale needs: UPSNEED's, a temporal model's chunk of one latent
 //                            in the VAE's smallest tiles (least) or of 21 frames with the frame whole (full, the
-//                            default chunk of ComfyUI's template) added                    -> NEED as NEED's
+//                            default chunk) added                                          -> NEED as NEED's
 //   UPSV <width> <height> <in> <out stem> <name>[:<path>] [COLOR:<m>] [SEED:<s>] [CHUNK:<frames>] [OVERLAP:<latents>]
 //        [CODEC:<h264|vp9|ffv1>] [YIELD:1]
 //                            the video <in> (a file ffmpeg reads) upscaled to width x height by the upscaler, written
@@ -1224,7 +1224,7 @@ std::string control_line(si::ControlPrep& prep, AuxNets& aux, si::ImagePipeline*
     return b;
 }
 
-// Crop and Stitch's box (img_crop.hpp) of a control image that is the picture's: the image at the picture's size
+// The cut's box (img_crop.hpp) of a control image that is the picture's: the image at the picture's size
 // (bicubic), the box cut out of it with its edges repeated where the box passes the picture
 si::QiRef control_box(const si::QiRef& control, const si::CropBox& b) {
     const std::vector<uint8_t> whole = si::control_resize(control, b.width, b.height);
@@ -1245,10 +1245,10 @@ bool takes_guidance(si::ImagePipeline& p) {
     return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr;
 }
 
-// An upscale past the model's size (TILES:), as Ultimate SD Upscale draws one: the base image at the line's size
+// An upscale past the model's size (TILES:), drawn again a tile at a time: the base image at the line's size
 // (upscale_base: Lanczos, or the line's upscaler), then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
 // from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
-// r.tile_blur (Crop and Stitch's steps: img_crop.hpp), the next tile cut from the picture as it now is.  The tiles'
+// r.tile_blur (the cut's steps: img_crop.hpp), the next tile cut from the picture as it now is.  The tiles'
 // times summed into `t`, the last one's plan in `pl`, the resizes and the cuts' time in `cut_s`.
 std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0, si::QiTimes& t, si::QiPlan& pl,
                                    double& cut_s, Lines& in, Upscalers& ups, double& ups_s) {
@@ -1371,7 +1371,7 @@ int serve(si::ImagePipeline& p) {
                 if (r.guide.any() && !takes_guidance(p))
                     throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
                                                 "DSLG: or DD: (Qwen-Image-2.1's and Mage-Flow's sampling do)");
-                // Crop and Stitch (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
+                // the cut (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
                 // own; the base image is the init image, else the first reference
                 std::unique_ptr<si::CropStitch> cs;
                 double crop_s = 0.0;   // its steps' time (the IMAGE line's crop_s)
@@ -1819,7 +1819,7 @@ int serve(si::ImagePipeline& p) {
                 std::vector<std::pair<int64_t, int64_t>> pictures;
                 si::QiRequest lr;   // the request's adapters, which the need counts and nothing else uses
                 auto sizes = ref_sizes(ls, mask, init, n_neg, states, crop, pictures, lr, loras);
-                // Crop and Stitch: the first reference (the base image without an init image) is drawn from at the
+                // the cut: the first reference (the base image without an init image) is drawn from at the
                 // line's size, and the steps' buffers come before the drawing and after it, beside what is held
                 if (crop && !init && !sizes.empty()) sizes[0] = {w, h};
                 auto* moss = dynamic_cast<si::MossPipeline*>(&p);

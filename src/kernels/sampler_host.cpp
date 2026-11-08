@@ -1,9 +1,12 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/kernels/sampler_host.cpp - see include/strata/kernels/sampler_host.hpp.  The kernel's chain (src/kernels/xe/
 // sampler.cpp, sample_launch and pick_from_list) step for step, serially: the window is the history row's tail of
 // penalty_last_n ids, an id outside the vocabulary never counts; the top_k list is k argmaxes over the not-yet-taken
 // ids (a slot no finite value fills holds id 0 at -inf, as the kernel's); greedy is the argmax of the same scores.
+// The Philox draws, the penalties and the list's pick are transcribed from Strata's sampler (src/kernels/cuda/
+// sampler.cu, MIT).
 #include "strata/kernels/sampler_host.hpp"
 
 #include <algorithm>

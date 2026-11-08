@@ -271,7 +271,7 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
                     rp.tiles = count;
                 }
                 break;
-            } catch (const std::runtime_error&) {   // no room for this tile: a smaller one, as ComfyUI shrinks its own
+            } catch (const std::runtime_error&) {   // no room for this tile: a smaller one
                 if (in.context <= 0 || T <= in.min_tile) {
                     m.release(false);
                     throw;

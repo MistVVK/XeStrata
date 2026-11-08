@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/img_color.hpp - the image engine's color corrections on the GPU, shared by Crop and Stitch's
-// color match (img_crop.hpp) and the upscalers' correction (strata/upscale/upscale.hpp).
+// include/strata/image/img_color.hpp - the image engine's color corrections on the GPU, shared by the cut's color
+// match (img_crop.hpp) and the upscalers' correction (strata/upscale/upscale.hpp).
 //
 // The images are RGBA8 on the GPU, on the image engine's queue (the runtime's default stream).  Statistics are each
 // channel's mean and spread over the opaque pixels (alpha 255), summed a work-group at a time on the GPU and the
 // groups' sums on the host in doubles.  A transfer moves an image's channels from its own mean and spread to another's
-// (Reinhard et al., Color Transfer between Images, 2001): in CIE Lab (D65, as kornia's rgb_to_lab, which ComfyUI's
-// ColorTransfer uses: its reinhard_lab) or in RGB (an AdaIN of the pixels).  The wavelet correction keeps an image's
-// high frequencies and takes another's low ones (five dilated 3 x 3 blurs, the edges repeated).
+// (Reinhard et al., Color Transfer between Images, 2001): in CIE Lab (D65, as kornia's rgb_to_lab) or in RGB (an AdaIN
+// of the pixels).  The wavelet correction keeps an image's high frequencies and takes another's low ones (five dilated
+// 3 x 3 blurs, the edges repeated).
 #pragma once
 
 #include <cstdint>
@@ -39,7 +39,7 @@ void wavelet(uint8_t* rgba, const uint8_t* ref, int64_t w, int64_t h, int levels
 /// The VRAM wavelet() takes for w x h pixels.
 uint64_t wavelet_bytes(int64_t w, int64_t h);
 
-/// SeedVR2's lab correction (vLLM-Omni's and ComfyUI's color_correction_method "lab"): the wavelet correction toward
+/// SeedVR2's lab correction (vLLM-Omni's color_correction_method "lab"): the wavelet correction toward
 /// ref, then in CIE Lab (the reference's matrices) each channel given ref's distribution, rank for rank (a histogram
 /// of 65536 bins of the channel's range: a bin's pixels take ref's value at their middle rank), the lightness kept
 /// `lum_weight` the corrected image's own.

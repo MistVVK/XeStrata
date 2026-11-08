@@ -27,10 +27,12 @@ struct QiRef {
     int64_t width = 0, height = 0;
 };
 
-// MOSS-Image's edits: where an edit adapter's references sit beside the image, as ComfyUI's ref_latents_method names
-// it (MossDit::set_refs).  TextStart: Moss-Image-Edit's ("index_timestep_zero_text_start"); Isolated: ai-toolkit's
-// with its kv_cache on ("index_timestep_zero_isolated"); TimestepZero: ai-toolkit's with it off
-// ("index_timestep_zero"); Index: the references at the image's timestep ("index")
+// MOSS-Image's edits: where an edit adapter's references sit beside the image, as the adapter was trained
+// (MossDit::set_refs; ai-toolkit's training code and each adapter's model card).  TextStart: Moss-Image-Edit's
+// ("moss-image-edit": the references at timestep 0, seeing only each other); Isolated: ai-toolkit's with its kv_cache
+// on ("ai-toolkit": the same, the image's rows moved past them); TimestepZero: ai-toolkit's with it off
+// ("ai-toolkit-no-kv": the references in the sequence, at timestep 0); Index: the references in the sequence at the
+// image's timestep ("index")
 enum class QiRefLayout { TextStart, Isolated, TimestepZero, Index };
 
 struct QiRequest {
@@ -46,8 +48,8 @@ struct QiRequest {
     // each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens: its sides, multiples of
     // 32, over 32 each), their tokens' rows from the vision encoder)
     QiRefLayout refs_layout = QiRefLayout::TextStart;
-    // Crop and Stitch's color match of the drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
-    // around the paint (the default's: the drawing's drift only), 2 the whole cut (ComfyUI's ColorTransfer)
+    // the color match of a cut's drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
+    // around the paint (the default's: the drawing's drift only), 2 the whole cut (a Reinhard transfer)
     int crop_color = 0;
     // an upscale: the base image resized to the request's size (Lanczos) before it is drawn again (strata_image's
     // UPSCALE; the pipelines take it at that size)
@@ -55,13 +57,13 @@ struct QiRequest {
     // its first pass by an upscaler (strata_image's UPS:<name>[:<path>], strata/upscale/upscale.hpp) rather than Lanczos
     // alone, and that pass's color correction (UPSCOLOR:, upscale.hpp's names; empty: the upscaler's own); empty: Lanczos
     std::string upscaler, upscaler_color;
-    // an upscale past the model's size, drawn again in tiles as Ultimate SD Upscale does (strata_image's TILES:): the
+    // an upscale past the model's size, drawn again a tile at a time (strata_image's TILES:): the
     // tile's side, the context around it and the blend at its edges, in pixels; 0: one drawing
     int64_t tile = 0, tile_pad = 0, tile_blur = 0;
     std::vector<QiRef> pictures;
     QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
                                 // alpha 0 where the image changes); empty: none
-    std::vector<float> mask_share;   // with a mask, its edit share by pixel at width x height (Crop and Stitch's,
+    std::vector<float> mask_share;   // with a mask, its edit share by pixel at width x height (the cut's,
                                      // img_crop.hpp): the sampler's mask is its mean over each latent position rather
                                      // than the mask's rule (request_latent_mask); empty: the mask's rule
     QiRef init;                 // img2img's base image for a model without edits (img_start.hpp); empty: none
@@ -97,7 +99,7 @@ struct QiRequest {
     std::vector<float> t5_weights, neg_t5_weights;
     // the sampler: "euler" or "er_sde" (Anima's and Mage-Flow's; empty: the model's own)
     std::string sampler;
-    // the guidance ComfyUI's nodes add to the sampling (guidance.hpp: CFGNorm, CFGZero*, APG, skip layer guidance,
+    // the guidance added to the sampling (guidance.hpp: CFGNorm, CFGZero*, APG, skip layer guidance,
     // Detail Daemon; strata_image's GUIDE words): Qwen-Image-2.1's and Mage-Flow's; the other models leave it
     GuidanceSpec guide;
     // Qwen-Image-2.1's ControlNet (qi_control.hpp; strata_image's CNET: and CTRL words): the branch's file (empty:

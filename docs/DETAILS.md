@@ -2230,29 +2230,13 @@ The model files are not part of it; their licenses apply to them (below).
      [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
-   - ComfyUI's MOSS-Image edit, by Kijai ([#17296](https://github.com/comfyanonymous/ComfyUI/pull/17296), GPL-3.0): how a
-     MOSS-Image edit takes its reference images (`src/image/moss_dit.cpp`'s `set_refs`: their keys and values made once
-     at timestep 0, the references seeing each other alone, and seen at every step by the image's and the text's rows;
-     their RoPE positions). The code is written without copying theirs.
-   - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (GPL-3.0):
-     the steps and defaults of an edit's cut and putting back with a mask (`src/image/img_crop.cpp`, `serve/images.py`'s
-     `plan_crop`: InpaintCropImproved's and InpaintStitchImproved's mask hipass, hole fill, growth and blur, how the part
-     is widened and shaped, the edges' copies and the putting back). The code is written without copying theirs.
-   - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)'s FaceDetailer, by ltdrdata (GPL-3.0): the
-     Detailer's steps and defaults (`serve/images.py`'s `fix_regions`, `fix_crop` and `fix_images`: the score of 0.5,
-     the dilation by a square of 10 pixels, the crop of three times the box, `drop_size` 10, the parts `guide_size`
-     skips, denoise 0.5, the noise mask's blur of 20 pixels, one at a time; largest first is XeStrata's choice, where
-     FaceDetailer goes in the detections' order). The code is written without copying theirs.
    - The YOLOv8 detector (`src/image/yolo_detect.cpp`): its layers and shapes are built from the tensors' names and
-     shapes in the weights' file and the model configuration (its layer list) the file carries; the letterbox, the
-     distribution box head and the segmentation masks follow [MMYOLO](https://github.com/open-mmlab/mmyolo)'s (GPL-3.0)
-     YOLOv8 head and LetterResize, read, not copied. Ultralytics' code was neither read nor used. The `.pt` weights are
-     converted to safetensors by `tools/image/yolo_pt.py` (no torch, no Ultralytics: a reader that builds only the
-     types it allows).
+     shapes in the weights' file and the model configuration (its layer list) the file carries. The `.pt` weights are
+     converted to safetensors by `tools/image/yolo_pt.py` (no torch: a reader that builds only the types it allows).
    - RealESRGAN x4plus (`src/upscale/esrgan.cpp`): the network (RRDBNet) is written from Real-ESRGAN's paper,
      [BasicSR](https://github.com/XPixelGroup/BasicSR)'s (Apache-2.0) RRDBNet's order of layers, and the tensors'
-     names and shapes in the weights' file. The tiles' overlap (32 pixels around each) and the Lanczos resize from four
-     times to the size asked for follow ComfyUI's (GPL-3.0) ImageUpscaleWithModel and ImageScale. The `.pth` weights are
+     names and shapes in the weights' file. The tiles overlap by 32 pixels around each, and the four times larger
+     image is Lanczos-resized to the size asked for. The `.pth` weights are
      converted to safetensors by `tools/image/esrgan.py` (no torch: `yolo_pt.py`'s reader). The code is written
      without copying theirs.
    - SeedVR2 (`src/upscale/seedvr2_dit.cpp`, `seedvr2.cpp`; its VAE `src/image/mf_vae.cpp`'s LDM path): the 7B's DiT
@@ -2260,41 +2244,32 @@ The model files are not part of it; their licenses apply to them (below).
      the 3B's from its `models/dit_v2` (the windows, the joint attention of the text and a window, the RoPE, the
      modulation, the time embedding) and Comfy-Org's weights' names and shapes; the 3B checked against
      [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) `vllm_omni/diffusion/models/seedvr2/`. The
-     one step (the noise, the condition latent times 0.9152, the velocity taken off) and the image's handling before
-     and after follow ComfyUI's (GPL-3.0) SeedVR2 nodes, whose outputs it was checked against; int8_convrot's rotation
-     is ComfyUI's regular Hadamard. A video's chunks and their overlaps' blend follow ComfyUI's SeedVR2TemporalChunk
-     and SeedVR2TemporalMerge. The code is written without copying theirs.
+     one step adds the noise, takes the condition latent times 0.9152 and takes the velocity off; int8_convrot's
+     rotation is a regular Hadamard matrix. The code is written without copying theirs.
    - The upscale's color corrections (`src/image/img_color.cpp`): their names (`lab`, `adain`, `wavelet`, `none`) and
      the steps of `wavelet` (five dilated blurs) and `lab` (`wavelet`'s, then each CIE Lab channel matched rank for
-     rank, the lightness kept 0.8) follow [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) and
-     ComfyUI's (GPL-3.0) SeedVR2 color corrections; the ranks are matched by a histogram of 65,536 bins, not a sort.
-     Crop and Stitch's color match's CIE Lab follows ComfyUI's ColorTransfer (kornia's CIE Lab). The code is written
-     without copying theirs.
+     rank, the lightness kept 0.8) follow [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) SeedVR2
+     color corrections; the ranks are matched by a histogram of 65,536 bins, not a sort. The CIE Lab of the masked
+     edit's color match (`color_match`) follows kornia's (Apache-2.0) CIE Lab conversion. The code is written without
+     copying theirs.
    - SAM 3's detector (`src/image/sam3.cpp`, `include/strata/image/sam3.hpp`): written again for the engine after
      [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) port, `vllm_omni/diffusion/models/sam3/`
-     at 15bb15d (LGPL-3.0-or-later AND Apache-2.0, `NOTICE`), and checked against transformers' Sam3Model. Neither
-     Meta's code (SAM License) nor ComfyUI's is used. CLIP's BPE that reads the words (`tools/strata_tokenizer.py`'s
-     `ClipTokenizer`) is written from its `tokenizer.json`'s shape.
-   - SAM 3.1's tracker (`src/image/sam3_track.cpp`): written for the engine after reading Meta's
-     [sam3](https://github.com/facebookresearch/sam3) (SAM License, f1647e8) and ComfyUI's (GPL-3.0)
-     `comfy/ldm/sam3/tracker.py` for the network's shape and defaults; neither's code is copied. Where the two differ
-     (the input's normalization, the sine positions, which token gives the object pointer, the norms' eps), Meta's is
-     followed. Its parts are checked against ComfyUI's outputs and against Meta's SAM 3.1 run in a throwaway
-     environment.
+     at 15bb15d (LGPL-3.0-or-later AND Apache-2.0, `NOTICE`), and checked against transformers' Sam3Model. CLIP's
+     BPE that reads the words (`tools/strata_tokenizer.py`'s `ClipTokenizer`) is written from its `tokenizer.json`'s
+     shape.
    - The video segmentation's rules (`src/image/sam3_video.cpp`, `include/strata/image/sam3_video.hpp`): after
      [vLLM-Omni](https://github.com/vllm-project/vllm-omni)'s (Apache-2.0) `vllm_omni/diffusion/models/sam3/sam3_video.py`
      at 2b610b3 (its association, hot start, occlusion suppression, delayed outputs and several words; LGPL-3.0-or-later
-     AND Apache-2.0, `NOTICE`). What SAM 3.1 adds (matching by IoM, detections at the edges left out, confirmation,
-     reconditioning, buckets of 16) and the clicks are written after reading Meta's sam3, whose code is not copied.
+     AND Apache-2.0, `NOTICE`).
    - Florence-2 (`src/image/florence2.cpp`, `serve/image_regions.py`): written from Microsoft's
-     [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (MIT) `modeling_florence2.py` (DaViT, BART, the
-     beam search) and `processing_florence2.py` (the task prompts, the added tokens, reading `<loc_*>` and the
-     polygons), and checked against transformers' Florence2ForConditionalGeneration (florence-community's weights).
+     [Florence-2](https://huggingface.co/microsoft/Florence-2-large) (MIT) `modeling_florence2.py` (DaViT, BART) and
+     `processing_florence2.py` (the task prompts, the added tokens, reading `<loc_*>` and the polygons), its beam search
+     after [transformers](https://github.com/huggingface/transformers)' (Apache-2.0) generation `_beam_search`, and
+     checked against transformers' Florence2ForConditionalGeneration (florence-community's weights).
    - BiRefNet (`src/image/birefnet.cpp`; the foreground's colors `src/image/aux_kernels.cpp`'s `aux_fg_*`): written
      from Peng Zheng's [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) (MIT) `birefnet.py` and `image_proc.py`'s
      `refine_foreground` (the GPU version of Photoroom's
-     [fast-foreground-estimation](https://github.com/Photoroom/fast-foreground-estimation) blur fusion). It was
-     checked against ComfyUI's (GPL-3.0) BiRefNet port's outputs only; none of its code is copied.
+     [fast-foreground-estimation](https://github.com/Photoroom/fast-foreground-estimation) blur fusion).
    - The composition control (`src/image/qi_control.cpp`, `src/image/cnet_*.cpp`, `serve/image_controls.py`):
      Qwen-Image-2.1's Fun ControlNet Union branch and how its condition is made (16 control blocks beside every second
      block of the model; 129 channels: the control picture's latent, a mark of what is kept, and the latent of the base
@@ -2305,21 +2280,17 @@ The model files are not part of it; their licenses apply to them (below).
      Durand and Isola's Informative Drawings, Gu et al.'s M-LSD, Yang et al.'s Depth Anything V2 and Ranftl et al.'s
      DPT, Ge et al.'s YOLOX, Jiang et al.'s RTMPose and Yang et al.'s DWPose) and from the weights' names and shapes.
      To match what the control models were trained on, the skeletons' colors, stroke widths and hand and face points
-     follow lllyasviel's [ControlNet](https://github.com/lllyasviel/ControlNet) (Apache-2.0) OpenPose drawing, M-LSD's
+     follow IDEA-Research's [DWPose](https://github.com/IDEA-Research/DWPose) (Apache-2.0) drawing in
+     `ControlNet-v1-1-nightly/annotator/dwpose/util.py` (its colors and how the body, hands and face are drawn), M-LSD's
      segments are read as its authors' [mlsd](https://github.com/navervision/mlsd) (Apache-2.0) reads them (the
      centres' 3x3 peaks, the 200 strongest, a score and a length to keep one), and the margin of a person's box given
      to DWPose (1.25 times) is RTMPose's in [MMPose](https://github.com/open-mmlab/mmpose)'s (Apache-2.0)
      configurations. MOSS-Image's color and depth were
      written from darask0's model card and training code (`training/moss_control.py`, Apache-2.0), and MOSS-Image's 4
      steps (`src/image/moss_pipeline.cpp`'s `few_steps`, `moss_dit.cpp`'s `set_time_path`) from the sampler's formula
-     in the model card of darask0's 4-step adapter and from its weights' names and shapes. ComfyUI and
-     comfyui_controlnet_aux (Fannovel16, Apache-2.0) were only compared with, by their outputs and speed; none of
-     their code is copied.
-   - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors
-     (GPL-3.0), its `comfy_extras/nodes_cfg.py`, `nodes_apg.py` and `nodes_slg.py`: the image sampling's guidance
-     (`src/image/guidance.cpp`, `serve/images.py`'s `GUIDANCE_METHODS`), its formulas, where they apply (before or
-     after CFG, on the predicted image) and their defaults and ranges (CFGNorm's post-CFG form, CFGZeroStar, APG,
-     SkipLayerGuidanceDiT). Written without copying its code.
+     in the model card of darask0's 4-step adapter and from its weights' names and shapes.
+     comfyui_controlnet_aux (Fannovel16, Apache-2.0) was only compared with, by its outputs and speed; none of
+     its code is copied.
    - [ComfyUI-Detail-Daemon](https://github.com/Jonseed/ComfyUI-Detail-Daemon), by Jonseed (MIT), after
      [sd-webui-detail-daemon](https://github.com/muerrilla/sd-webui-detail-daemon), by muerrilla (MIT): Detail
      Daemon's schedule (`make_detail_daemon_schedule`), its lookup and interpolation by sigma (`get_dd_schedule`),

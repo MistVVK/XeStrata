@@ -3,8 +3,8 @@
 // src/image/cnet_pose.cpp - the pose map (cnet_models.hpp): YOLOX-L finds the people (Ge et al. 2021, "YOLOX:
 // Exceeding YOLO Series in 2021"), DWPose finds each one's 133 whole-body keypoints (Yang et al. 2023, "Effective
 // Whole-body Pose Estimation with Two-stages Distillation", on RTMPose's CSPNeXt and RTMCC head: Jiang et al. 2023),
-// and the skeletons are drawn as OpenPose draws them (Cao et al. 2019): the limbs, colours, widths and the hands' and
-// face's points of the pictures ControlNet's pose models were trained on (lllyasviel/ControlNet's OpenPose drawing,
+// and the skeletons are drawn with the limbs, colours, widths and the hands' and face's points of the pictures
+// ControlNet's pose models were trained on (IDEA-Research/DWPose's ControlNet-v1-1-nightly/annotator/dwpose/util.py,
 // Apache-2.0, a convention those models expect).  Written from the papers and the weights' names and shapes; the
 // convolutions and the heads go through AuxMapNet and kernels here, the drawing runs on the host.
 
@@ -577,7 +577,7 @@ std::vector<uint8_t> draw_pose(const std::vector<WholeBody>& people, int64_t W, 
     std::vector<uint8_t> px((size_t) (W * H * 3), 0);
     Canvas cv{px, W, H};
     constexpr float kMin = 0.3f;
-    // OpenPose's 18 body points from COCO's 17 (the neck between the shoulders), their limbs and colours
+    // the drawing's 18 body points from COCO's 17 (the neck between the shoulders), their limbs and colours
     static const int kFromCoco[18] = {0, -1, 6, 8, 10, 5, 7, 9, 12, 14, 16, 11, 13, 15, 2, 1, 4, 3};
     static const int kLimbs[17][2] = {{1, 2},  {1, 5},   {2, 3},   {3, 4},  {5, 6},  {6, 7},   {1, 8},   {8, 9}, {9, 10},
                                       {1, 11}, {11, 12}, {12, 13}, {1, 0},  {0, 14}, {14, 16}, {0, 15}, {15, 17}};

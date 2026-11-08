@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/upscale/seedvr2_probe.cpp - strata-image-seedvr2-probe: SeedVR2's parts on the GPU against a reference run's
-// outputs (.npy files: an image's FP32 run of ComfyUI's SeedVR2 core, which follows ByteDance-Seed/SeedVR).
+// outputs (.npy files: an image's FP32 run of a reference that follows ByteDance-Seed/SeedVR).
 //
 //   strata-image-seedvr2-probe vae VAE.safetensors GOLDEN_DIR   (pix [3][H][W] in -1 .. 1, its encoder mean
 //       mean [16][H / 8][W / 8], and dec [3][H][W] the decode of that mean)

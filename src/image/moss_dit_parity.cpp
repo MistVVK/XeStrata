@@ -396,7 +396,7 @@ int main() {
             d.forward(x, kTime, kH, kW, 2, out);
             strata::gpu::stream_sync(s);
             // FP16 products: within 3e-3 of the largest value (about 3.5e-4 on the B70 and the RTX 4070); the 8-bit
-            // block's 5e-3 (8.4e-4).  The residual stream is BF16 (as ComfyUI keeps it): the rows read from it (1, 2)
+            // block's 5e-3 (8.4e-4).  The residual stream is BF16: the rows read from it (1, 2)
             // take two of its roundings more, 2^-7 of the largest (6.7e-3 and 8.5e-3 on the RTX 4070, 2026-11-06),
             // and the velocity, the head over them, 5e-3 in either form (3.0e-3 in FP16)
             const double tol = q8 ? 5e-3 : 3e-3, bf = 0x1p-7;

@@ -246,7 +246,7 @@ struct LnMod {
     }
 };
 
-// A DiT's residual stream: FP32, or BF16 (uint16_t, ComfyUI's form: MOSS-Image's), rounded to the nearest.  NVIDIA's
+// A DiT's residual stream: FP32, or BF16 (uint16_t: MOSS-Image's), rounded to the nearest.  NVIDIA's
 // GPUs take the conversion instruction (kernels::bf16_from_f32's integer rounding doubled MOSS-Image's RMS norm's
 // instructions on the RTX 4070, 2026-11-06); elsewhere the integer rounding: a kernel with
 // sycl::ext::oneapi::bfloat16's conversion crashes intel/llvm v7.2.0's SYCL runtime (libsycl 9) on Intel's GPUs where

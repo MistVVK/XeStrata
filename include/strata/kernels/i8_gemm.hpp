@@ -5,7 +5,7 @@
 // (X . W^T) times X's row scales and W's (a W8A8 product's), plus a bias, written as BF16 - what the products' readers
 // take, where a library's int8 product writes int32 sums for them to scale (prefill::Gemm::i8): half the bytes read
 // after it.  BF16, not FP16: some models' products leave values past FP16's range (Mage-Flow's to 4e8), and the
-// reference implementations keep these activations in BF16 (ComfyUI).  The GPU makers' libraries take no such product
+// reference implementations keep these activations in BF16.  The GPU makers' libraries take no such product
 // (cuBLASLt and hipBLASLt write int8 products' sums as int32 or int8 only, 2026-11-06).
 #pragma once
 

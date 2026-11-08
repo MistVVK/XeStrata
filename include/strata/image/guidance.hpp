@@ -1,27 +1,25 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/guidance.hpp - the guidance ComfyUI's nodes add to a flow model's sampling, worked as ComfyUI
-// works them: on the denoised predictions (x0 = x - sigma v, ComfyUI's CONST calculate_denoised), not on the velocity.
+// include/strata/image/guidance.hpp - the guidance added to a flow model's sampling, worked on the denoised
+// predictions (x0 = x - sigma v), not on the velocity.
 //
-//   APG (comfy_extras/nodes_apg.py, a pre-CFG function): the guidance cond - uncond of the denoised predictions, its
+//   APG (adaptive projected guidance, applied before CFG): the guidance cond - uncond of the denoised predictions, its
 //     running sum (momentum; started again when the sigma rises), its norm over the whole latent cut to
 //     norm_threshold, its part along cond scaled by eta; the conditional prediction becomes
 //     uncond + guidance' + (cond - uncond) / cfg, which CFG then combines.
 //   CFG: uncond + cfg (cond - uncond); without a negative pass, cond.
-//   Then the post-CFG functions in this order (ComfyUI runs them in the order the nodes patch the model; this order is
-//   XeStrata's, fixed):
-//   CFGZero* (nodes_cfg.py CFGZeroStar): alpha = <x - cond, x - uncond> / (|x - uncond|^2 + 1e-8) over the whole
+//   Then the functions applied after CFG, in this order (XeStrata's, fixed):
+//   CFGZero*: alpha = <x - cond, x - uncond> / (|x - uncond|^2 + 1e-8) over the whole
 //     latent, den + uncond (alpha - 1) + cfg uncond (1 - alpha).
-//   Skip Layer Guidance (nodes_slg.py SkipLayerGuidanceDiT): with the model's sigma within [sigma_end, sigma_start],
+//   Skip Layer Guidance: with the model's sigma within [sigma_end, sigma_start],
 //     den + scale (cond - skipped), skipped the conditional prediction of a pass with `layers` skipped; rescaling_scale
 //     moves den's spread towards cond's (torch.std, unbiased, over the whole latent).
-//   CFGNorm (nodes_cfg.py CFGNorm, its default post-CFG form): den scaled at each latent position by
+//   CFGNorm (its default form, after CFG): den scaled at each latent position by
 //     clamp(|cond| / (|den| + 1e-8), 0, 1) (norms over the channels) and by strength.
-//   Detail Daemon (Jonseed's ComfyUI-Detail-Daemon, DetailDaemonSamplerNode, after muerrilla's sd-webui-detail-daemon):
-//     the sampler's own sigmas and steps stay; the model is asked at sigma (1 - 0.1 d cfg), d the schedule's value
-//     (make_detail_daemon_schedule over the steps, looked up and interpolated at the sigma as get_dd_schedule does),
-//     cfg its override or the request's scale (1 without guidance).  Every prediction above (and the window of skip
-//     layer guidance) then goes by that sigma, as ComfyUI's wrapped model does.
+//   Detail Daemon (after muerrilla's sd-webui-detail-daemon): the sampler's own sigmas and steps stay; the model is
+//     asked at sigma (1 - 0.1 d cfg), d the detail schedule's value (made over the steps, looked up and interpolated
+//     at the sigma), cfg its override or the request's scale (1 without guidance).  Every prediction above (and the
+//     window of skip layer guidance) then goes by that sigma.
 // CFGZero* and APG need the negative pass (they do nothing without one here; the server refuses them); CFGNorm, skip
 // layer guidance and Detail Daemon work at CFG 1 as well.
 #pragma once

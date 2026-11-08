@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/florence2.cpp - see include/strata/image/florence2.hpp.
+// SPDX-FileCopyrightText: 2020 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
+// src/image/florence2.cpp - see include/strata/image/florence2.hpp.  The beam search (decode) follows transformers'
+// generation (src/transformers/generation/utils.py, _beam_search; Apache-2.0).
 
 #include "strata/image/florence2.hpp"
 

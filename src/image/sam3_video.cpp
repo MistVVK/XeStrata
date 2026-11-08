@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 // SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
-// src/image/sam3_video.cpp - see include/strata/image/sam3_video.hpp.  A frame's steps, in the order of Meta's
-// _det_track_one_frame (and vLLM-Omni's step): detect; propagate each bucket from its memory; associate; hot start;
+// src/image/sam3_video.cpp - see include/strata/image/sam3_video.hpp.  A frame's steps, in the order of
+// vLLM-Omni's step: detect; propagate each bucket from its memory; associate; hot start;
 // recondition (every recondition_every frames); suppress the recently occluded; encode the frame's memory; add the new
 // objects and remove the dropped ones; record the frame's outputs, shown hot_start frames later.  The masks the rules
 // compare are the 4x level's (288 x 288), binary, on the host; the network's work is the GPU's.
@@ -74,7 +74,7 @@ int64_t intersection(const Binary& a, const Binary& b) {
     return n;
 }
 
-// the intersection over the smaller mask (Meta's mask_iom), and over the union
+// the intersection over the smaller mask, and over the union
 float iom(const Binary& a, const Binary& b, int64_t aa, int64_t ab) {
     return (float) intersection(a, b) / ((float) std::min(aa, ab) + 1e-8f);
 }
@@ -153,7 +153,7 @@ struct Sam3Video::Impl {
 
     // ------------------------------------------------------------------------------------------- the frame's parts
     // each of the words looked for on frame f: the detector's queries past the threshold away from the edges, by IoM
-    // NMS, in the queries' order (as Meta's keep mask leaves them: a new object's id follows it); the words in order
+    // NMS, in the queries' order (a new object's id follows it); the words in order
     std::vector<Det> detect(int64_t f) {
         std::vector<Det> out;
         int64_t active = 0, done = 0;
@@ -500,8 +500,8 @@ struct Sam3Video::Impl {
                 if (best >= cfg.recondition_iom) high[objs[bj].id] = i;
             }
         }
-        // hot start: the unmatched frames, the masklets sharing a detection (Meta's 3.1 counts keep-alive too, but its
-        // GPU hot start hides nothing by it)
+        // hot start: the unmatched frames, the masklets sharing a detection (keep-alive is not counted: it would hide
+        // nothing)
         std::set<int64_t> to_remove;
         {
             for (size_t j = 0; j < no; ++j)
@@ -763,8 +763,7 @@ struct Sam3Video::Impl {
         const auto un = unconfirmed.find(std::min(p.frame + cfg.confirm_after - 1, last));
         std::vector<std::pair<int64_t, const std::vector<float>*>> keep;
         for (const auto& [id, m] : p.masks) {
-            // Meta's 3.1 hides the masklets not yet confirmed; the removed and the kept-alive-out ones it leaves shown
-            // (its GPU hot start fills neither of its lists that would hide them)
+            // the masklets not yet confirmed are hidden; the removed and the kept-alive-out ones stay shown
             if (un != unconfirmed.end() && un->second.count(id)) continue;
             keep.emplace_back(id, &m);
         }

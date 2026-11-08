@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/sam3_track.cpp - SAM 3.1's multiplex tracker's parts (sam3.hpp's video section), written for the engine
-// after reading Meta's sam3 (facebookresearch/sam3 at f1647e8: video_tracking_multiplex.py, multiplex_mask_decoder.py,
-// memory.py, model_builder.py) and ComfyUI's comfy/ldm/sam3/tracker.py; no code of theirs is copied.  Where the two
-// differ, Meta's is followed: the images normalized to [-1, 1], the sine positions at (i + 1) / (n + 1e-6), the
-// object pointer from the mask token of the best mask, the CXBlocks' norm at 1e-6.
+// src/image/sam3_track.cpp - SAM 3.1's multiplex tracker's parts (sam3.hpp's video section), written for the engine:
+// the images normalized to [-1, 1], the sine positions at (i + 1) / (n + 1e-6), the object pointer from the mask
+// token of the best mask, the CXBlocks' norm at 1e-6.
 //
 //   * the necks: the trunk's patches through the propagation's (and the interactive's) 4x, 2x and 1x convolutions;
 //   * the memory attention: 4 layers over the frame's 1x level (+ 0.1 its sine positions): a self-attention whose q
@@ -791,8 +789,8 @@ float Sam3::point_prompt(const std::vector<std::array<float, 3>>& pts, const flo
     gpu::copy(iou.data(), small, iou.size() * 4);
     const float score = iou[(size_t) T];
     // one point: the best of the 3 masks by their IoU; more (a box's corners among them): the single mask, unless it
-    // is unstable (its area at logits past +-0.05 differing by 2% or more), then the best of the 3 (Meta's dynamic
-    // multimask)
+    // is unstable (its area at logits past +-0.05 differing by 2% or more), then the best of the 3 (a dynamic
+    // multimask choice)
     const auto best_of_three = [&] {
         int64_t b = 1;
         for (int64_t t = 2; t < T; ++t)

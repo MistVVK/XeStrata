@@ -438,12 +438,6 @@ permission under GPL section 7, what goes in, and how to report).
      SSD by their rank);
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges);
-   - [ComfyUI-Inpaint-CropAndStitch](https://github.com/lquesada/ComfyUI-Inpaint-CropAndStitch), by lquesada (an edit
-     with a mask: the painted part cut out, drawn enlarged and put back);
-   - [ComfyUI-Impact-Pack](https://github.com/ltdrdata/ComfyUI-Impact-Pack)'s FaceDetailer, by ltdrdata (faces, hands
-     or people found and drawn again one by one);
-   - [ComfyUI](https://github.com/comfyanonymous/ComfyUI), by comfyanonymous and the ComfyUI contributors (the CFGNorm,
-     CFGZeroStar, APG and SkipLayerGuidanceDiT nodes: the image sampling's guidance);
    - [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun), by alibaba-pai (how Qwen-Image-2.1's Fun ControlNet Union
      is built), and [comfyui_controlnet_aux](https://github.com/Fannovel16/comfyui_controlnet_aux), by Fannovel16 (the
      control maps' kinds and defaults; only its outputs were compared with, none of its code is copied);

@@ -458,7 +458,7 @@
   "img.gStrength": "强度",
   "img.gZeroTitle": "CFG-Zero*：在引导前把负面提示词的预测按提示词的预测缩放；需要 CFG",
   "img.cropStitch": "裁出涂抹的部分并放大重画",
-  "img.cropStitchTitle": "Crop and Stitch：把涂抹部分的周围以约 1024x1024 重画后贴回；关闭时按输出尺寸重画",
+  "img.cropStitchTitle": "把涂抹部分的周围以约 1024x1024 重画后贴回；关闭时按输出尺寸重画",
   "img.refine": "再把涂抹的部分画得更细（时间约 1.6 倍）",
   "img.refineTitle": "MOSS-Image 使用两张以上图片时：先画整张图，再从中裁出涂抹的部分重画",
   "img.madeCrop": "（在涂抹部分周围以 {size} 绘制）",

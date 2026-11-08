@@ -706,7 +706,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         Block& b = blocks_[(size_t) bi];
         const uint8_t* base = blocks_stream_.begin(bi);   // the block's weights on the GPU (resident or a slot)
         // skip layer guidance's pass: the image's rows past the block as they came (the prefix's rows, cached, are
-        // the block's own: ComfyUI's Qwen-Image-2.1 replaces the block of the image's rows only)
+        // the block's own: the skip replaces the block of the image's rows only)
         if (prer && skip_ != nullptr && std::find(skip_->begin(), skip_->end(), bi) != skip_->end()) {
             blocks_stream_.end(bi);
             continue;

@@ -43,7 +43,7 @@ constexpr int64_t kPatch = 16, kPix = kPatch * kPatch;   // a latent position's 
 constexpr int64_t kWin = 32, kWinTok = kWin * kWin;       // the CoD decoder's attention windows
 constexpr int64_t kGroups = 32;                           // its group norms
 constexpr int64_t kF2Overlap = 4, kF2TileMin = 16;        // the Flux2 VAE's tiles: tokens shared, the least side
-// a video's tiles' tokens shared, blended over them all: ComfyUI's template's 128 pixels (4 took a tile of 160 pixels
+// a video's tiles' tokens shared, blended over them all: 128 pixels (4 took a tile of 160 pixels
 // 2.75% off the whole frame's decode against 1.7% with 8, 2026-11-08)
 constexpr int64_t kVOverlap = 8;
 constexpr int64_t kX = 32;                                // the per-pixel MLP's width
@@ -1589,7 +1589,7 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
 // ---- the Flux2 VAE's encoder
 
 // The encoder in tiles of t x t tokens (a tile's image 16 t pixels a side, the last ones flush with the edges), each
-// encoded whole (its group norms and its middle's attention over the tile, as ComfyUI's tiled encode has them) and the
+// encoded whole (its group norms and its middle's attention over the tile) and the
 // tiles' latents blended linearly across the kF2Overlap tokens two of them share
 void MfVae::f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, int64_t th, int64_t tw) {
     th = std::min(h, th);

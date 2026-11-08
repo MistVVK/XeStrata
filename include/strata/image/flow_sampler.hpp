@@ -5,7 +5,7 @@
 // (sample_er_sde: the extended reverse-time SDE solver of three stages, its integrals over 200 points, the noise scaler
 // x (e^(x^0.3) + 10)).  er_sde's first sigma is moved below 1 as ComfyUI's offset_first_sigma_for_snr moves it (the
 // model's schedule at 1e-4 of the way from the top), and its noise at each step is PyTorch's CPU generator's of a seed
-// a step (torch_cpu_randn), not ComfyUI's GPU generator's.  Guidance: u + cfg (c - u) of the contexts' velocities, or guidance.hpp's.
+// a step (torch_cpu_randn), not a GPU generator's.  Guidance: u + cfg (c - u) of the contexts' velocities, or guidance.hpp's.
 #pragma once
 
 #include "strata/image/guidance.hpp"

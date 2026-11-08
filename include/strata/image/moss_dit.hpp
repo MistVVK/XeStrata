@@ -67,19 +67,19 @@ public:
     /// The blocks context i skips (none by default).
     void set_skip(int i, std::vector<int> blocks) { ctx_[i].skip = std::move(blocks); }
 
-    /// An edit's reference images, as Moss-Image-Edit's adapter takes them (ComfyUI's MOSS-Image edit, its method
-    /// "index_timestep_zero_text_start"): each a latent [h w][128] (device FP32, the VAE's encode), on the rotary axes
-    /// at r = its index + 1, f = 0, its rows and columns centered.  They go through every block once, at timestep 0
+    /// An edit's reference images, as Moss-Image-Edit's adapter was trained to take them (its model card): each a
+    /// latent [h w][128] (device FP32, the VAE's encode), on the rotary axes at r = its index + 1, f = 0, its rows and
+    /// columns centered.  They go through every block once, at timestep 0
     /// and attending to each other alone, and each block's keys and values of them are kept (their v heads' scales
     /// with them); at every step the rows of each context attend to them as well, their keys before the context's
     /// own.  Called after the adapters are bound (the blocks they go through are the adapted ones); empty: none, the
-    /// kept keys and values freed.  `layout` Isolated: an ai-toolkit adapter's (ComfyUI's
-    /// "index_timestep_zero_isolated"), each context's image and text rows on f moved back by the context's rows (the
-    /// references keep f = 0; Moss-Image-Edit's, TextStart, leave them where a picture without references has them).
-    /// TimestepZero and Index, the references in the stream (ai-toolkit's with its kv_cache off; ComfyUI's
-    /// "index_timestep_zero" and "index"): f as Isolated's, but their rows go after each context's text at every step,
-    /// attending to all of its rows and they to them, modulated at timestep 0 (TimestepZero) or at the step's (Index);
-    /// only their input projection is kept (stream_rows of them a context).
+    /// kept keys and values freed.  `layout` Isolated: an ai-toolkit adapter's (as ai-toolkit trains it with its
+    /// kv_cache on), each context's image and text rows on f moved back by the context's rows (the references keep
+    /// f = 0; Moss-Image-Edit's, TextStart, leave them where a picture without references has them).  TimestepZero
+    /// and Index, the references in the stream (ai-toolkit's with its kv_cache off; Index at the image's timestep,
+    /// thearkorbit's moss-image-edit-lora-poc's): f as Isolated's, but their rows go after each context's text at every
+    /// step, attending to all of its rows and they to them, modulated at timestep 0 (TimestepZero) or at the step's
+    /// (Index); only their input projection is kept (stream_rows of them a context).
     struct RefLatent {
         const float* tokens;
         int64_t h, w;
@@ -329,7 +329,7 @@ private:
     };
     Rows rows_for(int64_t hw, int n, int64_t max_text, int64_t ref_rows, bool ref_i8) const;
     int64_t dirty_[2] = {0, 0};   // the rows of each attention slot (jq16_ ...) that may not be zero
-    // x_: the residual stream, BF16 as ComfyUI keeps it (the RMS norms read and write it: 8 bytes a value in FP32, 4
+    // x_: the residual stream, BF16 (the RMS norms read and write it: 8 bytes a value in FP32, 4
     // in BF16; the RTX 4070's step 634 -> 620 ms, 2026-11-06)
     uint16_t* x_ = nullptr;
     float *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *gu_ = nullptr,

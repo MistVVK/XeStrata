@@ -249,8 +249,8 @@ void Seedvr2::Impl::run_chunks() {
         dit->drop_activations();   // the room the VAE's slices take
         dit_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         restore(v.ncat, v.vel, len * n, 1.f / kScaling, v.vel, s);
-        // merged: the latents the chunk shares with the ones before it mixed in (their outputs as ComfyUI's
-        // SeedVR2TemporalMerge gives them), the rest appended
+        // merged: the latents the chunk shares with the ones before it mixed in, the rest
+        // appended
         const int64_t shared = std::min(v.made - s0, len);
         for (int64_t j = 0; j < len; ++j) {
             const int64_t L = s0 + j;
@@ -399,8 +399,8 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
             if (m.vae_tt < 0) m.vae_tt = std::end(kVaeTiles)[-1];
         }
         m.vae_lat = std::max<int64_t>(most(m.vae_tt, m.vae_host), 1);
-        // then a tile's slices within a call as long as the room left lets them, up to 4 latents (ComfyUI's
-        // SEEDVR2_MAX_SLICE_LATENTS): each convolution over more frames at once
+        // then a tile's slices within a call as long as the room left lets them, up to 4 latents:
+        // each convolution over more frames at once
         m.vae_slice = 1;
         for (int64_t sl = std::min<int64_t>(4, m.vae_lat); sl > 1; --sl)
             if (vae_video_need(*m.vae, th, tw, HW, m.vae_tt, m.vae_host, m.vae_lat, sl) <= room) {

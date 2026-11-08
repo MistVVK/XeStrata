@@ -9,7 +9,7 @@ or failed, its progress, GET /v1/videos/{id}, its file at /v1/videos/{id}/conten
 /v1/videos/sync (the file in the answer).  The source video comes as a multipart form's file (vLLM-Omni's
 input_references, or video), written to a file as it arrives, never held in memory whole.  size is the output's
 WIDTHxHEIGHT; without it, scale (2 by default); extra_params: vLLM-Omni's color_correction_method, and XeStrata's
-chunk_frames and temporal_overlap (SeedVR2's chunks: ComfyUI's SeedVR2TemporalChunk's) and video_codec (h264, vp9,
+chunk_frames and temporal_overlap (SeedVR2's chunks) and video_codec (h264, vp9,
 ffv1).
 
 The segmentation's entry point is vLLM-Omni's POST /v1/videos/segmentations: its form (video, prompt, prompts as a
