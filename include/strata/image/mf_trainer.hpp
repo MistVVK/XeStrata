@@ -1,0 +1,130 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/image/mf_trainer.hpp - Mage-Flow's smallest training loop: the model a step runs, the step's own
+// forward and backward, and the safetensors file it writes (docs/LORA_TRAIN.md, card 5).
+//
+// A step trains adapters (MfAdapter, one per block product the SPEC names) with the base weights frozen: the block
+// is mf_block run forwards and, on the way back, run again from its input's boundary rows (the tape of a whole
+// model does not fit, so every block pays one forward twice).  What the trainer reaches through prefill::Gemm is
+// the same math the inference reads (src/image/mf_dit.cpp): the sinusoidal time embedding, the modulations, the
+// joint attention without a mask, AdaLayerNormContinuous and the projection to the latent's channels.
+#pragma once
+
+#include "strata/image/mf_train.hpp"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace strata::image {
+
+/// One frozen product: the FP16 rows the products read and their transposed view, and the FP32 bias.
+struct MfTrainProduct {
+    int64_t N = 0, K = 0;
+    uint16_t* w = nullptr;    // [N][K] FP16
+    uint16_t* wt = nullptr;   // [K][N] FP16
+    float* b = nullptr;       // [N] FP32
+};
+
+/// One block's trainable side: an adapter per stream and product (null: none), with its own FP32 gradients.
+struct MfTrainAdapter {
+    MfAdapter ad[2][6];
+    int64_t rank = 0;
+    MfAdapterMethod method = MfAdapterMethod::lora;
+    float scale = 1.f;   // s * alpha / rank, folded (alpha free, default candidate rank)
+    float alpha = 16.f;
+    float *A[2][6] = {};    // [rank][K] FP32 masters, trained
+    float *B[2][6] = {};    // [N][rank] FP32 masters, trained
+    float *M[2][6] = {};    // [N] FP32 DoRA magnitudes, trained (null: plain LoRA)
+    float *W1[2][6] = {};   // [ol][im] FP32 LoKr masters, trained (null: not LoKr)
+    float *W2A[2][6] = {};  // [ok][rank] FP32 LoKr masters, trained
+    float *W2B[2][6] = {};  // [rank][inn] FP32 LoKr masters, trained
+    float *mA[2][6] = {}, *vA[2][6] = {};   // AdamW states
+    float *mB[2][6] = {}, *vB[2][6] = {};
+    float *mm[2][6] = {}, *vm[2][6] = {};
+    float *mW1[2][6] = {}, *vW1[2][6] = {};   // LoKr AdamW states
+    float *mW2A[2][6] = {}, *vW2A[2][6] = {};
+    float *mW2B[2][6] = {}, *vW2B[2][6] = {};
+};
+
+/// The DiT as the trainer reads it: every block's products and head norms, the weights outside the blocks, and one
+/// adapter set.  All device buffers; freed with the model.
+struct MfTrainModel {
+    void* stream = nullptr;
+    int64_t C = 0, F = 0, heads = 0, hd = 0, nblk = 0, txt_dim = 0, in_ch = 0;
+    std::vector<int64_t> axes;   // the RoPE's axes (16, 56, 56)
+    MfTrainProduct img_in, txt_in, t1, t2, nout, pout;
+    float* txt_norm = nullptr;   // [txt_dim] FP32
+    uint16_t* wtScratch = nullptr;   // one block's transposed views ([stream][product], offsets below)
+    int64_t wtOff[2][6] = {};
+    uint64_t adam_step = 0;   // the optimizer's step count (bias correction reads it)
+    struct Block {
+        MfTrainProduct prod[2][6];   // [stream][q, k, v, o, mlp1, mlp2]
+        MfTrainProduct mod[2];       // [stream] the img_mod.1 / txt_mod.1 linears ([6C][C])
+        float* nq[2] = {};           // [hd] FP32 per stream
+        float* nk[2] = {};
+        MfTrainAdapter* adap = nullptr;   // null: the block runs plain
+    };
+    std::vector<Block> blk;
+};
+
+/// Open the bf16 DiT (every weight as FP16, as the engine reads it) and an adapter set of the given rank (0: none).
+/// Throws when a shape the trainer reads is not the file's (the file's own block count and widths win).
+MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err);
+void mf_trainer_close(MfTrainModel* m);
+/// The adapters' starting point (once, before training): A ~ N(0, 1/sqrt(rank)), B = 0, m = norms (method 0 plain
+/// LoRA, 1 DoRA; alpha free, default candidate rank).  The FP16 working copies sync from the masters here and after
+/// every optimizer step.
+void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed);
+
+/// One sample's disk form (tools/image/mf_pre_export.py): the latent [tokens][128] F32, the text [rows][txt_dim]
+/// F32 (the bf16 widened), the empty prompt's rows beside them (caption dropout reads those), and the bucket's
+/// own rows and columns (the RoPE tables read them).
+struct MfTrainSample {
+    std::vector<float> lat;      // [tokens][128]
+    std::vector<float> te;       // [rows][txt_dim]
+    std::vector<float> uncond;   // [uncond_rows][txt_dim], the empty prompt
+    int64_t tokens = 0, rows = 0, uncond_rows = 0, h = 0, w = 0;
+};
+
+/// Read one sample of an exported run dir by its manifest stem.
+MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem, int64_t txt_dim);
+
+/// The step's constants from its sigma: the time embedding, the modulations of every block and stream, and the
+/// norm_out pair, on the device (the caller keeps them for the backward).  Computed through the products, the same
+/// math the inference reads.
+struct MfTrainCond {
+    float* temb = nullptr;                 // [C] FP32 (and its SiLU image below)
+    std::vector<float*> mod;               // [block][stream][6 C] FP32, kept
+    float* nmod = nullptr;                 // [2 C] FP32
+    float* cos = nullptr, * sin = nullptr;   // [tokens][hd / 2] FP32
+};
+MfTrainCond mf_trainer_cond(MfTrainModel* m, float sigma, int64_t h, int64_t w, prefill::Gemm& gemm);
+void mf_trainer_free_cond(MfTrainModel* m, MfTrainCond& c);
+
+/// One step's kept tensors (device buffers, freed with the state): the noised input and its target, the
+/// velocity and its gradient, and every block's input boundary rows (13 x (tokens + rows) x C).
+struct MfTrainState {
+    float *x0 = nullptr, *xe = nullptr, *v_pred = nullptr, *dv_pred = nullptr;
+    float* bounds = nullptr;   // [13][tokens + rows][C]: block i reads bounds[i], writes bounds[i + 1]
+    int64_t R = 0, Rt = 0;
+};
+void mf_trainer_free_state(MfTrainModel* m, MfTrainState& s);
+
+/// The forward with its state kept for the backward (bounds, x0/xe, v_pred; dv_pred filled by the backward).
+float mf_trainer_forward(MfTrainModel* m, const MfTrainSample& s, const MfTrainCond& c, const float* eps,
+                         float sigma, float* v_pred, std::vector<float>* bounds, prefill::Gemm& gemm);
+float mf_trainer_forward_keep(MfTrainModel* m, const MfTrainSample& s, const MfTrainCond& c, const float* eps,
+                              float sigma, MfTrainState& st, prefill::Gemm& gemm);
+/// The backward from the kept state: the norm and output projection, then every block from its boundary input.
+/// The adapters' gradients are added into (accumulate over micro-steps, then step the optimizer).
+void mf_trainer_backward(MfTrainModel* m, const MfTrainSample& s, const MfTrainCond& c, MfTrainState& st,
+                         float sigma, prefill::Gemm& gemm);
+/// One AdamW step over every adapter (gradients averaged over accum_n, then zeroed) and the FP16 working copies
+/// synced back from the masters.
+void mf_trainer_adamw(MfTrainModel* m, float lr, float beta1, float beta2, float eps, float wd, int64_t accum_n);
+/// The safetensors file (SPEC D1): dot keys, per-weight .alpha, the metadata v1 writes.
+void mf_trainer_save(MfTrainModel* m, const std::string& path, const std::string& title,
+                     const std::string& trigger, uint64_t seed, float lr, int64_t max_steps);
+
+}  // namespace strata::image

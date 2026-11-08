@@ -1,0 +1,1057 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/image/mf_trainer.cpp - see include/strata/image/mf_trainer.hpp.
+#include "strata/image/mf_trainer.hpp"
+
+#include "strata/core/gpu.hpp"
+#include "strata/image/safetensors.hpp"
+#include "strata/image/mapped_file.hpp"
+#include "strata/kernels/f16_bits.hpp"
+
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+#include "dit_rows.hpp"
+
+namespace strata::image {
+
+namespace {
+
+using kernels::f16_from_f32;
+using kernels::f32_from_f16;
+
+// one device buffer, freed with the model
+struct Owned {
+    std::vector<void*> p;
+    ~Owned() {
+        for (void* q : p) gpu::free(q);
+    }
+    template <class T>
+    T* get(int64_t n, void* s) {
+        void* q = nullptr;
+        if (!gpu::alloc_device(&q, (size_t) n * sizeof(T)))
+            throw std::runtime_error("image engine (Mage-Flow training): GPU memory");
+        if (!gpu::memset_async(q, 0, (size_t) n * sizeof(T), s))
+            throw std::runtime_error("image engine (Mage-Flow training): zero");
+        p.push_back(q);
+        return static_cast<T*>(q);
+    }
+};
+
+struct Model : MfTrainModel {
+    Owned owned;
+    prefill::Gemm gemm;
+};
+
+float* dev_dup(Model* m, const float* host, int64_t n) {
+    float* d = m->owned.get<float>(n, m->stream);
+    // the zero above runs on this stream; the copy below runs on the compute queue: without the sync the zero
+    // can land after the copy and wipe the weights (usually sane values, sometimes a healthy-looking run)
+    gpu::stream_sync(m->stream);
+    if (!gpu::copy(d, host, (size_t) n * 4)) throw std::runtime_error("image engine (Mage-Flow training): copy");
+    gpu::stream_sync(m->stream);
+    return d;
+}
+
+uint16_t* dev_dup16(Model* m, const uint16_t* host, int64_t n) {
+    uint16_t* d = m->owned.get<uint16_t>(n, m->stream);
+    // as above: the zero and the copy run on different queues
+    gpu::stream_sync(m->stream);
+    if (!gpu::copy(d, host, (size_t) n * 2)) throw std::runtime_error("image engine (Mage-Flow training): copy");
+    gpu::stream_sync(m->stream);
+    return d;
+}
+
+// the file's bf16 rows as the FP16 bits the products read, and their transposed view
+void load_product(Model* m, SafeTensors& st, const uint8_t* data, const std::string& name, MfTrainProduct& pr) {
+    const SafeTensor* t = st.find(name + ".weight");
+    if (t == nullptr) throw std::runtime_error("image engine (Mage-Flow training): no " + name);
+    if (t->dtype != "BF16" || t->shape.size() != 2)
+        throw std::runtime_error("image engine (Mage-Flow training): " + name + " is not a bf16 matrix");
+    pr.N = t->shape[0];
+    pr.K = t->shape[1];
+    const auto* src = reinterpret_cast<const uint16_t*>(data + t->begin);
+    std::vector<uint16_t> h((size_t) (pr.N * pr.K));
+    for (int64_t i = 0; i < pr.N * pr.K; ++i) h[(size_t) i] = f16_from_f32(dit_rows::bf16_value(src[i]));
+    pr.w = dev_dup16(m, h.data(), pr.N * pr.K);
+    pr.wt = nullptr;   // the transposed views are read per block from wtScratch (all blocks do not fit beside w)
+    pr.b = dev_dup(m, st.f32(name + ".bias").data(), pr.N);
+}
+
+void load_vec(Model* m, SafeTensors& st, const std::string& name, float*& out, int64_t want) {
+    auto v = st.f32(name);
+    if ((int64_t) v.size() != want)
+        throw std::runtime_error("image engine (Mage-Flow training): " + name + " is not " +
+                                 std::to_string(want) + " wide");
+    out = dev_dup(m, v.data(), want);
+}
+
+void silu_rows(const float* x, int64_t n, float* y, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float v = x[id[0]];
+        y[id[0]] = v / (1.f + sycl::exp(-v));
+    });
+}
+
+void to_f16(const float* x, int64_t n, uint16_t* y, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n),
+                                   [=](sycl::id<1> id) { y[id[0]] = f16_from_f32(x[id[0]]); });
+}
+
+/// the v1 target names per stream and product (SPEC D1 writes them as they are, no mapping table)
+const char* const kTarget[2][6] = {{"attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
+                                    "img_mlp.net.0.proj", "img_mlp.net.2"},
+                                   {"attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
+                                    "txt_mlp.net.0.proj", "txt_mlp.net.2"}};
+
+// rms norm without affine, eps 1e-6, as the text reader's rows take it (set_context's qi_rms_norm16)
+void rms_norm(const float* x, const float* w, int64_t rows, int64_t cols, float* y, void* s) {
+    constexpr int64_t kWG = 256;
+    constexpr float kEps = 1e-6f;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rows * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
+            float ss = 0.f;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += kWG)
+                ss += x[t * cols + c] * x[t * cols + c];
+            const float r = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) /
+                                                  (float) cols + kEps);
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += kWG)
+                y[t * cols + c] = x[t * cols + c] * r * w[c];
+        });
+}
+
+}  // namespace
+
+namespace {
+
+// sd-scripts' networks/lokr.py factorization(dimension, -1): m * n = dimension, m <= n, m + n minimal.
+void factorization(int64_t dim, int64_t& m, int64_t& n) {
+    m = 1;
+    n = dim;
+    int64_t len = m + n;
+    while (m < n) {
+        int64_t nm = m + 1;
+        while (dim % nm != 0) ++nm;
+        int64_t nn = dim / nm;
+        if (nm + nn > len || nm > dim) break;
+        m = nm;
+        n = nn;
+        len = m + n;
+    }
+    if (m > n) std::swap(m, n);
+}
+
+}  // namespace
+
+MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err) {
+    std::unique_ptr<Model> m(new Model());
+    m->stream = stream;
+    try {
+        if (!m->gemm.init(stream, 1 << 24, err)) return nullptr;
+        SafeTensors st(dit_path);
+        MappedFile file(dit_path);
+        const uint8_t* data = file.data() + st.data_base();
+        auto shape_of = [&](const std::string& name, int dim) -> int64_t {
+            const SafeTensor* t = st.find(name);
+            if (t == nullptr || (int) t->shape.size() <= dim)
+                throw std::runtime_error("image engine (Mage-Flow training): no " + name);
+            return t->shape[(size_t) dim];
+        };
+        m->C = shape_of("transformer_blocks.0.attn.to_q.weight", 0);
+        m->hd = shape_of("transformer_blocks.0.attn.norm_q.weight", 0);
+        if (m->C % m->hd != 0) throw std::runtime_error("image engine (Mage-Flow training): heads * head_dim");
+        m->heads = m->C / m->hd;
+        m->F = shape_of("transformer_blocks.0.img_mlp.net.0.proj.weight", 0);
+        m->txt_dim = shape_of("txt_in.weight", 1);
+        m->in_ch = shape_of("img_in.weight", 1);
+        m->axes = {16, 56, 56};
+        load_product(m.get(), st, data, "img_in", m->img_in);
+        load_product(m.get(), st, data, "txt_in", m->txt_in);
+        load_product(m.get(), st, data, "time_text_embed.timestep_embedder.linear_1", m->t1);
+        load_product(m.get(), st, data, "time_text_embed.timestep_embedder.linear_2", m->t2);
+        load_product(m.get(), st, data, "norm_out.linear", m->nout);
+        load_product(m.get(), st, data, "proj_out", m->pout);
+        load_vec(m.get(), st, "txt_norm.weight", m->txt_norm, m->txt_dim);
+        for (int b = 0;; ++b) {
+            const std::string p = "transformer_blocks." + std::to_string(b) + ".";
+            if (st.find(p + "img_mod.1.weight") == nullptr) break;
+            MfTrainModel::Block blk;
+            for (int i = 0; i < 6; ++i) {
+                load_product(m.get(), st, data, p + kTarget[0][i], blk.prod[0][i]);
+                load_product(m.get(), st, data, p + kTarget[1][i], blk.prod[1][i]);
+            }
+            load_product(m.get(), st, data, p + "img_mod.1", blk.mod[0]);
+            load_product(m.get(), st, data, p + "txt_mod.1", blk.mod[1]);
+            load_vec(m.get(), st, p + "attn.norm_q.weight", blk.nq[0], m->hd);
+            load_vec(m.get(), st, p + "attn.norm_k.weight", blk.nk[0], m->hd);
+            load_vec(m.get(), st, p + "attn.norm_added_q.weight", blk.nq[1], m->hd);
+            load_vec(m.get(), st, p + "attn.norm_added_k.weight", blk.nk[1], m->hd);
+            if (rank > 0) {
+                blk.adap = new MfTrainAdapter();
+                blk.adap->rank = rank;
+                for (int st = 0; st < 2; ++st)
+                    for (int i = 0; i < 6; ++i) {
+                        MfAdapter& az = blk.adap->ad[st][i];
+                        const int64_t N = blk.prod[st][i].N, K = blk.prod[st][i].K;
+                        az.method = MfAdapterMethod::lora;   // the trainer sets DoRA per product later
+                        az.rank = rank;
+                        int64_t ol, ok, im, inn;
+                        factorization(N, ol, ok);
+                        factorization(K, im, inn);
+                        az.ol = ol;
+                        az.ok = ok;
+                        az.im = im;
+                        az.inn = inn;
+                        az.a = m->owned.get<uint16_t>(rank * K, stream);
+                        az.at = m->owned.get<uint16_t>(rank * K, stream);
+                        az.b = m->owned.get<uint16_t>(N * rank, stream);
+                        az.bt = m->owned.get<uint16_t>(N * rank, stream);
+                        az.dA = m->owned.get<float>(rank * K, stream);
+                        az.dB = m->owned.get<float>(N * rank, stream);
+                        az.dm = m->owned.get<float>(N, stream);
+                        az.norms = m->owned.get<float>(N, stream);
+                        az.w1 = m->owned.get<uint16_t>(ol * im, stream);
+                        az.w1t = m->owned.get<uint16_t>(ol * im, stream);
+                        az.w2a = m->owned.get<uint16_t>(ok * rank, stream);
+                        az.w2b = m->owned.get<uint16_t>(rank * inn, stream);
+                        az.dW1 = m->owned.get<float>(ol * im, stream);
+                        az.dW2a = m->owned.get<float>(ok * rank, stream);
+                        az.dW2b = m->owned.get<float>(rank * inn, stream);
+                        MfTrainAdapter& tz = *blk.adap;
+                        tz.A[st][i] = m->owned.get<float>(rank * K, stream);
+                        tz.B[st][i] = m->owned.get<float>(N * rank, stream);
+                        tz.M[st][i] = m->owned.get<float>(N, stream);
+                        tz.mA[st][i] = m->owned.get<float>(rank * K, stream);
+                        tz.vA[st][i] = m->owned.get<float>(rank * K, stream);
+                        tz.mB[st][i] = m->owned.get<float>(N * rank, stream);
+                        tz.vB[st][i] = m->owned.get<float>(N * rank, stream);
+                        tz.mm[st][i] = m->owned.get<float>(N, stream);
+                        tz.vm[st][i] = m->owned.get<float>(N, stream);
+                        tz.W1[st][i] = m->owned.get<float>(ol * im, stream);
+                        tz.W2A[st][i] = m->owned.get<float>(ok * rank, stream);
+                        tz.W2B[st][i] = m->owned.get<float>(rank * inn, stream);
+                        tz.mW1[st][i] = m->owned.get<float>(ol * im, stream);
+                        tz.vW1[st][i] = m->owned.get<float>(ol * im, stream);
+                        tz.mW2A[st][i] = m->owned.get<float>(ok * rank, stream);
+                        tz.vW2A[st][i] = m->owned.get<float>(ok * rank, stream);
+                        tz.mW2B[st][i] = m->owned.get<float>(rank * inn, stream);
+                        tz.vW2B[st][i] = m->owned.get<float>(rank * inn, stream);
+                    }
+            }
+            m->blk.push_back(blk);
+        }
+        m->nblk = (int64_t) m->blk.size();
+        if (m->nblk == 0) throw std::runtime_error("image engine (Mage-Flow training): no transformer blocks");
+        // one block's transposed views, reused for every block (all blocks' do not fit beside the weights)
+        {
+            int64_t total = 0;
+            for (int q = 0; q < 2; ++q)
+                for (int i = 0; i < 6; ++i) {
+                    m->wtOff[q][i] = total;
+                    total += m->blk[0].prod[q][i].K * m->blk[0].prod[q][i].N;
+                }
+            m->wtScratch = m->owned.get<uint16_t>(total, m->stream);
+        }
+        // the modulations' linears stay on the host: one row a step, read once
+        (void) data;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return nullptr;
+    }
+    return m.release();
+}
+
+void mf_trainer_close(MfTrainModel* base) {
+    std::unique_ptr<Model> m(static_cast<Model*>(base));
+    for (auto& b : m->blk) delete b.adap;
+}
+
+MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem, int64_t txt_dim) {
+    MfTrainSample s;
+    auto read = [&](const std::string& name) -> std::vector<float> {
+        std::ifstream f(dir + "/" + name + ".bin", std::ios::binary);
+        if (!f) throw std::runtime_error("image engine (Mage-Flow training): no " + name);
+        std::stringstream js;
+        std::ifstream j(dir + "/" + name + ".json");
+        js << j.rdbuf();
+        const std::string t = js.str();
+        const size_t b = t.find("\"shape\"");
+        std::vector<int64_t> sh;
+        if (b != std::string::npos) {
+            const size_t o = t.find('[', b), c = t.find(']', o);
+            std::stringstream ns(t.substr(o + 1, c - o - 1));
+            std::string tok;
+            while (std::getline(ns, tok, ',')) sh.push_back(std::stoll(tok));
+        }
+        std::vector<float> v((size_t) (std::filesystem::file_size(dir + "/" + name + ".bin") / 4));
+        if (!f.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (v.size() * 4)))
+            throw std::runtime_error("image engine (Mage-Flow training): short " + name);
+        if (t.find("\"f16\"") != std::string::npos) {
+            std::vector<float> w(v.size());
+            const auto* h = reinterpret_cast<const uint16_t*>(v.data());
+            for (size_t i = 0; i < v.size(); ++i) w[i] = f32_from_f16(h[i]);
+            return w;
+        }
+        return v;
+    };
+    s.lat = read(stem + "_lat");
+    s.te = read(stem + "_te");
+    s.uncond = read(stem + "_uncond");
+    // the dump lists its shape fastest dim first: [128][tokens] and [txt_dim][rows]
+    s.tokens = (int64_t) s.lat.size() / 128;
+    s.rows = (int64_t) (s.te.size() / (size_t) txt_dim);
+    s.uncond_rows = (int64_t) (s.uncond.size() / (size_t) txt_dim);
+    if ((int64_t) s.lat.size() != s.tokens * 128 || (int64_t) s.te.size() != s.rows * txt_dim ||
+        (int64_t) s.uncond.size() != s.uncond_rows * txt_dim)
+        throw std::runtime_error("image engine (Mage-Flow training): " + stem + " is not this model's shape");
+    // the bucket's own rows and columns come from the manifest
+    std::ifstream mf(dir + "/manifest.tsv");
+    std::string line;
+    while (std::getline(mf, line)) {
+        std::stringstream ls(line);
+        std::string tok;
+        std::getline(ls, tok, '\t');
+        if (tok != stem) continue;
+        std::getline(ls, tok, '\t');
+        s.w = std::stoll(tok);
+        std::getline(ls, tok, '\t');
+        s.h = std::stoll(tok);
+    }
+    if (s.w <= 0 || s.h <= 0 || s.w * s.h != s.tokens)
+        throw std::runtime_error("image engine (Mage-Flow training): " + stem + " is not in the manifest");
+    return s;
+}
+
+namespace {
+
+// the RoPE tables of one h x w image (rope_tables' math, a single frame): cos/sin [h*w][hd/2]
+void rope_tables_host(int64_t h, int64_t w, int64_t hd, const std::vector<int64_t>& axes, std::vector<float>& c,
+                      std::vector<float>& s) {
+    const int64_t half = hd / 2, a0 = axes[0] / 2, a1 = axes[1] / 2;
+    const int64_t y0 = h - h / 2, x0 = w - w / 2;
+    c.resize((size_t) (h * w * half));
+    s.resize((size_t) (h * w * half));
+    int64_t row = 0;
+    for (int64_t y = 0; y < h; ++y)
+        for (int64_t x = 0; x < w; ++x, ++row)
+            for (int64_t j = 0; j < half; ++j) {
+                double pos = 0.0, dim = (double) axes[0], k = (double) j;
+                if (j >= a0 && j < a0 + a1) {
+                    pos = (double) (y - y0);
+                    dim = (double) axes[1];
+                    k = (double) (j - a0);
+                } else if (j >= a0 + a1) {
+                    pos = (double) (x - x0);
+                    dim = (double) axes[2];
+                    k = (double) (j - a0 - a1);
+                }
+                const double ang = pos * std::pow(10000.0, -2.0 * k / dim);
+                c[(size_t) row * half + j] = (float) std::cos(ang);
+                s[(size_t) row * half + j] = (float) std::sin(ang);
+            }
+}
+
+}  // namespace
+
+MfTrainCond mf_trainer_cond(MfTrainModel* base, float sigma, int64_t h, int64_t w, prefill::Gemm& gemm) {
+    Model* m = static_cast<Model*>(base);
+    void* s = m->stream;
+    MfTrainCond c;
+    Owned tmp;
+    const int64_t C = m->C;
+    // the sinusoidal row, as the engine reads it (bf16-rounded, then FP16)
+    const float t = dit_rows::round_bf16(sigma);
+    std::vector<uint16_t> e(256);
+    for (int i = 0; i < 128; ++i) {
+        const float f = dit_rows::round_bf16(std::exp(-std::log(10000.f) * (float) i / 128.f));
+        const float a = 1000.f * (t * f);
+        e[(size_t) i] = f16_from_f32(dit_rows::round_bf16(std::cos(a)));
+        e[128 + (size_t) i] = f16_from_f32(dit_rows::round_bf16(std::sin(a)));
+    }
+    uint16_t* e16 = tmp.get<uint16_t>(256, s);
+    float* temb = tmp.get<float>(C, s);
+    float* tsil = tmp.get<float>(C, s);
+    uint16_t* tsil16 = tmp.get<uint16_t>(C, s);
+    // the zero above runs on this stream; the copy below runs on the compute queue (see dev_dup)
+    gpu::stream_sync(s);
+    if (!gpu::copy(e16, e.data(), size_t{256} * 2)) throw std::runtime_error("image engine (Mage-Flow training): copy");
+    gemm.f16(e16, m->t1.w, temb, 1, C, 256);
+    dit_rows::rows_back(temb, nullptr, m->t1.b, 1, C, s);
+    silu_rows(temb, C, tsil, s);
+    to_f16(tsil, C, tsil16, s);
+    gemm.f16(tsil16, m->t2.w, temb, 1, C, C);
+    dit_rows::rows_back(temb, nullptr, m->t2.b, 1, C, s);
+    silu_rows(temb, C, tsil, s);
+    to_f16(tsil, C, tsil16, s);
+    // the modulations and the norm_out pair read tsil's FP16 rows, unscaled (rows_back with no rs)
+    c.mod.resize((size_t) m->nblk * 2);
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        for (int st = 0; st < 2; ++st) {
+            float* mod = m->owned.get<float>(6 * C, s);
+            const MfTrainProduct& mp = m->blk[(size_t) b].mod[st];
+            gemm.f16(tsil16, mp.w, mod, 1, 6 * C, C);
+            dit_rows::rows_back(mod, nullptr, mp.b, 1, 6 * C, s);
+            c.mod[(size_t) b * 2 + st] = mod;
+        }
+    }
+    c.nmod = m->owned.get<float>(2 * C, s);
+    gemm.f16(tsil16, m->nout.w, c.nmod, 1, 2 * C, C);
+    dit_rows::rows_back(c.nmod, nullptr, m->nout.b, 1, 2 * C, s);
+    std::vector<float> ch, sh;
+    rope_tables_host(h, w, m->hd, m->axes, ch, sh);
+    c.cos = dev_dup(m, ch.data(), (int64_t) ch.size());
+    c.sin = dev_dup(m, sh.data(), (int64_t) sh.size());
+    gpu::stream_sync(s);
+    return c;
+}
+
+void mf_trainer_free_cond(MfTrainModel* base, MfTrainCond& c) {
+    Model* m = static_cast<Model*>(base);
+    auto drop = [&](float* q) {
+        if (q == nullptr) return;
+        auto& v = m->owned.p;
+        v.erase(std::remove(v.begin(), v.end(), (void*) q), v.end());
+        gpu::free(q);
+    };
+    drop(c.temb);
+    for (float* q : c.mod) drop(q);
+    drop(c.nmod);
+    drop(c.cos);
+    drop(c.sin);
+    c = MfTrainCond();
+}
+
+namespace {
+
+// x = a * x0 + b * x1 (the noised latent)
+void axpby(const float* x0, const float* x1, float a, float b, int64_t n, float* y, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        y[id[0]] = a * x0[id[0]] + b * x1[id[0]];
+    });
+}
+
+}  // namespace
+
+namespace {
+
+// one step's scratch that outlives the forward (the backward frees it): boundaries, inputs, velocity
+struct KeepTmp {
+    Owned tmp;   // freed with the step
+};
+
+}  // namespace
+
+static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c, const float* eps, float sigma,
+                          float* v_pred, MfTrainState* keep, prefill::Gemm& gemm) {
+    void* st = m->stream;
+    const int64_t C = m->C, R = s.tokens, Rt = s.rows, Rj = R + Rt;
+    Owned tmp;
+    auto keep_get = [&](int64_t n) -> float* {
+        return keep != nullptr ? m->owned.get<float>(n, st) : tmp.get<float>(n, st);
+    };
+    // the noised latent, then the image stream's rows
+    float* x0 = keep_get(R * 128);
+    float* xe = keep_get(R * 128);
+    float* xs = tmp.get<float>(R * 128, st);
+    // the zeros above run on this stream; the copies below run on the compute queue (see dev_dup)
+    gpu::stream_sync(st);
+    if (!gpu::copy(x0, s.lat.data(), (size_t) R * 128 * 4) || !gpu::copy(xe, eps, (size_t) R * 128 * 4))
+        throw std::runtime_error("image engine (Mage-Flow training): copy");
+    axpby(x0, xe, 1.f - sigma, sigma, R * 128, xs, st);
+    uint16_t* xs16 = tmp.get<uint16_t>(R * 128, st);
+    float* xsrs = tmp.get<float>(R, st);
+    mf_rows16(xs, R, 128, xs16, xsrs, st);
+    float* img = tmp.get<float>(R * C, st);
+    gemm.f16(xs16, m->img_in.w, img, R, C, 128);
+    dit_rows::rows_back(img, xsrs, m->img_in.b, R, C, st);
+    // the text stream's rows: the states through their norm and projection
+    float* te = tmp.get<float>(Rt * m->txt_dim, st);
+    float* ten = tmp.get<float>(Rt * m->txt_dim, st);
+    // as above: the zeros run on this stream, the copy on the compute queue
+    gpu::stream_sync(st);
+    if (!gpu::copy(te, s.te.data(), (size_t) Rt * m->txt_dim * 4))
+        throw std::runtime_error("image engine (Mage-Flow training): copy");
+    rms_norm(te, m->txt_norm, Rt, m->txt_dim, ten, st);
+    uint16_t* te16 = tmp.get<uint16_t>(Rt * m->txt_dim, st);
+    float* ters = tmp.get<float>(Rt, st);
+    mf_rows16(ten, Rt, m->txt_dim, te16, ters, st);
+    float* txt = tmp.get<float>(Rt * C, st);
+    gemm.f16(te16, m->txt_in.w, txt, Rt, C, m->txt_dim);
+    dit_rows::rows_back(txt, ters, m->txt_in.b, Rt, C, st);
+    // the boundaries: block i reads bounds[i] and writes bounds[i + 1]
+    float* bounds = nullptr;
+    if (keep != nullptr) {
+        bounds = m->owned.get<float>((m->nblk + 1) * Rj * C, st);
+        // img/txt are this stream's rows; the copies below run on the compute queue: without the sync they can
+        // read ahead of the kernels that wrote them
+        gpu::stream_sync(st);
+        if (!gpu::copy(bounds, img, (size_t) R * C * 4) || !gpu::copy(bounds + R * C, txt, (size_t) Rt * C * 4))
+            throw std::runtime_error("image engine (Mage-Flow training): bounds");
+        keep->bounds = bounds;
+        keep->R = R;
+        keep->Rt = Rt;
+        keep->x0 = x0;
+        keep->xe = xe;
+        keep->v_pred = m->owned.get<float>(R * m->in_ch, st);
+        keep->dv_pred = m->owned.get<float>(R * m->in_ch, st);
+        v_pred = keep->v_pred;
+    }
+    // the twelve blocks, joint attention between the streams (the text's rows first)
+    float* bi = img;
+    float* bt = txt;
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        const MfTrainModel::Block& blk = m->blk[(size_t) b];
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 6; ++i) {
+                const MfTrainProduct& pr = blk.prod[q][i];
+                mf_transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+            }
+        MfBlockRun run;
+        run.C = C;
+        run.heads = m->heads;
+        run.hd = m->hd;
+        run.F = m->F;
+        run.rows_img = R;
+        run.rows_txt = Rt;
+        run.img = bi;
+        run.txt = bt;
+        run.cos = c.cos;
+        run.sin = c.sin;
+        float* no = (keep != nullptr) ? bounds + ((size_t) b + 1) * Rj * C : tmp.get<float>(R * C, st);
+        float* nt = (keep != nullptr) ? bounds + ((size_t) b + 1) * Rj * C + R * C : tmp.get<float>(Rt * C, st);
+        run.out_img = no;
+        run.out_txt = nt;
+        run.d_out_img = nullptr;
+        run.d_out_txt = nullptr;
+        run.dimg = nullptr;
+        run.dtxt = nullptr;
+        for (int q = 0; q < 2; ++q) {
+            MfBlockW* w = q == 0 ? &run.img_w : &run.txt_w;
+            for (int i = 0; i < 6; ++i) {
+                const MfTrainProduct& pr = blk.prod[q][i];
+                w->N[i] = pr.N;
+                w->K[i] = pr.K;
+                w->w[i] = pr.w;
+                w->wt[i] = m->wtScratch + m->wtOff[q][i];
+                w->b[i] = pr.b;
+                w->ad[i] = (blk.adap != nullptr) ? &blk.adap->ad[q][i] : nullptr;
+            }
+            w->nq = blk.nq[q];
+            w->nk = blk.nk[q];
+            w->mod = c.mod[(size_t) b * 2 + q];
+            w->dnq = nullptr;
+            w->dnk = nullptr;
+            for (int i = 0; i < 6; ++i) {
+                w->dw[i] = nullptr;
+                w->db[i] = nullptr;
+            }
+        }
+        mf_block(run, gemm, st);
+        bi = no;
+        bt = nt;
+    }
+    // the output norm and projection to the latent's channels
+    float* nsh = tmp.get<float>(R * C, st);
+    float* nsc = tmp.get<float>(R * C, st);
+    const float* nmod = c.nmod;
+    dit_rows::q_of(st).parallel_for(sycl::range<1>((size_t) R * C), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / C, cc = i - t * C;
+        nsh[id[0]] = nmod[C + cc];
+        nsc[id[0]] = nmod[cc];
+    });
+    uint16_t* ln16 = tmp.get<uint16_t>(R * C, st);
+    float* lnrs = tmp.get<float>(R, st);
+    // LayerNorm(no affine) * (1 + scale) + shift, as rows16 does it (see ln_mod16)
+    {
+        float* mean = tmp.get<float>(R, st);
+        float* inv = tmp.get<float>(R, st);
+        dit_rows::q_of(st).parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) R * 256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> it) {
+                const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
+                float sum = 0.f;
+                for (auto cc = static_cast<int64_t>(it.get_local_linear_id()); cc < C; cc += 256)
+                    sum += bi[t * C + cc];
+                const float mn = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>()) / (float) C;
+                float va = 0.f;
+                for (auto cc = static_cast<int64_t>(it.get_local_linear_id()); cc < C; cc += 256) {
+                    const float d = bi[t * C + cc] - mn;
+                    va += d * d;
+                }
+                const float iv =
+                    1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), va, sycl::plus<float>()) / (float) C +
+                                     1e-6f);
+                float mx = 0.f;
+                for (auto cc = static_cast<int64_t>(it.get_local_linear_id()); cc < C; cc += 256)
+                    mx = sycl::fmax(mx, sycl::fabs((bi[t * C + cc] - mn) * iv * (1.f + nsc[t * C + cc]) +
+                                                   nsh[t * C + cc]));
+                const float sc = dit_rows::pow2_scale(sycl::reduce_over_group(it.get_group(), mx,
+                                                                              sycl::maximum<float>()));
+                for (auto cc = static_cast<int64_t>(it.get_local_linear_id()); cc < C; cc += 256)
+                    ln16[t * C + cc] = kernels::f16_from_f32(
+                        ((bi[t * C + cc] - mn) * iv * (1.f + nsc[t * C + cc]) + nsh[t * C + cc]) / sc);
+                if (it.get_local_linear_id() == 0) {
+                    mean[t] = mn;
+                    inv[t] = iv;
+                    lnrs[t] = sc;
+                }
+            });
+    }
+    gemm.f16(ln16, m->pout.w, v_pred, R, m->in_ch, C);
+    dit_rows::rows_back(v_pred, lnrs, m->pout.b, R, m->in_ch, st);
+    const float loss = mf_flow_loss(v_pred, x0, xe, R * m->in_ch, keep != nullptr ? keep->dv_pred : nullptr,
+                                    nullptr, nullptr, st);
+    gpu::stream_sync(st);
+    return loss;
+}
+
+float mf_trainer_forward(MfTrainModel* base, const MfTrainSample& s, const MfTrainCond& c, const float* eps,
+                         float sigma, float* v_pred, std::vector<float>* bounds, prefill::Gemm& gemm) {
+    (void) bounds;
+    return forward_impl(static_cast<Model*>(base), s, c, eps, sigma, v_pred, nullptr, gemm);
+}
+
+float mf_trainer_forward_keep(MfTrainModel* base, const MfTrainSample& s, const MfTrainCond& c, const float* eps,
+                              float sigma, MfTrainState& st, prefill::Gemm& gemm) {
+    return forward_impl(static_cast<Model*>(base), s, c, eps, sigma, nullptr, &st, gemm);
+}
+
+void mf_trainer_free_state(MfTrainModel* base, MfTrainState& s) {
+    Model* m = static_cast<Model*>(base);
+    auto drop = [&](float* q) {
+        if (q == nullptr) return;
+        auto& v = m->owned.p;
+        v.erase(std::remove(v.begin(), v.end(), (void*) q), v.end());
+        gpu::free(q);
+    };
+    drop(s.x0);
+    drop(s.xe);
+    drop(s.v_pred);
+    drop(s.dv_pred);
+    drop(s.bounds);
+    s = MfTrainState();
+}
+
+namespace {
+
+// the base weight's row norms (the DoRA divisor), over the FP16 values the products read
+void rownorm_f16(const uint16_t* w, int64_t N, int64_t K, float* norms, void* s) {
+    constexpr int64_t kWG = 256;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) N * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            const int64_t n = static_cast<int64_t>(it.get_group_linear_id());
+            float ss = 0.f;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < K; c += kWG) {
+                const float v = f32_from_f16(w[n * K + c]);
+                ss += v * v;
+            }
+            ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+            if (it.get_local_linear_id() == 0) norms[n] = sycl::sqrt(ss);
+        });
+}
+
+}  // namespace
+
+void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint64_t seed) {
+    Model* m = static_cast<Model*>(base);
+    void* s = m->stream;
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<float> gauss(0.f, 1.f);
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        MfTrainModel::Block& blk = m->blk[(size_t) b];
+        if (blk.adap == nullptr) continue;
+        MfTrainAdapter& tz = *blk.adap;
+        tz.method = method == 0 ? MfAdapterMethod::lora : method == 1 ? MfAdapterMethod::dora : MfAdapterMethod::lokr;
+        tz.alpha = alpha;
+        const float std = 1.f / std::sqrt((float) tz.rank);
+        tz.scale = alpha / (float) tz.rank;
+        std::uniform_real_distribution<float> uni(-1.f, 1.f);
+        for (int st = 0; st < 2; ++st)
+            for (int i = 0; i < 6; ++i) {
+                const int64_t N = blk.prod[st][i].N, K = blk.prod[st][i].K, rk = tz.rank;
+                MfAdapter& az = tz.ad[st][i];
+                az.method = tz.method;
+                az.scale = tz.scale;
+                if (tz.method == MfAdapterMethod::lokr) {
+                    // LyCORIS LoKr init: w1 and w2a kaiming-uniform (bound 1/sqrt(fan_in)), w2b zero
+                    // (the delta starts at nothing); the f16 views follow the masters
+                    const int64_t ol = az.ol, ok = az.ok, im = az.im, inn = az.inn;
+                    const float b1 = 1.f / std::sqrt((float) im), ba = 1.f / std::sqrt((float) rk);
+                    std::vector<float> hw1((size_t) ol * im), hw2a((size_t) ok * rk);
+                    for (float& v : hw1) v = uni(rng) * b1;
+                    for (float& v : hw2a) v = uni(rng) * ba;
+                    if (!gpu::copy(tz.W1[st][i], hw1.data(), hw1.size() * 4) ||
+                        !gpu::copy(tz.W2A[st][i], hw2a.data(), hw2a.size() * 4))
+                        throw std::runtime_error("image engine (Mage-Flow training): copy");
+                    gpu::stream_sync(s);
+                    to_f16(tz.W1[st][i], ol * im, az.w1, s);
+                    mf_transpose_f16(az.w1, ol, im, az.w1t, s);
+                    to_f16(tz.W2A[st][i], ok * rk, az.w2a, s);
+                    to_f16(tz.W2B[st][i], rk * inn, az.w2b, s);
+                    // W2B stays zero (Owned zeroes)
+                    continue;
+                }
+                rownorm_f16(blk.prod[st][i].w, N, K, az.norms, s);
+                // A ~ N(0, 1/sqrt(rank)), B = 0 (the delta starts at nothing), m = norms (c starts at one)
+                std::vector<float> ha((size_t) rk * K);
+                for (float& v : ha) v = gauss(rng) * std;
+                if (!gpu::copy(tz.A[st][i], ha.data(), ha.size() * 4))
+                    throw std::runtime_error("image engine (Mage-Flow training): copy");
+                gpu::stream_sync(s);
+                az.m = tz.M[st][i];
+                if (!gpu::copy(tz.M[st][i], az.norms, (size_t) N * 4))
+                    throw std::runtime_error("image engine (Mage-Flow training): copy");
+                to_f16(tz.A[st][i], rk * K, az.a, s);
+                mf_transpose_f16(az.a, rk, K, az.at, s);
+                // B stays zero (Owned zeroes); its views stay zero with it
+            }
+    }
+    gpu::stream_sync(s);
+}
+
+
+namespace {
+
+// the norm's per-row statistics, recomputed for the backward (the forward's are gone with its temps)
+void ln_stats(const float* x, int64_t R, int64_t C, float* mean, float* inv, void* s) {
+    constexpr int64_t kWG = 256;
+    constexpr float kEps = 1e-6f;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) R * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
+            float sum = 0.f, va = 0.f;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < C; c += kWG) sum += x[t * C + c];
+            const float mn = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>()) / (float) C;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < C; c += kWG) {
+                const float d = x[t * C + c] - mn;
+                va += d * d;
+            }
+            const float iv =
+                1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), va, sycl::plus<float>()) / (float) C + kEps);
+            if (it.get_local_linear_id() == 0) {
+                mean[t] = mn;
+                inv[t] = iv;
+            }
+        });
+}
+
+// SPEC max grad norm 1.0: the global norm over the averaged grads, clipped before AdamW.
+// The grads stay on the device; the norm reads them back once per update (about 80 MB for
+// rank 16, negligible beside a 35 s update) through the same copy the save path uses.
+float grad_clip_scale(Model* m, float gscale, double* norm_out) {
+    struct Ref {
+        const float* g;
+        int64_t n;
+    };
+    std::vector<Ref> refs;
+    refs.reserve(600);
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        MfTrainAdapter* az = m->blk[(size_t) b].adap;
+        if (az == nullptr) continue;
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 6; ++i) {
+                const int64_t N = m->blk[(size_t) b].prod[q][i].N, K = m->blk[(size_t) b].prod[q][i].K;
+                const int64_t rk = az->rank;
+                refs.push_back({az->ad[q][i].dA, rk * K});
+                refs.push_back({az->ad[q][i].dB, N * rk});
+                if (az->ad[q][i].dm != nullptr) refs.push_back({az->ad[q][i].dm, N});
+                if (az->ad[q][i].method == MfAdapterMethod::lokr) {
+                    const int64_t ol = az->ad[q][i].ol, ok = az->ad[q][i].ok;
+                    const int64_t im = az->ad[q][i].im, inn = az->ad[q][i].inn;
+                    refs.push_back({az->ad[q][i].dW1, ol * im});
+                    refs.push_back({az->ad[q][i].dW2a, ok * rk});
+                    refs.push_back({az->ad[q][i].dW2b, rk * inn});
+                }
+            }
+    }
+    int64_t mx = 0;
+    for (auto& r : refs) mx = std::max(mx, r.n);
+    std::vector<float> host((size_t) mx);
+    gpu::stream_sync(m->stream);
+    double total = 0.0;
+    for (auto& r : refs) {
+        if (r.g == nullptr || r.n == 0) continue;
+        if (!gpu::copy(host.data(), r.g, (size_t) r.n * 4))
+            throw std::runtime_error("image engine (Mage-Flow training): clip readback");
+        for (int64_t i = 0; i < r.n; ++i) {
+            const double v = (double) host[(size_t) i] * gscale;
+            total += v * v;
+        }
+    }
+    const double norm = std::sqrt(total);
+    if (norm_out != nullptr) *norm_out = norm;
+    return (float) (norm > 1.0 ? 1.0 / norm : 1.0);
+}
+
+// one AdamW step over the adapter's tensors (FP32 masters and states): g averaged over accum_n, then zeroed
+void adamw_step(float* w, float* g, float* m, float* v, int64_t n, float lr, float beta1, float beta2, float eps,
+                float wd, float bc1, float bc2, float gscale, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float gg = g[id[0]] * gscale;
+        const float nm = m[id[0]] = beta1 * m[id[0]] + (1.f - beta1) * gg;
+        const float nv = v[id[0]] = beta2 * v[id[0]] + (1.f - beta2) * gg * gg;
+        w[id[0]] -= lr * (nm / bc1 / (sycl::sqrt(nv / bc2) + eps) + wd * w[id[0]]);
+        g[id[0]] = 0.f;
+    });
+}
+
+}  // namespace
+
+void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfTrainCond& c, MfTrainState& s,
+                         float sigma, prefill::Gemm& gemm) {
+    (void)smp;
+    (void)sigma;
+    Model* m = static_cast<Model*>(base);
+    void* st = m->stream;
+    const int64_t C = m->C, R = s.R, Rt = s.Rt, Rj = R + Rt;
+    Owned tmp;
+    // the norm and output projection backward (the base is frozen: its dgrad only, no wgrad or bias sum)
+    uint16_t* pout_wt = tmp.get<uint16_t>(C * m->in_ch, st);
+    mf_transpose_f16(m->pout.w, m->in_ch, C, pout_wt, st);
+    uint16_t* dv16 = tmp.get<uint16_t>(R * m->in_ch, st);
+    float* dvrs = tmp.get<float>(R, st);
+    mf_rows16(s.dv_pred, R, m->in_ch, dv16, dvrs, st);
+    float* dln = tmp.get<float>(R * C, st);
+    float* dsums = tmp.get<float>(R * C, st);
+    mf_dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
+    float* mean = tmp.get<float>(R, st);
+    float* inv = tmp.get<float>(R, st);
+    const float* last = s.bounds + (size_t) m->nblk * Rj * C;   // block 11's output (the image stream)
+    float* nsc = tmp.get<float>(R * C, st);   // the output norm's scale a row (its shift has no gradient here)
+    const float* nmod = c.nmod;
+    dit_rows::q_of(st).parallel_for(sycl::range<1>((size_t) R * C), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / C, cc = i - t * C;
+        nsc[id[0]] = nmod[cc];
+    });
+    ln_stats(last, R, C, mean, inv, st);
+    float* dimg = tmp.get<float>(R * C, st);
+    mf_ln_mod_bwd(last, mean, inv, nsc, dln, R, C, dimg, nullptr, nullptr, st);
+    // every block from its boundary input, the output's gradient ping-ponging down
+    float* dcur_i = dimg;
+    float* dnxt_i = tmp.get<float>(R * C, st);
+    float* dcur_t = tmp.get<float>(Rt * C, st);
+    float* dnxt_t = tmp.get<float>(Rt * C, st);
+    for (int64_t b = m->nblk - 1; b >= 0; --b) {
+        const MfTrainModel::Block& blk = m->blk[(size_t) b];
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 6; ++i) {
+                const MfTrainProduct& pr = blk.prod[q][i];
+                mf_transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+            }
+        MfBlockRun run;
+        run.C = C;
+        run.heads = m->heads;
+        run.hd = m->hd;
+        run.F = m->F;
+        run.rows_img = R;
+        run.rows_txt = Rt;
+        run.img = s.bounds + (size_t) b * Rj * C;
+        run.txt = s.bounds + (size_t) b * Rj * C + R * C;
+        run.cos = c.cos;
+        run.sin = c.sin;
+        run.out_img = nullptr;   // recomputed inside, read from the tape the forward does not keep: unused
+        run.out_txt = nullptr;
+        // the block forwards and backwards in one call; its outputs land in its own Pool, its gradients below
+        float* bo = tmp.get<float>(R * C, st);
+        float* bt = tmp.get<float>(Rt * C, st);
+        run.out_img = bo;
+        run.out_txt = bt;
+        run.d_out_img = dcur_i;
+        run.d_out_txt = dcur_t;
+        run.dimg = dnxt_i;
+        run.dtxt = dnxt_t;
+        for (int q = 0; q < 2; ++q) {
+            MfBlockW* w = q == 0 ? &run.img_w : &run.txt_w;
+            for (int i = 0; i < 6; ++i) {
+                const MfTrainProduct& pr = blk.prod[q][i];
+                w->N[i] = pr.N;
+                w->K[i] = pr.K;
+                w->w[i] = pr.w;
+                w->wt[i] = m->wtScratch + m->wtOff[q][i];
+                w->b[i] = pr.b;
+                w->ad[i] = (blk.adap != nullptr) ? &blk.adap->ad[q][i] : nullptr;
+            }
+            w->nq = blk.nq[q];
+            w->nk = blk.nk[q];
+            w->mod = c.mod[(size_t) b * 2 + q];
+            w->dnq = nullptr;
+            w->dnk = nullptr;
+            for (int i = 0; i < 6; ++i) {
+                w->dw[i] = nullptr;
+                w->db[i] = nullptr;
+            }
+        }
+        // mf_block adds into its input's gradient, and the buffer it gets back from the swap still holds the
+        // gradient two blocks up: without the zero every block's input gradient carried all of those above it
+        if (!gpu::memset_async(dnxt_i, 0, (size_t) (R * C) * 4, st) ||
+            !gpu::memset_async(dnxt_t, 0, (size_t) (Rt * C) * 4, st))
+            throw std::runtime_error("image engine (Mage-Flow training): zero");
+        mf_block(run, gemm, st);
+        std::swap(dcur_i, dnxt_i);
+        std::swap(dcur_t, dnxt_t);
+    }
+    gpu::stream_sync(st);
+}
+
+void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, float eps, float wd,
+                      int64_t accum_n) {
+    Model* m = static_cast<Model*>(base);
+    void* s = m->stream;
+    m->adam_step += 1;
+    const double b1 = beta1, b2 = beta2, st = (double) m->adam_step;
+    const float bc1 = (float) (1.0 - std::pow(b1, st)), bc2 = (float) (1.0 - std::pow(b2, st));
+    const float gscale = accum_n > 1 ? 1.f / (float) accum_n : 1.f;
+    // SPEC max grad norm 1.0: scale the averaged grads down to norm 1 when they run over.
+    double gnorm = 0;
+    const float clip = grad_clip_scale(m, gscale, &gnorm);
+    const float gscale_eff = gscale * clip;
+    std::fprintf(stderr, "adamw: update %llu global-norm %.4f clip %.4f (accum %lld)\n",
+                 (unsigned long long) m->adam_step, gnorm, (double) clip, (long long) accum_n);
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        MfTrainAdapter* az = m->blk[(size_t) b].adap;
+        if (az == nullptr) continue;
+        for (int q = 0; q < 2; ++q)
+            for (int i = 0; i < 6; ++i) {
+                const int64_t N = m->blk[(size_t) b].prod[q][i].N, K = m->blk[(size_t) b].prod[q][i].K;
+                const int64_t rk = az->rank;
+                adamw_step(az->A[q][i], az->ad[q][i].dA, az->mA[q][i], az->vA[q][i], rk * K, lr, beta1, beta2,
+                           eps, wd, bc1, bc2, gscale_eff, s);
+                adamw_step(az->B[q][i], az->ad[q][i].dB, az->mB[q][i], az->vB[q][i], N * rk, lr, beta1, beta2,
+                           eps, wd, bc1, bc2, gscale_eff, s);
+                if (az->ad[q][i].dm != nullptr)
+                    adamw_step(az->M[q][i], az->ad[q][i].dm, az->mm[q][i], az->vm[q][i], N, lr, beta1, beta2,
+                               eps, wd, bc1, bc2, gscale_eff, s);
+                // the FP16 working copies follow the masters
+                if (az->ad[q][i].method == MfAdapterMethod::lokr) {
+                    const int64_t ol = az->ad[q][i].ol, ok = az->ad[q][i].ok;
+                    const int64_t im = az->ad[q][i].im, inn = az->ad[q][i].inn;
+                    adamw_step(az->W1[q][i], az->ad[q][i].dW1, az->mW1[q][i], az->vW1[q][i], ol * im, lr, beta1,
+                               beta2, eps, wd, bc1, bc2, gscale_eff, s);
+                    adamw_step(az->W2A[q][i], az->ad[q][i].dW2a, az->mW2A[q][i], az->vW2A[q][i], ok * rk, lr,
+                               beta1, beta2, eps, wd, bc1, bc2, gscale_eff, s);
+                    adamw_step(az->W2B[q][i], az->ad[q][i].dW2b, az->mW2B[q][i], az->vW2B[q][i], rk * inn, lr,
+                               beta1, beta2, eps, wd, bc1, bc2, gscale_eff, s);
+                    to_f16(az->W1[q][i], ol * im, az->ad[q][i].w1, s);
+                    mf_transpose_f16(az->ad[q][i].w1, ol, im, az->ad[q][i].w1t, s);
+                    to_f16(az->W2A[q][i], ok * rk, az->ad[q][i].w2a, s);
+                    to_f16(az->W2B[q][i], rk * inn, az->ad[q][i].w2b, s);
+                    continue;
+                }
+                to_f16(az->A[q][i], rk * K, az->ad[q][i].a, s);
+                mf_transpose_f16(az->ad[q][i].a, rk, K, az->ad[q][i].at, s);
+                to_f16(az->B[q][i], N * rk, az->ad[q][i].b, s);
+                mf_transpose_f16(az->ad[q][i].b, N, rk, az->ad[q][i].bt, s);
+            }
+    }
+    gpu::stream_sync(s);
+}
+
+void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::string& title,
+                     const std::string& trigger, uint64_t seed, float lr, int64_t max_steps) {
+    Model* m = static_cast<Model*>(base);
+    void* s = m->stream;
+    struct Entry {
+        std::string key, dtype;
+        std::vector<int64_t> shape;   // outer dim first
+        std::vector<char> raw;
+    };
+    std::vector<Entry> es;
+    auto blob = [&](const std::string& key, const float* dev, const std::vector<int64_t>& shape) {
+        Entry e;
+        e.key = key;
+        e.dtype = "F32";
+        e.shape = shape;
+        int64_t n = 1;
+        for (int64_t d : shape) n *= d;
+        e.raw.resize((size_t) n * 4);
+        gpu::stream_sync(s);
+        if (!gpu::copy(e.raw.data(), dev, (size_t) n * 4))
+            throw std::runtime_error("image engine (Mage-Flow training): save readback");
+        es.push_back(std::move(e));
+    };
+    for (int64_t b = 0; b < m->nblk; ++b) {
+        MfTrainAdapter* az = m->blk[(size_t) b].adap;
+        if (az == nullptr) continue;
+        for (int st = 0; st < 2; ++st)
+            for (int i = 0; i < 6; ++i) {
+                const int64_t N = m->blk[(size_t) b].prod[st][i].N, K = m->blk[(size_t) b].prod[st][i].K;
+                const int64_t rk = az->rank;
+                const std::string t =
+                    "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kTarget[st][i];
+                const MfAdapter& ad = az->ad[st][i];
+                if (ad.method == MfAdapterMethod::lokr) {
+                    blob(t + ".lokr_w1", az->W1[st][i], {ad.ol, ad.im});
+                    blob(t + ".lokr_w2_a", az->W2A[st][i], {ad.ok, rk});
+                    blob(t + ".lokr_w2_b", az->W2B[st][i], {rk, ad.inn});
+                    Entry e;
+                    e.key = t + ".alpha";
+                    e.dtype = "F32";
+                    e.shape = {};
+                    e.raw.resize(4);
+                    std::memcpy(e.raw.data(), &az->alpha, 4);
+                    es.push_back(std::move(e));
+                    continue;
+                }
+                blob(t + ".lora_A.weight", az->A[st][i], {rk, K});
+                blob(t + ".lora_B.weight", az->B[st][i], {N, rk});
+                {   // the per-weight .alpha tensor (one value, 0-dimensional)
+                    Entry e;
+                    e.key = t + ".alpha";
+                    e.dtype = "F32";
+                    e.shape = {};
+                    e.raw.resize(4);
+                    std::memcpy(e.raw.data(), &az->alpha, 4);
+                    es.push_back(std::move(e));
+                }
+                if (ad.method == MfAdapterMethod::dora) blob(t + ".dora_scale", az->M[st][i], {N});
+            }
+    }
+    std::sort(es.begin(), es.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
+    std::ostringstream head;
+    head << "{\"__metadata__\":{";
+    head << "\"modelspec.title\":\"" << title << "\",";
+    head << "\"modelspec.trigger_phrase\":\"" << trigger << "\",";
+    std::string module = "networks.lora";
+    for (auto& e : es)
+        if (e.key.find(".lokr_") != std::string::npos) module = "networks.lokr";
+    head << "\"ss_network_module\":\"" << module << "\",";
+    head << "\"ss_network_dim\":\"" << m->blk[0].adap->rank << "\",";
+    head << "\"ss_network_alpha\":\"" << m->blk[0].adap->alpha << "\",";
+    head << "\"ss_seed\":\"" << seed << "\",";
+    head << "\"ss_learning_rate\":\"" << lr << "\",";
+    head << "\"ss_optimizer_type\":\"AdamW\",";
+    head << "\"ss_max_steps\":\"" << max_steps << "\",";
+    head << "\"ss_model\":\"mage-flow\",";
+    head << "\"ss_xestrata_revision\":\"card-5\"";
+    head << "}";
+    int64_t off = 0;
+    for (auto& e : es) {
+        head << ",\"" << e.key << "\":{\"dtype\":\"" << e.dtype << "\",\"shape\":[";
+        for (size_t i = 0; i < e.shape.size(); ++i) head << (i ? "," : "") << e.shape[i];
+        head << "],\"data_offsets\":[" << off << "," << (off + (int64_t) e.raw.size()) << "]}";
+        off += (int64_t) e.raw.size();
+    }
+    head << "}";
+    const std::string hs = head.str();
+    std::ofstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("image engine (Mage-Flow training): cannot write " + path);
+    const uint64_t n = hs.size();
+    f.write(reinterpret_cast<const char*>(&n), 8);
+    f.write(hs.data(), (std::streamsize) hs.size());
+    for (auto& e : es) f.write(e.raw.data(), (std::streamsize) e.raw.size());
+    f.close();
+    if (!f) throw std::runtime_error("image engine (Mage-Flow training): short write " + path);
+}
+
+}  // namespace strata::image

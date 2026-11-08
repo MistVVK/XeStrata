@@ -130,22 +130,31 @@ void mf_dora_bwd(const float* dY, const float* p, const float* d, const float* m
 /// y[t][c] *= r[t] (in place): a DoRA's row factors (mf_dora_bwd's da/db) on a gradient's rows.
 void mf_scale_rows(float* y, const float* r, int64_t rows, int64_t cols, void* stream);
 
-/// One block product's adapter (plain LoRA or DoRA; v1 trains the attention and the MLP projections, all six).
-/// null in MfBlockW::ad: the product runs as it always did, at the same cost.
-enum class MfAdapterMethod : int { lora = 0, dora = 1 };
+/// One block product's adapter (plain LoRA, DoRA or LoKr; v1 trains the attention and the MLP projections,
+/// all six).  null in MfBlockW::ad: the product runs as it always did, at the same cost.
+enum class MfAdapterMethod : int { lora = 0, dora = 1, lokr = 2 };
 struct MfAdapter {
     MfAdapterMethod method = MfAdapterMethod::lora;
     int64_t rank = 0;
     float scale = 0.f;                 // s * alpha / rank, folded (the request's strength times the file's alpha)
-    const uint16_t* a = nullptr;       // [rank][K] FP16: h = x A^T reads it
-    const uint16_t* at = nullptr;      // [K][rank] the same values transposed (the input gradient's dgrad reads it)
-    const uint16_t* b = nullptr;       // [N][rank] FP16: delta = h B^T reads it
-    const uint16_t* bt = nullptr;      // [rank][N] the same values transposed (mf_lora_bwd reads it)
+    uint16_t* a = nullptr;            // [rank][K] FP16: h = x A^T reads it (written on sync, read in the block)
+    uint16_t* at = nullptr;           // [K][rank] the same values transposed (the input gradient's dgrad reads it)
+    uint16_t* b = nullptr;            // [N][rank] FP16: delta = h B^T reads it
+    uint16_t* bt = nullptr;           // [rank][N] the same values transposed (mf_lora_bwd reads it)
     float* dA = nullptr;               // [rank][K], added into
     float* dB = nullptr;               // [N][rank], added into
-    const float* m = nullptr;          // [N] the DoRA magnitude (null: a plain LoRA)
-    const float* norms = nullptr;      // [N] the base weight's row norms (null: a plain LoRA)
+    const float* m = nullptr;         // [N] the DoRA magnitude (null: a plain LoRA)
+    float* norms = nullptr;           // [N] the base weight's row norms (null: a plain LoRA; written once at open)
     float* dm = nullptr;               // [N], added into (null: not taken)
+    // LoKr (method lokr): delta = s kron(w1, w2a w2b), N = ol * ok, K = im * inn (SPEC's factorization)
+    int64_t ol = 0, ok = 0, im = 0, inn = 0;
+    uint16_t* w1 = nullptr;           // [ol][im] FP16, whole
+    uint16_t* w1t = nullptr;          // [im][ol] transposed view (written on sync, read in the block)
+    uint16_t* w2a = nullptr;          // [ok][rank] FP16
+    uint16_t* w2b = nullptr;          // [rank][inn] FP16
+    float* dW1 = nullptr;              // [ol][im], added into
+    float* dW2a = nullptr;             // [ok][rank], added into
+    float* dW2b = nullptr;             // [rank][inn], added into
 };
 
 struct MfBlockW {

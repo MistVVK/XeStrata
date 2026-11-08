@@ -248,6 +248,9 @@ v1 has AdamW only, with F32 states: `betas = (0.9, 0.999)`, `eps = 1e-8`, weight
 The default is batch 1, gradients accumulated 4, 1500 update steps (the same for both kinds). A checkpoint every 250 steps (one of them goes through
 [the checks](#the-checks)). A sample image every 500 steps (card 10's field). No AdamW8bit, Adafactor, LoRA+, LaRA, gradient checkpointing or 8-bit training.
 sd-scripts' examples use AdamW8bit, `lr_scheduler=constant` and `network_dim=16`, so the optimizer's type and the warmup are the only differences.
+Mage-Flow trains resident in bf16 (16 GiB, about 14.5 GiB at peak). The tape is about 2.1 GiB per block, cut to 13 boundaries of 0.65 GiB by recomputing from the boundary (+1 forward).
+Plain LoRA measures 8.9 s/micro, 35 s/update and 14514 MiB (records `2026-11-03-mf-trainer` §3, `2026-11-04-lora-maje-e2e` training.txt).
+`XESTRATA_VRAM_LIMIT_MIB=8192` caps only the engine's apparent budget, not the trainer's allocations.
 
 ## What ai-toolkit and SimpleTuner do differently (D2)
 

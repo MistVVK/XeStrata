@@ -14,10 +14,13 @@ mis-shaped cache is an error, never a rebuild.
 
 The manifest line per image is tab separated:
 
-  <stem> <w16> <h16> <tokens> <te_rows> <uncond_rows> <txt_dim> <crop l t r b> <original w h> <caption>
+  <stem> <w16> <h16> <tokens> <te_rows> <uncond_rows> <txt_dim>
+  <crop l t r b> <original w h> <caption_dropout_rate> <caption>
 
 with w16/h16 the bucket's latent sides (tokens = w16*h16 rows of 128 channels), the text rows the
-prompt's states after the system turn, and the caption the one English line the data folder holds.
+prompt's states after the system turn, the dropout rate the manifest's 10th tab field (SPEC v1
+default 0.0; card-3 data carry 0.0 — the trainer reads this column and refuses a line without it),
+and the caption the one English line the data folder holds.
 """
 from __future__ import annotations
 

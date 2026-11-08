@@ -224,6 +224,9 @@ v1 は AdamW（F32 の状態）だけ。`betas = (0.9, 0.999)`、`eps = 1e-8`、
 既定は batch 1・勾配の積み 4・update 1500 step（画風もキャラクターも同じ）。保存は 250 step ごと（うち 1 本を[確かめの手順](#確かめの手順)に使う）。
 サンプル生成は 500 step ごと（カード 10 の欄）。AdamW8bit・Adafactor・LoRA+・LaRA・勾配のチェックポイント・8 ビットの学習は v1 に入れません。
 sd-scripts の例は AdamW8bit・`lr_scheduler=constant`・`network_dim=16` なので、optimizer の型と warmup だけが相違です。
+Mage-Flow の学習は bf16 常駐で組む（16 GiB、ピーク約 14.5 GiB）。tape は block あたり約 2.1 GiB を 13 境界 0.65 GiB に境目再計算で落とす（+1 forward 分）。
+素 LoRA の実測は 8.9 s/micro・35 s/update・14514 MiB（records `2026-11-03-mf-trainer` §3、`2026-11-04-lora-maje-e2e` training.txt）。
+8 GiB の `XESTRATA_VRAM_LIMIT_MIB` は engine の見かけ予算だけで学習の確保は見ない。
 
 ## ai-toolkit と SimpleTuner と突き合わせた相違（D2）
 

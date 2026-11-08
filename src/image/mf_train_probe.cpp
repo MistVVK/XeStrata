@@ -80,7 +80,7 @@ Var load(const std::string& dir, const std::string& name) {
         std::stringstream ns(s.substr(o + 1, c - o - 1));
         std::string tok;
         while (std::getline(ns, tok, ','))
-            if (!tok.empty()) v.shape.insert(v.shape.begin(), std::atoll(tok.c_str()));
+            if (!tok.empty()) v.shape.insert(v.shape.begin(), std::stoll(tok));
     }
     std::ifstream f(dir + "/" + name + ".bin", std::ios::binary);
     if (!f) throw std::runtime_error("no " + name + ".bin in " + dir);
@@ -98,7 +98,7 @@ void save(const std::string& dir, const std::string& name, const void* p, int64_
 /// the same, with the shape the reference reads back (the fastest dim first, as the engine's other dumps list it)
 void save2(const std::string& dir, const std::string& name, const void* p, int64_t rows, int64_t cols) {
     std::ofstream f(dir + "/" + name + ".bin", std::ios::binary);
-    f.write(reinterpret_cast<const char*>(p), (size_t) rows * cols * 4);
+    f.write(reinterpret_cast<const char*>(p), (std::streamsize) (rows * cols * 4));
     std::ofstream j(dir + "/" + name + ".json");
     j << "{\"type\":\"f32\",\"shape\":[" << cols << "," << rows << "]}";
 }
@@ -190,19 +190,19 @@ int main(int argc, char** argv) {
         } else if (op == "patch") {
             Var dz = load(dir, "dz");
             const int64_t h = dz.dim(0), w = dz.dim(1);
-            Dev dm(4 * h * w * 32 * 4), dmean(128 * 4), dsd(128 * 4), M(load(dir, "m")), MN(load(dir, "mean")),
+            Dev dm(4 * h * w * 32 * 4), dmean(int64_t{128} * 4), dsd(int64_t{128} * 4), M(load(dir, "m")), MN(load(dir, "mean")),
                 SD(load(dir, "sd")), DZ(dz);
-            zero(dmean, 128 * 4, s);
-            zero(dsd, 128 * 4, s);
+            zero(dmean, int64_t{128} * 4, s);
+            zero(dsd, int64_t{128} * 4, s);
             mf_patch_bwd(M.cf(), MN.cf(), SD.cf(), h, w, DZ.cf(), dm.f(), dmean.f(), dsd.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) (4 * h * w * 32 + 256));
             dm.read(ho.data(), 4 * h * w * 32 * 4);
-            dmean.read(ho.data() + 4 * h * w * 32, 128 * 4);
-            dsd.read(ho.data() + 4 * h * w * 32 + 128, 128 * 4);
+            dmean.read(ho.data() + 4 * h * w * 32, int64_t{128} * 4);
+            dsd.read(ho.data() + 4 * h * w * 32 + 128, int64_t{128} * 4);
             save(dir, "dm", ho.data(), 4 * h * w * 32 * 4);
-            save(dir, "dmean", ho.data() + 4 * h * w * 32, 128 * 4);
-            save(dir, "dsd", ho.data() + 4 * h * w * 32 + 128, 128 * 4);
+            save(dir, "dmean", ho.data() + 4 * h * w * 32, int64_t{128} * 4);
+            save(dir, "dsd", ho.data() + 4 * h * w * 32 + 128, int64_t{128} * 4);
         } else if (op == "flow") {
             Var vp = load(dir, "vp");
             const int64_t n = vp.n();
@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
             std::ofstream j(dir + "/gt.json");
             j << "{\"type\":\"f16\",\"shape\":[" << C << "," << T << "]}";
             std::ofstream b(dir + "/gt.bin", std::ios::binary);
-            b.write(reinterpret_cast<const char*>(ho.data()), (size_t) T * C * 2);
+            b.write(reinterpret_cast<const char*>(ho.data()), (std::streamsize) (T * C * 2));
             save(dir, "gscale", &gs, 4);
         } else if (op == "dgrad") {
             Var dy = load(dir, "dy16"), wt = load(dir, "wt");
@@ -277,7 +277,7 @@ int main(int argc, char** argv) {
                 std::ofstream j(dir + "/o16.json");
                 j << "{\"type\":\"f16\",\"shape\":[" << dims << "," << rows << "]}";
                 std::ofstream b(dir + "/o16.bin", std::ios::binary);
-                b.write(reinterpret_cast<const char*>(ho16.data()), (size_t) rows * dims * 2);
+                b.write(reinterpret_cast<const char*>(ho16.data()), (std::streamsize) (rows * dims * 2));
                 save(dir, "o32", ho32.data(), rows * dims * 4);
                 save(dir, "lse", hl.data(), rows * heads * 4);
             } else {
@@ -436,10 +436,10 @@ int main(int argc, char** argv) {
                                                     : strata::image::MfAdapterMethod::lora;
                     az.rank = rk;
                     az.scale = vcfg.hf()[2];
-                    az.a = ad.ch();
-                    az.at = adt.ch();
-                    az.b = bd.ch();
-                    az.bt = bdt.ch();
+                    az.a = ad.h();
+                    az.at = adt.h();
+                    az.b = bd.h();
+                    az.bt = bdt.h();
                     az.dA = fresh(rk * K[i]);
                     az.dB = fresh(N[i] * rk);
                     adA[st][i] = az.dA;
@@ -451,7 +451,7 @@ int main(int argc, char** argv) {
                         Dev& md = keep.emplace_back(vm);
                         Dev& nd = keep.emplace_back(vn);
                         az.m = md.cf();
-                        az.norms = nd.cf();
+                        az.norms = nd.f();
                         az.dm = fresh(N[i]);
                         adm[st][i] = az.dm;
                     }
@@ -494,7 +494,7 @@ int main(int argc, char** argv) {
                 std::vector<uint16_t> hw((size_t) (N[0] * K[0]));
                 strata::gpu::copy(hw.data(), W[st]->w[0], (size_t) N[0] * K[0] * 2);
                 std::ofstream b(dir + std::string("/rd_") + tag[st] + "_q.bin", std::ios::binary);
-                b.write(reinterpret_cast<const char*>(hw.data()), (size_t) hw.size() * 2);
+                b.write(reinterpret_cast<const char*>(hw.data()), (std::streamsize) (hw.size() * 2));
                 std::ofstream j(dir + std::string("/rd_") + tag[st] + "_q.json");
                 j << "{\"type\":\"f16\",\"shape\":[" << K[0] << "," << N[0] << "]}";
             }
@@ -572,7 +572,7 @@ int main(int argc, char** argv) {
             std::ofstream j(dir + "/y16.json");
             j << "{\"type\":\"f16\",\"shape\":[" << cols << "," << rows << "]}";
             std::ofstream b(dir + "/y16.bin", std::ios::binary);
-            b.write(reinterpret_cast<const char*>(ho.data()), (size_t) rows * cols * 2);
+            b.write(reinterpret_cast<const char*>(ho.data()), (std::streamsize) (rows * cols * 2));
             save(dir, "rs", hr.data(), rows * 4);
         } else if (op == "bias") {
             Var dy = load(dir, "dy");

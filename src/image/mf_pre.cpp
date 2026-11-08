@@ -74,7 +74,7 @@ Var load(const std::string& dir, const std::string& name, bool optional = false)
         std::string tok;
         while (std::getline(ns, tok, ','))
             if (tok.find_first_not_of(" \t\n") != std::string::npos)
-                v.shape.insert(v.shape.begin(), std::atoll(tok.c_str()));
+                v.shape.insert(v.shape.begin(), std::stoll(tok));
     }
     std::ifstream f(dir + "/" + name + ".bin", std::ios::binary);
     if (!f) {
@@ -167,7 +167,7 @@ void text_one(QiText& te, const std::string& dir, const std::string& base, int64
     const auto h = te.encode(v);
     if ((int64_t) h.size() / C != (int64_t) v.size())
         throw std::runtime_error(base + ": the states are not one row per id");
-    const std::vector<float> kept(h.begin() + (size_t) (drop * C), h.end());
+    const std::vector<float> kept(h.begin() + (std::ptrdiff_t) (drop * C), h.end());
     const int64_t rows = (int64_t) kept.size() / C;
     std::printf("%s: %lld ids -> %lld rows x %lld: %.1f ms\n", base.c_str(), (long long) v.size(), (long long) rows,
                 (long long) C, 1e3 * seconds_since(t0));
@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
     const std::string what = argc > 1 ? argv[1] : "";
     try {
         if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
-        if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? atoll(argv[4]) : 34);
+        if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? std::stoll(argv[4]) : 34);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata-image-mf-pre: %s\n", e.what());
         return 1;

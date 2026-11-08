@@ -222,6 +222,7 @@ void mf_qk_norm_rope_bwd(const float* q, const float* k, const float* wq, const 
         };
         if (wqn != nullptr) gsum(q, dgq, 0, wqn);
         if (wkn != nullptr) gsum(k, dgk, 1, wkn);
+        gpu::stream_sync(stream);   // rs is freed below: the sums above run async
         gpu::free(rs);
     }
 }
@@ -419,6 +420,7 @@ void mf_attn_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         attn_add_scaled(oh, tmp, rd, 1.f / 1024.f, stream);
         attn_scatter_out(oh, rows, heads, head_dim, h, o16, o32, stream);
     }
+    gpu::stream_sync(stream);   // the workspace is freed below: the kernels above run async
     gpu::free(ws);
 }
 
@@ -497,6 +499,7 @@ void mf_attn_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         gemm.f16(dotlo, ptlo, dvt, head_dim, rows, rows, 0, false, true);
         attn_scatter_grad_t(dvt, rows, heads, head_dim, h, dV, accumulate, stream);
     }
+    gpu::stream_sync(stream);   // the workspace is freed below: the kernels above run async
     gpu::free(ws);
 }
 void mf_scale_rows(float* y, const float* r, int64_t rows, int64_t cols, void* stream) {

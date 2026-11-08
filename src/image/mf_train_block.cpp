@@ -64,6 +64,34 @@ void add_into(float* a, const float* b, int64_t n, void* s) {
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) { a[id[0]] += b[id[0]]; });
 }
 
+void scale_by(float* a, int64_t n, const float* k, bool divide, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        a[id[0]] = divide ? a[id[0]] / k[0] : a[id[0]] * k[0];
+    });
+}
+
+// v's one power of two over both streams' rows, and every joint row's scale set to it (vs[1 + r]): the attention
+// mixes the streams' v rows head by head, so they share it.  Mage-Flow's v passes FP16's 65504 at a high sigma
+// (75176 in block 0 at sigma 1.0, the reference's own block-0 input); inference scales it the same way (head_scale).
+// amax is the zeroed word the rows' absolute maximum lands in, as bits (non-negative floats order as their bits).
+void v_scale(const float* v0, int64_t n0, const float* v1, int64_t n1, uint32_t* amax, float* vs, int64_t rows,
+             void* s) {
+    const int64_t n = n0 + n1, groups = std::min<int64_t>((n + kWG - 1) / kWG, 1024);
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (groups * kWG)), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            float m = 0.f;
+            for (int64_t i = static_cast<int64_t>(it.get_global_linear_id()); i < n; i += groups * kWG)
+                m = sycl::fmax(m, sycl::fabs(i < n0 ? v0[i] : v1[i - n0]));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            if (it.get_local_linear_id() == 0)
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*amax).fetch_max(
+                    sycl::bit_cast<uint32_t>(m));
+        });
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (rows + 1)), [=](sycl::id<1> id) {
+        vs[id[0]] = dit_rows::pow2_scale(sycl::bit_cast<float>(*amax));
+    });
+}
+
 // ---- adapters (MfBlockW::ad): the forward keeps h16/hr/h16t, the backward reads them back ----
 
 // y[t][n] = fa[n] * (y[t][n] * rsx[t]) + fb[n] * (delta[t][n] * hr[t]) + bias[n] (DoRA), or the plain LoRA's
@@ -79,6 +107,105 @@ void ad_rows_back(float* y, const float* rsx, const float* bias, const float* de
     });
 }
 
+// ---- LoKr (kronecker-structured delta): Y += s kron(w1, w2a w2b) X without materializing the product ----
+
+// dst rows (r,b) cols a from src rows (r,a) cols b.
+void lokr_transpose(const float* src, int64_t R, int64_t A, int64_t B, float* dst, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<2>((size_t) R * B, (size_t) A), [=](sycl::id<2> id) {
+        const int64_t rb = static_cast<int64_t>(id[0]), a = static_cast<int64_t>(id[1]);
+        const int64_t r = rb / B, b = rb - r * B;
+        dst[rb * A + a] = src[(r * A + a) * B + b];
+    });
+}
+
+void lokr_to_f16(const float* x, int64_t n, uint16_t* y, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n),
+                                   [=](sycl::id<1> id) { y[id[0]] = f16_from_f32(x[id[0]]); });
+}
+
+// y = (y + s D) rsx + b, D read through the transposed product's rows: D[r][l*ok+k] = o[(r*ok+k)][l].  o was read
+// from the same divided rows as y, so it takes rsx too.
+void lokr_rows_back(float* y, const float* rsx, const float* bias, const float* o, float scale, int64_t R,
+                    int64_t N, int64_t ol, int64_t ok, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) R * N), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / N, j = i - t * N;
+        const int64_t l = j / ok, k = j - l * ok;
+        y[i] = (y[i] + scale * o[(t * ok + k) * ol + l]) * (rsx != nullptr ? rsx[t] : 1.f) +
+               (bias != nullptr ? bias[j] : 0.f);
+    });
+}
+
+// dxv[t*K + m*inn+n] += s * dyrs[t] * dx[((t*inn+n)*im)+m]: the delta path's input gradient joins the base's.
+void lokr_dgrad_add(float* dxv, const float* dx, const float* dyrs, float scale, int64_t R, int64_t K,
+                    int64_t im, int64_t inn, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) R * K), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / K, j = i - t * K;
+        const int64_t m = j / inn, n = j - m * inn;
+        dxv[i] += scale * dyrs[t] * dx[(t * inn + n) * im + m];
+    });
+}
+
+// one LoKr product's forward rows: Y += s kron(w1, w2a w2b) X through two small products, w2 never formed;
+// t1/t2 are R*ad_maxN scratch, tt is u16 scratch (two f16 row blocks).  x16 is [R][im*inn] rows, (m,n) with n fastest.
+void lokr_product_fwd(const MfAdapter* ad, const uint16_t* x16, const float* rsx, float* y, const float* bias,
+                      int64_t R, int64_t N, float* t1, float* t2, uint16_t* tt,
+                      prefill::Gemm& gemm, void* stream) {
+    const int64_t ol = ad->ol, ok = ad->ok, im = ad->im, inn = ad->inn, rk = ad->rank;
+    const float s = ad->scale;
+    // U[(R*im), rk] = X[(R*im), inn] w2b ; T[(R*im), ok] = U w2a
+    gemm.f16(x16, ad->w2b, t1, R * im, rk, inn);
+    uint16_t* u16 = tt;
+    lokr_to_f16(t1, R * im * rk, u16, stream);
+    gemm.f16(u16, ad->w2a, t2, R * im, ok, rk);
+    // T2[(R*ok), im] = transpose(T); O[(R*ok), ol] = T2 w1
+    lokr_transpose(t2, R, im, ok, t1, stream);
+    uint16_t* t2_16 = tt + (size_t) R * im * rk;
+    lokr_to_f16(t1, R * ok * im, t2_16, stream);
+    gemm.f16(t2_16, ad->w1, t2, R * ok, ol, im);
+    lokr_rows_back(y, rsx, bias, t2, s, R, N, ol, ok, stream);
+}
+
+// one LoKr product's backward: the delta path's input gradient (added into dxv) and factor gradients (added into
+// dW1/dW2a/dW2b).  dYv is the gradient reaching the product's rows (unscaled: the base path above read it as is).
+// t1/t2 are R*ad_maxN scratch, tt/lrs R*N u16/R f32 scratch, t16t the [N][R] transpose map, sums 2*N*K scratch.
+void lokr_product_bwd(const MfAdapter* ad, const uint16_t* xt, const float* rsx, float* dYv, float* dxv, float* t1,
+                      float* t2, uint16_t* tt, float* trs, uint16_t* t16t, float* sums, int64_t R, int64_t N,
+                      int64_t K, prefill::Gemm& gemm, void* stream) {
+    const int64_t ol = ad->ol, ok = ad->ok, im = ad->im, inn = ad->inn, rk = ad->rank;
+    const float s = ad->scale;
+    // dY in FP16 rows with their scales, then the transposed apply: P1 = dY w2a, P2 = P1 w2b, dX = P2T w1t
+    uint16_t* dy16 = tt;
+    float* dyrs = trs;
+    mf_rows16(dYv, R, N, dy16, dyrs, stream);
+    gemm.f16(dy16, ad->w2a, t1, R * ol, rk, ok);
+    uint16_t* p1_16 = tt + (size_t) R * N;
+    lokr_to_f16(t1, R * ol * rk, p1_16, stream);
+    gemm.f16(p1_16, ad->w2b, t2, R * ol, inn, rk);
+    lokr_transpose(t2, R, ol, inn, t1, stream);
+    uint16_t* p2_16 = p1_16 + (size_t) R * ol * rk;
+    lokr_to_f16(t1, R * inn * ol, p2_16, stream);
+    gemm.f16(p2_16, ad->w1t, t2, R * inn, im, ol);
+    lokr_dgrad_add(dxv, t2, dyrs, s, R, K, im, inn, stream);
+    // the whole delta's gradient, then each factor through its partial trace (w2 splits as a product does)
+    const float g = mf_scaled_transpose_f16(dYv, rsx, R, N, t16t, stream);
+    float* dDelta = sums;
+    mf_wgrad(t16t, xt, R, N, K, s * g, dDelta, sums + (size_t) N * K, false, gemm, stream);
+    float* w2f = t1;
+    gemm.f16(ad->w2a, ad->w2b, w2f, ok, inn, rk);
+    uint16_t* w2_16 = p2_16 + (size_t) R * inn * ol;
+    float* w2rs = dyrs;
+    mf_rows16(w2f, ok, inn, w2_16, w2rs, stream);
+    float* dw1 = t2;
+    float* dw2 = t2 + (size_t) ol * im;
+    mf_lokr_partial_trace(dDelta, ad->w1, w2_16, ol, ok, im, inn, dw1, dw2, stream);
+    add_into(ad->dW1, dw1, ol * im, stream);
+    float* dw2a = dw2 + (size_t) ok * inn;
+    float* dw2b = dw2a + (size_t) ok * rk;
+    mf_lokr_factor_bwd(dw2, ad->w2a, ad->w2b, ok, inn, rk, dw2a, dw2b, stream);
+    add_into(ad->dW2a, dw2a, ok * rk, stream);
+    add_into(ad->dW2b, dw2b, rk * inn, stream);
+}
+
 // one product's forward rows with an adapter (ad null: the product as always): the base GEMM's output is in y
 // (still divided by rsx, no bias yet).  hf/delta/fa/fb are shared transients; h16/hr/h16t are kept for the backward.
 void ad_factors(const float* m, const float* norms, int64_t N, float scale, float* fa, float* fb, void* s);
@@ -86,13 +213,23 @@ void ad_rows_back(float* y, const float* rsx, const float* bias, const float* de
                   const float* fa, const float* fb, float scale, int64_t R, int64_t N, void* s);
 void ad_product_fwd(const MfAdapter* ad, const uint16_t* x16, const float* rsx, float* y, const float* bias,
                     int64_t R, int64_t N, int64_t K, float* hf, uint16_t* h16, float* hr, uint16_t* h16t,
-                    float* delta, float* fa, float* fb, prefill::Gemm& gemm, void* stream) {
+                    float* delta, float* delta2, uint16_t* tmp16, float* fa, float* fb, prefill::Gemm& gemm,
+                    void* stream) {
     if (ad == nullptr) {
         dit_rows::rows_back(y, rsx, bias, R, N, stream);
         return;
     }
+    if (ad->method == MfAdapterMethod::lokr) {
+        lokr_product_fwd(ad, x16, rsx, y, bias, R, N, delta, delta2, tmp16, gemm, stream);
+        return;
+    }
     gemm.f16(x16, ad->a, hf, R, ad->rank, K);
     mf_rows16(hf, R, ad->rank, h16, hr, stream);
+    // hf read x16, the input divided by rsx: hr takes rsx too, so h16 * hr is x A^T itself for the delta below,
+    // dB (mf_lora_bwd) and a DoRA's dm (without it the delta trained 1 / rsx of what inference applies)
+    if (rsx != nullptr)
+        dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) R),
+                                            [=](sycl::id<1> id) { hr[id[0]] *= rsx[id[0]]; });
     mf_transpose_f16(h16, R, ad->rank, h16t, stream);
     gemm.f16(h16, ad->b, delta, R, N, ad->rank);
     const float* fa_use = nullptr;
@@ -145,6 +282,9 @@ void ad_product_bwd(const MfBlockW& W, int pi, const MfAdapter* ad, const uint16
     if (W.db[pi] != nullptr) mf_bias_bwd(dYv, R, N, W.db[pi], stream);   // the bias is added after
         // the row scaling, so its gradient reads the unscaled rows (dYv, not dYa; the same buffer for a plain LoRA)
     if (ad != nullptr) {
+        if (ad->method == MfAdapterMethod::lokr) {
+            lokr_product_bwd(ad, xt, rsx, dYv, dxv, yb, yd, ltmp16, lrsT, t16t, sums, R, N, K, gemm, stream);
+        } else {
         // a plain LoRA's dY carries no scale, so mf_lora_bwd takes scale; a DoRA's dYb already carries its row
         // factor fb = scale * c, so it takes 1 (its dh is dL/dh either way: dh = scale * dYb B)
         const float ad_scale = ad->method == MfAdapterMethod::dora ? 1.0f : ad->scale;
@@ -156,6 +296,7 @@ void ad_product_bwd(const MfBlockW& W, int pi, const MfAdapter* ad, const uint16
         mf_dgrad(h16, nullptr, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
         mf_dgrad(reinterpret_cast<uint16_t*>(h16t), nullptr, ad->at, R, ad->rank, K, dxv, sums, true,
                  gemm, stream);
+        }
     }
 }
 // a DoRA's row factors (the same formula mf_dora_bwd's da/db read: c = m / (|W| + eps), fa = 1 + s (c - 1),
@@ -210,10 +351,10 @@ void ln_mod16(const float* x, const float* shift, const float* scale, int64_t ro
         });
 }
 
-// each head's q and k RMS-normed with its weight and rotated pairwise; v carried as it is (qk_rope_v16's forward)
+// each head's q and k RMS-normed with its weight and rotated pairwise; v divided by vs[0] (v_scale's power of two)
 void qk_norm_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk,
-                    const float* cos, const float* sin, bool rope, int64_t rows, int64_t heads, int64_t hd,
-                    uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s) {
+                    const float* cos, const float* sin, bool rope, const float* vs, int64_t rows, int64_t heads,
+                    int64_t hd, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s) {
     const int64_t half = hd / 2;
     dit_rows::q_of(s).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) rows * heads * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
@@ -222,8 +363,9 @@ void qk_norm_rope16(const float* q, const float* k, const float* v, const float*
                 const float* src = (which == 0 ? q : which == 1 ? k : v) + g * hd;
                 uint16_t* dst = (which == 0 ? q16 : which == 1 ? k16 : v16) + g * hd;
                 if (which == 2) {
+                    const float inv = 1.f / vs[0];
                     for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += kWG)
-                        dst[d] = f16_from_f32(src[d]);
+                        dst[d] = f16_from_f32(src[d] * inv);
                     continue;
                 }
                 const float* w = which == 0 ? wq : wk;
@@ -341,6 +483,10 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     float* ym2[2];
     uint16_t *jq = pool.u(Rj * C), *jk = pool.u(Rj * C), *jv = pool.u(Rj * C), *jo = pool.u(Rj * C);
     float* jof = pool.f(Rj * C);   // the same output before it was rounded: the backward's D reads this
+    // v's power of two (v_scale): jv, jo and jof are the true rows divided by vs[0], and vs[1 ..] is the output
+    // projection's row scale that puts it back
+    uint32_t* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
+    float* vs = pool.f(Rj + 1);
     float* lse = pool.f(Rj * heads);
     // ---- the gradients
     float* dym2[2];
@@ -441,7 +587,6 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     };
     for (int st = 0; st < 2; ++st) {
         const float* mod = w[st]->mod;
-        const int64_t off = st == 0 ? Rt : 0;   // the joint rows: the text's first, then the image's
         ln_mod16(in[st], mod, mod + C, R[st], C, ln1_16[st], ln1_s[st], mean1[st], inv1[st], stream);
         tape_put16(slice(st, kTapeLn1), ln1_16[st], R[st] * C, stream);
         mf_transpose_f16(ln1_16[st], R[st], C, ln1_t[st], stream);
@@ -449,11 +594,16 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
             float* dst = i == 0 ? yq[st] : i == 1 ? yk[st] : yv[st];
             gemm.f16(ln1_16[st], w[st]->w[i], dst, R[st], C, C);
             ad_product_fwd(w[st]->ad[i], ln1_16[st], ln1_s[st], dst, w[st]->b[i], R[st], C, C, ad_hf,
-                           adh16[st][i], adhr[st][i], adh16t[st][i], ad_y1, ad_fa, ad_fb, gemm, stream);
+                           adh16[st][i], adhr[st][i], adh16t[st][i], ad_y1, ad_y2, ad_tmp16, ad_fa, ad_fb, gemm,
+                           stream);
             tape_put(slice(st, kTapeQ + i), dst, R[st] * C, stream);
         }
+    }
+    v_scale(yv[0], R[0] * C, yv[1], R[1] * C, vamax, vs, Rj, stream);
+    for (int st = 0; st < 2; ++st) {
+        const int64_t off = st == 0 ? Rt : 0;   // the joint rows: the text's first, then the image's
         qk_norm_rope16(yq[st], yk[st], yv[st], w[st]->nq, w[st]->nk, st == 0 ? run.cos : nullptr,
-                       st == 0 ? run.sin : nullptr, st == 0 && run.cos != nullptr, R[st], heads, hd,
+                       st == 0 ? run.sin : nullptr, st == 0 && run.cos != nullptr, vs, R[st], heads, hd,
                        jq + off * C, jk + off * C, jv + off * C, stream);
     }
     mf_attn_fwd(jq, jk, jv, Rj, heads, hd, jo, jof, lse, gemm, stream);
@@ -466,8 +616,9 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         const float* mod = w[st]->mod;
         const int64_t off = st == 0 ? Rt : 0;
         gemm.f16(jo + off * C, w[st]->w[3], yo[st], R[st], C, C);
-        ad_product_fwd(w[st]->ad[3], jo + off * C, nullptr, yo[st], w[st]->b[3], R[st], C, C, ad_hf,
-                       adh16[st][3], adhr[st][3], adh16t[st][3], ad_y1, ad_fa, ad_fb, gemm, stream);
+        ad_product_fwd(w[st]->ad[3], jo + off * C, vs + 1, yo[st], w[st]->b[3], R[st], C, C, ad_hf,
+                       adh16[st][3], adhr[st][3], adh16t[st][3], ad_y1, ad_y2, ad_tmp16, ad_fa, ad_fb, gemm,
+                       stream);
         tape_put(slice(st, kTapeO), yo[st], R[st] * C, stream);
         resid_gate(in[st], yo[st], mod + 2 * C, R[st] * C, C, h1[st], stream);
         tape_put(slice(st, kTapeH1), h1[st], R[st] * C, stream);
@@ -476,7 +627,8 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         mf_transpose_f16(ln2_16[st], R[st], C, ln2_t[st], stream);
         gemm.f16(ln2_16[st], w[st]->w[4], ym1[st], R[st], F, C);
         ad_product_fwd(w[st]->ad[4], ln2_16[st], ln2_s[st], ym1[st], w[st]->b[4], R[st], F, C, ad_hf,
-                       adh16[st][4], adhr[st][4], adh16t[st][4], ad_y1, ad_fa, ad_fb, gemm, stream);
+                       adh16[st][4], adhr[st][4], adh16t[st][4], ad_y1, ad_y2, ad_tmp16, ad_fa, ad_fb, gemm,
+                       stream);
         tape_put(slice(st, kTapeM1), ym1[st], R[st] * F, stream);
         gelu_fwd(ym1[st], R[st] * F, dgelu[st], stream);           // dgelu still free here: it holds the GELU's output
         mf_rows16(dgelu[st], R[st], F, gelu_16[st], gelu_s[st], stream);
@@ -484,7 +636,8 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         mf_transpose_f16(gelu_16[st], R[st], F, gelu_t[st], stream);
         gemm.f16(gelu_16[st], w[st]->w[5], ym2[st], R[st], C, F);
         ad_product_fwd(w[st]->ad[5], gelu_16[st], gelu_s[st], ym2[st], w[st]->b[5], R[st], C, F, ad_hf,
-                       adh16[st][5], adhr[st][5], adh16t[st][5], ad_y1, ad_fa, ad_fb, gemm, stream);
+                       adh16[st][5], adhr[st][5], adh16t[st][5], ad_y1, ad_y2, ad_tmp16, ad_fa, ad_fb, gemm,
+                       stream);
         tape_put(slice(st, kTapeM2), ym2[st], R[st] * C, stream);
         resid_gate(h1[st], ym2[st], mod + 5 * C, R[st] * C, C, outp[st], stream);
         tape_put(slice(st, kTapeOut), outp[st], R[st] * C, stream);
@@ -502,65 +655,71 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         tape_put(tp + slot[kTapeScGeluT], gelu_s[1], wide[1], stream);
     }
 
+    // no output gradients: a forward-only read (the trainer's eval and kept forwards)
+    if (dout[0] != nullptr || dout[1] != nullptr) {
     // ---- backward, from the outputs' gradients
-    for (int st = 0; st < 2; ++st) {
-        const MfBlockW& W = *w[st];
-        const float* mod = W.mod;
-        // the MLP's gated residual: dh1 is the output's gradient as it reaches the first residual's sum
-        copy_rows(dout[st], R[st] * C, dh1[st], stream);
-        scale_cols(dout[st], mod + 5 * C, R[st] * C, C, dym2[st], stream);
-        tape_put(slice(st, kTapeDM2), dym2[st], R[st] * C, stream);
-        ad_product_bwd(W, 5, W.ad[5], gelu_16[st], gelu_s[st], gelu_t[st], dym2[st], dgelu[st], false,
-                       adh16[st][5], adhr[st][5], adh16t[st][5], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
-                       ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
-        tape_put(slice(st, kTapeDGelu), dgelu[st], R[st] * F, stream);
-        mf_gelu_bwd(ym1[st], dgelu[st], R[st] * F, dym1[st], stream);
-        tape_put(slice(st, kTapeDM1), dym1[st], R[st] * F, stream);
-        ad_product_bwd(W, 4, W.ad[4], ln2_16[st], ln2_s[st], ln2_t[st], dym1[st], dln2[st], false,
-                       adh16[st][4], adhr[st][4], adh16t[st][4], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
-                       ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
-        tape_put(slice(st, kTapeDLn2), dln2[st], R[st] * C, stream);
-        // the second norm: its input's gradient joins the residual's own
-        mf_ln_mod_bwd(h1[st], mean2[st], inv2[st], mod + 4 * C, dln2[st], R[st], C, dgelu[st], nullptr, nullptr,
-                      stream);
-        add_into(dh1[st], dgelu[st], R[st] * C, stream);
-        tape_put(slice(st, kTapeDH1), dh1[st], R[st] * C, stream);
-        // the attention's gated residual
-        scale_cols(dh1[st], mod + 2 * C, R[st] * C, C, dyo[st], stream);
-        tape_put(slice(st, kTapeDYo), dyo[st], R[st] * C, stream);
-        if (dIn[st] != nullptr) add_into(dIn[st], dh1[st], R[st] * C, stream);   // the residual's own path
-        const int64_t off = st == 0 ? Rt : 0;
-        mf_transpose_f16(jo + off * C, R[st], C, attn_t[st], stream);
-        ad_product_bwd(W, 3, W.ad[3], jo + off * C, nullptr, attn_t[st], dyo[st], dattn[st], false,
-                       adh16[st][3], adhr[st][3], adh16t[st][3], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
-                       ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
-        copy_rows(dattn[st], R[st] * C, jdo + off * C, stream);
-    }
-    mf_attn_bwd(jq, jk, jv, jof, jdo, Rj, heads, hd, jdq, jdk, jdv, true, gemm, stream);
-    tape_put(jslice(kTapeJDO), jdo, Rj * C, stream);
-    tape_put(jslice(kTapeJDQ), jdq, Rj * C, stream);
-    tape_put(jslice(kTapeJDK), jdk, Rj * C, stream);
-    tape_put(jslice(kTapeJDV), jdv, Rj * C, stream);
-    for (int st = 0; st < 2; ++st) {
-        const MfBlockW& W = *w[st];
-        const int64_t off = st == 0 ? Rt : 0;
-        copy_rows(jdv + off * C, R[st] * C, dyv[st], stream);
-        mf_qk_norm_rope_bwd(yq[st], yk[st], W.nq, W.nk, st == 0 ? run.cos : nullptr, st == 0 ? run.sin : nullptr,
-                            st == 0 && run.cos != nullptr, jdq + off * C, jdk + off * C, R[st], heads, hd, dyq[st],
-                            dyk[st], W.dnq, W.dnk, stream);
-        for (int i = 0; i < 3; ++i) {
-            float* dy = i == 0 ? dyq[st] : i == 1 ? dyk[st] : dyv[st];
-            tape_put(slice(st, kTapeDQ + i), dy, R[st] * C, stream);
-            float* dxv = i == 0 ? dln1[st] : dgelu[st];
-            ad_product_bwd(W, i, W.ad[i], ln1_16[st], ln1_s[st], ln1_t[st], dy, dxv, false,
-                           adh16[st][i], adhr[st][i], adh16t[st][i], ad_y1, ad_y2, ad_fa, ad_fb,
-                           ad_scratch, ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
-            if (i > 0) add_into(dln1[st], dgelu[st], R[st] * C, stream);
+        for (int st = 0; st < 2; ++st) {
+            const MfBlockW& W = *w[st];
+            const float* mod = W.mod;
+            // the MLP's gated residual: dh1 is the output's gradient as it reaches the first residual's sum
+            copy_rows(dout[st], R[st] * C, dh1[st], stream);
+            scale_cols(dout[st], mod + 5 * C, R[st] * C, C, dym2[st], stream);
+            tape_put(slice(st, kTapeDM2), dym2[st], R[st] * C, stream);
+            ad_product_bwd(W, 5, W.ad[5], gelu_16[st], gelu_s[st], gelu_t[st], dym2[st], dgelu[st], false,
+                           adh16[st][5], adhr[st][5], adh16t[st][5], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
+                           ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
+            tape_put(slice(st, kTapeDGelu), dgelu[st], R[st] * F, stream);
+            mf_gelu_bwd(ym1[st], dgelu[st], R[st] * F, dym1[st], stream);
+            tape_put(slice(st, kTapeDM1), dym1[st], R[st] * F, stream);
+            ad_product_bwd(W, 4, W.ad[4], ln2_16[st], ln2_s[st], ln2_t[st], dym1[st], dln2[st], false,
+                           adh16[st][4], adhr[st][4], adh16t[st][4], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
+                           ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
+            tape_put(slice(st, kTapeDLn2), dln2[st], R[st] * C, stream);
+            // the second norm: its input's gradient joins the residual's own
+            mf_ln_mod_bwd(h1[st], mean2[st], inv2[st], mod + 4 * C, dln2[st], R[st], C, dgelu[st], nullptr, nullptr,
+                          stream);
+            add_into(dh1[st], dgelu[st], R[st] * C, stream);
+            tape_put(slice(st, kTapeDH1), dh1[st], R[st] * C, stream);
+            // the attention's gated residual
+            scale_cols(dh1[st], mod + 2 * C, R[st] * C, C, dyo[st], stream);
+            tape_put(slice(st, kTapeDYo), dyo[st], R[st] * C, stream);
+            if (dIn[st] != nullptr) add_into(dIn[st], dh1[st], R[st] * C, stream);   // the residual's own path
+            const int64_t off = st == 0 ? Rt : 0;
+            mf_transpose_f16(jo + off * C, R[st], C, attn_t[st], stream);
+            ad_product_bwd(W, 3, W.ad[3], jo + off * C, vs + 1, attn_t[st], dyo[st], dattn[st], false,
+                           adh16[st][3], adhr[st][3], adh16t[st][3], ad_y1, ad_y2, ad_fa, ad_fb, ad_scratch,
+                           ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
+            copy_rows(dattn[st], R[st] * C, jdo + off * C, stream);
         }
-        tape_put(slice(st, kTapeDLn1), dln1[st], R[st] * C, stream);
-        mf_ln_mod_bwd(in[st], mean1[st], inv1[st], w[st]->mod + C, dln1[st], R[st], C, dxn1[st], nullptr, nullptr,
-                      stream);
-        add_into(dIn[st], dxn1[st], R[st] * C, stream);
+        // the attention ran on v / vs[0]: its output's gradient comes in times vs[0] and dV leaves divided by it
+        scale_by(jdo, Rj * C, vs, false, stream);
+        mf_attn_bwd(jq, jk, jv, jof, jdo, Rj, heads, hd, jdq, jdk, jdv, true, gemm, stream);
+        tape_put(jslice(kTapeJDO), jdo, Rj * C, stream);
+        tape_put(jslice(kTapeJDQ), jdq, Rj * C, stream);
+        tape_put(jslice(kTapeJDK), jdk, Rj * C, stream);
+        tape_put(jslice(kTapeJDV), jdv, Rj * C, stream);   // the joint rows' own gradients, as jv's
+        scale_by(jdv, Rj * C, vs, true, stream);
+        for (int st = 0; st < 2; ++st) {
+            const MfBlockW& W = *w[st];
+            const int64_t off = st == 0 ? Rt : 0;
+            copy_rows(jdv + off * C, R[st] * C, dyv[st], stream);
+            mf_qk_norm_rope_bwd(yq[st], yk[st], W.nq, W.nk, st == 0 ? run.cos : nullptr, st == 0 ? run.sin : nullptr,
+                                st == 0 && run.cos != nullptr, jdq + off * C, jdk + off * C, R[st], heads, hd, dyq[st],
+                                dyk[st], W.dnq, W.dnk, stream);
+            for (int i = 0; i < 3; ++i) {
+                float* dy = i == 0 ? dyq[st] : i == 1 ? dyk[st] : dyv[st];
+                tape_put(slice(st, kTapeDQ + i), dy, R[st] * C, stream);
+                float* dxv = i == 0 ? dln1[st] : dgelu[st];
+                ad_product_bwd(W, i, W.ad[i], ln1_16[st], ln1_s[st], ln1_t[st], dy, dxv, false,
+                               adh16[st][i], adhr[st][i], adh16t[st][i], ad_y1, ad_y2, ad_fa, ad_fb,
+                               ad_scratch, ad_tmp16, ad_rsT, t16, trs, t16t, sums, R[st], gemm, stream);
+                if (i > 0) add_into(dln1[st], dgelu[st], R[st] * C, stream);
+            }
+            tape_put(slice(st, kTapeDLn1), dln1[st], R[st] * C, stream);
+            mf_ln_mod_bwd(in[st], mean1[st], inv1[st], w[st]->mod + C, dln1[st], R[st], C, dxn1[st], nullptr, nullptr,
+                          stream);
+            if (dIn[st] != nullptr) add_into(dIn[st], dxn1[st], R[st] * C, stream);
+        }
     }
 }
 
