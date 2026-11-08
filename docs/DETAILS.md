@@ -1833,7 +1833,7 @@ Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | 7–9× faster than the CPU encoder (Vulkan) | up to 1,024 |
+| **GPU** (recommended) | 7–9× faster than the CPU encoder (Vulkan) | 1,024 (small and wide pictures scaled up to 1,024) |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -1851,7 +1851,7 @@ With `"vram_elastic": false` the server says so and starts the encoder with the 
 When the engine says it cannot give pieces back (`vram_elastic` 0, above), the first picture starts the encoder first and loads the model again, and from then on the encoder starts with the model.
 
 The GPU encoder's build (Vulkan), its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
-A picture becomes up to 1,024 tokens of the context (a 640x480 photo: 300).
+On the GPU encoder a picture becomes about 1,024 tokens of the context; on the CPU encoder about 300.
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
 **More image tokens:** `--vision-tokens N` at setup (`./setup.sh --setup --vision cpu --vision-tokens 768`) sets the most tokens a picture becomes.
@@ -1859,11 +1859,13 @@ It is `"max_tokens"` in the `"vision"` section of `xestrata-<model>.json`, which
 More tokens keep more detail (small text, charts, screenshots) and take longer to encode, on the CPU most of all.
 A setup run again keeps the value for the same encoder place (GPU or CPU).
 
-**A minimum of image tokens** (upstream #767): `"min_tokens": N` written by hand in the `"vision"` section of `xestrata-<model>.json` is passed to the encoder as `--min-tokens N` (mtmd's `image_min_tokens`): a small picture is scaled up to at least N tokens.
-llama.cpp's mtmd prints that Qwen-VL models want at least 1,024 for pointing at or counting small items.
-The default is no minimum.
-A higher minimum changes the image answers and takes longer to encode (the CPU of an i7-14700, 14 threads: a 512x384 picture as 192 tokens in 0.9 s, with `--min-tokens 256` as 266 tokens in 1.5 s).
-A setup run again keeps the value.
+**A minimum of image tokens** (upstream #767): the encoder scales a small picture up to at least `"min_tokens"` tokens (mtmd's `image_min_tokens`).
+The default is 1,024 on the GPU encoder and no minimum on the CPU encoder.
+With few tokens small text such as a receipt's is misread (an 800x400 receipt at 325 tokens gave a wrong number and total, at 1,024 the right ones; llama.cpp's mtmd recommends at least 1,024 for Qwen-VL models too).
+On the GPU 1,024 takes no more VRAM and at most 1.5 s a picture on the B70.
+To read small text accurately on the CPU too, write `"min_tokens": 1024` and `"max_tokens": 1024` by hand in the `"vision"` section of `xestrata-<model>.json`.
+Encoding then takes 11–12 s a picture (an i7-14700, 14 threads; 1.4–2.2 s at the default of about 300 tokens).
+A setup run again keeps the values.
 
 **A Q8_0 encoder** (upstream #625): `"mmproj"` in the `"vision"` section can point to another mmproj file of this model, for example a Q8_0 one (`llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0` makes one).
 The file is smaller (590 MiB against 865 MiB for the BF16 one), the encoder takes about 280 MiB less RAM on the CPU, and at the default 300 tokens it can encode faster than BF16.

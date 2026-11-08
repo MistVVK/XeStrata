@@ -2813,6 +2813,12 @@ class Vision:
     # hand-edited or migrated config without vision.max_tokens left the reader unclamped, and #3690 saw one picture
     # become 93,700 image tokens (I7).  A key that is there is the person's: 0 means no limit, as before.
     DEFAULT_MAX_TOKENS = {"gpu": 1024, "cpu": 300}
+    # the fewest image tokens a picture becomes on the GPU reader: below it a small or wide picture shrank to 300 tokens
+    # or so and its text was misread (a receipt of 800 x 400 at 325 tokens, by every Qwen3.x reader and by llama.cpp's
+    # mtmd, which recommends 1,024 for Qwen-VL); at 1,024 it read right, in 1.5 s at most a picture on the B70 and with
+    # the same VRAM (the reader's buffers are sized for its maximum).  The CPU reader keeps its 300 (11 s a picture at
+    # 1,024 on an i7-14700), and a config's min_tokens sets either
+    DEFAULT_MIN_TOKENS = {"gpu": 1024, "cpu": 0}
 
     @staticmethod
     def token_limit(cfg: dict) -> int:
@@ -2839,9 +2845,22 @@ class Vision:
         limit = Vision.token_limit(cfg)                 # I7 (#3690): a default when the config names none
         if limit:
             args += ["--max-tokens", str(limit)]
-        if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
-            args += ["--min-tokens", str(cfg["min_tokens"])]
+        floor = Vision.token_floor(cfg, limit)
+        if floor:
+            args += ["--min-tokens", str(floor)]
         return args
+
+    @staticmethod
+    def token_floor(cfg: dict, limit) -> int:
+        """The --min-tokens of a reader config (#767: mtmd's image_min_tokens): its min_tokens, else the default of its
+        kind, never above the reader's own limit."""
+        floor = Vision.DEFAULT_MIN_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
+        if cfg.get("min_tokens") is not None:
+            try:
+                floor = max(0, int(cfg["min_tokens"]))
+            except (TypeError, ValueError):
+                pass
+        return min(floor, limit) if limit else floor
 
     def _ensure_dir(self):
         """#3370: a temp cleaner (Windows Storage Sense) removes the empty work folder while the encoder is unloaded;
