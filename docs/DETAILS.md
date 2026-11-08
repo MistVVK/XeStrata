@@ -1495,7 +1495,7 @@ Local `#` references work; remote references are refused.
 `json_schema` is checked with the Python package `jsonschema` (setup installs it into `.venv`, the deb and rpm packages depend on the distribution's python3-jsonschema, and the Windows 7z carries it).
 Without it a `strict: true` request (`json_schema`'s `strict: true`, Messages' `output_config.format`, a `strict: true` tool) cannot be checked and is a 400, and another `json_schema` answer is only checked to be one JSON object; the server says so once, and `xestrata --setup` says how to install it.
 
-When the engine can constrain its decoding (not with continuous batching), **the answer is written under the schema's grammar** and checked after it as well.
+When the engine can constrain its decoding (not with `--batch-groups` 2 or more), **the answer is written under the schema's grammar** and checked after it as well. With tools, only the calls' arguments have a grammar, and the answer is checked after it is written.
 The thinking is not constrained: only the JSON answer after it.
 Otherwise the schema is in the prompt and the server checks the answer; `STRATA_GRAMMAR=0` in the environment turns the constraint off too.
 `strict` is true, false or null (as if not given); another type is a 400.

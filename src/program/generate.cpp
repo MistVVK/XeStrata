@@ -9112,7 +9112,7 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.elastic() ? 1 : 0, o.batch,
                         o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
-                        igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0,
+                        igc_workaround.c_str(), strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0,
                         o.batch == 0 ? 1 : 0,
                         drive.d.remote_count > 0 ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none");
         }
@@ -9355,6 +9355,10 @@ int main(int argc, char** argv) {
             bool tainted = false;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        // #60: each slot's grammar (the one its request's prompt read started: BADM moves it here), and the masks of a
+        // batch window's rows, one row for each (a slot without a grammar: every token)
+        std::vector<strata::core::Grammar> bgram(bs.size());
+        std::vector<uint32_t> bgram_rows;
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0, bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
@@ -9563,9 +9567,38 @@ int main(int argc, char** argv) {
                 bt_a_rounds0 = a_rounds;
                 bt_a_swapped0 = a_swapped;
             }
+            // #60: a slot with a grammar: its rows sample what it allows after the row's token (and the proposal
+            // before it), every other row anything
+            bool gmask = false;
+            for (int a = 0; a < A; ++a) gmask = gmask || bgram[(size_t) active[a]].active();
+            if (gmask) {
+                size_t words = 0;
+                for (int a = 0; a < A && words == 0; ++a)
+                    if (bgram[(size_t) active[a]].active()) words = (size_t) bgram[(size_t) active[a]].words();
+                bgram_rows.assign((size_t) S * words, 0xFFFFFFFFu);
+                for (int a = 0; a < A; ++a) {
+                    strata::core::Grammar& gr = bgram[(size_t) active[a]];
+                    if (gr.active() && !gr.fill(tok + first[a], per, bgram_rows.data() + (size_t) first[a] * words)) {
+                        std::fprintf(stderr, "xestrata batch: slot %d: the grammar failed: the rest of its reply is not "
+                                             "constrained\n", active[a]);
+                        gr.stop();
+                        std::fill_n(bgram_rows.begin() + (std::ptrdiff_t) ((size_t) first[a] * words),
+                                    (size_t) per * words, 0xFFFFFFFFu);
+                    }
+                }
+                if (!ver.set_allowed(bgram_rows.data(), S, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+            }
             const Clock::time_point w0 = Clock::now();
             if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+                return false;
+            }
+            // the next window (a batch window, a request's own) sets its own masks
+            if (gmask && !ver.set_allowed(nullptr, 0, err)) {
+                std::printf("ERR %s\n", err.c_str());
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
@@ -9622,8 +9655,15 @@ int main(int argc, char** argv) {
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
+                    bgram[(size_t) b].stop();
                     nan_flush = true;
                     continue;
+                }
+                strata::core::Grammar& gr = bgram[(size_t) b];
+                if (gr.active() && !gr.commit(outb + first[a], keep[(size_t) b])) {   // its masks made this impossible
+                    std::fprintf(stderr, "xestrata batch: slot %d: the grammar refused a token its mask allowed: the rest "
+                                         "of its reply is not constrained\n", b);
+                    gr.stop();
                 }
                 for (int j = 0; j < keep[(size_t) b]; ++j) {
                     const int32_t y = outb[first[a] + j];
@@ -9638,6 +9678,7 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;   // its session holds sl.ids
+                        gr.stop();
                         break;
                     }
                     sl.x = y;
@@ -10621,7 +10662,8 @@ int main(int argc, char** argv) {
             int req_logprobs = -1;
             // grammar=<base64 JSON> (src/core/grammar.cpp): the reply follows this grammar - each window's rows sample only
             // the tokens it allows after the tokens before them (serve builds it from a JSON schema, a strict tool's
-            // parameters, a regex or a Lark grammar).  Not with continuous batching (INFO grammar=0 there)
+            // parameters, a regex or a Lark grammar).  With --batch the slot the request continues in takes it over (bgram);
+            // not with --batch-groups above 1 (INFO grammar=0 there)
             std::string req_grammar;
             // allowed=a,b,c: the LP line names only these ids after the chosen one (the server renormalises over them;
             // OpenAI's allowed_token_ids, upstream 9ea044962).  Empty: the K most likely tokens, as before
@@ -10697,12 +10739,18 @@ int main(int argc, char** argv) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
                 continue;
             }
-            static strata::core::Grammar grammar;   // one request at a time (not with --batch)
+            static strata::core::Grammar grammar;   // the request being read (a --batch slot takes it over at BADM)
             grammar.stop();
             std::vector<uint32_t> grammar_rows;
             if (!req_grammar.empty()) {
                 std::vector<int32_t> stops(o.eos_ids.begin(), o.eos_ids.end());
-                if (o.batch > 0) { std::printf("ERR grammar: continuous batching is not supported\n"); continue; }
+                // #60: the pipelined groups' windows (pump, pmtp_verdict) fill no masks: a grammar there would be
+                // taken and not kept to
+                if (o.batch > 0 && o.batch_groups > 1) {
+                    std::printf("ERR grammar: not with --batch-groups above 1 (its windows do not constrain the reply); "
+                                "start the engine with --batch-groups 1\n");
+                    continue;
+                }
                 if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
                 grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
             }
@@ -10731,6 +10779,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (grammar.active() && !grammar.take_reply(ids, err)) {   // a request continued in another leg (--batch)
+                std::printf("ERR %s\n", err.c_str());
+                continue;
+            }
             if (req_prefill_only && (geni || o.batch > 0 || n < 2)) {
                 std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no --batch\n");
                 continue;
@@ -13089,6 +13141,9 @@ int main(int argc, char** argv) {
                 }
                 if (cont) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
+                    // its grammar has taken the first token: it goes on in the slot's windows (none: the slot's is
+                    // cleared)
+                    bgram[(size_t) admit_slot] = std::move(grammar);
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};
                     sl.active = true;

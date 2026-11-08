@@ -2955,13 +2955,18 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
     return 1;
 }
 
+// A batch window's rows sampled outside the graph: a sampled slot's, and with a grammar's masks set (set_allowed: a
+// slot with a grammar, the engine's batch_step) every row, each with its own row of the masks - the graph's argmax
+// knows no mask, and a slot without a grammar has a row that allows every token.
 bool Verifier::sample_rows(int S, std::string& err) {
     bool any = false;
+    const size_t words = (size_t) ((n_vocab_ + 31) / 32);
     for (int t = 0; t < S; ++t) {
         strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
-        if (sp.greedy || sp.temperature <= 0.0f) continue;
+        if (!allowed_on_ && (sp.greedy || sp.temperature <= 0.0f)) continue;
         sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
         sp.penalty_last_n = 0;
+        sp.allowed = allowed_on_ ? allowed_device_ + (size_t) t * words : nullptr;
         strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, sp,
                                        m_out_ + t, cs_);
         any = true;

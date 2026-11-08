@@ -1551,6 +1551,15 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
 
     @staticmethod
+    def leg_keys(sampling: dict, written: int) -> str:
+        """sampling_keys for a leg of a --batch request that continues a reply (a slot after the one-at-a-time path, or
+        that path again): the prompt's last `written` tokens are the reply so far, which its grammar goes on from."""
+        grammar = sampling.get("strata_grammar")
+        if isinstance(grammar, dict) and written > 0:
+            sampling = {**sampling, "strata_grammar": {**grammar, "reply_tokens": written}}
+        return StrataEngine.sampling_keys(sampling)
+
+    @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
         t = sampling.get("temperature")
@@ -2060,6 +2069,7 @@ class StrataEngine:
                         # prompt_read 1) and BDONE replace them
                         carry_leg(carry, self.last)
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
+                        keys = self.leg_keys(sampling or {}, len(out))
                 while True:
                     if slot is None:
                         # a free slot (they free themselves at BDONE, which needs no control lines): the one that holds
@@ -2236,6 +2246,7 @@ class StrataEngine:
                             if reused0 is None:
                                 reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
+                            keys = self.leg_keys(sampling or {}, len(out))
                             solo_again += 1
                             btrace("back to the solo path")
                             break
@@ -2882,9 +2893,17 @@ class Vision:
         self.dead = None
         self._ensure_dir()
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
-        self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
-                          cwd=self.dir)
+        try:
+            self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                              cwd=self.dir)
+        except OSError as e:
+            # the reason later pictures get too (they got "the picture reader is not running"): a reader that is not
+            # there (a config written for another install, a package that lost it) with its path and the cure
+            self.dead = (f"the picture reader is not installed: {args[0]} is not there - run xestrata --setup to "
+                         "install it again" if isinstance(e, FileNotFoundError) else
+                         f"the picture reader {args[0]} could not start ({e})")
+            raise RuntimeError(self.dead) from e
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
         line = self._line(VISION_READY_S)
@@ -4020,7 +4039,7 @@ class Service:
 
     def attach_grammar(self, req: dict, grammar) -> bool:
         """`grammar` (structured.answer_grammar / tool_grammar) into the request, for an engine that constrains its
-        decoding (INFO grammar=1: not with continuous batching).  STRATA_GRAMMAR=0 keeps
+        decoding (INFO grammar=1: not with --batch-groups above 1).  STRATA_GRAMMAR=0 keeps
         every reply unconstrained (checked after it, as before).  -> whether it was attached."""
         info = getattr(self.engine, "info", None) or {}
         if grammar is None or str(info.get("grammar")) != "1" or not self.tokenizer_dir or \
@@ -6824,7 +6843,8 @@ def _with_reasoning(lps: dict, entries: list) -> dict:
 
 
 def structured_chunks(chunks, validator):
-    """Buffer structured streams so a client never receives unvalidated content."""
+    """Buffer structured streams so a client never receives unvalidated content.  A turn that calls a tool goes out
+    as written: the schema is for the final answer (#60, as on /v1/responses and Messages)."""
     buffered = []
     heartbeat = time.monotonic()
     try:
@@ -6837,6 +6857,9 @@ def structured_chunks(chunks, validator):
                 yield chunk if progress else None
         result = openai_collect(buffered)
         choice = result["choices"][0]
+        if choice["finish_reason"] == "tool_calls":
+            yield from buffered
+            return
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
         # logprobs: the entries spell what the model wrote, which is replaced here with the canonical JSON;
         # _structured_logprobs gives back the form the tokens spell, or None
@@ -9056,9 +9079,10 @@ def make_handler(svc: Service):
             tools, choice = allowed_tools(req.get("tool_choice"), tools)   # the tools it lists, and its mode
             force = forced_call(choice, tools,                      # a bad value is a 400 before anything is sent
                                 getattr(svc.template, "call_form", "qwen"))
-            messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
-                raise ValueError("structured response_format with tools/MCP is not supported")
+            # #60: with tools the schema is the final answer's, as on /v1/responses and Messages: a turn that calls a
+            # tool goes out as it is, and the answer is checked after it is written (no answer grammar below)
+            messages, validator = prepare_format(req.get("response_format"), messages,
+                                                 with_tools=bool(tools) or req.get("strata_mcp") is True)
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             if top_logprobs(req) is not None and batch_slots_on(svc.engine) and max_req != 1:
@@ -9168,9 +9192,10 @@ def make_handler(svc: Service):
                 self._watch_client(cancel)                   # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
-            # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
+            # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py): one
+            # grammar cannot allow a call and hold the answer to the schema, so with tools only the calls have one
             strict, patterns = constrained_tools(req.get("tools"))
-            grammar = answer_grammar(req.get("response_format"), thinking) if validator is not None \
+            grammar = answer_grammar(req.get("response_format"), thinking) if validator is not None and not tools \
                 else tool_grammar(tools, strict, patterns, thinking, form)
             if grammar is None and image_force_names and len(image_force_names) > 1:
                 grammar = call_names_grammar(image_force_names, thinking, form)
@@ -9677,7 +9702,9 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             strict, patterns = constrained_tools(req.get("tools"))
-            svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
+            # with tools only the calls have a grammar: the answer is checked after it is written (#60)
+            svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking)
+                               if validator is not None and not tools
                                else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
             svc.check_strict(req, tools, strict)

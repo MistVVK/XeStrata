@@ -20,11 +20,18 @@ class Grammar {
 public:
     Grammar();
     ~Grammar();
+    /// A slot of --batch takes over the grammar the request's prompt read started (and its first token went through).
+    Grammar(Grammar&&) noexcept;
+    Grammar& operator=(Grammar&&) noexcept;
     /// One request's grammar from the GEN line's `grammar=` value: base64 of a JSON object {"vocab": the tokenizer
     /// folder (vocab.json, token_type.json), "kind": "json_schema" | "json_object" | "structural_tag" | "regex" | "lark" |
-    /// "ebnf", "text": the grammar, "prefix": the reply's text already written (a continued pass) or ""}.  `stop_ids`:
-    /// the end-of-turn tokens, allowed once the grammar is complete.
+    /// "ebnf", "text": the grammar, "prefix": the reply's text already written (a continued pass) or "",
+    /// "reply_tokens": how many of the prompt's last tokens are the reply already written (a request that continues in
+    /// another leg of --batch: a slot, or the one-at-a-time path again), 0 when absent}.  `stop_ids`: the end-of-turn
+    /// tokens, allowed once the grammar is complete.
     bool start(const std::string& value, int n_vocab, const std::vector<int32_t>& stop_ids, std::string& err);
+    /// The prompt's ids: its last "reply_tokens" go through the grammar after the prefix.  False when one is refused.
+    bool take_reply(const std::vector<int64_t>& ids, std::string& err);
     bool active() const { return impl_ != nullptr; }
     /// The words of one row's mask.
     int words() const { return words_; }
@@ -41,6 +48,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     int words_ = 0;
+    int64_t reply_tokens_ = 0;   ///< start's "reply_tokens", until take_reply
 };
 
 }  // namespace strata::core

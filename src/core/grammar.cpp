@@ -7,6 +7,7 @@
 #include <picojson.h>
 #endif
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -99,6 +100,8 @@ bool grammar_built() { return true; }
 
 Grammar::Grammar() = default;
 Grammar::~Grammar() = default;
+Grammar::Grammar(Grammar&&) noexcept = default;
+Grammar& Grammar::operator=(Grammar&&) noexcept = default;
 
 bool Grammar::start(const std::string& value, int n_vocab, const std::vector<int32_t>& stop_ids, std::string& err) {
     impl_.reset();
@@ -112,6 +115,8 @@ bool Grammar::start(const std::string& value, int n_vocab, const std::vector<int
     auto& o = v.get<picojson::object>();
     auto str = [&](const char* k) { return o.count(k) && o[k].is<std::string>() ? o[k].get<std::string>() : std::string(); };
     const std::string dir = str("vocab"), kind = str("kind"), text = str("text"), prefix = str("prefix");
+    reply_tokens_ = o.count("reply_tokens") && o["reply_tokens"].is<double>()
+                        ? std::max<int64_t>(0, (int64_t) o["reply_tokens"].get<double>()) : 0;
     Vocab* voc = vocab_of(dir, n_vocab, stop_ids, err);
     if (voc == nullptr) { err = "grammar: " + err; return false; }
     try {
@@ -137,6 +142,27 @@ bool Grammar::start(const std::string& value, int n_vocab, const std::vector<int
         return false;
     }
     words_ = xgrammar::GetBitmaskSize(n_vocab);
+    return true;
+}
+
+bool Grammar::take_reply(const std::vector<int64_t>& ids, std::string& err) {
+    const int64_t k = reply_tokens_;
+    reply_tokens_ = 0;
+    if (k == 0) return true;
+    if (k > (int64_t) ids.size()) {
+        err = "grammar: reply_tokens is longer than the prompt";
+        return false;
+    }
+    try {
+        for (size_t i = ids.size() - (size_t) k; i < ids.size(); ++i)
+            if (!impl_->m->AcceptToken((int32_t) ids[i])) {
+                err = "grammar: the reply written so far does not follow it";
+                return false;
+            }
+    } catch (const std::exception& e) {
+        err = std::string("grammar: ") + e.what();
+        return false;
+    }
     return true;
 }
 
@@ -188,10 +214,13 @@ bool grammar_built() { return false; }
 struct Grammar::Impl {};
 Grammar::Grammar() = default;
 Grammar::~Grammar() = default;
+Grammar::Grammar(Grammar&&) noexcept = default;
+Grammar& Grammar::operator=(Grammar&&) noexcept = default;
 bool Grammar::start(const std::string&, int, const std::vector<int32_t>&, std::string& err) {
     err = "grammar: this engine was built without grammar-constrained decoding (STRATA_GRAMMAR)";
     return false;
 }
+bool Grammar::take_reply(const std::vector<int64_t>&, std::string&) { return true; }
 bool Grammar::fill(const int32_t*, int, uint32_t*) { return true; }
 bool Grammar::commit(const int32_t*, int) { return true; }
 void Grammar::stop() {}

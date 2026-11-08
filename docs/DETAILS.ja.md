@@ -1438,7 +1438,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema に依存し、Windows の 7z には入っています）。
 なければ、`strict: true` の要求（`json_schema` の `strict: true`、Messages の `output_config.format`、`strict: true` の道具）は確かめられないので 400 で断り、ほかの `json_schema` は答えが 1 つの JSON のオブジェクトであることだけを確かめます。server はそのことを一度だけ伝え、入れ方は `xestrata --setup` が示します。
 
-エンジンが文法で縛れるとき（連続バッチを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
+エンジンが文法で縛れるとき（`--batch-groups` が 2 以上のときを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。道具を渡した要求では、文法は道具の呼び出しの引数だけに付け、答えは書いた後に確かめます。
 思考は縛らず、思考の後の答えの JSON だけを縛ります。
 縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
 `strict` は true、false、null（書かないのと同じ）のどれかで、ほかの型は 400 です。
