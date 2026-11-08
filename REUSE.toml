@@ -140,6 +140,13 @@ path = ["third_party/main/katex/**"]
 SPDX-FileCopyrightText = "2013-2020 Khan Academy and other contributors"
 SPDX-License-Identifier = "MIT"
 
+# mermaid's script bundles the packages BUNDLED.md lists, each under its own license (elkjs taken under EPL-2.0,
+# DOMPurify under Apache-2.0)
+[[annotations]]
+path = ["third_party/main/mermaid/**"]
+SPDX-FileCopyrightText = ["2014-2022 Knut Sveidqvist", "the authors of the packages third_party/main/mermaid/BUNDLED.md lists"]
+SPDX-License-Identifier = "MIT AND ISC AND BSD-3-Clause AND Apache-2.0 AND EPL-2.0"
+
 [[annotations]]
 path = ["third_party/main/containers-common/**"]
 SPDX-FileCopyrightText = ["The containers/common authors", "2026 MistVVK and the XeStrata contributors"]

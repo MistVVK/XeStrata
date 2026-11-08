@@ -94,7 +94,10 @@ COMPONENTS = [
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
-    ("KaTeX (the web chat's math)", "0.19.0", "MIT", "https://katex.org/", ["src:third_party/main/katex/LICENSE"], []),
+    ("KaTeX (the web chat's math)", "0.19.1", "MIT", "https://katex.org/", ["src:third_party/main/katex/LICENSE"], []),
+    ("mermaid (the web chat's flowcharts)", "12.3.0", "MIT; the packages it bundles: ISC, BSD-3-Clause, Apache-2.0, "
+     "EPL-2.0, MIT (third_party/main/mermaid/BUNDLED.md)", "https://mermaid.js.org/",
+     ["src:third_party/main/mermaid/LICENSE", "src:third_party/main/mermaid/BUNDLED.md"], []),
     ("XGrammar (compiled into the engine: grammar-constrained decoding)", "0.2.8", "Apache-2.0",
      "https://github.com/mlc-ai/xgrammar",
      ["src:third_party/main/xgrammar/LICENSE", "src:third_party/main/xgrammar/NOTICE"], []),
@@ -130,7 +133,7 @@ COMPONENTS = [
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
 APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/katex",
-            "third_party/main/quantscope")
+            "third_party/main/mermaid", "third_party/main/quantscope")
 APP_SKIP = ("__pycache__", "test_*", "mcp_fake_server.py", "lint", "vision", "package")
 
 

@@ -886,5 +886,6 @@
   "img.ctrlMap": "O mapa de controle",
   "img.ctrlRefHint": "Este modelo não tem ControlNet: o mapa entra como mais uma imagem de referência, e o prompt pede para segui-lo.",
   "img.ctrlNoPicture": "Escolha a imagem de onde tirar a composição (ou desligue o controle).",
-  "img.ctrlColor": "Onde está cada objeto (mapa de cores)"
+  "img.ctrlColor": "Onde está cada objeto (mapa de cores)",
+  "chart.label": "Um diagrama do plano"
 }

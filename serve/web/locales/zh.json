@@ -886,5 +886,6 @@
   "img.ctrlMap": "控制图",
   "img.ctrlRefHint": "此模型没有 ControlNet：控制图作为又一张参考图片传入，提示词要求遵循它。",
   "img.ctrlNoPicture": "请选择要从中取构图的图片（或关闭控制）。",
-  "img.ctrlColor": "每个物体的位置（颜色图）"
+  "img.ctrlColor": "每个物体的位置（颜色图）",
+  "chart.label": "步骤图"
 }

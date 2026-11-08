@@ -71,6 +71,12 @@ Every copyright holder whose work is in this repository, its license and where t
 - Copyright (c) 2013-2020 Khan Academy and other contributors
   MIT - third_party/main/katex/ (KaTeX 0.19.1, its script, style sheet and fonts as upstream Strata vendors them),
   which the web app's chat draws math with - third_party/main/katex/LICENSE, LICENSES/MIT.txt
+- Copyright (c) 2014 - 2022 Knut Sveidqvist, and the authors of the packages its script bundles
+  MIT - third_party/main/mermaid/ (mermaid 12.3.0, its dist/mermaid.min.js), which the web app's chat draws a plan's
+  flowchart with; the script also carries d3 (ISC, parts BSD-3-Clause), elkjs (EPL-2.0, taken under it of its
+  EPL-2.0 or GPL-3.0-or-later), chevrotain (Apache-2.0), DOMPurify (Apache-2.0, of its MPL-2.0 or Apache-2.0) and the
+  MIT packages third_party/main/mermaid/BUNDLED.md lists - third_party/main/mermaid/LICENSE, LICENSES/MIT.txt,
+  LICENSES/ISC.txt, LICENSES/BSD-3-Clause.txt, LICENSES/Apache-2.0.txt, LICENSES/EPL-2.0.txt
 - Copyright The containers/common authors (https://github.com/containers/container-libs); changes Copyright 2026
   MistVVK and the XeStrata contributors
   Apache-2.0 - third_party/main/containers-common/seccomp-io_uring.json (Podman's seccomp profile from

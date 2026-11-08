@@ -910,5 +910,6 @@
   "img.ctrlMap": "The control map",
   "img.ctrlRefHint": "This model has no ControlNet: the map goes in as one more reference image, and the prompt asks to follow it.",
   "img.ctrlNoPicture": "Choose the picture to take the composition from (or turn the control off).",
-  "img.ctrlColor": "Where each object is (color map)"
+  "img.ctrlColor": "Where each object is (color map)",
+  "chart.label": "A chart of the plan"
 }

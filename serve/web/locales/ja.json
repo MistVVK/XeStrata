@@ -886,5 +886,6 @@
   "img.ctrlMap": "制御の図",
   "img.ctrlRefHint": "このモデルには ControlNet がない。図は参照の画像の 1 枚として渡し、プロンプトでそれに従うよう頼む。",
   "img.ctrlNoPicture": "構図を取る画像を選んでください（または制御を「使わない」に）。",
-  "img.ctrlColor": "物体の位置（色の地図）"
+  "img.ctrlColor": "物体の位置（色の地図）",
+  "chart.label": "段取りの図"
 }

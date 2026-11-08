@@ -886,5 +886,6 @@
   "img.ctrlMap": "Die Steuerkarte",
   "img.ctrlRefHint": "Dieses Modell hat kein ControlNet: Die Karte geht als weiteres Referenzbild hinein, und der Prompt bittet, ihr zu folgen.",
   "img.ctrlNoPicture": "Wählen Sie das Bild, aus dem der Bildaufbau übernommen wird (oder schalten Sie die Steuerung aus).",
-  "img.ctrlColor": "Wo jedes Objekt ist (Farbkarte)"
+  "img.ctrlColor": "Wo jedes Objekt ist (Farbkarte)",
+  "chart.label": "Ein Diagramm des Plans"
 }

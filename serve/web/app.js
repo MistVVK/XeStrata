@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
-/* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
+/* global tr, StrataI18n, StrataMath, StrataMermaid, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
           clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen, chatId,
           chat, saveChatOf, resumeReplies, chatName, openChat, StrataSegments */
 /* exported pending */   // read by chats-ui.js (the history's buttons wait for it)
@@ -78,6 +78,7 @@ function setTheme(t, save) {
   if (save) try { localStorage.setItem("xestrata.theme", t); } catch (e) { /* ignore */ }
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
   refreshPreviews();                                  // the preview frames carry the page's colours
+  queueMicrotask(redrawCharts);                       // the charts too (after this script set the chat up)
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("dark-toggle").onclick = flipTheme;
@@ -1273,7 +1274,11 @@ function codeBlock(lang, code, complete) {
     (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(label)}" title="${esc(label)}" aria-pressed="false">${icon("image")}</button>` : "") +
     `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(tr("code.copy", "Copy code"))}">${icon("copy")}</button></span></div>`;
   const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(kind === "svg" ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
-  return `<div class="st-code">${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
+  // a finished ```mermaid block: drawn as its chart (mermaid-view.js), its code a click away
+  const chart = complete && /^mermaid$/i.test(lang || "");
+  const head2 = chart ? head.replace(`<button class="st-btn st-btn--icon" data-code-copy`,
+    `<button class="st-btn st-btn--icon" data-chart-code aria-pressed="false" aria-label="${esc(tr("preview.showCode", "Show the code"))}" title="${esc(tr("preview.showCode", "Show the code"))}">${icon("edit")}</button><button class="st-btn st-btn--icon" data-code-copy`) : head;
+  return `<div class="st-code"${chart ? " data-mermaid" : ""}>${head2}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
 }
 function blocks(text) {
   const out = [], lines = text.split("\n");
@@ -1537,6 +1542,25 @@ function sourcesHtml(tools) {
   }
   return links.length ? `<div class="msg-sources"><span class="muted small">${esc(tr("chatSearch.sources", "Sources"))}</span><ol>${links.join("")}</ol></div>` : "";
 }
+// every answer's charts drawn again (the theme's colors)
+function redrawCharts() {
+  for (const el of document.querySelectorAll("#chat .st-msg--assistant")) {
+    const m = messages[+el.dataset.i];
+    if (m) StrataMermaid.hydrate(el.querySelector(".st-bubble"), planSteps(m));
+  }
+}
+// the plan's boxes by their ids (combine-tools: a tool call's `step`) -> how each goes: running, done or error
+function planSteps(m) {
+  const out = new Map();
+  for (const t of m.tools || []) {
+    let a = t.arguments;
+    if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { a = null; } }
+    const id = a && typeof a.step === "string" ? a.step.trim() : "";
+    if (!id) continue;
+    out.set(id, t.state === "done" ? "done" : t.state === "error" ? "error" : t.state === "skipped" ? "waiting" : "running");
+  }
+  return out;
+}
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
   if (x.event === "limit") { m.limit = x.max_rounds; return; }
@@ -1574,6 +1598,7 @@ function updateAssistant(el, m, streaming) {
   } else {
     bubble.innerHTML = answerHtml(m);
     if (settings.math) StrataMath.hydrate(bubble);
+    StrataMermaid.hydrate(bubble, planSteps(m));
     hydrateToolImages(bubble);
     if (!streaming) paintMarks();
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
@@ -1645,6 +1670,13 @@ function scrollDown(force) {
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
+  const cv = e.target.closest("[data-chart-code]");   // a chart: flip between it and its code
+  if (cv) {
+    const box = cv.closest(".st-code"), on = box.dataset.showCode !== "true";
+    if (on) box.dataset.showCode = "true"; else delete box.dataset.showCode;
+    cv.setAttribute("aria-pressed", String(on));
+    return;
+  }
   // an svg/html block: flip between its code and its sandboxed preview. Closing the preview also turns scripts off.
   const pv = e.target.closest("[data-preview-toggle]");
   if (pv) {

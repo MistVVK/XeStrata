@@ -282,6 +282,21 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .mcp-server__tools { display: flex; flex-wrap: wrap; gap: 6px; }
 .mcp-server__tools .chip { height: 26px; padding: 0 10px; font-family: var(--st-font-mono); }
 .mcp-note { margin: 0; }
+/* a ```mermaid block drawn as its chart (mermaid-view.js); its code shown instead on a click. The plan's boxes by their
+   step's state: a mark (mermaid-view.js) and these colors */
+.st-mermaid { padding: var(--st-s-3); background: var(--st-surface); overflow-x: auto; }
+.st-mermaid svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+.st-code--chart > pre { display: none; }
+.st-code--chart[data-show-code="true"] > pre { display: block; }
+.st-code--chart[data-show-code="true"] > .st-mermaid { display: none; }
+.st-mermaid g.node[data-step="running"] :is(rect, polygon, path, circle, ellipse) { fill: var(--st-info-tint) !important; stroke: var(--st-info) !important; stroke-width: 2px !important; }
+.st-mermaid g.node[data-step="done"] :is(rect, polygon, path, circle, ellipse) { fill: var(--st-accent-tint) !important; stroke: var(--st-accent) !important; }
+.st-mermaid g.node[data-step="error"] :is(rect, polygon, path, circle, ellipse) { fill: var(--st-danger-tint) !important; stroke: var(--st-danger) !important; }
+.st-mermaid g.node[data-step="waiting"] :is(rect, polygon, path, circle, ellipse) { stroke-dasharray: 4 3; }
+.st-mermaid .xs-step-mark { font: var(--st-fw-bold) 12px var(--st-font); fill: var(--st-ink-muted); }
+.st-mermaid g.node[data-step="running"] .xs-step-mark { fill: var(--st-info-text); }
+.st-mermaid g.node[data-step="done"] .xs-step-mark { fill: var(--st-accent-text); }
+.st-mermaid g.node[data-step="error"] .xs-step-mark { fill: var(--st-danger-text); }
 
 /* ---------------------------------------------------------------- about */
 .about { max-width: min(100%, 1100px); }

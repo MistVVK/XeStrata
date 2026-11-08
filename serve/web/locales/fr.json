@@ -901,5 +901,6 @@
   "img.ctrlMap": "La carte de contrôle",
   "img.ctrlRefHint": "Ce modèle n'a pas de ControlNet : la carte entre comme une image de référence de plus, et le prompt demande de la suivre.",
   "img.ctrlNoPicture": "Choisissez l'image dont prendre la composition (ou désactivez le contrôle).",
-  "img.ctrlColor": "Où est chaque objet (carte de couleurs)"
+  "img.ctrlColor": "Où est chaque objet (carte de couleurs)",
+  "chart.label": "Un schéma du plan"
 }

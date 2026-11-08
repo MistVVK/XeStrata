@@ -1,0 +1,14 @@
+{
+  "package": "mermaid",
+  "version": "12.3.0",
+  "url": "https://registry.npmjs.org/mermaid/-/mermaid-12.3.0.tgz",
+  "integrity": "sha512-4113TdXeLAsMruJ79OpFL5O8+LTFXhQqZ260rF3tgUmiNAtRm4Uume04I+65PRN6yZ69J4f8rVYWW8zRk65UYw==",
+  "license": "MIT",
+  "bundled_licenses": "MIT AND ISC AND BSD-3-Clause AND Apache-2.0 AND EPL-2.0 (BUNDLED.md)",
+  "verified": "the tarball's sha512 was checked against the integrity above when these files were copied from package/ (2026-11-09)",
+  "changes": "none: LICENSE and dist/mermaid.min.js are the package's files unchanged",
+  "sha256": {
+    "LICENSE": "ec9fb67dcb25eccc416ed56e1aab819222c805a2a4bfe4cb19e7556bf2ffde80",
+    "dist/mermaid.min.js": "336df803d87a38b70a01e736e666c8f7601d2ce42f5e47c8fafe5d721074b9a3"
+  }
+}
