@@ -86,12 +86,14 @@ void rmsnorm_rows(const float* x, size_t ldx, float* y, size_t ldy, int n, int d
     }
 }
 
-bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, const std::function<bool(int o, float* dst)>& row,
-                  I8Matrix& m) {
-    if (n_in > kI8MaxIn || !i8_gemm_block_ok(block) || n_in <= 0 || n_out <= 0) return false;
+bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, int levels,
+                  const std::function<bool(int o, float* dst)>& row, I8Matrix& m) {
+    if (n_in > kI8MaxIn || !i8_gemm_block_ok(block) || !i8_gemm_levels_ok(levels) || n_in <= 0 || n_out <= 0)
+        return false;
     m.n_in = n_in;
     m.n_out = n_out;
     m.block = block;
+    m.levels = levels;
     m.panel.assign(i8_gemm_packed_bytes(n_out, n_in), 0);
     m.scale.assign(i8_gemm_scale_count(n_out, n_in, block), 0.0f);
     m.corr.assign(m.scale.size(), 0);
@@ -112,7 +114,7 @@ bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, const std::fun
         const size_t lanes = (size_t) i8_gemm_blocks(n_in, block) * kI8Panel;
         if (!i8_gemm_pack_f32(rows.data(), (size_t) n_in, n_in, o1 - o0, m.panel.data() + (size_t) p0 * quads *
                               kI8QuadBytes, m.scale.data() + (size_t) p0 * lanes, m.corr.data() + (size_t) p0 * lanes,
-                              0, p1 - p0, block))
+                              0, p1 - p0, block, levels))
             bad = true;
     });
     return !bad;
@@ -152,7 +154,8 @@ void i8_linear(BandPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r
         const int t0 = (int) ((long long) r.n * c / chunks), t1 = (int) ((long long) r.n * (c + 1) / chunks);
         if (p0 >= p1 || t0 >= t1) return;
         i8_gemm_rows(isa, m.panel.data(), m.scale.data(), m.corr.data(), m.n_in, m.n_out, r.q.data() + (size_t) t0 * r.ldq,
-                     r.ldq, r.s.data() + (size_t) t0 * nb, y + (size_t) t0 * ldy, ldy, t1 - t0, p0, p1, bias, m.block);
+                     r.ldq, r.s.data() + (size_t) t0 * nb, y + (size_t) t0 * ldy, ldy, t1 - t0, p0, p1, bias, m.block,
+                     m.levels);
     });
 }
 

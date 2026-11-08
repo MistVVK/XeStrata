@@ -58,20 +58,21 @@ private:
 /// squares walk the row in index order into one accumulator, as every other sum here does.
 void rmsnorm_rows(const float* x, size_t ldx, float* y, size_t ldy, int n, int dim, const float* w, float eps);
 
-/// A matrix in the int8 form of i8_gemm.hpp: [n_out, n_in], scale block `block`.
+/// A matrix in the int8 form of i8_gemm.hpp: [n_out, n_in], scale block `block`, weight levels `levels`.
 struct I8Matrix {
     std::vector<uint8_t> panel;
     std::vector<float> scale;
     std::vector<int32_t> corr;
-    int n_in = 0, n_out = 0, block = 0;
+    int n_in = 0, n_out = 0, block = 0, levels = kI8Levels;
     int panels() const { return i8_gemm_panels(n_out); }
     size_t bytes() const { return panel.size() + scale.size() * 4 + corr.size() * 4; }
 };
 
-/// Pack the rows `row(o, dst)` writes (n_in floats each) into `m`, panel bands on the pool.  False when the matrix is
-/// one i8_gemm_pack refuses (wider than kI8MaxIn) or a row could not be made (`row` returned false).
-bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, const std::function<bool(int o, float* dst)>& row,
-                  I8Matrix& m);
+/// Pack the rows `row(o, dst)` writes (n_in floats each) into `m` with `levels` weight levels
+/// (i8_gemm_weight_levels of the ISA that will run it), panel bands on the pool.  False when the matrix is one
+/// i8_gemm_pack refuses (wider than kI8MaxIn) or a row could not be made (`row` returned false).
+bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, int levels,
+                  const std::function<bool(int o, float* dst)>& row, I8Matrix& m);
 
 /// Activation rows quantized for one or more products that read them: `n` rows of `n_in`, scale block `block`.
 struct I8Rows {

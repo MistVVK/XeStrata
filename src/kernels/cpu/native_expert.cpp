@@ -66,6 +66,27 @@ size_t native_row_bytes(int type, int64_t n) {
     return ggml_row_size((ggml_type) type, n);
 }
 
+size_t native_vec_act_bytes(int type, int64_t n) {
+    init_once();
+    const ggml_type_traits_cpu* t = type >= 0 && type < GGML_TYPE_COUNT ? traits(type) : nullptr;
+    if (t == nullptr || t->vec_dot == nullptr || native_row_bytes(type, n) == 0) return 0;
+    const int vt = (int) t->vec_dot_type;
+    if (vt != GGML_TYPE_F32 && (traits(vt) == nullptr || traits(vt)->from_float == nullptr)) return 0;
+    return native_row_bytes(vt, n);
+}
+
+void native_vec_quant(int type, const float* x, void* dst, int64_t n) {
+    const int vt = (int) traits(type)->vec_dot_type;
+    if (vt == GGML_TYPE_F32) std::memcpy(dst, x, (size_t) n * 4);
+    else traits(vt)->from_float(x, dst, n);
+}
+
+void native_vec_rows(int type, const uint8_t* rows, size_t row_bytes, int64_t n, int64_t r0, int64_t r1,
+                     const void* act, float* y) {
+    const ggml_vec_dot_t dot = traits(type)->vec_dot;
+    for (int64_t r = r0; r < r1; ++r) dot((int) n, y + r, 0, rows + (size_t) r * row_bytes, 0, act, 0, 1);
+}
+
 bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
     if (native_row_bytes(type, n) == 0) return false;
     if (type == GGML_TYPE_F32) {   // ggml has no to_float for F32: its rows are the floats

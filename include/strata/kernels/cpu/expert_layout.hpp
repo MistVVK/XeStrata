@@ -68,6 +68,15 @@ bool cpu_gather_fast_here();
 /// Whether the AVX-VNNI kernels run here: the build has them (STRATA_HAVE_AVXVNNI), the CPU has AVX2 and AVX-VNNI
 /// (CPUID 7.1 EAX bit 4).  STRATA_NO_AVXVNNI=1 answers no (to compare with the AVX2 kernels).
 bool cpu_avxvnni_ok();
+/// Whether this CPU (and its OS) runs the int8 product's AVX-512 kernel (i8_gemm.hpp): AVX512F and AVX512_VNNI, and the
+/// OS saving the opmask and ZMM state (XCR0 bits 1, 2, 5, 6, 7).  Only what that kernel uses: cpu_avx512_ok's VBMI and BW
+/// would leave out the Cascade Lake servers, which have AVX-512 VNNI.  XESTRATA_FORCE_AVX2=1 answers no.
+bool cpu_avx512vnni_ok();
+/// Whether this CPU (and its OS) runs AVX-VNNI-INT8 (vpdpbssd: s8 x s8; CPUID 7.1 EDX bit 4, Arrow Lake, Lunar Lake and
+/// later) beside AVX2.  XESTRATA_NO_AVXVNNI=1 answers no, as for AVX-VNNI.
+bool cpu_avxvnniint8_ok();
+/// The bytes of one core's level-2 cache, from CPUID (leaf 4 on Intel, 0x8000001D on AMD); 0 when the CPU does not say.
+uint64_t cpu_l2_bytes();
 /// The CPU's brand string (CPUID 0x80000002..4), for messages; "unknown" when it has none.
 std::string cpu_name();
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.

@@ -19,7 +19,9 @@
 #include "strata/core/plain_model.hpp"
 #include "strata/kernels/cpu/cpu_ops.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/core/expert_source.hpp"
 #include "strata/platform/env.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <immintrin.h>
 
@@ -67,10 +69,33 @@ float dot(const float* a, const float* b, int n) {
 
 inline float sigm(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
+// The decode windows (4 tokens at most) read the GGUF's own rows where the RAM holds them beside the int8 copy: a token
+// then reads the file's 4 to 6 bits a weight instead of the int8 copy's 8.5, and the decode is the RAM's bandwidth
+// (the 9B: 260 ms a token from the int8 copy on an i7-14700).  Wider windows take the int8 products.
+constexpr int kNativeRows = 4;
+
+/// A matrix of the forward: its int8 panels, and where its rows are in the GGUF (one part a tensor of a fused product)
+struct Mat {
+    kc::I8Matrix q;
+    struct Part {
+        const uint8_t* src = nullptr;
+        int type = 0;
+        size_t rb = 0;
+        int64_t rows = 0;
+    };
+    std::vector<Part> parts;
+    bool native = false;   ///< every part has a vec_dot in ggml-cpu
+    uint64_t file_bytes() const {
+        uint64_t b = 0;
+        for (const Part& p : parts) b += (uint64_t) p.rb * (uint64_t) p.rows;
+        return b;
+    }
+};
+
 struct Layer {
     bool rec = false;
     std::vector<float> attn_norm, post_norm;
-    kc::I8Matrix in, out, gu, down;
+    Mat in, out, gu, down;
     // GDN
     std::vector<float> ab;          ///< [2 HV][N]: alpha's rows, then beta's
     std::vector<float> conv, dt, a, ssm_norm;
@@ -92,7 +117,9 @@ struct PlainCpu::Impl {
     int64_t max_cells = 0, chunk = 2048;
     std::vector<Layer> layers;
     std::vector<float> out_norm;
-    kc::I8Matrix head;
+    Mat head;
+    bool native = false;   ///< the decode windows read the GGUF's rows (Mat::parts)
+    std::vector<std::vector<uint8_t>> act;   ///< a native product's quantized activations, a part's for each row
     // the embedding rows, read from the mapped file
     const uint8_t* emb = nullptr;
     int emb_type = 0;
@@ -116,9 +143,9 @@ struct PlainCpu::Impl {
     }
 
     bool vec(const std::string& name, uint64_t n, std::vector<float>& out, std::string& err) const;
-    bool mat(const std::vector<std::string>& names, kc::I8Matrix& out, int64_t n_in, std::string& err) const;
+    bool mat(const std::vector<std::string>& names, Mat& out, int64_t n_in, std::string& err) const;
     bool dense(const std::string& name, int64_t n_in, int64_t n_out, float* out, std::string& err) const;
-    void linear(const kc::I8Matrix& w, const float* x, size_t ldx, int n, float* out, size_t ldo);
+    void linear(const Mat& w, const float* x, size_t ldx, int n, float* out, size_t ldo);
     void block_gdn(Layer& L, int T);
     void block_attn(Layer& L, int T, int64_t pos);
     void ffn(Layer& L, int T);
@@ -159,10 +186,9 @@ bool PlainCpu::Impl::dense(const std::string& name, int64_t n_in, int64_t n_out,
 }
 
 // the matrices `names`, their rows one after another (a fused product: [qkv | z], [q | k | v], [gate | up])
-bool PlainCpu::Impl::mat(const std::vector<std::string>& names, kc::I8Matrix& out, int64_t n_in,
-                         std::string& err) const {
-    struct Part { const uint8_t* src; int type; size_t rb; int64_t rows; };
-    std::vector<Part> parts;
+bool PlainCpu::Impl::mat(const std::vector<std::string>& names, Mat& out, int64_t n_in, std::string& err) const {
+    std::vector<Mat::Part>& parts = out.parts;
+    parts.clear();
     int64_t n_out = 0;
     for (const std::string& name : names) {
         size_t at = 0;
@@ -180,21 +206,50 @@ bool PlainCpu::Impl::mat(const std::vector<std::string>& names, kc::I8Matrix& ou
         parts.push_back({m->shard(at).tensor_data(*t), (int) t->type, rb, r});
         n_out += r;
     }
-    const bool ok = kc::i8_pack_rows(*pool, (int) n_in, (int) n_out, kBlock, [&](int o, float* dst) {
-        for (const Part& p : parts) {
+    out.native = true;
+    for (const Mat::Part& p : parts) out.native = out.native && kc::native_vec_act_bytes(p.type, n_in) > 0;
+    const bool ok = kc::i8_pack_rows(*pool, (int) n_in, (int) n_out, kBlock, kc::i8_gemm_weight_levels(isa),
+                                     [&](int o, float* dst) {
+        for (const Mat::Part& p : parts) {
             if (o < p.rows) return kc::native_row_to_float(p.type, p.src + (size_t) o * p.rb, dst, n_in);
             o -= (int) p.rows;
         }
         return false;
-    }, out);
+    }, out.q);
     if (!ok) err = "plain cpu: packing " + names[0] + " failed";
     return ok;
 }
 
-void PlainCpu::Impl::linear(const kc::I8Matrix& w, const float* xin, size_t ldx, int n, float* out, size_t ldo) {
+void PlainCpu::Impl::linear(const Mat& w, const float* xin, size_t ldx, int n, float* out, size_t ldo) {
     mark(3);
-    kc::i8_quantize_rows(*pool, isa, xin, ldx, n, w.n_in, w.block, rows);
-    kc::i8_linear(*pool, isa, w, rows, out, ldo);
+    if (!native || !w.native || n > kNativeRows) {
+        kc::i8_quantize_rows(*pool, isa, xin, ldx, n, w.q.n_in, w.q.block, rows);
+        kc::i8_linear(*pool, isa, w.q, rows, out, ldo);
+        mark(0);
+        return;
+    }
+    // the GGUF's rows: each part's activations once a row, then pieces of 64 rows, every token row against each
+    const int64_t n_in = w.q.n_in;
+    int64_t off = 0;
+    for (const Mat::Part& p : w.parts) {
+        const size_t ab = kc::native_vec_act_bytes(p.type, n_in);
+        act.resize((size_t) n);
+        for (int t = 0; t < n; ++t) {
+            act[(size_t) t].resize(ab);
+            kc::native_vec_quant(p.type, xin + (size_t) t * ldx, act[(size_t) t].data(), n_in);
+        }
+        constexpr int64_t kRows = 64;
+        pool->run((int) ((p.rows + kRows - 1) / kRows), [&](int i) {
+            const int64_t r0 = i * kRows, r1 = std::min(p.rows, r0 + kRows);
+            float tmp[kRows];
+            for (int t = 0; t < n; ++t) {
+                kc::native_vec_rows(p.type, p.src + (size_t) r0 * p.rb, p.rb, n_in, 0, r1 - r0, act[(size_t) t].data(),
+                                    tmp);
+                std::memcpy(out + (size_t) t * ldo + off + r0, tmp, (size_t) (r1 - r0) * 4);
+            }
+        });
+        off += p.rows;
+    }
     mark(0);
 }
 
@@ -258,7 +313,7 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     const char* head = m.find("output.weight") != nullptr ? "output.weight" : "token_embd.weight";
     if (!P.vec("output_norm.weight", (uint64_t) P.N, P.out_norm, err) || !P.mat({head}, P.head, P.N, err))
         return false;
-    if (P.head.n_out != n_vocab_) {
+    if (P.head.q.n_out != n_vocab_) {
         err = std::string("plain cpu: ") + head + "'s shape";
         return false;
     }
@@ -273,7 +328,7 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
             !P.mat({p + "ffn_gate.weight", p + "ffn_up.weight"}, L.gu, P.N, err) ||
             !P.mat({p + "ffn_down.weight"}, L.down, P.FF, err))
             return false;
-        if (L.gu.n_out != 2 * P.FF || L.down.n_out != P.N) {
+        if (L.gu.q.n_out != 2 * P.FF || L.down.q.n_out != P.N) {
             err = "plain cpu: block " + std::to_string(l) + "'s FFN has another shape";
             return false;
         }
@@ -289,7 +344,7 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
                 !P.vec(p + "ssm_a", (uint64_t) P.HV, L.a, err) ||
                 !P.vec(p + "ssm_norm.weight", (uint64_t) P.S, L.ssm_norm, err))
                 return false;
-            if (L.in.n_out != P.C + P.ZV || L.out.n_out != P.N) {
+            if (L.in.q.n_out != P.C + P.ZV || L.out.q.n_out != P.N) {
                 err = "plain cpu: block " + std::to_string(l) + "'s GDN projections have other shapes";
                 return false;
             }
@@ -304,11 +359,25 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
                 if (err.empty()) err = "plain cpu: block " + std::to_string(l) + "'s attention heads";
                 return false;
             }
-            if (L.in.n_out != (2 * P.NH + 2 * L.nkv) * P.HD || L.out.n_out != P.N) {
+            if (L.in.q.n_out != (2 * P.NH + 2 * L.nkv) * P.HD || L.out.q.n_out != P.N) {
                 err = "plain cpu: block " + std::to_string(l) + "'s attention has another shape";
                 return false;
             }
         }
+    }
+    // the decode from the GGUF's rows where the RAM holds them beside the int8 copy: the free RAM and the file cache
+    // (the packing just read the file through it) against the rows' bytes and a reserve for everything else
+    {
+        uint64_t file = P.head.file_bytes();
+        bool all = P.head.native;
+        for (const Layer& L : P.layers)
+            for (const Mat* w : {&L.in, &L.out, &L.gu, &L.down}) {
+                file += w->file_bytes();
+                all = all && w->native;
+            }
+        uint64_t free = 0, cached = 0;
+        const uint64_t reserve = std::max<uint64_t>(4ull << 30, strata::core::detail::ram_reserve_bytes());
+        P.native = all && strata::platform::free_and_cached(free, cached) && free + cached >= file + reserve;
     }
     P.gdn_state.assign((size_t) n_gdn, std::vector<float>((size_t) (P.HV * P.S * P.S), 0.0f));
     P.gdn_conv.assign((size_t) n_gdn, std::vector<float>((size_t) (P.C * 3), 0.0f));
@@ -323,10 +392,12 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
 }
 
 std::string PlainCpu::describe() const {
-    size_t bytes = p_->head.bytes();
-    for (const Layer& L : p_->layers) bytes += L.in.bytes() + L.out.bytes() + L.gu.bytes() + L.down.bytes();
-    return std::to_string(p_->pool->size()) + " threads, int8 products on " +
-           kc::i8_gemm_isa_name(p_->isa) + " (" + std::to_string(bytes >> 20) + " MiB of packed weights)";
+    size_t bytes = p_->head.q.bytes();
+    for (const Layer& L : p_->layers) bytes += L.in.q.bytes() + L.out.q.bytes() + L.gu.q.bytes() + L.down.q.bytes();
+    return std::to_string(p_->pool->size()) + " threads, int8 products on " + kc::i8_gemm_isa_name(p_->isa) +
+           (p_->head.q.levels == kc::kI8Levels7 ? " with 7-bit weights" : "") + " (" + std::to_string(bytes >> 20) +
+           " MiB of packed weights); the decode " +
+           (p_->native ? "from the model file's rows (the RAM holds both)" : "from the int8 copy");
 }
 
 void PlainCpu::reset() {

@@ -73,6 +73,17 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n);
 /// Bytes of one row of `n` values of ggml type `type` (0 when `n` is not whole blocks).
 size_t native_row_bytes(int type, int64_t n);
 
+/// A dense matrix's rows of ggml type `type` read where they are (a GGUF tensor), as ggml-cpu multiplies them: the
+/// activation quantized to the type's vec_dot format, each row's dot by ggml-cpu's own vec_dot (the K-quants' AVX2 and
+/// AVX-VNNI kernels).  native_vec_act_bytes: the bytes of one activation of `n` values in that format (0: ggml-cpu
+/// has no vec_dot for the type).
+size_t native_vec_act_bytes(int type, int64_t n);
+/// x (n floats) to the activation native_vec_rows reads for `type`, in `dst` (native_vec_act_bytes bytes).
+void native_vec_quant(int type, const float* x, void* dst, int64_t n);
+/// y[r] = row r . act for the rows [r0, r1) of `rows` (row_bytes apart, n values each).
+void native_vec_rows(int type, const uint8_t* rows, size_t row_bytes, int64_t n, int64_t r0, int64_t r1,
+                     const void* act, float* y);
+
 /// x (n_embd floats) -> the gate/up activation the layer's rows read (act_bytes), rotated first when the layer is
 /// Hadamard-folded: a Q2_0 layer's is Strata's ActQ, any other layer's its vec_dot_type.  Every caller gets the right one from here, so none chooses by type.  `dst` is
 /// a NativeAct's bytes, or kNativeActBytes as aligned.

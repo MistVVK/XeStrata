@@ -1,20 +1,33 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/i8_gemm_rows.inl - the row kernels of i8_gemm_vnni.cpp.  Not a header: i8_gemm_vnni.cpp includes it
-// twice,
+// four times,
 //
-//   STRATA_I8_ROWS_VNNI 0   the AVX2 forms (namespace avx2): vpmaddubsw + vpmaddwd on the signed levels;
-//   STRATA_I8_ROWS_VNNI 1   the same loops with AVX-VNNI (namespace vnni, built with STRATA_AVXVNNI): vpdpbusd on the
-//                           unsigned activation, the row-sum correction taken off.  Integer sums, so the same bits.
+//   STRATA_I8_ROWS_VNNI 0, STRATA_I8_ROWS_U8 0   the AVX2 forms (namespace avx2): vpmaddubsw + vpmaddwd on the
+//                           signed levels, for eight-bit weights;
+//   STRATA_I8_ROWS_VNNI 0, STRATA_I8_ROWS_U8 1   the AVX2 forms for seven-bit weights (namespace avx2_w7): vpmaddubsw
+//                           + vpmaddwd on the unsigned activation as it is, the row-sum correction taken off;
+//   STRATA_I8_ROWS_VNNI 1, STRATA_I8_ROWS_U8 1   the same loops with AVX-VNNI (namespace vnni, built with
+//                           STRATA_AVXVNNI): vpdpbusd on the unsigned activation, the correction taken off;
+//   STRATA_I8_ROWS_VNNI 2, STRATA_I8_ROWS_U8 0   with AVX-VNNI-INT8 (namespace vnni_int8, built with
+//                           STRATA_AVXVNNIINT8): vpdpbssd on the activation quantized signed (i8_gemm_quantize for
+//                           I8GemmIsa::vnni_int8), no correction.
 //
+// Integer sums, so the same bits.
 // Every function here is STRATA_I8_ROWS_FN: nothing in the AVX2 copy, GCC/Clang's target("avxvnni") in the VNNI copy,
 // so the AVX-VNNI intrinsics compile in these functions only and the AVX2 copy stays AVX2.
 
 /// One quad's products into the eight lanes: `a` the activation's four bytes (with their +128) in every lane, `w`
-/// the panel's 32 bytes.  The VNNI copy adds sum (qa + 128) * qw; the AVX2 copy adds sum qa * qw.
+/// the panel's 32 bytes.  The VNNI and the seven-bit copies add sum (qa + 128) * qw; the eight-bit AVX2 copy adds
+/// sum qa * qw.
 STRATA_I8_ROWS_FN inline __m256i dot4(__m256i acc, __m256i a, __m256i w) {
-#if STRATA_I8_ROWS_VNNI
+#if STRATA_I8_ROWS_VNNI == 1
     return _mm256_dpbusd_avx_epi32(acc, a, w);
+#elif STRATA_I8_ROWS_VNNI == 2
+    return _mm256_dpbssd_epi32(acc, a, w);
+#elif STRATA_I8_ROWS_U8
+    // |qw| <= 63: a pair is at most 2 * 255 * 63 = 32130, so vpmaddubsw's int16 cannot saturate (the header)
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, w), _mm256_set1_epi16(1)));
 #else
     const __m256i s = _mm256_xor_si256(a, _mm256_set1_epi8((char) 0x80));   // the signed levels
     const __m256i p = _mm256_maddubs_epi16(_mm256_abs_epi8(s), _mm256_sign_epi8(w, s));
@@ -55,7 +68,7 @@ STRATA_I8_ROWS_FN inline void tile(const uint8_t* wp, int quads, int nb, int bq,
         const __m256 wsv = _mm256_loadu_ps(ws + (size_t) b * kI8Panel);
         const __m256i cv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wc + (size_t) b * kI8Panel));
         for (int r = 0; r < ROWS; ++r) {
-            const __m256 d = _mm256_cvtepi32_ps(STRATA_I8_ROWS_VNNI ? _mm256_sub_epi32(acc[r], cv) : acc[r]);
+            const __m256 d = _mm256_cvtepi32_ps(STRATA_I8_ROWS_U8 ? _mm256_sub_epi32(acc[r], cv) : acc[r]);
             const __m256 s = _mm256_mul_ps(_mm256_set1_ps(xs[(size_t) r * nb + b]), wsv);
             if (b == 0) f[r] = bias != nullptr ? _mm256_fmadd_ps(s, d, bv) : _mm256_mul_ps(s, d);
             else f[r] = _mm256_fmadd_ps(s, d, f[r]);
@@ -105,8 +118,8 @@ STRATA_I8_ROWS_FN inline void tile2(const uint8_t* wp, int quads, int nb, int bq
         const __m256i c1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(wc1 + (size_t) b * kI8Panel));
         for (int r = 0; r < ROWS; ++r) {
             const __m256 xsv = _mm256_set1_ps(xs[(size_t) r * nb + b]);
-            const __m256 d0 = _mm256_cvtepi32_ps(STRATA_I8_ROWS_VNNI ? _mm256_sub_epi32(a0[r], c0) : a0[r]);
-            const __m256 d1 = _mm256_cvtepi32_ps(STRATA_I8_ROWS_VNNI ? _mm256_sub_epi32(a1[r], c1) : a1[r]);
+            const __m256 d0 = _mm256_cvtepi32_ps(STRATA_I8_ROWS_U8 ? _mm256_sub_epi32(a0[r], c0) : a0[r]);
+            const __m256 d1 = _mm256_cvtepi32_ps(STRATA_I8_ROWS_U8 ? _mm256_sub_epi32(a1[r], c1) : a1[r]);
             const __m256 t0 = _mm256_mul_ps(xsv, s0), t1 = _mm256_mul_ps(xsv, s1);
             if (b == 0) {
                 f0[r] = bias != nullptr ? _mm256_fmadd_ps(t0, d0, bv0) : _mm256_mul_ps(t0, d0);
@@ -202,4 +215,5 @@ STRATA_I8_ROWS_FN void rows_x86(const uint8_t* panel, const float* wscale, const
 }
 
 #undef STRATA_I8_ROWS_VNNI
+#undef STRATA_I8_ROWS_U8
 #undef STRATA_I8_ROWS_FN

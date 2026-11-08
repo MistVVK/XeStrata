@@ -4,10 +4,13 @@
 // and the AVX2 kernels against the scalar reference bit for bit, the quantizer's two copies bit for bit, the packing
 // against a split of the same matrix and its FP32 form against its BF16 one, the answer against the number of threads
 // and the token group, how far the int8 answer is from the exact one, and their speed; with a scale per row
-// (EmbeddingGemma 2) and per 32 k values (the plain dense model).  CPU only: no model, no GPU.
+// (EmbeddingGemma 2) and per 32 k values (the plain dense model), the latter also in the seven-bit weight form the AVX2
+// kernel takes.  CPU only: no model, no GPU.
 //
 //   cpu_i8_gemm_parity                   every check below on the EmbeddingGemma 2 and Qwen3.5 shapes and on odd ones
-//   cpu_i8_gemm_parity --bench [--reps N]  GOP/s per shape, one thread and six; the Qwen3.5 shapes on each copy
+//   cpu_i8_gemm_parity --bench [--reps N]  GOP/s per shape, one thread and six; the Qwen3.5 shapes on each copy and
+//                                          weight form
+//   cpu_i8_gemm_parity --one N_IN N_OUT N_TOK  one product between SDE's region marks (instruction counts)
 //   cpu_i8_gemm_parity --numpy DIR       the independent check against a float64 reference in DIR (the record's
 //                                        `s2b/numpy/`; made by `make_numpy_int8_ref.py`).  Without DIR or without
 //                                        the files the test exits 77, a CTest skip: the bit-exact checks below
@@ -15,9 +18,9 @@
 //                                        foreign implementation catches a mistake in THAT.
 //
 // WHAT EACH CHECK PROTECTS.
-//   (1) VNNI == AVX2 == scalar, every shape, every token group - the vector kernels are the ones that run, the scalar
-//       one is the definition.  Integer sums, so they have no reason to differ; a lane put in the wrong place or
-//       a missing quad of padding gives a difference here and nowhere else.
+//   (1) AVX-512 VNNI == AVX-VNNI-INT8 == AVX-VNNI == AVX2 == scalar, every shape, every token group - the vector
+//       kernels are the ones that run, the scalar one is the definition.  Integer sums, so they have no reason to
+//       differ; a lane put in the wrong place or a missing quad of padding gives a difference here and nowhere else.
 //   (2) the two quantizers' bytes: the AVX2 lanes and the scalar loop must write the same levels, or every check
 //       below would be comparing two different inputs rather than two ways of multiplying one.
 //   (3) a band of panels == the whole matrix, and a token inside a group == the same token alone - the forward
@@ -120,8 +123,8 @@ void fill_activations(std::mt19937& rng, std::vector<float>& x) {
 }
 
 /// One shape: pack, quantize, run every kernel and both quantizers, check (1)(2)(3)(5)(8).  `block` is the scale
-/// block (0: one per row, EmbeddingGemma 2's; 32: the plain model's).
-void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
+/// block (0: one per row, EmbeddingGemma 2's; 32: the plain model's), `levels` the weight form.
+void check_shape(const Shape& sh, int n_tok, bool with_bias, int block, int levels = kI8Levels) {
     const int panels = i8_gemm_panels(sh.n_out);
     const int row_bytes = i8_gemm_act_row_bytes(sh.n_in);
     const int nb = i8_gemm_blocks(sh.n_in, block);
@@ -142,7 +145,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
     std::vector<float> wscale(i8_gemm_scale_count(sh.n_out, sh.n_in, block));
     std::vector<int32_t> wcorr(wscale.size());
     if (!i8_gemm_pack(w.data(), (size_t) sh.n_in, sh.n_in, sh.n_out, panel.data(), wscale.data(), wcorr.data(), 0,
-                      panels, block)) {
+                      panels, block, levels)) {
         fail(sh.name, "the packer refused a shape it should take");
         return;
     }
@@ -154,16 +157,16 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
         std::vector<int32_t> cs(wcorr.size());
         const int cut = panels / 2;
         i8_gemm_pack(w.data(), (size_t) sh.n_in, sh.n_in, sh.n_out, split.data(), ss.data(), cs.data(), 0, cut,
-                     block);
+                     block, levels);
         i8_gemm_pack(w.data(), (size_t) sh.n_in, sh.n_in, sh.n_out, split.data(), ss.data(), cs.data(), cut, panels,
-                     block);
+                     block, levels);
         if (split != panel || ss != wscale || cs != wcorr) fail(sh.name, "pack split over panels differs");
         // the FP32 rows give the same pack as the BF16 ones they widen to
         std::vector<float> wf(w.size());
         for (size_t i = 0; i < w.size(); ++i) wf[i] = strata::kernels::f32_from_bf16(w[i]);
         std::fill(split.begin(), split.end(), (uint8_t) 0);
         i8_gemm_pack_f32(wf.data(), (size_t) sh.n_in, sh.n_in, sh.n_out, split.data(), ss.data(), cs.data(), 0,
-                         panels, block);
+                         panels, block, levels);
         if (split != panel || ss != wscale || cs != wcorr) fail(sh.name, "the FP32 pack differs from the BF16 one");
     }
 
@@ -174,7 +177,14 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
     i8_gemm_quantize(I8GemmIsa::scalar, x.data(), (size_t) sh.n_in, n_tok, sh.n_in, xqs.data(), (size_t) row_bytes,
                      xss.data(), block);
     i8_gemm_quantize(isa, x.data(), (size_t) sh.n_in, n_tok, sh.n_in, xq.data(), (size_t) row_bytes, xs.data(), block);
-    if (xq != xqs) {
+    // the VNNI-INT8 copy's bytes are the signed levels: the scalar bytes without their +128 (the padding stays 0)
+    auto as_isa = [&](std::vector<uint8_t> b, I8GemmIsa i) {
+        if (i == I8GemmIsa::vnni_int8)
+            for (int t = 0; t < n_tok; ++t)
+                for (int k = 0; k < sh.n_in; ++k) b[(size_t) t * row_bytes + k] ^= 0x80;
+        return b;
+    };
+    if (xq != as_isa(xqs, isa)) {
         size_t first = 0;
         while (first < xq.size() && xq[first] == xqs[first]) ++first;
         char buf[128];
@@ -187,24 +197,29 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
 
     // (1) the kernels: the scalar one is the definition, every vector copy this CPU runs is held to it
     std::vector<float> ys((size_t) n_tok * sh.n_out, 0.0f);
-    i8_gemm_rows(I8GemmIsa::scalar, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(),
+    i8_gemm_rows(I8GemmIsa::scalar, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xqs.data(),
                  (size_t) row_bytes, xs.data(), ys.data(), (size_t) sh.n_out, n_tok, 0, panels,
-                 bias.empty() ? nullptr : bias.data(), block);
-    for (const I8GemmIsa vi : {I8GemmIsa::vnni, I8GemmIsa::avx2}) {
-        if (isa == I8GemmIsa::scalar || !i8_gemm_isa_ok(vi) || (isa == I8GemmIsa::avx2 && vi == I8GemmIsa::vnni))
-            continue;
+                 bias.empty() ? nullptr : bias.data(), block, levels);
+    // the copies' order of preference: a run capped at one (XESTRATA_I8_GEMM_ISA) checks it and the ones below it
+    auto rank = [](I8GemmIsa i) {
+        return i == I8GemmIsa::avx512 ? 4 : i == I8GemmIsa::vnni_int8 ? 3 : i == I8GemmIsa::vnni ? 2
+               : i == I8GemmIsa::avx2 ? 1 : 0;
+    };
+    for (const I8GemmIsa vi : {I8GemmIsa::avx512, I8GemmIsa::vnni_int8, I8GemmIsa::vnni, I8GemmIsa::avx2}) {
+        if (isa == I8GemmIsa::scalar || !i8_gemm_isa_ok(vi) || rank(vi) > rank(isa)) continue;
+        const std::vector<uint8_t> xv = as_isa(xqs, vi);   // the bytes this copy's quantizer writes
         std::vector<float> yv((size_t) n_tok * sh.n_out, 0.0f);
-        i8_gemm_rows(vi, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(), (size_t) row_bytes,
+        i8_gemm_rows(vi, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xv.data(), (size_t) row_bytes,
                      xs.data(), yv.data(), (size_t) sh.n_out, n_tok, 0, panels, bias.empty() ? nullptr : bias.data(),
-                     block);
+                     block, levels);
         if (yv != ys) {
             size_t first = 0;
             while (first < ys.size() && yv[first] == ys[first]) ++first;
             char buf[160];
             const size_t at = first < ys.size() ? first : 0;   // the print never reads past the buffer
-            std::snprintf(buf, sizeof buf, "%s != scalar at %zu (%g vs %g), n_tok %d, bias %d, block %d",
+            std::snprintf(buf, sizeof buf, "%s != scalar at %zu (%g vs %g), n_tok %d, bias %d, block %d, levels %d",
                           i8_gemm_isa_name(vi), first, (double) yv[at], (double) ys[at], n_tok, (int) with_bias,
-                          block);
+                          block, levels);
             fail(sh.name, buf);
             return;
         }
@@ -218,7 +233,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
         for (int i = 0; i < 3; ++i)
             i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(),
                          (size_t) row_bytes, xs.data(), band.data(), (size_t) sh.n_out, n_tok, lo[i], hi[i],
-                         bias.empty() ? nullptr : bias.data(), block);
+                         bias.empty() ? nullptr : bias.data(), block, levels);
         if (band != ys) fail(sh.name, "panel bands differ");
     }
 
@@ -227,7 +242,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
         std::vector<float> one((size_t) sh.n_out, 0.0f);
         i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data() + (size_t) t * row_bytes,
                      (size_t) row_bytes, xs.data() + (size_t) t * nb, one.data(), (size_t) sh.n_out, 1, 0, panels,
-                     bias.empty() ? nullptr : bias.data(), block);
+                     bias.empty() ? nullptr : bias.data(), block, levels);
         if (std::memcmp(one.data(), ys.data() + (size_t) t * sh.n_out, (size_t) sh.n_out * sizeof(float)) != 0) {
             fail(sh.name, "a token alone differs from the same token in the group");
             break;
@@ -236,11 +251,11 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
 
     // (6) a zero activation row answers the bias, not the offset
     if (n_tok >= 1) {
-        std::vector<uint8_t> z((size_t) row_bytes, 128);    // +128 is the level 0
+        std::vector<uint8_t> z((size_t) row_bytes, isa == I8GemmIsa::vnni_int8 ? 0 : 128);   // the level 0
         std::vector<float> zs((size_t) nb, 0.0f);
         std::vector<float> zy((size_t) sh.n_out, 0.0f);
         i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, z.data(), (size_t) row_bytes,
-                     zs.data(), zy.data(), (size_t) sh.n_out, 1, 0, panels, nullptr, block);
+                     zs.data(), zy.data(), (size_t) sh.n_out, 1, 0, panels, nullptr, block, levels);
         double worst = 0;
         for (int o = 0; o < sh.n_out; ++o) worst = std::max(worst, std::fabs((double) zy[o]));
         if (worst > 0.0) {
@@ -258,7 +273,8 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
         for (auto& v : b2) v = g(rb);
         std::vector<float> yb(ys.size(), 0.0f);
         i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(),
-                     (size_t) row_bytes, xs.data(), yb.data(), (size_t) sh.n_out, n_tok, 0, panels, b2.data(), block);
+                     (size_t) row_bytes, xs.data(), yb.data(), (size_t) sh.n_out, n_tok, 0, panels, b2.data(), block,
+                     levels);
         size_t bad = 0;
         for (size_t i = 0; i < ys.size(); ++i) {
             const double want = (double) ys[i] + b2[i % (size_t) sh.n_out];
@@ -299,7 +315,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias, int block) {
 }
 
 /// (7) the same matrix on 1, 2 and 6 threads, through the band split a worker would take.
-void check_threads(int block) {
+void check_threads(int block, int levels = kI8Levels) {
     const Shape sh{"threads down_proj", 2048, 512};
     const int n_tok = 37;
     const int panels = i8_gemm_panels(sh.n_out);
@@ -311,7 +327,7 @@ void check_threads(int block) {
     std::vector<float> wscale(i8_gemm_scale_count(sh.n_out, sh.n_in, block));
     std::vector<int32_t> wcorr(wscale.size());
     i8_gemm_pack(w.data(), (size_t) sh.n_in, sh.n_in, sh.n_out, panel.data(), wscale.data(), wcorr.data(), 0, panels,
-                 block);
+                 block, levels);
     std::vector<float> x((size_t) n_tok * sh.n_in);
     fill_activations(rng, x);
     std::vector<uint8_t> xq((size_t) n_tok * row_bytes);
@@ -321,7 +337,7 @@ void check_threads(int block) {
 
     std::vector<float> once((size_t) n_tok * sh.n_out, 0.0f);
     i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(), (size_t) row_bytes,
-                 xs.data(), once.data(), (size_t) sh.n_out, n_tok, 0, panels, nullptr, block);
+                 xs.data(), once.data(), (size_t) sh.n_out, n_tok, 0, panels, nullptr, block, levels);
 
     for (int nt : {1, 2, 6}) {
         std::vector<float> y((size_t) n_tok * sh.n_out, 0.0f);
@@ -333,12 +349,12 @@ void check_threads(int block) {
             th.emplace_back([&, p0, p1] {
                 i8_gemm_rows(isa, panel.data(), wscale.data(), wcorr.data(), sh.n_in, sh.n_out, xq.data(),
                              (size_t) row_bytes, xs.data(), y.data(), (size_t) sh.n_out, n_tok, p0, p1, nullptr,
-                             block);
+                             block, levels);
             });
         }
         for (auto& t : th) t.join();
         if (y != once) {
-            std::printf("  FAIL threads %d (block %d): differs from one thread\n", nt, block);
+            std::printf("  FAIL threads %d (block %d, levels %d): differs from one thread\n", nt, block, levels);
             ++g_failures;
         }
     }
@@ -446,9 +462,11 @@ struct Pack {
     std::vector<float> y;
     int row_bytes = 0;
     int block = 0;
+    int levels = kI8Levels;
 };
 
-void make(int n_in, int n_out, int n_tok, Pack& p, int block = 0) {
+void make(int n_in, int n_out, int n_tok, Pack& p, int block = 0, I8GemmIsa isa = i8_gemm_isa(),
+          int levels = kI8Levels) {
     std::mt19937 rng(4242);   // NOLINT(bugprone-random-generator-seed): a reproducible bench.
     std::vector<uint16_t> w((size_t) n_out * n_in);
     fill_weights(rng, w);
@@ -457,15 +475,16 @@ void make(int n_in, int n_out, int n_tok, Pack& p, int block = 0) {
     p.wscale.assign(i8_gemm_scale_count(n_out, n_in, block), 0.0f);
     p.wcorr.assign(p.wscale.size(), 0);
     i8_gemm_pack(w.data(), (size_t) n_in, n_in, n_out, p.panel.data(), p.wscale.data(), p.wcorr.data(), 0, panels,
-                 block);
+                 block, levels);
     std::vector<float> x((size_t) n_tok * n_in);
     fill_activations(rng, x);
     p.row_bytes = i8_gemm_act_row_bytes(n_in);
     p.xq.resize((size_t) n_tok * p.row_bytes);
     p.xs.resize((size_t) n_tok * i8_gemm_blocks(n_in, block));
-    i8_gemm_quantize(i8_gemm_isa(), x.data(), (size_t) n_in, n_tok, n_in, p.xq.data(), (size_t) p.row_bytes,
-                     p.xs.data(), block);
+    i8_gemm_quantize(isa, x.data(), (size_t) n_in, n_tok, n_in, p.xq.data(), (size_t) p.row_bytes, p.xs.data(),
+                     block);
     p.block = block;
+    p.levels = levels;
     p.y.assign((size_t) n_tok * n_out, 0.0f);
 }
 
@@ -474,7 +493,7 @@ double bench_one(int n_in, int n_out, int n_tok, int reps, Pack& p, I8GemmIsa is
     auto run = [&] {
         i8_gemm_rows(isa, p.panel.data(), p.wscale.data(), p.wcorr.data(), n_in, n_out, p.xq.data(),
                      (size_t) p.row_bytes, p.xs.data(), p.y.data(), (size_t) n_out, n_tok, 0, panels, nullptr,
-                     p.block);
+                     p.block, p.levels);
     };
     run();
     const auto t0 = std::chrono::steady_clock::now();
@@ -493,7 +512,7 @@ double bench_mt(int n_in, int n_out, int n_tok, int reps, int threads, Pack& p, 
             th.emplace_back([&, p0, p1] {
                 i8_gemm_rows(isa, p.panel.data(), p.wscale.data(), p.wcorr.data(), n_in, n_out, p.xq.data(),
                              (size_t) p.row_bytes, p.xs.data(), p.y.data(), (size_t) n_out, n_tok, p0, p1, nullptr,
-                             p.block);
+                             p.block, p.levels);
             });
         }
         for (auto& t : th) t.join();
@@ -502,6 +521,29 @@ double bench_mt(int n_in, int n_out, int n_tok, int reps, int threads, Pack& p, 
     const auto t0 = std::chrono::steady_clock::now();
     for (int r = 0; r < reps; ++r) run();
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+}
+
+// SDE's region marks (`sde64 -start_ssc_mark 111 -stop_ssc_mark 222 -mix`): only the product between them is counted
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define SSC_MARK(tag) __asm__ __volatile__("movl %0, %%ebx; .byte 0x64, 0x67, 0x90" ::"i"(tag) : "%ebx", "memory")
+#else
+#define SSC_MARK(tag)
+#endif
+
+/// One product of [n_out, n_in] over n_tok rows on the engine's own choice of copy (XESTRATA_I8_GEMM_ISA caps it), a
+/// scale per 32 k values, between SDE's marks: the dynamic instruction counts of one copy, per multiply-accumulate.
+int one(int n_in, int n_out, int n_tok) {
+    Pack p;
+    make(n_in, n_out, n_tok, p, 32, i8_gemm_isa(), i8_gemm_weight_levels(i8_gemm_isa()));
+    std::printf("cpu_i8_gemm_parity --one %d x %d x %d on %s, %d-bit weights: %.0f multiply-accumulates\n", n_in,
+                n_out, n_tok, i8_gemm_isa_name(i8_gemm_isa()), p.levels == kI8Levels7 ? 7 : 8,
+                (double) n_in * n_out * n_tok);
+    SSC_MARK(0x111);
+    i8_gemm_rows(i8_gemm_isa(), p.panel.data(), p.wscale.data(), p.wcorr.data(), n_in, n_out, p.xq.data(),
+                 (size_t) p.row_bytes, p.xs.data(), p.y.data(), (size_t) n_out, n_tok, 0, i8_gemm_panels(n_out), nullptr,
+                 p.block, p.levels);
+    SSC_MARK(0x222);
+    return 0;
 }
 
 int bench(int reps) {
@@ -532,23 +574,28 @@ int bench(int reps) {
         std::printf("  %-28s %4d x %-5d %7d %8.2f ms %8.2f ms %9.1f\n", c.name, c.n_in, c.n_out, c.n_tok, s1, m6,
                     gops(c.n_in, c.n_out, c.n_tok, m6));
     }
-    // the plain dense model's matrices, a scale per 32 k values, on each vector copy this CPU runs
+    // the plain dense model's matrices, a scale per 32 k values, on each vector copy this CPU runs (the AVX2 one in
+    // both weight forms)
     const Cell q35[] = {
         {"q35 2B ffn gate/up", 2048, 6144, 1692},
         {"q35 2B ffn down", 6144, 2048, 1692},
         {"q35 2B qkv", 2048, 6144, 64},
         {"q35 2B ffn gate/up 1 token", 2048, 6144, 1},
     };
-    for (const I8GemmIsa vi : {I8GemmIsa::vnni, I8GemmIsa::avx2}) {
+    for (const I8GemmIsa vi : {I8GemmIsa::avx512, I8GemmIsa::vnni_int8, I8GemmIsa::vnni, I8GemmIsa::avx2}) {
         if (!i8_gemm_isa_ok(vi)) continue;
-        for (const auto& c : q35) {
-            Pack p;
-            make(c.n_in, c.n_out, c.n_tok, p, 32);
-            const int r = c.n_tok > 256 ? std::max(1, reps / 10) : reps;
-            const double s1 = bench_one(c.n_in, c.n_out, c.n_tok, r, p, vi);
-            const double m6 = bench_mt(c.n_in, c.n_out, c.n_tok, std::max(1, r / 4), 6, p, vi);
-            std::printf("  %-22s %-5s %4d x %-5d %7d %8.2f ms %8.2f ms %9.1f\n", c.name, i8_gemm_isa_name(vi), c.n_in,
-                        c.n_out, c.n_tok, s1, m6, gops(c.n_in, c.n_out, c.n_tok, m6));
+        for (const int levels : {kI8Levels, kI8Levels7}) {
+            if (levels == kI8Levels7 && vi != I8GemmIsa::avx2) continue;
+            for (const auto& c : q35) {
+                Pack p;
+                make(c.n_in, c.n_out, c.n_tok, p, 32, vi, levels);
+                const int r = c.n_tok > 256 ? std::max(1, reps / 10) : reps;
+                const double s1 = bench_one(c.n_in, c.n_out, c.n_tok, r, p, vi);
+                const double m6 = bench_mt(c.n_in, c.n_out, c.n_tok, std::max(1, r / 4), 6, p, vi);
+                std::printf("  %-22s %-11s w%d %4d x %-5d %7d %8.2f ms %8.2f ms %9.1f\n", c.name,
+                            i8_gemm_isa_name(vi), levels == kI8Levels7 ? 7 : 8, c.n_in, c.n_out, c.n_tok, s1, m6,
+                            gops(c.n_in, c.n_out, c.n_tok, m6));
+            }
         }
     }
     return 0;
@@ -566,6 +613,9 @@ int main(int argc, char** argv) {
     std::printf("i8_gemm_parity: %s (avx2 %d, avxvnni %d, int8 isa %s, panels of %d, quads of %d)\n",
                 cpu_name().c_str(), (int) cpu_avx2_ok(), (int) cpu_avxvnni_ok(),
                 i8_gemm_isa_name(i8_gemm_isa()), kI8Panel, kI8Quad);
+    if (a1 == "--one" && argc >= 5)
+        return one((int) std::strtol(argv[2], nullptr, 10), (int) std::strtol(argv[3], nullptr, 10),
+                   (int) std::strtol(argv[4], nullptr, 10));
     if (a1 == "--bench") {
         int reps = 20;
         if (argc >= 4 && !std::strcmp(argv[2], "--reps")) reps = std::max(1, (int) std::strtol(argv[3], nullptr, 10));
@@ -583,8 +633,14 @@ int main(int argc, char** argv) {
         for (int n_tok : {1, 3, 4, 5, 8, 9, 13}) check_shape(sh, n_tok, false, 32);
     for (const auto& sh : kBlockShapes)
         if (sh.n_out > 64) check_shape(sh, 6, true, 32);
+    // the seven-bit weight form the AVX2 kernel packs for, on the plain model's shapes: every copy against the scalar
+    for (const auto& sh : kBlockShapes)
+        for (int n_tok : {1, 3, 4, 5, 8, 9, 13}) check_shape(sh, n_tok, false, 32, kI8Levels7);
+    for (const auto& sh : kBlockShapes)
+        if (sh.n_out > 64) check_shape(sh, 6, true, 32, kI8Levels7);
     check_threads(0);
     check_threads(32);
+    check_threads(32, kI8Levels7);
     std::printf("i8_gemm_parity: %d failures\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

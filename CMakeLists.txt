@@ -1437,7 +1437,8 @@ endif()
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp
             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/bf16_gemm.cpp src/kernels/cpu/bf16_gemm_avx2.cpp
-            src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/cpu_ops.cpp)
+            src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
+            src/kernels/cpu/cpu_ops.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1451,7 +1452,9 @@ set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/kq_avx2.
 # baseline x86-64 and its vector copies in a file of their own with the AVX2 flags.  -mavxvnni is NOT put on a file:
 # the VNNI intrinsics are used only inside functions marked target("avxvnni"), the rule below.
 set_source_files_properties(src/kernels/cpu/bf16_gemm_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+# The AVX-512 VNNI copy is compiled the same way: its functions alone are target("avx512f,avx512vnni").
+set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
+                            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
 # copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
 # compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
@@ -1478,8 +1481,26 @@ set_property(SOURCE src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp
              ${_strata_avxvnni})
 # the int8 product needs the same answer twice: the kernel file to know whether to define the VNNI copy, the
 # dispatch file to know whether the VNNI copy exists to be reached.
-set_property(SOURCE src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp APPEND PROPERTY
+set_property(SOURCE src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
+             APPEND PROPERTY
              COMPILE_DEFINITIONS ${_strata_avxvnni})
+# AVX-VNNI-INT8 (Arrow Lake, Lunar Lake and later): the int8 product's vpdpbssd copy (i8_gemm_rows.inl), in functions
+# with target("avxvnniint8") only.  A compiler without the intrinsics builds no such copy, and the others run.
+set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma")
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+__attribute__((target("avxvnniint8")))
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbssd_epi32(a, a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_AVXVNNIINT8_INTRINSICS)
+unset(CMAKE_REQUIRED_FLAGS)
+if(STRATA_HAVE_AVXVNNIINT8_INTRINSICS)
+  set_property(SOURCE src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp APPEND PROPERTY
+               COMPILE_DEFINITIONS STRATA_AVXVNNIINT8=1)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -1698,6 +1719,15 @@ if(STRATA_BUILD_TESTS)
         set_tests_properties(sde_${sde_chip}_q2_bitplane_parity PROPERTIES ENVIRONMENT "XESTRATA_Q2_BITPLANE=1")
       endif()
     endforeach()
+    # the int8 product (i8_gemm.hpp): its AVX2 copy on Haswell, the AVX-VNNI one on Alder Lake, the AVX-512 VNNI one on
+    # Ice Lake (no AVX-VNNI there)
+    if(TARGET cpu_i8_gemm_parity)
+      foreach(sde_chip hsw adl icx)
+        add_test(NAME sde_${sde_chip}_cpu_i8_gemm_parity
+                 COMMAND ${STRATA_SDE} -${sde_chip} -- $<TARGET_FILE:cpu_i8_gemm_parity>)
+        set_tests_properties(sde_${sde_chip}_cpu_i8_gemm_parity PROPERTIES TIMEOUT 3600)
+      endforeach()
+    endif()
   endif()
 endif()
 

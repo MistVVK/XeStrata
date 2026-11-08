@@ -18,7 +18,9 @@
 // THE AVX2 COPY multiplies the signed levels: the activation byte with its +128 taken off (an xor of the top bit),
 // `vpmaddubsw` on its magnitude and the weight given its sign (`vpsignb`), then `vpmaddwd` with ones to sum the
 // pairs into the int32 lanes.  Its sum is sum qa * qw, the same integer the VNNI copy reaches by subtracting the
-// row-sum correction, so the two never differ.  It costs five operations where VNNI's costs one.
+// row-sum correction, so the two never differ.  It costs five operations where VNNI's costs one.  On seven-bit
+// weights (the header's THE WEIGHT LEVELS) it takes the unsigned byte as it is - `vpmaddubsw`, `vpmaddwd`, add - and
+// subtracts the correction as VNNI does: three operations.
 //
 // THE DEQUANTIZATION IS ONE PASS PER OUTPUT AND BLOCK and the only float arithmetic in the kernel: the int32 sum to
 // FP32, times the token's and the output's scales, folded into the output's running value with `vfmadd` - the same
@@ -44,6 +46,15 @@
 #define STRATA_I8_VNNI_FN __attribute__((target("avxvnni")))
 #else
 #define STRATA_I8_VNNI_FN
+#endif
+// STRATA_AVXVNNIINT8 (CMake: the compiler has the AVX-VNNI-INT8 intrinsics); 0 builds no such copy.
+#if !defined(STRATA_AVXVNNIINT8)
+#define STRATA_AVXVNNIINT8 0
+#endif
+#if STRATA_AVXVNNIINT8 && (defined(__GNUC__) || defined(__clang__))
+#define STRATA_I8_VNNIINT8_FN __attribute__((target("avxvnniint8")))
+#else
+#define STRATA_I8_VNNIINT8_FN
 #endif
 
 namespace strata::kernels::cpu::i8_gemm_detail {
@@ -74,34 +85,50 @@ inline __m256i levels8(__m256 v, __m256 inv) {
 /// unsigned side.  Both `packs` interleave by 128-bit halves, so the lanes are put back in order - the qwords
 /// after the first pack, the two 128-bit halves after the second.  Adding 128 to an int8 wraps at 255, which is
 /// exactly the byte the header's `qu` is: -127 -> 1, 0 -> 128, +127 -> 255.
-inline __m128i pack16(__m256i a, __m256i b) {
+inline __m128i pack16(__m256i a, __m256i b, bool sign) {
     __m256i w = _mm256_packs_epi32(a, b);                 // a0..3 b0..3 a4..7 b4..7
     w = _mm256_permute4x64_epi64(w, 0xD8);               // a0..7 b0..7
     const __m256i q = _mm256_packs_epi16(w, w);          // lane 0: a twice, lane 1: b twice
     const __m128i first = _mm256_castsi256_si128(q);     // its low eight bytes are a
     const __m128i second = _mm256_extracti128_si256(q, 1);   // its low eight bytes are b
     const __m128i r = _mm_unpacklo_epi64(first, second); // a0..7 b0..7
-    return _mm_add_epi8(r, _mm_set1_epi8((char) 128));
+    return sign ? r : _mm_add_epi8(r, _mm_set1_epi8((char) 128));
 }
 
 // ---- the row kernels, twice: the AVX2 forms and the AVX-VNNI ones (i8_gemm_rows.inl)
 namespace avx2 {
 #define STRATA_I8_ROWS_VNNI 0
+#define STRATA_I8_ROWS_U8 0
 #define STRATA_I8_ROWS_FN
 #include "i8_gemm_rows.inl"
 }  // namespace avx2
+namespace avx2_w7 {
+#define STRATA_I8_ROWS_VNNI 0
+#define STRATA_I8_ROWS_U8 1
+#define STRATA_I8_ROWS_FN
+#include "i8_gemm_rows.inl"
+}  // namespace avx2_w7
 #if STRATA_AVXVNNI
 namespace vnni {
 #define STRATA_I8_ROWS_VNNI 1
+#define STRATA_I8_ROWS_U8 1
 #define STRATA_I8_ROWS_FN STRATA_I8_VNNI_FN
 #include "i8_gemm_rows.inl"
 }  // namespace vnni
+#endif
+#if STRATA_AVXVNNIINT8
+namespace vnni_int8 {
+#define STRATA_I8_ROWS_VNNI 2
+#define STRATA_I8_ROWS_U8 0
+#define STRATA_I8_ROWS_FN STRATA_I8_VNNIINT8_FN
+#include "i8_gemm_rows.inl"
+}  // namespace vnni_int8
 #endif
 
 }  // namespace
 
 void i8_gemm_quantize_avx2(const float* x, size_t ldx, int n, int n_in, uint8_t* xq, size_t ldq, float* xs,
-                           int block) {
+                           int block, bool sign) {
     const int row_bytes = i8_gemm_act_row_bytes(n_in);
     const int nb = i8_gemm_blocks(n_in, block);
     const __m256 sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32((int) 0x80000000u));
@@ -129,30 +156,39 @@ void i8_gemm_quantize_avx2(const float* x, size_t ldx, int n, int n_in, uint8_t*
             for (; k + 16 <= k1; k += 16) {
                 const __m256i a = levels8(_mm256_loadu_ps(r + k), inv8);
                 const __m256i c = levels8(_mm256_loadu_ps(r + k + 8), inv8);
-                _mm_storeu_si128(reinterpret_cast<__m128i*>(q + k), pack16(a, c));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q + k), pack16(a, c, sign));
             }
             for (; k < k1; ++k) {
                 int v = (int) std::nearbyintf(r[k] * inv);
                 if (v > kI8Levels) v = kI8Levels;
                 if (v < -kI8Levels) v = -kI8Levels;
-                q[k] = (uint8_t) (v + 128);
+                q[k] = sign ? (uint8_t) (int8_t) v : (uint8_t) (v + 128);
             }
         }
         std::memset(q + n_in, 0, (size_t) (row_bytes - n_in));   // the last quad's padding
     }
 }
 
-void i8_gemm_rows_x86(bool vnni, const uint8_t* panel, const float* wscale, const int32_t* wcorr, int n_in, int n_out,
+void i8_gemm_rows_x86(int copy, const uint8_t* panel, const float* wscale, const int32_t* wcorr, int n_in, int n_out,
                       const uint8_t* xq, size_t ldq, const float* xs, float* y, size_t ldy, int n_tok, int p0, int p1,
-                      const float* bias, int block) {
+                      const float* bias, int block, int levels) {
+#if STRATA_AVXVNNIINT8
+    if (copy == 2) {
+        vnni_int8::rows_x86(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias, block);
+        return;
+    }
+#endif
 #if STRATA_AVXVNNI
-    if (vnni) {
+    if (copy == 1) {
         vnni::rows_x86(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias, block);
         return;
     }
-#else
-    (void) vnni;
 #endif
+    (void) copy;
+    if (levels <= kI8Levels7) {
+        avx2_w7::rows_x86(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias, block);
+        return;
+    }
     avx2::rows_x86(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias, block);
 }
 

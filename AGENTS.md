@@ -270,11 +270,13 @@ This covers:
 
 - the files compiled with AVX-512 flags: `src/kernels/cpu/expert.cpp` and `src/kernels/cpu/iq_avx512.cpp` (see `CMakeLists.txt`)
 - the run-time choice between the AVX-512 and AVX-2 kernels: `cpu_avx512_ok` and its callers (`src/kernels/cpu/expert_layout.cpp`, `src/kernels/cpu/native_expert.cpp`, `src/program/generate.cpp`)
+- the int8 product's AVX-512 VNNI copy, the one AVX-512 kernel written for XeStrata (the user's decision of 2026-11-08 for this component; the CPU kernels are otherwise AVX2 and AVX2 + AVX-VNNI): `src/kernels/cpu/i8_gemm_avx512.cpp`, chosen by `cpu_avx512vnni_ok` (F and VNNI only) in `src/kernels/cpu/i8_gemm.cpp`
 
 ```sh
 sde64 -icx -- ./build/free/expert_multi_test
 sde64 -icx -- ./build/free/expert_parity --selftest   # from the repository root
 sde64 -icx -- ./build/free/pool_test --selftest       # from the repository root
+sde64 -icx -- ./build/free/cpu_i8_gemm_parity          # the int8 product's AVX-512 VNNI copy against the scalar one
 ```
 
 The same tests must also still pass or skip natively, so the AVX-2 path is checked as well.

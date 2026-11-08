@@ -130,7 +130,76 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
     __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
 #endif
 }
+
+unsigned long long xcr0_bits() {
+#if defined(_MSC_VER)
+    return _xgetbv(0);
+#else
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    return ((unsigned long long) hi << 32) | lo;
+#endif
+}
 }  // namespace
+
+bool cpu_avx512vnni_ok() {
+    static const bool ok = [] {
+        if (const char* f = strata::env_get("FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        cpuid_regs(0, 0, r);
+        if (r[0] < 7) return false;
+        cpuid_regs(1, 0, r);
+        if (!((r[2] >> 27) & 1u)) return false;             // OSXSAVE
+        if ((xcr0_bits() & 0xE6) != 0xE6) return false;      // the OS saves the SSE, AVX, opmask and ZMM state
+        cpuid_regs(7, 0, r);
+        return ((r[1] >> 16) & 1u) && ((r[2] >> 11) & 1u);  // AVX512F, AVX512_VNNI
+    }();
+    return ok;
+}
+
+bool cpu_avxvnniint8_ok() {
+    static const bool ok = [] {
+        if (const char* e = strata::env_get("NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
+        if (!cpu_avx2_ok()) return false;
+        unsigned r[4] = {0, 0, 0, 0};
+        cpuid_regs(0, 0, r);
+        if (r[0] < 7) return false;
+        cpuid_regs(7, 0, r);
+        if (r[0] < 1) return false;                         // no sub-leaf 1
+        cpuid_regs(7, 1, r);
+        return ((r[3] >> 4) & 1u) != 0;                     // AVX-VNNI-INT8
+    }();
+    return ok;
+}
+
+uint64_t cpu_l2_bytes() {
+    static const uint64_t bytes = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+        cpuid_regs(0, 0, r);
+        const unsigned max_leaf = r[0];
+        cpuid_regs(0x80000000u, 0, r);
+        const unsigned max_ext = r[0];
+        // the deterministic cache parameters: Intel's leaf 4, AMD's 0x8000001D (the same layout)
+        unsigned leaf = 0;
+        if (max_leaf >= 4) leaf = 4;
+        cpuid_regs(0, 0, r);
+        const bool amd = r[1] == 0x68747541u;   // "Auth"enticAMD
+        if (amd) leaf = max_ext >= 0x8000001Du ? 0x8000001Du : 0;
+        if (leaf == 0) return (uint64_t) 0;
+        for (unsigned sub = 0; sub < 16; ++sub) {
+            cpuid_regs(leaf, sub, r);
+            const unsigned type = r[0] & 31u, level = (r[0] >> 5) & 7u;
+            if (type == 0) break;
+            if (level == 2 && (type == 2 || type == 3)) {   // the data or unified L2
+                const uint64_t ways = ((r[1] >> 22) & 1023u) + 1, parts = ((r[1] >> 12) & 1023u) + 1;
+                const uint64_t line = (r[1] & 4095u) + 1, sets = (uint64_t) r[2] + 1;
+                return ways * parts * line * sets;
+            }
+        }
+        return (uint64_t) 0;
+    }();
+    return bytes;
+}
 
 int iq256_gather_setting() {
     static const int s = [] {

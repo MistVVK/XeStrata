@@ -29,24 +29,27 @@
 #if !defined(STRATA_AVXVNNI)
 #define STRATA_AVXVNNI 0
 #endif
+#if !defined(STRATA_AVXVNNIINT8)
+#define STRATA_AVXVNNIINT8 0
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
 
-/// The level one value lands on: round-to-nearest-even (the mode every path here runs in), clamped to +/-127.
-/// `inv` is the block's 127 / max|block|; a block of zeros keeps 0, and every level then lands on 0.
-inline int i8_level(float v, float inv) {
+/// The level one value lands on: round-to-nearest-even (the mode every path here runs in), clamped to +/-`levels`.
+/// `inv` is the block's levels / max|block|; a block of zeros keeps 0, and every level then lands on 0.
+inline int i8_level(float v, float inv, int levels = kI8Levels) {
     int q = (int) std::nearbyintf(v * inv);
-    if (q > kI8Levels) q = kI8Levels;
-    if (q < -kI8Levels) q = -kI8Levels;
+    if (q > levels) q = levels;
+    if (q < -levels) q = -levels;
     return q;
 }
 
 /// A block's FP32 scale and the reciprocal its levels are made with.  Both come from the same maximum, so the
 /// dequantization multiplies by exactly what the quantization divided by, up to the last bit of one rounding.
-inline void i8_row_scale(float amax, float& scale, float& inv) {
-    scale = amax / (float) kI8Levels;
-    inv = amax > 0.0f ? (float) kI8Levels / amax : 0.0f;
+inline void i8_row_scale(float amax, float& scale, float& inv, int levels = kI8Levels) {
+    scale = amax / (float) levels;
+    inv = amax > 0.0f ? (float) levels / amax : 0.0f;
 }
 
 /// The k range of block `b` of a row of `n_in` (block 0: the whole row).
@@ -115,8 +118,8 @@ void i8_gemm_rows_scalar(const uint8_t* panel, const float* wscale, const int32_
 
 /// One output row's levels into its panel lane `j`, and its scales and corrections, from `value(k)`.
 template <class Value>
-void pack_lane(Value value, bool real, int n_in, int quads, int nb, int block, uint8_t* dst, int j, float* ws,
-               int32_t* wc) {
+void pack_lane(Value value, bool real, int n_in, int quads, int nb, int block, int levels, uint8_t* dst, int j,
+               float* ws, int32_t* wc) {
     for (int b = 0; b < nb; ++b) {
         int k0, k1;
         block_range(n_in, block, b, k0, k1);
@@ -124,7 +127,7 @@ void pack_lane(Value value, bool real, int n_in, int quads, int nb, int block, u
         if (real)
             for (int k = k0; k < k1; ++k) amax = std::max(amax, std::fabs(value(k)));
         float scale = 0.0f, inv = 0.0f;
-        i8_row_scale(amax, scale, inv);
+        i8_row_scale(amax, scale, inv, levels);
         ws[b * kI8Panel + j] = scale;
         // the block's quads: one block is every quad, the row's padding included
         const int q0 = block <= 0 ? 0 : k0 / kI8Quad;
@@ -134,7 +137,7 @@ void pack_lane(Value value, bool real, int n_in, int quads, int nb, int block, u
             uint8_t* lane = dst + (size_t) kq * (size_t) kI8QuadBytes + (size_t) j * kI8Quad;
             for (int qi = 0; qi < kI8Quad; ++qi) {
                 const int k = kq * kI8Quad + qi;
-                const int q = (real && k < n_in) ? i8_level(value(k), inv) : 0;
+                const int q = (real && k < n_in) ? i8_level(value(k), inv, levels) : 0;
                 lane[qi] = (uint8_t) (int8_t) q;    // the signed side: two's complement bits
                 sum += q;
             }
@@ -145,8 +148,9 @@ void pack_lane(Value value, bool real, int n_in, int quads, int nb, int block, u
 }
 
 template <class Row>
-bool pack(Row row, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* wcorr, int p0, int p1, int block) {
-    if (n_in > kI8MaxIn || !i8_gemm_block_ok(block)) return false;   // see THE BOUNDS in the header
+bool pack(Row row, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* wcorr, int p0, int p1, int block,
+          int levels) {
+    if (n_in > kI8MaxIn || !i8_gemm_block_ok(block) || !i8_gemm_levels_ok(levels)) return false;   // THE BOUNDS
     const int quads = i8_gemm_quads(n_in);
     const int nb = i8_gemm_blocks(n_in, block);
     for (int p = p0; p < p1; ++p) {
@@ -157,7 +161,7 @@ bool pack(Row row, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* 
         int32_t* wc = wcorr + (size_t) p * nb * kI8Panel;
         for (int j = 0; j < kI8Panel; ++j) {
             const int o = std::min(base + j, n_out - 1);   // a pad lane reads nothing (`real` false)
-            pack_lane([&](int k) { return row(o, k); }, j < rows, n_in, quads, nb, block, dst, j, ws, wc);
+            pack_lane([&](int k) { return row(o, k); }, j < rows, n_in, quads, nb, block, levels, dst, j, ws, wc);
         }
     }
     return true;
@@ -167,7 +171,9 @@ bool pack(Row row, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* 
 
 bool i8_gemm_isa_ok(I8GemmIsa isa) noexcept {
 #if defined(STRATA_I8_GEMM_X86)
+    if (isa == I8GemmIsa::avx512) return cpu_avx2_ok() && cpu_avx512vnni_ok();
     if (isa == I8GemmIsa::vnni) return STRATA_AVXVNNI && cpu_avx2_ok() && cpu_avxvnni_ok();
+    if (isa == I8GemmIsa::vnni_int8) return STRATA_AVXVNNIINT8 && cpu_avx2_ok() && cpu_avxvnniint8_ok();
     if (isa == I8GemmIsa::avx2) return cpu_avx2_ok();
     return true;
 #else
@@ -180,6 +186,10 @@ I8GemmIsa i8_gemm_isa() {
         const char* e = strata::env_get("I8_GEMM_ISA");
         if (e != nullptr && std::strcmp(e, "scalar") == 0) return I8GemmIsa::scalar;
         const bool cap_avx2 = e != nullptr && std::strcmp(e, "avx2") == 0;
+        const bool cap_vnni = cap_avx2 || (e != nullptr && std::strcmp(e, "vnni") == 0);
+        const bool cap_int8 = cap_vnni || (e != nullptr && std::strcmp(e, "vnni_int8") == 0);
+        if (!cap_int8 && i8_gemm_isa_ok(I8GemmIsa::avx512)) return I8GemmIsa::avx512;
+        if (!cap_vnni && i8_gemm_isa_ok(I8GemmIsa::vnni_int8)) return I8GemmIsa::vnni_int8;
         if (!cap_avx2 && i8_gemm_isa_ok(I8GemmIsa::vnni)) return I8GemmIsa::vnni;
         return i8_gemm_isa_ok(I8GemmIsa::avx2) ? I8GemmIsa::avx2 : I8GemmIsa::scalar;
     }();
@@ -187,19 +197,29 @@ I8GemmIsa i8_gemm_isa() {
 }
 
 const char* i8_gemm_isa_name(I8GemmIsa isa) noexcept {
-    return isa == I8GemmIsa::vnni ? "vnni" : isa == I8GemmIsa::avx2 ? "avx2" : "scalar";
+    return isa == I8GemmIsa::avx512 ? "avx512-vnni" : isa == I8GemmIsa::vnni_int8 ? "vnni-int8"
+           : isa == I8GemmIsa::vnni ? "vnni"
+           : isa == I8GemmIsa::avx2 ? "avx2" : "scalar";
+}
+
+int i8_gemm_weight_levels(I8GemmIsa isa) {
+    static const bool eight = [] {
+        const char* e = strata::env_get("I8_GEMM_WEIGHT_BITS");
+        return e != nullptr && std::strcmp(e, "8") == 0;
+    }();
+    return isa == I8GemmIsa::avx2 && !eight ? kI8Levels7 : kI8Levels;
 }
 
 bool i8_gemm_pack(const uint16_t* w, size_t ld, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* wcorr,
-                  int p0, int p1, int block) {
+                  int p0, int p1, int block, int levels) {
     return pack([&](int o, int k) { return strata::kernels::f32_from_bf16(w[(size_t) o * ld + (size_t) k]); }, n_in,
-                n_out, panel, wscale, wcorr, p0, p1, block);
+                n_out, panel, wscale, wcorr, p0, p1, block, levels);
 }
 
 bool i8_gemm_pack_f32(const float* w, size_t ld, int n_in, int n_out, uint8_t* panel, float* wscale, int32_t* wcorr,
-                      int p0, int p1, int block) {
+                      int p0, int p1, int block, int levels) {
     return pack([&](int o, int k) { return w[(size_t) o * ld + (size_t) k]; }, n_in, n_out, panel, wscale, wcorr, p0,
-                p1, block);
+                p1, block, levels);
 }
 
 void i8_gemm_quantize(I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in, uint8_t* xq, size_t ldq,
@@ -209,7 +229,7 @@ void i8_gemm_quantize(I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in
     // Only a vector ISA takes the lane copy: the scalar kernel is the definition, and its quantizer has to be the
     // one the reference ran through or the two would differ by the quantization as well as by the sum.
     if (isa != I8GemmIsa::scalar && cpu_avx2_ok()) {
-        i8_gemm_detail::i8_gemm_quantize_avx2(x, ldx, n, n_in, xq, ldq, xs, block);
+        i8_gemm_detail::i8_gemm_quantize_avx2(x, ldx, n, n_in, xq, ldq, xs, block, isa == I8GemmIsa::vnni_int8);
         return;
     }
 #else
@@ -220,17 +240,25 @@ void i8_gemm_quantize(I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in
 
 void i8_gemm_rows(I8GemmIsa isa, const uint8_t* panel, const float* wscale, const int32_t* wcorr, int n_in,
                   int n_out, const uint8_t* xq, size_t ldq, const float* xs, float* y, size_t ldy, int n_tok,
-                  int p0, int p1, const float* bias, int block) {
+                  int p0, int p1, const float* bias, int block, int levels) {
     if (p0 >= p1 || n_tok <= 0 || n_out <= 0) return;
 #if defined(STRATA_I8_GEMM_X86)
+    if (isa == I8GemmIsa::avx512) {
+        i8_gemm_detail::i8_gemm_rows_avx512(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias,
+                                            block);
+        return;
+    }
     if (isa != I8GemmIsa::scalar) {
-        i8_gemm_detail::i8_gemm_rows_x86(isa == I8GemmIsa::vnni, panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y,
-                                         ldy, n_tok, p0, p1, bias, block);
+        const int copy = isa == I8GemmIsa::vnni ? 1 : isa == I8GemmIsa::vnni_int8 ? 2 : 0;
+        i8_gemm_detail::i8_gemm_rows_x86(copy, panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1,
+                                         bias, block, levels);
         return;
     }
 #else
     (void) isa;
 #endif
+    // the reference computes sum qu * qw - corr whatever the weights' levels: both forms are its definition
+    (void) levels;
     i8_gemm_rows_scalar(panel, wscale, wcorr, n_in, n_out, xq, ldq, xs, y, ldy, n_tok, p0, p1, bias, block);
 }
 
