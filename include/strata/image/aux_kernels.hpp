@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2024 ZhengPeng
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/image/aux_kernels.hpp - the element kernels of the image engine's auxiliary models (Florence-2's
 // DaViT and BART, BiRefNet's Swin and decoder): their products go through prefill::Gemm, their attention through
 // qi_sdpa_ex, these do the rest on the GPU.  Activations are channels-last ([pixel or token][channel]); FP32 unless a
@@ -210,9 +211,9 @@ void aux_rgb_norm(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, 
 /// -0.75, the border replicated), rounded.
 void aux_alpha_bicubic(const float* logits, int64_t h, int64_t w, int64_t W, int64_t H, uint8_t* alpha, void* stream);
 
-// BiRefNet's refine_foreground (Photoroom's blur fusion, as its image_proc.py's GPU version runs it): the foreground's
-// colors estimated from the picture and the alpha, so a cut-out laid on another background carries no fringe of the
-// old one.  Two rounds of box means (90, then 6 pixels), each a stack, the means and their combination.
+// BiRefNet's refine_foreground (Photoroom's blur fusion, as its image_proc.py's GPU version runs it; MIT): the
+// foreground's colors estimated from the picture and the alpha, so a cut-out laid on another background carries no
+// fringe of the old one.  Two rounds of box means (90, then 6 pixels), each a stack, the means and their combination.
 
 /// x [n][7] = (a, F a, B (1 - a)) of the picture rgba (RGBA8) and its alpha (a = alpha / 255), F and B the picture's
 /// colors (fb null) or fb [n][6]'s (F, then B: the first round's).

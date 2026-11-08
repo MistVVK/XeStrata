@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2024 SageAttention team
+// SPDX-FileCopyrightText: 2025 NVIDIA CORPORATION & AFFILIATES (comfy-kitchen)
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 // src/kernels/xe/flash_attn_i8.cpp - flash_attn's int8 path (flash_attn.hpp: flash_attn_i8): the attention's
 // unmasked rows with Q . K^T and P . V on the int8 matrix instructions (SageAttention's scheme), for every model that
 // takes it.
@@ -762,6 +764,8 @@ struct NvKernel {
     STRATA_NV_MINWG(HD == 128 ? NVMIN : 1)
     void operator()(sycl::nd_item<2> it) const {
 #if STRATA_NV_I8
+        // P as unsigned bytes (offset log2 255, four packed into a word by byte_perm, their row sums by dp4a) after
+        // comfy-kitchen's SageAttention kernels (Apache-2.0)
         constexpr int kMagic = 0x4b400000;      // 1.5 * 2^23's bits
         constexpr float kMagicF = 12582912.f;   // 1.5 * 2^23
         sycl::sub_group sg = it.get_sub_group();

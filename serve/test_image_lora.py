@@ -91,7 +91,7 @@ def qwen_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1), prefix: str = "tr
 def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
               prefix: str = "diffusion_model.",
               extra: dict[str, tuple[int, ...]] | None = None) -> dict[str, tuple[int, ...]]:
-    """Mage-Flow's adapter's tensors, as ai-toolkit's mageflow form and ComfyUI's saves name them
+    """Mage-Flow's adapter's tensors, as ai-toolkit's mageflow form and the dot form name them
     (transformer_blocks.N.attn.to_q and the like), at `rank` and that prefix."""
     out: dict[str, tuple[int, ...]] = {}
     for b in blocks:
@@ -171,14 +171,14 @@ class Listing(Tree):
         entries = f.listing()
         self.assertEqual([e["name"] for e in entries], ["lokr"], f.skipped)
         e = entries[0]
-        self.assertEqual(e["rank"], 16, "the rank of w2's factors where w2 is decomposed (ComfyUI's dim)")
+        self.assertEqual(e["rank"], 16, "the rank of w2's factors where w2 is decomposed (the alpha's divisor)")
         self.assertEqual(e["targets"], ["attn.to_out.0", "attn.to_q"])
         self.assertEqual(loras.field([{"name": "lokr", "scale": 0.7}], f)[0]["scale"], 0.7)
 
     def test_a_dora_is_listed_and_one_over_the_columns_is_not(self):
         b = "transformer.transformer_blocks.0.attn.to_q"
         safetensors(self.d / "dora.safetensors", qwen_lora(
-            extra={b + ".dora_scale": (256,)}))   # the weight's rows: ComfyUI's weight_decompose
+            extra={b + ".dora_scale": (256,)}))   # the weight's rows: the decomposition's output axis
         safetensors(self.d / "columns.safetensors", qwen_lora(
             extra={"transformer.transformer_blocks.0.img_mlp.out.dora_scale": (512,)}))   # the weight's columns
         f = self.folder()
@@ -195,7 +195,7 @@ class Listing(Tree):
             b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 256),
             b + "attn.to_q.alpha": (1,),
             # img_mlp.out: both sides under linear Tucker cores, their factors written the core's way (a core of one
-            # dimension, w_a [1][out], is a rank of 1; both cores come together, as ComfyUI reads them)
+            # dimension, w_a [1][out], is a rank of 1; both cores come together or not at all)
             b + "img_mlp.out.hada_w1_a.weight": (1, 256), b + "img_mlp.out.hada_w1_b.weight": (8, 512),
             b + "img_mlp.out.hada_t1": (1, 8, 1, 1),
             b + "img_mlp.out.hada_w2_a.weight": (5, 256), b + "img_mlp.out.hada_w2_b.weight": (4, 512),
@@ -222,7 +222,7 @@ class Listing(Tree):
     def test_a_glora_is_listed_with_the_rank_its_reading_gives(self):
         b = "transformer.transformer_blocks.0."
         safetensors(self.d / "glora.safetensors", {
-            # to_q (256 of 256): ComfyUI's reading, a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+            # to_q (256 of 256): the newer reading, a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
             # [rank][cols]; every tensor square-or-not, the file's alpha divided by a1's columns
             b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 256),
             b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256),
@@ -303,7 +303,7 @@ class Listing(Tree):
         safetensors(self.d / "alone.safetensors", {b + "attn.to_q.diff_b": (256,)})
         safetensors(self.d / "norm.safetensors", {   # b_norm beside the weight's w_norm: the same bias's patch
             b + "attn.to_q.w_norm": (256, 256), b + "attn.to_q.b_norm": (256,)})
-        safetensors(self.d / "loose.safetensors", {   # b_norm without w_norm: ComfyUI reads it beside w_norm only
+        safetensors(self.d / "loose.safetensors", {   # b_norm without w_norm: read beside w_norm only
             b + "attn.to_q.b_norm": (256,)})
         f = self.folder("mage-flow")
         self.assertEqual([e["name"] for e in f.listing()], ["alone", "norm", "with"], f.skipped)

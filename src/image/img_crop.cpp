@@ -17,6 +17,7 @@
 #include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace strata::image {
 
@@ -128,149 +129,101 @@ Taps taps(int64_t in, int64_t out, Filter f) {
     return t;
 }
 
-// scipy's gaussian_filter1d weights: sigma, cut at int(4 sigma + 0.5)
-std::vector<float> gauss(double sigma) {
-    const int64_t r = (int64_t) std::floor(4.0 * sigma + 0.5);
-    std::vector<double> e((size_t) (2 * r + 1));
-    double sum = 0.0;
-    for (size_t k = 0; k < e.size(); ++k) {
-        const double x = (double) k - (double) r;
-        e[k] = std::exp(-0.5 * x * x / (sigma * sigma));
-        sum += e[k];
-    }
-    std::vector<float> w(e.size());
-    for (size_t k = 0; k < e.size(); ++k) w[k] = (float) (e[k] / sum);
-    return w;
-}
+// The edit share before its growth, on the host (a flood is a walk, not a GPU's work): 1 - alpha / 255, its strokes
+// fainter than kFaint left out, then its holes filled in grey: a pixel's fill is the lowest level a 4-connected way from
+// outside the mask's box to it has to climb over (a flood from a frame around the box, lowest first), and the pixel
+// takes the higher of its share and its fill - a hole takes the level of what encloses it, so a ring painted at 0.97
+// redraws its middle at 0.97, and a binary mask stays binary.  The fill stays inside the mask's box, so the server's
+// box (serve/images.py, crop_reach) need not count it.
+constexpr float kFaint = 0.05f;
 
-// scipy's "reflect" edge: d c b a | a b c d | d c b a
-inline int64_t reflect(int64_t i, int64_t n) {
-    for (;;) {
-        if (i < 0) i = -i - 1;
-        else if (i >= n) i = 2 * n - i - 1;
-        else return i;
-    }
-}
-
-// The mask before its growth, on the host (a flood is a walk, not a GPU's work): the edit share (1 - alpha / 255), its
-// values below a tenth out, then closed and its holes filled in grey.  The closing is the 3 x 3 square's (dilated with
-// the picture's outside as full, then eroded within the picture); a pixel's fill is the lowest level a 4-connected way
-// from outside the mask's box to it has to climb over the closed values (a flood from the box's frame, lowest first),
-// and the pixel takes the higher of its share and its fill: a hole or a gap the closing shuts takes the level of what
-// encloses it, so a ring painted at 0.97 redraws its middle at 0.97.  A binary mask comes out binary.  The closing and
-// the fill change nothing more than 2 pixels past the mask's box, so they run in that box: the server's box
-// (serve/images.py, crop_reach) counts the 2 pixels.
-std::vector<float> filled_share(const QiRef& mask) {
+std::vector<float> edit_share(const QiRef& mask) {
     const int64_t W = mask.width, H = mask.height;
     std::vector<float> m((size_t) (W * H));
-    int64_t x0 = W, y0 = H, x1 = -1, y1 = -1;
-    for (int64_t y = 0; y < H; ++y)
-        for (int64_t x = 0; x < W; ++x) {
-            float v = 1.0f - (float) mask.rgba[(size_t) ((y * W + x) * 4 + 3)] / 255.0f;
-            if (v < 0.1f) v = 0.0f;
-            m[(size_t) (y * W + x)] = v;
-            if (v > 0.0f) {
-                x0 = std::min(x0, x), x1 = std::max(x1, x);
-                y0 = std::min(y0, y), y1 = std::max(y1, y);
-            }
+    int64_t x0 = W, y0 = H, x1 = -1, y1 = -1;   // the mask's box
+    for (int64_t i = 0; i < W * H; ++i) {
+        const float v = 1.0f - (float) mask.rgba[(size_t) (i * 4 + 3)] / 255.0f;
+        m[(size_t) i] = v < kFaint ? 0.0f : v;
+        if (v >= kFaint) {
+            x0 = std::min(x0, i % W), x1 = std::max(x1, i % W);
+            y0 = std::min(y0, i / W), y1 = std::max(y1, i / W);
         }
-    if (x1 < 0) return m;
-    // the box R (the mask's, 2 pixels wider) and A (1 more), within the picture
-    const int64_t rx0 = std::max<int64_t>(0, x0 - 2), ry0 = std::max<int64_t>(0, y0 - 2);
-    const int64_t rx1 = std::min(W, x1 + 3), ry1 = std::min(H, y1 + 3), rw = rx1 - rx0, rh = ry1 - ry0;
-    const int64_t ax0 = std::max<int64_t>(0, rx0 - 1), ay0 = std::max<int64_t>(0, ry0 - 1);
-    const int64_t ax1 = std::min(W, rx1 + 1), ay1 = std::min(H, ry1 + 1), aw = ax1 - ax0;
-    const auto at = [&](int64_t x, int64_t y) -> float {   // the share the closing sees: full outside the picture
-        if (x < 0 || y < 0 || x >= W || y >= H) return 1.0f;
-        return x >= rx0 && x < rx1 && y >= ry0 && y < ry1 ? m[(size_t) (y * W + x)] : 0.0f;
+    }
+    if (x1 - x0 < 2 || y1 - y0 < 2) return m;   // no room for a hole
+    // the box on a frame of one cell a side, the frame's cells the flood's sources at level 0
+    const int64_t gw = x1 - x0 + 3, gh = y1 - y0 + 3;
+    std::vector<float> level((size_t) (gw * gh), 2.0f);
+    const auto share = [&](int64_t i) {
+        const int64_t x = i % gw + x0 - 1, y = i / gw + y0 - 1;
+        return x >= x0 && x <= x1 && y >= y0 && y <= y1 ? m[(size_t) (y * W + x)] : 0.0f;
     };
-    std::vector<float> grown((size_t) (aw * (ay1 - ay0)));
-    for (int64_t y = ay0; y < ay1; ++y)
-        for (int64_t x = ax0; x < ax1; ++x) {
-            float v = 0.0f;
-            for (int64_t dy = -1; dy <= 1; ++dy)
-                for (int64_t dx = -1; dx <= 1; ++dx) v = std::max(v, at(x + dx, y + dy));
-            grown[(size_t) ((y - ay0) * aw + x - ax0)] = v;
-        }
-    // the closed box on a frame (rw + 2) x (rh + 2) whose cells are the flood's sources, at 0
-    const int64_t gw = rw + 2, gh = rh + 2;
-    std::vector<float> closed((size_t) (gw * gh), 0.0f), level((size_t) (gw * gh), 2.0f);
-    for (int64_t y = 0; y < rh; ++y)
-        for (int64_t x = 0; x < rw; ++x) {
-            float v = 1.0f;
-            for (int64_t dy = -1; dy <= 1; ++dy)
-                for (int64_t dx = -1; dx <= 1; ++dx) {
-                    const int64_t nx = x + rx0 + dx, ny = y + ry0 + dy;
-                    if (nx >= 0 && ny >= 0 && nx < W && ny < H) v = std::min(v, grown[(size_t) ((ny - ay0) * aw + nx - ax0)]);
-                }
-            closed[(size_t) ((y + 1) * gw + x + 1)] = v;
-        }
     using Step = std::pair<float, int64_t>;   // a cell's level so far, the cell
     std::priority_queue<Step, std::vector<Step>, std::greater<Step>> open;
-    for (int64_t i = 0; i < gw * gh; ++i) {
-        const int64_t x = i % gw, y = i / gw;
-        if (x == 0 || y == 0 || x == gw - 1 || y == gh - 1) {
+    for (int64_t i = 0; i < gw * gh; ++i)
+        if (i % gw == 0 || i / gw == 0 || i % gw == gw - 1 || i / gw == gh - 1) {
             level[(size_t) i] = 0.0f;
             open.emplace(0.0f, i);
         }
-    }
     while (!open.empty()) {
         const auto [lv, i] = open.top();
         open.pop();
         if (lv > level[(size_t) i]) continue;   // reached lower already
         const int64_t x = i % gw, y = i / gw;
-        const int64_t next[4] = {x > 0 ? i - 1 : -1, x + 1 < gw ? i + 1 : -1, y > 0 ? i - gw : -1, y + 1 < gh ? i + gw : -1};
+        const int64_t next[4] = {x > 0 ? i - 1 : -1, x + 1 < gw ? i + 1 : -1, y > 0 ? i - gw : -1,
+                                 y + 1 < gh ? i + gw : -1};
         for (const int64_t j : next) {
             if (j < 0) continue;
-            const float up = std::max(lv, closed[(size_t) j]);
+            const float up = std::max(lv, share(j));
             if (up < level[(size_t) j]) {
                 level[(size_t) j] = up;
                 open.emplace(up, j);
             }
         }
     }
-    for (int64_t y = 0; y < rh; ++y)
-        for (int64_t x = 0; x < rw; ++x) {
-            float& v = m[(size_t) ((y + ry0) * W + x + rx0)];
-            v = std::max(v, level[(size_t) ((y + 1) * gw + x + 1)]);
+    for (int64_t y = y0; y <= y1; ++y)
+        for (int64_t x = x0; x <= x1; ++x) {
+            float& v = m[(size_t) (y * W + x)];
+            v = std::max(v, level[(size_t) ((y - y0 + 1) * gw + x - x0 + 1)]);
         }
     return m;
 }
 
-// scipy's grey_dilation by a square window of k (reflected edges: the window clipped to the picture), rows then
-// columns; the window's offsets are [-(k - 1 - k / 2), k / 2], scipy's footprint mirrored
-void dilate(float* m, float* tmp, int64_t W, int64_t H, int64_t k) {
-    const int64_t left = k - 1 - k / 2, right = k / 2;
+// The mask grown by a disc of radius `r` (each pixel the largest value within r of it, the picture's own pixels only)
+void grow_disc(float* m, float* tmp, int64_t W, int64_t H, int64_t r) {
     done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
         const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
-        const int64_t a = sycl::max(x - left, (int64_t) 0), b = sycl::min(x + right, W - 1);
         float v = 0.0f;
-        for (int64_t j = a; j <= b; ++j) v = sycl::fmax(v, m[y * W + j]);
+        for (int64_t dy = -r; dy <= r; ++dy) {
+            const int64_t yy = y + dy;
+            if (yy < 0 || yy >= H) continue;
+            // the disc's half width on this row
+            const int64_t span = (int64_t) sycl::floor(sycl::sqrt((float) (r * r - dy * dy)));
+            for (int64_t xx = sycl::max(x - span, (int64_t) 0); xx <= sycl::min(x + span, W - 1); ++xx)
+                v = sycl::fmax(v, m[yy * W + xx]);
+        }
         tmp[y * W + x] = v;
-    }), "crop: dilate rows");
-    done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
-        const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
-        const int64_t a = sycl::max(y - left, (int64_t) 0), b = sycl::min(y + right, H - 1);
-        float v = 0.0f;
-        for (int64_t j = a; j <= b; ++j) v = sycl::fmax(v, tmp[j * W + x]);
-        m[y * W + x] = sycl::fmin(v, 1.0f);
-    }), "crop: dilate columns");
+    }), "crop: grow");
+    done(queue().memcpy(m, tmp, (size_t) (W * H) * sizeof(float)), "crop: grow");
 }
 
-// scipy's gaussian_filter (reflected edges), along the rows' axis first, then clipped to [0, 1]
-void blur(float* m, float* tmp, int64_t W, int64_t H, const float* w, int r) {
-    done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
-        const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
-        float v = 0.0f;
-        for (int i = -r; i <= r; ++i) v += w[i + r] * m[reflect(y + i, H) * W + x];
-        tmp[y * W + x] = v;
-    }), "crop: blur columns");
-    done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
-        const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
-        float v = 0.0f;
-        for (int i = -r; i <= r; ++i) v += w[i + r] * tmp[y * W + reflect(x + i, W)];
-        m[y * W + x] = sycl::clamp(v, 0.0f, 1.0f);
-    }), "crop: blur rows");
+// The mask softened by three passes of a box mean of 2 r + 1 pixels each way (nearly a Gaussian of sigma about r; its
+// reach 3 r), the picture's edge pixels repeated past it, then kept within [0, 1]
+void soften(float* m, float* tmp, int64_t W, int64_t H, int64_t r) {
+    const float inv = 1.0f / (float) (2 * r + 1);
+    for (int pass = 0; pass < 3; ++pass) {
+        done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
+            const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+            float v = 0.0f;
+            for (int64_t d = -r; d <= r; ++d) v += m[y * W + sycl::clamp(x + d, (int64_t) 0, W - 1)];
+            tmp[y * W + x] = v * inv;
+        }), "crop: soften rows");
+        done(queue().parallel_for(sycl::range<2>((size_t) H, (size_t) W), [=](sycl::id<2> id) {
+            const int64_t y = (int64_t) id[0], x = (int64_t) id[1];
+            float v = 0.0f;
+            for (int64_t d = -r; d <= r; ++d) v += tmp[sycl::clamp(y + d, (int64_t) 0, H - 1) * W + x];
+            m[y * W + x] = sycl::clamp(v * inv, 0.0f, 1.0f);
+        }), "crop: soften columns");
+    }
 }
 
 // the rows' pass of a resize: an RGBA8 picture of W x H seen through a box (x0, y0, its rows bh; its parts past the
@@ -491,26 +444,19 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     gh_ = gh;
     Buffers b;
     const uint8_t* pic = rgba8_device(b, base.rgba);
-    float* m = b.put(filled_share(mask));
+    float* m = b.put(edit_share(mask));
     float* tmp = b.get<float>((size_t) (W * H));
-    // the mask grown and blurred over the picture: a window of 3/8 of the blend width and a pixel (rounded up), then a
-    // Gaussian of an eighth of it
-    const double sigma = (double) box.blend / 8.0;
-    std::vector<float> gw8;
-    float* gwd = nullptr;
-    int r = 0;
+    // the mask grown by an eighth of the blend width, then softened by three box means of an eighth each (crop_reach's
+    // sizes: the mask reaches half the blend width past the paint, no further than a square window and a Gaussian of
+    // the same blend width would)
     if (box.blend > 0) {
-        dilate(m, tmp, W, H, (int64_t) std::ceil((double) box.blend * 0.375 + 1.0));
-        gw8 = gauss(sigma);
-        r = (int) (gw8.size() / 2);
-        gwd = b.put(gw8);
-        blur(m, tmp, W, H, gwd, r);
+        grow_disc(m, tmp, W, H, box.blend / 8);
+        soften(m, tmp, W, H, box.blend / 8);
     }
     if (scaled != nullptr &&
         (scaled->width != gw || scaled->height != gh || scaled->rgba.size() != (size_t) (gw * gh * 4)))
         throw std::invalid_argument("image engine: CROP: the upscaled cut is not the drawing's size");
-    // the box at the drawing's size: the picture (Lanczos, or the upscaler's `scaled`) and the mask (bilinear), the
-    // mask blurred again there
+    // the box at the drawing's size: the picture (Lanczos, or the upscaler's `scaled`) and the mask (bilinear)
     const int64_t n = gw * gh;
     float* planes = b.get<float>((size_t) (4 * n));
     if (scaled != nullptr) {
@@ -534,7 +480,6 @@ void CropStitch::prepare(const QiRef& base, const QiRef& mask, const CropBox& bo
     }
     share_.resize((size_t) n);
     gpu::copy(share_.data(), mt, (size_t) n * sizeof(float));
-    if (box.blend > 0) blur(mt, b.get<float>((size_t) n), gw, gh, gwd, r);
     // the drawing's base image and its mask (the model redraws where the blend mask is above 0)
     uint8_t* out = b.get<uint8_t>((size_t) (4 * n));
     uint8_t* reg = b.get<uint8_t>((size_t) (4 * n));

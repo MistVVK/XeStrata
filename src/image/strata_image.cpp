@@ -29,7 +29,7 @@
 // --shift (5) its schedule's, --uncond-skip the blocks the negative pass skips (22; none), skip-layer guidance with
 // --slg-layers and --slg-scale, both active from --slg-start to --slg-stop (shares of the steps, 0 and 1), and --te /
 // --neg-te the chat engine's states (its ENCODE files) in place of encoding the ids.
-// Anima's DiT is a safetensors file with its LLM adapter (anima_dit.hpp), with Wan 2.1's VAE (--vae, ComfyUI's
+// Anima's DiT is a safetensors file with its LLM adapter (anima_dit.hpp), with Wan 2.1's VAE (--vae, Comfy-Org's
 // qwen_image_vae.safetensors) and Qwen3-0.6B-Base's GGUF (--text): its prompt's Qwen3 ids as --ids (no chat form),
 // the T5 tokenizer's ids and their weights (--t5, --t5-weights: the LLM adapter's queries, the prompt's emphasis),
 // guidance with --neg-ids, --neg-t5, --neg-t5-weights and --cfg, --steps and --shift (30, 3) its schedule's, and
@@ -45,7 +45,7 @@
 // 1, the default, starts from noise); --mask, a mask over the base image (the --init image, else the first --ref;
 // OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the base has it); see
 // img_start.hpp.
-// Adapters (LoRA files, image_lora.hpp: the forms ComfyUI's core reads, the plain LoRA's now) are applied at run time,
+// Adapters (LoRA files, image_lora.hpp: the forms it reads, the plain LoRA's now) are applied at run time,
 // a strength each: the IMG line's LORA:<strength>:<path>, repeated, in the order given.  Their A and B stay on the GPU
 // with the DiT's weights (the budget's fixed part; the IMAGE line says how many, lora_n, and their MiB, lora_mib), and
 // a set that differs from the last request's starts the context again (the prefix's K and V were the other set's).  A
@@ -345,14 +345,14 @@ std::string decoded_path(const std::string& s) {
     return out;
 }
 
-// EDITFMT:<moss|aitk|aitk-nokv|index>: MOSS-Image's edit adapter's layout (QiRefLayout)
+// EDITFMT:<moss|aitk|aitk-nokv|appended>: MOSS-Image's edit adapter's layout (QiRefLayout)
 si::QiRefLayout ref_layout(const std::string& word) {
     const std::string f = word.substr(8);
-    if (f == "moss") return si::QiRefLayout::TextStart;
-    if (f == "aitk") return si::QiRefLayout::Isolated;
-    if (f == "aitk-nokv") return si::QiRefLayout::TimestepZero;
-    if (f == "index") return si::QiRefLayout::Index;
-    throw std::invalid_argument("EDITFMT:<moss|aitk|aitk-nokv|index>: " + word);
+    if (f == "moss") return si::QiRefLayout::MossEdit;
+    if (f == "aitk") return si::QiRefLayout::AitkKv;
+    if (f == "aitk-nokv") return si::QiRefLayout::AitkNoKv;
+    if (f == "appended") return si::QiRefLayout::Appended;
+    throw std::invalid_argument("EDITFMT:<moss|aitk|aitk-nokv|appended>: " + word);
 }
 
 void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
@@ -1862,7 +1862,7 @@ int serve(si::ImagePipeline& p) {
                 if (moss != nullptr) {
                     moss->set_states_given(false);
                     moss->set_pictures_given({});
-                    moss->set_ref_layout(si::QiRefLayout::TextStart);
+                    moss->set_ref_layout(si::QiRefLayout::MossEdit);
                 }
                 if (!lr.upscaler.empty()) {   // the upscaler runs before the drawing, the image model's cache given back
                     su::UpscaleModel& m = ups.get(lr.upscaler);

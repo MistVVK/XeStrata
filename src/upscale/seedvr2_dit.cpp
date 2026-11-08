@@ -245,7 +245,7 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             throw std::runtime_error("image engine (SeedVR2 DiT): an unexpected shape");
         kin_ = (vin.shape[1] + 7) / 8 * 8;
         q8_ = f.get("blocks.0.attn.proj_qkv.vid.weight").dtype == "I8";
-        if (q8_) {   // ComfyUI's int8_convrot, its groups of 256 (the rotation RowsI8Of's kRegular makes)
+        if (q8_) {   // Comfy-Org's int8_convrot weights, their groups of 256 (the rotation RowsI8Of's kRegular makes)
             const image::SafeTensor& cq = f.get("blocks.0.attn.proj_qkv.vid.comfy_quant");
             const std::string meta(reinterpret_cast<const char*>(f.raw(cq)), (size_t) cq.elements());
             if (meta.find("int8_tensorwise") == std::string::npos || meta.find("\"convrot\": true") == std::string::npos ||

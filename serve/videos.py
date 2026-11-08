@@ -360,7 +360,7 @@ def segment_request(fields: dict, info: dict, sync: bool) -> dict:
             if box else []
         clicks.append({"frame": frame, "object": obj, "points": corners + pts})
     if not words and not clicks:
-        raise VideoRequestError("Provide a text 'prompt' (or clicks).")
+        raise VideoRequestError("prompt: the words to look for, or clicks on a frame (points or boxes)")
     outputs = _json_field(fields, "outputs") or []
     if isinstance(outputs, str):
         outputs = [outputs]

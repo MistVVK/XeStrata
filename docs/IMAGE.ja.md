@@ -54,11 +54,11 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 - **HunyuanImage 3.0**: 編集は参照画像を 3 枚まで受けます（モデル自身の読み方で、参照画像を VAE の潜在と SigLIP2 の特徴の両方にしてプロンプトの前に置きます）。透明な背景はありません。大きさは、モデルの決めた 37 の大きさ（バケット）のうち、頼んだ大きさに縦横比がいちばん近いもので作ります（512x512 は 1024x1024 になります）。大きさを `auto` にするか付けないと、モデル自身がプロンプト（編集では参照画像も）から縦横比を選びます（Tencent の実装の `image_size="auto"` と同じ）。選ぶのに B70 で 4〜13 秒かかります。
   重みは Tencent の量子化した 2 つ（w4a8 と int8）から選びます。Tencent の既定の動かし方（描く前にモデルが推論とプロンプトの書き直しをする）ではなく、プロンプトからすぐ描きます。
 - **Anima**: プロンプトは Danbooru のタグ（`1girl, solo, silver hair, ...`）と文のどちらでも書けます。Web のページのプロンプトの欄には、初めから品質のタグ（`masterpiece, best quality, score_7, safe`。Aesthetic にはありません）が入っています。サーバーはプロンプトに何も足しません。
-  `(語:強さ)` の強調は ComfyUI と同じに読みます。サンプラーは既定が er_sde で、Euler も選べます。
+  `(語:強さ)` の強調を読みます。`(語)` は周りの 1.1 倍（入れ子は掛け合わせ）、`(語:2)` は 2 倍で、`\(` `\)` はただの括弧です。サンプラーは既定が er_sde で、Euler も選べます。
   VAE は Wan 2.1 の VAE（Anima のリポジトリにあるもの）です。文の読み手の非検閲版はありません。
-- **Anima の派生モデル**: Anima を微調整したモデルの safetensors（ComfyUI の 1 つのファイルの形でも、接頭辞のない形でも）をデータのフォルダーの `models/anima` に置くと、setup がヘッダーを読んで Anima の派生モデルと見分け、Anima のモデルを入れるときに `anima:<拡張子を除いたファイル名>` の画像のモデルとして一緒に設定します。VAE と文の読み手は公式のものを共有します。
+- **Anima の派生モデル**: Anima を微調整したモデルの safetensors（`model.diffusion_model.` の接頭辞の付いた 1 つのファイルでも、接頭辞のない形でも）をデータのフォルダーの `models/anima` に置くと、setup がヘッダーを読んで Anima の派生モデルと見分け、Anima のモデルを入れるときに `anima:<拡張子を除いたファイル名>` の画像のモデルとして一緒に設定します。VAE と文の読み手は公式のものを共有します。
   `--images anima:<名前>` で名指すこともできます。Anima の形でないファイル（LoRA など）は、理由を示して使いません。
-- **マスクと strength**: どのモデルも、マスク（描き直す部分）と strength（元の画像からどれだけ変えるか）を受けます。どちらもモデル自身の機能ではなく、生成の途中で潜在を元の画像のものに戻す、モデルによらないやり方です（diffusers と ComfyUI と同じ）。
+- **マスクと strength**: どのモデルも、マスク（描き直す部分）と strength（元の画像からどれだけ変えるか）を受けます。どちらもモデル自身の機能ではなく、生成の途中で潜在を元の画像のものに戻す、モデルによらないやり方です（diffusers と同じ）。
   編集のあるモデルでは、1 枚目の参照画像が元の画像になります。編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）は、1 枚の画像から始める img2img になります。
 
 ## 入れ方
@@ -71,7 +71,7 @@ xestrata --setup --images qwen-image-turbo     # ソースから入れたとき�
   どのファイルもリビジョンを固定し、SHA-256 で確かめます。
 - HunyuanImage 3.0 が落とすのは、画像のモデル（Tencent の量子化）、VAE、モデル自身の `tokenizer.json`、システム文の入った `system_prompt.py`、編集の参照画像を読む SigLIP2 の入った bf16 の最後のシャード（3.3 GB。エンジンが読むのはその中の 0.9 GB です）の 5 つです。ほかに、モデルが大きさを選ぶのに使う重み（最後の正規化と、縦横比の 37 のトークンの出力の行）を、bf16 のシャードから範囲を指定して取り出し、`ratio_head.safetensors`（311 KB）にします。
   setup は `system_prompt.py` からシステム文を読んで `en_unified.txt` として同じフォルダーに書きます（ファイルは実行しません）。文の読み手はありません。
-  重みを Tencent が配るのは bf16 だけなので、XeStrata は Tencent の量子化したファイル（ComfyUI 向けの単一ファイル）を、それが公開されている場所から固定して落とします。
+  重みを Tencent が配るのは bf16 だけなので、XeStrata は Tencent の量子化したファイル（単一ファイル）を、それが公開されている場所から固定して落とします。
 - setup を対話で動かすと、画像を作るモデルも聞きます（番号をカンマで区切って選び、2 つ以上なら既定のモデル、非検閲の文の読み手を使うかを続けて聞きます）。初めて入れるモデルでは、既定の答えは Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つで（ダウンロードは合わせて約 60 GB、先頭の Mage-Flow-Turbo が既定のモデル）、そのモデルの setup をやり直すときは、今の設定が既定の答えです。
 - `--images` を付けたときと `--yes` のときは聞きません。`--yes` で付けずに setup をやり直しても、前の画像の設定はそのまま残ります。
 - Windows のランチャー（`xestrata.exe`）では、モデルを入れる画面で画像のモデル（大きさが選べるものは大きさも）を選べ（setup と同じ 3 つに初めから印が付いています）、入っているモデルの「Images ...」から画像のモデルだけを選び直せます（なしにすると外します）。
@@ -106,7 +106,7 @@ HunyuanImage 3.0 は Tencent の 2 つの量子化から選べます（`--image-
 | w4a8（既定） | 52.8 GB | 52 GB | 12 GB から（編集は約 20 GB から） |
 | int8 | 87.7 GB | 87 GB | 約 14 GB から（編集は約 22 GB から） |
 
-w4a8 は 4 ビットの重みと 8 ビットの活性（Tencent が ComfyUI 向けに配った量子化）で、1 ステップが int8 の約 2.5 分の 1 の時間です。int8（convrot の int8）のほうが bf16 の重みに近い画像になります。
+w4a8 は 4 ビットの重みと 8 ビットの活性（Tencent が配った量子化）で、1 ステップが int8 の約 2.5 分の 1 の時間です。int8（convrot の int8）のほうが bf16 の重みに近い画像になります。
 常に VRAM に置く重み（約 6.7 GB。編集では、最初の参照画像を読むときに SigLIP2 と VAE のエンコーダの 1.6 GB も置きます）と、流し込むエキスパートの入れ物 2 つ（w4a8 で 2.7 GB、int8 で 4.8 GB）が入らない GPU では動きません。VRAM が多いほどエキスパートを常駐させられ、速くなります。VAE は 1024x1024 で約 7.5 GB の作業領域を使い、入らないときは参照の実装と同じやり方でタイルに分けてデコードします（遅くなり、全体でデコードした絵とわずかに違います）。編集では、参照画像を読む間に VAE のエンコーダが作業領域を使い（1024x1024 の参照画像で約 7.5 GB、読み終えると返します）、こちらはタイルに分けないので、入らない編集は断ります。
 
 - **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手（MageTrail にはありません）の合計です（HunyuanImage 3.0 は文の読み手の代わりに tokenizer とシステム文、編集のための SigLIP2 のシャード）。
@@ -131,7 +131,7 @@ setup のオプションです（`xestrata --setup` に付けます）。
 | `--image-gpu-policy auto\|keep\|shrink\|unload` | `auto` | 画像を作るときの文章のモデルの扱い（[下](#gpu-のメモリの分け合い)）。`--images` と一緒に指定します |
 | `--image-gpu auto\|same\|<PCI>` | `auto` | 画像を作る GPU。`auto` は文章のモデルが使っていない、CPU 内蔵でない GPU のうち VRAM の最も大きいもの（なければ、文章のモデルが 2 枚を使うときはその 2 枚目、それ以外は文章のモデルと同じ GPU）、`same` は文章のモデルと同じ GPU、PCI のアドレス（`--check` に出るもの）はその GPU。`--images` と一緒に指定します |
 
-Mage-Flow の 8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は、重みと活性の両方を int8 にして掛けます（ComfyUI の int8_convrot と同じ形）。ほかの GPU では Q8_0 です。
+Mage-Flow の 8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は、重みと活性の両方を int8 にして掛けます（int8_convrot の形）。ほかの GPU では Q8_0 です。
 Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じく int8 で掛けます。
 
 設定のファイル（`xestrata-<モデル>.json`）の `"images"` には、手で書ける項目もあります。
@@ -150,7 +150,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
 | `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6` か `edit_adapters` に足した名前、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
 | `image_tools` | すべて | チャットのモデルが使ってよい画像の道具の一覧（`generate_image`・`edit_image`）。ここにない道具は、チャットにも Images API にも出しません |
-| `crop_stitch` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
+| `crop_edit` | `true` | マスク付きの編集で、塗った部分の周りを切り出して拡大して描き直し、貼り戻す（下の「画像を直す」のマスク）。`false` で今までどおり出力の大きさのまま描き直す |
 | `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。どのモデルも 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
 
 HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guidance`（2.5）・`resolutions`（大きさのバケットのパラメータ）・`vision`（SigLIP2 の入ったシャード）・`ratio_head`（大きさを選ぶ重み。ないと `auto` は 1024x1024 になります）が入り、`max_refs` の既定は 3 です。
@@ -317,18 +317,18 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
   MOSS-Image は、参照画像を 1 枚ずつ縦横比を保った約 1024x1024 ピクセルにして VAE で読み、最初に 1 度だけ DiT に通して、各ステップで描く画像がそれを見ます（chinoll の Moss-Image-Edit の形。文の読み手は画像を見ません）。参照画像 1 枚で約 2 GB の VRAM を使います。
 - **マスク**: `mask` に、1 枚目の画像と同じ大きさのアルファ付きの PNG を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します。どのモデルでも使えます。
   `size` を付けないか、`auto` か 1 枚目の画像と同じ大きさのときは、塗った部分の周りを切り出し、モデルの得意な約 1024x1024 ピクセルに拡大して描き直し、縮めて元の画像に貼り戻します。顔のような小さな部分も細かく描け、出力は 1 枚目の画像と同じ大きさです。
-   - 貼り戻しの縁はぼかすので、塗った部分のすぐ外（数十ピクセル）も少し変わります。それより外の画素は 1 枚目の画像とまったく同じです。
-   - 切り出す範囲は、塗った部分の 1.2 倍です。参照画像が 2 枚以上のとき（「画像 2 の顔に差し替える」など）は、周りがよく分かるよう 1.6 倍です。
+   - 貼り戻しの縁はなだらかにするので、塗った部分のすぐ外（数十ピクセル）も少し変わります。それより外の画素は 1 枚目の画像とまったく同じです。
+   - 切り出す範囲は、塗った部分の周りに、その大きさの 8 分の 1 ずつを足した範囲です。参照画像が 2 枚以上のとき（「画像 2 の顔に差し替える」など）は、周りがよく分かるよう 0.3 ずつです。
    - 塗った部分が大きく、切り出しても拡大にならないときは、画像全体を約 1024x1024 ピクセルで描き直し、元の大きさに戻して貼り戻します。
    - 何も塗っていないマスクは、1 枚目の画像をそのまま返します。
    - `color_match` に `auto` を付けると、描いた部分を貼り戻す前に、塗った部分のすぐ外（元のまま残る所）で元の画像と描いた画像の色（Lab の平均と標準偏差）をそろえ、モデルの色のずれだけを直します。塗った部分の中で頼んだ色の変更は打ち消しません。`full` は、切り出した全体の色（Lab の平均と標準偏差）を元の画像に寄せます（頼んだ色の変更も薄まります）。既定は `off`（設定の `images` の `color_match` で変えられます）で、試したモデル（Qwen-Image-2.1-Turbo、MOSS-Image）では描いた後の色のずれが小さかったためです。
    - MOSS-Image の編集の LoRA は、既定が chinoll の版です（顔の差し替えで、頼んでいない服を変えず、30 ステップで済みます）。設定のファイルの `"images"`（か `image_models` の MOSS-Image の欄）の `edit_adapter` を `armv5` か `armv6` にするか、環境変数 `XESTRATA_MOSS_EDIT=armv5` などで替わります。armV6 は armV5 から説明文と損失の重みを変えて学習を続けた版です。どちらも ai-toolkit で学習した形で、文の読み手にも参照画像を見せ（各画像を 384×384 以下に縮め、プロンプトの前に「Picture N:」と置きます）、既定は 50 ステップ・CFG 3 です。
-   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（thearkorbit の moss-image-edit-lora-poc）は `index` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
+   - 自分の編集の LoRA は、同じ欄の `edit_adapters` に `"名前": {"lora": "<ファイル>", "format": "<形>", "vision": "<mmproj>"}` を足し、`edit_adapter` をその名前にして使います。`format` は学習の形に合わせます。chinoll の版の形は `moss-image-edit`、ai-toolkit で `kv_cache` を有効にして学習したもの（公開されている ai-toolkit の編集の LoRA はどれもこれです）は `ai-toolkit`、無効にして学習したもの（ai-toolkit の既定）は `ai-toolkit-no-kv`、参照画像を描く画像と同じ時刻で流す形（thearkorbit の moss-image-edit-lora-poc）は `appended` です。ai-toolkit の LoRA のファイルには `kv_cache` の設定が残らないので、学習の設定（`model_kwargs.kv_cache`）を見て選びます。`ai-toolkit` と `ai-toolkit-no-kv` は、`vision` に Qwen3.5-9B の mmproj（setup が取った armV5 のものと同じ）が要ります。
    - LoRA の置き場（`lora_dir`）に置いた MOSS-Image の編集の LoRA も、形がファイルから分かれば選べます。分かるのは、隣の `<名前>.json` の `"edit_format"`、Moss-Image-Edit の形のメタデータ（`adapter_config` の `moss-edit-lora`）、ai-toolkit が出力に書く学習の設定（隣の `<名前>.yaml` か、ジョブの名前が同じ `config.yaml`）の `model_kwargs` の `edit` と `kv_cache` です。チャットで「armv6 の LoRA で」のように名指しすると、チャットのモデルが `edit_image` の `edit_adapter` でその LoRA を選び、Images API の編集でも `edit_adapter` に名前を書けます。使えない名前（形の分からない LoRA など）は、既定の LoRA で描かずに理由を返します。
    - MOSS-Image の編集で参照画像が 2 枚以上のときは、切り出さずに画像全体を描き直します（塗った部分の外は 1 枚目の画像のまま残します）。編集の LoRA は参照画像を画像全体と組みで覚えているので、切り出した部分だけでは参照画像の別の部分を写してしまうためです。
      `refine` を `true` にすると、その結果の塗った部分の周りを切り出して、参照画像とともに strength 0.5 で描き直します。塗った部分を拡大して細かく描き直し、時間はおよそ 1.6 倍です。チャットでは、まず `refine` なしで描き、塗った部分の出来が悪いときだけ `refine` で描き直します。
-   - `crop_stitch` を `false` にすると（設定の `images` の `crop_stitch` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
-- **描き足し**: `extend` に `{"left": 256, "bottom": 128}` のような上下左右の画素か、`{"aspect": "16:9"}` のような形を付けると、1 枚目の画像の外側を描き足します（足した部分と、元の画像の縁から 40 ピクセルの内側を描き直し、元の画像のそれより内側はそのまま残します）。足した部分は縁の画素で下塗りします。形を付けたときは、足りない向きの両側に同じだけ足します。マスクとは一緒に使えません。出力は足した後の大きさで、一辺は `max_side` までです。
+   - `crop_edit` を `false` にすると（設定の `images` の `crop_edit` でも）、今までどおり出力の大きさのまま描き直します。`size` に別の大きさを付けたときも今までどおりです。
+- **描き足し**: `extend` に `{"left": 256, "bottom": 128}` のような上下左右の画素か、`{"aspect": "16:9"}` のような形を付けると、1 枚目の画像の外側を描き足します（足した部分と、元の画像の縁から 48 ピクセル（短い辺の 3 分の 1 まで）の内側を描き直し、元の画像のそれより内側はそのまま残します）。足した部分は縁の画素で下塗りします。形を付けたときは、足りない向きの両側に同じだけ足します。マスクとは一緒に使えません。出力は足した後の大きさで、一辺は `max_side` までです。
 - **拡大**: `upscale` に `{"scale": 2}`（倍率は 1 より大きく 4 まで）を付けると、1 枚目の画像を拡大の手段で大きくします（それだけでは描き直しません）。`{"scale": 2, "redraw": true}` で、その大きさで strength 0.35 で描き直します（`"strength": 0.5` で strength も変えられます）。描き直す大きさが `max_side` を超えるときは、1024 ピクセルのタイル（周りに 128 ピクセル、縁を 32 ピクセルぼかす。周り 32・縁 8 ピクセルでは、タイルの境目にかかる服が崩れたため広げています）に分けて描き直します。一辺は 4096 までです。マスク・`extend` と一緒には使えません。
    - `method` は拡大の手段です。
       - `lanczos`: Lanczos の拡大。
@@ -343,18 +343,18 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
       - `adain`: RGB の各チャンネルの平均と広がりを合わせます。
       - `none`: 補正しません。
       - 付けないときは手段の既定で、RealESRGAN は `none`、SeedVR2 は `lab` です。
-- **部分を直す（Detailer）**: `fix` に `{"parts": ["face", "hands"], "strength": 0.5}`（部分の名前の並びだけでも書けます）を付けると、1 枚目の画像から顔（`face`）・手（`hands`）・人物（`person`）を見つけ、1 か所ずつ描き直します。
+- **部分を直す**: `fix` に `{"parts": ["face", "hands"], "strength": 0.5}`（部分の名前の並びだけでも書けます）を付けると、1 枚目の画像から顔（`face`）・手（`hands`）・人物（`person`）を見つけ、1 か所ずつ描き直します。
    - 見つけるのは YOLOv8 の検出器（Bingsu/adetailer の `face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）で、点数 0.5 以上のものです。重みは setup では取らず、初めて使うときにサーバーが取ります（下の「補助の重み」）。
-   - 見つけた部分の箱の 3 倍の範囲を切り出し、約 1024x1024 ピクセルに拡大して strength 0.5 で描き直し、縮めて貼り戻します（上の「マスク」の切り出しと同じ部品です）。描き直すのは、顔と手では箱を、人物では人の形のマスクを、10×10 の正方形で広げた部分（上と左に 4、下と右に 5 ピクセル）で、貼り戻しの縁を 20 ピクセルぼかします。
-   - 大きい部分から 1 か所ずつ、前の部分を直した後の画像の上で描きます。重なる部分は、後から描いた方が前の結果を変えることがあります。箱の一辺が 10 ピクセル以下のものと、両辺が 1024 ピクセル以上のもの（もう十分大きい）は飛ばします。何も見つからないときは、元の画像をそのまま返します。
+   - 見つけた部分の箱の周りに、箱の長い辺の 4 分の 3 ずつを足した範囲を切り出し、約 1024x1024 ピクセルに拡大して strength 0.5 で描き直し、縮めて貼り戻します（上の「マスク」の切り出しと同じ部品です）。描き直すのは、顔と手では箱を、人物では人の形のマスクを、箱の長い辺の 3%（4 ピクセル以上）ずつ四方に広げた部分で、貼り戻しの縁は 24 ピクセルかけてなだらかにします。
+   - 大きい部分から 1 か所ずつ、前の部分を直した後の画像の上で描きます。重なる部分は、後から描いた方が前の結果を変えることがあります。箱の短い辺が 16 ピクセル未満のものと、短い辺が 1024 ピクセル以上のもの（もう十分大きい）は飛ばします。何も見つからないときは、元の画像をそのまま返します。
    - 部分 k の seed は要求の seed + k です（`n` が 2 以上なら、i 枚目はさらに + 1000 i）。設定の `budget_s` は、次の部分を描き始める前にも見ます。GPU の番が来てから（検出を含めて）その秒数を過ぎると、残りの部分は飛ばして、応答にそう書きます（描いている途中の部分は止めません）。
    - `prompt` は直した部分の見た目です。付けないと、部分ごとの決まった言葉（「a detailed, well-drawn face」など）で描きます。マスク・`extend`・`upscale` と一緒には使えません。
    - 応答の `xestrata-engine` の `fix` に、描いた部分（`regions`: 部分の名前、画像の上の箱、点数、seed、切り出した範囲、描いた大きさ、秒数。飛ばしたものはその理由）と、検出の時間（`detect_s`）が入ります。
 - **言葉の場所（`region`）**: `region` に `"hair"` のような言葉を付けると、マスクを塗る代わりに、1 枚目の画像からその言葉の場所を見つけてマスクにし、そこだけ描き直します（上の「マスク」と同じ道筋）。見つけたものをすべて合わせ、短い辺の 1%（4 ピクセル以上）広げます。見つけるのは下の「言葉からマスク」と同じモデルで、`region_model` で選べます。マスクとは一緒に使えません。
-- **補助の重み**: 道具が使う重み（Detailer の検出器など）は、初めて使うときにサーバーが Hugging Face から取ります（版と SHA-256 を固定し、`HF_ENDPOINT` のミラーも使えます）。置き場所は画像のモデルと同じフォルダーの `image-tools/` です。取っている間は画像を作らず、Images API は 503（`code` が `weights_downloading`、`downloads` に大きさと進み具合とライセンス）、チャットの道具は「取っている途中」と返します。終わったら、もう一度頼むと使えます。取れなかったとき（オフライン、ディスクがいっぱい、書き込めないフォルダー）は、その理由を返します。進み具合はサーバーのログに出ます。
+- **補助の重み**: 道具が使う重み（部分を直す道具の検出器など）は、初めて使うときにサーバーが Hugging Face から取ります（版と SHA-256 を固定し、`HF_ENDPOINT` のミラーも使えます）。置き場所は画像のモデルと同じフォルダーの `image-tools/` です。取っている間は画像を作らず、Images API は 503（`code` が `weights_downloading`、`downloads` に大きさと進み具合とライセンス）、チャットの道具は「取っている途中」と返します。終わったら、もう一度頼むと使えます。取れなかったとき（オフライン、ディスクがいっぱい、書き込めないフォルダー）は、その理由を返します。進み具合はサーバーのログに出ます。
   SAM 3.1 の重みは、利用者が SAM License に同意するまで取りません（setup の問いか `--image-sam3-license agree`（`xestrata images` では `--sam3-license agree`）、ランチャーの画像の設定のチェック、または Web の画像の画面の「SAM 3 のライセンス…」で同意します。同意は `image-tools/sam3.accepted` に残ります）。同意するまでは Florence-2 が場所を見つけます。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
-  既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
+  既定は、編集では 1（今までの編集）、img2img では 0.87（ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。`denoise` は受けません（denoise 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
 - **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。MOSS-Image の編集は 30 ステップ、CFG 5 で、編集の LoRA を強さ 1 で当てます（強さが 1 より小さいと、編集でなく描き直しになります）。
 - **LoRA**: 生成と同じ `lora`（とプロンプトのタグ）を受け、参照画像を使う画像にも同じアダプターを当てます（[LoRA](#loraアダプター)）。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
@@ -502,7 +502,7 @@ vLLM-Omni の動画の分割と同じ形です。multipart の `video`（動画�
 
 ## LoRA（アダプター）
 
-画像のモデルに、ComfyUI などが配っている LoRA を、画像を作るたびに当てられます。
+画像のモデルに、よく配られている形の LoRA を、画像を作るたびに当てられます。
 当てられるのは Qwen-Image-2.1（Turbo と元のモデル）、MOSS-Image、Mage-Flow、MageTrail、Anima（派生モデルも）です。HunyuanImage 3.0 は当てられません（`lora` を付けた要求も、プロンプトのタグも 400 です）。
 
 ### 置き場所と一覧
@@ -539,25 +539,25 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 
 ### 当てる形式
 
-ファイルのキーは、`diffusion_model.`・`transformer.`・`model.diffusion_model.` の接頭辞を外して、このモデルの重みの名前にします。PEFT・ComfyUI・ai-toolkit の名前（`lora_A`/`lora_B`、`lora_down`/`lora_up`、`lora_A.default`）を読みます。
+ファイルのキーは、`diffusion_model.`・`transformer.`・`model.diffusion_model.` の接頭辞を外して、このモデルの重みの名前にします。PEFT・ai-toolkit などのよく使われる名前（`lora_A`/`lora_B`、`lora_down`/`lora_up`、`lora_A.default`）を読みます。
 
 | 形式 | ファイルのテンソル | 当て方 |
 | --- | --- | --- |
 | LoRA・LoCon | `lora_A`/`lora_B`（下と上）と `.alpha` かメタデータの `lora_alpha` | 強さ × alpha / rank。alpha が無ければ 1 |
-| LoKr | `lokr_w1`・`lokr_w2`（丸ごと、または 2 つの因子）と、線形の重みの Tucker の核 `lokr_t2` | 2 段の積。rank は ComfyUI と同じ（w2 の因子、無ければ w1 の因子） |
+| LoKr | `lokr_w1`・`lokr_w2`（丸ごと、または 2 つの因子）と、線形の重みの Tucker の核 `lokr_t2` | 2 段の積。rank は w2 の因子、無ければ w1 の因子 |
 | DoRA | 素の LoRA と、重みの行の `dora_scale` | 行方向だけ。`c = dora_scale / 重みの行のノルム` で、土台とデルタの行を掛ける |
-| 全体差分 | `.diff`・`.set_weight`・`.w_norm` | 差分を足す。`set_weight` は強さ 1 でその重みになり、その間は補間（ComfyUI は強さを読まない） |
+| 全体差分 | `.diff`・`.set_weight`・`.w_norm` | 差分を足す。`set_weight` は強さ 1 でその重みになり、その間は補間 |
 | LoHa | `hada_w1_a/b`・`hada_w2_a/b` と、線形の Tucker の核 | 2 組の積の要素ごとの積。rank は `hada_w1_b` の行 |
 | バイアスの差分 | `.diff_b`、または `.w_norm` の隣の `.b_norm` | 重みのバイアスに足す。alpha は掛からず、要求の強さだけ |
-| OFT・BOFT | `oft_blocks`（OFT は 3 次元、BOFT は 4 次元）と `rescale` | 重みの行をブロック対角の直交行列で回す。強さは 1 回だけ補間（ComfyUI は 2 回） |
-| GLoRA | `a1`・`a2`・`b1`・`b2` | `W (a1 a2)` と `b1 b2` の和。重みの積をもう一度通す。ComfyUI の読みと古い LyCORIS の読みの両方 |
+| OFT・BOFT | `oft_blocks`（OFT は 3 次元、BOFT は 4 次元）と `rescale` | 重みの行をブロック対角の直交行列で回す。強さは 1 回だけ補間 |
+| GLoRA | `a1`・`a2`・`b1`・`b2` | `W (a1 a2)` と `b1 b2` の和。重みの積をもう一度通す。今の読みと古い LyCORIS の読みの両方 |
 
-- 1 つの重みに 2 つの形式が並ぶファイルは、読むときに断ります（ComfyUI は片方を黙って落とします）。
+- 1 つの重みに 2 つの形式が並ぶファイルは、読むときに断ります（片方を黙って落とすことはしません）。
 - DoRA・OFT・GLoRA・`set_weight` の当たる行には、ほかのアダプターを重ねられません（重ねる順で絵が変わるため）。ほかの形式どうしは同じ行でも足し算になります。
 - バイアスの差分は、その重みが自分のバイアスを足すときだけ当たります。Qwen-Image-2.1 の DiT はバイアスを足さないので、Qwen では当たりません。MOSS-Image は 42 のブロックと `final_linear_video` が足さず、Mage-Flow はどの重みも足します。
 - MageTrail の低ランクの変調（F32 の重み）に当たるアダプターは当たりません（キーと理由を返します）。
 - OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、そこに当たる OFT は断ります。
-- LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります（ComfyUI と同じ）。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
+- LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
 - `use_rslora` のファイルは断ります（強さが alpha / √rank で、alpha / rank と違うため）。PEFT の `rank_pattern` は読まず、alpha だけを使います。
 - 文の読み手の重み（`lora_te_`・`text_encoder.`・`te.` などのキー）を含むファイルは、その分を文の読み手に当てます（Qwen-Image-2.1、Mage-Flow、MageTrail、MOSS-Image、Anima）。強さは画像のモデルの側と同じで、API に `scale_text` の欄はありません（送っても `style` や `user` と同じ知らない欄として無視します）。
   文の読み手に当てた要求は、プロンプトの状態をその組で作り直します。MOSS-Image でチャットのモデルと同じファイルを文の読み手にしているときは、アダプターを当てた要求だけ、画像のエンジンが自分でプロンプトを読みます。
@@ -659,10 +659,10 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
   VAE は Black Forest Labs が FLUX.2-klein-4B で公開している Flux2 VAE で、Apache 2.0 です（MageTrail のリポジトリにある同じ VAE は FLUX.2-dev の非商用のライセンスなので、setup はそちらを使いません）。
 - HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、欧州連合・英国・韓国には適用されません。
   使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
-  量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
+  量子化したファイルは PedroMarinhoDev が単一ファイルとして公開しているものです。
 - MOSS-Image（SFT と Base）の重みは Apache 2.0 で、OpenMOSS（MOSI. AI）が公開しています。VAE は MOSS-Image のリポジトリにあるものです。
   `moss-image-4-step` の 4 ステップのアダプター（LoRA、時刻の経路、サンプラーの表）は darask0 の [MOSS-Image_4-step_adapter_lora](https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora) で、Apache 2.0 です。
-  編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が ComfyUI の形に直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
+  編集の LoRA は 3 つで、setup はすべてを取ります。既定は chinoll の [Moss-Image-Edit](https://huggingface.co/chinoll/Moss-Image-Edit)（PedroMarinhoDev が単一ファイルに直した[版](https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI)、GPL-3.0）、ほかの 2 つは akhaliq の [MOSS-Image-Edit-HQ](https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ) の armV5 と armV6（Apache 2.0）です。この 2 つのために、Unsloth の Qwen3.5-9B の画像の読み手（mmproj、Apache 2.0）も取ります。
 - Anima（Base、Aesthetic、Turbo）の重みは CircleStone Labs の非商用のライセンスと、土台の Cosmos-Predict2 の NVIDIA Open Model License です。モデルを商用に使うことはできません（作った画像は使えます）。使う前に [Anima のページ](https://huggingface.co/circlestone-labs/Anima) を読んでください。
   Anima-2.9B（Gazingstars123）と派生モデルには、それぞれの公開元のライセンスが適用されます。
   VAE は Anima のリポジトリにある Wan 2.1 の VAE、プロンプトの区切りに使う T5 の `tokenizer.json`（google-t5/t5-base）は Apache 2.0 です。
@@ -670,7 +670,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 - 拡大の SeedVR2（7B、7B sharp、3B）の重みと VAE は、ByteDance Seed の [SeedVR](https://github.com/ByteDance-Seed/SeedVR) で、Apache-2.0 です。サーバーは Comfy-Org の [SeedVR2](https://huggingface.co/Comfy-Org/SeedVR2) にあるもの（16 ビットと int8_convrot）をそのまま使います。
 - 拡大の RealESRGAN x4plus の重みは、Xintao Wang・Liangbin Xie・Chao Dong・Ying Shan の [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) で、BSD-3-Clause です。
   サーバーは、公式の v0.1.0 のリリースと同じファイル（`RealESRGAN_x4plus.pth`、SHA-256 で同じと確かめたもの）を [lllyasviel/Annotators](https://huggingface.co/lllyasviel/Annotators) から取り、`tools/image/esrgan.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換です。
-- Detailer の検出器（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）は Bingsu の [adetailer](https://huggingface.co/Bingsu/adetailer) で、公開元のライセンスは Apache 2.0 です。
+- 部分を直す道具の検出器（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`）は Bingsu の [adetailer](https://huggingface.co/Bingsu/adetailer) で、公開元のライセンスは Apache 2.0 です。
   どれも Ultralytics の YOLOv8 で学習されていて、Ultralytics は YOLO で学習したモデルを既定で AGPL-3.0 としています（[Ultralytics のライセンス](https://www.ultralytics.com/license)。重みのファイルの中にも `AGPL-3.0 License` と書かれています）。使う前に両方を読んでください。
   サーバーは配られている `.pt` を取り、`tools/image/yolo_pt.py` で safetensors に直してから使います。これは重みの値を変えない形式の変換で、元のファイルの SHA-256 を変換後のファイルに書き残します。検出器は XeStrata のコードです（[DETAILS](DETAILS.ja.md#クレジットとライセンス)）。
 - 言葉からマスクの SAM 3.1 の重みは Meta の SAM License で、オープンソースのライセンスではありません（使う人を拘束し、禁じる使い方があります）。サーバーは利用者が同意するまで取りません。重みは Comfy-Org の [sam3.1](https://huggingface.co/Comfy-Org/sam3.1) の FP16 のものをそのまま使います。言葉を読む CLIP の `tokenizer.json`（openai/clip-vit-large-patch14）は MIT です。

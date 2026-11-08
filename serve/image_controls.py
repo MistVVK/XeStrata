@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# SPDX-FileCopyrightText: the comfyui_controlnet_aux contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 """serve/image_controls.py - the composition control (the chat's `control`, the Images API's `control` field and
 POST /v1/images/controls): a control image made from a picture by the engine's CONTROL line (xestrata-image's
 cnet_prep: canny, depth, pose and the others), then given to the image model.
@@ -162,6 +163,8 @@ def _kind(v: dict) -> str:
 
 
 def _params(v: dict, kind: str) -> dict:
+    """A kind's settings from the request; Canny's and M-LSD's defaults and limits as comfyui_controlnet_aux's
+    (Apache-2.0)."""
     p: dict = {}
     if kind == "canny":
         p["low"] = _num(v, "low_threshold", 0, 255, 100)

@@ -743,7 +743,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             const float scale = u.scale * e.scale();
             // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's
-            // delta and a DoRA's base factors, as ComfyUI's weight_decompose scales the weight with no delta)
+            // delta and a DoRA's base factors, as a DoRA's decomposition scales the weight with no delta)
             if (u.scale == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
             std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
             if (!e.dora.empty()) {

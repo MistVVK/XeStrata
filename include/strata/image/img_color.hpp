@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 // include/strata/image/img_color.hpp - the image engine's color corrections on the GPU, shared by the cut's color
 // match (img_crop.hpp) and the upscalers' correction (strata/upscale/upscale.hpp).
 //

@@ -362,7 +362,7 @@ void selftest_loha(void* s, int64_t T, int64_t K, int64_t R1, int64_t R2, int64_
     e.kind = si::LoraKind::loha;
     e.cols = K;
     e.rows = N;
-    e.rank = R1;   // ComfyUI's dim: w1_b's rows
+    e.rank = R1;   // the rank: w1_b's rows
     const auto fill = [&](const char* role, std::vector<int64_t> shape) {
         size_t n_values = 1;
         for (int64_t d : shape) n_values *= (size_t) d;
@@ -565,7 +565,7 @@ void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     if (!ok) throw std::runtime_error("the DoRA's product is not the reference's");
 }
 
-// a bias's delta (ComfyUI's "diff" patch of a weight's bias): y[t][row0 + c] += scale * bias[src_row + c], alone
+// a bias's delta (a "diff" patch of a weight's bias): y[t][row0 + c] += scale * bias[src_row + c], alone
 // (LoraKind::bias: the file holds no weight's delta) and beside a plain LoRA's, both into the rows of a fused weight's
 // second half where that is asked
 void selftest_bias(void* s, int64_t T, int64_t N, bool with_weight, int64_t src_row = 0, int64_t row0 = 0,
@@ -749,7 +749,7 @@ void selftest_glora(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool ro
     std::vector<float> rs((size_t) T);
     for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3)) * 0.5f;   // 0.5, 1, 2
     // the file's four tensors, in the reading its shapes take: LyCORIS's a1 [rank][cols], a2 [cols][rank], b1
-    // [rank][cols], b2 [rows][rank]; ComfyUI's own a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols]
+    // [rank][cols], b2 [rows][rank]; the newer a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols]
     si::LoraEntry e;
     e.key = "selftest-glora";
     e.kind = si::LoraKind::glora;
@@ -761,7 +761,7 @@ void selftest_glora(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool ro
         for (float& x : v) x = nd(rng) * 0.1f;
         return v;
     };
-    // the file's four, the reading's shapes: ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    // the file's four, the reading's shapes: the newer a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
     // [rank][cols]; LyCORIS's a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]
     std::vector<float> t1 = make(lycoris ? (size_t) (R * K) : (size_t) (K * R));
     std::vector<float> t2 = make(lycoris ? (size_t) (K * R) : (size_t) (R * K));
@@ -912,7 +912,7 @@ int selftest() {
         selftest_oft(s, 8, 64, 32, 1, true, false, 0.6f);
         selftest_oft(s, 8, 64, 4, 2, true, false, 1.0f);
         selftest_oft(s, 16, 64, 8, 3, true, true, 0.7f);
-        // a GLoRA: the plain form's pair and the weight's own product of the input its two factors make (ComfyUI's
+        // a GLoRA: the plain form's pair and the weight's own product of the input its two factors make (the newer
         // reading, then LyCORIS's older one), a W8A8 product's row scale, and the rows of a fused weight's half
         selftest_glora(s, 8, 64, 8, 32, false, false, 0.7f);
         selftest_glora(s, 8, 64, 8, 32, false, true, 1.0f);

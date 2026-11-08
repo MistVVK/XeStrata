@@ -50,7 +50,7 @@ chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QU
 the others').  When the chat model is that same file, setup links it instead of fetching it again and the server has
 the chat engine encode the prompts (serve/images.py's text_states).  Its edits take an edit adapter, applied at 1:
 up to four reference images, the instruction in the prompt.  Setup fetches three ("edit_adapters"; the config's
-"edit_adapter" or XESTRATA_MOSS_EDIT chooses): chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy, GPL-3.0),
+"edit_adapter" or XESTRATA_MOSS_EDIT chooses): chinoll's Moss-Image-Edit (PedroMarinhoDev's copy, GPL-3.0),
 the default - beside akhaliq's MOSS-Image-Edit-HQ armV5 (Apache 2.0) it kept the clothes a face swap was not asked to
 change, in 30 steps against 50 (the same face swap and expression, 2026-11-04) - and
 armV5 and armV6 (armV5 trained on with other captions and loss, its card's experiment), ai-toolkit adapters whose
@@ -62,8 +62,8 @@ anima-aesthetic, anima-turbo, and Gazingstars123's anima-2.9b): a DiT of one bf1
 quantizes it to 8 bits as it reads it, as Mage-Flow's), Wan 2.1's VAE (the release's qwen_image_vae), Qwen3-0.6B-Base
 as its text encoder (mradermacher's GGUFs, F16 lowered to Q8_0 for the RAM) and T5's tokenizer.json (google-t5/t5-base,
 Apache 2.0: the LLM adapter's queries), in its own folder (anima).  A derivative's DiT the user puts in that folder
-(a safetensors file of the same structure, with or without ComfyUI's prefix) is a model of its own, anima:<its name>
-(anima_user_dits): setup sets it up beside the release's files.
+(a safetensors file of the same structure, with or without the prefix `model.diffusion_model.`) is a model of its
+own, anima:<its name> (anima_user_dits): setup sets it up beside the release's files.
 """
 from __future__ import annotations
 
@@ -73,8 +73,8 @@ import os
 import struct
 from pathlib import Path
 
-# the ComfyUI checkpoint repository's revision, named apart: its repository name and its hash on one line would be
-# 130 characters
+# the HunyuanImage 3.0 checkpoints' repository's revision, named apart: its repository name and its hash on one line
+# would be 130 characters
 _HY_C_SHA = "b57626bc1840b64b47cb8d885a61298b352acf79"
 
 REVISIONS = {                                       # the `sha` of https://huggingface.co/api/models/<repo>, 2026-10-12
@@ -134,7 +134,7 @@ _HY = "tencent/HunyuanImage-3.0-Instruct-Distil"          # the model itself: th
 _HY_C = "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI"   # its quantized files, as single checkpoints
 _MS = "OpenMOSS-Team/MOSS-Image-SFT"
 _MB = "OpenMOSS-Team/MOSS-Image-Base"
-_ME = "PedroMarinhoDev/Moss-Image-Edit-ComfyUI"   # chinoll's Moss-Image-Edit adapter, its keys as ComfyUI's
+_ME = "PedroMarinhoDev/Moss-Image-Edit-ComfyUI"   # chinoll's Moss-Image-Edit adapter, its keys under `diffusion_model.`
 _MEHQ = "akhaliq/MOSS-Image-Edit-HQ"              # its armV5 and armV6, ai-toolkit adapters
 _Q35 = "unsloth/Qwen3.5-9B-GGUF"
 _Q35H = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
@@ -142,12 +142,12 @@ _Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
 _AN = "circlestone-labs/Anima"
 _AN29 = "Gazingstars123/Anima-2.9B"
 _Q306 = "mradermacher/Qwen3-0.6B-Base-GGUF"
-_AD = "Bingsu/adetailer"   # the Detailer's YOLOv8 detectors (fix_image)
+_AD = "Bingsu/adetailer"   # the parts' fix's YOLOv8 detectors (fix_image)
 # the upscaler RealESRGAN x4plus: xinntao/Real-ESRGAN's release file (v0.1.0's RealESRGAN_x4plus.pth, the same bytes),
 # as ControlNet's annotators keep it
 _ANN = "lllyasviel/Annotators"
 _SV = "Comfy-Org/SeedVR2"   # the upscaler SeedVR2 (ByteDance Seed's), its DiTs in FP16 and int8_convrot and its VAE
-_SAM = "Comfy-Org/sam3.1"   # SAM 3.1 (Meta's), as ComfyUI repackaged it: words to masks (find_region, edit_region)
+_SAM = "Comfy-Org/sam3.1"   # SAM 3.1 (Meta's), as Comfy-Org repackaged it: words to masks (find_region, edit_region)
 _CLIP = "openai/clip-vit-large-patch14"   # SAM 3's text encoder's tokenizer (CLIP's BPE)
 _FL = "microsoft/Florence-2-large"        # Florence-2: words to masks where SAM 3 is not taken, and boxes
 _FB = "microsoft/Florence-2-base"
@@ -685,7 +685,7 @@ def mage_q8(size: str | None) -> bool | None:
 
 def anima_header(path: Path) -> str:
     """Why a safetensors file is not an Anima DiT ("" when it is one): its header read alone, the names with or
-    without a prefix (`net.`, ComfyUI's `model.diffusion_model.`), the LLM adapter and the blocks of
+    without a prefix (`net.`, `model.diffusion_model.`), the LLM adapter and the blocks of
     Cosmos-Predict2 beside it.  An adapter (LoRA) file is named as one."""
     try:
         with open(path, "rb") as f:

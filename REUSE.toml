@@ -50,7 +50,7 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
 path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md", "serve/skills/**/SKILL.md",
-        "windows/launcher/Core/locales/*.json"]
+        "windows/launcher/Core/locales/*.json", "windows/launcher/Tests/describe.json"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 
@@ -144,7 +144,8 @@ SPDX-License-Identifier = "MIT"
 # DOMPurify under Apache-2.0)
 [[annotations]]
 path = ["third_party/main/mermaid/**"]
-SPDX-FileCopyrightText = ["2014-2022 Knut Sveidqvist", "the authors of the packages third_party/main/mermaid/BUNDLED.md lists"]
+SPDX-FileCopyrightText = ["2014-2022 Knut Sveidqvist", "2017 Kiel University and others",
+                         "the authors of the packages third_party/main/mermaid/BUNDLED.md lists"]
 SPDX-License-Identifier = "MIT AND ISC AND BSD-3-Clause AND Apache-2.0 AND EPL-2.0"
 
 [[annotations]]

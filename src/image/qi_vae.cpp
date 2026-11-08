@@ -49,7 +49,7 @@ const float kStd[64] = {3.2001f, 3.2936f, 3.4321f, 3.0091f, 3.1061f, 4.0379f, 4.
                         3.5327f, 4.7833f, 3.1286f, 4.1819f, 3.8527f, 3.8312f, 3.5605f, 4.3875f, 3.9624f, 4.0168f,
                         3.5643f, 4.055f, 5.5614f, 4.2963f, 4.408f, 3.4959f, 3.8747f, 3.7608f, 3.5735f, 3.149f,
                         3.7662f, 3.6746f, 3.4563f, 3.8161f};
-// Wan 2.1's (ComfyUI's latent_formats.Wan21): Qwen-Image's first VAE, Anima's
+// Wan 2.1's (its VAE's latent means and deviations): Qwen-Image's first VAE, Anima's
 const float kWanMean[16] = {-0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f, 0.9653f, -0.1517f, 1.5508f,
                             0.4134f,  -0.0715f, 0.5517f,  -0.3632f, -0.1922f, -0.9497f, 0.2503f, -0.2921f};
 const float kWanStd[16] = {2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
@@ -294,7 +294,7 @@ QiVae::Res QiVae::res_w(SafeTensors& st, const std::string& p) {
     return r;
 }
 
-// Wan 2.1's VAE as ComfyUI names it (comfy/ldm/wan/vae.py): conv2 the post-quantization 1 x 1, decoder.conv1, the
+// Wan 2.1's VAE by its original checkpoint's names: conv2 the post-quantization 1 x 1, decoder.conv1, the
 // middle's residual block, attention and residual block, the upsamples (residual blocks, each run's resample after
 // it), the head's norm and convolution to RGB; the encoder the other way round, conv1 its quantization 1 x 1.  A
 // residual block's norms and convolutions are residual.0, .2, .3 and .6, its 1 x 1 shortcut `shortcut`.
@@ -375,7 +375,7 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
         s_ = stream;
         dry_ = dry;
         SafeTensors st(path);
-        if (st.find("decoder.conv1.weight") != nullptr) {   // Wan 2.1's, as ComfyUI has it
+        if (st.find("decoder.conv1.weight") != nullptr) {   // Wan 2.1's, its keys as decoder.conv1 and so on
             open_wan21(st);
             if (dry_) return true;
             return gemm_.init(s_, 16, err);

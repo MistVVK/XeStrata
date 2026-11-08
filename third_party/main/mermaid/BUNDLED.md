@@ -77,3 +77,11 @@ EPL-2.0, DOMPurify under Apache-2.0. The license texts are in the repository's `
 | `roughjs` | 4.6.6 | MIT |
 | `stylis` | 4.3.6 | MIT |
 | `ts-dedent` | 2.2.0 | MIT |
+
+## elkjs's source
+
+elkjs (Copyright (c) 2017 Kiel University and others, EPL-2.0) is in the script compiled and minified, not in the
+form its authors change it in. Its source is elkjs 0.12.0's, https://github.com/kieler/elkjs/tree/0.12.0 (the tag's
+commit ff5771d7165445c42c408bb8a090c8035272218c), with the Eclipse Layout Kernel it is built from,
+https://github.com/eclipse-elk/elk (EPL-2.0, the same holders); npm's package is
+https://registry.npmjs.org/elkjs/-/elkjs-0.12.0.tgz.

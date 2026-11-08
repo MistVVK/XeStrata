@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: the ComfyUI-SeedVR2_VideoUpscaler contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND Apache-2.0
 // src/upscale/seedvr2.cpp - see include/strata/upscale/seedvr2.hpp.
 
 #include "strata/upscale/seedvr2.hpp"
@@ -93,14 +94,15 @@ void rgba8_of_raw(const float* rgb, int64_t T, int64_t HW, uint8_t* out, void* s
     });
 }
 
-// The share of the earlier chunk's latent at position j of the `shared` two chunks have (0 .. shared - 1, one alone
-// 0): all of it over the first third of the stretch, none over the last, falling as a half cosine between, in u =
-// j / (shared - 1)
+// The weight the earlier of two overlapping chunks keeps at position j of the `shared` latents they both have (one
+// alone: 1): the comfy-seedvr2 crossfade (Apache-2.0), a Hann window's half laid over the stretch's middle third, so
+// each chunk's own edge latents (the ones its attention saw least of the other's) weigh nothing in the mix
 float kept_share(int64_t j, int64_t shared) {
-    const float u = shared > 1 ? (float) j / (float) (shared - 1) : 0.f;
-    if (u <= 1.f / 3.f) return 1.f;
-    if (u >= 2.f / 3.f) return 0.f;
-    return 0.5f * (1.f + std::cos(3.14159265358979f * (3.f * u - 1.f)));
+    if (shared <= 1) return 1.f;
+    const float t = std::clamp(3.f * (float) j / (float) (shared - 1) - 1.f, 0.f, 1.f);   // 0 .. 1 over the middle
+    if (t >= 1.f) return 0.f;
+    const float c = std::cos(1.57079632679490f * t);
+    return c * c;
 }
 
 // a = a w + b (1 - w)
@@ -222,8 +224,8 @@ void Seedvr2::Impl::encode_slice(bool keep) {
 }
 
 // the chunks whose latents are all encoded, each through the DiT and merged; then the latents no later chunk touches
-// decoded.  Before the clip's end only whole chunks; at it (v.ended, v.tl known) the rest, the last cut at the clip's
-// end, none after the one that reaches it (SeedVR2TemporalChunk's)
+// decoded.  Before the clip's end only whole chunks; at it (v.ended, v.tl known) the rest: the chunk that reaches the
+// end is cut there and is the last
 void Seedvr2::Impl::run_chunks() {
     const int64_t th = v.h / 16, tw = v.w / 16, n = th * tw * 64, lh = v.h / 8, lw = v.w / 8;
     const int64_t end = v.ended ? v.tl : INT64_MAX;
@@ -249,8 +251,7 @@ void Seedvr2::Impl::run_chunks() {
         dit->drop_activations();   // the room the VAE's slices take
         dit_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         restore(v.ncat, v.vel, len * n, 1.f / kScaling, v.vel, s);
-        // merged: the latents the chunk shares with the ones before it mixed in, the rest
-        // appended
+        // merged: where the chunk overlaps what is merged so far, the two mixed by kept_share; past it, appended
         const int64_t shared = std::min(v.made - s0, len);
         for (int64_t j = 0; j < len; ++j) {
             const int64_t L = s0 + j;

@@ -40,7 +40,7 @@ constexpr uint64_t kTextWork = 1280 * kMiB;
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
 // an edit's references in the stream at every step (MossDit::set_refs), rather than kept as keys and values
-bool in_stream(QiRefLayout l) { return l == QiRefLayout::TimestepZero || l == QiRefLayout::Index; }
+bool in_stream(QiRefLayout l) { return l == QiRefLayout::AitkNoKv || l == QiRefLayout::Appended; }
 
 // RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque
 std::vector<float> base_rgb(const QiRef& f, int64_t W, int64_t H) {

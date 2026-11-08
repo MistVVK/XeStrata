@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/yolo_detect.hpp - a YOLOv8 detector (the boxes of faces, hands or people, and a person's mask)
-// for the Detailer (the IMG line's DETAIL:, serve/images.py's fix_image), on the GPU.
+// for the parts' fix (the IMG line's DETAIL:, serve/images.py's fix_image), on the GPU.
 //
 // The weights are a checkpoint converted by tools/image/yolo_pt.py (Bingsu/adetailer's face_yolov8m, hand_yolov8s,
 // person_yolov8m-seg): each convolution's weight and batch norm under its module path, and the layer list in the

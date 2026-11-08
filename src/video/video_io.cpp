@@ -4,6 +4,7 @@
 
 #include "strata/video/video_io.hpp"
 
+#include "strata/platform/env.hpp"
 #include "strata/platform/process.hpp"
 
 #include <algorithm>
@@ -20,8 +21,9 @@ namespace strata::video {
 
 namespace {
 
+// the command XESTRATA_<name> (else STRATA_<name>) names, else `program` where it is on the PATH
 std::string env_or(const char* name, const char* program) {
-    const char* e = std::getenv(name);
+    const char* e = strata::env_get(name);
     if (e != nullptr && *e != '\0') return e;
     return platform::Process::found(program) ? program : std::string();
 }

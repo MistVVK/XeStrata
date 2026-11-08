@@ -42,30 +42,30 @@ The target modules are the names each DiT's `build_lora_targets` (`src/image/mf_
 
 ## The saved file (D1)
 
-One `.safetensors` file is one adapter. Its keys are ComfyUI generic / ai-toolkit form (the dot form): **the prefix `diffusion_model.` + the target name,
+One `.safetensors` file is one adapter. Its keys are the generic / ai-toolkit form (the dot form): **the prefix `diffusion_model.` + the target name,
 dotted + the role**. The trainer writes its own target names as they are: there is no mapping table.
 
 | Method | The keys of one weight | Shapes | Type |
 | --- | --- | --- | --- |
 | plain LoRA | `<target>.lora_A.weight`, `<target>.lora_B.weight`, `<target>.alpha` | A `[rank][in]`, B `[out][rank]`, alpha 0-dimensional | F32 |
 | DoRA | the plain LoRA's three plus `<target>.dora_scale` | `dora_scale` is `[out]`: the weight's rows only | F32 |
-| LoKr | `<target>.lokr_w1`, `<target>.lokr_w2_a`, `<target>.lokr_w2_b`, `<target>.alpha` | no `.weight` (as sd-scripts' and ComfyUI's LoKr) | F32 |
+| LoKr | `<target>.lokr_w1`, `<target>.lokr_w2_a`, `<target>.lokr_w2_b`, `<target>.alpha` | no `.weight` (as sd-scripts' LoKr and the common readers') | F32 |
 
-- The readers (`serve/loras.py` and `src/image/image_lora.cpp`) and the four DiTs stay as they are. The dot form is what today's reader and ComfyUI read without
+- The readers (`serve/loras.py` and `src/image/image_lora.cpp`) and the four DiTs stay as they are. The dot form is what today's reader and the common dot-form reader read without
   trouble (the survey of 2026-11-02, "read without problems").
 - The strength goes out as a **per-weight `.alpha` tensor**: one form, no metadata lookup. Card 15 makes `.alpha` win and applies a metadata `lora_alpha` only to
-  weights that have no `.alpha` (as ComfyUI does, `comfy/lora.py`).
+  weights that have no `.alpha` (as the common dot-form reader does).
 - The metadata v1 writes: `modelspec.title`, `modelspec.trigger_phrase` (the trigger word), `ss_network_module` (`networks.lora`, `networks.lokr`), `ss_network_dim`,
   `ss_network_alpha`, `ss_seed`, `ss_learning_rate`, `ss_optimizer_type`, `ss_max_steps`, `ss_model` (the `model_name`) and `ss_xestrata_revision`. No recommended
   strength (`recommended_strength*`): the listing's `scale` stays 1.0.
 
 ### alpha (how the strength is applied)
 
-The engine, ComfyUI and sd-scripts all multiply the delta by `alpha / rank` (`LoraEntry::scale()` in `image_lora.cpp`, `comfy/weight_adapter/lora.py`, `networks/lora.py`).
+The engine, the common dot-form reader and sd-scripts all multiply the delta by `alpha / rank` (`LoraEntry::scale()` in `image_lora.cpp`, sd-scripts' `networks/lora.py`).
 alpha is a free value; **the default candidate is alpha = rank** (the multiplier becomes 1.0 — where sd-scripts' `--network_alpha` defaults to 1, v1 sets it to `network_dim`, 16).
 
 - diffusers' Qwen-Image path **pops the dot form's `.alpha` and does not apply it** (`loaders/lora_conversion_utils.py`, `loaders/lora_pipeline.py`). With alpha ≠ rank,
-  our side and ComfyUI differ from diffusers. The documents (card 10) carry that note. sd-scripts' `lora_down` / `lora_up` form is not affected: diffusers multiplies by
+  our side and the common dot-form reader differ from diffusers. The documents (card 10) carry that note. sd-scripts' `lora_down` / `lora_up` form is not affected: diffusers multiplies by
   `alpha / rank` there, so card 13's external files keep their strength.
 
 ### Qwen-Image-2.1's MLP
@@ -74,13 +74,13 @@ Qwen-Image-2.1's MLP's first weight is one fused matrix on the GPU: `img_mlp.gat
 v1 saves it **split: `img_mlp.gate_layer` and `img_mlp.proj` as two weights** (the rows cut 12288 and 12288; `img_mlp.out` stays one).
 
 - All three readers apply the split form. Ours: the slots in `qi_dit.cpp` read gate_layer from row 0 and proj from row 12288, the bind of `xestrata-image-lora-probe` maps all 21 keys of its synthetic model (21 of 21), and `records/2026-10-29-image-lora/parity` gives cos 1.0000000 per weight for both the split and the fused form.
-  ComfyUI: `comfy/lora.py` says "LoRAs address the halves" and cuts the fused weight by rows. diffusers 0.41.0: `img_mlp.gate_layer` and `img_mlp.proj` are the real
+  The common dot-form reader cuts the fused weight by rows (LoRAs address the halves). diffusers 0.41.0: `img_mlp.gate_layer` and `img_mlp.proj` are the real
   modules and there is no `gate_up`.
 - If a file carries the fused `img_mlp.gate_up`, diffusers cannot find that target and **silently drops it** (the injection still succeeds while other targets match;
   `NoMatchingPeftModuleError` in `peft/tuners/tuners_utils.py` fires only when nothing matches). The same file then applies a delta here and not there, and the picture
   differs without a word. An adapter of the MLP alone fails the whole injection.
 
-MOSS-Image goes the other way and saves the **fused** `proj.ffn_up_gate`: diffusers 0.41.0 has no MOSS-Image, and ComfyUI's MOSS-Image and sd-scripts' weights both
+MOSS-Image goes the other way and saves the **fused** `proj.ffn_up_gate`: diffusers 0.41.0 has no MOSS-Image, and the common MOSS-Image weights and sd-scripts' both
 name the fused module, so one form settles it.
 
 ### LoKr's axes (fixed for every model)
@@ -97,9 +97,9 @@ delta          kron(w1, w2_a @ w2_b) * (alpha / rank)    rows out_l * out_k = ou
 ```
 
 `factorization` is sd-scripts' same function (`networks/lokr.py`). The rank is `lokr_w2_b`'s rows, which is what alpha is divided by — the way
-`comfy/weight_adapter/lokr.py` and our `make_lokr` both take it. v1 uses rank 16 for all three methods, and every target weight fits the factorized form
+the common dot-form reader and our `make_lokr` both take it. v1 uses rank 16 for all three methods, and every target weight fits the factorized form
 (`max(out_k, in_n) / 2` is 32 or more). **The full matrix form (`lokr_w2` whole) is never written**: in that form all three readers skip the division and apply strength 1.0 (checked in `records/2026-10-29-image-lora/formats`), and v1 wants alpha to count. No Tucker core
-(`lokr_t2`) either — every v1 target is a Linear. The formulas were checked against ComfyUI's `calculate_weight` in
+(`lokr_t2`) either — every v1 target is a Linear. The formulas were checked against each form's weight built in torch from the file's tensors in
 `records/2026-10-29-image-lora/formats` (relative difference 1.5e-7 to 4.9e-7).
 
 ### DoRA's norm convention
@@ -111,10 +111,10 @@ c_r = m_r / (|W_r| + eps)      eps = 1.1920929e-07 (FP32's eps, `kLoraDoraEps`)
 y   = [1 + s (c - 1)] (W x) + s c (alpha / rank) (B A x)
 ```
 
-Training starts with `m_r = |W_r|`, so c = 1 and the model is unchanged at first. At a request's strength 1 the formula is ComfyUI's `weight_decompose`, measured to a
-**relative** 3.1e-8 to 4.8e-8 over F32 weights (rounding; 1.9e-7 taking in the strength -0.5 case too) — the values of the DoRA table in `records/2026-10-29-image-lora/formats`. **PEFT divides by `|W + ΔV|`** instead, measured 2.4e-4 apart in relative terms. v1 keeps our side and ComfyUI's (W's row norms).
+Training starts with `m_r = |W_r|`, so c = 1 and the model is unchanged at first. At a request's strength 1 the formula is DoRA's weight decomposition with W's row norms, measured to a
+**relative** 3.1e-8 to 4.8e-8 over F32 weights (rounding; 1.9e-7 taking in the strength -0.5 case too) — the values of the DoRA table in `records/2026-10-29-image-lora/formats`. **PEFT divides by `|W + ΔV|`** instead, measured 2.4e-4 apart in relative terms. v1 keeps W's row norms, as the common dot-form reader does.
 
-- ComfyUI adds `torch.finfo(weight.dtype).eps`, which follows the base's type while ours is always FP32's. Where a row norm is 1, an F16 base gives c about 0.098% below ours (eps 0.0009765625) and a BF16 base about 0.775% below ours (eps 0.0078125); only an FP32 base matches ours (eps 1.1920929e-07). The smaller the row norm, the wider the gap: the bf16 run of the record had row norms of 0.3 to 1 and a relative difference of 1.69e-02 over the weight's change (the last two rows of the DoRA table in
+- A reader that adds `torch.finfo(weight.dtype).eps` follows the base's type, while ours is always FP32's. Where a row norm is 1, an F16 base gives its c about 0.098% below ours (eps 0.0009765625) and a BF16 base about 0.775% below ours (eps 0.0078125); only an FP32 base matches ours (eps 1.1920929e-07). The smaller the row norm, the wider the gap: the bf16 run of the record had row norms of 0.3 to 1 and a relative difference of 1.69e-02 over the weight's change (the last two rows of the DoRA table in
   `records/2026-10-29-image-lora/formats`), and a base whose row norms sit nearer 1 is closer still.
 - Over a quantized base (Q8_0 and others) the row norms come from the weight the engine reads for inference, dequantized (`dora_norms` reads
   `model.diffusion_model.<target>.weight`). Training takes them from the same weights.
@@ -128,8 +128,8 @@ sd-scripts saves with `lora_unet_` and underscore-separated names (`lora_name = 
 `networks/network_base.py`). Our reader drops `lora_unet_` and **turns every underscore into a dot** (`split_key` in `serve/loras.py`), so it only hits names
 with no underscore at all. Measured (2026-11-02): of the four models only MOSS-Image's `layers.{b}.proj.q/k/v/o` read; `proj.ffn_up_gate` (which becomes
 `proj.ffn.up.gate`), `video_embedder`, `time_embedding.0`, `final_linear_video`, `text_embedder.*` and every name with `transformer_blocks.*` in Mage-Flow,
-MageTrail and Qwen-Image-2.1 are refused, whole file. ComfyUI maps them (its `comfy/lora.py` adds `lora_unet_<underscores>` keys, and sd-scripts' own
-`networks/convert_anima_lora_to_comfy.py` converts the same way).
+MageTrail and Qwen-Image-2.1 are refused, whole file. Other readers map them (as `lora_unet_<underscores>` keys; sd-scripts' own Anima converter
+converts the same way).
 
 **v1 saves the dot form**, so this problem does not arise. The reading side for sd-scripts' form (matching `lora_unet_` and `lycoris_` names) is
 **card 13**, as external compatibility. Until card 13 lands, a file sd-scripts wrote itself cannot be read here. The documents (card 10) carry the key table
@@ -258,9 +258,9 @@ The same machinery, read in the versions placed beside this document. The right-
 | Loss | rectified flow: `target = noise - latents`; `model_prediction_type` defaults to `sigma_scaled` while the FLUX and MOSS-Image guides use `raw`; `weighting_scheme` defaults to `uniform` | velocity MSE; the sigma scale comes from the scheduler config | rectified flow (diffusers' scheduler) with its `--flow_matching*` fields | `raw` with weight 1.0 (`v = eps - x`) |
 | Optimizer and LR | AdamW by default (`--optimizer_type`); the guides show AdamW8bit, `lr_scheduler=constant`, lr 1e-4 and `network_dim=16` (the argument defaults to None, so LoRA's own 4 is the fallback) | `toolkit/optimizer.py` builds `torch.optim.AdamW` with `eps = 1e-6` (ours is 1e-8), and its own optimizers (`automagic*`) can be chosen instead | `--optimizer` is required, from a long list (bnb-adamw8bit, prodigy, soap, …) | AdamW with F32 states and `eps = 1e-8`, lr 1e-4, 50 warmup steps, gradients accumulated 4, 1500 steps, rank 16 |
 | LoKr keys | `lokr_w1` always whole; w2 as factors (`lokr_w2_a` `[out_k][rank]`, `lokr_w2_b` `[rank][in_n]`) or full matrix; an `alpha` beside them | the same names; even in `peft_format` it keeps `.alpha` for LoKr (`network_mixins.py`); the old form writes a `lycoris_` prefix | through LyCORIS (the `lycoris_` prefix: the survey's problem 2) | sd-scripts' shape (w1 whole, w2 factored, `.alpha`); no full matrix, no Tucker |
-| DoRA's divisor | no training code at all (0 hits for `dora`) | `toolkit/models/DoRA.py` takes the row norms of `W + ΔW`, and names the key `.magnitude` (it rewrites `alpha` to `.magnitude`) | via PEFT / LyCORIS (`lora_magnitude_vector`) | our and ComfyUI's `norm(W)`, the key `dora_scale`; a foreign magnitude applied here is an approximation |
-| Saved keys | `lora_unet_` + underscores + `lora_down` / `lora_up` | `diffusion_model.` + dots + `lora_A` / `lora_B` (the ComfyUI form; `peft_format` drops `.alpha`) | diffusers form (`transformer.` + dots) or the comfyui form, with `lora_alpha` in the metadata | the dot form plus a per-weight `.alpha` ([the saved file](#the-saved-file-d1)) |
-| Plain LoRA keys | `lora_down` / `lora_up` plus `.alpha` (strength alpha / rank) | with `peft_format` it writes `lora_A`/`lora_B` and drops `.alpha` | switches between the diffusers form and the comfyui form (`lycoris_` belongs to LoKr) | `lora_A`/`lora_B` plus a per-weight `.alpha`. Our readers also take `.lora_A.default`. v1's default rank is 16 |
+| DoRA's divisor | no training code at all (0 hits for `dora`) | `toolkit/models/DoRA.py` takes the row norms of `W + ΔW`, and names the key `.magnitude` (it rewrites `alpha` to `.magnitude`) | via PEFT / LyCORIS (`lora_magnitude_vector`) | our and the common dot-form reader's `norm(W)`, the key `dora_scale`; a foreign magnitude applied here is an approximation |
+| Saved keys | `lora_unet_` + underscores + `lora_down` / `lora_up` | `diffusion_model.` + dots + `lora_A` / `lora_B` (the dot form; `peft_format` drops `.alpha`) | diffusers form (`transformer.` + dots) or the dot form, with `lora_alpha` in the metadata | the dot form plus a per-weight `.alpha` ([the saved file](#the-saved-file-d1)) |
+| Plain LoRA keys | `lora_down` / `lora_up` plus `.alpha` (strength alpha / rank) | with `peft_format` it writes `lora_A`/`lora_B` and drops `.alpha` | switches between the diffusers form and the dot form (`lycoris_` belongs to LoKr) | `lora_A`/`lora_B` plus a per-weight `.alpha`. Our readers also take `.lora_A.default`. v1's default rank is 16 |
 
 DiffSynth-Studio `543bf84` (Qwen-Image-2.1's second reference) differs: its training defaults are `--learning_rate` 1e-4 and `--lora_rank` 32, it saves bare `.lora_A.default.weight` keys (the survey found our reader takes them), and its schedulers separate the inference and training shift (`set_timesteps_moss_image(shift=1.0, training_shift=1.0)`). Plain LoRA only: no LoKr, no DoRA (survey).
 
@@ -284,7 +284,7 @@ The data is the data folder's `records/2026-11-02-lora-train-data/` (`<data>`: L
 1. **The bind**: `xestrata-image-lora-probe`'s `map` must match every name with no refusal.
 1. **Generation and effect**: through serve, make the same prompt and seed with and without one adapter, show the difference with LPIPS and leave the eye check to a person
    (the way of `records/2026-10-29-image-lora/pipeline`).
-1. **The outside readers**: the same file must load in ComfyUI 7a28332 (once each in cards 5, 7, 8, 9). diffusers is only Qwen-Image-2.1, as in the table above.
+1. **The outside readers**: the same file must load in the common dot-form reader (once each in cards 5, 7, 8, 9). diffusers is only Qwen-Image-2.1, as in the table above.
 
 ## Measuring
 
@@ -349,7 +349,7 @@ The survey of 2026-11-02 listed nine problems. What v1 fixes goes to cards 13 an
 | 4 diffusers' metadata alpha (`transformer.lora_alpha`) and `use_rslora` are not found | card 15 (`.alpha` wins; metadata applies only where `.alpha` is absent) |
 | 5 LyCORIS' `dora_scale` shaped `[out,1]` is refused | card 15 (loosen the shape, keep the direction check) |
 | 6 no target for MOSS-Image's fused `proj.qkv` | **not fixed**. The documents refuse it |
-| 7 the `base_model.model.` prefix (PEFT's own save) is unknown | **not fixed**. The documents refuse it (ComfyUI does not read it either) |
+| 7 the `base_model.model.` prefix (PEFT's own save) is unknown | **not fixed**. The documents refuse it (the common readers do not read it either) |
 | 8 DoRA on LoKr and LoHa is refused | **not fixed**. The documented refusal stays and goes into the documents |
 | 9 keys with no role are dropped in silence (`base_layer.bias` and the rest) | card 15 (warn) |
 
@@ -368,7 +368,7 @@ None of these go into the product. They are cloned at the survey's versions unde
 | --- | --- |
 | this repository | XeStrata dev `11824103d` (the code lines and numbers quoted here) |
 | the main source of the shared machinery | sd-scripts `cb70b96` |
-| the dot form's reading side, DoRA and LoKr | ComfyUI `7a28332` (`comfy/lora.py`, `comfy/weight_adapter/`) |
+| the dot form's reading side, DoRA and LoKr | the common dot-form reader |
 | Qwen-Image-2.1's reference | diffusers 0.41.0 (`venv-mage`) and peft `d672982` (the DoRA math only, in a reference environment nothing in the product uses) |
 | Mage-Flow and MageTrail references | ai-toolkit `e9c72b7` and SimpleTuner `dc793c0`, with our `src/image/mf_dit.cpp` target names as the reference |
 | LoKr and LoHa shapes | LyCORIS `7abd570` |

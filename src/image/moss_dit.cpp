@@ -900,7 +900,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             const float scale = u.scale * e.scale();
             // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's
-            // delta and a DoRA's base factors, as ComfyUI's weight_decompose scales the weight with no delta)
+            // delta and a DoRA's base factors, as a DoRA's decomposition scales the weight with no delta)
             if (u.scale == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
             // a DoRA's: the entry's rows' delta factors (its B's, by the entry's rows), and each part's base factors
             const bool dora = !e.dora.empty();
@@ -1641,7 +1641,7 @@ void MossDit::ref_coord(int64_t r, float* p) const {
 
 void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     gpu::stream_sync(s_);
-    ref_text_start_ = layout == QiRefLayout::TextStart;
+    ref_text_start_ = layout == QiRefLayout::MossEdit;
     for (void* p : {(void*) ref_k16_, (void*) ref_v16_, (void*) ref_hs_, (void*) ref_i8_, (void*) ref_x_})
         release(allocs_, p);
     ref_k16_ = ref_v16_ = nullptr;
@@ -1658,7 +1658,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         ref_shapes_.emplace_back(f.h, f.w);
     }
     if (R == 0) return;
-    if (layout == QiRefLayout::TimestepZero || layout == QiRefLayout::Index) {
+    if (layout == QiRefLayout::AitkNoKv || layout == QiRefLayout::Appended) {
         // in the stream: their input projection kept, and timestep 0's modulation beside the step's
         uint16_t* x16 = alloc<uint16_t>(allocs_, R * in_ch_);
         int64_t o = 0;
@@ -1670,7 +1670,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
         ref_x_ = alloc<uint16_t>(allocs_, R * C_);
         product(x16, nullptr, ctl_path_.empty() ? vin_ : ctl_w0_, nullptr, rx, R, ctl_path_.empty() ? b_vin_ : ctl_b_);
         prefill::to_bf16(rx, ref_x_, R * C_, s_);
-        if (layout == QiRefLayout::TimestepZero) {
+        if (layout == QiRefLayout::AitkNoKv) {
             time_embedding(0.f);
             gpu::copy_async(mod_ + 6 * C_, mod_, (size_t) (6 * C_) * 4, s_);
             stream_t0_ = true;

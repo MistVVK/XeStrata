@@ -30,7 +30,7 @@
 // 128 to 512 (the convolutions' bands are the decoder's alone, so a decode is the same with the encoder loaded).
 // Where the whole does not fit the room decode is given, it runs the stages up to the deepest level that fits on the
 // whole latent (the middle's attention and the group norms there over all of it) and the rest in overlapping tiles (4
-// tokens, 64 pixels, on each side shared), blended linearly across the overlap as ComfyUI's tiled decode does; the
+// tokens, 64 pixels, on each side shared), blended linearly across the overlap; the
 // group norms of the tiled levels take each tile's statistics.
 //
 // SeedVR2's VAE (ByteDance-Seed/SeedVR's video_vae_v3, as Comfy-Org's ema_vae_fp16 names it, diffusers' names) is the

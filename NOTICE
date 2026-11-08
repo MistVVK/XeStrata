@@ -51,7 +51,9 @@ Every copyright holder whose work is in this repository, its license and where t
   Apache-2.0 - the image engine's SAM 3 detector (src/image/sam3.cpp, include/strata/image/sam3.hpp), written after
   vLLM-Omni's port of it (https://github.com/vllm-project/vllm-omni, vllm_omni/diffusion/models/sam3/ at 15bb15d),
   and its video segmentation's rules (src/image/sam3_video.cpp, include/strata/image/sam3_video.hpp), after
-  vllm_omni/diffusion/models/sam3/sam3_video.py at 2b610b3; that code stays under Apache-2.0, the files as a whole are
+  vllm_omni/diffusion/models/sam3/sam3_video.py at 2b610b3, and its lab color correction (src/image/img_color.cpp,
+  include/strata/image/img_color.hpp: the wavelet split's bound and the order of the steps), after
+  vllm_omni/diffusion/models/seedvr2/pipeline_seedvr2.py; that code stays under Apache-2.0, the files as a whole are
   under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
 - Copyright 2020 The Google AI Language Team Authors, Facebook AI Research authors and The HuggingFace Inc. team
   Apache-2.0 - the image engine's Florence-2 beam search (src/image/florence2.cpp), written after transformers'
@@ -62,6 +64,31 @@ Every copyright holder whose work is in this repository, its license and where t
   Apache-2.0 - the words Florence-2's phrase grounding leaves out (serve/image_regions.py, GROUNDING_SKIP), from
   Florence-2's processing_florence2.py (https://huggingface.co/microsoft/Florence-2-large); that list stays under
   Apache-2.0, the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright (c) 2024 SageAttention team; changes Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES (comfy-kitchen)
+  Apache-2.0 - the int8 attention's probabilities as unsigned bytes on NVIDIA GPUs (src/kernels/xe/flash_attn_i8.cpp:
+  the offset of log2 255, the packing of four of them into a word and their row sums by dp4a), written after
+  comfy-kitchen's SageAttention kernels (https://github.com/Comfy-Org/comfy-kitchen,
+  comfy_kitchen/backends/cuda/sage_attention/); that code stays under Apache-2.0, the file as a whole is under the
+  LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright the comfyui_controlnet_aux contributors
+  Apache-2.0 - the defaults and limits of the control maps' settings (serve/image_controls.py: M-LSD's thresholds,
+  Canny's), as https://github.com/Fannovel16/comfyui_controlnet_aux has them; they stay under Apache-2.0, the file as
+  a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright the ComfyUI-SeedVR2_VideoUpscaler contributors
+  Apache-2.0 - the crossfade of SeedVR2's overlapping chunks of a video (src/upscale/seedvr2.cpp, kept_share: a Hann
+  window's half over the overlap's middle third), after https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler
+  (src/core/generation_utils.py); that code stays under Apache-2.0, the file as a whole is under the LGPL
+  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt
+- Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
+  MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
+  sigma the model is asked at, their constants and the settings' defaults), written after
+  https://github.com/muerrilla/sd-webui-detail-daemon and https://github.com/Jonseed/ComfyUI-Detail-Daemon; that code
+  stays under MIT, the files as a whole are under the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright (c) 2024 ZhengPeng
+  MIT - BiRefNet's foreground estimate (src/image/aux_kernels.cpp, include/strata/image/aux_kernels.hpp and
+  src/image/birefnet.cpp: the blur fusion's two passes, their radii and constants), written after
+  https://github.com/ZhengPeng7/BiRefNet (image_proc.py); that code stays under MIT, the files as a whole are under the
+  LGPL (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2017 Sean Barrett
   MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
@@ -73,8 +100,9 @@ Every copyright holder whose work is in this repository, its license and where t
   which the web app's chat draws math with - third_party/main/katex/LICENSE, LICENSES/MIT.txt
 - Copyright (c) 2014 - 2022 Knut Sveidqvist, and the authors of the packages its script bundles
   MIT - third_party/main/mermaid/ (mermaid 12.3.0, its dist/mermaid.min.js), which the web app's chat draws a plan's
-  flowchart with; the script also carries d3 (ISC, parts BSD-3-Clause), elkjs (EPL-2.0, taken under it of its
-  EPL-2.0 or GPL-3.0-or-later), chevrotain (Apache-2.0), DOMPurify (Apache-2.0, of its MPL-2.0 or Apache-2.0) and the
+  flowchart with; the script also carries d3 (ISC, parts BSD-3-Clause), elkjs (Copyright (c) 2017 Kiel University
+  and others; EPL-2.0, taken under it of its EPL-2.0 or GPL-3.0-or-later; compiled and minified there, its source
+  at https://github.com/kieler/elkjs/tree/0.12.0, as BUNDLED.md says), chevrotain (Apache-2.0), DOMPurify (Apache-2.0, of its MPL-2.0 or Apache-2.0) and the
   MIT packages third_party/main/mermaid/BUNDLED.md lists - third_party/main/mermaid/LICENSE, LICENSES/MIT.txt,
   LICENSES/ISC.txt, LICENSES/BSD-3-Clause.txt, LICENSES/Apache-2.0.txt, LICENSES/EPL-2.0.txt
 - Copyright The containers/common authors (https://github.com/containers/container-libs); changes Copyright 2026
@@ -209,6 +237,78 @@ Copyright 2024, Xuanteng Huang
 Copyright 2024, Christian Kastner
 Copyright 2025, Igor Luppi
 Copyright 2025-2026, Talha Can Havadar
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+sd-webui-detail-daemon (MIT License)
+------------------------------------
+
+Copyright (c) 2024 Sahand Ahmadian
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+ComfyUI-Detail-Daemon (MIT License)
+-----------------------------------
+
+Copyright (c) 2024 Jonseed
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+BiRefNet (MIT License)
+----------------------
+
+Copyright (c) 2024 ZhengPeng
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

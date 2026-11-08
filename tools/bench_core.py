@@ -1124,7 +1124,7 @@ def collect(out: Path, names: dict[str, str], say: Callable = print) -> None:
             steps = next(r["steps"] for r in image if (r["gpu"], r["model"]) == (gpu, model))
             say(f"\n### {gpu} image generation, {model} (1024x1024, {steps} steps)\n\n| Engine | backend | image (s) | "
                 "sampling (s) | VAE (s) |\n| --- | --- | ---: | ---: | ---: |")
-            # the named arms first, then any other (bench_comfy.py's ComfyUI arms)
+            # the named arms first, then any other (bench_comfy.py's arms)
             for name in dict.fromkeys([*names.values(), *sorted(r["engine"] for r in image)]):
                 c = [r for r in image if (r["gpu"], r["model"], r["engine"]) == (gpu, model, name)]
                 if not c:

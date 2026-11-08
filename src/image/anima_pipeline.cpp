@@ -26,9 +26,9 @@ namespace gpu = strata::gpu;
 namespace anima_pipeline_detail {
 
 constexpr int kSteps = 30;          // the model card's 30 to 50 for the base and aesthetic models
-constexpr float kShift = 3.0f;      // ComfyUI's sampling_settings for the model
+constexpr float kShift = 3.0f;      // the model's sampling shift
 constexpr int64_t kMaxTokens = 4096;
-constexpr int32_t kPad = 151643;    // Qwen3's <|endoftext|>: ComfyUI's one token for an empty prompt
+constexpr int32_t kPad = 151643;    // Qwen3's <|endoftext|>: the one token of an empty prompt
 constexpr int32_t kT5End = 1;       // T5's </s>
 
 sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
@@ -410,8 +410,8 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
         encode_base(r, *base, ls);
     }
     if (stage) stage("text");
-    // STRATA_IMAGE_PARTS: each part's time on stderr (the comparison with ComfyUI's parts), the prompt's states and
-    // contexts made again every image
+    // STRATA_IMAGE_PARTS: each part's time on stderr (to compare the parts with another program's), the prompt's
+    // states and contexts made again every image
     const bool parts = strata::env_get("IMAGE_PARTS") != nullptr;
     if (parts) {
         last_ids_.clear();
@@ -460,7 +460,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
     }
     p.text_cached = cached;
     const auto t1 = clock::now();
-    // the seed's noise as ComfyUI's (PyTorch's CPU randn of the latent [16][2h][2w]) in the tokens' order
+    // the seed's noise as PyTorch's CPU randn makes it (of the latent [16][2h][2w]), in the tokens' order
     const int64_t L = d.latent_channels(), TV = d.token_values(), N = TV * h * w;
     const auto noise = torch_cpu_randn(r.seed, (uint64_t) N);
     std::vector<float> tokens((size_t) N);

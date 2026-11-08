@@ -39,26 +39,26 @@ v1 の既定で当てるのは**ブロック内の attention と MLP の射影**
 
 ## 保存の形（D1）
 
-1 ファイル = 1 アダプターの `.safetensors`。鍵は ComfyUI generic / ai-toolkit の形（dot 形）で、**接頭辞 `diffusion_model.` + 点区切りの対象名 + 役割**です。
+1 ファイル = 1 アダプターの `.safetensors`。鍵は generic / ai-toolkit の形（dot 形）で、**接頭辞 `diffusion_model.` + 点区切りの対象名 + 役割**です。
 対象名は上の `build_lora_targets` の名前をそのまま書きます（写像表はありません。トレイナーは自分の対象名を書くだけです）。
 
 | 方式 | 1 つの重みの鍵 | 形 | 型 |
 | --- | --- | --- | --- |
 | 素の LoRA | `<対象>.lora_A.weight`、`<対象>.lora_B.weight`、`<対象>.alpha` | A `[rank][in]`・B `[out][rank]`・alpha は 0 次元 | F32 |
 | DoRA | 素の LoRA の 3 本 + `<対象>.dora_scale` | `dora_scale` は `[out]`（重みの行）だけ | F32 |
-| LoKr | `<対象>.lokr_w1`、`<対象>.lokr_w2_a`、`<対象>.lokr_w2_b`、`<対象>.alpha` | `.weight` を付けない（sd-scripts と ComfyUI の LoKr と同じ） | F32 |
+| LoKr | `<対象>.lokr_w1`、`<対象>.lokr_w2_a`、`<対象>.lokr_w2_b`、`<対象>.alpha` | `.weight` を付けない（sd-scripts の LoKr と一般の読み手と同じ） | F32 |
 
-- 読む側（`serve/loras.py` と `src/image/image_lora.cpp`）と 4 つの DiT はこのカードで変えません。dot 形は今日の reader と ComfyUI が問題なく読む形です（調査 2026-11-02 の「問題なく読めたもの」）。
-- 強さは**重みごとの `.alpha` テンソル**で書き出します（形式はこれ 1 つ。メタデータの検索に頼りません）。カード 15 が `.alpha` を優先し、メタデータの `lora_alpha` は `.alpha` の無い重みにだけ効きます（ComfyUI と同じ。`comfy/lora.py`）。
+- 読む側（`serve/loras.py` と `src/image/image_lora.cpp`）と 4 つの DiT はこのカードで変えません。dot 形は今日の reader と一般の dot 形の読み手が問題なく読む形です（調査 2026-11-02 の「問題なく読めたもの」）。
+- 強さは**重みごとの `.alpha` テンソル**で書き出します（形式はこれ 1 つ。メタデータの検索に頼りません）。カード 15 が `.alpha` を優先し、メタデータの `lora_alpha` は `.alpha` の無い重みにだけ効きます（一般の dot 形の読み手と同じ）。
 - v1 が書くメタデータ: `modelspec.title`、`modelspec.trigger_phrase`（トリガー語）、`ss_network_module`（`networks.lora`・`networks.lokr`）、`ss_network_dim`、`ss_network_alpha`、
   `ss_seed`、`ss_learning_rate`、`ss_optimizer_type`、`ss_max_steps`、`ss_model`（`model_name`）、`ss_xestrata_revision`。勧める強さ（`recommended_strength*`）は書きません（1.0 のまま）。
 
 ### alpha（強さの掛かり方）
 
-エンジンも ComfyUI も sd-scripts も、デルタに `alpha / rank` を掛けます（`image_lora.cpp` の `LoraEntry::scale()`、`comfy/weight_adapter/lora.py`、`networks/lora.py`）。
+エンジンも一般の dot 形の読み手も sd-scripts も、デルタに `alpha / rank` を掛けます（`image_lora.cpp` の `LoraEntry::scale()`、sd-scripts の `networks/lora.py`）。
 alpha は自由値で、**既定の候補は alpha = rank**（掛かりが 1.0 になる。sd-scripts の `--network_alpha` の既定 1 とちがい、この値は `network_dim` 16 と揃えます）。
 
-- diffusers の Qwen-Image 経路は dot 形の `.alpha` を `.pop` して**適用しません**（`loaders/lora_conversion_utils.py`、`loaders/lora_pipeline.py`）。alpha ≠ rank で学習すると、当方・ComfyUI と diffusers で強さがずれます。
+- diffusers の Qwen-Image 経路は dot 形の `.alpha` を `.pop` して**適用しません**（`loaders/lora_conversion_utils.py`、`loaders/lora_pipeline.py`）。alpha ≠ rank で学習すると、当方・一般の dot 形の読み手と diffusers で強さがずれます。
   この注意は docs（カード 10）に書きます。kohya の `lora_down`/`lora_up` 形では diffusers も `alpha / rank` を掛けるので、外部ファイルの受け入れ（カード 13）には効いません。
 
 ### Qwen-Image-2.1 の MLP
@@ -67,12 +67,12 @@ Qwen-Image-2.1 の MLP の第 1 の重みは GPU では束ねた 1 枚です（`
 v1 の保存は**束ねず、`img_mlp.gate_layer` と `img_mlp.proj` を別々に**書きます（行を 12288 ずつに割る。`img_mlp.out` はそのまま 1 本）。
 
 - 分けた形は読む側が 3 つとも当てます。当方（`qi_dit.cpp` の slot が gate_layer を行 0 から、proj を行 12288 から読む。`xestrata-image-lora-probe` の bind で合成模型の全鍵 21 本が 21/21 当たり、
-  `records/2026-10-29-image-lora/parity` で分けた形も束ねた形も重みごとに cos 1.0000000）、ComfyUI（`comfy/lora.py` が「LoRAs address the halves」と書いて束ねた重みを行で半々に割る）、
+  `records/2026-10-29-image-lora/parity` で分けた形も束ねた形も重みごとに cos 1.0000000）、一般の dot 形の読み手（束ねた重みを行で半々に割る。LoRA は半分ずつを指す）、
   diffusers 0.41.0（`img_mlp.gate_layer` と `img_mlp.proj` が実際のモジュールで、束ねた `gate_up` は無い）。
 - 束ねた `img_mlp.gate_up` をファイルに入れると、diffusers 側はその target を見つけられず**黙って無視します**（他の層が一致すれば注入は通る。`peft/tuners/tuners_utils.py` の `NoMatchingPeftModuleError` は一致 0 件のときだけ）。
   同じファイルで当方だけがデルタを当てるので、絵が黙って違います。MLP だけのアダプターなら注入全体が失敗します。
 
-MOSS-Image は逆に**束ねた形**（`proj.ffn_up_gate`）で書きます。diffusers 0.41.0 に MOSS-Image が無く、ComfyUI の MOSS-Image と sd-scripts の重みがどちらも束ねた `ffn_up_gate` なので、形が 1 つに決まるためです。
+MOSS-Image は逆に**束ねた形**（`proj.ffn_up_gate`）で書きます。diffusers 0.41.0 に MOSS-Image が無く、一般の MOSS-Image の重みと sd-scripts の重みがどちらも束ねた `ffn_up_gate` なので、形が 1 つに決まるためです。
 
 ### LoKr の軸（模型共通の固定）
 
@@ -87,9 +87,9 @@ lokr_w2_b     [rank][in_n]
 デルタ         kron(w1, w2_a @ w2_b) * (alpha / rank)    行 out_l * out_k = out、列 in_m * in_n = in
 ```
 
-`factorization` は sd-scripts の `networks/lokr.py` の同じ式です。rank は `lokr_w2_b` の行数で、alpha を割る数です（ComfyUI の `comfy/weight_adapter/lokr.py` と当方の `make_lokr` が同じ取り方をします）。
+`factorization` は sd-scripts の `networks/lokr.py` の同じ式です。rank は `lokr_w2_b` の行数で、alpha を割る数です（一般の dot 形の読み手と当方の `make_lokr` が同じ取り方をします）。
 v1 の rank は 3 方式すべて 16 で、対象の重みはどれも因子形に収まります（`max(out_k, in_n) / 2` が 32 以上）。**full matrix 形（`lokr_w2` を丸ごと）は書きません**。あの形では 3 つの読む側どれもが alpha を割らずに強さ 1.0 になる（`records/2026-10-29-image-lora/formats` で確かめた）ので、alpha を効かせたい v1 は因子形だけ書きます。
-Tucker の核（`lokr_t2`）も書きません（v1 の対象はすべて Linear）。式の確かめは `records/2026-10-29-image-lora/formats`（ComfyUI の `calculate_weight` との相対差 1.5e-7 〜 4.9e-7）。
+Tucker の核（`lokr_t2`）も書きません（v1 の対象はすべて Linear）。式の確かめは `records/2026-10-29-image-lora/formats`（ファイルのテンソルから torch で組んだ形式ごとの重みとの相対差 1.5e-7 〜 4.9e-7）。
 
 ### DoRA のノルムの規約
 
@@ -100,10 +100,10 @@ c_r = m_r / (|W_r| + eps)      eps = 1.1920929e-07（FP32 の eps。`kLoraDoraEp
 y   = [1 + s (c - 1)] (W x) + s c (alpha / rank) (B A x)
 ```
 
-学習の始めは `m_r = |W_r|` に初期化します（c = 1 で、最初は素の模型と同じ）。要求の強さ s が 1 のとき式は ComfyUI の `weight_decompose` と同じで、実測の**相対差**は 3.1e-8 〜 4.8e-8 です（F32 の重み。丸めの範囲。強さ -0.5 まで入れて 1.9e-7。`records/2026-10-29-image-lora/formats` の DoRA の表と同じ値）。
-**PEFT は分母が `|W + ΔV|`** で、実測の相対差は 2.4e-4 です。v1 は当方と ComfyUI の側（W の行ノルム）に揃えます。
+学習の始めは `m_r = |W_r|` に初期化します（c = 1 で、最初は素の模型と同じ）。要求の強さ s が 1 のとき式は W の行ノルムを使う DoRA の重みの分解で、実測の**相対差**は 3.1e-8 〜 4.8e-8 です（F32 の重み。丸めの範囲。強さ -0.5 まで入れて 1.9e-7。`records/2026-10-29-image-lora/formats` の DoRA の表と同じ値）。
+**PEFT は分母が `|W + ΔV|`** で、実測の相対差は 2.4e-4 です。v1 は一般の dot 形の読み手と同じく W の行ノルムに揃えます。
 
-- ComfyUI が足す eps は `torch.finfo(weight.dtype).eps` で、土台の型に付きます。当方は型に関係なく FP32 の値を足すので、次の差が出ます。行ノルムが 1 の重みで、土台が BF16 なら ComfyUI の c は当方より 0.775% 小さく（eps 0.0078125）、F16 なら 0.098% 小さく（eps 0.0009765625）、FP32 の土台だけ当方と同じです（eps 1.1920929e-07）。行ノルムが小さいほど開きます（記録の bf16 の実測は行ノルム 0.3〜1 で、重みの変化の相対差 1.69e-02。`formats` の DoRA の表の下の 2 行。行ノルムが 1 により近い実物ではもっと小さい）。
+- eps に `torch.finfo(weight.dtype).eps` を足す読み手では、eps が土台の型に付きます。当方は型に関係なく FP32 の値を足すので、次の差が出ます。行ノルムが 1 の重みで、土台が BF16 ならその c は当方より 0.775% 小さく（eps 0.0078125）、F16 なら 0.098% 小さく（eps 0.0009765625）、FP32 の土台だけ当方と同じです（eps 1.1920929e-07）。行ノルムが小さいほど開きます（記録の bf16 の実測は行ノルム 0.3〜1 で、重みの変化の相対差 1.69e-02。`formats` の DoRA の表の下の 2 行。行ノルムが 1 により近い実物ではもっと小さい）。
 - 量子化した土台（Q8_0 など）では、エンジンが推論で読む復号後の重みから行ノルムを取ります（`dora_norms` が `model.diffusion_model.<対象>.weight` を読む）。学習も同じ重みから取ります。
 - `dora_scale` の長さは**重みの行数**でなければなりません（列方向はエンジンが断り、一覧も `(rows,)` で検査します）。
 - **LoKr に DoRA は足しません**（エンジンの断りは文書どおり）。DoRA は素の LoRA に m を足す形です。
@@ -115,7 +115,7 @@ sd-scripts は `lora_unet_` + 下線区切りの名前で保存します（`netw
 当方の reader は `lora_unet_` を外して**下線を全部点に替えます**（`serve/loras.py` の `split_key`）。だから下線を 1 つも含まない名前にだけ当たります。
 実測（2026-11-02）では、4 模型のうち読めるのは MOSS-Image のブロックの `layers.{b}.proj.q/k/v/o` だけで、`proj.ffn_up_gate`（→ `proj.ffn.up.gate`）・`video_embedder`・`time_embedding.0`・
 `final_linear_video`・`text_embedder.*` と、Mage-Flow・MageTrail・Qwen-Image-2.1 の `transformer_blocks.*` を含む名前はすべて外れます（ファイルごと拒否）。
-ComfyUI は写せます（`comfy/lora.py` が `lora_unet_<下線>` を鍵に加える。sd-scripts 自身の `networks/convert_anima_lora_to_comfy.py` も同じ写し方）。
+ほかの読み手は写せます（`lora_unet_<下線>` の鍵として。sd-scripts 自身の Anima の変換も同じ写し方）。
 
 **v1 の保存は dot 形**なので、この問題は起きません。sd-scripts 形のファイルを読む対応（`lora_unet_` と `lycoris_` の名前の照合）は**カード 13**が外部ファイルの互換として入れます。
 カード 13 が入るまで、sd-scripts がそのまま書いたファイルは本倉庫では読めません。docs（カード 10）は日本語原本と英語訳の両方に鍵対応表とこの旨を書きます。
@@ -234,9 +234,9 @@ sd-scripts の例は AdamW8bit・`lr_scheduler=constant`・`network_dim=16` な�
 | 損失 | flow matching（rectified flow）。`target = noise - latents`、`model_prediction_type` の既定は `sigma_scaled`（FLUX と MOSS の文書の例は `raw`）、`weighting_scheme` の既定は `uniform` | velocity の MSE。`sigma` の目盛りは scheduler の config どおり | flow matching（diffusers の scheduler）+ `--flow_matching*` の欄 | `raw` + 重み 1.0（`v = eps - x`） |
 | optimizer と LR | 既定は AdamW（`--optimizer_type`）。文書の例は AdamW8bit・`lr_scheduler=constant`・lr 1e-4・`network_dim=16`（`--network_dim` の既定は None で、LoRA 側の 4） | `toolkit/optimizer.py` が既定で `torch.optim.AdamW` を `eps = 1e-6`（当方の 1e-8 と違う）で組み、`automagic*` など独自の optimizer も選べる | `--optimizer` が必須で、bnb-adamw8bit・prodigy・soap など長い選択肢から選ぶ | AdamW（F32 の状態、`eps = 1e-8`）、lr 1e-4・warmup 50・勾配の積み 4・1500 step・rank 16 |
 | LoKr の鍵 | `lokr_w1` は常に丸ごと。w2 は因子（`lokr_w2_a` `[out_k][rank]`・`lokr_w2_b` `[rank][in_n]`）か full matrix。`alpha` を添える | 同じ名前。`peft_format` で保存しても LoKr だけは `.alpha` を残す（`network_mixins.py`）。古い形は `lycoris_` 前置 | LyCORIS を通す（`lycoris_` 前置。調査の問題 2） | sd-scripts の形（w1 丸ごと・w2 因子・`.alpha`）。full matrix と Tucker は書かない |
-| DoRA の分母 | 学習コードなし（`dora` の検索 0 件） | `toolkit/models/DoRA.py` が `norm(W + ΔW)` の行ノルムで、鍵の名前は `.magnitude`（`alpha` を `.magnitude` に書き換える） | PEFT / LyCORIS 経由（`lora_magnitude_vector`） | 当方と ComfyUI の `norm(W)`。鍵は `dora_scale`。外の magnitude を当方で当てるのは近似 |
-| 保存の鍵の形 | `lora_unet_` + 下線 + `lora_down`/`lora_up` | `diffusion_model.` + 点 + `lora_A`/`lora_B`（ComfyUI 形。`peft_format` だと `.alpha` を落とす） | diffusers 形（`transformer.` + 点）と comfyui 形の切り替え。メタデータに `lora_alpha` を書く | dot 形 + 重みごとの `.alpha`（上の[保存の形](#保存の形d1)） |
-| 素の LoRA の鍵 | `lora_down`/`lora_up` + `.alpha`（強さは alpha / rank） | `peft_format` なら `lora_A`/`lora_B` で、`.alpha` は落とす | diffusers 形と comfyui 形を切り替える（`lycoris_` は LoKr 側の話） | `lora_A`/`lora_B` + 重みごとの `.alpha`。読む側は `.lora_A.default` も読む。v1 の rank の既定は 16 |
+| DoRA の分母 | 学習コードなし（`dora` の検索 0 件） | `toolkit/models/DoRA.py` が `norm(W + ΔW)` の行ノルムで、鍵の名前は `.magnitude`（`alpha` を `.magnitude` に書き換える） | PEFT / LyCORIS 経由（`lora_magnitude_vector`） | 当方と一般の dot 形の読み手の `norm(W)`。鍵は `dora_scale`。外の magnitude を当方で当てるのは近似 |
+| 保存の鍵の形 | `lora_unet_` + 下線 + `lora_down`/`lora_up` | `diffusion_model.` + 点 + `lora_A`/`lora_B`（dot 形。`peft_format` だと `.alpha` を落とす） | diffusers 形（`transformer.` + 点）と dot 形の切り替え。メタデータに `lora_alpha` を書く | dot 形 + 重みごとの `.alpha`（上の[保存の形](#保存の形d1)） |
+| 素の LoRA の鍵 | `lora_down`/`lora_up` + `.alpha`（強さは alpha / rank） | `peft_format` なら `lora_A`/`lora_B` で、`.alpha` は落とす | diffusers 形と dot 形を切り替える（`lycoris_` は LoKr 側の話） | `lora_A`/`lora_B` + 重みごとの `.alpha`。読む側は `.lora_A.default` も読む。v1 の rank の既定は 16 |
 
 DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。学習の既定は `--learning_rate` 1e-4・`--lora_rank` 32 で、保存の鍵は `.lora_A.default.weight` の裸の形（調査では当方がそのまま読めたとあります）。scheduler は推論と学習の shift を分けます（`set_timesteps_moss_image(shift=1.0, training_shift=1.0)`）。素の LoRA だけで、LoKr と DoRA はありません（調査）。
 
@@ -259,7 +259,7 @@ DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。
 1. **一覧**: その模型の family で `serve/loras.py` の `Folder` を読み、ファイルが `listing` に出ること（`skipped` に出たら不合格）。`rank`・`trigger`・`targets` の値が本物と合うことも見ます。
 1. **バインド**: `xestrata-image-lora-probe` の `map` で名前が全部当たり、拒否の理由が出ないこと。
 1. **生成と効き目**: serve 経由で素の画像と 1 本当てた画像を同じ prompt・同じ seed で作り、LPIPS で差を示し、目視は人に残します（`records/2026-10-29-image-lora/pipeline` の流儀）。
-1. **外の読む側**: ComfyUI（7a28332）で同じファイルが読めること（カード 5・7・8・9 で 1 度ずつ）。diffusers は上の表どおり Qwen-Image-2.1 だけ。
+1. **外の読む側**: 一般の dot 形の読み手で同じファイルが読めること（カード 5・7・8・9 で 1 度ずつ）。diffusers は上の表どおり Qwen-Image-2.1 だけ。
 
 ## 測り方
 
@@ -320,7 +320,7 @@ contrib-llvm（oneMKL・W8A8）では同じ要求で 3.393 / 0.588 / 3.074 秒�
 | 4 diffusers のメタデータの alpha（`transformer.lora_alpha`）と `use_rslora` が見つからない | カード 15（`.alpha` を優先し、メタデータは `.alpha` の無い重みにだけ効く） |
 | 5 LyCORIS の `dora_scale` の形 `[out,1]` を断る | カード 15（形を緩め、方向は検査する） |
 | 6 MOSS-Image の束ねた `proj.qkv` の対象が無い | **直さない**。docs に断りを書く |
-| 7 `base_model.model.` の接頭辞（PEFT の直接保存）を知らない | **直さない**。docs に断りを書く（ComfyUI も読みません） |
+| 7 `base_model.model.` の接頭辞（PEFT の直接保存）を知らない | **直さない**。docs に断りを書く（一般の読み手も読みません） |
 | 8 LoKr・LoHa の DoRA を断る | **直さない**。文書どおりの拒否をそのまま docs に書く |
 | 9 役割の無い鍵を黙って飛ばす（`base_layer.bias` など） | カード 15（警告を出す） |
 
@@ -339,7 +339,7 @@ booru タグ形のキャプションへの書き換え、保存形式を kohya �
 | --- | --- |
 | 本倉庫 | XeStrata dev `11824103d`（この文書のコードの行と数値） |
 | 共通機構の主な写し元 | sd-scripts `cb70b96` |
-| dot 形の読み側と DoRA・LoKr の基準 | ComfyUI `7a28332`（`comfy/lora.py`、`comfy/weight_adapter/`） |
+| dot 形の読み側と DoRA・LoKr の基準 | 一般の dot 形の読み手 |
 | Qwen-Image-2.1 の対照 | diffusers 0.41.0（`venv-mage`）と peft `d672982`（DoRA の数理の参照のみ。製品に影響しない） |
 | Mage-Flow・MageTrail の対照 | ai-toolkit `e9c72b7` と SimpleTuner `dc793c0`。当方の `src/image/mf_dit.cpp` の対象名を正にします |
 | LoKr・LoHa の形の対照 | LyCORIS `7abd570` |

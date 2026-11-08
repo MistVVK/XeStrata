@@ -17,8 +17,7 @@
 // frames pushed are encoded in the VAE's slices (its causal convolutions carry what the slice before left: the same
 // latents as the whole clip at once); each chunk of latents goes through the DiT once its latents are there (the noise
 // the same seed's for every chunk, of the chunk's shape [16][t][h][w], as the sampler makes it for each); the chunks
-// overlap by `overlap` latents, crossfaded (the previous chunk's weight a Hann fade over the overlap's middle third,
-// flat on its outer thirds); the latents no later chunk touches are decoded, in the VAE's slices too, and their
+// overlap by `overlap` latents, crossfaded (seedvr2.cpp, kept_share); the latents no later chunk touches are decoded, in the VAE's slices too, and their
 // frames are ready.  What it holds does not grow with the clip: a chunk's latents and the frames of a slice.  The
 // clip's frames are padded to 4 n + 1 (the last one repeated), the padding's output dropped.
 #pragma once

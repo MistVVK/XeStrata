@@ -3,8 +3,8 @@
 // include/strata/image/hunyuanimage3_file.hpp - HunyuanImage 3.0's weights as its safetensors files hold them: the quantized
 // matrices and the routed experts' banks, read in place.
 //
-// The files come from ComfyUI's ecosystem (HunyuanImage-3.0-*-ComfyUI), in two quantized forms, and the form is in
-// each quantized tensor's `comfy_quant` JSON:
+// The files are single checkpoints (PedroMarinhoDev's HunyuanImage-3.0-*-ComfyUI), in two quantized forms, and the form
+// is in each quantized tensor's `comfy_quant` JSON:
 //
 //   * `int8_tensorwise` with `convrot` (81.9 GB, the original's weights at 8 bits): `weight` I8 [E][N][K] and
 //     `weight_scale` F32 [E][N][1], one scale a row; K's groups of `convrot_groupsize` (256) were rotated when the
@@ -63,8 +63,8 @@ struct HunyuanImage3Matrix {
 };
 
 /// Whether a DiT file is laid out as a HunyuanImage 3.0 model: its header says so (`format`), or a matrix carries a
-/// `comfy_quant` (ComfyUI's quantized save), or it holds the model's own pieces (`model.wte.weight` beside
-/// `patch_embed.model.0.weight`).  The header alone is read (no mapping), so strata-image can pick its pipeline:
+/// `comfy_quant` (a quantized save's description of its form), or it holds the model's own pieces (`model.wte.weight`
+/// beside `patch_embed.model.0.weight`).  The header alone is read (no mapping), so strata-image can pick its pipeline:
 /// a HunyuanImage save and a Mage-Flow save share the `.safetensors` extension.  False on a file that is not a
 /// safetensors one (a GGUF) or whose header cannot be read.
 bool hunyuanimage3_is_dit_file(const std::string& path);

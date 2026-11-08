@@ -9,7 +9,7 @@ the file's prefix off, ".weight" off, the role's suffix off), and a file is this
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
 name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
-dora_scale over the weight's rows, ComfyUI's weight_decompose), a whole weight's difference (diff, set_weight,
+dora_scale over the weight's rows: the weight's rows' norms rescaled), a whole weight's difference (diff, set_weight,
 w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
 constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input
 its factors make, beside a plain form's pair), and no text encoder's weight.  A bias's delta (diff_b, or b_norm beside
@@ -71,7 +71,7 @@ FAMILY_NAMES = {"qwen-image": "Qwen-Image-2.1", "moss-image": "MOSS-Image", "mag
 # The weights adapters may take, by the name a file's key is left with after split_key: the DiTs' target tables
 # (src/image/qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's build_lora_targets write these names).  "{b}" is a block's
 # number - the same names for every block, so a listing needs no block count.  Qwen-Image-2.1's MLP's first weight is
-# one [gate | up] on the GPU: a file may name it fused (gate_up, ComfyUI's and a GGUF's form) or as diffusers' two
+# one [gate | up] on the GPU: a file may name it fused (gate_up, the dot form's and a GGUF's) or as diffusers' two
 # halves (gate_layer is its rows [0, inter), proj the rest).  MOSS-Image's text embedder holds one qkv of three C-row
 # weights (one name on the file's side), and up and gate apart on the file's side where the GPU has one [up | gate].
 # Mage-Flow's and MageTrail's blocks are the same 14 weights (the two streams' modulations, the attention's projections,
@@ -203,12 +203,12 @@ def _lokr_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
     """A LoKr weight's tensors -> (the factorization's rank, "") or (0, why they make no Kronecker product): its
     two matrices whole (lokr_w1 and lokr_w2) or each from two factors (lokr_w1_a [rows][rank] and lokr_w1_b
     [rank][cols]), w2's under a Tucker core (lokr_t2, a linear product's: a kernel of 1 x 1).  The rank is the one
-    ComfyUI divides the file's alpha by (w2's factors' rows, else w1's); the engine reads the tensors the same way
+    the file's alpha is divided by (w2's factors' rows, else w1's); the engine reads the tensors the same way
     (src/image/image_lora.cpp's make_lokr)."""
     rank = 0
     for name in ("w1", "w2"):
         whole, fa, fb = f"lokr_{name}", f"lokr_{name}_a", f"lokr_{name}_b"
-        if whole in roles:   # the whole matrix: a Tucker core beside w2 stays unread, as ComfyUI leaves it
+        if whole in roles:   # the whole matrix: a Tucker core beside w2 stays unread, the matrix taken
             if fa in roles or fb in roles:
                 return 0, f"both {whole} and its factors {fa}/{fb}"
             if len(roles[whole]) != 2:
@@ -232,10 +232,10 @@ def _lokr_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
 
 
 def _loha_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
-    """A LoHa weight's tensors -> (the rank ComfyUI divides the file's alpha by, "") or (0, why they make no delta):
+    """A LoHa weight's tensors -> (the rank the file's alpha is divided by, "") or (0, why they make no delta):
     two low-rank products, (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core
     (hada_t1/hada_t2; a linear product's, a kernel of 1 x 1), which writes the side's factors the core's way (w_a
-    [core][out], w_b [rank][in]).  The rank is w1_b's rows, as ComfyUI takes it; the engine makes the delta when it
+    [core][out], w_b [rank][in]).  The rank is w1_b's rows; the engine makes the delta when it
     binds the entry (src/image/image_lora.cpp's make_loha and loha_delta)."""
     if ("hada_t1" in roles) != ("hada_t2" in roles):
         return 0, "a LoHa with one Tucker core (hada_t1/hada_t2): both or neither"
@@ -293,7 +293,7 @@ def _oft_shape(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
 
 def _glora_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
     """A GLoRA weight's tensors -> (the rank the file's alpha is divided by, "") or (0, why they make no GLoRA): the
-    four matrices of one of the form's two readings - ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    four matrices of one of the form's two readings - the newer a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
     [rank][cols], or LyCORIS's older one (a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]).  A
     square weight's four fit both, and the weight's rows and columns choose between them in the engine (make_glora's
     `glora_other`, the entry the DiT resolves with lora_glora_for_weight); the listing has no weight to ask, so it
@@ -585,15 +585,15 @@ class Folder:
                     rank = max(rank, roles["lora_A"][0])
                 targets.add("text_encoder." + re.sub(r"^layers\.\d+\.", "", text_encoder_name(key)))
                 continue
-            # a bias's delta (ComfyUI's .diff_b, or .b_norm beside the weight's w_norm, which .diff_b overrides): the
+            # a bias's delta (.diff_b, or .b_norm beside the weight's w_norm, which .diff_b overrides): the
             # engine adds it where the DiT adds the weight's own bias, and only the weights that add one take it
             bias = roles.get("diff_b", roles.get("b_norm"))
             if bias is not None:
                 if len(bias) != 1:
                     return f"{key}: a bias's delta (diff_b/b_norm) must be the bias's vector"
                 if "diff_b" not in roles and "w_norm" not in roles:
-                    return (f"{key}: a bias's delta (b_norm) without the weight's w_norm, beside which ComfyUI's "
-                            f"load_lora reads it")
+                    return (f"{key}: a bias's delta (b_norm) without the weight's w_norm, beside which the common "
+                            f"readers take it")
                 if not any(m.match(key) for m in _BIASED[self.family]):
                     return f"{key}: a bias's delta (diff_b/b_norm), and this model's weight adds no bias"
             form = form_of(roles)
@@ -611,8 +611,8 @@ class Folder:
             if not any(m.match(key) for m in _MATCH[self.family]):
                 return f"{key} is not one of this image model's weights"
             if form == "diff":
-                # the weight's own matrix (set_weight is the weight itself, diff and w_norm a delta), as ComfyUI's
-                # patch table takes one a key; its rows and columns are the DiT's, which the engine checks
+                # the weight's own matrix (set_weight is the weight itself, diff and w_norm a delta), one a key, read
+                # in that order; its rows and columns are the DiT's, which the engine checks
                 whole = roles.get("set_weight", roles.get("diff", roles.get("w_norm")))
                 if whole is None or len(whole) != 2:
                     return f"{key}: a whole delta (diff/set_weight) must be the weight's matrix"

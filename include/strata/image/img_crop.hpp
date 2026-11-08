@@ -4,14 +4,14 @@
 // the picture.
 //
 // The server (serve/images.py, plan_crop) chooses the box and the size the model draws; the engine does the rest.  The
-// mask, as its edit share (1 where the picture changes), has its faint values (below a tenth) taken out and its holes
-// filled level by level on the host (filled_share), then on the GPU is grown by a square window of about three
-// eighths of the blend width and blurred by a Gaussian of an eighth of it (cut at 4 sigma, edges reflected).  The box
-// is cut out of the picture, its parts past the picture's edges the edges' copies (the mask 1 there), and resized to
-// the drawing's size (Lanczos; the mask bilinear), and the mask blurred again there: the blend mask.  The model
-// redraws where the blend mask is above 0, its latent positions following the base image as much as the resized mask keeps them (share), and its
-// picture, resized back to the box (Lanczos), goes into the picture by the blend mask (bilinear): where that is 0 the
-// picture's own pixels stay as they are, byte for byte.  The resizes are Pillow's (its filters, its supports widened by the scale when it shrinks), in floats.
+// mask, as its edit share (1 where the picture changes), loses its faintest strokes and has its holes filled with the
+// level that encloses them on the host (edit_share), then on the GPU grows by a disc of an eighth of the blend width
+// and is softened by three box means of an eighth of it each: the blend mask.  The box is cut out of the picture, its
+// parts past the picture's edges the edges' copies (the mask 1 there), and resized to the drawing's size (Lanczos; the
+// mask bilinear).  The model redraws where the blend mask is above 0, its latent positions following the base image
+// as much as the mask keeps them (share), and its picture, resized back to the box (Lanczos), goes into the picture
+// by the blend mask (bilinear): where that is 0 the picture's own pixels stay as they are, byte for byte.  The
+// resizes are Pillow's (its filters, its supports widened by the scale when it shrinks), in floats.
 #pragma once
 
 #include "strata/image/pipeline.hpp"
@@ -24,7 +24,7 @@ namespace strata::image {
 
 struct CropBox {
     int64_t x = 0, y = 0, w = 0, h = 0;   // the box on the picture, which may reach past its edges
-    int64_t blend = 32;                    // the mask's growth and blur, in the picture's pixels
+    int64_t blend = 32;                    // the mask's growth and softening, in the picture's pixels
     int64_t width = 0, height = 0;         // the picture's size, as the server read it
     // the first reference beside the drawing's base, the box at this size (an ai-toolkit MOSS-Image edit's, whose
     // references are smaller than the drawing); 0: the base is the reference
@@ -75,9 +75,8 @@ public:
     const QiRef& regen() const { return regen_; }
     /// The box at the box's ref_w x ref_h (Lanczos, from the picture as the base is), when it asks for one.
     const QiRef& ref() const { return ref_; }
-    /// The drawing's edit share (the grown and blurred mask at gw x gh, before the blend mask's blur): the sampler's
-    /// mask (QiRequest::mask_share), so that the blurred edge follows the picture rather than being drawn anew and blended
-    /// over it.
+    /// The drawing's edit share (the blend mask at gw x gh): the sampler's mask (QiRequest::mask_share), so that the
+    /// soft edge follows the picture rather than being drawn anew and blended over it.
     const std::vector<float>& share() const { return share_; }
     /// The drawing (RGBA8, gw x gh) put back into the picture -> the picture (RGBA8, at its own size).  `color`
     /// (QiRequest::crop_color): the drawing's colors matched first (Reinhard's transfer in CIE Lab: each channel's mean

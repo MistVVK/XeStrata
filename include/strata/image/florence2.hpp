@@ -7,7 +7,7 @@
 // embeddings, the pooled token and the projection; BART's encoder over the picture's tokens and the task's words, and
 // its decoder in a beam search (beams, no repeated 3-grams, the first token <s>, the last </s>, length penalty 1 and
 // stopping when the beams are done, the generation config's) with a cache of the keys and values.  The tokens out are
-// the server's to read (serve/images.py: <loc_*> into polygons); aux_polygon_fill makes a mask of the polygons.
+// the server's to read (serve/image_regions.py: <loc_*> into polygons); aux_polygon_fill makes a mask of the polygons.
 //
 // The weights are Microsoft's model.safetensors (FP16), downloaded by the server when first needed; they stay on the
 // GPU until release().

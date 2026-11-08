@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/video/video_io.hpp - a video's frames in and out through the ffmpeg and ffprobe commands (found on the
-// PATH, or named by STRATA_FFMPEG / STRATA_FFPROBE; not part of the engine: setup.py's check_ffmpeg tells the user how
+// PATH, or named by XESTRATA_FFMPEG / XESTRATA_FFPROBE; not part of the engine: setup.py's check_ffmpeg tells the user how
 // to get them), streamed a few frames at a time as RGB24, so that no video is held whole in RAM.
 //
 // probe() asks ffprobe what the file is: the first video stream's size as shown (a rotation in its side data or tags
@@ -44,7 +44,8 @@ struct Info {
     std::string audio_codec;
 };
 
-/// The ffmpeg and ffprobe commands (STRATA_FFMPEG, STRATA_FFPROBE, else on the PATH); empty where there is none.
+/// The ffmpeg and ffprobe commands (XESTRATA_FFMPEG, XESTRATA_FFPROBE or their old STRATA_ names, else on the PATH);
+/// empty where there is none.
 std::string ffmpeg_command();
 std::string ffprobe_command();
 /// Whether both are there.

@@ -74,9 +74,10 @@ int64_t intersection(const Binary& a, const Binary& b) {
     return n;
 }
 
-// the intersection over the smaller mask, and over the union
+// the share of the smaller mask the two have in common (0 when one is empty), and the intersection over the union
 float iom(const Binary& a, const Binary& b, int64_t aa, int64_t ab) {
-    return (float) intersection(a, b) / ((float) std::min(aa, ab) + 1e-8f);
+    const int64_t small = std::min(aa, ab);
+    return small > 0 ? (float) intersection(a, b) / (float) small : 0.f;
 }
 
 float iou(const Binary& a, const Binary& b, int64_t aa, int64_t ab) {
@@ -172,9 +173,12 @@ struct Sam3Video::Impl {
     std::vector<Det> detect_words(size_t g) {
         const Sam3::Detection det = sam.detect(cfg.score_threshold);
         std::vector<int64_t> keep;
-        for (int64_t q : det.keep) {   // best first; the boxes' centers away from the edges
-            const float cx = det.box[(size_t) (q * 4)], cy = det.box[(size_t) (q * 4 + 1)];
-            if (cx > cfg.edge && cx < 1.f - cfg.edge && cy > cfg.edge && cy < 1.f - cfg.edge) keep.push_back(q);
+        // best first; a box whose center (in the frame's [0, 1]) is not more than half the frame less the margin away
+        // from its middle, on both axes, is left out
+        const float reach = 0.5f - cfg.edge;
+        for (int64_t q : det.keep) {
+            const float* box = det.box.data() + q * 4;
+            if (std::fabs(box[0] - 0.5f) < reach && std::fabs(box[1] - 0.5f) < reach) keep.push_back(q);
         }
         std::vector<Det> out;
         if (keep.empty()) return out;
@@ -476,29 +480,22 @@ struct Sam3Video::Impl {
             }
             is_new[i] = dets[i].prob >= cfg.new_det && !any;
         }
-        // the reconditioning's one-to-one pairs: a detection and a masklet past recondition_iom alone
+        // the pairs the reconditioning may use: a sure detection (high_conf, not a new object) and a masklet that are
+        // each the other's only overlap of recondition_iom or more
         std::map<int64_t, size_t> high;   // object id -> detection
         {
-            std::vector<int> per_det(nd, 0), per_trk(no, 0);
+            std::vector<int> det_hits(nd, 0), trk_hits(no, 0);
+            std::vector<size_t> det_pair(nd, 0);
             for (size_t i = 0; i < nd; ++i)
                 for (size_t j = 0; j < no; ++j)
                     if (im[i][j] >= cfg.recondition_iom) {
-                        ++per_det[i];
-                        ++per_trk[j];
+                        ++det_hits[i];
+                        ++trk_hits[j];
+                        det_pair[i] = j;
                     }
-            for (size_t i = 0; i < nd; ++i) {
-                if (!(dets[i].prob >= cfg.high_conf) || is_new[i] || per_det[i] > 1) continue;
-                float best = 0.f;
-                size_t bj = 0;
-                for (size_t j = 0; j < no; ++j) {
-                    const float v = per_trk[j] > 1 ? 0.f : im[i][j];
-                    if (v > best) {
-                        best = v;
-                        bj = j;
-                    }
-                }
-                if (best >= cfg.recondition_iom) high[objs[bj].id] = i;
-            }
+            for (size_t i = 0; i < nd; ++i)
+                if (det_hits[i] == 1 && trk_hits[det_pair[i]] == 1 && dets[i].prob >= cfg.high_conf && !is_new[i])
+                    high[objs[det_pair[i]].id] = i;
         }
         // hot start: the unmatched frames, the masklets sharing a detection (keep-alive is not counted: it would hide
         // nothing)
@@ -639,15 +636,12 @@ struct Sam3Video::Impl {
         const int64_t room = cfg.max_objects - (int64_t) objs.size();
         if ((int64_t) fresh.size() > room) fresh.resize((size_t) std::max<int64_t>(room, 0));
         if (!fresh.empty()) {
-            // a bucket with the fewest free slots that still holds them all, else a new one
-            int64_t target = -1, best_free = M + 1;
-            for (size_t bi = 0; bi < buckets.size(); ++bi) {
-                const int64_t free = std::count(buckets[bi]->slot.begin(), buckets[bi]->slot.end(), kPad);
-                if (buckets[bi]->any() && free >= (int64_t) fresh.size() && free < best_free) {
-                    best_free = free;
+            // the first bucket in use with room for them all, else a new one
+            int64_t target = -1;
+            for (size_t bi = 0; bi < buckets.size() && target < 0; ++bi)
+                if (buckets[bi]->any() &&
+                    std::count(buckets[bi]->slot.begin(), buckets[bi]->slot.end(), kPad) >= (int64_t) fresh.size())
                     target = (int64_t) bi;
-                }
-            }
             const bool created = target < 0;
             if (created) {
                 buckets.push_back(std::make_unique<Bucket>());
@@ -734,16 +728,16 @@ struct Sam3Video::Impl {
                 }
             }
         }
-        // confirmation: a masklet matched (or just found) in confirm_after frames in a row
+        // confirmation: the frames in a row a masklet was matched in (its first frame counts as one); confirm_after of
+        // them confirm it for good
         {
             std::set<int64_t> hit;   // the objects a detection matched (out.masks' first no are this frame's tracked)
             for (size_t i = 0; i < nd; ++i)
                 for (size_t j = 0; j < no && j < ob.size(); ++j)
                     if (im[i][j] >= cfg.assoc) hit.insert(out.masks[j].first);
             for (Obj& o : objs) {
-                if (o.first == f || hit.count(o.id)) ++o.consecutive;
-                else o.consecutive = 0;
-                if (o.consecutive >= cfg.confirm_after) o.confirmed = true;
+                o.consecutive = o.first == f || hit.count(o.id) ? o.consecutive + 1 : 0;
+                o.confirmed = o.confirmed || o.consecutive >= cfg.confirm_after;
             }
             auto& un = unconfirmed[f];
             for (const Obj& o : objs)

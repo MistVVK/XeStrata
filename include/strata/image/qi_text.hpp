@@ -59,11 +59,11 @@ public:
     uint64_t layers_vram() const { return layers_stream_.vram(); }
     void drop_layers() { layers_stream_.drop(); }
     void drop_layer_homes() { layers_stream_.drop_homes(); }
-    /// The adapters' text encoder entries (lora_split's `te`: sd-scripts' lora_te_layers_N_..., ComfyUI's and
-    /// diffusers' names of the layers' q, k, v, o, gate, up and down projections) added to the layers' products from
-    /// the next encode: a plain LoRA, a LoKr, a LoHa or a whole delta (a DoRA, an OFT, a GLoRA or a bias's delta is
-    /// refused, as a key the encoder has no weight for), false with err and nothing bound.  The same set again changes
-    /// nothing.
+    /// The adapters' text encoder entries (lora_split's `te`: sd-scripts' lora_te_layers_N_... or the dotted names
+    /// under a prefix, text_encoder.model.layers.N..., of the layers' q, k, v, o, gate, up and down projections) added
+    /// to the layers' products from the next encode: a plain LoRA, a LoKr, a LoHa or a whole delta (a DoRA, an OFT, a
+    /// GLoRA or a bias's delta is refused, as a key the encoder has no weight for), false with err and nothing bound.
+    /// The same set again changes nothing.
     bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
     const std::string& lora_key() const { return lora_key_; }
     uint64_t lora_bytes() const;

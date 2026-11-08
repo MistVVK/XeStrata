@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/flow_sampler.hpp - ComfyUI's samplers of a flow model (CONST: x_t = sigma noise + (1 - sigma)
-// x0, the model's output a velocity, the denoised x - sigma v) over a DiT's forward: Euler (sample_euler) and er_sde
-// (sample_er_sde: the extended reverse-time SDE solver of three stages, its integrals over 200 points, the noise scaler
-// x (e^(x^0.3) + 10)).  er_sde's first sigma is moved below 1 as ComfyUI's offset_first_sigma_for_snr moves it (the
-// model's schedule at 1e-4 of the way from the top), and its noise at each step is PyTorch's CPU generator's of a seed
-// a step (torch_cpu_randn), not a GPU generator's.  Guidance: u + cfg (c - u) of the contexts' velocities, or guidance.hpp's.
+// include/strata/image/flow_sampler.hpp - The samplers of a flow model (x_t = sigma noise + (1 - sigma) x0, the
+// model's output a velocity, the denoised x - sigma v) over a DiT's forward: Euler and er_sde (the extended
+// reverse-time SDE solver of three stages, its integrals over 200 points, the noise scaler x (e^(x^0.3) + 10)).
+// er_sde's first sigma is moved below 1, to the model's schedule at 1e-4 of the way from the top (a sigma of 1 has no
+// signal for its log-SNR), and its noise at each step is PyTorch's CPU generator's of a seed a step (torch_cpu_randn),
+// not a GPU generator's.  Guidance: u + cfg (c - u) of the contexts' velocities, or guidance.hpp's.
 #pragma once
 
 #include "strata/image/guidance.hpp"

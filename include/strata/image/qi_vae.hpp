@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/qi_vae.hpp - Qwen-Image-2.1's VAE decoder on the GPU: a latent [64][h][w] to an RGBA image
 // [4][16 h][16 w] in 0 .. 1.  The same part reads Qwen-Image's first VAE, which is Wan 2.1's (Anima's: its 16 channels
-// at an eighth of the image's sides, ComfyUI's names), whose causal 3-D convolutions take one frame: the zero frames
-// before it leave each kernel's last time slice, a 2-D convolution, and the upsamplers' time convolutions are not run
-// on a first frame.
+// at an eighth of the image's sides, the original checkpoint's names), whose causal 3-D convolutions take one frame:
+// the zero frames before it leave each kernel's last time slice, a 2-D convolution, and the upsamplers' time
+// convolutions are not run on a first frame.
 //
 // The activations are channels-last ([pixel][channel], FP32); a convolution is a product on the matrix path
 // (prefill::Gemm, FP16 operands) of the input's 3 x 3 neighbourhoods (unfolded a band of rows at a time, so the scratch
@@ -26,7 +26,7 @@ public:
     QiVae(const QiVae&) = delete;
     QiVae& operator=(const QiVae&) = delete;
 
-    /// Reads the VAE's safetensors (Qwen-Image-2.1's diffusers names, or Wan 2.1's as ComfyUI has them) and puts the
+    /// Reads the VAE's safetensors (Qwen-Image-2.1's diffusers names, or Wan 2.1's original names) and puts the
     /// decoder's weights on the current GPU.
     /// `dry`: read for its sizes only (weight_bytes, scratch_bytes), nothing put on the GPU; such a part cannot run.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);

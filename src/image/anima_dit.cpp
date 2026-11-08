@@ -259,7 +259,7 @@ uint16_t bf16_of(float f) {
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 
-// an F8 E4M3 byte (ComfyUI's scaled fp8: no inf, 0x7f / 0xff NaN)
+// an F8 E4M3 byte (the scaled fp8 saves': no inf, 0x7f / 0xff NaN)
 float e4m3(uint8_t b) {
     const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
     float v = e == 0 ? (float) m / 8.f * std::ldexp(1.f, -6) : (1.f + (float) m / 8.f) * std::ldexp(1.f, e - 7);
@@ -322,7 +322,7 @@ struct AnimaDit::File {
     std::vector<float> f32(const std::string& name) {
         const SafeTensor& t = get(name);
         if (t.dtype != "F8_E4M3") return st.f32(pre + name);
-        // ComfyUI's scaled fp8: the weight times its scale_weight (one value), where the file has one
+        // scaled fp8: the weight times its scale_weight (one value), where the file has one
         float scale = 1.f;
         const std::string base = name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0
                                      ? name.substr(0, name.size() - 7) : name;
@@ -835,7 +835,7 @@ void AnimaDit::attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, con
     }
 }
 
-// The adapter (comfy/ldm/anima/model.py's LLMAdapter) of the T5 ids over the states, its rows times their weights,
+// The LLM adapter of the T5 ids over the states, its rows times their weights,
 // into each context's FP16 rows padded with zero rows to 512.  The contexts go through it as one run of rows (each
 // attending to its own), so that a guided request's two cost the launches of one.
 void AnimaDit::adapter(const std::vector<AdapterIn>& in) {

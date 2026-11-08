@@ -189,8 +189,10 @@ int run(const std::string& path, const std::string& dir, bool q8) {
     if (const char* e = std::getenv("MOSS_PROBE_REFS")) {
         const std::string list = e, lay = std::getenv("MOSS_PROBE_LAYOUT") ? std::getenv("MOSS_PROBE_LAYOUT") : "";
         using L = strata::image::QiRefLayout;
-        const L layout = lay == "aitk" ? L::Isolated : lay == "aitk-nokv" ? L::TimestepZero : lay == "index" ? L::Index
-                                                                                                             : L::TextStart;
+        const L layout = lay == "aitk"        ? L::AitkKv
+                         : lay == "aitk-nokv" ? L::AitkNoKv
+                         : lay == "appended"  ? L::Appended
+                                              : L::MossEdit;
         std::vector<strata::image::MossDit::RefLatent> lat;
         for (size_t i = 0; i < list.size();) {
             const size_t j = std::min(list.find(',', i), list.size());

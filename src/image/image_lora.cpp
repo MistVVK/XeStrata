@@ -1,22 +1,23 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/image_lora.cpp - an adapter file read into the host tensors of ComfyUI's LoRA forms, its keys brought to
+// src/image/image_lora.cpp - an adapter file read into the host tensors of the LoRA forms, its keys brought to
 // the DiT's own names; and one entry's A and B on the GPU, its delta added to a product's output.
 //
-// The keys: ComfyUI's adapters take a weight's name `x` and the tensors `x.lora_up.weight` and `x.lora_down.weight`
+// The keys: an adapter names a weight `x` and its tensors `x.lora_up.weight` and `x.lora_down.weight`
 // (or `x.lora_B.weight` and `x.lora_A.weight`, `x.lora.up.weight` and `x.lora.down.weight`, or the bare
 // `x.lora_B`/`x.lora_A` of PEFT's own saves), with `x.alpha` and `x.dora_scale` beside them.  A file's prefix says
 // whose names they are: `transformer.` for diffusers' saves, `diffusion_model.` and `model.diffusion_model.` for
-// ComfyUI's and a GGUF's.  What is left is the DiT's own name, which the DiT's target table matches.
+// the dot form's (the DiT's names with points between them) and a GGUF's.  What is left is the DiT's own name, which
+// the DiT's target table matches.
 //
 // A LoHa (LyCORIS) writes one weight's delta as the element-wise product of two low-rank products,
 // (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core (hada_t1, hada_t2) where the
-// file has one (comfy/weight_adapter/loha.py).  The product is the weight's size, so it is made when the entry is bound
+// file has one.  The product is the weight's size, so it is made when the entry is bound
 // (LoraDeviceEntry::upload) rather than kept: the entry holds the four factors and the shapes that make it.
 //
 // A LoKr (LyCORIS) writes one weight's two matrices whole (`x.lokr_w1`, `x.lokr_w2`) or as two factors each
 // (`x.lokr_w1_a` [rows][rank] and `x.lokr_w1_b` [rank][cols]), w2's under a Tucker core (`x.lokr_t2`); the delta is
-// their Kronecker product, and the file's alpha is divided by the factorization's rank (comfy/weight_adapter/lokr.py).
+// their Kronecker product, and the file's alpha is divided by the factorization's rank.
 //
 // A GLoRA (a1/a2/b1/b2) writes its delta as a low rank of the weight on each side, W' = W + s (alpha / rank) (W a1
 // a2 + b1 b2), or LyCORIS's older W a2 a1 + b2 b1 (the shapes say which).  Its b pair is the plain form's (A = b2,
@@ -24,9 +25,9 @@
 // output is W x + s (W v + B (A x)), and the weight's delta itself is never made (that is the weight's size).
 //
 // A whole delta is the weight's own matrix: `x.diff` (LyCORIS's full form, a fine tune's difference from its base),
-// `x.w_norm` (the same role in ComfyUI's patch table) and `x.set_weight` (the weight itself).  ComfyUI patches them
-// as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
-// (W + s (S - W)), so that a strength scales both.  `x.diff_b` (or `x.b_norm`, which ComfyUI reads only beside the
+// `x.w_norm` (a diff's role under another name) and `x.set_weight` (the weight itself).  Read as written, they patch
+// the weight as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
+// (W + s (S - W)), so that a strength scales both.  `x.diff_b` (or `x.b_norm`, which is read only beside the
 // weight's `w_norm`, `x.diff_b` overriding it) is the same patch of the weight's bias: b' = b + strength * Db, added
 // where the DiT adds the bias it has, and no alpha involved (a file may hold one alone: LoraKind::bias).
 #include "strata/image/image_lora.hpp"
@@ -305,8 +306,8 @@ LoraKind kind_of(const Group& g, const std::string& path) {
     const bool glora = has("a1") || has("b1");
     const bool oft = has("oft_blocks");
     const bool diff = has("diff") || has("set_weight") || has("w_norm");
-    // one weight, one form: a file that holds two would have one of them silently dropped (ComfyUI keeps the last of
-    // its patches' types), so it is refused here, saying which
+    // one weight, one form: a file that holds two would have one of them silently dropped (a reader that keeps one
+    // patch a key keeps whichever form it reads last), so it is refused here, saying which
     const int forms = (int) lora + (int) lokr + (int) loha + (int) glora + (int) oft + (int) diff;
     if (forms > 1) {
         std::vector<const char*> which;
@@ -338,9 +339,8 @@ LoraKind kind_of(const Group& g, const std::string& path) {
 
 // A LoKr's two matrices -> its entry: w1 [out_l][in_m] and w2 [out_k][in_n], the file's whole matrices or its two
 // factors' products (w2's under a Tucker core), the delta their Kronecker product is at the weight's rows
-// out_l * out_k and columns in_m * in_n.  `rank` is the factorization's, where a matrix has one: ComfyUI divides the
-// file's alpha by w2's factors' rank, else w1's, and by nothing where both matrices are whole
-// (comfy/weight_adapter/lokr.py's calculate_weight).
+// out_l * out_k and columns in_m * in_n.  `rank` is the factorization's, where a matrix has one: the file's alpha is
+// divided by w2's factors' rank, else w1's, and by nothing where both matrices are whole.
 void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -381,7 +381,7 @@ void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
     RawTensor w1 = matrix_of("lokr_w1", "lokr_w1_a", "lokr_w1_b");
     RawTensor w2;
     const RawTensor* t2 = get("lokr_t2");
-    if (t2 == nullptr || get("lokr_w2") != nullptr) {   // a core beside the whole matrix stays unread, as ComfyUI
+    if (t2 == nullptr || get("lokr_w2") != nullptr) {   // a core beside the whole matrix stays unread: the matrix wins
         w2 = matrix_of("lokr_w2", "lokr_w2_a", "lokr_w2_b");
     } else {
         // Tucker: w2 [out_k][in_n] = w2_a [core_out][out_k]^T . T . w2_b [core_in][in_n], T the core's kernel, 1 x 1
@@ -405,7 +405,7 @@ void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
                                                                    std::to_string(b->shape[0])));
         const int64_t core_out = t2->shape[0], core_in = t2->shape[1];
         const int64_t out_k = a->shape[1], in_n = b->shape[1];
-        rank = core_in;   // ComfyUI's dim: w2_b's rows
+        rank = core_in;   // the rank: w2_b's rows
         const std::vector<float> tb = mat_mul(t2->v.data(), core_out, core_in, b->v.data(), in_n);
         w2.shape = {out_k, in_n};
         w2.v.assign((size_t) (out_k * in_n), 0.0f);
@@ -462,9 +462,9 @@ bool hada_side_shape(const std::vector<int64_t>& sa, const std::vector<int64_t>&
     return true;
 }
 
-// A LoHa's four tensors -> its entry: the two sides' products must be one shape, the rank is ComfyUI's (w1's factors'
-// rows, the alpha's divisor).  The factors themselves go into `extra` and `shapes` with the file's other tensors (below),
-// for the delta made when the entry is bound.
+// A LoHa's four tensors -> its entry: the two sides' products must be one shape, the rank is w1's factors' rows (the
+// alpha's divisor).  The factors themselves go into `extra` and `shapes` with the file's other tensors (below), for
+// the delta made when the entry is bound.
 void make_loha(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -497,7 +497,7 @@ void make_loha(LoraEntry& e, Group& g, const std::string& path) {
                                                    std::to_string(c2) + ": not the weight's one shape"));
     e.rows = r1;
     e.cols = c1;
-    e.rank = b1->shape[0];   // ComfyUI's dim: w1_b's rows, which the file's alpha is divided by
+    e.rank = b1->shape[0];   // the rank: w1_b's rows, which the file's alpha is divided by
 }
 
 // One of a GLoRA's readings laid into an entry: the plain form's pair (A [rank][cols] and B [rows][rank]) and the
@@ -514,13 +514,13 @@ void glora_reading(GloraReading& r, const RawTensor& in, const RawTensor& out, c
     lora_to_f16(out.v, r.out);
 }
 
-// A GLoRA's four tensors -> its entry: W' = W + s (alpha / rank) (W a1 a2 + b1 b2) (comfy/weight_adapter/glora.py's
-// calculate_weight), whose b1 b2 is a plain LoRA's pair (A = b2 [rank][cols], B = b1 [rows][rank]) and whose a1 a2 is
-// the weight's own product's input (v = a1 (a2 x)).  LyCORIS's older form writes the four the other way round
-// (W a2 a1 + b2 b1: A = b1, B = b2, v = a2 (a1 x)); the shapes say which a file holds - ComfyUI's two tests - and a
+// A GLoRA's four tensors -> its entry: W' = W + s (alpha / rank) (W a1 a2 + b1 b2), whose b1 b2 is a plain LoRA's
+// pair (A = b2 [rank][cols], B = b1 [rows][rank]) and whose a1 a2 is the weight's own product's input
+// (v = a1 (a2 x)).  LyCORIS's older form writes the four the other way round
+// (W a2 a1 + b2 b1: A = b1, B = b2, v = a2 (a1 x)); the shapes say which a file holds - two tests on them - and a
 // file of neither is refused.  Where both fit (the four are the weight's rows' and columns' square, so each reading
 // makes a product of its own shape), the entry keeps the older one and the other in `glora_other`: a weight's rows and
-// columns choose at the bind (lora_glora_for_weight), as ComfyUI's calculate_weight asks its weight's shape.
+// columns choose at the bind (lora_glora_for_weight): the reading whose product has the weight's shape.
 void make_glora(LoraEntry& e, Group& g, const std::string& path) {
     const auto get = [&g](const char* r) -> const RawTensor* {
         auto it = g.by_role.find(r);
@@ -537,8 +537,8 @@ void make_glora(LoraEntry& e, Group& g, const std::string& path) {
             throw std::runtime_error(path_key_what(path, e.key, "a1, a2, b1 and b2 must be matrices"));
     const auto r = [](const RawTensor* t) { return t->shape[0]; };
     const auto c = [](const RawTensor* t) { return t->shape[1]; };
-    // ComfyUI's two tests on the shapes as the file writes them: LyCORIS's older form (a1 [rank][cols], a2
-    // [cols][rank], b1 [rank][cols], b2 [rows][rank]) and the one ComfyUI's glora.py writes of its own (a1
+    // the two tests on the shapes as the file writes them: LyCORIS's older form (a1 [rank][cols], a2
+    // [cols][rank], b1 [rank][cols], b2 [rows][rank]) and the newer one (a1
     // [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols])
     const bool old = c(m4) == r(m3) && r(m3) == r(m1) && r(m1) == c(m2);
     const bool current = r(m4) == c(m3) && c(m3) == c(m1) && c(m1) == r(m2);
@@ -552,7 +552,7 @@ void make_glora(LoraEntry& e, Group& g, const std::string& path) {
                                                    ": neither of a GLoRA's two readings (a1 [cols][rank], a2 "
                                                    "[rank][cols], b1 [rows][rank], b2 [rank][cols], or LyCORIS's "
                                                    "with a1/a2 and b1/b2 the other way round)"));
-    // the reading the entry holds first: the older one where both fit, as ComfyUI's calculate_weight keeps it for a
+    // the reading the entry holds first: the older one where both fit
     const bool first_old = old;
     GloraReading& main = e.glora;
     // the older reading's input path is a1 [rank][cols] then a2, its plain pair b1 [rank][cols] and b2 [rows][rank];
@@ -699,7 +699,7 @@ bool loha_delta(const LoraEntry& e, std::vector<uint16_t>& out, std::string& err
     return true;
 }
 
-// A block's rotation r = (I + Q) (I - Q)^-1 (comfy/weight_adapter/oft.py's Cayley transform of the skew matrix Q):
+// A block's rotation r = (I + Q) (I - Q)^-1 (the Cayley transform of the skew matrix Q):
 // (I - Q) inverted by Gauss-Jordan with partial pivoting, FP32, then multiplied by (I + Q).  `n` is a block's rows (a
 // few dozen at most: the file's block size).
 bool oft_cayley(const float* q, int64_t n, float* r) {
@@ -746,9 +746,9 @@ bool oft_cayley(const float* q, int64_t n, float* r) {
 }
 
 // An OFT's (a BOFT's) blocks -> the rotations the engine applies: r = (I + Q) (I - Q)^-1 a block, Q the block's skew
-// part, its Frobenius norm over the whole file clamped to the file's alpha where that is above 0 (ComfyUI's
+// part, its Frobenius norm over the whole file clamped to the file's alpha where that is above 0 (the OFT's
 // constraint).  The file's `oft_blocks` is [blocks][bs][bs] (an OFT) or [stages][blocks][bs][bs] (a BOFT, whose
-// stage i turns the rows in 2^i-row groups: comfy/weight_adapter/boft.py's reshapes want 2^i of the blocks).  The
+// stage i turns the rows in 2^i-row groups: the butterfly's reshapes want 2^i of the blocks).  The
 // rotations go to `extra` under "oft_r", a stage's blocks after another's; `rescale` is kept as the file has it.
 void make_oft(LoraEntry& e, Group& g, const std::string& path) {
     auto it = g.by_role.find("oft_blocks");
@@ -785,7 +785,7 @@ void make_oft(LoraEntry& e, Group& g, const std::string& path) {
     e.oft.boft = b.shape.size() == 4;
     e.rows = e.oft.rows();
     e.cols = 0;   // the rotation is over the weight's rows: its columns are the product's own
-    // the constraint: the file's alpha, a bound on the skew parts' Frobenius norm (ComfyUI clamps them as one tensor)
+    // the constraint: the file's alpha, a bound on the skew parts' Frobenius norm (clamped as one tensor)
     const float bound = e.alpha_set ? e.alpha : 0.0f;
     std::vector<float> q(b.v);
     for (int64_t i = 0; i < stages * blocks; ++i) {
@@ -862,8 +862,8 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         lora_to_f16(b->v, e.b);
     }
     if (e.kind == LoraKind::diff) {
-        // the weight's own delta: set_weight (the weight itself) before diff, and w_norm, ComfyUI's patch table's
-        // order (comfy/lora.py writes each into the same key)
+        // the weight's own delta: set_weight (the weight itself) before diff, and w_norm last (the three fill one
+        // patch of the weight, so one of them is read)
         const char* const which =
             role("set_weight") != nullptr ? "set_weight" : (role("diff") != nullptr ? "diff" : "w_norm");
         const RawTensor* t = role(which);
@@ -904,8 +904,8 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         throw std::runtime_error(path_and(path, e.key) +
                                  ": a LoRA with a middle layer (a convolution's) is not one the image engine's linear "
                                  "products take");
-    // a bias's delta: ComfyUI's load_lora papers the weight's bias with `diff_b` (or with `b_norm` beside the weight's
-    // `w_norm`, which `diff_b` then overrides), the same "diff" patch as the weight's - no alpha, the request's
+    // a bias's delta: `diff_b` patches the weight's bias (or `b_norm` beside the weight's `w_norm`, which `diff_b`
+    // then overrides), the same "diff" patch as the weight's - no alpha, the request's
     // strength only.  An entry may hold one alone (LoraKind::bias): its rows are the bias's.
     const RawTensor* bb = role("diff_b");
     if (bb == nullptr) {
@@ -913,7 +913,7 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         if (bb != nullptr && role("w_norm") == nullptr)
             throw std::runtime_error(path_key_what(path, e.key,
                                                    "a bias's delta (b_norm) without the weight's w_norm, beside "
-                                                   "which ComfyUI's load_lora reads it"));
+                                                   "which the common readers take it"));
     }
     if (bb != nullptr) {
         if (bb->shape.size() != 1)
@@ -1060,7 +1060,8 @@ std::string lora_text_encoder_name(const std::string& key) {
             break;
         }
     std::replace(s.begin(), s.end(), '_', '.');
-    // a model's own wrappers before its layers (ComfyUI's qwen3_06b.transformer.model., Qwen3-VL's language_model.)
+    // a model's own wrappers before its layers (a Qwen3-0.6B text encoder's qwen3_06b.transformer.model. in the dot
+    // form, Qwen3-VL's language_model.)
     const size_t at = s.find("layers.");
     if (at != std::string::npos && at > 0 && s[at - 1] == '.') s.erase(0, at);
     return s;
@@ -1183,7 +1184,7 @@ struct KronRows {
     }
 };
 
-// A bias's delta: y[t][row0 + c] += scale * b[src_row + c] (ComfyUI's "diff" patch of the weight's bias)
+// A bias's delta: y[t][row0 + c] += scale * b[src_row + c] (a "diff" patch of the weight's bias)
 struct AddBias {
     const float* b;
     float scale;
@@ -1273,7 +1274,7 @@ void LoraDeviceEntry::release() {
 bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef) {
     release();
     kind_ = e.kind;
-    // a bias's delta (ComfyUI's "diff" patch of the weight's bias), beside or instead of the weight's own
+    // a bias's delta (a "diff" patch of the weight's bias), beside or instead of the weight's own
     const auto bias_to_gpu = [&]() -> bool {
         if (e.bias.empty()) return true;
         if ((int64_t) e.bias.size() != e.rows) {
@@ -1918,8 +1919,8 @@ bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n
         return false;
     }
     if (!e.dora_over_rows) {
-        err = "a DoRA (dora_scale) over the weight's columns: the engine's DoRA scales its output's rows, as ComfyUI's "
-              "weight_decompose does where the scale is the output axis's";
+        err = "a DoRA (dora_scale) over the weight's columns: the engine's DoRA scales its output's rows (the "
+              "weight's decomposition where the scale is the output axis's)";
         return false;
     }
     if (src_row < 0 || row0 < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n ||

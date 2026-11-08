@@ -4,9 +4,9 @@
 // include/strata/image/sam3_video.hpp - SAM 3.1's video segmentation: every frame the detector finds the words'
 // instances, the multiplex tracker (sam3.hpp's video section) carries the objects found before, and the two are
 // matched.  The rules follow vLLM-Omni's sam3_video.py (2b610b3, Apache-2.0: its association, hot start, occlusion
-// suppression and delayed outputs), with SAM 3.1's defaults and what 3.1 adds: masks compared by their intersection
-// over the smaller one (IoM), detections whose centers are near the frame's edges left out, a masklet shown only once
-// confirmed, reconditioning by IoM, up to 16 objects in buckets of 16 slots.
+// suppression and delayed outputs), and XeStrata's own: masks compared by their intersection over the smaller one
+// (IoM), detections whose centers are near the frame's edges left out, a masklet shown only after a run of matched
+// frames, reconditioning only of one-to-one pairs, up to 16 objects in buckets of 16 slots.
 //
 // A clip goes in a frame at a time (push); each frame's objects come out confirm_after - 1 frames later (a masklet
 // shown once it is confirmed: the outputs need not wait the whole hot start, only the unconfirmed ones are hidden,
@@ -31,7 +31,7 @@
 
 namespace strata::image {
 
-/// SAM 3.1's defaults for its video predictor.
+/// The video segmentation's settings (the thresholds the multiplex checkpoint was tuned to work with).
 struct Sam3VideoConfig {
     float score_threshold = 0.4f;    // a detection kept
     float nms_iom = 0.1f;            // detections overlapping a better one past this (IoM) dropped
@@ -41,10 +41,10 @@ struct Sam3VideoConfig {
     int hot_start = 15;              // frames an object may still be removed in
     int hot_unmatched = 8, hot_duplicate = 8;
     float occlusion = 0.7f;          // overlapping masklets (IoU): the more recently occluded one hidden
-    float edge = 0.025f;             // detections whose center is this close to an edge left out
+    float edge = 0.025f;             // detections whose center is within this share of the frame of an edge left out
     int recondition_every = 16;
     float recondition_iom = 0.5f, high_conf = 0.8f;
-    int confirm_after = 3;           // consecutive detections a masklet needs before it is shown
+    int confirm_after = 3;           // frames in a row a masklet must be matched in before it is shown
     int max_objects = 16;
     int max_cond_frames = 4, max_pointers = 16;
 };

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/anima_dit.hpp - Anima's DiT on the GPU (Cosmos-Predict2-2B's MiniTrainDIT as ComfyUI runs it,
-// comfy/ldm/cosmos/predict2.py and comfy/ldm/anima/model.py): its LLM adapter, which turns the text encoder's states
-// into the cross-attention's context once a prompt, and its blocks, the velocity of a flow-matching step.
+// include/strata/image/anima_dit.hpp - Anima's DiT on the GPU (Cosmos-Predict2-2B's MiniTrainDIT): its LLM adapter,
+// which turns the text encoder's states into the cross-attention's context once a prompt, and its blocks, the velocity
+// of a flow-matching step.
 //
 // The latent is Wan 2.1's (16 channels at an eighth of the image's sides), in 2 x 2 patches: a token's 64 values are
 // channel c of the patch's pixel (m, n) at c * 4 + m * 2 + n (the patch embedder's order), the sampler's tokens
@@ -23,11 +23,12 @@
 // over the ids' positions, pairs (j, j + 32)), cross-attention to the text encoder's states (the queries rotated by
 // their positions, the keys by theirs) and an MLP with biases, on RMS norms with weights; then out_proj and an RMS norm.
 // Its rows are multiplied by the T5 ids' weights (the prompt's emphasis) and padded with zero rows to 512: the zero
-// rows take part in the blocks' cross-attention as ComfyUI's do.  The cross-attention's keys and values of a context's
+// rows take part in the blocks' cross-attention, unmasked.  The cross-attention's keys and values of a context's
 // rows are the same at every step: each block's are made at its first step and kept.
 //
-// The weights: one safetensors file (BF16 as distributed; F16, F32 and ComfyUI's scaled F8 E4M3 converted as read), its
-// names with or without the prefix `net.` (the release) or `model.diffusion_model.` (ComfyUI's saves of derivatives).
+// The weights: one safetensors file (BF16 as distributed; F16, F32 and F8 E4M3 with a scale_weight a matrix converted
+// as read), its names with or without the prefix `net.` (the release) or `model.diffusion_model.` (single-file saves of
+// derivatives).
 // The blocks as MossDit's: 8 bits (W8A8 where the GPU's library takes int8 products, else Q8_0) quantized on the host,
 // or FP16 from bf16, through a LayerStream; the number of blocks from the file (28; the 2.9B expansion's 40).  The
 // parts outside the blocks and the adapter are FP16 on the GPU; the adapter's (0.2 GiB) are needed only by

@@ -1193,12 +1193,12 @@ void MfVae::open_flux2(SafeTensors& st) {
             throw std::runtime_error("image engine (Flux2 VAE): the batch norm is not of 128 values");
         const auto m = st.f32("bn.running_mean"), v = st.f32("bn.running_var");
         std::vector<float> sd(v.size());
-        for (size_t i = 0; i < v.size(); ++i) sd[i] = std::sqrt(v[i] + 1e-4f);   // ComfyUI's bn_eps
+        for (size_t i = 0; i < v.size(); ++i) sd[i] = std::sqrt(v[i] + 1e-4f);   // the batch norm's eps
         f2_mean_ = upload(m);
         f2_std_ = upload(sd);
     }
-    // the names as the LDM checkpoint has them (BFL's ae.safetensors, ComfyUI's flux2-vae), or as diffusers' (the vae/
-    // folder of FLUX.2-klein): nm takes the first to the file's
+    // the names as the LDM checkpoint has them (BFL's ae.safetensors, Comfy-Org's flux2-vae), or as diffusers' (the
+    // vae/ folder of FLUX.2-klein): nm takes the first to the file's
     const bool df = st.find("decoder.mid_block.resnets.0.conv1.weight") != nullptr;
     int dl = 0;
     while (df && st.find("decoder.up_blocks." + std::to_string(dl) + ".resnets.0.conv1.weight") != nullptr) ++dl;

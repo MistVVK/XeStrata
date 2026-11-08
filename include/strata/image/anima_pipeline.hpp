@@ -4,11 +4,11 @@
 // (QiText, every token after the final norm), the LLM adapter and the DiT's flow sampling (AnimaDit), and the image
 // through Wan 2.1's VAE (QiVae), within a VRAM budget.
 //
-// The sampler is ComfyUI's for the model (ModelSamplingDiscreteFlow, shift 3, the timestep sigma itself): the
-// "simple" schedule, then er_sde (the model card's default, ComfyUI's sample_er_sde: the extended reverse-time SDE
-// solver of three stages, 200 points of its integrals, the noise scaler x (e^(x^0.3) + 10)) or Euler.  er_sde's noise at
-// each step is the CPU generator's (torch_cpu_randn, a seed a step), not ComfyUI's GPU generator's, so the same seed makes
-// another picture than ComfyUI's; the latent's start is PyTorch's CPU noise of the seed, as ComfyUI makes it.
+// The sampler is a discrete flow model's (shift 3, the timestep the sigma itself): the "simple" schedule, then er_sde
+// (the model card's default: the extended reverse-time SDE solver of three stages, 200 points of its integrals, the
+// noise scaler x (e^(x^0.3) + 10)) or Euler.  er_sde's noise at each step is the CPU generator's (torch_cpu_randn, a
+// seed a step), not a GPU generator's, so the same seed makes another picture than a sampler that draws it on the GPU;
+// the latent's start is PyTorch's CPU noise of the seed.
 // Guidance: u + cfg (c - u) with the negative prompt's context (CFG 1, Turbo's, runs the prompt alone).
 //
 // The budget is split as MossPipeline's: the weights that always stay (the DiT's parts outside its blocks, the VAE's),
@@ -29,13 +29,13 @@
 
 namespace strata::image {
 
-/// ComfyUI's "simple" schedule of a flow model at `shift` over 1000 training steps: n sigmas from the top, then 0.
+/// The "simple" schedule of a flow model at `shift` over 1000 training steps: n sigmas from the top, then 0.
 std::vector<float> anima_sigmas(int n, float shift = 3.0f);
 
 class AnimaPipeline : public ImagePipeline {
 public:
-    /// `dit`: the DiT's safetensors, `vae`: Wan 2.1's VAE (ComfyUI's qwen_image_vae.safetensors), `text`: Qwen3-0.6B-Base's
-    /// GGUF.  `q8`: the DiT's blocks in 8 bits (1), FP16 (0) or by the budget (-1).
+    /// `dit`: the DiT's safetensors, `vae`: Wan 2.1's VAE (Comfy-Org's qwen_image_vae.safetensors), `text`:
+    /// Qwen3-0.6B-Base's GGUF.  `q8`: the DiT's blocks in 8 bits (1), FP16 (0) or by the budget (-1).
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1);
     /// The release's blocks in an expanded DiT (AnimaDit::set_lora_block_map), for the adapters made for the release.
     void set_lora_block_map(std::vector<int> map) { block_map_ = std::move(map); }

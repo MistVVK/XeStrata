@@ -1,27 +1,30 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2024 Sahand Ahmadian
+// SPDX-FileCopyrightText: 2024 Jonseed
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/image/guidance.hpp - the guidance added to a flow model's sampling, worked on the denoised
-// predictions (x0 = x - sigma v), not on the velocity.
+// predictions (x0 = x - sigma v), not on the velocity.  c and u below are the prompt's and the negative prompt's
+// predictions, w the guidance scale; the result is den.
 //
-//   APG (adaptive projected guidance, applied before CFG): the guidance cond - uncond of the denoised predictions, its
-//     running sum (momentum; started again when the sigma rises), its norm over the whole latent cut to
-//     norm_threshold, its part along cond scaled by eta; the conditional prediction becomes
-//     uncond + guidance' + (cond - uncond) / cfg, which CFG then combines.
-//   CFG: uncond + cfg (cond - uncond); without a negative pass, cond.
-//   Then the functions applied after CFG, in this order (XeStrata's, fixed):
-//   CFGZero*: alpha = <x - cond, x - uncond> / (|x - uncond|^2 + 1e-8) over the whole
-//     latent, den + uncond (alpha - 1) + cfg uncond (1 - alpha).
-//   Skip Layer Guidance: with the model's sigma within [sigma_end, sigma_start],
-//     den + scale (cond - skipped), skipped the conditional prediction of a pass with `layers` skipped; rescaling_scale
-//     moves den's spread towards cond's (torch.std, unbiased, over the whole latent).
-//   CFGNorm (its default form, after CFG): den scaled at each latent position by
-//     clamp(|cond| / (|den| + 1e-8), 0, 1) (norms over the channels) and by strength.
-//   Detail Daemon (after muerrilla's sd-webui-detail-daemon): the sampler's own sigmas and steps stay; the model is
-//     asked at sigma (1 - 0.1 d cfg), d the detail schedule's value (made over the steps, looked up and interpolated
-//     at the sigma), cfg its override or the request's scale (1 without guidance).  Every prediction above (and the
-//     window of skip layer guidance) then goes by that sigma.
-// CFGZero* and APG need the negative pass (they do nothing without one here; the server refuses them); CFGNorm, skip
-// layer guidance and Detail Daemon work at CFG 1 as well.
+//   Plain CFG: den = u + w (c - u); without a negative pass, den = c.
+//   APG (Sadat et al., adaptive projected guidance), in place of plain CFG: d = c - u, summed over the steps with the
+//     momentum's weight on the earlier sum (r = momentum r + d), its length over the whole latent kept at most
+//     norm_threshold, and its component along c weighed by eta (the orthogonal one kept):
+//     den = c + w (r_ortho + eta r_par).
+//   CFGZero* (Fan et al.): with alpha the projection of the prompt's velocity on the negative one's,
+//     <v_c, v_u> / |v_u|^2 over the whole latent, den = alpha u + w (c - alpha u).
+//   Skip Layer Guidance: while the model's sigma is within [sigma_end, sigma_start], a third pass of the prompt with
+//     the blocks `layers` left out (k): den += scale (c - k); rescaling_scale then mixes den towards c's spread
+//     (Lin et al.'s rescale, by the sample standard deviations over the whole latent).
+//   CFG norm: at each latent position, den's norm over the channels is brought down to c's where it is larger, then
+//     den is scaled by strength.
+//   Detail Daemon (after muerrilla's sd-webui-detail-daemon and Jonseed's ComfyUI-Detail-Daemon, MIT): the sampler's
+//     own sigmas and steps stay; the model is asked at sigma (1 - 0.1 d cfg), d the detail schedule's value (made over
+//     the steps, looked up and interpolated at the sigma), cfg its override or the request's scale (1 without
+//     guidance).  Every prediction above (and the window of skip layer guidance) then goes by that sigma.
+// The order is fixed: plain CFG or APG, CFGZero*, Skip Layer Guidance, CFG norm; each later one reads c as the model
+// gave it.  CFGZero* and APG need the negative pass (they do nothing without one here; the server refuses them);
+// CFG norm, skip layer guidance and Detail Daemon work at CFG 1 as well.
 #pragma once
 
 #include <cstdint>
@@ -30,7 +33,7 @@
 namespace strata::image {
 
 struct GuidanceSpec {
-    float cfgnorm = -1.0f;   // CFGNorm's strength; below 0 off
+    float cfgnorm = -1.0f;   // CFG norm's strength; below 0 off
     bool zero_star = false;  // CFGZero*
     bool apg = false;
     float apg_eta = 1.0f, apg_norm_threshold = 5.0f, apg_momentum = 0.0f;
@@ -82,14 +85,12 @@ private:
     bool tm_, on_;
     float cfg_;
     std::vector<float> sig_, dd_;
-    float* cd_ = nullptr;    // the conditional prediction (APG's after it)
-    float* ud_ = nullptr;    // the unconditional one
-    float* run_ = nullptr;   // APG's running guidance
+    float* cd_ = nullptr;    // the prompt's prediction
+    float* ud_ = nullptr;    // the negative prompt's
+    float* run_ = nullptr;   // APG's sum of the differences over the steps
     float* part_ = nullptr;  // the reductions' partial sums
     float* red_ = nullptr;   // their sums
     size_t wg_ = 0, groups_ = 0;
-    bool have_run_ = false;
-    float prev_sigma_ = -1.0f;
     int calls_ = 0, seq_ = 0;
 };
 

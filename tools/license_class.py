@@ -34,9 +34,12 @@ STRATA = "2026 Niko1221 and the Strata contributors"
 # copyright holders whose code is under a permissive license XeStrata's files may carry (AGENTS.md, Licenses);
 # all of them MIT (Expat)
 PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging",
-              "Peasant Smith and the Project Maya contributors")
+              "Peasant Smith and the Project Maya contributors", "Sahand Ahmadian", "Jonseed", "ZhengPeng")
 # the same for the projects under another permissive license: a copyright holder's words -> its license
-PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The HuggingFace Inc. team": "Apache-2.0"}
+PERMISSIVE_OTHER = {"contributors to the vLLM-Omni project": "Apache-2.0", "The HuggingFace Inc. team": "Apache-2.0",
+                    "SageAttention team": "Apache-2.0", "(comfy-kitchen)": "Apache-2.0",
+                    "the comfyui_controlnet_aux contributors": "Apache-2.0",
+                    "the ComfyUI-SeedVR2_VideoUpscaler contributors": "Apache-2.0"}
 OWN = "LGPL-3.0-or-later"
 MIXED = "LGPL-3.0-or-later AND MIT"
 # the files the classes do not cover: other projects' folders, license texts, the notices

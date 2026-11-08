@@ -28,12 +28,12 @@ struct QiRef {
 };
 
 // MOSS-Image's edits: where an edit adapter's references sit beside the image, as the adapter was trained
-// (MossDit::set_refs; ai-toolkit's training code and each adapter's model card).  TextStart: Moss-Image-Edit's
-// ("moss-image-edit": the references at timestep 0, seeing only each other); Isolated: ai-toolkit's with its kv_cache
-// on ("ai-toolkit": the same, the image's rows moved past them); TimestepZero: ai-toolkit's with it off
-// ("ai-toolkit-no-kv": the references in the sequence, at timestep 0); Index: the references in the sequence at the
-// image's timestep ("index")
-enum class QiRefLayout { TextStart, Isolated, TimestepZero, Index };
+// (MossDit::set_refs; ai-toolkit's training code and each adapter's model card), named after the trainers.  MossEdit:
+// chinoll's Moss-Image-Edit ("moss-image-edit": the references at timestep 0, seeing only each other); AitkKv:
+// ai-toolkit's with its kv_cache on ("ai-toolkit": the same, the image's rows moved past them); AitkNoKv: ai-toolkit's
+// with it off ("ai-toolkit-no-kv": the references in the sequence, at timestep 0); Appended: thearkorbit's
+// moss-image-edit-lora-poc ("appended": the references appended to the sequence at the image's timestep)
+enum class QiRefLayout { MossEdit, AitkKv, AitkNoKv, Appended };
 
 struct QiRequest {
     std::vector<int32_t> ids;   // the prompt in the model's chat form, tokenized; an edit's one <|image_pad|> per ref
@@ -47,7 +47,7 @@ struct QiRequest {
     // MOSS-Image's edits: the references' layout (an ai-toolkit adapter's also has pictures: the text encoder sees
     // each at a <|image_pad|> of ids (one a picture, which the engine widens to its tokens: its sides, multiples of
     // 32, over 32 each), their tokens' rows from the vision encoder)
-    QiRefLayout refs_layout = QiRefLayout::TextStart;
+    QiRefLayout refs_layout = QiRefLayout::MossEdit;
     // the color match of a cut's drawing as it goes back (CropStitch::stitch): 0 none, 1 the part kept
     // around the paint (the default's: the drawing's drift only), 2 the whole cut (a Reinhard transfer)
     int crop_color = 0;
@@ -99,7 +99,7 @@ struct QiRequest {
     std::vector<float> t5_weights, neg_t5_weights;
     // the sampler: "euler" or "er_sde" (Anima's and Mage-Flow's; empty: the model's own)
     std::string sampler;
-    // the guidance added to the sampling (guidance.hpp: CFGNorm, CFGZero*, APG, skip layer guidance,
+    // the guidance added to the sampling (guidance.hpp: CFG norm, CFGZero*, APG, skip layer guidance,
     // Detail Daemon; strata_image's GUIDE words): Qwen-Image-2.1's and Mage-Flow's; the other models leave it
     GuidanceSpec guide;
     // Qwen-Image-2.1's ControlNet (qi_control.hpp; strata_image's CNET: and CTRL words): the branch's file (empty:

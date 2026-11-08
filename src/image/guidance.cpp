@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-FileCopyrightText: 2024 Sahand Ahmadian
+// SPDX-FileCopyrightText: 2024 Jonseed
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/image/guidance.cpp - see include/strata/image/guidance.hpp.
 
 #include "strata/image/guidance.hpp"
@@ -121,7 +123,10 @@ Guidance::Guidance(const GuidanceSpec& g, void* stream, int64_t n, int64_t chann
     };
     get(cd_, (size_t) n_);
     get(ud_, (size_t) n_);
-    if (g_.apg && g_.apg_momentum != 0.0f) get(run_, (size_t) n_);
+    if (g_.apg && g_.apg_momentum != 0.0f) {   // the sum starts at 0 (one Guidance is one sampling)
+        get(run_, (size_t) n_);
+        q_of(s_).memset(run_, 0, (size_t) n_ * 4);
+    }
     get(part_, groups_ * kSums);
     get(red_, 8);
 }
@@ -170,42 +175,23 @@ bool Guidance::skip_pass(float sigma) const {
 void Guidance::denoised(const float* x, const float* c, const float* u, const float* k, float sigma, float* den) {
     sycl::queue& q = q_of(s_);
     const int64_t n = n_;
-    const float s = sigma, cfg = cfg_;
+    const float s = sigma, w = cfg_;
     float *cd = cd_, *ud = ud_, *red = red_;
     const bool apg = g_.apg && u != nullptr, zero = g_.zero_star && u != nullptr;
-    // the predictions (and APG's guidance with its sums: |g|^2, |cond|^2, g . cond)
+    // the denoised predictions; for APG also the step's difference summed (red: |r|^2, |c|^2, <r, c>), for CFGZero*
+    // the velocities' products (red + 4: <v_c, v_u>, |v_u|^2)
     if (apg) {
-        if (prev_sigma_ >= 0.0f && sigma > prev_sigma_) have_run_ = false;   // a new sampling: its sum from 0
-        prev_sigma_ = sigma;
         const float mom = g_.apg_momentum;
         float* run = run_;
-        const bool first = !have_run_;
-        have_run_ = true;
         sums<3>(s_, n, wg_, groups_, part_, red, [=](int64_t i, float* v) {
-            const float a = x[i] - s * c[i], b = x[i] - s * u[i];
-            cd[i] = a;
-            ud[i] = b;
-            float gd = a - b;
-            if (run != nullptr) {
-                gd = first ? gd : mom * run[i] + gd;
-                run[i] = gd;
-            }
-            v[0] += gd * gd;
-            v[1] += a * a;
-            v[2] += gd * a;
-        });
-        const float eta = g_.apg_eta, thr = g_.apg_norm_threshold;
-        q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-            const size_t i = id[0];
-            const float gn = sycl::sqrt(red[0]);
-            const float sc = thr > 0.0f ? sycl::fmin(1.0f, thr / gn) : 1.0f;
-            const float gd = (run != nullptr ? run[i] : cd[i] - ud[i]) * sc;
-            // project(guidance, cond): cond normalized (F.normalize, eps 1e-12), the guidance's part along it
-            const float cn = sycl::fmax(sycl::sqrt(red[1]), 1e-12f);
-            const float v1 = cd[i] / cn;
-            const float par = sc * red[2] / cn * v1;
-            const float mg = (gd - par) + eta * par;
-            cd[i] = (ud[i] + mg) + (cd[i] - ud[i]) / cfg;
+            const float pc = x[i] - s * c[i], pu = x[i] - s * u[i];
+            cd[i] = pc;
+            ud[i] = pu;
+            float r = pc - pu;
+            if (run != nullptr) run[i] = r = r + mom * run[i];
+            v[0] += r * r;
+            v[1] += pc * pc;
+            v[2] += r * pc;
         });
     } else {
         q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -214,56 +200,66 @@ void Guidance::denoised(const float* x, const float* c, const float* u, const fl
             if (u != nullptr) ud[i] = x[i] - s * u[i];
         });
     }
-    // CFGZero*'s alpha: <x - cond, x - uncond> / (|x - uncond|^2 + 1e-8)
     if (zero)
         sums<2>(s_, n, wg_, groups_, part_, red + 4, [=](int64_t i, float* v) {
-            const float a = x[i] - cd[i], b = x[i] - ud[i];
-            v[0] += a * b;
-            v[1] += b * b;
+            v[0] += c[i] * u[i];
+            v[1] += u[i] * u[i];
         });
-    // CFG, CFGZero*, skip layer guidance
     const float slg = k != nullptr ? g_.slg_scale : 0.0f;
+    const float eta = g_.apg_eta, cap = g_.apg_norm_threshold;
+    float* run = run_;
     q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const size_t i = id[0];
-        float d = u != nullptr ? ud[i] + (cd[i] - ud[i]) * cfg : cd[i];
-        if (zero) {
-            const float alpha = red[4] / (red[5] + 1e-8f);
-            d = d + ud[i] * (alpha - 1.0f) + cfg * ud[i] * (1.0f - alpha);
+        const float pc = cd[i];
+        // CFGZero* scales the negative prediction by alpha before the combination
+        const float alpha = zero ? red[4] / (red[5] + 1e-8f) : 1.0f;
+        float d = pc;
+        if (apg) {
+            // r's length capped, then its component along c (r . c / |c|^2) weighed by eta; with CFGZero* as well,
+            // the same alpha's change of the plain combination added
+            const float len = sycl::sqrt(red[0]);
+            const float keep = cap > 0.0f && len > cap ? cap / len : 1.0f;
+            const float along = keep * red[2] / sycl::fmax(red[1], 1e-24f);
+            const float r = (run != nullptr ? run[i] : pc - ud[i]) * keep;
+            d = pc + w * (r + (eta - 1.0f) * along * pc) + (1.0f - w) * (alpha - 1.0f) * ud[i];
+        } else if (u != nullptr) {
+            const float pu = alpha * ud[i];
+            d = pu + w * (pc - pu);
         }
-        if (slg != 0.0f) d = d + (cd[i] - (x[i] - s * k[i])) * slg;
+        if (slg != 0.0f) d += slg * (pc - (x[i] - s * k[i]));
         den[i] = d;
     });
-    if (k != nullptr && g_.slg_rescale != 0.0f) {   // den's spread towards cond's (torch.std: unbiased)
+    if (k != nullptr && g_.slg_rescale != 0.0f) {   // den towards c's spread: the sample standard deviations' ratio
         sums<4>(s_, n, wg_, groups_, part_, red, [=](int64_t i, float* v) {
             v[0] += cd[i];
             v[1] += cd[i] * cd[i];
             v[2] += den[i];
             v[3] += den[i] * den[i];
         });
-        const float rs = g_.slg_rescale;
+        const float mix = g_.slg_rescale;
         q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-            const float nn = (float) n, mc = red[0] / nn, md = red[2] / nn;
-            const float sc = sycl::sqrt(sycl::fmax(red[1] - nn * mc * mc, 0.0f) / (nn - 1.0f));
-            const float sd = sycl::sqrt(sycl::fmax(red[3] - nn * md * md, 0.0f) / (nn - 1.0f));
-            const float f = rs * (sc / sd) + (1.0f - rs);
-            den[id[0]] *= f;
+            const float nn = (float) n;
+            const auto spread = [=](float sum, float sq) {
+                return sycl::sqrt(sycl::fmax(sq - sum * sum / nn, 0.0f) / (nn - 1.0f));
+            };
+            den[id[0]] *= 1.0f + mix * (spread(red[0], red[1]) / spread(red[2], red[3]) - 1.0f);
         });
     }
-    // CFGNorm: each position's norm over the channels, den's no larger than cond's, then the strength
+    // CFG norm: at each position, den no longer than c over the channels, then the strength
     if (g_.cfgnorm >= 0.0f) {
         const int64_t C = ch_, P = n / ch_;
         const bool tm = tm_;
         const float st = g_.cfgnorm;
         q.parallel_for(sycl::range<1>((size_t) P), [=](sycl::id<1> id) {
             const int64_t p = (int64_t) id[0];
-            auto at = [=](int64_t ch) { return tm ? p * C + ch : ch * P + p; };
-            float nc = 0.0f, nd = 0.0f;
-            for (int64_t ch = 0; ch < C; ++ch) {
-                nc += cd[at(ch)] * cd[at(ch)];
-                nd += den[at(ch)] * den[at(ch)];
+            const int64_t base = tm ? p * C : p, step = tm ? 1 : P;
+            float lc = 0.0f, ld = 0.0f;
+            for (int64_t j = 0; j < C; ++j) {
+                lc += cd[base + j * step] * cd[base + j * step];
+                ld += den[base + j * step] * den[base + j * step];
             }
-            const float sc = sycl::clamp(sycl::sqrt(nc) / (sycl::sqrt(nd) + 1e-8f), 0.0f, 1.0f);
-            for (int64_t ch = 0; ch < C; ++ch) den[at(ch)] = den[at(ch)] * sc * st;
+            const float f = st * (ld > lc ? sycl::sqrt(lc / ld) : 1.0f);
+            for (int64_t j = 0; j < C; ++j) den[base + j * step] *= f;
         });
     }
     dump(x, c, u, k, sigma, den);

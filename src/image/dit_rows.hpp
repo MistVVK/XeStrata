@@ -376,7 +376,7 @@ struct GeluTanh {
 // W values at once: raw_w, keep_w, out_w; or with the sub-group, load_sg (a lane's 8 values of a GGUF block, W 8).
 // row_scale(t), where the op has it: the row's own factor on its scale.  An op with kRegular rotates by the regular
 // Hadamard matrix instead (kron(H4, H4, H4, H4) / 16, H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2: the
-// basis ComfyUI's int8_convrot weights are saved in, hunyuanimage3_file.hpp), which is Sylvester's, a sign that flips
+// basis Comfy-Org's int8_convrot weights are saved in, hunyuanimage3_file.hpp), which is Sylvester's, a sign that flips
 // for each of the position's base-4 digits that is 3, and Sylvester's again: H4 = S D S with D = diag(1, 1, 1, -1).
 template<class Op> constexpr bool regular_rotation() {
     if constexpr (requires { Op::kRegular; }) return Op::kRegular;

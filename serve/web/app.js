@@ -3567,7 +3567,7 @@ function imgMaskSetup() {
   if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
   imgMaskURL = null;
   $("img-mask").hidden = !(f && d.mask);
-  $("img-crop").checked = d.crop_stitch !== false;
+  $("img-crop").checked = d.crop_edit !== false;
   $("img-refine-f").hidden = !(d.refine && ($("img-ref").files || []).length > 1);
   if ($("img-mask").hidden) { imgLayoutDraw(); return; }
   imgMaskURL = URL.createObjectURL(f);
@@ -4221,7 +4221,7 @@ $("img-form").onsubmit = async (ev) => {
     const mask = refs.length ? imgMask() : null;
     if (mask) {
       body.mask = {image_url: mask};
-      body.crop_stitch = $("img-crop").checked;
+      body.crop_edit = $("img-crop").checked;
       if ($("img-color").value !== "off") body.color_match = $("img-color").value;
       if (!$("img-refine-f").hidden && $("img-refine").checked) body.refine = true;
     }
@@ -4283,7 +4283,7 @@ $("img-go").onclick = (ev) => {
 
 // ------------------------------------------------------------------ the Tools tab: the image tools on their own
 // Each tool is its API's request: the upscale /v1/images/upscale (model, scale, extra_params: color_correction_method,
-// redraw, redraw_strength, redraw_model), the Detailer the edits' fix ({parts, strength}), the parts found
+// redraw, redraw_strength, redraw_model), the parts' fix the edits' fix ({parts, strength}), the parts found
 // /v1/images/segmentations (prompt, task, model, score_threshold, mask_threshold), the background removed
 // /v1/images/remove-background (model, operating_resolution, refine_foreground, mask_only, background_color, mask_grow,
 // mask_blur, output_format).  The image is one of this browser's files or one the Images tab sends (toolOpen).
@@ -4298,7 +4298,7 @@ function toolsSetup() {
   for (const b of $("tool-kind").children) b.hidden = !has(b.dataset.tool);
   for (const b of document.querySelectorAll("[data-send-tool]")) b.hidden = !has(b.dataset.sendTool);
   if (any.length && !any.includes(toolKind)) toolKind = any[0];
-  // the image model that draws (an upscale's redraw, the Detailer): one that offers the tool, a choice of several
+  // the image model that draws (an upscale's redraw, the parts' fix): one that offers the tool, a choice of several
   const sel = $("tool-model"), was = sel.value;
   const draw = ms.filter(m => ((m.defaults || {}).tools || []).includes(TOOL_NAMES[toolKind === "fix" ? "fix" : "upscale"]));
   sel.replaceChildren(...draw.map(m => new Option(m.id, m.id)));
@@ -4308,7 +4308,7 @@ function toolsSetup() {
 // the tool's name (its button) and what it does
 const toolRunText = (k) => k === "fix" ? tr("tool.fix", "Fix parts") : k === "segment" ? tr("tool.segment", "Find parts")
   : k === "rembg" ? tr("tool.rembg", "Remove background") : tr("tool.upscale", "Upscale");
-const toolAboutText = (k) => k === "fix" ? tr("tool.aboutFix", "Finds faces, hands or people and draws each again, finer (a Detailer). The image keeps its size.")
+const toolAboutText = (k) => k === "fix" ? tr("tool.aboutFix", "Finds faces, hands or people and draws each again, finer. The image keeps its size.")
   : k === "segment" ? tr("tool.aboutSegment", "Finds the parts the words name. A mask found here can be the mask of an edit in the Images tab.")
   : k === "rembg" ? tr("tool.aboutRembg", "Cuts the subject out (BiRefNet): a PNG with a transparent background, or its mask.")
   : tr("tool.aboutUpscale", "Makes the image larger on the GPU; with the redraw, the image model draws the larger picture again for detail.");
@@ -4568,7 +4568,7 @@ $("tool-form").onsubmit = async (ev) => {
       $("tool-sam-license").hidden = !(j.xestrata && /license/.test(j.xestrata.fallback || ""));
     } else {
       const fmt = j.output_format || "png", d = j.data[0];
-      const fix = j.xestrata && j.xestrata.fix;   // the Detailer's regions found and drawn again
+      const fix = j.xestrata && j.xestrata.fix;   // the parts' fix's regions found and drawn again
       const answer = [`model: ${j.model}`, j.size ? `size: ${j.size}` : j.width ? `size: ${j.width}x${j.height}` : "", d.seed != null ? `seed: ${d.seed}` : "",
                       fix ? `regions: ${(fix.regions || []).map(x => `${x.part} ${x.score.toFixed(2)}`).join(", ") || 0}` : "", `seconds: ${seconds}`].filter(Boolean);
       const req = d.seed != null && body.seed == null && (body.prompt || body.fix) ? {...body, seed: d.seed} : body;

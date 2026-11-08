@@ -111,7 +111,7 @@ private:
     mutable int64_t w8_rows_ = 0;
     bool base_encoder_ = false, states_given_ = false;
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
-    QiRefLayout ref_layout_ = QiRefLayout::TextStart;   // and their layout (in the stream: as text rows)
+    QiRefLayout ref_layout_ = QiRefLayout::MossEdit;   // and their layout (in the stream: as text rows)
     std::string vision_path_;
     int32_t image_pad_ = -1;   // the text encoder's <|image_pad|> (its GGUF's vocabulary)
     std::unique_ptr<QiVision> vision_size_;
