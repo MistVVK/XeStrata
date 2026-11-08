@@ -60,7 +60,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ2_XS",
@@ -73,7 +74,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_XXS",
@@ -86,7 +88,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_S",
@@ -99,9 +102,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "original",
+   "quantizer": "gsq-rco",
+   "recommended_size": "Q2_0"
   },
   {
    "id": "swift",
@@ -141,7 +149,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ2_XS",
@@ -154,7 +163,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_XXS",
@@ -167,7 +177,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_S",
@@ -180,9 +191,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "swift",
+   "quantizer": "gsq-rco",
+   "recommended_size": "Q2_0"
   },
   {
    "id": "coder",
@@ -222,9 +238,14 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "coder",
+   "quantizer": "gsq-rco",
+   "recommended_size": "IQ1_M"
   },
   {
    "id": "unsloth",
@@ -264,7 +285,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-IQ2_XS",
@@ -277,7 +299,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q2_K_XL",
@@ -290,7 +313,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-IQ3_XXS",
@@ -303,7 +327,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q3_K_XL",
@@ -316,7 +341,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-IQ4_XS",
@@ -329,7 +355,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q4_K_XL",
@@ -342,7 +369,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q5_K_XL",
@@ -355,7 +383,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q6_K_XL",
@@ -368,7 +397,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -381,9 +411,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "UD-Q2_0"
   },
   {
    "id": "gyro",
@@ -423,7 +458,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gyro"
     },
     {
      "id": "Gyro-M",
@@ -436,7 +472,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gyro"
     },
     {
      "id": "Gyro-L",
@@ -449,9 +486,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gyro"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "original",
+   "quantizer": "gyro",
+   "recommended_size": "Gyro-S"
   },
   {
    "id": "gyro-coder",
@@ -491,7 +533,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gyro"
     },
     {
      "id": "Gyro-Coder",
@@ -504,9 +547,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gyro"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "coder",
+   "quantizer": "gyro",
+   "recommended_size": "Gyro-Coder-L"
   },
   {
    "id": "huihui-swift",
@@ -546,7 +594,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_XXS",
@@ -559,9 +608,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "swift-huihui-ai",
+   "quantizer": "gsq-rco",
+   "recommended_size": "IQ2_XS"
   },
   {
    "id": "huihui-unsloth",
@@ -601,7 +655,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q4_K_XL",
@@ -614,7 +669,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -627,9 +683,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "huihui-ai",
+   "quantizer": "unsloth",
+   "recommended_size": "UD-IQ4_XS"
   },
   {
    "id": "sc117",
@@ -669,7 +730,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ2_XS",
@@ -682,7 +744,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_XXS",
@@ -695,7 +758,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_S",
@@ -708,9 +772,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "sc117",
+   "quantizer": "gsq-rco",
+   "recommended_size": "Q2_0"
   },
   {
    "id": "sc117-swift",
@@ -750,7 +819,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ2_XS",
@@ -763,7 +833,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_XXS",
@@ -776,7 +847,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     },
     {
      "id": "IQ3_S",
@@ -789,9 +861,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "gsq-rco"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "swift-sc117",
+   "quantizer": "gsq-rco",
+   "recommended_size": "Q2_0"
   },
   {
    "id": "atomicchat",
@@ -831,7 +908,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "ad"
     },
     {
      "id": "AD-5.00bpw",
@@ -844,9 +922,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "ad"
     }
-   ]
+   ],
+   "base": "qwen3.8-flash-next",
+   "variant": "original",
+   "quantizer": "ad",
+   "recommended_size": "AD-4.27bpw"
   },
   {
    "id": "ornith",
@@ -881,10 +964,11 @@
      "fits": "yes",
      "tested": true,
      "experimental": false,
-     "recommended": true,
+     "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "ornith-ai"
     },
     {
      "id": "Q5_K_M",
@@ -894,10 +978,11 @@
      "fits": "yes",
      "tested": false,
      "experimental": false,
-     "recommended": false,
+     "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "ornith-ai"
     },
     {
      "id": "Q6_K",
@@ -910,7 +995,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "ornith-ai"
     },
     {
      "id": "Q8_0",
@@ -923,7 +1009,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "ornith-ai"
     },
     {
      "id": "BF16",
@@ -936,7 +1023,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "ornith-ai"
     },
     {
      "id": "GSQ-RCO-3BIT",
@@ -949,7 +1037,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "gsq-rco-pfeifferj"
     },
     {
      "id": "GSQ-RCO-3.5BIT",
@@ -959,12 +1048,17 @@
      "fits": "yes",
      "tested": false,
      "experimental": false,
-     "recommended": false,
+     "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "gsq-rco-pfeifferj"
     }
-   ]
+   ],
+   "base": "ornith-1.5",
+   "variant": "original",
+   "quantizer": "ornith-ai",
+   "recommended_size": "Q5_K_M"
   },
   {
    "id": "ornith-uncensored",
@@ -999,10 +1093,11 @@
      "fits": "yes",
      "tested": false,
      "experimental": false,
-     "recommended": true,
+     "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "dealignai"
     },
     {
      "id": "Q5_K_M",
@@ -1012,10 +1107,11 @@
      "fits": "yes",
      "tested": false,
      "experimental": false,
-     "recommended": false,
+     "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "dealignai"
     },
     {
      "id": "Q6_K",
@@ -1028,7 +1124,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "dealignai"
     },
     {
      "id": "Q8_0",
@@ -1041,9 +1138,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "dealignai"
     }
-   ]
+   ],
+   "base": "ornith-1.5",
+   "variant": "dealignai",
+   "quantizer": "dealignai",
+   "recommended_size": "Q5_K_M"
   },
   {
    "id": "llmjp",
@@ -1079,7 +1181,8 @@
      "recommended": true,
      "context": 32768,
      "vision": false,
-     "budget": true
+     "budget": true,
+     "quantizer": "llm-jp"
     },
     {
      "id": "BF16",
@@ -1092,9 +1195,14 @@
      "recommended": false,
      "context": 32768,
      "vision": false,
-     "budget": true
+     "budget": true,
+     "quantizer": "llm-jp"
     }
-   ]
+   ],
+   "base": "llm-jp-4.1",
+   "variant": "original",
+   "quantizer": "llm-jp",
+   "recommended_size": "Q4_K_M"
   },
   {
    "id": "qwen36",
@@ -1132,7 +1240,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q6_K_XL",
@@ -1145,7 +1254,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -1158,9 +1268,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.6",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "UD-Q4_K_XL"
   },
   {
    "id": "qwen36-uncensored",
@@ -1198,7 +1313,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "apex"
     },
     {
      "id": "APEX-I-Balanced",
@@ -1211,7 +1327,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "apex"
     },
     {
      "id": "APEX-I-Compact",
@@ -1224,7 +1341,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "apex"
     },
     {
      "id": "APEX-I-MINI",
@@ -1237,9 +1355,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": true
+     "budget": true,
+     "quantizer": "apex"
     }
-   ]
+   ],
+   "base": "qwen3.6",
+   "variant": "llmfan46",
+   "quantizer": "apex",
+   "recommended_size": "APEX-I-Quality"
   },
   {
    "id": "qwen35",
@@ -1277,7 +1400,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q6_K",
@@ -1290,7 +1414,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -1303,7 +1428,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "BF16",
@@ -1316,9 +1442,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.5-9b",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "Q4_K_M"
   },
   {
    "id": "qwen35-2b",
@@ -1356,7 +1487,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-Q5_K_XL",
@@ -1369,7 +1501,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q6_K",
@@ -1382,7 +1515,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -1395,7 +1529,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "BF16",
@@ -1408,9 +1543,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.5-2b",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "Q8_0"
   },
   {
    "id": "qwen35-0.8b",
@@ -1448,7 +1588,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q6_K",
@@ -1461,7 +1602,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "Q8_0",
@@ -1471,10 +1613,11 @@
      "fits": "yes",
      "tested": true,
      "experimental": false,
-     "recommended": false,
+     "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     },
     {
      "id": "BF16",
@@ -1484,12 +1627,17 @@
      "fits": "yes",
      "tested": false,
      "experimental": false,
-     "recommended": true,
+     "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "qwen3.5-0.8b",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "Q8_0"
   },
   {
    "id": "qwen35-uncensored",
@@ -1527,7 +1675,8 @@
      "recommended": true,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "hauhaucs"
     },
     {
      "id": "Q6_K",
@@ -1540,7 +1689,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "hauhaucs"
     },
     {
      "id": "Q8_0",
@@ -1553,7 +1703,8 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "hauhaucs"
     },
     {
      "id": "BF16",
@@ -1566,9 +1717,14 @@
      "recommended": false,
      "context": 32768,
      "vision": true,
-     "budget": false
+     "budget": false,
+     "quantizer": "hauhaucs"
     }
-   ]
+   ],
+   "base": "qwen3.5-9b",
+   "variant": "hauhaucs",
+   "quantizer": "hauhaucs",
+   "recommended_size": "Q4_K_M"
   },
   {
    "id": "glm53",
@@ -1600,10 +1756,11 @@
      "fits": "slow",
      "tested": true,
      "experimental": false,
-     "recommended": true,
+     "recommended": false,
      "context": 32768,
      "vision": false,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-IQ1_S",
@@ -1613,10 +1770,11 @@
      "fits": "slow",
      "tested": true,
      "experimental": false,
-     "recommended": false,
+     "recommended": true,
      "context": 32768,
      "vision": false,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     },
     {
      "id": "UD-IQ4_XS",
@@ -1629,9 +1787,14 @@
      "recommended": false,
      "context": 32768,
      "vision": false,
-     "budget": true
+     "budget": true,
+     "quantizer": "unsloth"
     }
-   ]
+   ],
+   "base": "glm-5.3-flash",
+   "variant": "original",
+   "quantizer": "unsloth",
+   "recommended_size": "UD-IQ1_S"
   }
  ],
  "installed": [
@@ -2033,5 +2196,69 @@
   "moss-image"
  ],
  "web_search": null,
- "custom": null
+ "custom": null,
+ "bases": [
+  {
+   "id": "qwen3.8-flash-next",
+   "title": "Qwen3.8-Flash-Next"
+  },
+  {
+   "id": "ornith-1.5",
+   "title": "Ornith-1.5-35B-A3B"
+  },
+  {
+   "id": "qwen3.6",
+   "title": "Qwen3.6-35B-A3B"
+  },
+  {
+   "id": "qwen3.5-9b",
+   "title": "Qwen3.5-9B"
+  },
+  {
+   "id": "qwen3.5-2b",
+   "title": "Qwen3.5-2B"
+  },
+  {
+   "id": "llm-jp-4.1",
+   "title": "llm-jp-4.1-32b-a3b-thinking"
+  },
+  {
+   "id": "glm-5.3-flash",
+   "title": "GLM-5.3-Flash"
+  },
+  {
+   "id": "qwen3.5-0.8b",
+   "title": "Qwen3.5-0.8B"
+  }
+ ],
+ "recommended_family": "gyro-coder",
+ "variants": {
+  "original": "the original",
+  "swift": "Swift 1.5 (UkisAI's fine-tune)",
+  "coder": "Coder (half the experts, kept for code)",
+  "sc117": "abliterated by SC117",
+  "swift-sc117": "Swift 1.5, abliterated by SC117",
+  "huihui-ai": "abliterated by huihui-ai",
+  "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai",
+  "dealignai": "uncensored by dealignai",
+  "llmfan46": "uncensored by llmfan46",
+  "hauhaucs": "uncensored by HauhauCS"
+ },
+ "quantizers": {
+  "gsq-rco": "GSQ-RCO by ISTA-DASLab",
+  "unsloth": "Unsloth",
+  "gyro": "Gyro by agentionai",
+  "ad": "AD by AtomicChat",
+  "ornith-ai": "GGUFs by Ornith AI",
+  "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
+  "dealignai": "GGUFs by dealignai",
+  "llm-jp": "GGUFs by LLM-jp",
+  "apex": "APEX by SC117",
+  "hauhaucs": "GGUFs by HauhauCS",
+  "own": "your own files"
+ },
+ "sam3": {
+  "license": "Meta's SAM License: https://huggingface.co/facebook/sam3.1",
+  "agreed": false
+ }
 }

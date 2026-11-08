@@ -10,6 +10,12 @@ open System.Text.Json
 
 type Cpu = { Name: string; Avx2: bool; Avx512: bool }
 
+/// SAM 3.1's license (setup's --image-sam3-license) and whether it was agreed to.
+type Sam3 = { License: string; Agreed: bool }
+
+/// A level of the lists' entry: its id and its name.
+type Tier = { Id: string; Title: string }
+
 type Gpu =
     { Index: int
       Name: string
@@ -36,13 +42,22 @@ type Model =
       /// whether it can read pictures (setup's "Do you want images?", --vision)
       Vision: bool
       /// whether setup takes a RAM budget of its experts, the rest read from the SSD (--resident-budget-gib)
-      Budget: bool }
+      Budget: bool
+      /// the quantization it is of (Describe.Quantizers), its family's or its own
+      Quantizer: string }
 
 type Family =
     { Id: string
       Title: string
       By: string
       About: string
+      /// its place in the lists: the model (Describe.Bases), the version (Describe.Variants) and the quantization
+      /// (Describe.Quantizers); null from a setup without the levels
+      Base: string
+      Variant: string
+      Quantizer: string
+      /// the size setup recommends of it on this PC
+      RecommendedSize: string
       License: string
       Experimental: bool
       /// whether setup can add image generation to its models
@@ -105,7 +120,16 @@ type Describe =
       /// web search for every model as setup set it up: "deepseek", "tinyfish", or null (none)
       WebSearch: string
       /// with --gguf: what setup read of those files (their family, "custom", is in Families), else null
-      Custom: CustomModel }
+      Custom: CustomModel
+      /// the models in setup's order
+      Bases: Tier[]
+      /// the family a first install is offered
+      RecommendedFamily: string
+      /// the versions' and the quantizations' names
+      Variants: Collections.Generic.Dictionary<string, string>
+      Quantizers: Collections.Generic.Dictionary<string, string>
+      /// null from a setup without it
+      Sam3: Sam3 }
 
 type Update =
     { Current: string

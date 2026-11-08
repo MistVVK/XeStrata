@@ -137,10 +137,44 @@ let private open' (setup: FakeSetup) =
 
 let private english () = I18n.choose "en"
 
-/// The install page's two lists (the model families and the sizes).
+/// The install page's choices: the model, its version and its quantization, and the list of sizes.
+type private Levels = { Model: ComboBox; Version: ComboBox; Quantization: ComboBox; Sizes: ListBox }
+
 let private installPage (w: Window) =
     click w (tr "home.install" "Install a model ...")
-    waitFor "the lists" (fun () -> match all<ListBox> w with [ a; b ] -> Some(a, b) | _ -> None)
+    let sizes = waitFor "the sizes" (fun () -> match all<ListBox> w with [ s ] -> Some s | _ -> None)
+    { Model = fieldOf<ComboBox> w (tr "install.model" "Model")
+      Version = fieldOf<ComboBox> w (tr "install.version" "Version: the original, or whose changed copy")
+      Quantization = fieldOf<ComboBox> w (tr "install.quantization" "Quantization: whose model files")
+      Sizes = sizes }
+
+/// Every model, version and quantization chosen in turn: `each` gets the family's title the page shows.
+let private everyChoice (w: Window) (lv: Levels) (each: string -> unit) =
+    for i in 0 .. lv.Model.ItemCount - 1 do
+        lv.Model.SelectedIndex <- i
+        pump ()
+        for j in 0 .. lv.Version.ItemCount - 1 do
+            lv.Version.SelectedIndex <- j
+            pump ()
+            for k in 0 .. lv.Quantization.ItemCount - 1 do
+                lv.Quantization.SelectedIndex <- k
+                pump ()
+                // the family's title as the page shows it whole (the model's own name is a shorter title)
+                let on = texts w
+                let shown = described.Value.Families |> Array.filter (fun f -> List.contains f.Title on)
+                each (match shown with [||] -> failwith "no family on the page" | fs -> (fs |> Array.maxBy (fun f -> f.Title.Length)).Title)
+
+/// The page's choice of a family by its id (its model, version and quantization).
+let private choose (w: Window) (lv: Levels) (id: string) =
+    let d = described.Value
+    let f = d.Families |> Array.find (fun f -> f.Id = id)
+    lv.Model.SelectedItem <- (d.Bases |> Array.find (fun t -> t.Id = f.Base)).Title
+    pump ()
+    if lv.Version.ItemCount > 1 then lv.Version.SelectedItem <- d.Variants[f.Variant]
+    pump ()
+    if lv.Quantization.ItemCount > 1 then lv.Quantization.SelectedItem <- d.Quantizers[f.Quantizer]
+    pump ()
+    f
 
 let private none (_: string list) : Message list = []
 
@@ -197,24 +231,44 @@ let ``setup that cannot describe the PC leaves a page that says why`` () =
 let ``the install page's lists scroll to their ends`` () =
     english ()
     let w = open' (FakeSetup(described.Value, none))
-    let families, sizes = installPage w
-    for list in [ families; sizes ] do
-        let centre = list.TranslatePoint(Point(list.Bounds.Width / 2.0, list.Bounds.Height / 2.0), w)
-        Assert.True(centre.HasValue, "the list is not on the page")
-        for _ in 1..30 do
-            w.MouseWheel(centre.Value, Vector(0.0, -1.0))
-            pump ()
-        for _ in 1..30 do
-            w.MouseWheel(centre.Value, Vector(0.0, 1.0))
-            pump ()
-    families.SelectedIndex <- 0
-    (families.ContainerFromIndex 0).Focus() |> ignore
-    for _ in 1 .. families.ItemCount do
+    let lv = installPage w
+    choose w lv "unsloth" |> ignore                          // the family of the most sizes (10)
+    let sizes = lv.Sizes
+    let centre = sizes.TranslatePoint(Point(sizes.Bounds.Width / 2.0, sizes.Bounds.Height / 2.0), w)
+    Assert.True(centre.HasValue, "the list is not on the page")
+    for _ in 1..30 do
+        w.MouseWheel(centre.Value, Vector(0.0, -1.0))
+        pump ()
+    for _ in 1..30 do
+        w.MouseWheel(centre.Value, Vector(0.0, 1.0))
+        pump ()
+    sizes.SelectedIndex <- 0
+    (sizes.ContainerFromIndex 0).Focus() |> ignore
+    for _ in 1 .. sizes.ItemCount do
         press w Key.Down PhysicalKey.ArrowDown
-    Assert.Equal(families.ItemCount - 1, families.SelectedIndex)
-    for _ in 1 .. families.ItemCount do
+    Assert.Equal(sizes.ItemCount - 1, sizes.SelectedIndex)
+    for _ in 1 .. sizes.ItemCount do
         press w Key.Up PhysicalKey.ArrowUp
-    Assert.Equal(0, families.SelectedIndex)
+    Assert.Equal(0, sizes.SelectedIndex)
+
+/// The model setup recommends is chosen first, with its recommended size's quantization and that size; a level of
+/// one choice is not shown.
+[<AvaloniaFact>]
+let ``the install page starts at setup's recommendation`` () =
+    english ()
+    let d = described.Value
+    let w = open' (FakeSetup(d, none))
+    let lv = installPage w
+    let f = d.Families |> Array.find (fun f -> f.Id = d.RecommendedFamily)
+    Assert.Equal(box (d.Bases |> Array.find (fun t -> t.Id = f.Base)).Title, lv.Model.SelectedItem)
+    Assert.Equal(f.RecommendedSize, (lv.Sizes.SelectedItem :?> Model).Id)
+    Assert.True(shows w f.Title)
+    choose w lv "llmjp" |> ignore
+    Assert.False(visible lv.Version, "llm-jp has one version")
+    Assert.False(visible lv.Quantization, "llm-jp has one quantization")
+    choose w lv "qwen" |> ignore
+    Assert.True(visible lv.Quantization, "Qwen3.8-Flash-Next has four quantizations")
+    Assert.Equal(4, lv.Quantization.ItemCount)
 
 /// Every family, each of its sizes and each context the install page offers, the fields setup would ask shown.
 [<AvaloniaFact>]
@@ -222,16 +276,17 @@ let ``every family, size and context can be chosen`` () =
     english ()
     let d = described.Value
     let w = open' (FakeSetup(d, none))
-    let families, sizes = installPage w
+    let lv = installPage w
+    let sizes = lv.Sizes
     let contexts = fieldOf<ComboBox> w "Context: how much text the model sees at once (longer takes more VRAM)"
     let imagesField = fieldOf<StackPanel> w "Image generation: models to make images with, besides the text model"
-    for i in 0 .. families.ItemCount - 1 do
-        families.SelectedIndex <- i
-        pump ()
-        let f = families.SelectedItem :?> Family
-        Assert.True(sizes.SelectedItem :? Model, f.Id + ": no size chosen")
-        let recommended = f.Models |> Array.tryFind (fun m -> m.Recommended)
-        recommended |> Option.iter (fun m -> Assert.Equal(m.Id, (sizes.SelectedItem :?> Model).Id))
+    let seen = Collections.Generic.HashSet<string>()
+    everyChoice w lv (fun title ->
+        let f = d.Families |> Array.find (fun f -> f.Title = title)
+        seen.Add f.Id |> ignore
+        let m = sizes.SelectedItem :?> Model
+        // the sizes of the quantization chosen, its recommended one chosen
+        Assert.True(m.Recommended, sprintf "%s: %s is not the recommended size" f.Id m.Id)
         for j in 0 .. sizes.ItemCount - 1 do
             sizes.SelectedIndex <- j
             pump ()
@@ -239,7 +294,8 @@ let ``every family, size and context can be chosen`` () =
                 contexts.SelectedIndex <- k
                 pump ()
         // the image models are offered for every family when the PC has a GPU (setup_plain's included)
-        Assert.True(visible imagesField, f.Id + ": no image models offered")
+        Assert.True(visible imagesField, f.Id + ": no image models offered"))
+    Assert.Equal(d.Families.Length, seen.Count)
 
 /// The install button passes the page's choices to setup as its options, and the run's page follows setup.
 [<AvaloniaFact>]
@@ -248,10 +304,9 @@ let ``an install passes the choices to setup and follows its run`` () =
     let d = described.Value
     let setup = FakeSetup(d, none)
     let w = open' setup
-    let families, sizes = installPage w
-    families.SelectedIndex <- Array.findIndex (fun (f: Family) -> f.Id = "qwen") (families.ItemsSource :?> Family[])
-    pump ()
-    let m = sizes.SelectedItem :?> Model
+    let lv = installPage w
+    choose w lv "qwen" |> ignore
+    let m = lv.Sizes.SelectedItem :?> Model
     (fieldOf<TextBox> w "Port").Text <- "8100"
     (fieldOf<TextBox> w "VRAM left free for other programs, in MiB").Text <- "512"
     click w "Install"
@@ -362,10 +417,26 @@ let ``a start with options passes them`` () =
     (fieldOf<TextBox> w "Port").Text <- "8200"
     (fieldOf<TextBox> w "API key").Text <- "k1"
     (fieldOf<ComboBox> w "Who may connect (with networks: set an API key too)").SelectedIndex <- 1
+    (fieldOf<ComboBox> w "Other languages' characters in the answers, for every model (the thinking is left as it is)").SelectedIndex <- 1
+    (fieldOf<ComboBox> w "Qwen3.8-Flash-Next's n-gram table").SelectedIndex <- 1
     click w "Start"
     let args = setup.Last.Args
-    for part in [ [ "--port"; "8200" ]; [ "--host"; "0.0.0.0" ]; [ "--api-key"; "k1" ] ] do
+    for part in
+        [ [ "--port"; "8200" ]; [ "--host"; "0.0.0.0" ]; [ "--api-key"; "k1" ]; [ "--script-guard"; "ja" ]
+          [ "--ple-io"; "ram" ] ] do
         Assert.True(contains part args, sprintf "%A not in %A" part args)
+
+/// The options left as they are pass nothing: setup keeps what was set before.
+[<AvaloniaFact>]
+let ``a start with the options untouched passes none of them`` () =
+    english ()
+    let setup = FakeSetup(described.Value, none)
+    let w = open' setup
+    click w "Start with options ..."
+    click w "Start"
+    let args = setup.Last.Args
+    for name in [ "--script-guard"; "--ple-io"; "--port"; "--host" ] do
+        Assert.DoesNotContain(name, args)
 
 [<AvaloniaFact>]
 let ``an installed model's image models are set by install.py`` () =
@@ -376,12 +447,38 @@ let ``an installed model's image models are set by install.py`` () =
     click w "Images ..."
     let first = all<CheckBox> w |> List.find (fun b -> match b.Content with :? StackPanel -> true | _ -> false)
     first.IsChecked <- Nullable true
+    // the image jobs on the GPU of the list (by its PCI address), and SAM 3.1's license agreed to
+    (fieldOf<ComboBox> w "The GPU that makes the images").SelectedIndex <- 1
+    let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
+    sam3.IsChecked <- Nullable true
     pump ()
     click w "Apply"
     let r = setup.Last
     Assert.Equal(Places.imageInstallPy, r.Script)
-    for part in [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id ]; [ "--yes" ] ] do
+    for part in
+        [ [ "--config"; d.Installed[0].Config ]; [ "--model"; d.Images[0].Id ]; [ "--yes" ]; [ "--gpu"; "same" ]
+          [ "--sam3-license"; "agree" ] ] do
         Assert.True(contains part r.Args, sprintf "%A not in %A" part r.Args)
+
+/// The install page passes the image options as setup's --image-<name>, SAM 3.1's license not agreed unless checked;
+/// once agreed (setup's record), it is not asked again.
+[<AvaloniaFact>]
+let ``an install passes the image options, SAM 3.1's license only where it is not agreed yet`` () =
+    english ()
+    let d = described.Value
+    let setup = FakeSetup(d, none)
+    let w = open' setup
+    installPage w |> ignore
+    click w "Install"
+    let args = setup.Last.Args
+    for part in [ [ "--image-gpu"; "auto" ]; [ "--image-sam3-license"; "no" ] ] do
+        Assert.True(contains part args, sprintf "%A not in %A" part args)
+    let agreed = FakeSetup({ d with Sam3 = { d.Sam3 with Agreed = true } }, none)
+    let w2 = open' agreed
+    installPage w2 |> ignore
+    Assert.False(shows w2 "The license: ", "SAM 3.1's license asked again")
+    click w2 "Install"
+    Assert.DoesNotContain("--image-sam3-license", agreed.Last.Args)
 
 [<AvaloniaFact>]
 let ``taking the image models out passes no`` () =
@@ -488,11 +585,8 @@ let ``every page is made in every language`` () =
             let home () = click w (tr "common.back" "Back")
             let check page = Assert.True((unfilled w).IsEmpty, sprintf "%s, %s: %A" code page (unfilled w))
             check "home"
-            let families, _ = installPage w
-            for i in 0 .. families.ItemCount - 1 do
-                families.SelectedIndex <- i
-                pump ()
-                check ("install " + string i)
+            let lv = installPage w
+            everyChoice w lv (fun title -> check ("install " + title))
             home ()
             for label, page in
                 [ "home.ownFiles", "Install from files on this PC ..."

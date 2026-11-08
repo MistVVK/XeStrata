@@ -28,6 +28,8 @@ the United Kingdom or South Korea: https://github.com/Tencent-Hunyuan/HunyuanIma
 under Apache 2.0.
 --dit-q8, --dit-keep: Mage-Flow's or MOSS-Image's image model in 8 or 16 bits, and Mage-Flow's not in use kept in RAM
 (as setup's --image-dit-q8 and --image-dit-keep).
+--gpu auto|same|PCI: the GPU of the image jobs (setup's --image-gpu); --sam3-license agree|no: Meta's SAM License for
+SAM 3.1, which finds a part of a picture by words (setup's --image-sam3-license; asked when not given).
 """
 from __future__ import annotations
 
@@ -61,6 +63,8 @@ def main(argv=None) -> int:
     ap.add_argument("--dit-q8", choices=["auto", "on", "off"],
                     help="Mage-Flow, MOSS-Image: its DiT 16-bit in VRAM when it fits there with the text encoder, "
                          "else 8 bits (auto, the default); on always 8 bits, off always 16-bit")
+    ap.add_argument("--gpu", metavar="auto|same|PCI", help="the GPU of the image jobs, as setup's --image-gpu")
+    ap.add_argument("--sam3-license", choices=["agree", "no"], help="as setup's --image-sam3-license")
     ap.add_argument("--dit-keep", choices=["on", "off"],
                     help="Mage-Flow: keep the DiT not in use (the generation's or the edit's) in RAM (on, the default)")
     ap.add_argument("--print", action="store_true", help="print the images section instead of writing it")
@@ -89,7 +93,7 @@ def main(argv=None) -> int:
         a.models_dir = str(data / "models")
     ns = argparse.Namespace(images=a.model, image_quant=a.quant, image_gpu_policy=a.gpu_policy, yes=a.yes,
                             image_ssd_offload=a.ssd_offload, image_dit_q8=a.dit_q8,
-                            image_dit_keep=a.dit_keep)
+                            image_dit_keep=a.dit_keep, image_gpu=a.gpu, image_sam3_license=a.sam3_license)
     path = Path(a.config) if a.config else None
     cfg = json.loads(path.read_text(encoding="utf-8-sig")) if path is not None and path.is_file() else {}
     # the RAM the model was set up to leave free (setup's --ram-reserve-gib, its engine's --ram-reserve-mib)
@@ -121,6 +125,7 @@ def main(argv=None) -> int:
     assert path is not None
     cfg["images"] = section
     cfg["image_models"] = more or None
+    S.place_images(ns, cfg)            # the card of the image jobs (--gpu), as setup places it
     S.write_config(path, cfg)
     S.ok(f"{path.name}: image generation added (POST /v1/images/generations once the server starts again)")
     return 0

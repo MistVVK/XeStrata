@@ -94,8 +94,9 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 
 ## モデルの選び方
 
-**迷ったら、`xestrata --setup` の質問で Enter を押してください。** 元の Qwen3.8-Flash-Next の **Q2_0** を選び、RAM が 60 GB 以上なら **IQ3_XXS** を選びます（Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
-RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルが選べます。
+**迷ったら、`xestrata --setup` の質問で Enter を押してください。** Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に、この PC で動く最初のものを選び、大きさは品質で選びます（GSQ-RCO の版は **IQ3_XXS**、入らなければ入るうちで品質のいちばん高いもの。Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
+setup は、モデル、版（元のもの、Swift 1.5、Coder、誰が拒否を外したものか）、量子化（誰が作ったファイルか）、大きさの順に尋ねます。選び方の決まりは [DETAILS](docs/DETAILS.ja.md#setup-の尋ね方と勧め方) にあります。
+RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルも選べます。
 あとから別のモデルを足すときも `xestrata --setup` を実行します。
 表にないモデルでも、GGUF のファイルが手元にあれば `xestrata --setup --gguf <ファイル> --name <名前>` で入れられます（Qwen3.8-Flash-Next と、下の BETA のモデルと同じアーキテクチャのもの。[DETAILS](docs/DETAILS.ja.md#手元の-gguf-から入れる--gguf)）。
 

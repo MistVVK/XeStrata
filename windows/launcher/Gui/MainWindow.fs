@@ -73,6 +73,22 @@ let private runOptions (gpus: Gpu[]) =
               (tr "run.englishCodeAndFrench" "English, code and French"), "fr" ]
             0
     let oldDriver = CheckBox(Content = text (tr "run.startAlthoughTheIntel" "Start although the Intel GPU's driver is older than the one setup asks for"))
+    let scriptGuard, scriptGuardValue =
+        choice
+            [ tr "run.scriptGuardSet" "As set before (or the system's language the first time)", ""
+              tr "run.scriptGuardJa" "Japanese: no Simplified Chinese, Hangul or Vietnamese letters in the answers", "ja"
+              tr "run.scriptGuardEn" "English and others: no CJK characters or Vietnamese letters", "en"
+              tr "run.scriptGuardKo" "Korean: no kana, Han characters Korean does not use, or Vietnamese letters", "ko"
+              tr "run.scriptGuardZhCn" "Chinese (Simplified): no kana, Hangul or Japanese-only characters", "zh-cn"
+              tr "run.scriptGuardZhTw" "Chinese (Traditional): no kana, Hangul or Japanese-only characters", "zh-tw"
+              tr "run.scriptGuardOff" "Off: answers as the model writes them", "off" ]
+            0
+    let pleIo, pleIoValue =
+        choice
+            [ tr "run.pleIoAuto" "As set up (auto: chosen by the RAM and the disk)", ""
+              tr "run.pleIoRam" "The whole table in RAM (faster new prompts, ~29 GB more RAM)", "ram"
+              tr "run.pleIoDirect" "Read from the SSD as needed", "direct" ]
+            0
     let control =
         stack 10.0 [
             if gpus.Length > 1 then
@@ -83,6 +99,8 @@ let private runOptions (gpus: Gpu[]) =
             yield field (tr "run.apiKey" "API key") apiKey :> Control
             yield field (tr "run.vramLeftFreeFor" "VRAM left free for other programs, in MiB") reserve :> Control
             yield field (tr "run.theDraftLayerS" "The draft layer's tokens") vocab :> Control
+            yield field (tr "run.scriptGuard" "Other languages' characters in the answers, for every model (the thinking is left as it is)") scriptGuard :> Control
+            yield field (tr "run.pleIo" "Qwen3.8-Flash-Next's n-gram table") pleIo :> Control
             yield oldDriver :> Control
         ]
     let args () =
@@ -98,12 +116,25 @@ let private runOptions (gpus: Gpu[]) =
             optionOf "--vram-reserve-mib" reserve (isInt 0) (tr "opt.vramReserveMib" "a number of MiB, 0 or more")
             Result.Ok(match vocabValue () with "" -> [] | v -> [ "--draft-vocab"; v ])
             Result.Ok(flag "--old-driver" oldDriver)
+            Result.Ok(match scriptGuardValue () with "" -> [] | v -> [ "--script-guard"; v ])
+            Result.Ok(match pleIoValue () with "" -> [] | v -> [ "--ple-io"; v ])
         ]
     control, args
 
-/// How the image models run, which setup (--image-<name>) and tools/image/install.py (--<name>) take alike -> the
+/// How the image models run, which setup (--image-<name>) and tools/image/install.py (--<name>) take alike: on which
+/// GPU, in which sizes, what the text model does meanwhile, and SAM 3.1's license (where not agreed to yet) -> the
 /// controls and the (name, value) pairs.
-let private imageRunOptions () =
+let private imageRunOptions (gpus: Gpu[]) (sam3: Sam3) =
+    let imageGpu, imageGpuValue =
+        choice
+            ([ tr "img.gpuAuto" "Auto: a GPU the text model does not use, else the text model's", "auto"
+               tr "img.gpuSame" "The text model's GPU", "same" ]
+             @ [ for g in gpus do
+                     if not (String.IsNullOrEmpty g.Pci) then
+                         yield trf "img.gpuOnly" "{gpu} ({vram})" [ "gpu", box g.Name; "vram", box (gb g.VramGb) ], g.Pci ])
+            0
+    let askSam3 = not (isNull (box sam3)) && not sam3.Agreed
+    let agreeSam3 = CheckBox(Content = text (tr "img.sam3Agree" "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words (find_region, edit_region); without it Florence-2 (MIT) finds the parts"))
     let ditQ8, ditQ8Value =
         choice [ (tr "img.auto16BitWhen" "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit"), "auto"; (tr "img.always8Bit" "Always 8-bit"), "on"; (tr "img.always16Bit" "Always 16-bit"), "off" ] 0
     let ditKeep, ditKeepValue =
@@ -118,16 +149,21 @@ let private imageRunOptions () =
             0
     let control =
         stack 10.0 [
-            field (tr "img.mageFlowMossImage" "Mage-Flow, MOSS-Image and Anima: the image model on the GPU") ditQ8
-            field (tr "img.mageFlowTheImage" "Mage-Flow: the image model not in use (the generation's or the edit's)") ditKeep
-            ssdOffload
-            field (tr "img.theTextModelWhile" "The text model while an image is made") policy
+            yield field (tr "img.gpu" "The GPU that makes the images") imageGpu :> Control
+            if askSam3 then
+                yield stack 4.0 [ agreeSam3; muted (trf "img.sam3License" "The license: {license}" [ "license", box sam3.License ]) ] :> Control
+            yield field (tr "img.mageFlowMossImage" "Mage-Flow, MOSS-Image and Anima: the image model on the GPU") ditQ8 :> Control
+            yield field (tr "img.mageFlowTheImage" "Mage-Flow: the image model not in use (the generation's or the edit's)") ditKeep :> Control
+            yield ssdOffload :> Control
+            yield field (tr "img.theTextModelWhile" "The text model while an image is made") policy :> Control
         ]
     let values () =
         [ "dit-q8", ditQ8Value ()
           "dit-keep", ditKeepValue ()
           "ssd-offload", (if ssdOffload.IsChecked = Nullable true then "on" else "off")
-          "gpu-policy", policyValue () ]
+          "gpu-policy", policyValue ()
+          "gpu", imageGpuValue ()
+          if askSam3 then "sam3-license", (if agreeSam3.IsChecked = Nullable true then "agree" else "no") ]
     control, values
 
 /// The log of a run, its last lines kept.
@@ -513,20 +549,36 @@ type MainWindow(setup: Setup.Access) as this =
 
     /// The install page; `own`: the model in the user's own files (--gguf PATH, --name NAME) instead of a family's.
     and choosePage (d: Describe) (own: (string * string) option) =
-        let families =
-            ListBox(
-                ItemsSource = (if own.IsSome then d.Families |> Array.filter (fun f -> f.Id = "custom") else d.Families |> Array.filter (fun f -> f.Id <> "custom")),
-                MaxHeight = 260.0
-            )
-        families.ItemTemplate <-
-            itemTemplate (fun (f: Family) ->
-                stack 2.0 [
-                    row 6.0 [
-                        subheading f.Title
-                        if f.Experimental then badge warnBrush (tr "common.experimental" "experimental")
-                    ]
-                    muted (f.By + " - " + f.About)
-                ])
+        let pool =
+            if own.IsSome then d.Families |> Array.filter (fun f -> f.Id = "custom")
+            else d.Families |> Array.filter (fun f -> f.Id <> "custom")
+        // the lists' levels (setup's TIERS): the model, its version, its quantization; from a setup without them, each
+        // family a model of its own
+        let baseOf (f: Family) = if String.IsNullOrEmpty f.Base then f.Id else f.Base
+        let variantOf (f: Family) = if isNull f.Variant then "" else f.Variant
+        let quantOf (f: Family) (m: Model) =
+            if not (String.IsNullOrEmpty m.Quantizer) then m.Quantizer elif isNull f.Quantizer then "" else f.Quantizer
+        let named (table: Collections.Generic.Dictionary<string, string>) (id: string) =
+            if isNull table then id else match table.TryGetValue id with | true, t -> t | _ -> id
+        let tiers = if isNull d.Bases then [||] else d.Bases
+        let bases =
+            pool |> Array.map baseOf |> Array.distinct
+            |> Array.sortBy (fun b -> match Array.tryFindIndex (fun (t: Tier) -> t.Id = b) tiers with Some i -> i | None -> tiers.Length)
+        let baseTitle b =
+            match tiers |> Array.tryFind (fun t -> t.Id = b) with
+            | Some t -> t.Title
+            | None -> (pool |> Array.find (fun f -> baseOf f = b)).Title
+        let recFamily = pool |> Array.tryFind (fun f -> f.Id = d.RecommendedFamily) |> Option.defaultValue pool[0]
+        let recQuant (f: Family) = f.Models |> Array.tryFind (fun m -> m.Id = f.RecommendedSize) |> Option.map (quantOf f)
+        let baseBox = ComboBox(ItemsSource = [ for b in bases -> baseTitle b ], MinWidth = 320.0)
+        let variantBox = ComboBox(MinWidth = 320.0)
+        let quantBox = ComboBox(MinWidth = 320.0)
+        let variantField = field (tr "install.version" "Version: the original, or whose changed copy") variantBox
+        let quantField = field (tr "install.quantization" "Quantization: whose model files") quantBox
+        let familyInfo = stack 2.0 []
+        let mutable variants: string[] = [||]
+        let mutable quants: (string * Family)[] = [||]
+        let mutable current: Family option = None
         let sizes = ListBox(MaxHeight = 320.0)
         sizes.ItemTemplate <-
             itemTemplate (fun (m: Model) ->
@@ -631,7 +683,7 @@ type MainWindow(setup: Setup.Access) as this =
         let moveData = CheckBox(Content = text (tr "install.moveTheModelFiles" "Move the model files already on this PC into the data folder"))
         let rememberData = CheckBox(Content = text (tr "install.rememberTheDataFolder" "Remember the data folder for later downloads without moving anything"))
         let noWarmup = CheckBox(Content = text (tr "install.skipTheFirstStart" "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)"))
-        let imageOptions, imageValues = imageRunOptions ()
+        let imageOptions, imageValues = imageRunOptions gpus d.Sam3
         let serverControl, serverArgs = runOptions gpus
         let selectedModel () =
             match sizes.SelectedItem with
@@ -639,8 +691,8 @@ type MainWindow(setup: Setup.Access) as this =
             | _ -> None
         let selectedContext (f: Family) = f.Contexts[max 0 contexts.SelectedIndex]
         let refresh () =
-            match families.SelectedItem, selectedModel () with
-            | (:? Family as f), Some m ->
+            match current, selectedModel () with
+            | Some f, Some m ->
                 let ctx = selectedContext f
                 pictures.IsVisible <- m.Vision
                 readerField.IsVisible <- m.Vision
@@ -655,30 +707,62 @@ type MainWindow(setup: Setup.Access) as this =
                 imagesField.IsVisible <- f.Images && d.Images.Length > 0
                 imageOptions.IsVisible <- imagesField.IsVisible
             | _ -> ()
+        // the quantization chosen: its family, and that quantization's sizes with its recommended one chosen
         let familyChanged () =
-            match families.SelectedItem with
-            | :? Family as f ->
-                sizes.ItemsSource <- f.Models
+            if quantBox.SelectedIndex >= 0 then
+                let q, f = quants[quantBox.SelectedIndex]
+                current <- Some f
+                let models = f.Models |> Array.filter (fun m -> quantOf f m = q)
+                familyInfo.Children.Clear()
+                familyInfo.Children.AddRange [
+                    row 6.0 [
+                        subheading f.Title
+                        if f.Experimental then badge warnBrush (tr "common.experimental" "experimental")
+                    ] :> Control
+                    muted (f.By + " - " + f.About) :> Control
+                ]
+                sizes.ItemsSource <- models
                 plainKv.ItemsSource <- [ for k in f.KvTakes -> (match kvLabels.TryGetValue k with | true, l -> l | _ -> k) ]
                 plainKv.SelectedIndex <- max 0 (Array.IndexOf(f.KvTakes, "fp16"))
-                sizes.SelectedItem <- (f.Models |> Array.tryFind (fun m -> m.Recommended) |> Option.defaultValue f.Models[0])
+                sizes.SelectedItem <- (models |> Array.tryFind (fun m -> m.Recommended) |> Option.defaultValue models[0])
                 license.Text <- (if String.IsNullOrEmpty f.License then "" else trf "install.license" "Its license: {license}" [ "license", box f.License ])
-            | _ -> ()
+        let variantChanged () =
+            if variantBox.SelectedIndex >= 0 then
+                let b = bases[max 0 baseBox.SelectedIndex]
+                let v = variants[variantBox.SelectedIndex]
+                let fams = pool |> Array.filter (fun f -> baseOf f = b && variantOf f = v)
+                quants <- [| for f in fams do for q in f.Models |> Array.map (quantOf f) |> Array.distinct -> q, f |] |> Array.distinctBy fst
+                quantField.IsVisible <- quants.Length > 1
+                quantBox.ItemsSource <- [ for q, _ in quants -> named d.Quantizers q ]
+                let want = if Array.contains recFamily fams then recQuant recFamily else None
+                quantBox.SelectedIndex <- max 0 (match want with Some q -> Array.FindIndex(quants, fun (x, _) -> x = q) | None -> 0)
+                // a list of the same names keeps its selection without a change (Swift 1.5's versions: GSQ-RCO each)
+                familyChanged ()
+        let baseChanged () =
+            if baseBox.SelectedIndex >= 0 then
+                let b = bases[baseBox.SelectedIndex]
+                variants <- pool |> Array.filter (fun f -> baseOf f = b) |> Array.map variantOf |> Array.distinct
+                variantField.IsVisible <- variants.Length > 1
+                variantBox.ItemsSource <- [ for v in variants -> named d.Variants v ]
+                variantBox.SelectedIndex <- max 0 (if baseOf recFamily = b then Array.IndexOf(variants, variantOf recFamily) else 0)
+                variantChanged ()
         let sizeChanged () =
-            match families.SelectedItem, selectedModel () with
-            | (:? Family as f), Some m ->
+            match current, selectedModel () with
+            | Some f, Some m ->
                 contexts.ItemsSource <- [ for c in f.Contexts -> contextLabel c ]
                 contexts.SelectedIndex <- max 0 (Array.IndexOf(f.Contexts, m.Context))
                 install.IsEnabled <- true
                 refresh ()
             | _ -> install.IsEnabled <- false
-        families.SelectionChanged.Add(fun _ -> familyChanged ())
+        baseBox.SelectionChanged.Add(fun _ -> baseChanged ())
+        variantBox.SelectionChanged.Add(fun _ -> variantChanged ())
+        quantBox.SelectionChanged.Add(fun _ -> familyChanged ())
         sizes.SelectionChanged.Add(fun _ -> sizeChanged ())
         contexts.SelectionChanged.Add(fun _ -> refresh ())
         projection.IsCheckedChanged.Add(fun _ -> refresh ())
         install.Click.Add(fun _ ->
-            match families.SelectedItem, selectedModel () with
-            | (:? Family as f), Some m ->
+            match current, selectedModel () with
+            | Some f, Some m ->
                 let ctx = selectedContext f
                 let questions =
                     [ yield "--context"; yield string ctx
@@ -740,7 +824,7 @@ type MainWindow(setup: Setup.Access) as this =
                         @ more
                     installPage (f.Title + " " + m.Id) args
             | _ -> ())
-        families.SelectedIndex <- 0
+        baseBox.SelectedIndex <- max 0 (Array.IndexOf(bases, baseOf recFamily))
         let advanced =
             Expander(
                 Header = (tr "common.advanced" "Advanced"),
@@ -770,7 +854,10 @@ type MainWindow(setup: Setup.Access) as this =
         show (
             stack 14.0 [
                 heading (tr "install.installAModel" "Install a model")
-                field (tr "install.model" "Model") families
+                field (tr "install.model" "Model") baseBox
+                variantField
+                quantField
+                card familyInfo
                 field (tr "install.size" "Size") sizes
                 license
                 field (tr "install.contextHowMuchText" "Context: how much text the model sees at once (longer takes more VRAM)") contexts
@@ -798,7 +885,7 @@ type MainWindow(setup: Setup.Access) as this =
     /// and its config rewritten by tools/image/install.py; the server takes it at its next start.
     and imagesPage (d: Describe) (m: Installed) =
         let picker, value = imagePicker d.Images m.Images
-        let options, optionValues = imageRunOptions ()
+        let options, optionValues = imageRunOptions (d.Gpus |> Array.filter (fun g -> isNull g.Problem)) d.Sam3
         let apply () =
             let v = value () |> Option.defaultValue "no"
             let more = if v = "no" then [] else [ for name, x in optionValues () do yield! [ "--" + name; x ] ]

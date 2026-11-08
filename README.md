@@ -97,8 +97,9 @@ So XeStrata runs only on the GPUs the distribution's rocBLAS has code for.
 
 ## Choosing a model
 
-**Not sure? Press Enter at `xestrata --setup`'s questions.** It takes the original Qwen3.8-Flash-Next at **Q2_0**, or at **IQ3_XXS** with 60 GB of RAM or more (UD-IQ4_XS on a Ryzen AI Max with 80 GB or more).
-With less RAM than that, the Coder (32 GB), Gyro (from 36 GB, or 38 GB of RAM and VRAM together), Gyro-Coder (from 26 GB, or 28 GB together) and the BETA models are there to choose.
+**Not sure? Press Enter at `xestrata --setup`'s questions.** It takes the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L, Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs, and its size by quality (the GSQ-RCO versions at **IQ3_XXS**, or the best quality that fits when that does not; UD-IQ4_XS on a Ryzen AI Max with 80 GB or more).
+setup asks for the model, its version (the original, Swift 1.5, the Coder, or whose copy with the refusals removed), its quantization (whose files) and the size, in that order. How it recommends is in [DETAILS](docs/DETAILS.md#how-setup-asks-and-recommends).
+With less RAM, the Coder (32 GB), Gyro (from 36 GB, or 38 GB of RAM and VRAM together), Gyro-Coder (from 26 GB, or 28 GB together) and the BETA models are there to choose too.
 To add another model later, run `xestrata --setup` too.
 A model not in the table can be installed from GGUF files you have with `xestrata --setup --gguf <file> --name <name>` (Qwen3.8-Flash-Next, and models of the BETA models' architectures; [DETAILS](docs/DETAILS.md#installing-from-your-own-gguf-files---gguf)).
 

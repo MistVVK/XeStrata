@@ -189,6 +189,26 @@ Unless asked, the device's reported virtual-memory granularity decides: on at 2 
 
 ## Which model
 
+### How setup asks and recommends
+
+setup (`./setup.sh`, the packages' `xestrata`, the Windows launcher) asks for the model, its version (the original, Swift 1.5, the Coder, or whose copy with the refusals removed), its quantization (whose files) and the size, in that order.
+A level with one choice is not asked.
+On the command line, choose each level with `--base`, `--variant` and `--quantizer`, or all of them with `--family` (`--base qwen3.8-flash-next --variant sc117` is `--family sc117`).
+`--model` is the size.
+
+The model chosen first is the first of Qwen3.8-Flash-Next's Swift 1.5 in SC117's copy (where its IQ3_XXS fits), Gyro-Coder-L (where its experts all fit the RAM), Ornith-1.5, Qwen3.6-35B-A3B, Qwen3.5-9B and Qwen3.5-2B that this PC runs (Qwen3.5-2B on a PC without a GPU).
+The size is recommended by quality:
+
+- ISTA-DASLab's GSQ-RCO files (the original, Swift 1.5, the Coder, SC117's and huihui-ai's versions): IQ3_XXS; where this PC does not hold it, the best quality it holds (in the low-RAM mode too).
+- The files that run on a RAM budget (Unsloth's, Gyro, AtomicChat's AD): the best quality whose experts all fit the RAM; never an experimental one.
+- The MoE models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, GLM-5.3-Flash): the best quality the RAM and VRAM together hold.
+- Qwen3.5 (9B, 2B, 0.8B): the largest the VRAM holds. On a PC without a GPU, UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B.
+- The models other than Qwen3.8-Flash-Next up to Q8_0, never their unquantized BF16 weights (BF16 answers as Q8_0 does, in twice the memory).
+
+When none fits, the smallest.
+
+### Qwen3.8-Flash-Next's sizes
+
 Every model is a compression of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 The original's four sizes are [ISTA-DASLab's GSQ-RCO quantizations](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
 
@@ -412,8 +432,8 @@ a GPU ([a PC without a GPU](#a-pc-without-a-gpu)).
   (Qwen, Apache-2.0): small dense thinking models built as the 9B, that read images too, context up to 256K.
   For a small GPU or a PC without one; their answers fall short of the 9B's (and the 0.8B's of the 2B's).
   The GGUFs are Unsloth's: Q4_K_M, UD-Q5_K_XL, Q6_K, Q8_0 and BF16 for the 2B, Q4_K_M, Q6_K, Q8_0 and BF16 for the
-  0.8B (`--family qwen35-2b`, `--family qwen35-0.8b`). setup recommends UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B
-  (the largest that fits when the GPU does not hold it).
+  0.8B (`--family qwen35-2b`, `--family qwen35-0.8b`). setup recommends the largest up to Q8_0 that the GPU holds
+  (without a GPU, UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B).
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)** (Z.ai, MIT): a thinking MoE of 320B with 18B
   active per token; setup offers contexts up to 256K. Its attention is KDA (linear attention) and DSA (attention over
   the tokens it selects), with four residual streams (mHC). The GGUFs are Unsloth's UD-IQ1_S, UD-IQ3_XXS and UD-IQ4_XS.
@@ -457,7 +477,7 @@ The RAM is about the download's size plus 8 GB (for GLM-5.3-Flash, RAM and VRAM 
 With less, the experts that RAM and VRAM do not hold are read from the model's files, which is slower.
 Qwen3.5's VRAM is its weights and, at a 32K context, its KV cache (a token's: 32 KB for the 9B, 12 KB for the 2B and
 the 0.8B) and about 1 GB more (the same for the version without refusals).
-setup recommends the largest version the GPU's VRAM holds and warns of a choice it does not; weights that do not fit
+setup recommends the largest version up to Q8_0 the GPU's VRAM holds and warns of a choice it does not; weights that do not fit
 the VRAM are not streamed from RAM yet.
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
 The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them

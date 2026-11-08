@@ -74,7 +74,7 @@ import urllib.request
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NamedTuple, NoReturn
 
 from serve import envvars, kernel_check, places, release_check
 
@@ -857,11 +857,12 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                                     "size": 12992461216,
                                     "sha256": "9cae3b59a34308664b53e5b80fd74914cd0c1cf504bcd05609498b0f9126a74f",
                                     "about": "3-bit GSQ-RCO by pfeifferj (a community reproduction of the method, not "
-                                             "IST-DASLab's)", "tested": True},
+                                             "IST-DASLab's)", "tested": True, "quantizer": "gsq-rco-pfeifferj"},
                    "GSQ-RCO-3.5BIT": {"repo": _ORNITH_GSQ, "file": "Ornith-1.5-35B-A3B-GSQ-RCO-3.5bit.gguf",
                                       "size": 15163013536,
                                       "sha256": "69191d3d2c402f7c13950815bf20d826d7066c8d7f1bef4594cf70c13ea56ccc",
-                                      "about": "3.5-bit GSQ-RCO by pfeifferj (as above)"},
+                                      "about": "3.5-bit GSQ-RCO by pfeifferj (as above)",
+                                      "quantizer": "gsq-rco-pfeifferj"},
                }},
     # Ornith-1.5 with its refusals removed (dealignai's CRACK, which changes the attention's weights; the MTP layer is
     # kept and changed alike), the official files' versions with their tensor types: only the weights differ
@@ -926,16 +927,17 @@ PLAIN_FAMILIES["qwen36-uncensored"] = {
     "models": {
         "APEX-I-Quality": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Quality"), "size": 23514746272,
                            "sha256": "31a6a415d4de270cdd2128103a671202f4b92b6eb30c5f87934f3b06fc2a55cc",
-                           "about": "the best of the four by its authors' numbers (APEX's mixed 4 to 6 bits)"},
+                           "about": "the best of the four by its authors' numbers (APEX's mixed 4 to 6 bits)",
+                           "rank": 4},
         "APEX-I-Balanced": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Balanced"), "size": 25962671520,
                             "sha256": "782636c45124fd40bf55254f802aba3b6c14e53d36f7a60f724f332761e9aa89",
-                            "about": "5 and 6 bits, its authors' all-rounder"},
+                            "about": "5 and 6 bits, its authors' all-rounder", "rank": 3},
         "APEX-I-Compact": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Compact"), "size": 17016624544,
                            "sha256": "ff82d1993140be550f21f17ec9e93697a060d71ce15d8f6089c911032b448058",
-                           "about": "3 and 4 bits, smaller and a little lower in quality"},
+                           "about": "3 and 4 bits, smaller and a little lower in quality", "rank": 2},
         "APEX-I-MINI": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("MINI"), "size": 14273277376,
                         "sha256": "e4eae0e289b36039faa26f955ca021025754e0c56130a16746749bb1491118d4",
-                        "about": "2 and 3 bits, the smallest, lower in quality"},
+                        "about": "2 and 3 bits, the smallest, lower in quality", "rank": 1},
     }}
 # Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
 # K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
@@ -1044,6 +1046,54 @@ PLAIN_FAMILIES["glm53"] = {
                       "size": sum(x["size"] for x in _GLM53_IQ4), "about": "4-bit (Unsloth Dynamic), the best quality"},
     }}
 FAMILIES.update(PLAIN_FAMILIES)
+
+# How setup's questions and the launcher's window list the families: the model, its version (the original, or whose
+# changed copy) and its quantization (whose files), then the size (the user's decision of 2026-11-09: the families of
+# one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
+# kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
+# FIRST_CHOICE's models first.
+BASES = {"qwen3.8-flash-next": "Qwen3.8-Flash-Next", "ornith-1.5": "Ornith-1.5-35B-A3B",
+         "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
+         "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
+VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
+            "coder": "Coder (half the experts, kept for code)", "sc117": "abliterated by SC117",
+            "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
+            "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
+            "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
+QUANTIZERS = {"gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth", "gyro": "Gyro by agentionai",
+              "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
+              "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
+              "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
+TIERS = {  # family: (model, version, quantization), in the order each level lists them
+    "qwen": ("qwen3.8-flash-next", "original", "gsq-rco"),
+    "unsloth": ("qwen3.8-flash-next", "original", "unsloth"),
+    "gyro": ("qwen3.8-flash-next", "original", "gyro"),
+    "atomicchat": ("qwen3.8-flash-next", "original", "ad"),
+    "swift": ("qwen3.8-flash-next", "swift", "gsq-rco"),
+    "coder": ("qwen3.8-flash-next", "coder", "gsq-rco"),
+    "gyro-coder": ("qwen3.8-flash-next", "coder", "gyro"),
+    "sc117": ("qwen3.8-flash-next", "sc117", "gsq-rco"),
+    "sc117-swift": ("qwen3.8-flash-next", "swift-sc117", "gsq-rco"),
+    "huihui-unsloth": ("qwen3.8-flash-next", "huihui-ai", "unsloth"),
+    "huihui-swift": ("qwen3.8-flash-next", "swift-huihui-ai", "gsq-rco"),
+    "ornith": ("ornith-1.5", "original", "ornith-ai"),
+    "ornith-uncensored": ("ornith-1.5", "dealignai", "dealignai"),
+    "qwen36": ("qwen3.6", "original", "unsloth"),
+    "qwen36-uncensored": ("qwen3.6", "llmfan46", "apex"),
+    "qwen35": ("qwen3.5-9b", "original", "unsloth"),
+    "qwen35-uncensored": ("qwen3.5-9b", "hauhaucs", "hauhaucs"),
+    "qwen35-2b": ("qwen3.5-2b", "original", "unsloth"),
+    "llmjp": ("llm-jp-4.1", "original", "llm-jp"),
+    "glm53": ("glm-5.3-flash", "original", "unsloth"),
+    "qwen35-0.8b": ("qwen3.5-0.8b", "original", "unsloth"),
+}
+# a model's line in setup's first question where its original family's "about" does not say what the model is
+BASE_ABOUT = {"qwen3.8-flash-next": "Qwen's model, the one XeStrata is made for"}
+# the families a first install is offered, in this order: the first this PC runs (recommend_family), with the size it
+# must hold where one is named (the user's decisions of 2026-11-09: Swift 1.5's SC117 copy where its IQ3_XXS runs, else
+# Gyro-Coder-L where its experts all fit the RAM, then the smaller models)
+FIRST_CHOICE = (("sc117-swift", "IQ3_XXS"), ("gyro-coder", "Gyro-Coder-L"), ("ornith", None), ("qwen36", None),
+                ("qwen35", None), ("qwen35-2b", None))
 
 
 def plain_parts(d: dict) -> list[dict[str, Any]]:
@@ -5011,16 +5061,21 @@ def ask_sam3_license(a, aux: Path) -> None:
     """SAM 3.1's weights (find_region, edit_region: words to masks) are under Meta's SAM License, so the server fetches
     them only once the user has agreed (serve/image_aux.py, its record <aux>/sam3.accepted): asked here, no by default
     and with --yes (agreeing is the user's own act); the web page's Images view asks it too.  Florence-2 (MIT) finds
-    the parts until then."""
+    the parts until then.  --image-sam3-license agree agrees without the question (the launcher's window, a script),
+    no leaves it unagreed without it."""
     QI = _qimage()
     mark = aux / "sam3.accepted"
     if mark.is_file():
         return
-    say("  find_region and edit_region find a part of a picture by words with SAM 3.1, whose weights are under "
-        f"{QI.SAM3_LICENSE}; until you agree to it, Florence-2 (MIT) finds the parts (you can agree later on the web "
-        "page's Images view)")
-    if ask("  Agree to the SAM License (read it at the address above)?", ["y", "n"], "n", a.yes) != "y":
+    choice = getattr(a, "image_sam3_license", None)
+    if choice == "no":
         return
+    if choice != "agree":
+        say("  find_region and edit_region find a part of a picture by words with SAM 3.1, whose weights are under "
+            f"{QI.SAM3_LICENSE}; until you agree to it, Florence-2 (MIT) finds the parts (you can agree later on the "
+            "web page's Images view)")
+        if ask("  Agree to the SAM License (read it at the address above)?", ["y", "n"], "n", a.yes) != "y":
+            return
     aux.mkdir(parents=True, exist_ok=True)
     mark.write_text(f"{time.strftime('%Y-%m-%d %H:%M')} setup\n{QI.SAM3_LICENSE}\n", encoding="utf-8")
     ok("the SAM License agreed to: the server fetches SAM 3.1 (1.7 GB) when a part is first found")
@@ -5246,14 +5301,190 @@ def model_file(fam: dict, model: str, i: int) -> str:
     return form.get("file", fam["file"]).format(q=model, i=i)
 
 
-def default_size(names: list, ram: float) -> str:
-    """The size setup recommends of a family's `names`: IQ3_XXS from 60 GB of RAM where it is one, else for the sizes
-    with a RAM budget (Unsloth's) the largest regular one whose experts all stay in RAM, else the first."""
-    if "IQ3_XXS" in names:
-        return "IQ3_XXS" if ram >= 60 else names[0]
-    fit = [m for m in names if MODELS[m].get("budget") and not MODELS[m].get("experimental")
-           and MODELS[m]["arena_gb"] + UNSLOTH_RAM_LEFT_GB <= ram]
-    return max(fit, key=lambda m: MODELS[m]["arena_gb"]) if fit else names[0]
+def family_sizes(family: str) -> list:
+    """A family's sizes in setup's order: a model of PLAIN_FAMILIES as its table lists them; a Flash-Next family's
+    (MODELS) the experimental ones last."""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        return list(fam["models"])
+    return sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),
+                  key=lambda m: bool(MODELS[m].get("experimental")))
+
+
+def size_quantizer(family: str, size: str) -> str:
+    """The quantization a size is of (QUANTIZERS): its family's, or the size's own (Ornith-1.5's GSQ-RCO sizes)"""
+    fam = FAMILIES[family]
+    own = fam["models"].get(size, {}).get("quantizer") if fam.get("plain") else None
+    return own or ("own" if fam.get("custom") else TIERS[family][2])
+
+
+def tier_of(family: str) -> tuple:
+    """(model, version, quantization) of a family; a model of the user's own files is a model of its own"""
+    return TIERS.get(family) or (CUSTOM, "original", "own")
+
+
+def tier_families(base: str | None = None, variant: str | None = None, fams=None) -> list:
+    """The families of a model (and a version), in the order setup lists them"""
+    order = list(BASES)
+    fams = [f for f in (fams if fams is not None else FAMILIES) if f in TIERS]
+    fams.sort(key=lambda f: order.index(TIERS[f][0]))
+    return [f for f in fams if (base is None or TIERS[f][0] == base) and (variant is None or TIERS[f][1] == variant)]
+
+
+def tier_family(base: str, variant: str | None, quantizer: str | None) -> str:
+    """--base, --variant and --quantizer -> the family (the version and quantization first listed where not given);
+    a choice that matches none stops setup with the ones there are"""
+    if base not in BASES:
+        fail(f"--base {base}: no such model", "choose one of: " + ", ".join(BASES))
+    fams = tier_families(base)
+    variants = list(dict.fromkeys(TIERS[f][1] for f in fams))
+    if variant is not None and variant not in variants:
+        fail(f"--variant {variant}: {BASES[base]} has no such version", "choose one of: " + ", ".join(variants))
+    fams = [f for f in fams if TIERS[f][1] == (variant or variants[0])]
+    quants = {q: f for f in fams
+              for q in dict.fromkeys([TIERS[f][2], *(size_quantizer(f, m) for m in family_sizes(f))])}
+    if quantizer is not None and quantizer not in quants:
+        fail(f"--quantizer {quantizer}: no such quantization of that version", "choose one of: " + ", ".join(quants))
+    return quants[quantizer] if quantizer else fams[0]
+
+
+class Room(NamedTuple):
+    """This PC's memory as the recommendations read it (GB): the RAM; the VRAM that holds Flash-Next experts
+    (low_ram_fits' vram_gb: the first card's, each later card's less 5); the VRAM that holds a plain MoE's weights
+    (each card less 5 for its buffers, setup_plain's); the VRAM a dense model has (every card's); the context a dense
+    model is sized at (vram_ctx); no GPU (the CPU runs the model)."""
+    ram: float
+    vram: float = 0.0
+    plain_vram: float = 0.0
+    gpu_gb: float = 0.0
+    ctx: int = 32768
+    on_cpu: bool = False
+
+
+def room_of(ram: float, cards: list) -> Room:
+    """The Room of this PC with `cards` (the GPUs a model runs on; none, or the CPU's entry: no GPU)"""
+    if not cards or cards[0].get("cpu"):
+        return Room(ram, on_cpu=True)
+    return Room(ram, gpu_expert_vram(cards[0]) + sum(max(0.0, gpu_expert_vram(c) - 5) for c in cards[1:]),
+                sum(max(0.0, c.get("vram_gb", 0.0) - 5) for c in cards), sum(gpu_expert_vram(c) for c in cards),
+                vram_ctx(cards))
+
+
+def size_quality(family: str, size: str) -> tuple:
+    """A size's place in its family's quality order, lowest first: a Flash-Next size by its experts (more bits keep more
+    of the model), then its download (AtomicChat's AD-5.00bpw: the same experts, the n-gram table at 8 bits); a model
+    of PLAIN_FAMILIES by its files' size, or its "rank" where its authors rank sizes otherwise (APEX's I-Quality above
+    the larger I-Balanced)"""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        d = fam["models"][size]
+        return (d.get("rank", 0), d["size"])
+    return (MODELS[size]["arena_gb"], MODELS[size]["download_gb"])
+
+
+def size_fits(family: str, size: str, room: Room) -> bool:
+    """Does this size run on this PC with its weights in memory: a Flash-Next size's experts all in RAM (a RAM-budget
+    size's beside UNSLOTH_RAM_LEFT_GB, a GSQ-RCO size's in the low-RAM mode too, its file cache the GPU's share), a
+    plain MoE's file in RAM and VRAM with 8 GB beside it, a dense model's weights and K/V in VRAM; on the CPU, a dense
+    model in RAM"""
+    fam = FAMILIES[family]
+    if fam.get("plain"):
+        d = fam["models"][size]
+        if room.on_cpu:
+            return bool(fam.get("cpu")) and cpu_ram_gb(fam, cpu_ctx(fam, room.ram)) <= room.ram
+        if fam.get("dense"):
+            return room.gpu_gb >= dense_vram_gb(fam, d, min(room.ctx, fam["max_context"]))
+        return room.ram + room.plain_vram >= d["size"] / 1e9 + 8
+    d = MODELS[size]
+    if d.get("budget"):
+        return d["arena_gb"] + UNSLOTH_RAM_LEFT_GB <= room.ram
+    if room.ram >= d["ram_gb"]:
+        return True
+    gsq = family in TIERS and TIERS[family][2] == "gsq-rco"
+    return gsq and low_ram_fits(size, room.ram, room.vram)
+
+
+# The recommendations by quality (the user's decisions of 2026-11-09): a GSQ-RCO family's IQ3_XXS where this PC runs it;
+# a model of PLAIN_FAMILIES up to Q8_0, never its unquantized weights (BF16 answers as Q8_0 does, in twice the memory)
+GSQ_RCO_PICK = "IQ3_XXS"
+PLAIN_TOP = "Q8_0"
+UNQUANTIZED = ("BF16", "F16", "F32")
+
+
+def recommend_size(family: str, room: Room, names: list | None = None) -> str:
+    """The size setup recommends of `family` (of `names`, a quantization's): the best quality this PC runs with its
+    weights in memory (size_fits), never an experimental one - a GSQ-RCO family's IQ3_XXS where it runs, a model of
+    PLAIN_FAMILIES' at most Q8_0, on the CPU the family's own choice - else the smallest"""
+    fam = FAMILIES[family]
+    names = names or family_sizes(family)
+    if room.on_cpu and fam.get("default") in names:
+        return fam["default"]
+    order = sorted(names, key=lambda m: size_quality(family, m))
+    kept = [m for m in order if not (not fam.get("plain") and MODELS[m].get("experimental"))] or order
+    if fam.get("plain"):
+        top = [m for m in kept if m not in UNQUANTIZED and
+               (PLAIN_TOP not in kept or size_quality(family, m) <= size_quality(family, PLAIN_TOP))]
+        kept = top or kept
+    fits = [m for m in kept if size_fits(family, m, room)]
+    if GSQ_RCO_PICK in fits:
+        return GSQ_RCO_PICK
+    return fits[-1] if fits else kept[0]
+
+
+def ask_tiers(fams: list, rec_fam: str, room: Room, halo_fam: str | None, yes: bool) -> tuple:
+    """Step 2's first questions: the model, its version and its quantization (TIERS), each with `rec_fam`'s answer
+    as the default (its recommended size's quantization) and a level of one choice not asked -> the family and the
+    quantization chosen (None where the family has only its own)"""
+    rec_base, rec_variant, _ = TIERS[rec_fam]
+    rec_quant = size_quantizer(rec_fam, recommend_size(rec_fam, room))
+
+    def pick(question: str, choices: list, lines: list, rec) -> Any:
+        if len(choices) == 1:
+            return choices[0]
+        for i, line in enumerate(lines, 1):
+            say(f"  {i}) {line}")
+        default = str(choices.index(rec) + 1) if rec in choices else "1"
+        return choices[int(ask(question, [str(i) for i in range(1, len(choices) + 1)], default, yes)) - 1]
+
+    ordered = tier_families(fams=fams)
+    bases = list(dict.fromkeys(TIERS[f][0] for f in ordered))
+    firsts = {b: next(f for f in ordered if TIERS[f][0] == b) for b in bases}
+    base = pick("Which model?", bases,
+                [f"{BASES[b]:28s} {BASE_ABOUT.get(b, FAMILIES[firsts[b]]['about'])}"
+                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if halo_fam and TIERS[halo_fam][0] == b
+                    else "") for b in bases], rec_base)
+    in_base = [f for f in ordered if TIERS[f][0] == base]
+    variants = list(dict.fromkeys(TIERS[f][1] for f in in_base))
+    by = {v: FAMILIES[next(f for f in in_base if TIERS[f][1] == v)]["by"] for v in variants}
+    variant = pick("Which version?", variants, [f"{VARIANTS[v]:28s} {by[v]}" for v in variants],
+                   rec_variant if base == rec_base else variants[0])
+    quants: dict[str, str] = {}
+    for f in (f for f in in_base if TIERS[f][1] == variant):
+        for q in dict.fromkeys(size_quantizer(f, m) for m in family_sizes(f)):
+            quants.setdefault(q, f)
+    lines = [f"{QUANTIZERS[q]:28s} " + (FAMILIES[f]["about"] if list(quants.values()).count(f) == 1 else
+                                        ", ".join(m for m in family_sizes(f) if size_quantizer(f, m) == q))
+             + ("   [experimental]" if FAMILIES[f].get("experimental") else "") for q, f in quants.items()]
+    quant = pick("Which quantization?", list(quants), lines,
+                 rec_quant if (base, variant) == (rec_base, rec_variant) else next(iter(quants)))
+    family = quants[quant]
+    return family, (quant if len({size_quantizer(family, m) for m in family_sizes(family)}) > 1 else None)
+
+
+def runs_here(family: str, room: Room) -> bool:
+    """Does any size of the family, experimental ones aside, run on this PC with its weights in memory"""
+    fam = FAMILIES[family]
+    return any(size_fits(family, m, room) for m in family_sizes(family)
+               if fam.get("plain") or not MODELS[m].get("experimental"))
+
+
+def recommend_family(fams: list, room: Room) -> str:
+    """The family a first install is offered: on the CPU Qwen3.5-2B, else the first of FIRST_CHOICE this PC runs (the
+    size it names, or any), else the first of `fams`"""
+    if room.on_cpu:
+        return "qwen35-2b" if "qwen35-2b" in fams else fams[0]
+    return next((f for f, size in FIRST_CHOICE if f in fams and
+                 (size_fits(f, size, room) if size else runs_here(f, room))), fams[0])
 
 
 def model_shards(fam: dict, model: str) -> int:
@@ -7148,6 +7379,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     names = list(models)
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
+    if a.quantizer and not a.model:   # one quantization's sizes (Ornith-1.5's GSQ-RCO files or Ornith AI's)
+        names = [m for m in names if size_quantizer(family, m) == a.quantizer] or names
     # the experts the GPUs hold need no copy in RAM (every card of --gpus: the layer split)
     vram = sum(max(0.0, gpu_info(i).get("vram_gb", 0.0) - 5) for i in sel) if len(sel) > 1 \
         else max(0.0, gpu.get("vram_gb", 0.0) - 5)
@@ -7171,16 +7404,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
         say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") +
             ("" if d.get("tested") else "   [untested]") + fit)
-    if on_cpu:   # the family's own choice: on the CPU every size runs as int8, so it decides only the answers
-        rec = str(names.index(fam.get("default", names[0])) + 1)
-    elif dense:   # the family's own choice where it fits the GPU, else the largest that fits, else the smallest
-        fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
-        own_rec = names.index(fam["default"]) + 1 if fam.get("default") in names else None
-        rec = str(own_rec) if own_rec in fits else \
-            str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
-            str(min(range(1, len(names) + 1), key=lambda i: models[names[i - 1]]["size"]))
-    else:
-        rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
+    # the best quality this PC runs (recommend_size; on the CPU the family's own choice: every size runs as int8)
+    cards = [gpu_info(i) for i in sel] if len(sel) > 1 else [gpu]
+    rec = str(names.index(recommend_size(family, room_of(ram, cards), names)) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
     own = bool(a.gguf_dir or d.get("custom"))          # the person's own files: never downloaded or marked
@@ -7488,31 +7714,30 @@ def describe() -> dict:
     gpu = usable[0] if usable else None
     vram = gpu_expert_vram(gpu) if gpu else 0.0
     by_vram = vram_ctx([gpu]) if gpu else 32768
+    room = room_of(ram, [gpu] if gpu else [])
     families = []
     for f, fam in FAMILIES.items():
         models = []
+        names = family_sizes(f)
+        # the recommendation of each quantization's sizes (Ornith-1.5 has two), and of the family's
+        by_quant = {q: recommend_size(f, room, [m for m in names if size_quantizer(f, m) == q])
+                    for q in dict.fromkeys(size_quantizer(f, m) for m in names)}
+        rec = recommend_size(f, room, names)
         if fam.get("plain"):
-            names = list(fam["models"])
-            rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
             ctx_f = min(by_vram, fam["max_context"])
-            if fam.get("dense"):   # every weight in VRAM: the largest size that fits the GPU
-                fit_d = [m for m in names if vram >= dense_vram_gb(fam, fam["models"][m], ctx_f)]
-                rec = max(fit_d, key=lambda m: fam["models"][m]["size"]) if fit_d else names[0]
             for m in names:
                 d = fam["models"][m]
                 gb = d["size"] / 1e9
-                fits = ("yes" if vram >= dense_vram_gb(fam, d, ctx_f) else "no") if fam.get("dense") \
-                    else "yes" if ram + vram >= gb + 8 else "slow"
+                fits = ("yes" if size_fits(f, m, room) else "no") if fam.get("dense") \
+                    else "yes" if size_fits(f, m, room) else "slow"
                 models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
                                "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
                                "fits": fits, "tested": bool(d.get("tested")),
-                               "experimental": False, "recommended": m == rec, "context": ctx_f,
+                               "experimental": False, "recommended": m == by_quant[size_quantizer(f, m)],
+                               "quantizer": size_quantizer(f, m), "context": ctx_f,
                                "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
             max_ctx = fam["max_context"]
         else:
-            names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
-                           key=lambda m: bool(MODELS[m].get("experimental")))
-            rec = default_size(names, ram)
             for m in names:
                 d = MODELS[m]
                 low = not d.get("budget") and low_ram_needed(m, ram) and low_ram_fits(m, ram, vram)
@@ -7520,11 +7745,16 @@ def describe() -> dict:
                         "no")
                 models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
                                "fits": fits, "tested": True, "experimental": bool(d.get("experimental")),
-                               "recommended": m == rec, "context": min(by_vram, ram_ctx(m, ram, low)),
+                               "recommended": m == by_quant[size_quantizer(f, m)], "quantizer": size_quantizer(f, m),
+                               "context": min(by_vram, ram_ctx(m, ram, low)),
                                "vision": d.get("vision", fam.get("vision")) is not False,
                                "budget": bool(d.get("budget"))})
             max_ctx = CONTEXTS[-1]
+        base, variant, quant = tier_of(f)
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
+                         # its place in the lists (TIERS) and the size recommended of it, whose quantization is the
+                         # one the window shows first
+                         "base": base, "variant": variant, "quantizer": quant, "recommended_size": rec,
                          "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
                          "images": gpu is not None,                  # image generation needs a GPU (setup_plain's too)
                          # the questions setup_plain does not ask: the KV cache's precision, the speed projection
@@ -7567,7 +7797,17 @@ def describe() -> dict:
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
                       "problem": gpu_problem(g)} for g in found],
             "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
+            # the lists' levels (TIERS): the models in setup's order with the family a first install is offered, and
+            # the versions' and quantizations' names
+            "bases": [{"id": b, "title": t} for b, t in BASES.items()]
+            + ([{"id": CUSTOM, "title": FAMILIES[CUSTOM]["title"]}] if CUSTOM in FAMILIES else []),
+            "recommended_family": recommend_family([f for f in FAMILIES if f != CUSTOM], room),
+            "variants": VARIANTS, "quantizers": QUANTIZERS,
             "images": images, "image_default": list(QI.SETUP_DEFAULT),
+            # SAM 3.1's license (--image-sam3-license), and whether it was agreed to (ask_sam3_license's record)
+            "sam3": {"license": QI.SAM3_LICENSE,
+                     "agreed": (data_folder_path(None, load_settings()) / "models" / QI.AUX_DIR
+                                / "sam3.accepted").is_file()},
             "web_search": (load_settings()["search_engine"]
                            if load_settings().get("search_engine") in WEB_SEARCH_APIS else None),
             # --describe --gguf PATH: what setup read of those files (their family, CUSTOM, is in "families")
@@ -7585,7 +7825,14 @@ def main() -> int:
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=[*FAMILIES, CUSTOM],
-                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5; custom = a model installed with --gguf")
+                    help="the model, version and quantization in one name (qwen = Qwen3.8-Flash-Next's GSQ-RCO files, "
+                         "swift = Swift 1.5's; custom = a model installed with --gguf); or --base, --variant and "
+                         "--quantizer")
+    ap.add_argument("--base", choices=list(BASES), help="the model (setup's first question)")
+    ap.add_argument("--variant", choices=list(VARIANTS),
+                    help="the model's version: the original, or whose changed copy (default: the original)")
+    ap.add_argument("--quantizer", choices=list(QUANTIZERS),
+                    help="whose quantization of that version (default: the first setup lists)")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
     models = list(dict.fromkeys([*MODELS, *plain_models]))
     ap.add_argument("--model", metavar="{" + ",".join(models) + ",custom-NAME}",
@@ -7664,6 +7911,10 @@ def main() -> int:
     ap.add_argument("--image-ssd-offload", choices=["on", "off"],
                     help="on: keep the image model's and its text encoder's sizes even when the RAM is short, and "
                          "read what does not fit from the SSD (slower); off (default): smaller sizes instead")
+    ap.add_argument("--image-sam3-license", choices=["agree", "no"],
+                    help="agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a "
+                         "picture by words with it), no: do not (Florence-2, MIT, finds the parts); asked when not "
+                         "given, no with --yes")
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help="what the text model does during an image job (default auto: stays loaded when both fit, "
                          "else gives VRAM back or is unloaded and its conversation restored afterwards)")
@@ -7844,6 +8095,15 @@ def main() -> int:
              "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")
     if a.model and a.model not in models and not a.model.startswith("custom-"):
         ap.error(f"argument --model: invalid choice: {a.model!r} (choose from {', '.join(models)}, or custom-NAME)")
+    # --base, --variant and --quantizer name a family by its levels (TIERS); --family names it in one
+    if a.base:
+        if a.family:
+            ap.error("--family and --base name the model twice: give one of them")
+        a.family = tier_family(a.base, a.variant, a.quantizer)
+    elif a.variant:
+        ap.error("--variant is a version of the model --base names: give --base too")
+    elif a.quantizer and a.family and a.quantizer not in {size_quantizer(a.family, m) for m in family_sizes(a.family)}:
+        ap.error(f"--quantizer {a.quantizer}: --family {a.family} has no such quantization")
     if a.gguf and (a.family or a.model or a.gguf_dir or a.inspect):
         ap.error("--gguf installs the model in those files: give it without --family, --model, --gguf-dir and "
                  "--inspect")
@@ -8221,14 +8481,9 @@ def main() -> int:
     if a.family:
         family = a.family
     else:
-        rec_fam = halo_fam or ("qwen35-2b" if on_cpu else fams[0])   # without a GPU: the 2B, the better answers
-        for i, f in enumerate(fams, 1):
-            d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" +
-                ("   [experimental]" if d.get("experimental") else "") +
-                (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == halo_fam and f != fams[0] else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], str(fams.index(rec_fam) + 1),
-                              a.yes)) - 1]
+        # the first this PC runs of FIRST_CHOICE (without a GPU: the 2B, the better answers), asked by its levels
+        room = room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]])
+        family, a.quantizer = ask_tiers(fams, halo_fam or recommend_family(fams, room), room, halo_fam, a.yes)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
@@ -8264,7 +8519,7 @@ def main() -> int:
                    + ("the rest in RAM)" if low_ram_resident(m, ram, vram) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}" + ("" if d.get("custom") else f"; download {d['download_gb']:.0f} GB") +
             f", uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index(default_size(names, ram)) + 1)
+    rec = str(names.index(recommend_size(family, room_of(ram, [gpu] + [gpu_info(i) for i in sel[1:]]), names)) + 1)
     if family == halo_fam and STRIX_HALO_MODEL in names:
         rec = str(names.index(STRIX_HALO_MODEL) + 1)
     if have_size is not None:   # setup run again: the installed size, whatever is recommended for a first install

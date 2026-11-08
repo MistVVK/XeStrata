@@ -171,6 +171,26 @@ B70 では、遅くなるのはキャッシュを仮想メモリに置いた側�
 
 ## モデルの選び方
 
+### setup の尋ね方と勧め方
+
+setup（`./setup.sh`、パッケージの `xestrata`、Windows のランチャー）は、モデル、版（元のもの、Swift 1.5、Coder、誰が拒否を外したものか）、量子化（誰が作ったファイルか）、大きさの順に尋ねます。
+選択肢が 1 つしかない段は尋ねません。
+コマンドラインでは、段ごとに `--base`・`--variant`・`--quantizer` で選ぶか、`--family` でまとめて選びます（`--base qwen3.8-flash-next --variant sc117` は `--family sc117` と同じです）。
+`--model` は大きさです。
+
+最初に選ばれているモデルは、Qwen3.8-Flash-Next の Swift 1.5 の SC117 版（IQ3_XXS が入るとき）、Gyro-Coder-L（エキスパートが全部 RAM に入るとき）、Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B、Qwen3.5-2B の順に見て、この PC で動く最初のものです（GPU のない PC では Qwen3.5-2B）。
+大きさは品質で勧めます。
+
+- ISTA-DASLab の GSQ-RCO のファイル（元のもの、Swift 1.5、Coder、SC117 と huihui-ai の版）は IQ3_XXS です。この PC に入らなければ、入るうちで品質のいちばん高いものです（省 RAM モードで入るものも含みます）。
+- RAM の予算で動くファイル（Unsloth、Gyro、AtomicChat の AD）は、エキスパートが全部 RAM に入るうちで品質のいちばん高いものです。実験的な版は勧めません。
+- Qwen3.8-Flash-Next 以外の MoE（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）は、RAM と VRAM の合計に入るうちで品質のいちばん高いものです。
+- Qwen3.5（9B、2B、0.8B）は、VRAM に入るうちで最も大きなものです。GPU のない PC では、2B は UD-Q5_K_XL、0.8B は Q8_0 です。
+- Qwen3.8-Flash-Next 以外のモデルは Q8_0 までで、量子化していない BF16 は勧めません（BF16 は Q8_0 とほぼ同じ答えで、メモリを倍使います）。
+
+どれも入らないときは、いちばん小さな版を勧めます。
+
+### Qwen3.8-Flash-Next の大きさ
+
 どのモデルも [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を圧縮したものです。
 元のモデルの 4 つの大きさは、[ISTA-DASLab の GSQ-RCO の量子化](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)です。
 
@@ -379,7 +399,7 @@ Qwen3.5 の 9B・2B・0.8B は、重みをすべて GPU の VRAM に置きます
   HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)（Apache-2.0、同じ 4 つの大きさ）も選べます（`--family qwen35-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
 - **[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)・[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)**（Qwen、Apache-2.0）: 9B と同じ作りの小さな密な思考するモデルで、画像も読めます。文脈は 256K まで。
   小さな GPU や GPU のない PC 向けで、答えは 9B に及びません（0.8B は 2B にも及びません）。
-  GGUF は Unsloth の、2B は Q4_K_M・UD-Q5_K_XL・Q6_K・Q8_0・BF16、0.8B は Q4_K_M・Q6_K・Q8_0・BF16 です（`--family qwen35-2b`、`--family qwen35-0.8b`）。setup は 2B では UD-Q5_K_XL、0.8B では Q8_0 を勧めます（GPU に入らなければ入る最も大きな版）。
+  GGUF は Unsloth の、2B は Q4_K_M・UD-Q5_K_XL・Q6_K・Q8_0・BF16、0.8B は Q4_K_M・Q6_K・Q8_0・BF16 です（`--family qwen35-2b`、`--family qwen35-0.8b`）。setup は GPU に入る Q8_0 までで最も大きな版を勧めます（GPU のない PC では 2B は UD-Q5_K_XL、0.8B は Q8_0）。
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)**（Z.ai、MIT）: 320B、1 トークンで使うのは 18B の思考する MoE です。setup で選べる文脈は 256K まで。
   注意は KDA（線形の注意）と DSA（選んだトークンだけを見る注意）で、4 本の流れ（mHC）を持ちます。GGUF は Unsloth の UD-IQ1_S・UD-IQ3_XXS・UD-IQ4_XS です。
 
@@ -421,7 +441,7 @@ Qwen3.5 の 9B・2B・0.8B は、重みをすべて GPU の VRAM に置きます
 RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです（GLM-5.3-Flash は RAM と VRAM の合計）。
 それより少ないと、RAM と VRAM に入らないエキスパートをモデルのファイルから読むので、遅くなります。
 Qwen3.5 の VRAM の目安は、32K の文脈で重みと KV キャッシュ（1 トークン、9B は 32 KB、2B と 0.8B は 12 KB）に約 1 GB を足したものです（拒否を外した版も同じ）。
-setup は GPU の VRAM に入る最も大きな版を勧め、入らない組み合わせは警告します。VRAM に入らない重みを RAM から流す仕組みはまだありません。
+setup は GPU の VRAM に入る Q8_0 までで最も大きな版を勧め、入らない組み合わせは警告します。VRAM に入らない重みを RAM から流す仕組みはまだありません。
 太字は、このリリースで llama.cpp と答えを比べた版です。
 ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
 
