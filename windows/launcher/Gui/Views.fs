@@ -7,6 +7,7 @@ module Xestrata.Launcher.Views
 
 open Avalonia
 open Avalonia.Controls
+open Avalonia.Controls.Templates
 open Avalonia.Layout
 open Avalonia.Media
 
@@ -81,6 +82,11 @@ let actions (buttons: Control seq) =
     let r = row 8.0 buttons
     r.HorizontalAlignment <- HorizontalAlignment.Right
     r
+
+/// A list's item template.  It takes no null item: a list that scrolls clears its recycled item's content while the
+/// template is still set, and Avalonia then builds the template for null (#50: the install page closed on scrolling).
+let itemTemplate<'T> (build: 'T -> Control) =
+    FuncDataTemplate<'T>((fun x -> not (isNull (box x))), (fun x _ -> build x))
 
 /// A label above a control.
 let field (label: string) (control: Control) =

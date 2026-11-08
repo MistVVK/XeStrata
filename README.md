@@ -263,7 +263,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 ### Windows
 
 1. Download `XeStrata-<version>-windows-x64.7z` from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`) and unpack it into a folder of your choice.
-1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". On the console, `xestrata-cli.exe` (used as `xestrata` on Linux).
+1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". On the console, `xestrata-cli.exe` (used as `xestrata` on Linux, `xestrata-cli chat` and `xestrata-cli images` included).
 
 - **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
   Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.

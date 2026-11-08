@@ -23,9 +23,9 @@ let private startInfo (script: string) (args: string seq) =
         si.ArgumentList.Add a
     si
 
-/// setup.py on this console, interactive as on Linux; its exit code.
-let runOnConsole (args: string seq) =
-    use p = Process.Start(startInfo Places.setupPy args)
+/// `script` (setup.py, chat.py, tools/image/install.py) on this console, interactive as on Linux; its exit code.
+let runOnConsole (script: string) (args: string seq) =
+    use p = Process.Start(startInfo script args)
     p.WaitForExit()
     p.ExitCode
 

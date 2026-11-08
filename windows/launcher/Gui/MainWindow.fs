@@ -10,7 +10,6 @@ open System.Diagnostics
 open System.Text.RegularExpressions
 open Avalonia
 open Avalonia.Controls
-open Avalonia.Controls.Templates
 open Avalonia.Layout
 open Avalonia.Platform.Storage
 open Avalonia.Threading
@@ -517,7 +516,7 @@ type MainWindow() as this =
                 MaxHeight = 260.0
             )
         families.ItemTemplate <-
-            FuncDataTemplate<Family>(fun f _ ->
+            itemTemplate (fun (f: Family) ->
                 stack 2.0 [
                     row 6.0 [
                         subheading f.Title
@@ -527,7 +526,7 @@ type MainWindow() as this =
                 ])
         let sizes = ListBox(MaxHeight = 320.0)
         sizes.ItemTemplate <-
-            FuncDataTemplate<Model>(fun m _ ->
+            itemTemplate (fun (m: Model) ->
                 stack 2.0 [
                     row 6.0 [
                         yield subheading m.Id
@@ -545,7 +544,7 @@ type MainWindow() as this =
         let contexts = ComboBox(MinWidth = 160.0)
         let gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
         let gpuBox = ComboBox(ItemsSource = [ for g in gpus -> sprintf "%s (%s)" g.Name (gb g.VramGb) ], MinWidth = 260.0)
-        gpuBox.SelectedIndex <- (if d.Gpu.HasValue then max 0 (Array.findIndex (fun g -> g.Index = d.Gpu.Value) gpus) else 0)
+        gpuBox.SelectedIndex <- (if d.Gpu.HasValue then defaultArg (Array.tryFindIndex (fun g -> g.Index = d.Gpu.Value) gpus) 0 else 0)
         let dataDir = TextBox(Text = d.DataDir, MinWidth = 420.0)
         let ggufDir = TextBox(PlaceholderText = "(optional) a folder with the model files already downloaded", MinWidth = 420.0)
         let license = muted ""

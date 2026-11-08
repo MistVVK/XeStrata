@@ -16,6 +16,9 @@ let app = Path.Combine(root, "app")
 
 let setupPy = Path.Combine(app, "setup.py")
 
+/// The chat in the console (`xestrata chat` on Linux).
+let chatPy = Path.Combine(app, "chat.py")
+
 /// An installed model's image generation changed (setup.py's setup_images, the config's "images" rewritten).
 let imageInstallPy = Path.Combine(app, "tools", "image", "install.py")
 

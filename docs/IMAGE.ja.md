@@ -82,7 +82,7 @@ xestrata --setup --images qwen-image-turbo     # ソースから入れたとき�
   HunyuanImage 3.0 は `:w4a8` か `:int8` です。
   一度に GPU で動くのは 1 つで、違うモデルの要求が来ると、前のモデルのエンジンを止めてから起動し直します（数秒〜十数秒かかります）。RAM の目安は、いちばん大きいモデルの分です。
 - 同じ GPU で XeStrata のサーバーをいくつか動かしているときも、画像の仕事は GPU ごとに 1 つずつ順番に動きます。別のサーバーの仕事が動いている間は待ち（Monitor に出ます）、順番が来ると、ほかのモデルのエンジンを止めてから動きます。同じモデルのサーバーどうしは、同じエンジンを使います。
-- 入っている設定にあとから足すときは `tools/image/install.py --config <設定のファイル>` も使えます（`--model`、`--quant` などは setup のオプションと同じ意味です）。
+- 入っている設定にあとから足すときは `xestrata images --config <設定のファイル>`（Windows は `xestrata-cli images`、ソースからは `tools/image/install.py`）も使えます（`--model`、`--quant` などは setup のオプションと同じ意味です）。
 
 ## 大きさとメモリ
 

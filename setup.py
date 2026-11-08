@@ -7526,7 +7526,7 @@ def describe() -> dict:
             max_ctx = CONTEXTS[-1]
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
                          "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
-                         "images": not fam.get("plain"),             # setup_plain sets up no image generation
+                         "images": gpu is not None,                  # image generation needs a GPU (setup_plain's too)
                          # the questions setup_plain does not ask: the KV cache's precision, the speed projection
                          "kv": not fam.get("plain"), "speed_projection": f in SPEED_PROJECTION_FAMILIES,
                          # the precisions --kv takes; a plain family's are not asked, FP16 unless one is given

@@ -254,7 +254,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ### Windows
 
 1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
-1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方）です。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方で、`xestrata-cli chat`・`xestrata-cli images` も）です。
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
