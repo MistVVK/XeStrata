@@ -41,6 +41,17 @@ class QuantHeaderNames(unittest.TestCase):
         self.assertIn('third_party/strata-ggml/strata-quant-common.h" "$STAGE/metal/strata-quant-common.h"', sh)
         self.assertIn('third_party/strata-ggml/strata-quant-common.h" "$STAGE/metal/ggml-common.h"', sh)
 
+    def test_the_repo_mac_qwen_package_script_stages_the_real_header_under_both_names(self):
+        """packaging/mac/build_engine.sh is the repo version of the release scripts' Mac stage (rel213/scripts/mac_rel213.sh copied third_party/ggml/ggml-common.h,
+        which is only a forwarder now: staged like that the Metal kernels would have no block layouts)."""
+        sh = (ROOT / "packaging" / "mac" / "build_engine.sh").read_text(encoding="utf-8")
+        self.assertIn('QUANT=third_party/strata-ggml/strata-quant-common.h', sh)
+        self.assertIn('cp "$QUANT" "$STAGE/metal/strata-quant-common.h"', sh)
+        self.assertIn('cp "$QUANT" "$STAGE/metal/ggml-common.h"', sh)
+        self.assertNotIn("cp third_party/ggml/ggml-common.h", sh)
+        self.assertIn('cmp "$PKG/metal/$n" "$QUANT"', sh)
+        self.assertNotIn("STRATA_GGML_DIR=$LL", sh)
+
     @unittest.skipUnless(shutil.which("c++") or shutil.which("g++") or shutil.which("clang++"), "no C++ compiler")
     def test_an_include_of_the_old_name_still_compiles(self):
         cxx = shutil.which("c++") or shutil.which("g++") or shutil.which("clang++")
