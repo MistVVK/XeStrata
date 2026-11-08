@@ -53,6 +53,22 @@ class NoLlamaDownload(unittest.TestCase):
                     "vendor/miniaudio/miniaudio.h", "vendor/stb/stb_image.h", "LICENSE"):
             self.assertTrue((tree / rel).is_file(), rel)
 
+    def test_the_nvfp4_tools_take_the_vendored_converter(self):
+        """The NVFP4-local tools import torch and transformers (not on the test boxes), so only the wiring is checked: they compile, name no downloaded tree and
+        find the vendored converter, whose conversion/qwen4exp.py the policy hooks patch."""
+        sys.path.insert(0, str(ROOT / "tools"))
+        import _paths
+        for name in ("nvfp4_convert.py", "nvfp4_verify.py", "nvfp4_verify_gguf.py"):
+            src = (ROOT / "tools" / name).read_text(encoding="utf-8")
+            compile(src, name, "exec")
+            self.assertNotIn("llama.cpp\"", src.replace("llama.cpp's", ""), name)
+            self.assertNotIn('"third_party" / "llama.cpp"', src, name)
+        conv = Path(_paths.converter_dir())
+        self.assertEqual(conv, ROOT / "third_party" / "strata-gguf-py" / "converter")
+        src = (conv / "conversion" / "qwen4exp.py").read_text(encoding="utf-8")
+        self.assertIn("class Qwen4ExpTextModel", src)
+        self.assertIn("_place_ple_shard", src)
+
     def test_the_terminal_and_control_carry_gguf_py_so_a_model_is_prepared_without_a_download(self):
         pt = (ROOT / "packaging" / "package_terminal.py").read_text(encoding="utf-8")
         self.assertIn('INSTALLER_THIRD_PARTY = ("third_party/strata-gguf-py",)', pt)
