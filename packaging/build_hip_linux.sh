@@ -78,16 +78,16 @@ if [ -z "${VISION_ONLY:-}" ]; then
     [ -x "$OUT/bd/strata-dsv41" ] || { st "ABORT no strata-dsv41 (DSV41=0 leaves it out)"; tail -20 "$OUT/build-dsv41.log" >> "$S"; exit 1; }
   fi
 fi
-# strata-vision still builds from llama.cpp's own tree until it is vendored (the next commit)
-[ -n "$LLAMA" ] || { st "ABORT strata-vision needs LLAMA=<llama.cpp checkout at the pinned commit> until it is vendored"; exit 1; }
+# strata-vision builds from the vendored third_party/strata-llama; LLAMA=<llama.cpp checkout> overrides it
+VLLAMA=(); [ -z "$LLAMA" ] || VLLAMA=("-DLLAMA_DIR=$LLAMA")
 # the CPU reader: portable (AVX2), the fallback that runs on any PC
-cmake -G Ninja -S tools/vision -B "$OUT/bv" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$LLAMA" -DSTRATA_VISION_CUDA=OFF \
+cmake -G Ninja -S tools/vision -B "$OUT/bv" -DCMAKE_BUILD_TYPE=Release ${VLLAMA[@]+"${VLLAMA[@]}"} -DSTRATA_VISION_CUDA=OFF \
   -DSTRATA_PORTABLE=ON > "$OUT/cfg-vision.log" 2>&1
 nice -n 10 cmake --build "$OUT/bv" --target strata-vision -j "$JOBS" > "$OUT/build-vision.log" 2>&1
 chk $? "cpu reader built"
 [ -x "$OUT/bv/bin/strata-vision" ] || { st "ABORT no strata-vision"; exit 1; }
 # the GPU reader: ggml-hip for the same archs; the CPU kernels in it are portable too
-cmake -G Ninja -S tools/vision -B "$OUT/bh" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$LLAMA" -DSTRATA_VISION_HIP=ON \
+cmake -G Ninja -S tools/vision -B "$OUT/bh" -DCMAKE_BUILD_TYPE=Release ${VLLAMA[@]+"${VLLAMA[@]}"} -DSTRATA_VISION_HIP=ON \
   "-DSTRATA_VISION_HIP_ARCHS=$ARCHS" -DSTRATA_PORTABLE=ON "${HIPDEFS[@]}" ${VISION_HIP_DEFS:-} > "$OUT/cfg-vision-hip.log" 2>&1
 chk $? "gpu reader configured"
 nice -n 10 cmake --build "$OUT/bh" --target strata-vision -j "$JOBS" > "$OUT/build-vision-hip.log" 2>&1

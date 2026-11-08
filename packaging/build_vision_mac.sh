@@ -1,9 +1,9 @@
 #!/bin/bash
 # packaging/build_vision_mac.sh - the picture reader for the Mac engine package: strata-vision for macOS arm64, with ggml's Metal
 # backend built in (`--gpu` reads pictures on the Mac's GPU, without it on the CPU). One program for both: Apple Silicon always has
-# the Metal framework, the Metal engine needs it too. It is built against the llama.cpp commit the engine is pinned to.
+# the Metal framework, the Metal engine needs it too. It is built from the vendored third_party/strata-llama (llama.cpp at the engine's pin); --llama <checkout> builds from that instead (an override, kept for two releases).
 #
-#   packaging/build_vision_mac.sh --llama <llama.cpp checkout at the pin> --out <folder> [--build <build folder>] [--jobs N]
+#   packaging/build_vision_mac.sh --out <folder> [--llama <llama.cpp checkout>] [--build <build folder>] [--jobs N]
 #
 # <folder>/strata-vision is the program; copy it beside `strata` in the engine package's --src before packaging/package_engine.py
 # (`strata-vision` is one of the files it takes) and sign it with the rest (packaging/mac/sign-and-notarize.sh signs every Mach-O).
@@ -20,11 +20,13 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
-[ -n "$llama" ] && [ -n "$out" ] || { echo "usage: $0 --llama <llama.cpp> --out <folder> [--build <folder>] [--jobs N]" >&2; exit 2; }
+[ -n "$out" ] || { echo "usage: $0 --out <folder> [--llama <llama.cpp checkout: an override>] [--build <folder>] [--jobs N]" >&2; exit 2; }
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] || { echo "this builds on an Apple Silicon Mac" >&2; exit 1; }
 build="${build:-$out/build-vision}"
 mkdir -p "$out"
-cmake -S "$here/../tools/vision" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
+vision_llama=""; [ -z "$llama" ] || vision_llama="-DLLAMA_DIR=$llama"     # default: the vendored third_party/strata-llama
+# shellcheck disable=SC2086
+cmake -S "$here/../tools/vision" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release $vision_llama \
   -DSTRATA_PORTABLE=ON -DSTRATA_VISION_METAL=ON -DSTRATA_VISION_CUDA=OFF
 ninja -C "$build" ${jobs:+-j "$jobs"} strata-vision
 cp "$build/bin/strata-vision" "$out/strata-vision"

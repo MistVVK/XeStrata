@@ -40,7 +40,7 @@ cd "$repo"
 ggml=""
 # ggml is the vendored third_party/strata-ggml. STRATA_GGML_DIR=<llama.cpp checkout> (or LLAMA_CPP=, the name this script used before) builds from that
 # checkout instead: an override kept for two releases. (LLAMA_CPP used to set a FetchContent variable that the CMake files stopped reading when ggml was
-# vendored, so it did nothing, and a downloaded third_party/llama.cpp was picked up by itself; neither happens now.)
+# vendored, so it did nothing, and a llama.cpp tree downloaded into third_party/ was picked up by itself; neither happens now.)
 override=${STRATA_GGML_DIR:-${LLAMA_CPP:-}}
 [ -z "$override" ] || ggml="-DSTRATA_GGML_DIR=$override"
 # shellcheck disable=SC2086

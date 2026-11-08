@@ -30,3 +30,4 @@ docker/compose/* text eol=lf
 serve/web/vendor/** -text
 third_party/strata-ggml/** text eol=lf
 third_party/strata-gguf-py/** text eol=lf
+third_party/strata-llama/** text eol=lf

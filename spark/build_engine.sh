@@ -42,14 +42,6 @@ case "$cudafull" in
   13.*) echo "build_engine.sh: note: CUDA $cudafull has not been tried for this build; 13.0 is the release toolkit" >&2 ;;
   *) echo "build_engine.sh: needs the CUDA 13 toolkit (nvcc here: ${cudafull:-missing})" >&2; exit 2 ;;
 esac
-if [ "${BUILD_VISION:-1}" = 1 ] && [ -z "$llama" ]; then
-  # strata-vision still builds from llama.cpp's own tree until it is vendored (the next commit): the pinned one, as setup.py fetches it
-  llama=$repo/third_party/llama.cpp
-  if [ ! -f "$llama/ggml/CMakeLists.txt" ]; then
-    (cd "$repo" && "$py" -c "import setup; print(setup.get_llama_cpp())")
-    [ -f "$llama/ggml/CMakeLists.txt" ] || { echo "build_engine.sh: no llama.cpp tree at $llama after fetching it (STRATA_GGML_DIR=<tree> names another)" >&2; exit 2; }
-  fi
-fi
 # the commit the DeepSeek engine prints with --version: a checkout gives it to CMake itself; a tree copy without .git needs COMMIT=<hex>
 want_dsv41=OFF; [ "${BUILD_DSV41:-1}" = 1 ] && want_dsv41=ON
 if [ "$want_dsv41" = ON ] && [ ! -e "$repo/.git" ] && [ ! -f "$repo/BUILD_ID" ]; then
@@ -72,7 +64,10 @@ else
 fi
 
 if [ "${BUILD_VISION:-1}" = 1 ]; then
-  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
+  # strata-vision builds from the vendored third_party/strata-llama; STRATA_GGML_DIR=<llama.cpp checkout> overrides it
+  vision_llama=""; [ -z "$llama" ] || vision_llama="-DLLAMA_DIR=$llama"
+  # shellcheck disable=SC2086
+  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release $vision_llama \
       -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm \
       "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"
   "$cmake" --build "$vision_dir" --target strata-vision -j "$jobs"

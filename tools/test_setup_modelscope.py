@@ -62,7 +62,7 @@ class Source(Base):
 
     def test_a_failed_download_recommends_modelscope(self):
         self.assertIn("--source modelscope", setup.source_hint(HF_URL))
-        self.assertEqual(setup.source_hint(setup.LLAMA_CPP_ZIP), "")
+        self.assertEqual(setup.source_hint("https://github.com/example/repo/archive/main.zip"), "")
 
     def test_hf_endpoint_is_a_choice(self):
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -75,7 +75,7 @@ class Source(Base):
         self.assertEqual(setup.ms_url(REPO, PATH),
                          "https://www.modelscope.cn/models/" + REPO + "/resolve/master/" + PATH)
         self.assertIsNone(setup.ms_file("https://huggingface.co/someone/other/resolve/main/x.gguf"))
-        self.assertIsNone(setup.ms_file(setup.LLAMA_CPP_ZIP))
+        self.assertIsNone(setup.ms_file("https://github.com/example/repo/archive/main.zip"))
 
 
 class Download(Base):
