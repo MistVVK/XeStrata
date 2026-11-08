@@ -105,13 +105,14 @@ A model not in the table can be installed from GGUF files you have with `xestrat
 | Model | Parameters | RAM (about) | Good for |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 125B | 32-62 GB | the smartest; choose from the versions and sizes below |
-| **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | a PC with less RAM; also with its refusals removed |
+| **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | reads images too; a PC with less RAM; also with its refusals removed |
 | **llm-jp-4.1** (BETA) | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
-| **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model; a PC with less RAM |
+| **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model that reads images too; a PC with less RAM |
 | **Qwen3.5-9B** (BETA) | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
 | **GLM-5.3-Flash** (BETA) | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
 
-The BETA models do not make images yet; of them only Qwen3.5-9B reads images. Their sizes and options are in
+The BETA models do not make images yet; of them Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5-9B read images. Their sizes and
+options are in
 [DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash).
 
 ### Qwen3.8-Flash-Next's versions and sizes

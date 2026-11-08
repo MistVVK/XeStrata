@@ -788,6 +788,19 @@ _QWEN36_UNC = "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APE
 _QWEN36_UNC_FILE = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-{}.gguf"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
 _QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
+# The 35B-A3B models' picture readers (qwen35moe, as Qwen3.5-9B's): each repository's mmproj.  Unsloth's Qwen3.6, Ornith
+# AI's and dealignai's (named f16, BF16 inside) hold the same tensors byte for byte, SC117's the same weights in F16
+# (2026-11-08).  pfeifferj's GSQ-RCO repository has none: Ornith AI's reads pictures for those files too (the same
+# model, the projection as wide as its embedding, 2048)
+_QWEN36_MMPROJ = {"repo": _QWEN36, "path": "mmproj-BF16.gguf", "size": 902822528,
+                  "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"}
+_QWEN36_UNC_MMPROJ = {"repo": _QWEN36_UNC,
+                      "path": "mmproj-Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-F16.gguf",
+                      "size": 899283072, "sha256": "c8e702344a81f8c226a914aa980ed6e1f604bce9374f1fed8e65c896908af414"}
+_ORNITH_MMPROJ = {"repo": _ORNITH, "path": "mmproj-Ornith-1.5-35B-BF16.gguf", "size": 902822240,
+                  "sha256": "1921a36a85aee56cd2abd27f46701802c9d85a33474792e600df6c3b282a135d"}
+_ORNITH_UNC_MMPROJ = {"repo": _ORNITH_UNC, "path": "mmproj-Ornith-1.5-35B-A3B-f16.gguf", "size": 902822240,
+                      "sha256": "eef27583f74f2990b7a3d97119a0b67c05aeb48c92dde9466f050e30bf1a3595"}
 _QWEN35_HAU = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 
 
@@ -815,9 +828,10 @@ _GLM53_IQ4 = _glm53_parts("UD-IQ4_XS", [
     (7729791616, "66ebf9ec85e04d3f44af674ae4f694acbc89cc53db75e42f2f4d3646bf321c0d")])
 PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     "ornith": {"title": "Ornith-1.5-35B-A3B", "by": "Ornith AI (MIT)",
-               "about": "35B, 3B active; a Qwen3.5 MoE: Q4_K_M to BF16, and community GSQ-RCO 3 and 3.5 bits",
+               "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 "
+                        "and 3.5 bits",
                "tag": "ornith-", "name": "ornith-1.5-35b-a3b", "max_context": 262144, "plain": True,
-               "profile": "expert-profile-ornith.bin",
+               "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_MMPROJ,
                "models": {
                    "Q4_K_M": {"repo": _ORNITH, "file": "Ornith-1.5-35B-Q4_K_M.gguf", "size": 21713463040,
                               "sha256": "42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f",
@@ -851,7 +865,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
         "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and its safety "
                  "filtering is reduced, so check what it writes",
         "tag": "ornith-uncensored-", "name": "ornith-1.5-35b-a3b-uncensored", "max_context": 262144, "plain": True,
-        "profile": "expert-profile-ornith.bin",
+        "profile": "expert-profile-ornith.bin", "mmproj": _ORNITH_UNC_MMPROJ,
         "models": {
             "Q4_K_M": {"repo": _ORNITH_UNC, "file": _ORNITH_UNC_FILE.format("Q4_K_M"), "size": 21713462848,
                        "sha256": "f1e281f07c99aa9a731b47082c3d1bfc22e9477230330688a543e3d451319d76", "about": "4-bit"},
@@ -878,9 +892,9 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
     # CUDA engine path there, 0.1.44; here the same plain path as Ornith's).  Their tensors: Q4_K, Q5_K, Q6_K and Q8_0
     # experts, Q8_0 dense, F32, and the MTP block's two routers in BF16
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
-               "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's 4-, 6- and 8-bit files",
+               "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Unsloth's 4-, 6- and 8-bit files",
                "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
-               "profile": "expert-profile-qwen36.bin",
+               "profile": "expert-profile-qwen36.bin", "mmproj": _QWEN36_MMPROJ,
                "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
@@ -903,7 +917,7 @@ PLAIN_FAMILIES["qwen36-uncensored"] = {
     "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, and its safety "
              "filtering is reduced, so check what it writes",
     "tag": "qwen36-uncensored-", "name": "qwen3.6-35b-a3b-uncensored", "max_context": 262144, "plain": True,
-    "profile": "expert-profile-qwen36.bin", "draft_vocab": True,
+    "profile": "expert-profile-qwen36.bin", "draft_vocab": True, "mmproj": _QWEN36_UNC_MMPROJ,
     "models": {
         "APEX-I-Quality": {"repo": _QWEN36_UNC, "file": _QWEN36_UNC_FILE.format("Quality"), "size": 23514746272,
                            "sha256": "31a6a415d4de270cdd2128103a671202f4b92b6eb30c5f87934f3b06fc2a55cc",

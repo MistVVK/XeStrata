@@ -465,9 +465,12 @@ With two or more GPUs chosen by `setup --gpus`, the layers are split across them
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
 `setup`'s `--kv`, `--parallel`, `--replicas` and `--resident-budget-gib N` (N GiB of the experts the GPU does not hold in RAM, the rest read from the file) go into the config as for Qwen3.8-Flash-Next (`--kv`'s `q4_0` and `k8v4` for the models with heads of 256, `fp16` and `int8` for llm-jp, `fp16` alone for GLM-5.3-Flash; `--parallel` not for GLM-5.3-Flash nor with images).
-Qwen3.5-9B reads images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more,
-the CPU reader below that).
-Not yet: the other models' images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
+Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5-9B read images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader
+on a GPU of 24 GB and more, the CPU reader below that).
+Each picture reader (mmproj) is its publisher's: Ornith AI's BF16 for Ornith-1.5 (pfeifferj's GSQ-RCO files use it too),
+dealignai's for its version without refusals, Unsloth's BF16 for Qwen3.6-35B-A3B and Qwen3.5-9B, and SC117's F16 for
+Qwen3.6-35B-A3B's version without refusals.
+Not yet: llm-jp-4.1's and GLM-5.3-Flash's images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
@@ -1819,6 +1822,9 @@ This is the opposite direction from [Tools from MCP servers](#tools-from-mcp-ser
 The model has an image encoder:
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
 (0.9 GB, a 27-layer ViT plus the projector into the language model).
+Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5-9B use their publishers' mmproj files (0.9 GB;
+[other models](#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash)), chosen
+and set as this section describes.
 It is **optional**, and setup's "Images?" defaults to yes for a model that reads pictures (upstream 91baead75).
 To leave it out, say no or pass `--vision no`; to add it later, run setup again with `--vision gpu` (or `--vision cpu`).
 Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.

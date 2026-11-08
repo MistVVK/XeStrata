@@ -102,13 +102,13 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM �
 | モデル | パラメーター | RAM の目安 | 向いていること |
 | --- | --- | ---: | --- |
 | **Qwen3.8-Flash-Next** | 1,250 億 | 32〜62 GB | いちばん賢い。下の版と大きさから選びます |
-| **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | RAM の少ない PC 向け。拒否を外した版もあります |
+| **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | 画像も読む。RAM の少ない PC 向け。拒否を外した版もあります |
 | **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
-| **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 思考するモデル。RAM の少ない PC 向け |
+| **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 画像も読む思考するモデル。RAM の少ない PC 向け |
 | **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
 | **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Qwen3.5-9B だけです。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
+BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B です。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 

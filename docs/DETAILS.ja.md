@@ -429,8 +429,9 @@ Ornith の公式の版（Q4_K_M〜BF16）と拒否を外した版、Qwen3.6、GL
 温度つきの要求でも使います。窓の各行は位置で決まる乱数で引き、下書きはその引きと同じときだけ使うので、文は下書きがないときと同じです（B70 の Qwen3.6-35B-A3B、温度 0.8 の 400 トークンで decode 92.9 → 131.7 トークン/秒）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
 `setup` の `--kv`、`--parallel`、`--replicas`、`--resident-budget-gib N`（GPU が持たないエキスパートのうち N GiB を RAM に置き、残りをファイルから読む）は、Qwen3.8-Flash-Next と同じく設定に書かれます（`--kv` の `q4_0`・`k8v4` はヘッドが 256 のモデル、llm-jp は `fp16`・`int8`、GLM-5.3-Flash は `fp16` だけ。`--parallel` は GLM-5.3-Flash と画像では使えません）。
-Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
-まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は GLM-5.3-Flash ではまだ FP16 だけです）。
+Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
+画像の読み手（mmproj）は、それぞれの配布元のものです。Ornith-1.5 は Ornith AI の BF16（pfeifferj の GSQ-RCO の版も同じものを使います）、拒否を外した版は dealignai のもの、Qwen3.6-35B-A3B と Qwen3.5-9B は Unsloth の BF16、Qwen3.6-35B-A3B の拒否を外した版は SC117 の F16 です。
+まだ使えないのは、llm-jp-4.1 と GLM-5.3-Flash の画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は GLM-5.3-Flash ではまだ FP16 だけです）。
 RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
 そのとき、上の `XESTRATA_RAM_ADAPT=<n>` で RAM のコピーを会話に従わせられます（1 GPU のとき）。
 `XESTRATA_DISK_SKIP_FROM=R`（opt-in、答えが変わる、Project Maya の #109 から）にすると、VRAM にも RAM のコピーにもなくファイルから読むエキスパートを、順位 R 以下で選んだトークンでは寄与を 0 にし、窓のどのトークンもその順位でしか選ばないものは読みません（SSD を待ちません）。GLM-5.3-Flash UD-IQ3_XXS を RAM 56 GB に絞った B70 の decode は、R=6 で 4.33 → 5.11 トークン/秒（128 トークンが同じ）、R=4 で 5.93（13 トークン目から分かれる）でした。
@@ -1765,6 +1766,7 @@ Python の標準ライブラリだけを使うので、`.venv` ができる前�
 
 モデルには画像のエンコーダーがあります。
 [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)（0.9 GB、27 層の ViT と、言語モデルへの射影）です。
+Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B は、それぞれの配布元の mmproj（0.9 GB）を使います（[ほかのモデル](#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash)）。この節の選び方とオプションは同じです。
 使うかどうかは**任意**で、画像を読めるモデルでは setup の「Images?」の既定は yes です（upstream 91baead75）。
 切るには no と答えるか `--vision no` を付けます。後から入れるには `--vision gpu`（または `--vision cpu`）を付けて setup をもう一度実行します。
 yes（`--vision yes`）は、24 GB 以上のカードでは GPU のエンコーダー、それより小さいカードでは CPU のエンコーダーです。GPU のエンコーダーは VRAM を約 1.4 GB 空けておくので、16 GB のカードで文章の速さが 3〜5% 落ちたためです（upstream #2406 の計測）。`--vision gpu` を付ければ、小さいカードでも GPU のエンコーダーです。
