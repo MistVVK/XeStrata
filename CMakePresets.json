@@ -24,7 +24,7 @@
     {
       "name": "cuda-compile",
       "displayName": "CUDA compile-only (the release flags of packaging/build_cuda_linux.sh, no tests)",
-      "description": "Builds the strata and strata_kq targets for the given CUDA architectures. No GPU is needed to compile; nothing is run. ggml is the vendored third_party/strata-ggml; -DSTRATA_GGML_DIR=<llama.cpp checkout> overrides it (CI still passes one).",
+      "description": "Builds the strata and strata_kq targets for the given CUDA architectures. No GPU is needed to compile; nothing is run. ggml is the vendored third_party/strata-ggml; -DSTRATA_GGML_DIR=<llama.cpp checkout> overrides it.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {

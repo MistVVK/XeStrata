@@ -4,8 +4,9 @@
 #   VARIANT=cuda12 packaging/build_cuda_linux.sh     # CUDA 12.9: GTX 10 (Pascal), Tesla P100, V100, and the newer cards up to sm_89
 #   VARIANT=cuda13 packaging/build_cuda_linux.sh     # CUDA 13: RTX 20 and newer (sm_75 .. sm_120)
 #
-# Run it on a Linux x86_64 box with the CUDA toolkit of that variant on PATH (nvcc), a Python 3 venv with requirements.txt and
-# requirements-build.txt, and the pinned llama.cpp in third_party/llama.cpp (python -c "import setup; setup.get_llama_cpp()").
+# Run it on a Linux x86_64 box with the CUDA toolkit of that variant on PATH (nvcc) and a Python 3 venv with requirements.txt and
+# requirements-build.txt. ggml comes from the vendored third_party/strata-ggml: nothing is downloaded. STRATA_GGML_DIR=<llama.cpp checkout>
+# builds from that checkout instead (an override, kept for two releases).
 # The package lands in $OUT (default ./out-engine-<variant>). Nothing is uploaded.
 #
 # The cuda12 package is the one the feed and docs/DOCKER.md offer to Pascal and Volta cards, so it needs machine code for sm_60,
@@ -31,12 +32,13 @@ esac
 real=""; for a in $(echo "$archs" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}
 last=$(echo "$archs" | tr ';,' '  ' | awk '{print $NF}')
 cd "$repo"
+ggml=""; [ -z "${STRATA_GGML_DIR:-}" ] || ggml="-DSTRATA_GGML_DIR=$STRATA_GGML_DIR"
 # STRATA_CMAKE_EXTRA: more configure arguments for the engine build, e.g. the model shape of a new family:
 #   STRATA_CMAKE_EXTRA="-DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp"   (or -DSTRATA_GEOMETRY=<name>)
 # shellcheck disable=SC2086
 cmake -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_EXPERIMENTAL_SM60=$sm60 -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
-    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR="$repo/third_party/llama.cpp" ${STRATA_CMAKE_EXTRA:-}
+    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-}
 cmake --build "$build" --target strata strata_kq -j "$(nproc)"
 
 # The picture reader is built for the SAME architectures as the engine (#3669: a reader reused from an older build had no sm_60, and on

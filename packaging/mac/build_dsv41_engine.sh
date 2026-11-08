@@ -10,7 +10,7 @@
 #
 # The package is text-only on purpose (--no-picture-reader): DeepSeek reads pictures with its own tower, which the Metal engine has not run.
 # Needs: Xcode Command Line Tools, cmake + ninja (a pip venv is enough: python3 -m venv v && v/bin/pip install cmake ninja), Apple's
-# metal-cpp (METAL_CPP_DIR) and the llama.cpp tree setup pins (STRATA_GGML_DIR). Defaults: ~/strata-mac/metal-cpp, ~/strata-mac/llamacpp.
+# metal-cpp (METAL_CPP_DIR; default ~/strata-mac/metal-cpp). ggml comes from the vendored third_party/strata-ggml; STRATA_GGML_DIR=<llama.cpp checkout> is an override.
 #
 # Layout (strata-dsv41 finds these beside its own executable, metal/src/resource_path.h):
 #   <exe>/metal/kernels/*.metal         the shared Qwen kernels the DeepSeek host also compiles
@@ -34,14 +34,14 @@ done
 CMAKE=${CMAKE:-$(command -v cmake || echo "$HOME/strata-mac/tools/bin/cmake")}
 NINJA=${NINJA:-$(command -v ninja || echo "$HOME/strata-mac/tools/bin/ninja")}
 METAL_CPP_DIR=${METAL_CPP_DIR:-$HOME/strata-mac/metal-cpp}
-STRATA_GGML_DIR=${STRATA_GGML_DIR:-$HOME/strata-mac/llamacpp}
+GGML=""; [ -z "${STRATA_GGML_DIR:-}" ] || GGML="-DSTRATA_GGML_DIR=$STRATA_GGML_DIR"   # an override (kept for two releases); default the vendored third_party/strata-ggml
 if [ -z "$BUILD_ID" ]; then   # the commit the binary is built from: the tree's own git, else a BUILD_ID file beside the sources
   BUILD_ID=$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || head -1 "$ROOT/BUILD_ID" 2>/dev/null || echo unknown)
 fi
 EXE="$BUILD/strata_ds4"
 if [ ! -x "$EXE" ]; then
   "$CMAKE" -S "$ROOT/metal" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="$NINJA" \
-    -DMETAL_CPP_DIR="$METAL_CPP_DIR" -DSTRATA_GGML_DIR="$STRATA_GGML_DIR" -DSTRATA_BUILD_ID="$BUILD_ID" \
+    -DMETAL_CPP_DIR="$METAL_CPP_DIR" $GGML -DSTRATA_BUILD_ID="$BUILD_ID" \
     -DSTRATA_DS4_VERSION="$VERSION-metal" || exit 1
 fi
 "$NINJA" -C "$BUILD" strata_ds4 || exit 1      # (always: a no-op when current; an existing build folder must not package a stale binary)
