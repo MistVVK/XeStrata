@@ -84,6 +84,10 @@ public:
     static void prepare();
     /// Waits for prepare's trial on the current GPU (the library and its first kernels loaded).
     static void settle();
+    /// Waits for every GPU's trial still running: before the process ends, so no trial is still loading its library
+    /// while the exit handlers take the GPU runtime down (main's guard; a run that ended in an error before its first
+    /// prompt crashed or hung there on the RX 9060 XT, 2026-11-08).
+    static void finish();
     /// The path the products take on the current GPU, for the startup report: "oneMath", or the own kernels'
     /// (kernels::gemm_path).
     static const char* path();

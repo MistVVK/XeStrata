@@ -63,6 +63,7 @@ class GgufModel;
 namespace strata::core {
 
 class RemoteExperts;
+class PlainCpu;
 
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
@@ -95,6 +96,10 @@ struct PlainOptions {
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
+    /// --device cpu: the dense Qwen3.5 forward on the CPU alone (plain_cpu.hpp), no GPU opened; `cpu_threads` its
+    /// pool's threads (0: every hardware thread)
+    bool cpu = false;
+    int cpu_threads = 0;
     /// --batch N (--serve): conversations decoded together, one row each in a window (plain_serve's batch slots), each
     /// slot its own copy of the per-sequence state; at most max_t, as many as take half the VRAM free before the
     /// expert tier at most.  Not GLM-5.3-Flash's nor with --vision (one table of rotary positions) for now.
@@ -230,7 +235,9 @@ public:
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
     /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
-    bool recurrent() const { return !gdn_state_.empty(); }
+    bool recurrent() const { return cpu_ != nullptr || !gdn_state_.empty(); }
+    /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
+    bool on_cpu() const { return cpu_ != nullptr; }
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
@@ -875,6 +882,15 @@ private:
     PlainOptions opt_;
     ModelSpec spec_;
     std::unique_ptr<GgufModel> model_;
+    // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
+    std::unique_ptr<PlainCpu> cpu_;
+    std::vector<float> cpu_bias_, cpu_logits_;
+    std::vector<uint32_t> cpu_allowed_;
+    std::vector<int32_t> cpu_hist_;
+    int cpu_hist_len_ = 0;
+    bool cpu_load(std::string& err);
+    bool cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows, int32_t* out, float* logits,
+                 std::string& err);
     int64_t n_vocab_ = 0;
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)

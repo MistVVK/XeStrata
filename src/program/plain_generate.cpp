@@ -2232,6 +2232,9 @@ static void plain_usage(const std::string& arch) {
                  "                       --conversation-cache-min-free-mib (also XESTRATA_RAM_RESERVE_MIB; 0 = none)\n"
                  "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from xestrata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
+                 "  --device cpu|gpu     where the forward runs (default gpu; the dense Qwen3.5 models, qwen35, run on\n"
+                 "                       the CPU as well, and take it when no GPU is there)\n"
+                 "  --cpu-threads N      --device cpu: the threads the forward takes (default every hardware thread)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
                  "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n",
@@ -2256,7 +2259,7 @@ int plain_main(int argc, char** argv) {
     int64_t n_new = 16;
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
-    bool stop_eos = false, serve = false;
+    bool stop_eos = false, serve = false, device_given = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
@@ -2322,6 +2325,16 @@ int plain_main(int argc, char** argv) {
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
         else if (a == "--serve") serve = true;
         else if (a == "--vision") opt.vision = true;
+        else if (a == "--device") {
+            const std::string v = next("--device");
+            if (v != "cpu" && v != "gpu") {
+                std::fprintf(stderr, "xestrata (%s): --device takes cpu or gpu, not \"%s\"\n", arch.c_str(), v.c_str());
+                return 2;
+            }
+            opt.cpu = v == "cpu";
+            device_given = true;
+        }
+        else if (a == "--cpu-threads") opt.cpu_threads = std::max(0, (int) std::strtol(next("--cpu-threads"), nullptr, 10));
         else if (a == "--greedy") sp.greedy = true;
         else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--eos-ids") {
@@ -2585,6 +2598,37 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
         opt.vision = false;
     }
+    // the CPU: asked for, or a dense Qwen3.5 model on a PC whose SYCL runtime lists no GPU it can use
+    if (!opt.cpu && !device_given && arch == "qwen35") {
+        int gpus = 0;
+        try {
+            gpus = strata::core::Runtime::count();
+        } catch (const std::exception&) {
+            gpus = 0;
+        }
+        if (gpus == 0) {
+            std::fprintf(stderr, "xestrata (%s): no GPU the engine can use: the forward runs on the CPU\n", arch.c_str());
+            opt.cpu = true;
+        }
+    }
+    if (opt.cpu) {
+        if (arch != "qwen35") {
+            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense Qwen3.5 models (qwen35) only\n", arch.c_str());
+            return 2;
+        }
+        if (opt.vision) {
+            std::fprintf(stderr, "xestrata (%s): --vision is off: the CPU's forward reads text only\n", arch.c_str());
+            opt.vision = false;
+        }
+        if (opt.kv_int8 || opt.kv_q4 != 0) {
+            std::fprintf(stderr, "xestrata (%s): --kv is FP32 on the CPU\n", arch.c_str());
+            opt.kv_int8 = false;
+            opt.kv_q4 = 0;
+        }
+        opt.kv_grow = 0;
+        opt.vram_elastic = false;
+        opt.batch_slots = 0;
+    }
     auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
 
     strata::core::PlainModel model;
@@ -2601,7 +2645,8 @@ int plain_main(int argc, char** argv) {
         opt.vram_elastic = false;
     }
     const Clock::time_point t0 = Clock::now();
-    if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
+    // the products' library loads beside the model (not on the CPU: no GPU is opened there)
+    if (opt.prompt_chunk > 0 && !opt.cpu) strata::prefill::Gemm::prepare();
     {   // before the expert pool is built: its workers' CPUs, the other threads' plan, the RAM guard's limit
         std::string text = pool_cores;
         if (text.empty())
@@ -2658,7 +2703,8 @@ int plain_main(int argc, char** argv) {
         }
     }
     opt.prompt_chunk = model.prompt_chunk();   // the model may take the prompt in windows (short of pinned memory)
-    if (opt.prompt_chunk > 0 && model.spec().n_expert == 0) {   // a dense model (qwen35)
+    if (model.on_cpu()) {   // the CPU's products (plain_cpu.hpp), said by its load
+    } else if (opt.prompt_chunk > 0 && model.spec().n_expert == 0) {   // a dense model (qwen35)
         std::fprintf(stderr, "xestrata (%s): prompt matrix products on %s, the int8 ones on %s\n", arch.c_str(),
                      strata::prefill::Gemm::path(),
                      strata::prefill::mmq::chosen() ? strata::prefill::mmq::path() : "none (FP16 for all)");
@@ -2784,9 +2830,10 @@ int plain_main(int argc, char** argv) {
                  (double) (produced.size() - 1) / (tg > 0 ? tg : 1), (long long) model.resident(),
                  (long long) model.slots(), routed > 0 ? 100.0 * (double) model.hits() / (double) routed : 0.0,
                  (long long) model.swaps());
-    std::fprintf(stderr, "xestrata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
-                         "RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
-                 (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
+    if (!model.on_cpu())
+        std::fprintf(stderr, "xestrata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken "
+                             "from RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
+                     (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
     if (model.ram_adapts() > 0)
         std::fprintf(stderr, "xestrata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
                              "them out of a stage buffer (XESTRATA_RAM_ADAPT)\n", arch.c_str(),

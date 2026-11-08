@@ -270,6 +270,7 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
 }
 
 bool PlainModel::prompt_warm(std::string& err) {
+    if (cpu_ != nullptr) return true;   // the CPU's products need no warming
     for (auto& st : next_) {   // every GPU's products
         const OnDevice on(st->dev_);
         if (!st->prompt_warm(err)) return false;
@@ -773,6 +774,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
 }
 
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
+    if (cpu_ != nullptr) return cpu_run(tokens, n, pos, 1, out, logits, err);
     return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
 }
 

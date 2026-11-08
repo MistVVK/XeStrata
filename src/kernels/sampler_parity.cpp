@@ -12,6 +12,7 @@
 // DIFFER - then requires the kernel to agree with the specified one.  Without the first half, the test would
 // pass against either order.
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/sampler_host.hpp"
 
 #include "parity_device.hpp"
 
@@ -124,116 +125,21 @@ int run(const char* name, const std::vector<float>& logits, int n_tokens, const 
     return bad;
 }
 
-// The Philox draw, host side - a transcription of the kernel's `philox_uniform` so the SAMPLED pick (not
-// just the greedy argmax) can be pinned against a reference.  `__umulhi(a, b)` is the high half of a 32x32
-// multiply, spelled `(uint32_t)(((uint64_t) a * b) >> 32)` here.
-struct PhiloxRound {
-    uint32_t& c0; uint32_t& c1; uint32_t& c2; uint32_t& c3;
-    void step(uint32_t k0, uint32_t k1) const {
-        const uint32_t hi0 = (uint32_t) (((uint64_t) 0x9E3779B9u * c0) >> 32);
-        const uint32_t hi1 = (uint32_t) (((uint64_t) 0xBB67AE85u * c2) >> 32);
-        const uint32_t lo0 = 0x9E3779B9u * c0;
-        const uint32_t lo1 = 0xBB67AE85u * c2;
-        const uint32_t n0 = hi1 ^ c1 ^ k0;
-        const uint32_t n1 = lo1;
-        const uint32_t n2 = hi0 ^ c3 ^ k1;
-        const uint32_t n3 = lo0;
-        c0 = n0; c1 = n1; c2 = n2; c3 = n3;
-    }
-};
-
-float host_philox_uniform(uint64_t seed, uint64_t counter) {
-    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32);
-    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
-    PhiloxRound r{c0, c1, c2, c3};
-    for (int i = 0; i < 10; ++i) r.step((uint32_t) i, 0u);
-    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
-}
-
-// The Gumbel-max noise, host side - a transcription of the kernel's `gumbel_exp` (STRATA_SPEC_GUMBEL): Exp(1) from
-// a splitmix64 hash of (seed, counter, token id).  The pick is argmax_i p_i / E_i, an exact sample of p.
-double host_gumbel_exp(uint64_t seed, uint64_t counter, uint32_t token) {
-    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ ((uint64_t) token * 0xD1B54A32D192ED03ull);
-    z += 0x9E3779B97F4A7C15ull;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    z ^= z >> 31;
-    const double u = ((double) (z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
-    return -std::log(u);
-}
-
-// The full SAMPLED chain, host side - the kernel's `sampler_kernel` in serial form, in llama.cpp's order:
-// penalties on the raw logits during the top_k selection (ties to the lowest index), top_p's cut in double over
-// the top_k list, the min_p prefix cut on its survivors, the temperature, and one Philox draw at
-// (seed, counter + row).  One penalties stage (issue #53: this reference used to repeat the kernel's second one).
+// The full SAMPLED chain, host side: sampler_host.hpp's, which a forward on the CPU picks with - so this test holds
+// the GPU kernel and the CPU's picks to the same tokens.  `hist` is the row's whole penalty window, `row` its draw's
+// offset from p.counter; the bias and the mask are the GPU's arrays in `p`, not read here.
 int sampled_reference(const std::vector<float>& l, const std::vector<int>& hist,
                       const strata::kernels::SamplerParams& p, int row) {
-    auto penal = [&](float logit, int count) {
-        if (count <= 0) return logit;
-        if (logit <= 0.0f) logit *= p.penalty_repeat; else logit /= p.penalty_repeat;
-        logit -= (float) count * p.penalty_freq + (count > 0 ? 1.0f : 0.0f) * p.penalty_present;
-        return logit;
-    };
-    auto count = [&](int v) { int c = 0; for (int h : hist) if (h == v) ++c; return c; };
-    const int nv = (int) l.size();
-    const int KMAX = 64;                       // 1..64 as given; 0 (off) and wider keep the widest list, 64
-    const int k = std::min(nv, (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX);
-    std::vector<int> sel_ids;
-    std::vector<float> sel_logit;
-    std::vector<char> taken((size_t) nv, 0);
-    for (int i = 0; i < k; ++i) {
-        int best = -1; float bv = 0;
-        for (int v = 0; v < nv; ++v) {
-            if (taken[(size_t) v]) continue;
-            const float s = penal(l[(size_t) v], count(v));
-            if (best < 0 || s > bv) { best = v; bv = s; }
-        }
-        taken[(size_t) best] = 1;
-        sel_ids.push_back(best); sel_logit.push_back(bv);
-    }
-    // llama.cpp's order (issue #53): top_p over the whole top_k list, then min_p on its survivors
-    const int n_sel = (int) sel_ids.size();
-    int n_keep = n_sel;
-    if (p.top_p < 1.0f) {
-        double sum = 0.0;
-        for (int i = 0; i < n_sel; ++i) sum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]);
-        double cum = 0.0;
-        int cut = n_sel;
-        for (int i = 0; i < n_sel; ++i) {
-            cum += std::exp((double) sel_logit[(size_t) i] - (double) sel_logit[0]) / sum;
-            if (cum >= (double) p.top_p) { cut = i + 1; break; }
-        }
-        if (cut < p.min_keep) cut = p.min_keep < n_sel ? p.min_keep : n_sel;
-        n_keep = cut;
-    }
-    if (p.min_p > 0.0f) {
-        const float thresh = sel_logit[0] + std::log(p.min_p);
-        for (int i = 0; i < n_keep; ++i)
-            if (sel_logit[(size_t) i] < thresh) { n_keep = i; break; }
-    }
-    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
-    auto scaled = [&](int i) { return sel_logit[(size_t) i] * inv_t; };   // one penalties stage, before (#53)
-    float smx = scaled(0);
-    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, scaled(i));
-    double sum = 0.0;
-    for (int i = 0; i < n_keep; ++i) sum += std::exp((double) scaled(i) - (double) smx);
-    int pick = sel_ids[(size_t) (n_keep - 1)];
-    if (p.gumbel) {
-        double best = -1.0;
-        for (int i = 0; i < n_keep; ++i) {
-            const double r = std::exp((double) scaled(i) - (double) smx) / sum /
-                             host_gumbel_exp(p.seed, p.counter + (uint64_t) row, (uint32_t) sel_ids[(size_t) i]);
-            if (r > best) { best = r; pick = sel_ids[(size_t) i]; }
-        }
-        return pick;
-    }
-    const float u = host_philox_uniform(p.seed, p.counter + (uint64_t) row);
-    double cum = 0.0;
-    for (int i = 0; i < n_keep; ++i) {
-        cum += std::exp((double) scaled(i) - (double) smx) / sum;
-        if ((double) u < cum) { pick = sel_ids[(size_t) i]; break; }
-    }
-    return pick;
+    strata::kernels::SamplerParams h = p;
+    h.counter = p.counter + (uint64_t) row;
+    h.penalty_last_n = (int) hist.size();
+    h.logit_bias = nullptr;
+    h.allowed = nullptr;
+    h.greedy = false;
+    int out = 0;
+    strata::kernels::sample_tokens_host(l.data(), 1, (int) l.size(), hist.empty() ? nullptr : hist.data(),
+                                        (int) hist.size(), h, &out);
+    return out;
 }
 
 // Survivors after the min_p + top_p cuts, in the sampled chain - the quantity an order or a threshold

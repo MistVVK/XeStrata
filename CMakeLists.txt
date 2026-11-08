@@ -404,6 +404,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/cvec.cpp src/kernels/xe/verify_kernels.cpp
                                     src/kernels/xe/s_gemv.cpp src/kernels/xe/s2_gemv.cpp
                                     src/kernels/xe/shared_expert.cpp src/kernels/xe/sampler.cpp
+                                    src/kernels/sampler_host.cpp
                                     src/kernels/xe/native_gdn.cpp src/kernels/xe/native_moe.cpp
                                     src/kernels/xe/fused_gdn.cpp src/kernels/xe/native_gdn_preprocess.cpp
                                     src/kernels/xe/native_ple_postops.cpp src/kernels/xe/native_qsa.cpp
@@ -538,8 +539,10 @@ if(STRATA_ENABLE_XE)
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
-                                   src/core/grammar.cpp src/core/script_guard.cpp)
+                                   src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp)
   target_include_directories(strata_engine PUBLIC include)
+  # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
+  set_source_files_properties(src/core/plain_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
   # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release
   # and dlpack (Apache-2.0), the one header it reads, both checked by SHA-256.  Built here from xgrammar's C++ sources
@@ -1433,7 +1436,8 @@ endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp
-            src/kernels/cpu/kq_avx2.cpp)
+            src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/bf16_gemm.cpp src/kernels/cpu/bf16_gemm_avx2.cpp
+            src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/cpu_ops.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1442,6 +1446,12 @@ set(STRATA_AVX512_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni
 set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "${STRATA_AVX512_FLAGS}")
 set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+# The CPU forwards' matrix products (EmbeddingGemma 2, the plain dense model on the CPU): the BF16 x FP32 one
+# (bf16_gemm.hpp) and the int8 x int8 one (i8_gemm.hpp).  Each keeps its packing, scalar reference and dispatch on the
+# baseline x86-64 and its vector copies in a file of their own with the AVX2 flags.  -mavxvnni is NOT put on a file:
+# the VNNI intrinsics are used only inside functions marked target("avxvnni"), the rule below.
+set_source_files_properties(src/kernels/cpu/bf16_gemm_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 # AVX-VNNI (Alder Lake, Sapphire Rapids and later; upstream b211ba17): the AVX-2 expert kernels' vpdpwssd / vpdpbusd
 # copies (q2_avx2.cpp, iq_avx2.cpp; *_rows.inl), taken at run time where cpu_avxvnni_ok().  Only those functions are
 # compiled with target("avxvnni") - never -mavxvnni on a file, which would let the compiler use it anywhere.  A compiler
@@ -1466,6 +1476,10 @@ else()
 endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp APPEND PROPERTY COMPILE_DEFINITIONS
              ${_strata_avxvnni})
+# the int8 product needs the same answer twice: the kernel file to know whether to define the VNNI copy, the
+# dispatch file to know whether the VNNI copy exists to be reached.
+set_property(SOURCE src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp APPEND PROPERTY
+             COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
@@ -1606,6 +1620,40 @@ if(STRATA_BUILD_TESTS)
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
   target_link_libraries(expert_parity PRIVATE strata_kernels_cpu)
+  # The CPU forwards' BF16 x FP32 matrix product (bf16_gemm.hpp): the AVX2 kernel against the scalar reference bit for
+  # bit, on the model's own shapes and on odd ones; the same answer by panel band, by thread count and for a token
+  # inside a group as alone.  `--bench` is the micro-benchmark and `--numpy DIR` adds the check against a foreign
+  # float64 sum (EmbeddingGemma 2's record `s2/numpy`; without the files the case exits 77).  The second run caps the
+  # engine's own choice to scalar (XESTRATA_BF16_GEMM_ISA=scalar), which is the path a CPU without AVX2 takes.
+  add_executable(bf16_gemm_parity tests/kernels/bf16_gemm_parity.cpp)
+  target_link_libraries(bf16_gemm_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME bf16_gemm_parity COMMAND bf16_gemm_parity)
+  add_test(NAME bf16_gemm_parity_scalar
+           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_BF16_GEMM_ISA=scalar $<TARGET_FILE:bf16_gemm_parity>)
+  add_test(NAME bf16_gemm_parity_numpy
+           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_EG2_S2=$ENV{XESTRATA_EG2_S2} $<TARGET_FILE:bf16_gemm_parity>
+                   --numpy)
+  set_tests_properties(bf16_gemm_parity bf16_gemm_parity_scalar PROPERTIES TIMEOUT 300)
+  set_tests_properties(bf16_gemm_parity_numpy PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+  # The CPU forwards' int8 x int8 product (i8_gemm.hpp): each vector kernel against the scalar reference bit for bit,
+  # the activation quantizers bit for bit, the same answer by panel band, by token group and by thread count, the zero
+  # row's answer, how far int8 lands from the exact sum, and their speed, with a scale per row and per 32 k values.
+  # The runs below cap the engine's own choice (XESTRATA_I8_GEMM_ISA) so a CPU with AVX-VNNI checks the AVX2 copy's
+  # quantizer path and the scalar reference's as well.
+  # `--numpy DIR` adds the check against a foreign float64 sum of the same quantization (EmbeddingGemma 2's record
+  # `s2b/numpy`).
+  add_executable(cpu_i8_gemm_parity tests/kernels/i8_gemm_parity.cpp)
+  target_link_libraries(cpu_i8_gemm_parity PRIVATE strata_kernels_cpu)
+  add_test(NAME cpu_i8_gemm_parity COMMAND cpu_i8_gemm_parity)
+  add_test(NAME cpu_i8_gemm_parity_avx2
+           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_I8_GEMM_ISA=avx2 $<TARGET_FILE:cpu_i8_gemm_parity>)
+  add_test(NAME cpu_i8_gemm_parity_scalar
+           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_I8_GEMM_ISA=scalar $<TARGET_FILE:cpu_i8_gemm_parity>)
+  add_test(NAME cpu_i8_gemm_parity_numpy
+           COMMAND ${CMAKE_COMMAND} -E env XESTRATA_EG2_S2B=$ENV{XESTRATA_EG2_S2B} $<TARGET_FILE:cpu_i8_gemm_parity>
+                   --numpy)
+  set_tests_properties(cpu_i8_gemm_parity cpu_i8_gemm_parity_avx2 cpu_i8_gemm_parity_scalar PROPERTIES TIMEOUT 600)
+  set_tests_properties(cpu_i8_gemm_parity_numpy PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
   # The pack is a REQUIRED input, not an optional one: this test compares against a real expert blob, and a
   # missing file would otherwise be reported as a pass by a test that skipped everything.
   add_test(NAME expert_parity COMMAND expert_parity --selftest

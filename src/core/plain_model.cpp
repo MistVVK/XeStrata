@@ -20,6 +20,8 @@
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/plain_model.hpp"
 
+#include "strata/core/plain_cpu.hpp"
+
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_tier.hpp"
@@ -51,6 +53,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/sampler_host.hpp"
 #include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -91,6 +94,10 @@ bool mapped(size_t bytes, void** h, void** d) {
 PlainModel::PlainModel() = default;
 
 PlainModel::~PlainModel() {
+    if (cpu_ != nullptr) {   // --device cpu: no GPU was opened, nothing of its to give back
+        if (route_dump_ != nullptr) std::fclose(route_dump_);
+        return;
+    }
     next_.clear();   // the later stages read the root's experts and pool
     const OnDevice on(dev_);
     if (route_dump_ != nullptr && root_ == this) std::fclose(route_dump_);
@@ -347,6 +354,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
+    if (opt_.cpu) return cpu_load(err);
     // the processor's own graphics through Level Zero: the first Level Zero adapter only (plain_generate.cpp's
     // linkless_gpu_adapter chooses it before the devices are listed; a user's SYCL_UR_USE_LEVEL_ZERO_V2=1 is refused)
     if (const sycl::device& dev = Runtime::get().device();
@@ -2183,7 +2191,62 @@ void PlainModel::set_sampler(const strata::kernels::SamplerParams& sp) {
     for (auto& st : next_) st->sampler_ = sp;
 }
 
+// --device cpu: the model file and its spec as for a GPU, then the CPU's forward (plain_cpu.hpp) in place of the
+// stages.  The CPU must run AVX2 (plain_cpu.cpp is compiled for it), checked here before any of its code runs.
+bool PlainModel::cpu_load(std::string& err) {
+    if (!k::cpu::cpu_avx2_ok()) {
+        err = "plain model: --device cpu needs a CPU with AVX2";
+        return false;
+    }
+    try {
+        model_ = std::make_unique<GgufModel>(GgufModel::open(opt_.gguf));
+    } catch (const std::exception& e) {
+        err = std::string("plain model: ") + e.what();
+        return false;
+    }
+    if (!read_model_spec(model_->meta(), spec_, err)) return false;
+    if (opt_.vision || opt_.encoder || opt_.batch_slots > 0 || !opt_.split_at.empty() || opt_.split_auto) {
+        err = "plain model: --device cpu runs one conversation of text: no pictures, batches or layer split";
+        return false;
+    }
+    opt_.spec = 0;   // no MTP layer read: no drafts
+    cpu_ = std::make_unique<PlainCpu>();
+    if (!cpu_->load(*model_, spec_, opt_, err)) {
+        cpu_.reset();
+        return false;
+    }
+    n_vocab_ = cpu_->vocab();
+    std::fprintf(stderr, "xestrata plain: the forward on the CPU: %s\n", cpu_->describe().c_str());
+    return true;
+}
+
+// The CPU's run and its picks: the last `rows` tokens' logits, each row's draw from its position as pick() takes it
+bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows, int32_t* out, float* logits,
+                         std::string& err) {
+    cpu_logits_.resize((size_t) rows * (size_t) n_vocab_);
+    if (!cpu_->run(tokens, n, pos, rows, cpu_logits_.data(), err)) return false;
+    k::SamplerParams sp = sampler_;
+    sp.counter = (uint64_t) (pos + n - rows);
+    sp.logit_bias = cpu_bias_.empty() ? nullptr : cpu_bias_.data();
+    sp.allowed = cpu_allowed_.empty() ? nullptr : cpu_allowed_.data();
+    const bool hist = cpu_hist_len_ > 0 && sp.penalty_last_n > 0;
+    std::vector<int> picks((size_t) rows);
+    k::sample_tokens_host(cpu_logits_.data(), rows, (int) n_vocab_, hist ? cpu_hist_.data() : nullptr,
+                          hist ? cpu_hist_len_ : 0, sp, picks.data());
+    for (int i = 0; i < rows; ++i) out[i] = picks[(size_t) i];
+    if (logits != nullptr) std::memcpy(logits, cpu_logits_.data(), cpu_logits_.size() * 4);
+    return true;
+}
+
 bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err) {
+    if (cpu_ != nullptr) {
+        if (!bias.empty() && bias.size() != (size_t) n_vocab_) {
+            err = "plain model: a logit bias of another vocabulary";
+            return false;
+        }
+        cpu_bias_ = bias;
+        return true;
+    }
     PlainModel& t = tail();
     const OnDevice on(t.dev_);
     t.bias_on_ = !bias.empty();
@@ -2201,6 +2264,13 @@ bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err
 }
 
 bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
+    if (cpu_ != nullptr) {   // the same row for each of a window's rows
+        const size_t words = (size_t) (n_vocab_ + 31) / 32;
+        cpu_allowed_.clear();
+        if (row != nullptr)
+            for (int r = 0; r < opt_.max_t; ++r) cpu_allowed_.insert(cpu_allowed_.end(), row, row + words);
+        return true;
+    }
     PlainModel& t = tail();
     const OnDevice on(t.dev_);
     t.allowed_on_ = row != nullptr;
@@ -2225,6 +2295,13 @@ bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
 }
 
 bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err) {
+    if (cpu_ != nullptr) {
+        if (rows != nullptr && (T < 1 || T > opt_.max_t)) { err = "plain model: mask rows out of range"; return false; }
+        const size_t words = (size_t) (n_vocab_ + 31) / 32;
+        cpu_allowed_.assign(rows, rows == nullptr ? rows : rows + words * (size_t) T);
+        if (rows != nullptr) cpu_allowed_.resize(words * (size_t) opt_.max_t, ~0u);
+        return true;
+    }
     PlainModel& t = tail();
     const OnDevice on(t.dev_);
     t.allowed_on_ = rows != nullptr;
@@ -2248,6 +2325,12 @@ bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err)
 }
 
 bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
+    if (cpu_ != nullptr) {   // the same history for each of a window's rows
+        cpu_hist_len_ = std::max(0, n);
+        cpu_hist_.clear();
+        for (int r = 0; r < opt_.max_t && cpu_hist_len_ > 0; ++r) cpu_hist_.insert(cpu_hist_.end(), tokens, tokens + n);
+        return true;
+    }
     PlainModel& t = tail();
     const OnDevice on(t.dev_);
     t.hist_len_ = std::max(0, n);
@@ -2333,23 +2416,40 @@ size_t PlainModel::Snapshot::bytes() const {
 }
 
 size_t PlainModel::state_bytes(int64_t tokens) const {
+    if (cpu_ != nullptr) return cpu_->state_bytes(tokens, true);
     size_t n = 0;
     for (const StatePart& p : state_parts(tokens)) n += p.bytes;
     for (const auto& st : next_) n += st->state_bytes(tokens);
     return n;
 }
 
+// --device cpu: the CPU's parts, every one FP32
+static void cpu_snapshot(const PlainCpu& c, int64_t tokens, bool kv, PlainModel::Snapshot& snap) {
+    snap = PlainModel::Snapshot{};
+    snap.tokens = tokens;
+    c.save(tokens, kv, snap.parts);
+    snap.typesize.assign(snap.parts.size(), 4);
+}
+
 bool PlainModel::save_state(int64_t tokens, Snapshot& snap, std::string& err) {
+    if (cpu_ != nullptr) { cpu_snapshot(*cpu_, tokens, true, snap); return true; }
     return save_parts(tokens, false, snap, err);
 }
 
-bool PlainModel::restore_state(const Snapshot& snap, std::string& err) { return restore_parts(snap, false, err); }
+bool PlainModel::restore_state(const Snapshot& snap, std::string& err) {
+    if (cpu_ != nullptr) return cpu_->restore(snap.parts, true, err);
+    return restore_parts(snap, false, err);
+}
 
 bool PlainModel::save_recurrent(int64_t tokens, Snapshot& snap, std::string& err) {
+    if (cpu_ != nullptr) { cpu_snapshot(*cpu_, tokens, false, snap); return true; }
     return save_parts(tokens, true, snap, err);
 }
 
-bool PlainModel::restore_recurrent(const Snapshot& snap, std::string& err) { return restore_parts(snap, true, err); }
+bool PlainModel::restore_recurrent(const Snapshot& snap, std::string& err) {
+    if (cpu_ != nullptr) return cpu_->restore(snap.parts, false, err);
+    return restore_parts(snap, true, err);
+}
 
 int PlainModel::batch_slot_count() const {
     int n = (int) bslots_.size();
@@ -2508,6 +2608,10 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
 }
 
 bool PlainModel::reset(std::string& err) {
+    if (cpu_ != nullptr) {
+        cpu_->reset();
+        return true;
+    }
     for (auto& st : next_) {
         const OnDevice on(st->dev_);
         if (!st->reset(err)) return false;
@@ -2981,6 +3085,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
         err = "plain model: the window is out of range";
         return false;
     }
+    if (cpu_ != nullptr) return cpu_run(tokens, T, pos, T, out, logits, err);
     const float* hand = nullptr;   // each stage's rows to the next
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
@@ -3001,6 +3106,13 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
 
 bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits,
                              std::string& err, const std::function<void(int64_t)>& progress) {
+    if (cpu_ != nullptr) {   // one run; out and logits the last window's rows, as the windows would leave them
+        if (n < 1) { err = "plain model: no tokens to run"; return false; }
+        const int last = (int) ((n - 1) % opt_.max_t) + 1;
+        if (!cpu_run(tokens, n, pos, last, out, logits, err)) return false;
+        if (progress) progress(n);
+        return true;
+    }
     const std::vector<PlainModel*> st = chain();
     const size_t S = st.size();
     struct Win { int64_t at; int T; std::vector<float> hand; };

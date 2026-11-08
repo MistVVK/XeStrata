@@ -321,6 +321,18 @@ void Gemm::prepare() {
 #endif
 }
 
+void Gemm::finish() {
+#if STRATA_ONEMATH
+    std::vector<std::shared_future<Trial>> running;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        for (const auto& [dev, b] : g_backends)
+            if (b.ready.valid()) running.push_back(b.ready);
+    }
+    for (const auto& f : running) f.wait();
+#endif
+}
+
 void Gemm::settle() {
 #if STRATA_ONEMATH
     (void) backend(core::Runtime::get().compute().get_device());
