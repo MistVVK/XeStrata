@@ -13,6 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Views.fs" />
+    <Compile Include="Fields.fs" />
     <Compile Include="MainWindow.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

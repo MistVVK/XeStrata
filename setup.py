@@ -5071,10 +5071,10 @@ def ask_sam3_license(a, aux: Path) -> None:
     if choice == "no":
         return
     if choice != "agree":
-        say("  find_region and edit_region find a part of a picture by words with SAM 3.1, whose weights are under "
-            f"{QI.SAM3_LICENSE}; until you agree to it, Florence-2 (MIT) finds the parts (you can agree later on the "
-            "web page's Images view)")
-        if ask("  Agree to the SAM License (read it at the address above)?", ["y", "n"], "n", a.yes) != "y":
+        OPTION["image-sam3-license"]["vars"] = {"license": QI.SAM3_LICENSE}
+        if not a.yes:
+            say("  (you can also agree later, on the web page's Images view)")
+        if ask_option("image-sam3-license", a.yes) != "agree":
             return
     aux.mkdir(parents=True, exist_ok=True)
     mark.write_text(f"{time.strftime('%Y-%m-%d %H:%M')} setup\n{QI.SAM3_LICENSE}\n", encoding="utf-8")
@@ -5781,33 +5781,15 @@ def script_guard_setup(a) -> None:
     """The script guard (serve/script_guard.py) for every model, by --script-guard or the question: the answers kept
     free of other languages' characters (ja, en) or not (off), written to the settings (script_guard); a model's
     config, the web page and a request's own "script_guard" go over it.  Asked as web search is: interactively, the
-    first time or with --setup.  The answer offered is the system's language's: its own mode for Japanese, Korean and
-    Chinese (zh-tw for Taiwan's and Hong Kong's), off for Vietnamese, en for any other."""
+    first time or with --setup.  The answer offered is option_default's: the mode set, else the system's language's
+    (its own mode for Japanese, Korean and Chinese, zh-tw for Taiwan's and Hong Kong's; off for Vietnamese; en for
+    any other)."""
     settings = load_settings()
     want = a.script_guard
     busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
     if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
             ("script_guard" not in settings or a.setup):
-        import locale                                   # the environment's on Linux, the system's on Windows
-        lang = (next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
-                or locale.getlocale()[0] or "").lower()
-        modes = ["ja", "en", "ko", "zh-cn", "zh-tw", "off"]
-        offered = settings.get("script_guard") if settings.get("script_guard") in modes else \
-            "ja" if lang.startswith(("ja", "japanese")) else "ko" if lang.startswith(("ko", "korean")) else \
-            "zh-tw" if lang.startswith(("zh_tw", "zh_hk", "zh-tw", "zh-hk", "chinese (traditional)")) else \
-            "zh-cn" if lang.startswith(("zh", "chinese")) else "off" if lang.startswith(("vi", "vietnamese")) else "en"
-        say()
-        say("  Other languages in the answers: the model sometimes mixes another language's characters into its")
-        say("  answer. XeStrata can keep them out (the thinking is left as it is):")
-        say("    ja: Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers")
-        say("    en: every CJK character (kanji, kana, Hangul) and Vietnamese letters out of answers in English and")
-        say("        the other languages that write none of them")
-        say("    ko: kana, the Han characters Korean does not use and Vietnamese letters out of Korean answers")
-        say("    zh-cn, zh-tw: kana, Hangul, Japanese-only forms, Vietnamese letters and the other script")
-        say("        (Traditional in zh-cn, Simplified in zh-tw) out of Chinese answers")
-        say("    off: as the model writes (to have it write another of these languages)")
-        say("  The web page's chat settings and a request's own \"script_guard\" go over this.")
-        want = ask("Keep other languages' characters out?", modes, offered, False)
+        want = ask_option("script-guard", False)
     if want is None:
         return
     save_settings({**load_settings(), "script_guard": want})
@@ -5829,20 +5811,13 @@ def web_search_setup(a) -> None:
     Asked only interactively, and only the first time or with --setup; unasked, nothing changes.  A search_url the
     user wrote by hand (their own SearXNG) is left as it is."""
     settings = load_settings()
-    now = settings["search_engine"] if settings.get("search_engine") in WEB_SEARCH_APIS else "no"
     want = a.web_search
     busy = a.update or a.bench or a.bench_verbose or a.bench_original_compat is not None or a.calibrate
     if want is None and not busy and not a.yes and not JSON_OUT and sys.stdin.isatty() and \
             ("web_search" not in settings or a.setup):
         say()
-        say("  Web search: the model can search the web when a request asks for it (the API's web search tools and")
-        say("  the web page's Search switch), with one of two search APIs:")
-        say("    deepseek: DeepSeek's search API, with your DeepSeek API key. Billed by DeepSeek per search that finds")
-        say("         something (USD 0.75 per 1,000); the search words go to DeepSeek.")
-        say("    tinyfish: TinyFish's search API, with your TinyFish API key. Free up to a daily allowance (12,000")
-        say("         searches, 1,000 pages read); the search words and the pages found go to TinyFish.")
         say(f"  A SearXNG-compatible server of your own: write its address as search_url in {settings_path()}.")
-        want = ask("Use web search?", ["deepseek", "tinyfish", "no"], now, False)
+        want = ask_option("web-search", False)
     if want is None:
         return
     if want == "no":
@@ -7436,11 +7411,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     elif a.vision:
         vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
-        say()
-        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
-            " picture).")
-        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
+        asked = ask_option("vision", a.yes)
+        vision = "none" if asked == "no" else images_encoder(asked, gpu)
     if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
@@ -7704,6 +7676,397 @@ def vram_ctx(cards: list) -> int:
     return 32768 if small < 14 else 65536 if small < 20 else 131072
 
 
+# ------------------------------------------------------------------------------------------------ the options
+# The options a front end shows as fields, in one table: --describe's "options" (the launcher's window draws its
+# fields from them), the command line's options (option_args) and setup's own questions (ask_option) are made from it,
+# so a label lives here only.  An option:
+#   name     the command line's --NAME (and its key in describe); the image options are also tools/image/install.py's,
+#            without "image-"
+#   label    a field's label, in English (the window shows its translation where its catalogs have setup.NAME.label)
+#   help     the command line's help
+#   kind     choice (one of `choices`, [value, label] each), int, number (min, max: the values taken), text (pattern: a
+#            regular expression the whole value matches), path (folder or file: `pick`), flag (a check box: --NAME
+#            alone, or with `values`, [checked, unchecked], --NAME with either), password (not on the command line:
+#            given in the environment variable `env`), gpus (the GPUs as check boxes, two or more: their indexes)
+#   place    install (the install page), advanced (its Advanced), start (how a model runs: at an install and at a
+#            start), images (how the image models run: at an install with images, and an installed model's images)
+#   when     what has to hold for the field to be shown (all of them): vision (the model reads pictures), kv (setup
+#            takes a KV cache precision there), long_context (a context past 262,144), speed_projection, budget (a RAM
+#            budget of the experts), images (image models chosen), multi_gpu (two GPUs or more), download (not the
+#            user's own files), sam3 (SAM 3.1's license not agreed to yet), NAME=VALUE and NAME!=VALUE (another
+#            option's value; "" is blank)
+#   default  the value shown first: a choice's or a check box's (True: checked); a value of "" passes nothing.  keep:
+#            the option is passed only when it was changed (it is saved, and the default shown is what is saved)
+#   hint     the text a blank field shows; takes: what the value must be, after "--NAME takes"; about: a note under
+#            the field; vars: what {NAME} in the texts stands for; question: setup's question for it, in a terminal;
+#            gpu_choices: the choices also list the GPUs, by "index" or by "pci"; path_choice: the choice that shows
+#            a path field whose value is passed instead; needed: why a password field cannot be left blank, unless its
+#            key is saved already ("set" in describe)
+#   cli      more of argparse's add_argument (metavar, choices, default)
+def _option(name: str, label: str, help: str, kind: str = "choice", place: str = "install", **more) -> dict:
+    return {"name": name, "label": label, "help": help, "kind": kind, "place": place, **more}
+
+
+OPTIONS = [
+    # ---- the install page: setup's questions of step 2
+    _option("data-dir", "Data folder: where the model files go (tens of GB)",
+            "where the model files go (~70-120 GB): default XeStrata-data next to this folder, remembered for every "
+            "XeStrata folder on this PC", kind="path", pick="folder"),
+    _option("gguf-dir", "Model files you already have",
+            "use GGUF files you already have (a folder with every shard: <name>-00001-of-0000N.gguf ... "
+            "-0000N-of-0000N.gguf)", kind="path", pick="folder", when=["download"],
+            hint="(optional) a folder with the model files already downloaded"),
+    _option("vision", "Read pictures too (screenshots, photos, scanned pages; a 0.9 GB download)",
+            "let the model read images (on by default where the model can; yes = the reader for this card: the CPU "
+            "under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU encoder taking over when "
+            "it cannot start; cpu = on the CPU only; no = text only)",
+            choices=[["yes", "On: the reader for this GPU (on the GPU from 24 GB of VRAM, else on the CPU)"],
+                     ["gpu", "On, the reader on the GPU (the CPU when it cannot start there)"],
+                     ["cpu", "On, the reader on the CPU"],
+                     ["no", "Off: text only"]],
+            default="yes", when=["vision"], question="Do you want images?",
+            cli={"choices": ["yes", "no", "none", "gpu", "cpu"]}),
+    _option("kv", "KV cache precision (the model's memory of the conversation)",
+            "KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less precise), "
+            "k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 (16-bit, twice the "
+            "memory of int8)",
+            choices=[["int8", "8-bit (recommended)"],
+                     ["q4_0", "4-bit: half the memory, a little less precise on long documents"],
+                     ["k8v4", "8-bit keys and 4-bit values: about three quarters of the memory"],
+                     ["fp16", "16-bit: twice the memory of 8-bit"]],
+            default="int8", when=["kv"], question="KV cache?"),
+    _option("rope-scaling", "RoPE extension: a context past the model's trained 262,144 positions rescales its rotary "
+            "angles",
+            "the RoPE extension for a context past the model's trained 262144: linear (position interpolation) or "
+            "yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; none is refused there",
+            choices=[["yarn", "yarn (keeps the trained angles on the high-frequency pairs)"],
+                     ["linear", "linear (shrinks every angle)"]],
+            default="yarn", when=["long_context"], question="RoPE extension method?",
+            cli={"choices": ["none", "linear", "yarn"]}),
+    _option("experimental-speed-projection", "EXPERIMENTAL - speed projection (off unless you choose it)",
+            "EXPERIMENTAL, off by default: the control vector in third_party/nonfree/experimental-speed-projection "
+            "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md",
+            choices=[["off", "Off"], ["on", "On"], ["file", "On, with another control vector (a GGUF file)"]],
+            default="off", when=["speed_projection"], path_choice="file", pick="file",
+            hint="another control vector, a GGUF file",
+            about="A small control vector applied while the model runs (layers 4-44). It changes how the model "
+                  "answers: its package describes it as a refusal-direction projection (the model declines far fewer "
+                  "requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or "
+                  "huihui-ai's abliterated version as the model instead (the refusals removed in its weights).",
+            question="Turn on the experimental speed projection?", cli={"metavar": "on|off|GGUF"}),
+    _option("web-search", "Web search, for every model: the model searches when a request asks for it (the web "
+            "page's Search switch, the API's web search tools)",
+            "web search for every model (serve's web search tools, the web page's Search switch): deepseek uses "
+            "DeepSeek's search API with your API key (asked without echo; billed by DeepSeek per search); tinyfish "
+            "TinyFish's search API with your API key (asked without echo; free up to a daily allowance); no takes "
+            "either out. A SearXNG-compatible server of your own is its address as search_url in settings.json. "
+            "Without it setup asks the first time, and with --setup",
+            choices=[["no", "Off"],
+                     ["deepseek", "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per "
+                      "1,000); the search words go to DeepSeek"],
+                     ["tinyfish", "TinyFish's search API: your API key, free up to a daily allowance (12,000 "
+                      "searches, 1,000 pages read); the search words and the pages found go to TinyFish"]],
+            default="no", question="Use web search?"),
+    _option("deepseek-api-key", "DeepSeek API key (kept in your settings, never shown)",
+            "the DeepSeek API key of web search", kind="password", env="XESTRATA_DEEPSEEK_API_KEY",
+            when=["web-search=deepseek"], hint="your DeepSeek API key",
+            needed="Web search with DeepSeek needs your DeepSeek API key."),
+    _option("tinyfish-api-key", "TinyFish API key (kept in your settings, never shown)",
+            "the TinyFish API key of web search", kind="password", env="XESTRATA_TINYFISH_API_KEY",
+            when=["web-search=tinyfish"], hint="your TinyFish API key",
+            needed="Web search with TinyFish needs your TinyFish API key."),
+    # ---- the install page's Advanced: what setup takes without asking
+    _option("vision-tokens", "The most image tokens a picture becomes (more reads small text better, and takes "
+            "longer)",
+            "the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on the CPU): more "
+            "reads small text and charts better, and takes longer to encode; remembered for this model",
+            kind="int", place="advanced", min=1, when=["vision", "vision!=no"], hint="1024 on the GPU, 300 on the CPU",
+            takes="a number of image tokens, 1 or more", cli={"metavar": "N"}),
+    _option("rope-scale", "RoPE extension factor (1 or more)",
+            "the extension factor, finite and >= 1 (default: the final context over the trained 262144, at least 1: "
+            "1.5 for 384K, 2 for 512K, 1 inside the trained range)",
+            kind="number", place="advanced", min=1, max=1e6, when=["long_context"], hint="the context over 262,144",
+            takes="a number, 1 or more"),
+    _option("low-ram", "Low-RAM mode: the experts read from the model files instead of all copied into RAM",
+            "read the model's experts from its files instead of copying them all into RAM (for a PC with a big GPU "
+            "and little RAM); auto: when the experts would not fit the RAM. In this mode the experts the GPU does not "
+            "hold are copied into RAM once when they fit (resident), else read through the OS file cache (mmap); "
+            "resident / mmap force one of the two",
+            place="advanced",
+            choices=[["auto", "Auto: when the experts do not fit the RAM"], ["on", "On"], ["off", "Off"],
+                     ["resident", "On, the experts the GPU does not hold copied into RAM"],
+                     ["mmap", "On, the experts the GPU does not hold read through the OS file cache"]],
+            default="auto", cli={"default": "auto"}),
+    _option("resident-budget-gib", "GiB of the experts kept in RAM (the rest read from the SSD)",
+            "UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, ~38 on 64 GB; "
+            "more is kept as you choose, with a note); the other models' files: the GiB of the experts the GPU does "
+            "not hold kept in RAM, the rest read from the file",
+            kind="number", place="advanced", min=1, max=1e6, when=["budget"], hint="setup's choice for this RAM",
+            takes="a number of GiB", cli={"metavar": "N"}),
+    _option("ram-reserve-gib", "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and "
+            "the image models' sizes are chosen with that much less; slower when the experts are then read from the "
+            "SSD)",
+            "RAM in GiB XeStrata leaves free for other programs: setup chooses the model's mode, the RAM its experts "
+            "keep and the image models' sizes with that much less, and the engines keep it free beside their RAM "
+            "copies (slower when the experts no longer fit and are read from the SSD; default: none, as before); set "
+            "up again to change it",
+            kind="number", place="advanced", min=0, max=1e6, hint="(none) GiB of RAM to leave free for other programs",
+            takes="a number of GiB, 0 or more", cli={"metavar": "N"}),
+    _option("parallel", "Requests decoded together (each takes VRAM from the expert cache)",
+            "up to N requests decode together (batch slots, opt-in; default: one at a time, the others wait). Each "
+            "slot takes VRAM from the expert cache; setup says what it recommends",
+            kind="int", place="advanced", min=1, hint="1: one request at a time",
+            takes="a number of requests, 1 or more", cli={"metavar": "N"}),
+    _option("replicas", "With a layer split: independent engines, each on an equal group of the GPUs",
+            "several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen cards (2 "
+            "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total throughput for "
+            "a model that fits fewer cards; each replica holds its own copy of the model in RAM and VRAM)",
+            kind="int", place="advanced", min=1, hint="1", takes="a number of engines, 1 or more",
+            cli={"metavar": "N"}),
+    _option("source", "Where the model files come from",
+            "where the model files come from: auto (default: Hugging Face), huggingface or modelscope (mainland "
+            "China: the same files, checked against ModelScope's published SHA-256; XESTRATA_SOURCE)",
+            place="advanced",
+            choices=[["", "Hugging Face (default)"], ["modelscope", "ModelScope (mainland China: the same files)"]],
+            default="", when=["download"], cli={"choices": SOURCES, "default": None}),
+    _option("models-dir", "Where the model files go", "where the GGUF files go (default: <data folder>/models)",
+            kind="path", place="advanced", pick="folder", when=["download"], hint="<data folder>{sep}models",
+            vars={"sep": os.sep}),
+    _option("move-data", "Move the model files already on this PC into the data folder",
+            "with --data-dir: move the model files already on this PC into the new folder (without it nothing is "
+            "moved: the old files stay usable and the new folder gets the new downloads)",
+            kind="flag", place="advanced", default=False),
+    _option("set-default-data-dir", "Remember the data folder for later downloads without moving anything",
+            "with --data-dir: remember the new folder as the data folder without moving anything",
+            kind="flag", place="advanced", default=False),
+    _option("no-warmup", "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)",
+            "skip starting the model once at the end of setup to compile its GPU code (the first request then "
+            "compiles it: ~30 s more)", kind="flag", place="advanced", default=False),
+    # ---- how the image models run (setup's --image-NAME, tools/image/install.py's --NAME)
+    _option("image-gpu", "The GPU that makes the images",
+            "the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the one with the "
+            "most VRAM, where the images are made beside the chat; else the text model's); same: the text model's "
+            "GPU; a PCI address as --check lists it: that GPU",
+            place="images",
+            choices=[["auto", "Auto: a GPU the text model does not use, else the text model's"],
+                     ["same", "The text model's GPU"]],
+            default="auto", gpu_choices="pci", when=["images"], cli={"metavar": "auto|same|PCI"}),
+    _option("image-sam3-license", "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words "
+            "(find_region, edit_region); without it Florence-2 (MIT) finds the parts",
+            "agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a picture by "
+            "words with it), no: do not (Florence-2, MIT, finds the parts); asked when not given, no with --yes",
+            kind="flag", place="images", values=["agree", "no"], default=False, when=["images", "sam3"],
+            about="The license: {license}", question="  Agree to the SAM License (read it at the address above)?",
+            cli={"choices": ["agree", "no"]}),
+    _option("image-dit-q8", "Mage-Flow, MOSS-Image and Anima: the image model on the GPU",
+            "Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it fits there with "
+            "the text encoder (nearer the reference) and quantizes it to 8 bits when it does not (half the VRAM and "
+            "the bytes streamed; int8 products where the GPU's math library has them, else Q8_0); on always 8 bits, "
+            "off always 16-bit",
+            place="images",
+            choices=[["auto", "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit"],
+                     ["on", "Always 8-bit"], ["off", "Always 16-bit"]],
+            default="auto", when=["images"]),
+    _option("image-dit-keep", "Mage-Flow: the image model not in use (the generation's or the edit's)",
+            "Mage-Flow: on (default) keeps the image model not in use (the generation's or the edit's) in RAM as "
+            "Q8_0, so switching is quick; off lets it go (about 4.4 GB less RAM) and reads it from the file again at "
+            "each switch",
+            place="images",
+            choices=[["on", "Keep the one not in use in RAM (quick switch)"],
+                     ["off", "Let it go (about 4.4 GB less RAM)"]],
+            default="on", when=["images"]),
+    _option("image-ssd-offload", "Keep the image models' sizes when the RAM is short, reading what does not fit from "
+            "the SSD (slower)",
+            "on: keep the image model's and its text encoder's sizes even when the RAM is short, and read what does "
+            "not fit from the SSD (slower); off (default): smaller sizes instead",
+            kind="flag", place="images", values=["on", "off"], default=False, when=["images"],
+            cli={"choices": ["on", "off"]}),
+    _option("image-gpu-policy", "The text model while an image is made",
+            "what the text model does during an image job (default auto: stays loaded when both fit, else gives VRAM "
+            "back or is unloaded and its conversation restored afterwards)",
+            place="images",
+            choices=[["auto", "Auto: stays when both fit, else gives VRAM back or is unloaded"],
+                     ["keep", "Keep it loaded"], ["shrink", "Give VRAM back for the image"],
+                     ["unload", "Unload it, its conversation restored afterwards"]],
+            default="auto", when=["images"]),
+    # ---- how a model runs: at an install, and at a start
+    _option("gpu", "GPU",
+            "the GPU, numbered in PCI order as --check lists them (default: the one with the most VRAM); the engine "
+            "takes it by PCI address",
+            place="start", choices=[["", "As set up (the one with the most VRAM the first time)"]], default="",
+            gpu_choices="index", when=["multi_gpu"]),
+    _option("gpus", "Split the model's layers over these GPUs (two or more; the first runs the early layers)",
+            "a layer split across these GPUs, e.g. 0,1 (numbered as --check lists them; the first runs the early "
+            "layers; docs/MULTIGPU.md); saved for the model",
+            kind="gpus", place="start", when=["multi_gpu"]),
+    _option("layer-split", "With a split: the first layer of each later GPU's share (e.g. 36, or 16,32 for three "
+            "GPUs)",
+            "with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 for 3 GPUs), one rising number "
+            "per GPU after the first - not layers per card; or auto (the default: measured on this PC)",
+            kind="text", place="start", pattern=r"auto|[1-9][0-9]*(,[1-9][0-9]*)*", when=["multi_gpu", "gpus!="],
+            hint="auto (measured on this PC)", takes="auto or rising layer numbers, e.g. 36 or 16,32"),
+    _option("port", "Port", "the server's port (default: the one the install was set up with, 8095 for a new one)",
+            kind="int", place="start", min=1, max=65535, hint="as set up (8095 for a new model)",
+            takes="a port number, 1 to 65535"),
+    _option("host", "Who may connect (with networks: set an API key too)",
+            "where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 interfaces, :: = all "
+            "IPv6 interfaces (issue #26; set --api-key too)",
+            place="start",
+            choices=[["", "This PC only (127.0.0.1)"], ["0.0.0.0", "Every IPv4 network (0.0.0.0)"],
+                     ["::", "Every IPv6 network (::)"]],
+            default="", cli={"choices": None}),
+    _option("api-key", "API key",
+            "require this key from clients (recommended with --host 0.0.0.0 or --host ::); several keys: key1,key2",
+            kind="text", place="start", hint="(none) a key the clients must send; several: key1,key2"),
+    _option("vram-reserve-mib", "VRAM left free for other programs, in MiB",
+            "VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's default: "
+            "700); the expert cache takes that much less",
+            kind="int", place="start", min=0, hint="the engine's default (700)", takes="a number of MiB, 0 or more",
+            cli={"metavar": "N"}),
+    _option("draft-vocab", "The draft layer's tokens",
+            "the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English and code only "
+            "(~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = English, code and French "
+            "(French answers draft more)",
+            place="start",
+            choices=[["", "As set up (with Chinese, Japanese and Korean the first time)"],
+                     ["cjk", "With Chinese, Japanese and Korean"],
+                     ["en", "English and code only (~110 MiB less VRAM)"],
+                     ["cyrillic", "English, code and the Cyrillic script"],
+                     ["fr", "English, code and French"]],
+            default=""),
+    _option("script-guard", "Other languages' characters in the answers, for every model (the thinking is left as "
+            "it is)",
+            "keep other languages' characters out of the answers of every model (serve/script_guard.py): ja keeps "
+            "Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers, en every CJK character and "
+            "Vietnamese letters out of English (and other non-CJKV) ones, ko kana and non-Korean Han characters out "
+            "of Korean ones, zh-cn and zh-tw kana, Hangul, Japanese-only forms and the other Chinese script out of "
+            "Chinese ones; off leaves them as the model writes. The web page and a request's own \"script_guard\" go "
+            "over it. Without it setup asks the first time, and with --setup",
+            place="start",
+            choices=[["ja", "Japanese: no Simplified Chinese, Hangul or Vietnamese letters in the answers"],
+                     ["en", "English and others: no CJK characters or Vietnamese letters"],
+                     ["ko", "Korean: no kana, Han characters Korean does not use, or Vietnamese letters"],
+                     ["zh-cn", "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
+                     ["zh-tw", "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
+                     ["off", "Off: answers as the model writes them"]],
+            default="en", keep=True, question="Keep other languages' characters out?"),
+    _option("ple-io", "Qwen3.8-Flash-Next's n-gram table",
+            "how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole table in RAM "
+            "(faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, auto = setup chooses by the "
+            "RAM and the disk (default)",
+            place="start",
+            choices=[["", "As set up (auto: chosen by the RAM and the disk)"],
+                     ["auto", "Auto: chosen by the RAM and the disk"],
+                     ["ram", "The whole table in RAM (faster new prompts, ~29 GB more RAM)"],
+                     ["direct", "Read from the SSD as needed"]],
+            default=""),
+    _option("old-driver", "Start although the Intel GPU's driver is older than the one setup asks for",
+            "start although the Level Zero driver predates the fix setup stops on (see its message)",
+            kind="flag", place="start", default=False),
+]
+OPTION = {o["name"]: o for o in OPTIONS}
+
+
+def option_args(ap) -> None:
+    """The command line's options of OPTIONS (not the passwords: those come in the environment)."""
+    for o in OPTIONS:
+        if o["kind"] == "password":
+            continue
+        kw: dict = {"help": o["help"]}
+        if o["kind"] == "choice" and not o.get("gpu_choices") and not o.get("path_choice"):
+            kw["choices"] = [v for v, _ in o["choices"] if v]
+        elif o["kind"] == "int":
+            kw["type"] = int
+        elif o["kind"] == "number":
+            kw["type"] = float
+        elif o["kind"] == "flag" and not o.get("values"):
+            kw["action"] = "store_true"
+        kw.update(o.get("cli", {}))
+        if kw.get("choices") is None:
+            kw.pop("choices", None)
+        ap.add_argument("--" + o["name"], **kw)
+
+
+def option_problem(name: str, value) -> str | None:
+    """Why `value` is not one --NAME takes (its range or its pattern), or None."""
+    o = OPTION[name]
+    if value is None:
+        return None
+    if o["kind"] in ("int", "number"):
+        if not (o.get("min", -math.inf) <= value <= o.get("max", math.inf)) or value != value:
+            return f"--{name} takes {o['takes']}"
+    elif o.get("pattern") and not re.fullmatch(o["pattern"], str(value)):
+        return f"--{name} takes {o['takes']}"
+    return None
+
+
+def option_default(name: str):
+    """The answer setup offers for --NAME, the same in a terminal's question and in describe: what is set where it is
+    saved for every model (web search, the script guard), else the table's."""
+    settings = load_settings()
+    if name == "web-search":
+        return settings["search_engine"] if settings.get("search_engine") in WEB_SEARCH_APIS else "no"
+    if name == "script-guard":
+        modes = [v for v, _ in OPTION[name]["choices"]]
+        if settings.get("script_guard") in modes:
+            return settings["script_guard"]
+        import locale                                   # the environment's on Linux, the system's on Windows
+        lang = (next((os.environ[k] for k in ("LC_ALL", "LC_MESSAGES", "LANG") if os.environ.get(k)), "")
+                or locale.getlocale()[0] or "").lower()
+        return "ja" if lang.startswith(("ja", "japanese")) else "ko" if lang.startswith(("ko", "korean")) else \
+            "zh-tw" if lang.startswith(("zh_tw", "zh_hk", "zh-tw", "zh-hk", "chinese (traditional)")) else \
+            "zh-cn" if lang.startswith(("zh", "chinese")) else "off" if lang.startswith(("vi", "vietnamese")) else "en"
+    if name == "data-dir":
+        return str(data_folder_path(None, settings))
+    o = OPTION[name]
+    return o.get("default", False if o["kind"] == "flag" else "")
+
+
+def ask_option(name: str, yes: bool, values: list | None = None, default=None) -> str:
+    """Setup's question for --NAME in a terminal: its label, its choices (`values` of them; not the blank one) and the
+    table's question, `default` (else option_default's) offered."""
+    o = OPTION[name]
+    if default is None:
+        default = option_default(name)
+    if o["kind"] == "flag":
+        choices = [["y", "yes"], ["n", "no"]]
+        default = "y" if default in (True, (o.get("values") or ["y"])[0]) else "n"
+    else:
+        choices = [[v, t] for v, t in o["choices"]
+                   if v and v != o.get("path_choice") and (values is None or v in values)]
+    if not yes:
+        say()
+        say(f"  {o['label']}:")
+        if o.get("about"):
+            for line in textwrap.wrap(o["about"].format(**o.get("vars", {})), 104):
+                say(f"  {line}")
+        if o["kind"] != "flag":
+            width = max(len(v) for v, _ in choices)
+            for v, t in choices:
+                say(f"    {v:{width}s}  {t}")
+    got = ask(o["question"], [v for v, _ in choices], default, yes)
+    if o["kind"] == "flag":
+        return (o.get("values") or [True, False])[0 if got == "y" else 1]
+    return got
+
+
+def options_described() -> list:
+    """OPTIONS for describe: each as the table has it (the command line's own settings and the questions left out),
+    its default what setup offers now, a password's whether its key is saved, the GPUs' choices filled in."""
+    QI = _qimage()
+    settings = load_settings()
+    out = []
+    for o in OPTIONS:
+        d = {k: v for k, v in o.items() if k not in ("help", "cli", "question")}
+        d["default"] = option_default(o["name"])
+        if o["kind"] == "password":
+            d["set"] = bool(settings.get(o["name"].removesuffix("-api-key") + "_api_key"))
+        if o["name"] == "image-sam3-license":
+            d["vars"] = {"license": QI.SAM3_LICENSE}
+        out.append(d)
+    return out
+
+
 def describe() -> dict:
     """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
     GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
@@ -7768,6 +8131,9 @@ def describe() -> dict:
                          "kv": not fam.get("plain"), "speed_projection": f in SPEED_PROJECTION_FAMILIES,
                          # the precisions --kv takes; a plain family's are not asked, FP16 unless one is given
                          "kv_takes": list(plain_kv_takes(f)) if fam.get("plain") else ["int8", "q4_0", "k8v4", "fp16"],
+                         # the options whose choices are the family's own: NAME -> its choices and its default
+                         "options": ({"kv": {"choices": list(plain_kv_takes(f)), "default": "fp16"}}
+                                     if fam.get("plain") else {}),
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
     QI = _qimage()
     images = []
@@ -7818,7 +8184,9 @@ def describe() -> dict:
             "web_search": (load_settings()["search_engine"]
                            if load_settings().get("search_engine") in WEB_SEARCH_APIS else None),
             # --describe --gguf PATH: what setup read of those files (their family, CUSTOM, is in "families")
-            "custom": getattr(ARGS, "custom", None)}
+            "custom": getattr(ARGS, "custom", None),
+            # the fields of the options (OPTIONS), each with what setup offers now
+            "options": options_described()}
 
 
 def main() -> int:
@@ -7845,40 +8213,7 @@ def main() -> int:
     ap.add_argument("--model", metavar="{" + ",".join(models) + ",custom-NAME}",
                     help="the size; custom-NAME: a model installed with --gguf --name NAME")
     ap.add_argument("--context", type=int)
-    ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
-                    help="the RoPE extension for a context past the model's trained 262144: linear (position "
-                         "interpolation) or yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; "
-                         "none is refused there")
-    ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
-                         "262144, at least 1: 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
-                    help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise), k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 "
-                         "(16-bit, twice the memory of int8)")
-    ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
-                    help="let the model read images (on by default where the model can; yes = the reader for this "
-                         "card: the CPU under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU "
-                         "encoder taking over when it cannot start; cpu = on the CPU only; no = text only)")
-    ap.add_argument("--vision-tokens", type=int, metavar="N",
-                    help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
-                         "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
-                         "for this model")
-    ap.add_argument("--web-search", choices=["deepseek", "tinyfish", "no"],
-                    help="web search for every model (serve's web search tools, the web page's Search switch): "
-                         "deepseek uses DeepSeek's search API with your API key (asked without echo; billed by "
-                         "DeepSeek per search); tinyfish TinyFish's search API with your API key (asked without "
-                         "echo; free up to a daily allowance); no takes either out. A SearXNG-compatible server of "
-                         "your own is its address as search_url in settings.json. Without it setup asks the first "
-                         "time, and with --setup")
-    ap.add_argument("--script-guard", choices=["ja", "en", "ko", "zh-cn", "zh-tw", "off"],
-                    help="keep other languages' characters out of the answers of every model (serve/script_guard.py): "
-                         "ja keeps Simplified Chinese, Hangul and Vietnamese letters out of Japanese answers, en every "
-                         "CJK character and Vietnamese letters out of English (and other non-CJKV) ones, ko kana and "
-                         "non-Korean Han characters out of Korean ones, zh-cn and zh-tw kana, Hangul, Japanese-only "
-                         "forms and the other Chinese script out of Chinese ones; off leaves them as the model "
-                         "writes. The web page and a request's own \"script_guard\" go over it. Without it setup asks "
-                         "the first time, and with --setup")
+    option_args(ap)                                  # the options a front end shows as fields (OPTIONS)
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
                     "mage-flow-base|magetrail|moss-image|moss-image-base|moss-image-4-step[-uncensored]|"
                     "hunyuan-image-3-distil|no",
@@ -7905,62 +8240,11 @@ def main() -> int:
                     help="the image model's size (default Q8_0, or w4a8 for HunyuanImage 3.0, lowered when its files "
                          "would not fit the RAM the text model leaves, after its text encoder; the GPU's memory does "
                          "not decide it)")
-    ap.add_argument("--image-dit-q8", choices=["auto", "on", "off"],
-                    help="Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it "
-                         "fits there with the text encoder (nearer the reference) and quantizes it to 8 bits when it "
-                         "does not "
-                         "(half the VRAM and the bytes streamed; int8 products where the GPU's math library has "
-                         "them, else Q8_0); on always 8 bits, off always 16-bit")
-    ap.add_argument("--image-dit-keep", choices=["on", "off"],
-                    help="Mage-Flow: on (default) keeps the image model not in use (the generation's or the edit's) in "
-                         "RAM as Q8_0, so switching is quick; off lets it go (about 4.4 GB less RAM) and reads it from "
-                         "the file again at each switch")
-    ap.add_argument("--image-ssd-offload", choices=["on", "off"],
-                    help="on: keep the image model's and its text encoder's sizes even when the RAM is short, and "
-                         "read what does not fit from the SSD (slower); off (default): smaller sizes instead")
-    ap.add_argument("--image-sam3-license", choices=["agree", "no"],
-                    help="agree: agree to Meta's SAM License for SAM 3.1 (find_region and edit_region find a part of a "
-                         "picture by words with it), no: do not (Florence-2, MIT, finds the parts); asked when not "
-                         "given, no with --yes")
-    ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
-                    help="what the text model does during an image job (default auto: stays loaded when both fit, "
-                         "else gives VRAM back or is unloaded and its conversation restored afterwards)")
-    ap.add_argument("--image-gpu", metavar="auto|same|PCI",
-                    help="the GPU of the image jobs (default auto: a discrete GPU the text model does not take, the "
-                         "one with the most VRAM, where the images are made beside the chat; else the text model's); "
-                         "same: the text model's GPU; a PCI address as --check lists it: that GPU")
-    ap.add_argument("--experimental-speed-projection", metavar="on|off|GGUF",
-                    help="EXPERIMENTAL, off by default: the control vector in "
-                         "third_party/nonfree/experimental-speed-projection "
-                         "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
-    ap.add_argument("--port", type=int,
-                    help="the server's port (default: the one the install was set up with, 8095 for a new one)")
-    ap.add_argument("--gpu", help="the GPU, numbered in PCI order as --check lists them (default: the one with "
-                                  "the most VRAM); the engine takes it by PCI address")
-    ap.add_argument("--gpus", help="a layer split across these GPUs, e.g. 0,1 (numbered as --check lists them; the "
-                                   "first runs the early layers; docs/MULTIGPU.md); saved for the model")
-    ap.add_argument("--layer-split", help="with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 "
-                                          "for 3 GPUs), one rising number per GPU after the first - not layers per "
-                                          "card; or auto (the default: measured on this PC)")
-    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 "
-                                   "interfaces, :: = all IPv6 interfaces (issue #26; set --api-key too)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0 or --host ::); "
-                                      "several keys: key1,key2")
-    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
-                                       "folder, remembered for every XeStrata folder on this PC")
-    ap.add_argument("--move-data", action="store_true",
-                    help="with --data-dir: move the model files already on this PC into the new folder (without it "
-                         "nothing is moved: the old files stay usable and the new folder gets the new downloads)")
-    ap.add_argument("--set-default-data-dir", action="store_true",
-                    help="with --data-dir: remember the new folder as the data folder without moving anything")
-    ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
-    ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
-                                       "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
     ap.add_argument("--gguf", metavar="PATH",
                     help="install a model from GGUF files already on this PC, nothing downloaded: its .gguf file (the "
                          "first shard of a split one) or its folder; Qwen3.8-Flash-Next (qwen4exp) or a model of the "
@@ -7971,10 +8255,6 @@ def main() -> int:
     ap.add_argument("--inspect", nargs="+", metavar=("SOURCE", "VARIANT"),
                     help="what a GGUF is and whether XeStrata runs it, from its headers only (no download): a file, a "
                          "folder, a URL, ms:owner/repo (ModelScope) or hf:owner/repo, and optionally a variant name")
-    ap.add_argument("--source", choices=SOURCES, default=None,
-                    help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
-                         "(mainland China: the same files, checked against ModelScope's published SHA-256; "
-                         "XESTRATA_SOURCE)")
     ap.add_argument("--license", choices=[*LICENSES, "contrib-icpx"],
                     help="the build mode: free builds with free software only, for Intel and AMD GPUs; contrib (the "
                          "default) builds with intel/llvm's CUDA target for Intel, AMD and NVIDIA GPUs, and hands the "
@@ -7993,31 +8273,6 @@ def main() -> int:
                     help="with --intel-llvm-build: keep its build tree so the next update is quicker")
     ap.add_argument("--allow-no-xmx", action="store_true",
                     help="build even when the compiler gives the GPU no XMX (prompt processing about 1.6 times slower)")
-    ap.add_argument("--low-ram", choices=["auto", "on", "off", "resident", "mmap"], default="auto",
-                    help="read the model's experts from its files instead of copying them all into RAM (for a PC with "
-                         "a big GPU and little RAM); auto: when the experts would not fit the RAM. In this mode the "
-                         "experts the GPU does not hold are copied into RAM once when they fit (resident), else read "
-                         "through the OS file cache (mmap); resident / mmap force one of the two")
-    ap.add_argument("--resident-budget-gib", type=float, metavar="N",
-                    help="UD-Q4_K_XL, UD-IQ4_XS: the GiB of its experts kept in RAM (default: the RAM less 24 GB, "
-                         "~38 on 64 GB; more is kept as you choose, with a note); the other models' files: the GiB "
-                         "of the experts the GPU does not hold kept in RAM, the rest read from the file")
-    ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
-                    help="VRAM in MiB the engine leaves free for other programs (a game, another model; the engine's "
-                         "default: 700); the expert cache takes that much less")
-    ap.add_argument("--ram-reserve-gib", type=float, metavar="N",
-                    help="RAM in GiB XeStrata leaves free for other programs: setup chooses the model's mode, the "
-                         "RAM its experts keep and the image models' sizes with that much less, and the engines keep "
-                         "it free beside their RAM copies (slower when the experts no longer fit and are read from "
-                         "the SSD; default: none, as before); set up again to change it")
-    ap.add_argument("--parallel", type=int, metavar="N",
-                    help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
-                         "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
-    ap.add_argument("--replicas", type=int, metavar="N",
-                    help="several GPUs (--gpus): run N independent engines, each on its own equal group of the chosen "
-                         "cards (2 replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more "
-                         "total throughput for a model that fits fewer cards; each replica holds its own copy of the "
-                         "model in RAM and VRAM)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--json", action="store_true",
                     help="one JSON object a line for a front end (the Windows launcher): messages, steps, progress and "
@@ -8028,14 +8283,9 @@ def main() -> int:
                          "launcher's first screen)")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
-    ap.add_argument("--old-driver", action="store_true",
-                    help="start although the Level Zero driver predates the fix setup stops on (see its message)")
     ap.add_argument("--update", action="store_true",
                     help="update the engine, Python packages and model settings as a start would, without starting "
                          "the model (update.sh runs it after a git pull)")
-    ap.add_argument("--no-warmup", action="store_true",
-                    help="skip starting the model once at the end of setup to compile its GPU code (the first "
-                         "request then compiles it: ~30 s more)")
     ap.add_argument("--build", action="store_true", help=argparse.SUPPRESS)   # the engine is always compiled here
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--check-update", action="store_true",
@@ -8049,14 +8299,6 @@ def main() -> int:
     ap.add_argument("--remove-data", action="store_true",
                     help="delete the model files, settings and logs XeStrata keeps for you (asks first; removing the "
                          "program with apt or dnf leaves them)")
-    ap.add_argument("--draft-vocab", choices=list(DRAFT_VOCABS),
-                    help="the draft layer's tokens: cjk = with Chinese, Japanese and Korean (default), en = English "
-                         "and code only (~110 MiB less VRAM), cyrillic = English, code and the Cyrillic script, fr = "
-                         "English, code and French (French answers draft more)")
-    ap.add_argument("--ple-io", choices=PLE_IO,
-                    help="how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole "
-                         "table in RAM (faster new prompts, ~29 GB more RAM), direct = read from the SSD as needed, "
-                         "auto = setup chooses by the RAM and the disk (default)")
     ap.add_argument("--calibrate", action="store_true",
                     help="tune the engine's settings for this PC (about 15-30 minutes, longer on a slow card), "
                          "then start the model; usually not needed, the engine and setup fit them by themselves "
@@ -8123,14 +8365,11 @@ def main() -> int:
         sys.exit(inspect_with_engine(Path(a.inspect[0]).expanduser(), code) if len(a.inspect) == 1 else code)
     global ARGS
     ARGS = a
-    if a.vision_tokens is not None and a.vision_tokens < 1:
-        ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
+    for o in OPTIONS:                                  # the ranges and patterns of the table, as the window checks
+        if o["kind"] != "password" and (why := option_problem(o["name"], getattr(a, o["name"].replace("-", "_")))):
+            ap.error(why)
     if any(x and "=" not in x for x in a.cmake_arg or []):
         ap.error("--cmake-arg takes KEY=VALUE, e.g. --cmake-arg STRATA_ROCM_DEVICE_LIBS=/opt/rocm-7.1.1/amdgcn/bitcode")
-    if a.ram_reserve_gib is not None and not 0 <= a.ram_reserve_gib < 1e6:
-        ap.error("--ram-reserve-gib takes a number of GiB, 0 or more, e.g. --ram-reserve-gib 16")
-    if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
-        ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.bench_original_compat is not None and (a.bench or a.bench_verbose or a.original_strata):
         ap.error("--bench-original-compat is a measurement of its own: give it without --bench, --bench-verbose and "
                  "--original-strata")
@@ -8600,12 +8839,7 @@ def main() -> int:
              "recommended size.")
     scaling = a.rope_scaling
     if ctx > 262144 and scaling is None and not a.yes:
-        say()
-        say(f"  A {ctx // 1024}K context runs the model past its trained 262,144 positions: the rotary angles")
-        say("  get rescaled (llama.cpp's RoPE extension). yarn keeps the trained angles on the high-frequency")
-        say("  pairs and corrects the magnitudes; linear shrinks every angle. Override any time with")
-        say("  --rope-scaling.")
-        scaling = ask("RoPE extension method?", ["yarn", "linear"], "yarn", a.yes)
+        scaling = ask_option("rope-scaling", a.yes)
     try:
         scaling, rope_scale = resolve_rope(ctx, scaling, a.rope_scale)
     except ValueError as e:
@@ -8618,12 +8852,7 @@ def main() -> int:
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
     kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
     if ctx > 8192 and not a.kv and not a.yes:
-        say()
-        say("  KV cache precision (the model's memory of the conversation):")
-        say("  1) 8-bit   (recommended: what every published number was measured with)")
-        say("  2) 4-bit   half the memory (about 4% faster at 128K), but measurably less precise on long")
-        say("             documents; long-context lookups (needle tests) still pass")
-        kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
+        kv = ask_option("kv", a.yes)
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
@@ -8636,18 +8865,15 @@ def main() -> int:
         # differ from the CPU encoder's by a few percent; the answers agree): the 2026-09-30-xe-vision-sycl record
         vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
     else:
-        small = 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB
-        say()
-        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        if small:
-            say("  download. On a card under 24 GB the encoder runs on the CPU (a few seconds per picture, nothing")
-            say("  taken from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on")
-            say("  16 GB cards. --vision gpu if you want pictures in under a second.")
-        else:
-            say("  download; the image encoder runs on the GPU (on the CPU if it cannot start there).")
         # upstream 91baead75: pictures on by default wherever the model reads them, on every make of card (the reader
         # follows images_encoder: the CPU under 24 GB of VRAM, the GPU from 24 GB)
-        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
+        if 0 < gpu_expert_vram(gpu) < IMAGES_GPU_ENCODER_MIN_VRAM_GB and not a.yes:
+            say()
+            say("  On a card under 24 GB the picture reader runs on the CPU (a few seconds per picture, nothing taken")
+            say("  from the GPU): the GPU encoder keeps ~1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB")
+            say("  cards. Choose gpu if you want pictures in under a second.")
+        asked = ask_option("vision", a.yes)
+        vision = "none" if asked == "no" else images_encoder(asked, gpu)
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
     if vision != "none" and MODELS[model].get("vision_untested"):
@@ -8685,14 +8911,10 @@ def main() -> int:
     esp_choice = (a.experimental_speed_projection or "").strip()
     if family in SPEED_PROJECTION_FAMILIES:
         if not esp_choice:
-            say()
-            say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")
-            say("  It changes how the model answers: its package describes it as a refusal-direction projection (the")
-            say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it")
-            say("  off per chat. Details: " + (esp_release_url("README.md") if PACKAGED else
-                                               "third_party/nonfree/experimental-speed-projection/README.md"))
-            esp_choice = ("on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y"
-                          else "off")
+            esp_choice = ask_option("experimental-speed-projection", a.yes)
+            if esp_choice == "on" and not a.yes:
+                say("  Its details: " + (esp_release_url("README.md") if PACKAGED else
+                                         "third_party/nonfree/experimental-speed-projection/README.md"))
         if esp_choice.lower() not in ("off", "no", "n", "0"):
             # the user's decision of 2026-11-05: fewer refusals are offered as the abliterated versions (refusals
             # removed in the weights), the vector only when it is still wanted after that

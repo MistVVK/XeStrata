@@ -46,6 +46,43 @@ type Model =
       /// the quantization it is of (Describe.Quantizers), its family's or its own
       Quantizer: string }
 
+/// One of setup's options as a field (setup.py's OPTIONS: what each part means is written there).
+type OptionSpec =
+    { Name: string
+      Label: string
+      /// choice, int, number, text, path, flag, password or gpus
+      Kind: string
+      /// install, advanced, images or start
+      Place: string
+      /// [value, label] each
+      Choices: string[][]
+      /// a choice's value or a check box's state, as setup offers it now (a string, or true and false)
+      Default: JsonElement
+      When: string[]
+      Min: Nullable<float>
+      Max: Nullable<float>
+      Pattern: string
+      Hint: string
+      Takes: string
+      About: string
+      Vars: Collections.Generic.Dictionary<string, string>
+      /// "index" or "pci": the GPUs are choices too
+      GpuChoices: string
+      PathChoice: string
+      /// folder or file
+      Pick: string
+      /// a check box's values, checked first
+      Values: string[]
+      /// passed only when changed
+      Keep: bool
+      /// a password's environment variable, whether its key is saved, and why it cannot be left blank
+      Env: string
+      Set: bool
+      Needed: string }
+
+/// The choices a family takes of one of the options, and the one offered first.
+type FamilyOption = { Choices: string[]; Default: string }
+
 type Family =
     { Id: string
       Title: string
@@ -68,6 +105,8 @@ type Family =
       SpeedProjection: bool
       /// the precisions --kv takes (where setup does not ask: 16-bit unless one is given)
       KvTakes: string[]
+      /// the options whose choices are the family's own (setup's --kv of a plain family)
+      Options: Collections.Generic.Dictionary<string, FamilyOption>
       Contexts: int[]
       Models: Model[] }
 
@@ -129,7 +168,9 @@ type Describe =
       Variants: Collections.Generic.Dictionary<string, string>
       Quantizers: Collections.Generic.Dictionary<string, string>
       /// null from a setup without it
-      Sam3: Sam3 }
+      Sam3: Sam3
+      /// the options the window shows as fields
+      Options: OptionSpec[] }
 
 type Update =
     { Current: string

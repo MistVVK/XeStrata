@@ -24,11 +24,6 @@ let private openUrl (url: string) =
 
 let private readyUrl = Regex(@"ready: (http://\S+?)(/v1)?\s", RegexOptions.Compiled)
 
-/// A choice among labelled values -> the control and its value.
-let private choice (items: (string * string) list) (selected: int) =
-    let c = ComboBox(ItemsSource = [ for label, _ in items -> label ], SelectedIndex = selected, MinWidth = 260.0)
-    c, (fun () -> snd items[max 0 c.SelectedIndex])
-
 let private trimmed (box: TextBox) = if isNull box.Text then "" else box.Text.Trim()
 
 let private isInt (least: int) (t: string) =
@@ -53,118 +48,6 @@ let private collectArgs (parts: Result<string list, string> list) =
     parts |> List.fold (fun acc p -> match acc, p with Result.Ok a, Result.Ok b -> Result.Ok(a @ b) | Error e, _ | _, Error e -> Error e) (Result.Ok [])
 
 let private flag (name: string) (box: CheckBox) = if box.IsChecked = Nullable true then [ name ] else []
-
-/// The options of how a model runs, which setup takes at an install and at a start alike: the GPUs of a layer split,
-/// the port, who may connect, the VRAM left free, the draft layer's tokens, an old driver -> the controls and their
-/// options (blank: as set up before, or setup's default).
-let private runOptions (gpus: Gpu[]) =
-    let splitBoxes = [| for g in gpus -> CheckBox(Content = text (sprintf "%s (%s)" g.Name (gb g.VramGb))) |]
-    let layerSplit = TextBox(PlaceholderText = (tr "run.autoMeasuredOnThis" "auto (measured on this PC)"), MinWidth = 260.0)
-    let port = TextBox(PlaceholderText = (tr "run.asSetUp8095" "as set up (8095 for a new model)"), MinWidth = 260.0)
-    let host, hostValue =
-        choice [ (tr "run.thisPcOnly127" "This PC only (127.0.0.1)"), ""; (tr "run.everyIpv4Network0" "Every IPv4 network (0.0.0.0)"), "0.0.0.0"; (tr "run.everyIpv6Network" "Every IPv6 network (::)"), "::" ] 0
-    let apiKey = TextBox(PlaceholderText = (tr "run.noneAKeyThe" "(none) a key the clients must send; several: key1,key2"), MinWidth = 420.0)
-    let reserve = TextBox(PlaceholderText = (tr "run.theEngineSDefault" "the engine's default (700)"), MinWidth = 260.0)
-    let vocab, vocabValue =
-        choice
-            [ (tr "run.withChineseJapaneseAnd" "With Chinese, Japanese and Korean (default)"), ""
-              (tr "run.englishAndCodeOnly" "English and code only (~110 MiB less VRAM)"), "en"
-              (tr "run.englishCodeAndThe" "English, code and the Cyrillic script"), "cyrillic"
-              (tr "run.englishCodeAndFrench" "English, code and French"), "fr" ]
-            0
-    let oldDriver = CheckBox(Content = text (tr "run.startAlthoughTheIntel" "Start although the Intel GPU's driver is older than the one setup asks for"))
-    let scriptGuard, scriptGuardValue =
-        choice
-            [ tr "run.scriptGuardSet" "As set before (or the system's language the first time)", ""
-              tr "run.scriptGuardJa" "Japanese: no Simplified Chinese, Hangul or Vietnamese letters in the answers", "ja"
-              tr "run.scriptGuardEn" "English and others: no CJK characters or Vietnamese letters", "en"
-              tr "run.scriptGuardKo" "Korean: no kana, Han characters Korean does not use, or Vietnamese letters", "ko"
-              tr "run.scriptGuardZhCn" "Chinese (Simplified): no kana, Hangul or Japanese-only characters", "zh-cn"
-              tr "run.scriptGuardZhTw" "Chinese (Traditional): no kana, Hangul or Japanese-only characters", "zh-tw"
-              tr "run.scriptGuardOff" "Off: answers as the model writes them", "off" ]
-            0
-    let pleIo, pleIoValue =
-        choice
-            [ tr "run.pleIoAuto" "As set up (auto: chosen by the RAM and the disk)", ""
-              tr "run.pleIoRam" "The whole table in RAM (faster new prompts, ~29 GB more RAM)", "ram"
-              tr "run.pleIoDirect" "Read from the SSD as needed", "direct" ]
-            0
-    let control =
-        stack 10.0 [
-            if gpus.Length > 1 then
-                yield field (tr "run.splitTheModelS" "Split the model's layers over these GPUs (two or more; the first runs the early layers)") (stack 4.0 [ for b in splitBoxes -> b :> Control ]) :> Control
-                yield field (tr "run.withASplitThe" "With a split: the first layer of each later GPU's share (e.g. 36, or 16,32 for three GPUs)") layerSplit :> Control
-            yield field (tr "run.port" "Port") port :> Control
-            yield field (tr "run.whoMayConnectWith" "Who may connect (with networks: set an API key too)") host :> Control
-            yield field (tr "run.apiKey" "API key") apiKey :> Control
-            yield field (tr "run.vramLeftFreeFor" "VRAM left free for other programs, in MiB") reserve :> Control
-            yield field (tr "run.theDraftLayerS" "The draft layer's tokens") vocab :> Control
-            yield field (tr "run.scriptGuard" "Other languages' characters in the answers, for every model (the thinking is left as it is)") scriptGuard :> Control
-            yield field (tr "run.pleIo" "Qwen3.8-Flash-Next's n-gram table") pleIo :> Control
-            yield oldDriver :> Control
-        ]
-    let args () =
-        let split = [ for i, b in Array.indexed splitBoxes do if b.IsChecked = Nullable true then string gpus[i].Index ]
-        collectArgs [
-            Result.Ok(if split.Length >= 2 then [ "--gpus"; String.Join(",", split) ] else [])
-            (if split.Length >= 2 then
-                 optionOf "--layer-split" layerSplit (fun t -> t = "auto" || t.Split(',') |> Array.forall (isInt 1)) (tr "opt.layerSplit" "auto or rising layer numbers, e.g. 36 or 16,32")
-             else Result.Ok [])
-            optionOf "--port" port (fun t -> isInt 1 t && int t <= 65535) (tr "opt.port" "a port number, 1 to 65535")
-            Result.Ok(match hostValue () with "" -> [] | h -> [ "--host"; h ])
-            Result.Ok(match trimmed apiKey with "" -> [] | k -> [ "--api-key"; k ])
-            optionOf "--vram-reserve-mib" reserve (isInt 0) (tr "opt.vramReserveMib" "a number of MiB, 0 or more")
-            Result.Ok(match vocabValue () with "" -> [] | v -> [ "--draft-vocab"; v ])
-            Result.Ok(flag "--old-driver" oldDriver)
-            Result.Ok(match scriptGuardValue () with "" -> [] | v -> [ "--script-guard"; v ])
-            Result.Ok(match pleIoValue () with "" -> [] | v -> [ "--ple-io"; v ])
-        ]
-    control, args
-
-/// How the image models run, which setup (--image-<name>) and tools/image/install.py (--<name>) take alike: on which
-/// GPU, in which sizes, what the text model does meanwhile, and SAM 3.1's license (where not agreed to yet) -> the
-/// controls and the (name, value) pairs.
-let private imageRunOptions (gpus: Gpu[]) (sam3: Sam3) =
-    let imageGpu, imageGpuValue =
-        choice
-            ([ tr "img.gpuAuto" "Auto: a GPU the text model does not use, else the text model's", "auto"
-               tr "img.gpuSame" "The text model's GPU", "same" ]
-             @ [ for g in gpus do
-                     if not (String.IsNullOrEmpty g.Pci) then
-                         yield trf "img.gpuOnly" "{gpu} ({vram})" [ "gpu", box g.Name; "vram", box (gb g.VramGb) ], g.Pci ])
-            0
-    let askSam3 = not (isNull (box sam3)) && not sam3.Agreed
-    let agreeSam3 = CheckBox(Content = text (tr "img.sam3Agree" "Agree to Meta's SAM License, so that SAM 3.1 finds a part of a picture by words (find_region, edit_region); without it Florence-2 (MIT) finds the parts"))
-    let ditQ8, ditQ8Value =
-        choice [ (tr "img.auto16BitWhen" "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit"), "auto"; (tr "img.always8Bit" "Always 8-bit"), "on"; (tr "img.always16Bit" "Always 16-bit"), "off" ] 0
-    let ditKeep, ditKeepValue =
-        choice [ (tr "img.keepTheOneNot" "Keep the one not in use in RAM (quick switch)"), "on"; (tr "img.letItGoAbout" "Let it go (about 4.4 GB less RAM)"), "off" ] 0
-    let ssdOffload = CheckBox(Content = text (tr "img.keepTheImageModels" "Keep the image models' sizes when the RAM is short, reading what does not fit from the SSD (slower)"))
-    let policy, policyValue =
-        choice
-            [ (tr "img.autoStaysWhenBoth" "Auto: stays when both fit, else gives VRAM back or is unloaded"), "auto"
-              (tr "img.keepItLoaded" "Keep it loaded"), "keep"
-              (tr "img.giveVramBackFor" "Give VRAM back for the image"), "shrink"
-              (tr "img.unloadItItsConversation" "Unload it, its conversation restored afterwards"), "unload" ]
-            0
-    let control =
-        stack 10.0 [
-            yield field (tr "img.gpu" "The GPU that makes the images") imageGpu :> Control
-            if askSam3 then
-                yield stack 4.0 [ agreeSam3; muted (trf "img.sam3License" "The license: {license}" [ "license", box sam3.License ]) ] :> Control
-            yield field (tr "img.mageFlowMossImage" "Mage-Flow, MOSS-Image and Anima: the image model on the GPU") ditQ8 :> Control
-            yield field (tr "img.mageFlowTheImage" "Mage-Flow: the image model not in use (the generation's or the edit's)") ditKeep :> Control
-            yield ssdOffload :> Control
-            yield field (tr "img.theTextModelWhile" "The text model while an image is made") policy :> Control
-        ]
-    let values () =
-        [ "dit-q8", ditQ8Value ()
-          "dit-keep", ditKeepValue ()
-          "ssd-offload", (if ssdOffload.IsChecked = Nullable true then "on" else "off")
-          "gpu-policy", policyValue ()
-          "gpu", imageGpuValue ()
-          if askSam3 then "sam3-license", (if agreeSam3.IsChecked = Nullable true then "agree" else "no") ]
-    control, values
 
 /// The log of a run, its last lines kept.
 type private LogView() =
@@ -351,7 +234,7 @@ type MainWindow(setup: Setup.Access) as this =
     /// control and its --images value (None: none checked).  A choice of the default where several are, of the size
     /// where a model has several (Auto: by the RAM), and of the text encoder with the refusal direction removed
     /// (-uncensored) where the models have one.
-    let imagePicker (models: ImageModel[]) (current: string[]) =
+    let imagePicker (models: ImageModel[]) (current: string[]) (changed: unit -> unit) =
         let plain (id: string) =
             let id = id.Split(':')[0]
             if id.EndsWith "-uncensored" then id.Substring(0, id.Length - 11) else id
@@ -397,6 +280,7 @@ type MainWindow(setup: Setup.Access) as this =
                  | _ -> (match ms with m :: _ -> m.Title | [] -> null))
             defaultField.IsVisible <- ms.Length > 1
             uncensored.IsVisible <- ms |> List.exists (fun m -> m.Uncensored)
+            changed ()
         for b in boxes do
             b.IsCheckedChanged.Add(fun _ -> refresh ())
         refresh ()
@@ -547,6 +431,15 @@ type MainWindow(setup: Setup.Access) as this =
             ]
         )
 
+    /// A page's fields of setup's options (describe's "options") at `places`, shown as `holds` says.
+    and fieldsOf (d: Describe) (places: string list) (holds: string -> bool) (family: unit -> Family option) =
+        let page: Fields.Page =
+            { Holds = holds
+              Family = family
+              Gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
+              Browse = fun kind title target -> if kind = "file" then pickFile title target else pickFolder title target }
+        [ for p in places -> p, Fields.make d.Options p page ]
+
     /// The install page; `own`: the model in the user's own files (--gguf PATH, --name NAME) instead of a family's.
     and choosePage (d: Describe) (own: (string * string) option) =
         let pool =
@@ -586,7 +479,6 @@ type MainWindow(setup: Setup.Access) as this =
                     row 6.0 [
                         yield subheading m.Id
                         if m.Recommended then yield badge okBrush (tr "install.recommended" "recommended")
-                        if not m.Tested then yield badge mutedBrush (tr "install.untested" "untested")
                         if m.Experimental then yield badge warnBrush (tr "common.experimental" "experimental")
                         match m.Fits with
                         | "low-ram" -> yield badge warnBrush (tr "install.lowRamMode" "low-RAM mode")
@@ -597,116 +489,48 @@ type MainWindow(setup: Setup.Access) as this =
                     muted (trf "install.sizeAbout" "{about}; download {download}, needs ~{ram} of RAM" [ "about", box m.About; "download", box (gb m.DownloadGb); "ram", box (gb m.RamGb) ])
                 ])
         let contexts = ComboBox(MinWidth = 160.0)
-        let gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
-        let gpuBox = ComboBox(ItemsSource = [ for g in gpus -> sprintf "%s (%s)" g.Name (gb g.VramGb) ], MinWidth = 260.0)
-        gpuBox.SelectedIndex <- (if d.Gpu.HasValue then defaultArg (Array.tryFindIndex (fun g -> g.Index = d.Gpu.Value) gpus) 0 else 0)
-        let dataDir = TextBox(Text = d.DataDir, MinWidth = 420.0)
-        let ggufDir = TextBox(PlaceholderText = (tr "install.optionalAFolderWith" "(optional) a folder with the model files already downloaded"), MinWidth = 420.0)
         let license = muted ""
         let install = accentButton (tr "install.install" "Install") ignore
         let problem = coloured failBrush ""
-        // setup's other questions (step 2), each shown where setup would ask it
-        let pictures = CheckBox(IsChecked = Nullable true, Content = text (tr "install.readPicturesTooScreenshots" "Read pictures too (screenshots, photos, scanned pages; a 0.9 GB download)"))
-        let kv, kvValue =
-            choice
-                [ (tr "install.8BitRecommended" "8-bit (recommended)"), "int8"
-                  (tr "install.4BitHalfThe" "4-bit: half the memory, a little less precise on long documents"), "q4_0"
-                  (tr "install.8BitKeysAnd" "8-bit keys and 4-bit values: about three quarters of the memory"), "k8v4"
-                  (tr "install.16BitTwiceThe" "16-bit: twice the memory of 8-bit"), "fp16" ]
-                0
-        let kvField = field (tr "install.kvCachePrecisionThe" "KV cache precision (the model's memory of the conversation)") kv
-        // a family whose KV cache setup does not ask: 16-bit unless one of the precisions it takes is chosen
-        let kvLabels =
-            dict [ "fp16", tr "install.kvFp16" "16-bit (default)"; "int8", tr "install.kvInt8" "8-bit"
-                   "q4_0", tr "install.kvQ4" "4-bit (Hadamard-rotated)"; "k8v4", tr "install.kvK8v4" "8-bit keys and 4-bit values" ]
-        let plainKv = ComboBox(MinWidth = 260.0)
-        let plainKvField = field (tr "install.kvCachePrecisionThe" "KV cache precision (the model's memory of the conversation)") plainKv
-        let plainKvValue (f: Family) = if plainKv.SelectedIndex >= 0 then f.KvTakes[plainKv.SelectedIndex] else "fp16"
-        let rope, ropeValue =
-            choice [ (tr "install.yarnKeepsTheTrained" "yarn (keeps the trained angles on the high-frequency pairs)"), "yarn"; (tr "install.linearShrinksEveryAngle" "linear (shrinks every angle)"), "linear" ] 0
-        let ropeField = field (tr "install.ropeExtensionAContext" "RoPE extension: a context past the model's trained 262,144 positions rescales its rotary angles") rope
-        let projection =
-            CheckBox(
-                Content =
-                    stack 2.0 [
-                        text (tr "install.experimentalSpeedProjectionOff" "EXPERIMENTAL - speed projection (off unless you choose it)")
-                        muted (tr "install.aSmallControlVector" "A small control vector applied while the model runs (layers 4-44). It changes how the model answers: its package describes it as a refusal-direction projection (the model declines far fewer requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or huihui-ai's abliterated version as the model instead (the refusals removed in its weights).")
-                    ]
-            )
-        let vector = TextBox(PlaceholderText = (tr "install.optionalAnotherControlVector" "(optional) another control vector, a GGUF file"), MinWidth = 420.0)
-        let vectorField = field (tr "install.theSpeedProjectionS" "The speed projection's vector") vector
-        let images, imagesValue = imagePicker d.Images d.ImageDefault
-        let webSearch, webSearchValue =
-            choice
-                [ (tr "install.off" "Off"), "no"
-                  (tr "install.deepseekSSearchApi" "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek"), "deepseek"
-                  (tr "install.tinyfishSSearchApi" "TinyFish's search API: your API key, free up to a daily allowance (12,000 searches, 1,000 pages read); the search words and the pages found go to TinyFish"), "tinyfish" ]
-                (match d.WebSearch with "deepseek" -> 1 | "tinyfish" -> 2 | _ -> 0)
-        // the search APIs' keys: (setup's --web-search value, its name, the box)
-        let apiKeys =
-            [ for id, who in [ "deepseek", "DeepSeek"; "tinyfish", "TinyFish" ] ->
-                  id, who,
-                  TextBox(PasswordChar = '*', MinWidth = 420.0,
-                          PlaceholderText = (if d.WebSearch = id then tr "install.keySet" "set (type to replace)" else trf "install.keyYour" "your {who} API key" [ "who", box who ])) ]
-        let apiKeyFields =
-            [ for id, who, box in apiKeys -> id, field (trf "install.keyField" "{who} API key (kept in your settings, never shown)" [ "who", who :> obj ]) box ]
-        let showApiKey () =
-            for id, f in apiKeyFields do f.IsVisible <- webSearchValue () = id
-        showApiKey ()
-        webSearch.SelectionChanged.Add(fun _ -> showApiKey ())
-        let webSearchField = field (tr "install.webSearchForEvery" "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)") webSearch
-        let imagesField = field (tr "install.imageGenerationModelsTo" "Image generation: models to make images with, besides the text model") images
-        // the options setup takes without asking, under Advanced
-        let reader, readerValue =
-            choice [ (tr "install.forThisGpuOn" "For this GPU (on the GPU from 24 GB of VRAM, else on the CPU)"), "yes"; (tr "install.onTheGpuThe" "On the GPU (the CPU when it cannot start there)"), "gpu"; (tr "install.onTheCpu" "On the CPU"), "cpu" ] 0
-        let readerField = field (tr "install.thePictureReader" "The picture reader") reader
-        let visionTokens = TextBox(PlaceholderText = (tr "install.1024OnTheGpu" "1024 on the GPU, 300 on the CPU"), MinWidth = 260.0)
-        let visionTokensField = field (tr "install.theMostImageTokens" "The most image tokens a picture becomes (more reads small text better, and takes longer)") visionTokens
-        let ropeScale = TextBox(PlaceholderText = (tr "install.theContextOver262" "the context over 262,144"), MinWidth = 260.0)
-        let ropeScaleField = field (tr "install.ropeExtensionFactor1" "RoPE extension factor (1 or more)") ropeScale
-        let lowRam, lowRamValue =
-            choice
-                [ (tr "install.autoWhenTheExperts" "Auto: when the experts do not fit the RAM"), "auto"
-                  (tr "install.on" "On"), "on"
-                  (tr "install.off" "Off"), "off"
-                  (tr "install.onTheExpertsThe" "On, the experts the GPU does not hold copied into RAM"), "resident"
-                  (tr "install.onTheExpertsThe2" "On, the experts the GPU does not hold read through the OS file cache"), "mmap" ]
-                0
-        let budget = TextBox(PlaceholderText = (tr "install.setupSChoiceFor" "setup's choice for this RAM"), MinWidth = 260.0)
-        let budgetField = field (tr "install.gibOfTheExperts" "GiB of the experts kept in RAM (the rest read from the SSD)") budget
-        let ramReserve = TextBox(PlaceholderText = (tr "install.noneGibOfRam" "(none) GiB of RAM to leave free for other programs"), MinWidth = 260.0)
-        let parallelBox = TextBox(PlaceholderText = (tr "install.1OneRequestAt" "1: one request at a time"), MinWidth = 260.0)
-        let replicas = TextBox(PlaceholderText = "1", MinWidth = 260.0)
-        let source, sourceValue =
-            choice [ (tr "install.huggingFaceDefault" "Hugging Face (default)"), ""; (tr "install.modelscopeMainlandChinaThe" "ModelScope (mainland China: the same files)"), "modelscope" ] 0
-        let modelsDir = TextBox(PlaceholderText = (tr "install.dataFolderModels" "<data folder>\\models"), MinWidth = 420.0)
-        let moveData = CheckBox(Content = text (tr "install.moveTheModelFiles" "Move the model files already on this PC into the data folder"))
-        let rememberData = CheckBox(Content = text (tr "install.rememberTheDataFolder" "Remember the data folder for later downloads without moving anything"))
-        let noWarmup = CheckBox(Content = text (tr "install.skipTheFirstStart" "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)"))
-        let imageOptions, imageValues = imageRunOptions gpus d.Sam3
-        let serverControl, serverArgs = runOptions gpus
         let selectedModel () =
             match sizes.SelectedItem with
             | :? Model as m -> Some m
             | _ -> None
         let selectedContext (f: Family) = f.Contexts[max 0 contexts.SelectedIndex]
-        let refresh () =
+        let mutable imagesChosen = false
+        let mutable refreshFields = ignore
+        let images, imagesValue = imagePicker d.Images d.ImageDefault (fun () -> refreshFields ())
+        let imagesField = field (tr "install.imageGenerationModelsTo" "Image generation: models to make images with, besides the text model") images
+        // what setup's options are shown for: the family, size and context chosen (step 2's questions where setup
+        // would ask them)
+        let holds (w: string) =
             match current, selectedModel () with
             | Some f, Some m ->
                 let ctx = selectedContext f
-                pictures.IsVisible <- m.Vision
-                readerField.IsVisible <- m.Vision
-                visionTokensField.IsVisible <- m.Vision
-                kvField.IsVisible <- f.Kv && ctx > 8192
-                plainKvField.IsVisible <- not f.Kv && f.KvTakes.Length > 1
-                ropeField.IsVisible <- ctx > 262144
-                ropeScaleField.IsVisible <- ctx > 262144
-                projection.IsVisible <- f.SpeedProjection
-                vectorField.IsVisible <- f.SpeedProjection && projection.IsChecked = Nullable true
-                budgetField.IsVisible <- m.Budget
+                match w with
+                | "vision" -> m.Vision
+                | "kv" -> (f.Kv && ctx > 8192) || (not f.Kv && f.KvTakes.Length > 1)
+                | "long_context" -> ctx > 262144
+                | "speed_projection" -> f.SpeedProjection
+                | "budget" -> m.Budget
+                | "images" -> f.Images && d.Images.Length > 0 && imagesChosen
+                | "multi_gpu" -> (d.Gpus |> Array.filter (fun g -> isNull g.Problem)).Length > 1
+                | "download" -> own.IsNone
+                | "sam3" -> not (isNull (box d.Sam3)) && not d.Sam3.Agreed
+                | _ -> false
+            | _ -> false
+        let placed = fieldsOf d [ "install"; "advanced"; "images"; "start" ] holds (fun () -> current)
+        let all = placed |> List.collect snd
+        let at place = placed |> List.find (fst >> (=) place) |> snd
+        let refresh () =
+            match current, selectedModel () with
+            | Some f, Some _ ->
                 imagesField.IsVisible <- f.Images && d.Images.Length > 0
-                imageOptions.IsVisible <- imagesField.IsVisible
+                imagesChosen <- imagesField.IsVisible && (imagesValue ()).IsSome
+                Fields.refresh all
             | _ -> ()
+        refreshFields <- refresh
+        Fields.watch all refresh
         // the quantization chosen: its family, and that quantization's sizes with its recommended one chosen
         let familyChanged () =
             if quantBox.SelectedIndex >= 0 then
@@ -722,8 +546,6 @@ type MainWindow(setup: Setup.Access) as this =
                     muted (f.By + " - " + f.About) :> Control
                 ]
                 sizes.ItemsSource <- models
-                plainKv.ItemsSource <- [ for k in f.KvTakes -> (match kvLabels.TryGetValue k with | true, l -> l | _ -> k) ]
-                plainKv.SelectedIndex <- max 0 (Array.IndexOf(f.KvTakes, "fp16"))
                 sizes.SelectedItem <- (models |> Array.tryFind (fun m -> m.Recommended) |> Option.defaultValue models[0])
                 license.Text <- (if String.IsNullOrEmpty f.License then "" else trf "install.license" "Its license: {license}" [ "license", box f.License ])
         let variantChanged () =
@@ -759,124 +581,58 @@ type MainWindow(setup: Setup.Access) as this =
         quantBox.SelectionChanged.Add(fun _ -> familyChanged ())
         sizes.SelectionChanged.Add(fun _ -> sizeChanged ())
         contexts.SelectionChanged.Add(fun _ -> refresh ())
-        projection.IsCheckedChanged.Add(fun _ -> refresh ())
         install.Click.Add(fun _ ->
             match current, selectedModel () with
             | Some f, Some m ->
+                refresh ()
                 let ctx = selectedContext f
-                let questions =
-                    [ yield "--context"; yield string ctx
-                      if m.Vision then
-                          yield "--vision"
-                          yield (if pictures.IsChecked = Nullable true then readerValue () else "no")
-                      if f.Kv && ctx > 8192 then yield! [ "--kv"; kvValue () ]
-                      if ctx > 262144 then yield! [ "--rope-scaling"; ropeValue () ]
-                      if f.SpeedProjection then
-                          yield "--experimental-speed-projection"
-                          yield (match projection.IsChecked = Nullable true, trimmed vector with
-                                 | false, _ -> "off"
-                                 | true, "" -> "on"
-                                 | true, file -> file)
-                      match imagesValue () with
-                      | Some v when f.Images -> yield! [ "--images"; v ]
-                      | _ -> ()
-                      yield! [ "--web-search"; webSearchValue () ] ]
-                let withImages = f.Images && (imagesValue ()).IsSome
-                let advanced =
+                let chosen =
                     collectArgs [
-                        (if m.Vision && pictures.IsChecked = Nullable true then
-                             optionOf "--vision-tokens" visionTokens (isInt 1) (tr "opt.visionTokens" "a number of image tokens, 1 or more")
-                         else Result.Ok [])
-                        (if ctx > 262144 then optionOf "--rope-scale" ropeScale (isNumber 1.0 1e6) (tr "opt.ropeScale" "a number, 1 or more") else Result.Ok [])
-                        Result.Ok(match lowRamValue () with "auto" -> [] | v -> [ "--low-ram"; v ])
-                        Result.Ok(if f.Kv then [] else match plainKvValue f with "fp16" -> [] | k -> [ "--kv"; k ])
-                        (if m.Budget then optionOf "--resident-budget-gib" budget (isNumber 1.0 1e6) (tr "opt.residentBudgetGib" "a number of GiB") else Result.Ok [])
-                        optionOf "--ram-reserve-gib" ramReserve (isNumber 0.0 1e6) (tr "opt.ramReserveGib" "a number of GiB, 0 or more")
-                        optionOf "--parallel" parallelBox (isInt 1) (tr "opt.parallel" "a number of requests, 1 or more")
-                        optionOf "--replicas" replicas (isInt 1) (tr "opt.replicas" "a number of engines, 1 or more")
-                        Result.Ok(match sourceValue () with "" -> [] | v -> [ "--source"; v ])
-                        Result.Ok(match trimmed modelsDir with "" -> [] | p -> [ "--models-dir"; p ])
-                        Result.Ok(flag "--move-data" moveData @ flag "--set-default-data-dir" rememberData @ flag "--no-warmup" noWarmup)
-                        Result.Ok(if withImages then [ for name, v in imageValues () do yield! [ "--image-" + name; v ] ] else [])
-                        serverArgs ()
+                        Result.Ok [ "--context"; string ctx ]
+                        Fields.args (at "install") id
+                        Result.Ok(match imagesValue () with Some v when f.Images -> [ "--images"; v ] | _ -> [])
+                        Fields.args (at "advanced") id
+                        Fields.args (at "images") id
+                        Fields.args (at "start") id
                     ]
-                let api = apiKeys |> List.tryFind (fun (id, _, _) -> id = webSearchValue ())
-                let key = match api with Some (_, _, box) -> trimmed box | None -> ""
-                match advanced with
+                match chosen with
                 | Error why -> problem.Text <- why
-                | Result.Ok _ when api.IsSome && key = "" && d.WebSearch <> webSearchValue () ->
-                    let _, who, _ = api.Value
-                    problem.Text <- trf "install.keyNeeded" "Web search with {who} needs your {who} API key." [ "who", box who ]
                 | Result.Ok more ->
-                    // the key reaches setup in its environment, never on its command line (process lists show that)
-                    for id, _, box in apiKeys do
-                        let k = if webSearchValue () = id then trimmed box else ""
-                        Environment.SetEnvironmentVariable($"XESTRATA_{id.ToUpperInvariant()}_API_KEY", (if k = "" then null else k))
+                    // the keys reach setup in its environment, never on its command line (process lists show that)
+                    for name, value in Fields.environment all do
+                        Environment.SetEnvironmentVariable(name, value)
                     let which =
                         match own with
                         | Some(path, name) -> [ "--gguf"; path ] @ (if name = "" then [] else [ "--name"; name ])
                         | None -> [ "--family"; f.Id; "--model"; m.Id ]
-                    let args =
-                        [ "--setup"; "--yes"; "--no-start" ] @ which @ [ "--data-dir"; dataDir.Text ]
-                        @ questions
-                        @ (if gpus.Length > 0 then [ "--gpu"; string gpus[max 0 gpuBox.SelectedIndex].Index ] else [])
-                        @ (if own.IsSome || String.IsNullOrWhiteSpace ggufDir.Text then [] else [ "--gguf-dir"; ggufDir.Text ])
-                        @ more
-                    installPage (f.Title + " " + m.Id) args
+                    installPage (f.Title + " " + m.Id) ([ "--setup"; "--yes"; "--no-start" ] @ which @ more)
             | _ -> ())
         baseBox.SelectedIndex <- max 0 (Array.IndexOf(bases, baseOf recFamily))
+        let controls place = [ for x in at place -> x.Control ]
         let advanced =
             Expander(
                 Header = (tr "common.advanced" "Advanced"),
                 HorizontalAlignment = HorizontalAlignment.Stretch,
-                Content =
-                    stack 10.0 [
-                        readerField
-                        visionTokensField
-                        ropeScaleField
-                        vectorField
-                        plainKvField
-                        field (tr "install.lowRamModeThe" "Low-RAM mode: the experts read from the model files instead of all copied into RAM") lowRam
-                        budgetField
-                        field (tr "install.ramLeftFreeFor" "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and the image models' sizes are chosen with that much less; slower when the experts are then read from the SSD)") ramReserve
-                        field (tr "install.requestsDecodedTogetherEach" "Requests decoded together (each takes VRAM from the expert cache)") parallelBox
-                        field (tr "install.withALayerSplit" "With a layer split: independent engines, each on an equal group of the GPUs") replicas
-                        if own.IsNone then
-                            field (tr "install.whereTheModelFiles" "Where the model files come from") source
-                            field (tr "install.whereTheModelFiles2" "Where the model files go") (row 8.0 [ modelsDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.modelFilesFolder" "Model files folder") modelsDir) ])
-                        moveData
-                        rememberData
-                        noWarmup
-                        imageOptions
-                        serverControl
-                    ]
+                Content = stack 10.0 (controls "advanced" @ controls "images" @ controls "start")
             )
         show (
             stack 14.0 [
-                heading (tr "install.installAModel" "Install a model")
-                field (tr "install.model" "Model") baseBox
-                variantField
-                quantField
-                card familyInfo
-                field (tr "install.size" "Size") sizes
-                license
-                field (tr "install.contextHowMuchText" "Context: how much text the model sees at once (longer takes more VRAM)") contexts
-                if gpus.Length > 1 then field (tr "install.gpu" "GPU") gpuBox
-                field (tr "install.dataFolderWhereThe" "Data folder: where the model files go (tens of GB)") (row 8.0 [ dataDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.dataFolder" "Data folder") dataDir) ])
-                if own.IsNone then
-                    field (tr "install.modelFilesYouAlready" "Model files you already have") (row 8.0 [ ggufDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.modelFiles" "Model files") ggufDir) ])
-                pictures
-                kvField
-                ropeField
-                projection
-                imagesField
-                webSearchField
-                yield! [ for _, f in apiKeyFields -> f :> Control ]
-                advanced
-                problem
-                actions [ button (tr "common.back" "Back") (fun () -> homePage d); install ]
+                yield heading (tr "install.installAModel" "Install a model") :> Control
+                yield field (tr "install.model" "Model") baseBox :> Control
+                yield variantField :> Control
+                yield quantField :> Control
+                yield card familyInfo :> Control
+                yield field (tr "install.size" "Size") sizes :> Control
+                yield license :> Control
+                yield field (tr "install.contextHowMuchText" "Context: how much text the model sees at once (longer takes more VRAM)") contexts :> Control
+                yield! controls "install"
+                yield imagesField :> Control
+                yield advanced :> Control
+                yield problem :> Control
+                yield actions [ button (tr "common.back" "Back") (fun () -> homePage d); install ] :> Control
             ]
         )
+        refresh ()
 
     and installPage (what: string) (args: string list) =
         runPage (trf "install.installing" "Installing {what}" [ "what", box what ]) args (fun _ -> None) ignore (fun _ -> home ()) |> ignore
@@ -884,20 +640,28 @@ type MainWindow(setup: Setup.Access) as this =
     /// An installed model's image generation: its image models chosen again (none: taken out), the files downloaded
     /// and its config rewritten by tools/image/install.py; the server takes it at its next start.
     and imagesPage (d: Describe) (m: Installed) =
-        let picker, value = imagePicker d.Images m.Images
-        let options, optionValues = imageRunOptions (d.Gpus |> Array.filter (fun g -> isNull g.Problem)) d.Sam3
+        let picker, value = imagePicker d.Images m.Images ignore
+        let holds w = match w with "images" -> true | "sam3" -> not (isNull (box d.Sam3)) && not d.Sam3.Agreed | _ -> false
+        let options = fieldsOf d [ "images" ] holds (fun () -> None) |> List.collect snd
+        Fields.watch options (fun () -> Fields.refresh options)
+        Fields.refresh options
+        let problem = coloured failBrush ""
         let apply () =
             let v = value () |> Option.defaultValue "no"
-            let more = if v = "no" then [] else [ for name, x in optionValues () do yield! [ "--" + name; x ] ]
-            runScriptPage Places.imageInstallPy (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
-                ([ "--config"; m.Config; "--model"; v; "--yes" ] @ more) (fun _ -> None) ignore (fun _ -> home ())
-            |> ignore
+            // tools/image/install.py takes setup's --image-NAME as --NAME
+            match (if v = "no" then Result.Ok [] else Fields.args options (fun n -> n.Substring "image-".Length)) with
+            | Error why -> problem.Text <- why
+            | Result.Ok more ->
+                runScriptPage Places.imageInstallPy (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
+                    ([ "--config"; m.Config; "--model"; v; "--yes" ] @ more) (fun _ -> None) ignore (fun _ -> home ())
+                |> ignore
         show (
             stack 14.0 [
                 heading (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
                 muted (tr "images.checkTheImageModels" "Check the image models to make images with (none: image generation off). Their files are downloaded, and the model takes them at its next start.")
                 picker
-                Expander(Header = (tr "common.advanced" "Advanced"), Content = options, HorizontalAlignment = HorizontalAlignment.Stretch)
+                Expander(Header = (tr "common.advanced" "Advanced"), Content = stack 10.0 [ for f in options -> f.Control ], HorizontalAlignment = HorizontalAlignment.Stretch)
+                problem
                 actions [ button (tr "common.back" "Back") (fun () -> homePage d); accentButton (tr "images.apply" "Apply") apply ]
             ]
         )
@@ -905,22 +669,20 @@ type MainWindow(setup: Setup.Access) as this =
     /// A start of an installed model with setup's options for a start (the GPUs, the port, who may connect, ...).
     and startOptionsPage (d: Describe) (index: int) (m: Installed) =
         let gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
-        let control, args = runOptions gpus
-        let one, oneValue =
-            choice ((tr "start.asSetUp" "As set up", "") :: [ for g in gpus -> trf "start.only" "Only {gpu}, this time" [ "gpu", box g.Name ], string g.Index ]) 0
+        let holds w = match w with "multi_gpu" -> gpus.Length > 1 | _ -> false
+        let options = fieldsOf d [ "start" ] holds (fun () -> None) |> List.collect snd
+        Fields.watch options (fun () -> Fields.refresh options)
+        Fields.refresh options
         let browser = CheckBox(IsChecked = Nullable true, Content = text (tr "start.openTheChatIn" "Open the chat in the browser when the model is ready"))
         let problem = coloured failBrush ""
         let start () =
-            match args () with
+            match Fields.args options id with
             | Error why -> problem.Text <- why
-            | Result.Ok more ->
-                let gpu = match oneValue () with "" -> [] | i -> [ "--gpu"; i ]
-                startModel index m (gpu @ more) (browser.IsChecked = Nullable true)
+            | Result.Ok more -> startModel index m more (browser.IsChecked = Nullable true)
         show (
             stack 14.0 [
                 yield heading (trf "start.title" "Start {model}" [ "model", box m.ModelName ]) :> Control
-                if gpus.Length > 1 then yield field (tr "start.gpu" "GPU") one :> Control
-                yield control :> Control
+                yield! [ for f in options -> f.Control ]
                 yield browser :> Control
                 yield problem :> Control
                 yield actions [ button (tr "common.back" "Back") (fun () -> homePage d); accentButton (tr "start.start" "Start") start ] :> Control

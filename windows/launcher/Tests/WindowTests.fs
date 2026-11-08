@@ -128,6 +128,24 @@ let private press (w: Window) (key: Key) (physical: PhysicalKey) =
 
 let private tr key english = I18n.tr key english
 
+/// One of setup's options as describe.json has it.
+let private spec (name: string) = described.Value.Options |> Array.find (fun o -> o.Name = name)
+
+/// The label of an option's field.
+let private labelOf (name: string) = Fields.label (spec name)
+
+/// An option's field: the control under its label.
+let private optionField<'T when 'T :> Control> (w: Window) (name: string) : 'T = fieldOf<'T> w (labelOf name)
+
+/// A choice of an option's field chosen by its value.
+let private pick (w: Window) (name: string) (value: string) =
+    let o = spec name
+    let c = optionField<ComboBox> w name
+    let english = o.Choices |> Array.find (fun x -> x[0] = value)
+    c.SelectedItem <- Fields.choiceLabel o value english[1]
+    Assert.Equal(box (Fields.choiceLabel o value english[1]), c.SelectedItem)
+    pump ()
+
 /// A window on `setup`, at its home page.
 let private open' (setup: FakeSetup) =
     let w = new MainWindow.MainWindow(setup.Access)
@@ -307,8 +325,8 @@ let ``an install passes the choices to setup and follows its run`` () =
     let lv = installPage w
     choose w lv "qwen" |> ignore
     let m = lv.Sizes.SelectedItem :?> Model
-    (fieldOf<TextBox> w "Port").Text <- "8100"
-    (fieldOf<TextBox> w "VRAM left free for other programs, in MiB").Text <- "512"
+    (optionField<TextBox> w "port").Text <- "8100"
+    (optionField<TextBox> w "vram-reserve-mib").Text <- "512"
     click w "Install"
     let r = setup.Last
     Assert.Equal(Places.setupPy, r.Script)
@@ -341,6 +359,48 @@ let ``an install passes the choices to setup and follows its run`` () =
     r.Exit 0
     waitFor "the home page again" (fun () -> findButton w (tr "home.install" "Install a model ...")) |> ignore
 
+/// Every option setup describes is a field: on the install page (its Advanced included), and those of a start and of
+/// the images on their own pages.
+[<AvaloniaFact>]
+let ``every option setup describes is a field`` () =
+    english ()
+    let d = described.Value
+    let present (w: Window) name = all<TextBlock> w |> List.exists (fun t -> t.Text = labelOf name)
+    let w = open' (FakeSetup(d, none))
+    installPage w |> ignore
+    for o in d.Options do
+        Assert.True(present w o.Name, o.Name + " is not on the install page")
+    click w "Back"
+    for button, place in [ "Start with options ...", "start"; "Images ...", "images" ] do
+        click w button
+        for o in d.Options do
+            if o.Place = place then Assert.True(present w o.Name, sprintf "%s is not on the page of %s" o.Name button)
+        click w "Back"
+
+/// A field is shown where setup would ask its question, with the family's own choices: the KV cache's precision above
+/// 8K of context, and a plain family's precisions, 16-bit first.
+[<AvaloniaFact>]
+let ``an option is shown where setup asks it, with the family's choices`` () =
+    english ()
+    let d = described.Value
+    let w = open' (FakeSetup(d, none))
+    let lv = installPage w
+    choose w lv "qwen" |> ignore
+    let contexts = fieldOf<ComboBox> w "Context: how much text the model sees at once (longer takes more VRAM)"
+    let kv = optionField<ComboBox> w "kv"
+    contexts.SelectedItem <- Views.contextLabel 8192
+    pump ()
+    Assert.False(visible kv, "the KV cache asked at 8K")
+    contexts.SelectedItem <- Views.contextLabel 32768
+    pump ()
+    Assert.True(visible kv, "the KV cache not asked at 32K")
+    Assert.Equal(4, kv.ItemCount)
+    let f = choose w lv "llmjp"
+    pump ()
+    Assert.True(visible kv, "llm-jp's precisions not offered")
+    Assert.Equal(f.KvTakes.Length, kv.ItemCount)
+    Assert.Equal(box (Fields.choiceLabel (spec "kv") "fp16" "16-bit: twice the memory of 8-bit"), kv.SelectedItem)
+
 [<AvaloniaFact>]
 let ``an option the page cannot take is refused before setup runs`` () =
     english ()
@@ -348,11 +408,11 @@ let ``an option the page cannot take is refused before setup runs`` () =
     let w = open' setup
     installPage w |> ignore
     for text, why in [ "abc", "--port takes a port number, 1 to 65535."; "70000", "--port takes a port number, 1 to 65535." ] do
-        (fieldOf<TextBox> w "Port").Text <- text
+        (optionField<TextBox> w "port").Text <- text
         click w "Install"
         Assert.True(shows w why, text)
-    (fieldOf<TextBox> w "Port").Text <- ""
-    (fieldOf<TextBox> w "Requests decoded together (each takes VRAM from the expert cache)").Text <- "0"
+    (optionField<TextBox> w "port").Text <- ""
+    (optionField<TextBox> w "parallel").Text <- "0"
     click w "Install"
     Assert.True(shows w "--parallel takes a number of requests, 1 or more.")
     Assert.Empty setup.Runs
@@ -363,9 +423,7 @@ let ``a web search API needs its key`` () =
     let setup = FakeSetup(described.Value, none)
     let w = open' setup
     installPage w |> ignore
-    let search = fieldOf<ComboBox> w "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)"
-    search.SelectedIndex <- 1
-    pump ()
+    pick w "web-search" "deepseek"
     click w "Install"
     Assert.True(shows w "Web search with DeepSeek needs your DeepSeek API key.")
     Assert.Empty setup.Runs
@@ -410,15 +468,15 @@ let ``a start with options passes them`` () =
     let setup = FakeSetup(described.Value, none)
     let w = open' setup
     click w "Start with options ..."
-    (fieldOf<TextBox> w "Port").Text <- "x"
+    (optionField<TextBox> w "port").Text <- "x"
     click w "Start"
     Assert.True(shows w "--port takes a port number, 1 to 65535.")
     Assert.Empty setup.Runs
-    (fieldOf<TextBox> w "Port").Text <- "8200"
-    (fieldOf<TextBox> w "API key").Text <- "k1"
-    (fieldOf<ComboBox> w "Who may connect (with networks: set an API key too)").SelectedIndex <- 1
-    (fieldOf<ComboBox> w "Other languages' characters in the answers, for every model (the thinking is left as it is)").SelectedIndex <- 1
-    (fieldOf<ComboBox> w "Qwen3.8-Flash-Next's n-gram table").SelectedIndex <- 1
+    (optionField<TextBox> w "port").Text <- "8200"
+    (optionField<TextBox> w "api-key").Text <- "k1"
+    pick w "host" "0.0.0.0"
+    pick w "script-guard" "ja"
+    pick w "ple-io" "ram"
     click w "Start"
     let args = setup.Last.Args
     for part in
@@ -448,7 +506,7 @@ let ``an installed model's image models are set by install.py`` () =
     let first = all<CheckBox> w |> List.find (fun b -> match b.Content with :? StackPanel -> true | _ -> false)
     first.IsChecked <- Nullable true
     // the image jobs on the GPU of the list (by its PCI address), and SAM 3.1's license agreed to
-    (fieldOf<ComboBox> w "The GPU that makes the images").SelectedIndex <- 1
+    pick w "image-gpu" "same"
     let sam3 = all<CheckBox> w |> List.find (fun b -> match b.Content with :? TextBlock as t -> t.Text.StartsWith "Agree to Meta's SAM License" | _ -> false)
     sam3.IsChecked <- Nullable true
     pump ()

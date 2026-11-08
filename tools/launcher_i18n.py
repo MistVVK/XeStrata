@@ -10,6 +10,10 @@ The English text lives in the code (see windows/launcher/Core/I18n.fs):
     trf "key" "English text with {name}" [ "name", box value ]
 The text must be one plain string literal, so that this reader and a translator see the same text.  The catalogs are
 windows/launcher/Core/locales/<lang>.json, built into the launchers.
+
+setup's options (setup.py's OPTIONS) are fields the window draws from setup's --describe, in setup's English: their
+texts are keyed setup.NAME.label, .hint, .takes, .about and .needed, and setup.NAME.choice.VALUE (VALUE "" is unset,
+a character a key does not take is _), as windows/launcher/Gui/Fields.fs looks them up.
 """
 from __future__ import annotations
 
@@ -18,7 +22,8 @@ import re
 import sys
 from pathlib import Path
 
-LAUNCHER = Path(__file__).resolve().parents[1] / "windows" / "launcher"
+ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER = ROOT / "windows" / "launcher"
 LOCALES = LAUNCHER / "Core" / "locales"
 LANGUAGES = ("de", "fr", "es", "ja", "ko", "pt", "ru", "zh")
 CALL = re.compile(r'(?<![\w.])(?:I18n\.)?trf?\s+"([\w.\-]+)"\s+"((?:[^"\\]|\\.)*)"')
@@ -45,8 +50,27 @@ def english() -> tuple[dict, list]:
     return text, problems
 
 
+def setup_texts() -> dict:
+    """The English texts of setup's options by their keys."""
+    sys.path.insert(0, str(ROOT))
+    import setup                                       # noqa: PLC0415 - setup.py is read only for this check
+
+    def key(v: str) -> str:
+        return "unset" if v == "" else re.sub(r"[^\w\-]", "_", v)
+
+    text: dict[str, str] = {}
+    for o in setup.OPTIONS:
+        for part in ("label", "hint", "takes", "about", "needed"):
+            if o.get(part):
+                text[f"setup.{o['name']}.{part}"] = o[part]
+        for v, t in o.get("choices", []):
+            text[f"setup.{o['name']}.choice.{key(v)}"] = t
+    return text
+
+
 def check() -> list:
     text, problems = english()
+    text.update(setup_texts())
     for lang in LANGUAGES:
         path = LOCALES / f"{lang}.json"
         if not path.is_file():
@@ -65,7 +89,7 @@ def check() -> list:
 
 def main() -> int:
     if "--english" in sys.argv[1:]:
-        print(json.dumps(english()[0], ensure_ascii=False, indent=1, sort_keys=True))
+        print(json.dumps({**english()[0], **setup_texts()}, ensure_ascii=False, indent=1, sort_keys=True))
         return 0
     problems = check()
     for p in problems:
